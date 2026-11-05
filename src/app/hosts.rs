@@ -67,16 +67,22 @@ pub enum HostField {
     User,
     /// The optional group label.
     Group,
+    /// The optional private key path a connection may use.
+    ///
+    /// The editor only ever holds a path: Shellune never reads the key file, so there
+    /// is nothing here that could hold a key or its passphrase.
+    IdentityFile,
 }
 
 impl HostField {
     /// Every field, in form order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Name,
         Self::Address,
         Self::Port,
         Self::User,
         Self::Group,
+        Self::IdentityFile,
     ];
 
     /// Label shown in front of the field.
@@ -87,6 +93,7 @@ impl HostField {
             Self::Port => strings.host_field_port,
             Self::User => strings.host_field_user,
             Self::Group => strings.host_field_group,
+            Self::IdentityFile => strings.host_field_identity,
         }
     }
 
@@ -98,6 +105,7 @@ impl HostField {
             Self::Port => "hosts.field.port",
             Self::User => "hosts.field.user",
             Self::Group => "hosts.field.group",
+            Self::IdentityFile => "hosts.field.identity",
         }
     }
 }
@@ -115,6 +123,7 @@ pub struct HostDraft {
     port: String,
     user: String,
     group: String,
+    identity: String,
 }
 
 impl HostDraft {
@@ -128,6 +137,7 @@ impl HostDraft {
             port: Port::DEFAULT.to_string(),
             user: String::new(),
             group: String::new(),
+            identity: String::new(),
         }
     }
 
@@ -141,6 +151,7 @@ impl HostDraft {
             port: host.port().to_string(),
             user: host.user().to_owned(),
             group: host.group().unwrap_or_default().to_owned(),
+            identity: host.identity_file().unwrap_or_default().to_owned(),
         }
     }
 
@@ -159,6 +170,7 @@ impl HostDraft {
             HostField::Port => &self.port,
             HostField::User => &self.user,
             HostField::Group => &self.group,
+            HostField::IdentityFile => &self.identity,
         }
     }
 
@@ -170,6 +182,7 @@ impl HostDraft {
             HostField::Port => &mut self.port,
             HostField::User => &mut self.user,
             HostField::Group => &mut self.group,
+            HostField::IdentityFile => &mut self.identity,
         };
         let text = text.into();
         if *slot == text {
@@ -200,6 +213,9 @@ impl HostDraft {
                 host.set_user(self.user.clone())
                     .map_err(|error| error.to_string())?;
                 host.set_group(Some(self.group.clone()));
+                // A blank field clears the path instead of storing an empty string, and
+                // the value is only ever the path to the key.
+                host.set_identity_file(Some(self.identity.clone()));
                 Ok(HostEdit::replace(host))
             }
             None => {
@@ -211,6 +227,7 @@ impl HostDraft {
                 )
                 .map_err(|error| error.to_string())?;
                 host.set_group(Some(self.group.clone()));
+                host.set_identity_file(Some(self.identity.clone()));
                 Ok(HostEdit::create(host))
             }
         }

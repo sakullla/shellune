@@ -55,7 +55,7 @@ pub struct ShelluneView {
     /// The host list views, the open form and the last message.
     hosts: HostsPanel,
     hosts_search: Entity<TextField>,
-    /// The five form fields, present only while the editor is open.
+    /// The six form fields, present only while the editor is open.
     host_fields: Option<HostFields>,
     /// The SSH configuration import panel and what the last read of a file showed.
     import: ImportPanel,
@@ -63,13 +63,14 @@ pub struct ShelluneView {
     import_path: Option<Entity<TextField>>,
 }
 
-/// The five fields of the host editor, in form order.
+/// The six fields of the host editor, in form order.
 struct HostFields {
     name: Entity<TextField>,
     address: Entity<TextField>,
     port: Entity<TextField>,
     user: Entity<TextField>,
     group: Entity<TextField>,
+    identity: Entity<TextField>,
 }
 
 impl HostFields {
@@ -80,6 +81,7 @@ impl HostFields {
             HostField::Port => &self.port,
             HostField::User => &self.user,
             HostField::Group => &self.group,
+            HostField::IdentityFile => &self.identity,
         }
     }
 }
@@ -374,12 +376,20 @@ impl ShelluneView {
         let group = cx.new(|cx| {
             TextField::with_text(strings.host_field_group, draft.text(HostField::Group), cx)
         });
+        let identity = cx.new(|cx| {
+            TextField::with_text(
+                strings.host_field_identity,
+                draft.text(HostField::IdentityFile),
+                cx,
+            )
+        });
         self.host_fields = Some(HostFields {
             name,
             address,
             port,
             user,
             group,
+            identity,
         });
         for field in HostField::ALL {
             self.bind_host_field(field, cx);
@@ -1006,6 +1016,11 @@ impl ShelluneView {
             );
         }
 
+        // The key path is the only part of a key this application knows; saying so in
+        // the form is what keeps an imported IdentityFile editable without pretending
+        // the key itself is managed here.
+        card = card.child(caption_line(strings.host_identity_note.to_owned(), metrics));
+
         card.child(
             div()
                 .flex()
@@ -1249,6 +1264,21 @@ impl ShelluneView {
                     "{} · {}",
                     strings.import_match_label,
                     line_list(limits.match_lines())
+                ),
+                metrics,
+            ));
+        }
+        if !limits.unmatched_proxy().is_empty() {
+            let patterns: Vec<String> = limits
+                .unmatched_proxy()
+                .iter()
+                .map(|note| format!("{} (line {})", note.keyword(), note.line()))
+                .collect();
+            block = block.child(caption_line(
+                format!(
+                    "{} · {}",
+                    strings.import_unmatched_proxy_label,
+                    patterns.join(", ")
                 ),
                 metrics,
             ));

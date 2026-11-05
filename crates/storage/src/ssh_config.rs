@@ -16,6 +16,10 @@
 //! * a host that never sets HostName is reached under the alias itself, exactly as
 //!   ssh does it.
 //!
+//! A proxy or a forwarding in a block whose pattern no alias in the file matches is
+//! reported too: it reached no imported host, but ssh would still apply it to a name
+//! this file never defines, so the result is partial rather than complete.
+//!
 //! Everything the subset cannot decide is reported instead of guessed: a Match
 //! block, an Include, an OpenSSH token inside a value, a directive this build does
 //! not apply, and every directive that could change the target or the path to it
@@ -174,7 +178,8 @@ impl ImportNote {
         self.line
     }
 
-    /// The directive as it was spelled in the file.
+    /// The directive, or the Host pattern a block-level note is about, as it was
+    /// spelled in the file.
     #[must_use]
     pub fn keyword(&self) -> &str {
         &self.keyword
@@ -290,6 +295,7 @@ pub struct ImportLimits {
     ignored: Vec<ImportNote>,
     include_lines: Vec<usize>,
     match_lines: Vec<usize>,
+    unmatched_proxy: Vec<ImportNote>,
 }
 
 impl ImportLimits {
@@ -311,10 +317,25 @@ impl ImportLimits {
         &self.match_lines
     }
 
+    /// Proxy and forwarding directives in a Host block that no host in this file
+    /// matches, one entry per block.
+    ///
+    /// A pattern such as `*.corp` or a negation decides which aliases a block applies
+    /// to. When no concrete alias in the file is covered, the directives never reach
+    /// an imported host, so without this list they would vanish from the preview while
+    /// ssh would still use them for `ssh box.corp`.
+    #[must_use]
+    pub fn unmatched_proxy(&self) -> &[ImportNote] {
+        &self.unmatched_proxy
+    }
+
     /// Whether the file as a whole was only partly applied.
     #[must_use]
     pub fn is_partial(&self) -> bool {
-        !self.ignored.is_empty() || !self.include_lines.is_empty() || !self.match_lines.is_empty()
+        !self.ignored.is_empty()
+            || !self.include_lines.is_empty()
+            || !self.match_lines.is_empty()
+            || !self.unmatched_proxy.is_empty()
     }
 }
 
@@ -439,7 +460,7 @@ impl ImportPreview {
         let source = source.into();
         let blocks = parse_blocks(&source, text)?;
         let aliases = concrete_aliases(&blocks);
-        let limits = file_limits(&blocks);
+        let limits = file_limits(&blocks, &aliases);
         let hosts = aliases
             .into_iter()
             .map(|(alias, line)| resolve_host(&blocks, &alias, line))
@@ -794,10 +815,15 @@ fn concrete_aliases(blocks: &[Block]) -> Vec<(String, usize)> {
 }
 
 /// What the file cannot contribute as a whole.
-fn file_limits(blocks: &[Block]) -> ImportLimits {
+///
+/// The aliases are the ones the file defines concretely, and they decide whether a
+/// Host block reaches any host at all: a block no alias matches carries directives
+/// that the preview would otherwise drop without a word.
+fn file_limits(blocks: &[Block], aliases: &[(String, usize)]) -> ImportLimits {
     let mut ignored: BTreeMap<String, ImportNote> = BTreeMap::new();
     let mut include_lines = Vec::new();
     let mut match_lines = Vec::new();
+    let mut unmatched_proxy = Vec::new();
 
     for block in blocks {
         if block.matches_conditions {
@@ -822,6 +848,59 @@ fn file_limits(blocks: &[Block]) -> ImportLimits {
                 _ => {}
             }
         }
+
+        // A proxy or a forwarding inside a Host block that no concrete alias matches
+        // is never resolved onto a host, so nothing else in the preview mentions it.
+        // ssh still applies those rules by pattern (`ssh box.corp` would take the
+        // jump host), so the file was not read completely and the preview says which
+        // pattern and line it skipped instead of claiming the opposite.
+        if block.patterns.is_empty() {
+            continue;
+        }
+        let blocking: Vec<&Setting> = block
+            .settings
+            .iter()
+            .filter(|setting| {
+                matches!(
+                    classify(&setting.lower),
+                    Directive::Proxy | Directive::Forwarding
+                )
+            })
+            .collect();
+        if blocking.is_empty() {
+            continue;
+        }
+        if aliases
+            .iter()
+            .any(|(alias, _)| block.covers(alias.as_str()))
+        {
+            continue;
+        }
+        let pattern = pattern_text(&block.patterns);
+        let directives = blocking
+            .iter()
+            .map(|setting| format!("{} on line {}", setting.keyword, setting.line))
+            .collect::<Vec<String>>()
+            .join(", ");
+        let kind = if blocking
+            .iter()
+            .any(|setting| matches!(classify(&setting.lower), Directive::Proxy))
+        {
+            NoteKind::Proxy
+        } else {
+            NoteKind::Forwarding
+        };
+        unmatched_proxy.push(ImportNote::new(
+            block.line,
+            pattern.clone(),
+            kind,
+            format!(
+                "line {}: Host {pattern} sets {directives}, but no Host in this file matches \
+                 that pattern, so the rule was not applied to any imported host and a \
+                 connection it would have redirected is not shown here",
+                block.line
+            ),
+        ));
     }
 
     include_lines.sort_unstable();
@@ -830,7 +909,23 @@ fn file_limits(blocks: &[Block]) -> ImportLimits {
         ignored: ignored.into_values().collect(),
         include_lines,
         match_lines,
+        unmatched_proxy,
     }
+}
+
+/// How a Host line spelled its patterns, so a note can quote it back.
+fn pattern_text(patterns: &[Pattern]) -> String {
+    patterns
+        .iter()
+        .map(|pattern| {
+            if pattern.negated {
+                format!("!{}", pattern.text)
+            } else {
+                pattern.text.clone()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
 }
 
 /// What a directive means to this importer.
@@ -1590,6 +1685,125 @@ Host web
             let plan = preview.plan(&HostBook::new());
             assert!(plan.is_empty(), "{directive} must not reach the book");
         }
+    }
+
+    #[test]
+    fn a_proxy_on_a_pattern_no_host_matches_is_reported_instead_of_dropped() {
+        // A pattern decides which aliases a block applies to. When nothing in the file
+        // is covered, the proxy never reaches an imported host — but ssh would still
+        // route `ssh box.corp` through it, so the file was not read completely and the
+        // preview has to name the pattern and the line instead of claiming otherwise.
+        let wildcard = parse_preview(
+            "\
+Host *.corp
+    ProxyJump bastion
+
+Host web
+    HostName web.example.org
+    User deploy
+",
+        );
+        assert_eq!(
+            host(&wildcard, "web").outcome(),
+            ImportOutcome::Ready,
+            "the unmatched block does not change the host it never reached"
+        );
+        assert!(
+            wildcard.is_partial(),
+            "a block that was skipped makes the result partial"
+        );
+        assert!(
+            wildcard.limits().is_partial(),
+            "the limitation belongs to the file, not to one host"
+        );
+        let note = wildcard
+            .limits()
+            .unmatched_proxy()
+            .first()
+            .unwrap_or_else(|| panic!("the skipped block is reported: {:?}", wildcard.limits()));
+        assert_eq!(note.line(), 1, "the note points at the Host line");
+        assert!(
+            note.keyword().contains("*.corp"),
+            "the pattern is named: {}",
+            note.keyword()
+        );
+        assert_eq!(note.kind(), NoteKind::Proxy);
+        assert!(
+            note.reason().contains("ProxyJump") && note.reason().contains("line 1"),
+            "{}",
+            note.reason()
+        );
+
+        // A negation next to a wildcard that nothing matches is the same omission, and
+        // the pattern is quoted the way the file spelled it.
+        let negated = parse_preview(
+            "\
+Host !bad web*
+    ProxyCommand nc %h %p
+
+Host db
+    HostName db.example.org
+    User ops
+",
+        );
+        assert!(negated.is_partial());
+        let note = negated
+            .limits()
+            .unmatched_proxy()
+            .first()
+            .unwrap_or_else(|| panic!("the skipped block is reported: {:?}", negated.limits()));
+        assert_eq!(note.line(), 1);
+        assert_eq!(
+            note.keyword(),
+            "!bad web*",
+            "the pattern that was skipped is named"
+        );
+        assert_eq!(note.kind(), NoteKind::Proxy);
+        assert!(note.reason().contains("ProxyCommand"), "{}", note.reason());
+
+        // A list of only negated patterns excludes every alias, so it reaches none.
+        let only_negated = parse_preview(
+            "\
+Host !bad
+    LocalForward 8080 localhost:80
+
+Host db
+    HostName db.example.org
+    User ops
+",
+        );
+        let note = only_negated
+            .limits()
+            .unmatched_proxy()
+            .first()
+            .unwrap_or_else(|| {
+                panic!("the skipped block is reported: {:?}", only_negated.limits())
+            });
+        assert_eq!(note.keyword(), "!bad");
+        assert_eq!(
+            note.kind(),
+            NoteKind::Forwarding,
+            "a forwarding is reported as a forwarding"
+        );
+        assert!(note.reason().contains("LocalForward"), "{}", note.reason());
+
+        // And a block that does reach an alias is not listed here: it blocks that host
+        // instead, which the host row already says.
+        let reached = parse_preview(
+            "\
+Host web*
+    ProxyJump bastion
+
+Host web1
+    HostName web1.example.org
+    User deploy
+",
+        );
+        assert_eq!(host(&reached, "web1").outcome(), ImportOutcome::Blocked);
+        assert!(
+            reached.limits().unmatched_proxy().is_empty(),
+            "a reachable block is reported on the host, not twice"
+        );
     }
 
     #[test]

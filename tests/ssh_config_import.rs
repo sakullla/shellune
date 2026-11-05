@@ -301,6 +301,77 @@ Match exec \"true\"
 }
 
 #[test]
+fn a_proxy_on_a_pattern_no_host_matches_is_reported_rather_than_dropped() {
+    // ssh would still apply these rules to a name this file never defines, so the
+    // preview cannot call the file completely read. Both the wildcard form and the
+    // negated form are the same omission and are named with their line.
+    let dir = TempDir::new("unmatched-proxy");
+    let config = dir.write_config(
+        "\
+Host *.corp
+    ProxyJump bastion corp
+
+Host app
+    HostName app.example.org
+    User deploy
+
+Host !bad web*
+    ProxyCommand nc %h %p
+",
+    );
+    let before = std::fs::read(&config).expect("the configuration is readable");
+
+    let preview = ImportPreview::from_file(&config).expect("the configuration parses");
+    let named: Vec<(usize, &str)> = preview
+        .limits()
+        .unmatched_proxy()
+        .iter()
+        .map(|note| (note.line(), note.keyword()))
+        .collect();
+    assert_eq!(
+        named,
+        vec![(1, "*.corp"), (8, "!bad web*")],
+        "each skipped pattern is reported with its Host line: {:?}",
+        preview.limits()
+    );
+    assert!(
+        preview.is_partial(),
+        "a proxy the preview could not place means the file was not read completely"
+    );
+    assert!(
+        preview
+            .limits()
+            .unmatched_proxy()
+            .iter()
+            .all(|note| note.reason().contains("Proxy")),
+        "the reason names the directive that was skipped: {:?}",
+        preview.limits().unmatched_proxy()
+    );
+    assert_eq!(
+        preview.importable_count(),
+        1,
+        "the plain host is still offered; the skipped rules do not block it"
+    );
+
+    // Importing writes the offered host, leaves the source file byte for byte as it
+    // was, and stores no rule the preview said it had skipped.
+    let store = dir.store();
+    let mut book = store.load().expect("a first run is not a failure");
+    preview
+        .plan(&book)
+        .apply(&mut book)
+        .expect("the offered host is added");
+    store.save(&book).expect("the book saves");
+    assert_eq!(book.hosts().len(), 1);
+    assert_eq!(book.hosts()[0].name(), "app");
+    assert_eq!(
+        std::fs::read(&config).expect("the configuration is still readable"),
+        before,
+        "the import must not change the source file"
+    );
+}
+
+#[test]
 fn importing_the_same_file_twice_does_not_duplicate_the_saved_hosts() {
     let dir = TempDir::new("twice");
     let config = dir.write_config(CONFIG);

@@ -208,6 +208,10 @@ pub struct Strings {
     pub host_field_user: &'static str,
     /// Form label: group label.
     pub host_field_group: &'static str,
+    /// Form label: the private key file a connection may use.
+    pub host_field_identity: &'static str,
+    /// Note that only the key path is stored, never the key.
+    pub host_identity_note: &'static str,
     /// Title of the editor when a new host is being created.
     pub host_editor_new: &'static str,
     /// Title of the editor when a saved host is being changed.
@@ -271,6 +275,8 @@ pub struct Strings {
     pub import_include_label: &'static str,
     /// Label introducing the Match blocks, whose conditions were not evaluated.
     pub import_match_label: &'static str,
+    /// Label introducing proxy or forwarding rules no host in the file matched.
+    pub import_unmatched_proxy_label: &'static str,
     /// Shown when the file holds no host that could be imported.
     pub import_nothing: &'static str,
     /// Button that saves the hosts the preview offers.
@@ -360,6 +366,8 @@ pub static ENGLISH: Strings = Strings {
     host_field_port: "Port",
     host_field_user: "User",
     host_field_group: "Group",
+    host_field_identity: "Key file",
+    host_identity_note: "Only the path is saved; Shellune never reads or copies the key itself.",
     host_editor_new: "New host",
     host_editor_edit: "Edit host",
     host_save: "Save host",
@@ -392,6 +400,7 @@ pub static ENGLISH: Strings = Strings {
     import_ignored_label: "Not applied",
     import_include_label: "Included files were not read",
     import_match_label: "Match blocks were not evaluated",
+    import_unmatched_proxy_label: "Proxy or forwarding rules no host here matches",
     import_nothing: "No host in this file can be imported as a direct connection yet.",
     import_apply: "Import hosts",
     import_applied: "Imported",
@@ -474,6 +483,8 @@ pub static CHINESE: Strings = Strings {
     host_field_port: "端口",
     host_field_user: "用户名",
     host_field_group: "分组",
+    host_field_identity: "密钥文件",
+    host_identity_note: "只保存密钥路径，Shellune 从不读取或复制密钥内容。",
     host_editor_new: "新建主机",
     host_editor_edit: "编辑主机",
     host_save: "保存主机",
@@ -506,6 +517,7 @@ pub static CHINESE: Strings = Strings {
     import_ignored_label: "未应用的指令",
     import_include_label: "没有读取被包含的文件",
     import_match_label: "没有评估 Match 条件块",
+    import_unmatched_proxy_label: "没有匹配到任何主机的代理或转发规则",
     import_nothing: "这个文件里还没有可以直接导入的主机。",
     import_apply: "导入主机",
     import_applied: "已导入",

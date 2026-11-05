@@ -1765,6 +1765,76 @@ async fn a_new_host_is_created_through_the_form_and_reaches_the_file(cx: &mut Te
 }
 
 #[gpui::test]
+async fn the_key_path_of_a_host_is_visible_and_editable_in_the_form(cx: &mut TestAppContext) {
+    // An imported IdentityFile is part of the record, so it has to be readable and
+    // changeable afterwards; only the path is stored, never the key itself.
+    let dir = TempDir::new("identity");
+    let store = dir.store();
+    let mut imported = stored_host("web", "10.0.0.5", 22, "deploy", None);
+    imported.set_identity_file(Some("C:/keys/web_ed25519"));
+    let book = seed(&store, vec![imported]);
+    let id = book.hosts()[0].id();
+
+    let (view, cx) = hosts_view(cx, HostStore::at(dir.path()));
+    click(cx, "hosts.edit.0");
+    assert!(
+        cx.debug_bounds("hosts.field.identity").is_some(),
+        "the key path has a field of its own"
+    );
+    cx.update(|_window, app| {
+        let draft = view
+            .read(app)
+            .hosts_state()
+            .draft()
+            .expect("a form is open");
+        assert_eq!(
+            draft.text(crate::app::hosts::HostField::IdentityFile),
+            "C:/keys/web_ed25519",
+            "the path that was imported is shown in the form"
+        );
+    });
+
+    clear_field(cx, "hosts.field.identity", "C:/keys/web_ed25519".len());
+    type_into(cx, "hosts.field.identity", "C:/keys/work_ed25519.pem");
+    click(cx, "hosts.save");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(view.book().hosts().len(), 1, "an edit must not add a host");
+        assert_eq!(
+            view.book()
+                .host(id)
+                .expect("the same record")
+                .identity_file(),
+            Some("C:/keys/work_ed25519.pem"),
+            "the edited path is what the record holds"
+        );
+    });
+    let restarted = HostStore::at(dir.path()).load().expect("the file loads");
+    assert_eq!(
+        restarted.host(id).expect("the same record").identity_file(),
+        Some("C:/keys/work_ed25519.pem"),
+        "the edited path survives a restart"
+    );
+
+    // An emptied field clears the reference; it does not save an empty path that
+    // would look like a key location.
+    click(cx, "hosts.edit.0");
+    clear_field(cx, "hosts.field.identity", "C:/keys/work_ed25519.pem".len());
+    click(cx, "hosts.save");
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app)
+                .book()
+                .host(id)
+                .expect("the same record")
+                .identity_file(),
+            None,
+            "a blank field removes the key path"
+        );
+    });
+}
+
+#[gpui::test]
 async fn an_invalid_port_is_refused_and_nothing_is_written(cx: &mut TestAppContext) {
     let dir = TempDir::new("port");
     let (view, cx) = hosts_view(cx, dir.store());
@@ -2175,6 +2245,59 @@ Host through-bastion
     User root
     ProxyJump bastion.example.org
 ";
+
+#[gpui::test]
+async fn a_proxy_the_preview_could_not_place_is_shown_before_importing(cx: &mut TestAppContext) {
+    // The panel must not say the file was read completely while a rule it skipped
+    // could still decide where ssh goes.
+    let dir = TempDir::new("import-unmatched");
+    let config = dir.path().join("config");
+    std::fs::write(
+        &config,
+        "\
+Host *.corp
+    ProxyJump bastion
+
+Host web
+    HostName web.example.org
+    User deploy
+",
+    )
+    .expect("the test writes the configuration");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+    assert!(
+        cx.debug_bounds("hosts.import.limits").is_some(),
+        "the limits are on screen before anything is applied"
+    );
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let preview = view
+            .import_state()
+            .preview()
+            .expect("the preview is kept while the panel is open");
+        assert!(
+            preview.is_partial(),
+            "a proxy on a pattern no host matches is not a complete read"
+        );
+        assert_eq!(
+            preview.limits().unmatched_proxy().len(),
+            1,
+            "the skipped block is listed: {:?}",
+            preview.limits()
+        );
+        assert_eq!(preview.limits().unmatched_proxy()[0].keyword(), "*.corp");
+        assert_eq!(preview.limits().unmatched_proxy()[0].line(), 1);
+        assert_eq!(preview.importable_count(), 1);
+        assert!(view.book().hosts().is_empty(), "a preview writes nothing");
+    });
+}
 
 #[gpui::test]
 async fn the_import_panel_opens_on_the_platform_file_and_reads_a_named_one(
