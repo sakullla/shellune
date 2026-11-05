@@ -19,7 +19,12 @@ use gpui::{
 use crate::app::theme::{self, Metrics, palette, radius, spacing};
 
 /// What the field does with the text the user submitted.
-type SubmitHandler = Box<dyn Fn(String, &mut App) + 'static>;
+///
+/// The window comes with it because a submit usually replaces the field with
+/// whatever the text started, and moving keyboard focus needs the window. The
+/// answer says whether the text became something real: if it did, the field
+/// empties itself, so pressing Enter again does not repeat the same submit.
+type SubmitHandler = Box<dyn Fn(String, &mut Window, &mut App) -> bool + 'static>;
 
 /// A one-line text input.
 pub struct TextField {
@@ -55,7 +60,7 @@ impl TextField {
     }
 
     /// Called with the text when the user presses Enter.
-    pub fn on_submit(&mut self, submit: impl Fn(String, &mut App) + 'static) {
+    pub fn on_submit(&mut self, submit: impl Fn(String, &mut Window, &mut App) -> bool + 'static) {
         self.submit = Some(Box::new(submit));
     }
 
@@ -65,11 +70,16 @@ impl TextField {
         cx.notify();
     }
 
-    fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "enter" => {
-                if let Some(submit) = &self.submit {
-                    submit(self.text.clone(), cx);
+                let text = self.text.clone();
+                let consumed = match &self.submit {
+                    Some(submit) => submit(text, window, cx),
+                    None => false,
+                };
+                if consumed {
+                    self.clear(cx);
                 }
                 cx.stop_propagation();
             }

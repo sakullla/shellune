@@ -64,6 +64,17 @@ pub enum SessionFailure {
         /// The shell that was requested.
         shell: String,
     },
+    /// A local shell that had started stopped accepting input or output.
+    ///
+    /// Kept apart from the launch failures because the process really did start:
+    /// the reason is what the system said about the running session, and telling
+    /// the user to check the program path would be the wrong advice.
+    LocalShellIoFailed {
+        /// The shell that was running.
+        shell: String,
+        /// What the system said, kept verbatim so it can be acted on.
+        reason: String,
+    },
     /// The remote address refused or could not be reached.
     ConnectionRefused,
     /// The connection attempt timed out.
@@ -96,6 +107,12 @@ impl std::fmt::Display for SessionFailure {
                 write!(
                     formatter,
                     "the local shell '{shell}' could not be started because access was denied"
+                )
+            }
+            Self::LocalShellIoFailed { shell, reason } => {
+                write!(
+                    formatter,
+                    "the local shell '{shell}' stopped responding: {reason}"
                 )
             }
             Self::ConnectionRefused => formatter.write_str("the connection was refused"),
@@ -522,5 +539,16 @@ mod tests {
             SessionFailure::AuthenticationFailed.to_string(),
             "the server rejected the credentials"
         );
+        // A session that started and then failed has to say so: the launch text
+        // would tell the user to check a path that is fine.
+        let io = SessionFailure::LocalShellIoFailed {
+            shell: "pwsh".to_owned(),
+            reason: "the pipe has been ended".to_owned(),
+        };
+        assert_eq!(
+            io.to_string(),
+            "the local shell 'pwsh' stopped responding: the pipe has been ended"
+        );
+        assert!(!io.to_string().contains("could not be started"));
     }
 }

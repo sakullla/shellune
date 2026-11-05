@@ -73,6 +73,18 @@ impl ShelluneView {
         self.pane.as_ref()
     }
 
+    /// Whether the free-text shell path field is on screen.
+    #[cfg(test)]
+    pub fn custom_shell_open(&self) -> bool {
+        self.custom_shell_open
+    }
+
+    /// What the free-text shell path field holds.
+    #[cfg(test)]
+    pub fn shell_path_text(&self, cx: &gpui::App) -> String {
+        self.shell_path.read(cx).text().to_owned()
+    }
+
     /// The current workspace state.
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
@@ -130,8 +142,9 @@ impl ShelluneView {
     fn bind_shell_path(&mut self, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
         self.shell_path.update(cx, |field, _cx| {
-            field.on_submit(move |text, app| {
-                let _ = view.update(app, |view, cx| view.start_custom_shell(text, cx));
+            field.on_submit(move |text, window, app| {
+                view.update(app, |view, cx| view.start_custom_shell(text, window, cx))
+                    .unwrap_or(false)
             });
         });
     }
@@ -140,13 +153,27 @@ impl ShelluneView {
     ///
     /// The text is taken as written: a wrong path becomes a real launch failure,
     /// which is the only honest answer to a program that does not exist.
-    fn start_custom_shell(&mut self, program: String, cx: &mut Context<Self>) {
+    fn start_custom_shell(
+        &mut self,
+        program: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let program = program.trim().to_owned();
         if program.is_empty() {
-            return;
+            return false;
         }
         let shell = LocalShell::new(program.clone(), program);
-        self.start_shell(shell, None, cx);
+        self.start_shell(shell, Some(window), cx);
+        if self.pane.is_some() {
+            // The shell that started owns the keyboard, so what the user types next
+            // goes to it. The field closes and, because this returns true, empties:
+            // a second Return over the same path would start the shell again
+            // instead of reaching it.
+            self.custom_shell_open = false;
+            cx.notify();
+        }
+        self.pane.is_some()
     }
 
     /// Starts whichever shell the picker currently points at.

@@ -11,8 +11,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    Entity, IntoElement, Modifiers, MouseButton, Pixels, Render, ScrollDelta, ScrollWheelEvent,
-    Size, TestAppContext, VisualTestContext, div, point, px, size,
+    ClipboardItem, Entity, IntoElement, Modifiers, MouseButton, Pixels, Render, ScrollDelta,
+    ScrollWheelEvent, Size, TestAppContext, VisualTestContext, div, point, px, size,
 };
 use shellune_core::{
     HostConfig, LocalShell, Session, SessionKind, SessionState, Transfer, TransferDirection,
@@ -1072,6 +1072,38 @@ async fn a_mouse_selection_is_copied_when_it_is_released(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn a_click_in_the_terminal_leaves_the_clipboard_untouched(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello world", cx);
+
+    // What the user copied elsewhere, before clicking into the terminal to paste it.
+    cx.update(|_window, app| {
+        app.write_to_clipboard(ClipboardItem::new_string("copied elsewhere".to_owned()));
+    });
+
+    let viewport = bounds_of(cx, "terminal.viewport");
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    // Pressing and releasing on the same cell: moving the caret, not selecting text.
+    let target = point(
+        viewport.origin.x + px(cell.width * 0.5),
+        viewport.origin.y + px(cell.height * 0.5),
+    );
+    cx.simulate_mouse_down(target, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| app.read_from_clipboard().and_then(|item| item.text())),
+        Some("copied elsewhere".to_owned()),
+        "a click must not replace the clipboard with the one cell under the pointer"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        None,
+        "a click selects nothing, so there is nothing to copy"
+    );
+}
+
+#[gpui::test]
 async fn the_wheel_scrolls_back_through_the_history(cx: &mut TestAppContext) {
     let content = (0..60)
         .map(|line| format!("line {line}"))
@@ -1248,6 +1280,75 @@ async fn a_custom_shell_path_starts_exactly_what_was_typed(cx: &mut TestAppConte
             "the failure must name the program that was typed: {reason}"
         );
     });
+}
+
+#[gpui::test]
+async fn a_custom_shell_that_starts_owns_the_keyboard(cx: &mut TestAppContext) {
+    let shell = shellune_terminal::platform_default();
+    if !shellune_terminal::program_exists(shell.program()) {
+        return;
+    }
+    let mut workspace = Workspace::new();
+    workspace.set_shells(Vec::new());
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let bounds = bounds_of(cx, "shell.custom");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("shell.path").is_some(),
+        "the path field must open"
+    );
+
+    cx.simulate_input(shell.program());
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("the typed shell must start");
+    assert!(
+        cx.update(|_window, app| matches!(pane.read(app).state(), PaneState::Live)),
+        "the shell named in the field must really be running"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).custom_shell_open()),
+        "the field closes once its text became a session"
+    );
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "the keyboard must belong to the shell, not to the field that started it"
+    );
+
+    // What the user types next is shell input, and Return reaches the shell instead
+    // of starting the same program again.
+    cx.simulate_input("echo typed");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"echo typed\r".to_vec(),
+        "typing after the start must reach the shell"
+    );
+    assert_eq!(
+        cx.update(|_window, app| { view.read(app).workspace().local_sessions().count() }),
+        1,
+        "a second Return must not start the shell again"
+    );
+    // The field emptied itself, so reopening it cannot offer the same path again.
+    let bounds = bounds_of(cx, "shell.custom");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).shell_path_text(app)),
+        "",
+        "the field must not still hold the path that became a session"
+    );
 }
 
 #[gpui::test]

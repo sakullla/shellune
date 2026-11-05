@@ -93,12 +93,27 @@ impl Session {
         what: &str,
         mut predicate: impl FnMut(&Snapshot, &str) -> bool,
     ) -> String {
+        self.poll_until(what, |_session, snapshot, text| predicate(snapshot, text))
+    }
+
+    /// Polls the PTY until `step` says the screen is ready, then returns it.
+    ///
+    /// `step` gets the session as well as the screen, so a test can react to what
+    /// it read — send another key, or offer a line again — instead of sleeping a
+    /// guessed amount and hoping the shell was ready for it.
+    fn poll_until(
+        &mut self,
+        what: &str,
+        mut step: impl FnMut(&mut Self, &Snapshot, &str) -> bool,
+    ) -> String {
+        // A last-resort deadline so a broken terminal fails instead of hanging; the
+        // condition, not this number, decides when the wait is over.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             self.pump();
             let snapshot = self.core.snapshot();
             let text = snapshot.text().join("\n");
-            if predicate(&snapshot, &text) {
+            if step(self, &snapshot, &text) {
                 return text;
             }
             if Instant::now() > deadline {
@@ -440,14 +455,30 @@ fn sustained_output_can_be_interrupted_and_the_shell_stays_usable() {
     session.write(&[0x03]);
 
     // The shell has to come back and accept another command: the interruption must
-    // stop the program, not the session.
-    std::thread::sleep(Duration::from_millis(300));
-    if cfg!(windows) {
-        session.run("Write-Output 'after-interrupt'");
+    // stop the program, not the session. Nothing here waits a guessed amount of
+    // time: a line typed while the interrupted program has not stopped yet is
+    // swallowed by that program, so the same line is offered again on the polling
+    // loop and the screen decides when the shell took it.
+    //
+    // The marker is split across two literals in the command itself, because a
+    // terminal echoes what is typed: a literal marker would let the echo satisfy
+    // the wait before the command had run. Only real output contains it whole.
+    let command = if cfg!(windows) {
+        "Write-Output ('after' + '-interrupt')\r"
     } else {
-        session.run("echo after-interrupt");
-    }
-    let screen = session.wait_for("the shell to answer again", contains("after-interrupt"));
+        "echo 'after'-'interrupt'\r"
+    };
+    let mut next_offer = Instant::now();
+    let screen = session.poll_until("the shell to answer again", |session, _snapshot, text| {
+        if text.contains("after-interrupt") {
+            return true;
+        }
+        if Instant::now() >= next_offer {
+            session.write(command.as_bytes());
+            next_offer = Instant::now() + Duration::from_millis(200);
+        }
+        false
+    });
     assert!(
         screen.contains("after-interrupt"),
         "the shell did not recover from the interrupt:\n{screen}"

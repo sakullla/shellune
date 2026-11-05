@@ -75,7 +75,7 @@ pub fn monospace_family() -> &'static str {
 pub enum PaneState {
     /// The shell is running.
     Live,
-    /// The shell could not be started or could not be written to.
+    /// The shell could not be started, or stopped accepting input or output.
     Failed(SessionFailure),
     /// The shell exited.
     Exited {
@@ -128,6 +128,10 @@ pub struct TerminalPane {
     shell: LocalShell,
     state: PaneState,
     /// Bytes written to the shell, kept so what the user typed can be inspected.
+    ///
+    /// Only a test reads this back: keeping every byte the user ever typed would
+    /// grow for the life of the session, so a release build does not.
+    #[cfg(test)]
     sent: Vec<u8>,
     font_size: f32,
     cell: CellSize,
@@ -135,6 +139,12 @@ pub struct TerminalPane {
     viewport: Option<Bounds<Pixels>>,
     focus: FocusHandle,
     dragging: bool,
+    /// Cell the left button went down on, while a drag is in progress.
+    ///
+    /// It is what separates a click from a selection: a release on the cell the
+    /// button went down on selected nothing, and copying there would replace the
+    /// user's clipboard with a single character they never chose.
+    press: Option<(usize, usize)>,
     marked: Option<String>,
     last_copy: Option<String>,
     locale: Locale,
@@ -166,6 +176,7 @@ impl TerminalPane {
             source,
             shell,
             state,
+            #[cfg(test)]
             sent: Vec::new(),
             font_size,
             cell: CellSize::for_font_size(font_size),
@@ -173,6 +184,7 @@ impl TerminalPane {
             viewport: None,
             focus: cx.focus_handle(),
             dragging: false,
+            press: None,
             marked: None,
             last_copy: None,
             locale,
@@ -201,6 +213,7 @@ impl TerminalPane {
             source: None,
             shell,
             state: PaneState::Live,
+            #[cfg(test)]
             sent: Vec::new(),
             font_size,
             cell: CellSize::for_font_size(font_size),
@@ -208,6 +221,7 @@ impl TerminalPane {
             viewport: None,
             focus: cx.focus_handle(),
             dragging: false,
+            press: None,
             marked: None,
             last_copy: None,
             locale,
@@ -351,7 +365,9 @@ impl TerminalPane {
                 false
             }
             PtyEvent::ReadFailed(reason) => {
-                self.state = PaneState::Failed(SessionFailure::LocalShellLaunchFailed {
+                // The shell did start; what failed is reading it. Saying it "could
+                // not be started" would send the user to fix a launch that worked.
+                self.state = PaneState::Failed(SessionFailure::LocalShellIoFailed {
                     shell: self.shell.program().to_owned(),
                     reason,
                 });
@@ -375,12 +391,15 @@ impl TerminalPane {
         if bytes.is_empty() || !self.state.accepts_input() {
             return;
         }
+        // Only a test keeps a copy of the byte stream; a release build would grow
+        // it for the life of the session.
+        #[cfg(test)]
         self.sent.extend_from_slice(bytes);
         let Some(source) = self.source.as_mut() else {
             return;
         };
         if let Err(error) = source.write(bytes) {
-            self.state = PaneState::Failed(SessionFailure::LocalShellLaunchFailed {
+            self.state = PaneState::Failed(SessionFailure::LocalShellIoFailed {
                 shell: self.shell.program().to_owned(),
                 reason: error.to_string(),
             });
@@ -547,6 +566,7 @@ impl TerminalPane {
             return;
         };
         self.dragging = true;
+        self.press = Some((row, column));
         self.core
             .begin_selection(row, column, SelectionType::Simple);
         cx.notify();
@@ -568,12 +588,30 @@ impl TerminalPane {
             return;
         }
         self.dragging = false;
-        if let Some((row, column)) = self.cell_at(event.position) {
+        let released = self.cell_at(event.position);
+        if let Some((row, column)) = released {
             self.core.extend_selection(row, column);
         }
-        // Copying on release is what makes "select with the mouse, paste" work
-        // without a second step; the copy button stays for a repeat.
-        self.copy_selection(cx);
+        let press = self.press.take();
+        // A selection needs movement: pressing and releasing on the same cell is a
+        // click, and copying it would replace whatever the user had on the
+        // clipboard with one character they did not select. A release outside the
+        // grid counts as movement, because the pointer really did leave the cell
+        // the button went down on.
+        let moved = match (press, released) {
+            (Some(press), Some(released)) => press != released,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if moved {
+            // Copying on release is what makes "select with the mouse, paste" work
+            // without a second step; the copy button stays for a repeat.
+            self.copy_selection(cx);
+        } else {
+            // A click clears the selection instead of leaving a one-cell highlight
+            // that claims the user selected something.
+            self.core.clear_selection();
+        }
         cx.notify();
     }
 
