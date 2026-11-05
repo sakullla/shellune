@@ -18,7 +18,8 @@ use gpui::{
     ScrollWheelEvent, Size, TestAppContext, VisualTestContext, div, point, px, size,
 };
 use shellune_core::{
-    HostConfig, LocalShell, Session, SessionKind, SessionState, Transfer, TransferDirection,
+    EventTag, HostConfig, LocalShell, Session, SessionId, SessionKind, SessionState, Transfer,
+    TransferDirection,
 };
 use shellune_storage::{HostBook, HostEdit, HostKey, HostStore, TrustStore};
 use shellune_terminal::GridSize;
@@ -29,7 +30,7 @@ use crate::app::hosts::HostView;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
-use crate::app::terminal::{PaneState, TerminalPane};
+use crate::app::terminal::{PaneState, SourceEvent, TerminalPane};
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Tone, Zoom, palette,
 };
@@ -93,6 +94,73 @@ fn connected_local_session(title: &str) -> Session {
     session.begin_connecting().expect("a new session starts");
     session.connected().expect("a local session connects");
     session
+}
+
+// ---------------------------------------------------------------------------
+// The session list as a model (R7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_session_that_ended_can_be_restarted_but_a_live_one_cannot() {
+    let mut workspace = Workspace::new();
+    let mut ended = connected_local_session("first");
+    ended
+        .disconnected(shellune_core::SessionFailure::ProcessExited { code: Some(0) })
+        .expect("the shell ended");
+    let ended_id = ended.id();
+    let live = connected_local_session("second");
+    let live_id = live.id();
+    workspace.set_sessions_for_test(vec![ended, live]);
+
+    assert!(
+        workspace.session_reconnecting(ended_id),
+        "a session that ended starts another process"
+    );
+    assert_eq!(
+        workspace
+            .session(ended_id)
+            .map(|session| session.generation()),
+        Some(1),
+        "the reconnect is the second process of that session"
+    );
+    assert_eq!(
+        workspace
+            .session(ended_id)
+            .map(|session| session.state().clone()),
+        Some(SessionState::Connecting)
+    );
+    assert!(
+        !workspace.session_reconnecting(live_id),
+        "a live session is not restarted behind the user's back"
+    );
+    assert_eq!(
+        workspace
+            .session(live_id)
+            .map(|session| session.state().clone()),
+        Some(SessionState::Connected),
+        "the other session did not move"
+    );
+}
+
+#[test]
+fn forgetting_a_session_that_never_started_keeps_the_others() {
+    let mut workspace = Workspace::new();
+    let mut pending = Session::new(SessionKind::Local { shell: None }, "never ran");
+    pending.begin_connecting().expect("a new session starts");
+    let pending_id = pending.id();
+    let live = connected_local_session("running");
+    let live_id = live.id();
+    workspace.set_sessions_for_test(vec![pending, live]);
+
+    workspace.session_forgotten(pending_id);
+    assert!(workspace.session(pending_id).is_none());
+    assert_eq!(
+        workspace
+            .session(live_id)
+            .map(|session| session.state().clone()),
+        Some(SessionState::Connected),
+        "a shell that never ran must not take the running one with it"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +732,12 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             import_skipped,
             import_error_title,
             import_path_required,
+            session_kind_local,
+            session_kind_remote,
+            session_close,
+            session_reconnect,
+            session_reconnect_no_shell,
+            session_reconnect_missing_host,
         ]
     )
 }
@@ -1016,6 +1090,7 @@ fn pane_with<'a>(
     let pane = cx.new(|pane_cx| {
         TerminalPane::without_process(
             LocalShell::new("Test shell", "test-shell"),
+            shellune_core::EventTag::new(shellune_core::SessionId::new(), 0),
             GridSize::new(40, 10),
             shellune_terminal::DEFAULT_FONT_SIZE,
             Locale::English,
@@ -3302,4 +3377,766 @@ fn type_into_pane(cx: &mut VisualTestContext, pane: &Entity<TerminalPane>, text:
             pane.pump_once(cx);
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// Several sessions at once (R7)
+// ---------------------------------------------------------------------------
+
+/// Starts the shell the picker points at through the header action, the way a user
+/// does, and returns the session it opened.
+fn start_local_session(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+) -> Option<SessionId> {
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return None;
+    }
+    let bounds = bounds_of(cx, "header.primary");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|_window, app| view.read(app).active_session())
+}
+
+/// The state of one session, or None when the shell does not list it.
+fn session_state(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+) -> Option<SessionState> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .session(id)
+            .map(|session| session.state().clone())
+    })
+}
+
+/// Types into one terminal and returns every byte that session sent.
+fn sent_after_typing(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+    text: &str,
+) -> String {
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the session has a terminal");
+    type_into_pane(cx, &pane, text);
+    cx.update(|_window, app| String::from_utf8_lossy(pane.read(app).sent()).into_owned())
+}
+
+#[gpui::test]
+async fn two_local_sessions_open_at_once_and_switch_by_identity(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let Some(first) = start_local_session(cx, &view) else {
+        eprintln!("no shell on this machine, skipping");
+        return;
+    };
+    let Some(second) = start_local_session(cx, &view) else {
+        return;
+    };
+    assert_ne!(
+        first, second,
+        "a second start opens a second session, not the same one"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_sessions()),
+        vec![first, second],
+        "both sessions stay open, in the order they were started"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(second),
+        "the shell just started is the one on screen"
+    );
+
+    // Every open session has a tab, and both are really live.
+    assert!(cx.debug_bounds("session.tab.0").is_some());
+    assert!(cx.debug_bounds("session.tab.1").is_some());
+    assert_eq!(
+        session_state(cx, &view, first),
+        Some(SessionState::Connected)
+    );
+    assert_eq!(
+        session_state(cx, &view, second),
+        Some(SessionState::Connected),
+        "opening a second terminal must not end the first one"
+    );
+    assert!(
+        cx.debug_bounds("session.bar").is_some(),
+        "the selected session is described on screen"
+    );
+
+    // Input goes to the selected terminal and to no other.
+    let second_sent = sent_after_typing(cx, &view, second, "second-only");
+    assert!(second_sent.contains("second-only"));
+    let first_pane = cx
+        .update(|_window, app| view.read(app).pane_of(first).cloned())
+        .expect("the first terminal");
+    assert!(
+        cx.update(|_window, app| first_pane.read(app).sent().is_empty()),
+        "typing into one session reached another one"
+    );
+
+    // Switching by tab moves the selection and the keyboard with it.
+    click(cx, "session.tab.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(first)
+    );
+    let first_sent = sent_after_typing(cx, &view, first, "first-only");
+    assert!(first_sent.contains("first-only"));
+    assert!(
+        !first_sent.contains("second-only"),
+        "the terminals keep their own input: {first_sent:?}"
+    );
+}
+
+#[gpui::test]
+async fn closing_one_session_leaves_the_others_running(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let Some(first) = start_local_session(cx, &view) else {
+        return;
+    };
+    let Some(second) = start_local_session(cx, &view) else {
+        return;
+    };
+
+    click(cx, "session.tab.close.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_sessions()),
+        vec![second],
+        "only the closed session's terminal goes away"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(second),
+        "the remaining session takes over"
+    );
+    assert_eq!(
+        session_state(cx, &view, first),
+        Some(SessionState::Closed),
+        "a closed session is recorded as closed"
+    );
+    assert_eq!(
+        session_state(cx, &view, second),
+        Some(SessionState::Connected),
+        "and the other session keeps running"
+    );
+
+    // The surviving terminal still takes input.
+    let sent = sent_after_typing(cx, &view, second, "still-here");
+    assert!(sent.contains("still-here"), "{sent:?}");
+}
+
+#[gpui::test]
+async fn a_session_that_ended_reconnects_without_replaying_anything(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let Some(id) = start_local_session(cx, &view) else {
+        return;
+    };
+    let old_pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the terminal of the started shell");
+    let old_tag = cx.update(|_window, app| old_pane.read(app).tag());
+
+    // Leave the shell the way a user does, so the session really ends.
+    cx.simulate_input("exit");
+    cx.simulate_keystrokes("enter");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        cx.update(|_window, app| {
+            old_pane.update(app, |pane, cx| {
+                pane.pump_once(cx);
+            });
+        });
+        let ended =
+            cx.update(|_window, app| !matches!(old_pane.read(app).state(), PaneState::Live));
+        if ended {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shell never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    cx.run_until_parked();
+    assert!(
+        matches!(
+            session_state(cx, &view, id),
+            Some(SessionState::Disconnected(_))
+        ),
+        "an exited shell is listed as ended, not as running"
+    );
+
+    // The manual reconnect starts another process for the same session.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.reconnect_session(id, cx));
+    });
+    cx.run_until_parked();
+
+    let new_pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the reconnected session has a terminal");
+    assert_ne!(
+        new_pane.entity_id(),
+        old_pane.entity_id(),
+        "a reconnect is a new terminal, not the old one restarted"
+    );
+    assert_eq!(
+        session_state(cx, &view, id),
+        Some(SessionState::Connected),
+        "the new process is running"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(id)
+            .map(|session| session.generation())),
+        Some(1),
+        "the session counts its processes so late events can be told apart"
+    );
+    assert!(
+        cx.update(|_window, app| new_pane.read(app).sent().is_empty()),
+        "nothing typed into the old shell is sent to the new one"
+    );
+
+    // An event that belongs to the old process is dropped instead of being drawn into
+    // the terminal that replaced it.
+    let accepted = cx.update(|_window, app| {
+        new_pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                old_tag,
+                vec![SourceEvent::Data(b"stale-old-command\r\n".to_vec())],
+                cx,
+            )
+        })
+    });
+    assert!(
+        !accepted,
+        "an event of the previous process must be refused"
+    );
+    let screen = cx.update(|_window, app| new_pane.read(app).visible_text().join("\n"));
+    assert!(
+        !screen.contains("stale-old-command"),
+        "the old process output reached the new terminal: {screen:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_pending_connection_keeps_navigation_and_the_other_session_usable(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("multi-pending");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let workspace = Workspace::new();
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let Some(local) = start_local_session(cx, &view) else {
+        return;
+    };
+
+    // Start a connection that stays pending: the form opens, the attempt reports
+    // nothing yet.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
+    });
+    cx.run_until_parked();
+    let pending = cx
+        .update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .find(|session| session.kind().is_remote())
+                .map(|session| session.state().clone())
+        })
+        .expect("the attempt is listed as a session");
+    assert!(
+        pending.is_pending(),
+        "an attempt that has not answered is still connecting, got {pending:?}"
+    );
+
+    // The pending session has a tab of its own, so switching is possible before it is
+    // live.
+    assert!(
+        cx.debug_bounds("session.tab.1").is_some(),
+        "the connecting session is listed beside the local one"
+    );
+
+    // Navigation keeps working while the attempt waits.
+    click(cx, "nav.sessions");
+    assert_eq!(
+        destination_of(&view, cx),
+        Destination::Sessions,
+        "a pending connection does not pin the navigation"
+    );
+    click(cx, "nav.local");
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+
+    // The live session still answers, and the attempt is still being watched.
+    let sent = sent_after_typing(cx, &view, local, "while-connecting");
+    assert!(sent.contains("while-connecting"), "{sent:?}");
+    assert_eq!(
+        session_state(cx, &view, local),
+        Some(SessionState::Connected)
+    );
+    let watching = cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    assert!(watching, "the attempt is still being polled");
+}
+
+#[gpui::test]
+async fn a_dropped_remote_session_changes_only_its_own_state(cx: &mut TestAppContext) {
+    let dir = TempDir::new("multi-drop");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let workspace = Workspace::new();
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let Some(local) = start_local_session(cx, &view) else {
+        return;
+    };
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"remote ready\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let remote = cx
+        .update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .find(|session| {
+                    session.kind().is_remote() && matches!(session.state(), SessionState::Connected)
+                })
+                .map(|session| session.id())
+        })
+        .expect("the remote session is live");
+    let remote_pane = cx
+        .update(|_window, app| view.read(app).pane_of(remote).cloned())
+        .expect("the remote terminal exists");
+    let tag = cx.update(|_window, app| remote_pane.read(app).tag());
+
+    // An event addressed to another session is refused by this terminal.
+    let foreign = EventTag::new(local, 0);
+    let accepted = cx.update(|_window, app| {
+        remote_pane.update(app, |pane, cx| {
+            pane.adopt_events(foreign, vec![SourceEvent::Data(b"leaked\r\n".to_vec())], cx)
+        })
+    });
+    assert!(!accepted, "an event of another session must be refused");
+    let screen = cx.update(|_window, app| remote_pane.read(app).visible_text().join("\n"));
+    assert!(
+        !screen.contains("leaked"),
+        "output of another session was drawn: {screen:?}"
+    );
+
+    // The connection dropping changes the state of that session only.
+    let accepted = cx.update(|_window, app| {
+        remote_pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::Lost("the channel was closed".to_owned())],
+                cx,
+            )
+        })
+    });
+    assert!(accepted, "an event of this session is applied");
+    cx.run_until_parked();
+
+    assert!(
+        matches!(
+            session_state(cx, &view, remote),
+            Some(SessionState::Disconnected(_))
+        ),
+        "the dropped session says it was disconnected, got {:?}",
+        session_state(cx, &view, remote)
+    );
+    assert_eq!(
+        session_state(cx, &view, local),
+        Some(SessionState::Connected),
+        "the local session did not notice the remote one dropping"
+    );
+    let sent = sent_after_typing(cx, &view, local, "still-responsive");
+    assert!(
+        sent.contains("still-responsive"),
+        "the other session kept answering: {sent:?}"
+    );
+}
+
+#[gpui::test]
+async fn closing_every_tab_leaves_no_session_behind(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let Some(first) = start_local_session(cx, &view) else {
+        return;
+    };
+    let Some(second) = start_local_session(cx, &view) else {
+        return;
+    };
+
+    // Closing through the tabs is the user's path, and it is what has to leave the
+    // screen tidy: no strip, no tab, and both sessions recorded as closed.
+    click(cx, "session.tab.close.1");
+    click(cx, "session.tab.close.0");
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions())
+            .is_empty(),
+        "no terminal outlives its tab"
+    );
+    for id in [first, second] {
+        assert_eq!(session_state(cx, &view, id), Some(SessionState::Closed));
+    }
+    assert!(
+        cx.update(|_window, app| view.read(app).open_tabs())
+            .is_empty(),
+        "the tab strip goes away with the last session"
+    );
+}
+
+#[gpui::test]
+async fn two_remote_hosts_stay_open_side_by_side(cx: &mut TestAppContext) {
+    let dir = TempDir::new("multi-hosts");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.5", 22, "deploy", None),
+            stored_host("beta", "10.0.0.6", 22, "deploy", None),
+        ],
+    );
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    // Two hosts, two connections, each with the banner of its own server. The form is
+    // opened for each of them in turn, which is what the connect button does; the
+    // button itself is covered by the single-host tests.
+    let hosts = cx.update(|_window, app| view.read(app).workspace().hosts().items().to_vec());
+    assert_eq!(hosts.len(), 2);
+    for host in &hosts {
+        let banner = format!("{} ready", host.name());
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| view.open_remote(host, cx));
+        });
+        assert_eq!(
+            cx.update(|_window, app| view
+                .read(app)
+                .remote_state()
+                .map(|panel| panel.host().name().to_owned())),
+            Some(host.name().to_owned()),
+            "the form is for the host it was opened on"
+        );
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.script_remote_attempt(
+                    vec![
+                        shellune_ssh::RemoteEvent::Connected,
+                        shellune_ssh::RemoteEvent::Data(format!("{banner}\r\n$ ").into_bytes()),
+                    ],
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.pump_remote_once(cx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    let remotes: Vec<(SessionId, String)> = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .sessions()
+            .items()
+            .iter()
+            .filter(|session| session.kind().is_remote())
+            .map(|session| (session.id(), session.title().to_owned()))
+            .collect()
+    });
+    assert_eq!(remotes.len(), 2, "both connections stay open: {remotes:?}");
+    let titles: Vec<&str> = remotes.iter().map(|(_, title)| title.as_str()).collect();
+    assert!(
+        titles.contains(&"alpha") && titles.contains(&"beta"),
+        "each tab names the host it talks to: {titles:?}"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.1").is_some(),
+        "two remote sessions are two tabs"
+    );
+
+    // The two terminals are separate: each shows its own server's banner and none of
+    // the other's.
+    for (index, (id, title)) in remotes.iter().enumerate() {
+        let pane = cx
+            .update(|_window, app| view.read(app).pane_of(*id).cloned())
+            .expect("each remote session has its own terminal");
+        let screen = cx.update(|_window, app| pane.read(app).visible_text().join("\n"));
+        let own = format!("{title} ready");
+        let other = remotes
+            .iter()
+            .map(|(_, known)| format!("{known} ready"))
+            .find(|banner| *banner != own)
+            .expect("the other server's banner");
+        assert!(
+            screen.contains(&own),
+            "session {index} lost the screen of its own server: {screen:?}"
+        );
+        assert!(
+            !screen.contains(&other),
+            "session {index} shows the screen of the other server: {screen:?}"
+        );
+    }
+
+    // Switching between them moves the terminal on screen, not the connections.
+    let (first, _) = remotes[0].clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.activate(first, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(first)
+    );
+    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_sessions())
+            .len(),
+        2,
+        "switching does not close either session"
+    );
+}
+
+#[gpui::test]
+async fn a_remote_session_reconnects_through_the_form_without_replay(cx: &mut TestAppContext) {
+    let dir = TempDir::new("multi-remote-reconnect");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"first process\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .find(|session| session.kind().is_remote())
+                .map(|session| session.id())
+        })
+        .expect("the remote session exists");
+    let old_pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the remote terminal exists");
+    let tag = cx.update(|_window, app| old_pane.read(app).tag());
+
+    // The server hangs up.
+    cx.update(|_window, app| {
+        old_pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::Lost("the channel was closed".to_owned())],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(matches!(
+        session_state(cx, &view, id),
+        Some(SessionState::Disconnected(_))
+    ));
+
+    // Reconnecting a remote session needs credentials again, so the form comes back
+    // with everything that is not a secret; the session is not claimed as connecting
+    // before the form has started an attempt.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.reconnect_session(id, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).remote_state().is_some()),
+        "the connection form is open again"
+    );
+    assert!(matches!(
+        session_state(cx, &view, id),
+        Some(SessionState::Disconnected(_))
+    ));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![id],
+        "the tab keeps its place instead of becoming a second session"
+    );
+
+    // The new attempt reuses the record, so there is still one tab for this host.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"second process\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![id],
+        "the reconnect did not open a second tab"
+    );
+    let new_pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the reconnected session has a terminal");
+    assert_ne!(new_pane.entity_id(), old_pane.entity_id());
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connected));
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(id)
+            .map(|session| session.generation())),
+        Some(1)
+    );
+    assert!(
+        cx.update(|_window, app| new_pane.read(app).sent().is_empty()),
+        "nothing typed into the lost connection is replayed"
+    );
+    let screen = cx.update(|_window, app| new_pane.read(app).visible_text().join("\n"));
+    assert!(screen.contains("second process"), "{screen:?}");
+    assert!(
+        !screen.contains("first process"),
+        "the new terminal starts empty instead of replaying the old screen: {screen:?}"
+    );
+}
+
+#[gpui::test]
+async fn leaving_the_application_closes_every_session(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let Some(first) = start_local_session(cx, &view) else {
+        return;
+    };
+    let Some(second) = start_local_session(cx, &view) else {
+        return;
+    };
+
+    // This is the cleanup the window runs when it closes.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.close_all_sessions(cx));
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions())
+            .is_empty(),
+        "no terminal outlives the window"
+    );
+    for id in [first, second] {
+        assert_eq!(
+            session_state(cx, &view, id),
+            Some(SessionState::Closed),
+            "every session is closed when the application leaves"
+        );
+    }
 }

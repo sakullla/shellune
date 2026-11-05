@@ -26,7 +26,9 @@ pub use error::{AgentKind, SecretString, SecurityError};
 pub use fingerprint::sha256_fingerprint;
 pub use host::{DEFAULT_SSH_PORT, HostConfig, HostValidationError, Port};
 pub use ids::{HostId, SessionId, TransferId};
-pub use session::{Session, SessionFailure, SessionKind, SessionState, SessionTransitionError};
+pub use session::{
+    EventTag, Session, SessionFailure, SessionKind, SessionState, SessionTransitionError,
+};
 pub use shell::LocalShell;
 pub use task::{
     Transfer, TransferDirection, TransferEvent, TransferFailure, TransferState, TransferUpdate,

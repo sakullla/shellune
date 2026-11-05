@@ -230,10 +230,31 @@ impl SessionState {
         matches!(self, Self::Connected | Self::Disconnected(_))
     }
 
+    /// Whether the session is on its way to being live.
+    ///
+    /// Used to keep a tab honest while an attempt is in flight: a session that is
+    /// still connecting has neither a terminal nor a failure to report.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Connecting | Self::VerifyingHost | Self::Authenticating
+        )
+    }
+
     /// Whether no further transition can happen without a new session.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Disconnected(_) | Self::Failed(_) | Self::Closed)
+    }
+
+    /// Whether a session in this state can start another process.
+    ///
+    /// A session that is live, connecting or closed cannot: the first two already
+    /// own a process, and a closed session is final.
+    #[must_use]
+    pub fn can_reconnect(&self) -> bool {
+        matches!(self, Self::Disconnected(_) | Self::Failed(_))
     }
 
     /// Short label for tabs and status text.
@@ -248,6 +269,32 @@ impl SessionState {
             Self::Disconnected(_) => "Disconnected",
             Self::Failed(_) => "Failed",
             Self::Closed => "Closed",
+        }
+    }
+}
+
+/// Which process an event belongs to.
+///
+/// A [SessionId] alone is not enough: a session that was reconnected keeps its tab
+/// and its id, but the events of the process it used to run must not reach the new
+/// one. The generation is incremented by every reconnect, so a late event from the
+/// previous process carries an older generation and is dropped instead of being
+/// drawn as output of the new shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventTag {
+    /// The session the event is for.
+    pub session: SessionId,
+    /// Which process of that session produced it.
+    pub generation: u32,
+}
+
+impl EventTag {
+    /// The tag of one process of one session.
+    #[must_use]
+    pub fn new(session: SessionId, generation: u32) -> Self {
+        Self {
+            session,
+            generation,
         }
     }
 }
@@ -275,6 +322,13 @@ pub struct Session {
     kind: SessionKind,
     title: String,
     state: SessionState,
+    /// How many processes this session has run.
+    ///
+    /// Zero for the first one and incremented by every reconnect, which is what
+    /// separates the events of a closed process from the events of the one that
+    /// replaced it.
+    #[serde(default)]
+    generation: u32,
 }
 
 impl Session {
@@ -298,6 +352,7 @@ impl Session {
             kind,
             title,
             state: SessionState::Idle,
+            generation: 0,
         }
     }
 
@@ -323,6 +378,30 @@ impl Session {
     #[must_use]
     pub fn state(&self) -> &SessionState {
         &self.state
+    }
+
+    /// Which process of this session is running, or last ran.
+    #[must_use]
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The tag every event of the current process carries.
+    ///
+    /// Identical for every event of one process, so a caller that hands events to a
+    /// pane can drop the ones that belong to a process this session no longer runs.
+    #[must_use]
+    pub fn tag(&self) -> EventTag {
+        EventTag::new(self.id, self.generation)
+    }
+
+    /// Whether an event tagged with `generation` still belongs to this session.
+    ///
+    /// A closed session accepts nothing: its process was ended on purpose, so an
+    /// event that arrives afterwards describes something the user already dismissed.
+    #[must_use]
+    pub fn accepts_event(&self, generation: u32) -> bool {
+        !matches!(self.state, SessionState::Closed) && generation == self.generation
     }
 
     fn advance(
@@ -418,6 +497,35 @@ impl Session {
                 SessionState::Authenticating,
             ],
         )
+    }
+
+    /// Starts another process for a session that ended.
+    ///
+    /// This is the manual reconnect: it is refused for a session that is still live,
+    /// still connecting, or closed, so the caller cannot restart a shell that was
+    /// never asked to restart. The generation moves on in the same step, which is
+    /// what makes the previous process' late events unwelcome from here on.
+    ///
+    /// Nothing is replayed: the new process starts with an empty terminal, and the
+    /// caller is responsible for not resending what was typed into the old one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [SessionTransitionError::Illegal] when the session did not end, and
+    /// [SessionTransitionError::AlreadyClosed] when it was closed.
+    pub fn begin_reconnect(&mut self) -> Result<(), SessionTransitionError> {
+        if matches!(self.state, SessionState::Closed) {
+            return Err(SessionTransitionError::AlreadyClosed);
+        }
+        if !self.state.can_reconnect() {
+            return Err(SessionTransitionError::Illegal {
+                from: self.state.label(),
+                to: SessionState::Connecting.label(),
+            });
+        }
+        self.state = SessionState::Connecting;
+        self.generation += 1;
+        Ok(())
     }
 
     /// Closes the session from any state that has not ended yet.

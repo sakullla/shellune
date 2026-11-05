@@ -16,7 +16,8 @@ use gpui::{
     Window, div, px,
 };
 use shellune_core::{
-    HostConfig, HostId, LocalShell, Session, SessionFailure, SessionId, SessionState, Transfer,
+    EventTag, HostConfig, HostId, LocalShell, Session, SessionFailure, SessionId, SessionKind,
+    SessionState, Transfer,
 };
 use shellune_ssh::{ConnectRequest, PtySize, RemoteEvent, RemoteSession};
 use shellune_storage::{
@@ -44,15 +45,51 @@ use crate::app::workspace::{
 };
 use crate::app::{components, theme::radius};
 
-/// Where the terminal on screen comes from.
+/// Where a terminal comes from.
 ///
-/// One pane exists in this step, so the shell has to know whether the local
-/// destination or the host destination owns it: showing a remote terminal under
-/// "Local shells" would mislabel a server session.
+/// A session keeps its kind for its whole life, and the destinations use it to decide
+/// which of them can show the terminal: a server session under "Local shells" would
+/// mislabel what the user is looking at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaneKind {
     Local,
     Remote,
+}
+
+impl PaneKind {
+    /// The kind of terminal a session runs.
+    fn of(kind: &SessionKind) -> Self {
+        if kind.is_remote() {
+            Self::Remote
+        } else {
+            Self::Local
+        }
+    }
+}
+
+/// One terminal and the session it shows.
+///
+/// The pair is the unit of everything multi-session: an event, a close or a reconnect
+/// names a session, and the entry that carries that session is the only one touched.
+struct OpenPane {
+    /// Which session process the terminal shows.
+    tag: EventTag,
+    /// The terminal itself.
+    pane: Entity<TerminalPane>,
+}
+
+/// A connection attempt the open form is watching.
+///
+/// One attempt at a time: the form holds the credentials of one host, so a second
+/// attempt would need a second form. Live sessions are not limited by this — they keep
+/// running, and keep answering, while another host is being connected to.
+struct Attempt {
+    /// The session record the attempt owns.
+    id: SessionId,
+    /// The transport, until it becomes a terminal.
+    session: RemoteSession,
+    /// Whether a poll loop is already watching it.
+    watching: bool,
 }
 
 /// How often the shell looks for events from a connecting remote session.
@@ -72,11 +109,18 @@ pub struct ShelluneView {
     workspace: Workspace,
     root_focus: FocusHandle,
     destination_focus: Vec<FocusHandle>,
-    /// The terminal this step shows; multi-session arrives later.
-    pane: Option<Entity<TerminalPane>>,
-    pane_session: Option<SessionId>,
-    /// Whether that terminal runs locally or on a server.
-    pane_kind: PaneKind,
+    /// Every open terminal, in the order its session was opened.
+    ///
+    /// Sessions are kept apart by identity, never by position: nothing here reaches
+    /// for "the current terminal" to decide where an event belongs.
+    panes: Vec<OpenPane>,
+    /// The session whose terminal is on screen.
+    active: Option<SessionId>,
+    /// Why the last local start failed, when it did.
+    ///
+    /// Kept beside the sessions instead of replacing them: a shell path that did not
+    /// start says nothing about the terminals that are already running.
+    local_error: Option<String>,
     shell_path: Entity<TextField>,
     custom_shell_open: bool,
     /// Where the saved hosts live.
@@ -95,11 +139,12 @@ pub struct ShelluneView {
     /// The remote connection form, present while a host is being connected to.
     remote: Option<RemotePanel>,
     /// The attempt in flight, before it becomes a terminal.
-    remote_session: Option<RemoteSession>,
-    /// The session record the attempt owns, once one exists.
-    remote_session_id: Option<SessionId>,
-    /// Whether a poll loop is already watching the attempt.
-    remote_watching: bool,
+    attempt: Option<Attempt>,
+    /// The session the open form belongs to once it is live.
+    form_session: Option<SessionId>,
+    /// The ended session a new attempt restarts, when the form was opened by a
+    /// reconnect instead of by a host row.
+    reconnect: Option<SessionId>,
     /// The credentials fields, created once and reused per attempt.
     remote_fields: RemoteFields,
     /// The accepted server identities.
@@ -196,9 +241,9 @@ impl ShelluneView {
             workspace,
             root_focus: cx.focus_handle(),
             destination_focus: Destination::ALL.iter().map(|_| cx.focus_handle()).collect(),
-            pane: None,
-            pane_session: None,
-            pane_kind: PaneKind::Local,
+            panes: Vec::new(),
+            active: None,
+            local_error: None,
             shell_path,
             custom_shell_open: false,
             store,
@@ -209,9 +254,9 @@ impl ShelluneView {
             import: ImportPanel::new(),
             import_path: None,
             remote: None,
-            remote_session: None,
-            remote_session_id: None,
-            remote_watching: false,
+            attempt: None,
+            form_session: None,
+            reconnect: None,
             remote_fields: RemoteFields {
                 password,
                 key_path,
@@ -223,12 +268,26 @@ impl ShelluneView {
             #[cfg(test)]
             scripted: None,
         };
+        view.bind_cleanup(cx);
         view.bind_shell_path(cx);
         view.bind_host_search(cx);
         view.bind_remote_fields(cx);
         view.restore_hosts(cx);
         view.restore_trust();
         view
+    }
+
+    /// Ends every session when the window that shows them closes (R7).
+    ///
+    /// Closing the window is the end of this application, so the shells and the
+    /// connection threads it started must not outlive it. Each source is shut down
+    /// through its own session, and nothing outside this shell is touched.
+    fn bind_cleanup(&mut self, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        cx.on_window_closed(move |app| {
+            let _ = view.update(app, |view, cx| view.close_all_sessions(cx));
+        })
+        .detach();
     }
 
     /// Reads the accepted server identities, or reports that they could not be read.
@@ -293,10 +352,271 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// The terminal currently shown, if one was started.
+    /// The terminal on screen, if the selected session has one.
+    ///
+    /// This is the terminal the user is looking at, not "the only one": several
+    /// sessions can be open, and the ones that are not selected keep their processes
+    /// and their screens.
     #[cfg(test)]
     pub fn pane(&self) -> Option<&Entity<TerminalPane>> {
-        self.pane.as_ref()
+        self.active_pane()
+    }
+
+    /// The session whose terminal is on screen.
+    #[cfg(test)]
+    #[must_use]
+    pub fn active_session(&self) -> Option<SessionId> {
+        self.active
+    }
+
+    /// The sessions that have a terminal open, in the order they were opened.
+    #[must_use]
+    pub fn open_sessions(&self) -> Vec<SessionId> {
+        self.panes.iter().map(|open| open.tag.session).collect()
+    }
+
+    /// The terminal of one session, whether or not it is on screen.
+    #[cfg(test)]
+    #[must_use]
+    pub fn pane_of(&self, id: SessionId) -> Option<&Entity<TerminalPane>> {
+        self.pane_for(id)
+    }
+
+    /// The sessions the tab strip shows, in the order they were opened.
+    ///
+    /// Every session that is not closed has a tab: one that is still connecting has no
+    /// terminal yet and still needs one, because the tab is the only place that reports
+    /// what the attempt is doing. A closed session is over and has none.
+    fn tab_sessions(&self) -> Vec<SessionId> {
+        self.workspace
+            .sessions()
+            .items()
+            .iter()
+            .filter(|session| !matches!(session.state(), SessionState::Closed))
+            .map(Session::id)
+            .collect()
+    }
+
+    /// The sessions the tab strip would draw, for the tests that check what is left
+    /// after a close.
+    ///
+    /// Read instead of the rendered bounds on purpose: the test window keeps the debug
+    /// bounds of every frame it has drawn, so an element that disappeared cannot be
+    /// proven gone that way.
+    #[cfg(test)]
+    pub fn open_tabs(&self) -> Vec<SessionId> {
+        self.tab_sessions()
+    }
+
+    fn pane_for(&self, id: SessionId) -> Option<&Entity<TerminalPane>> {
+        self.panes
+            .iter()
+            .find(|open| open.tag.session == id)
+            .map(|open| &open.pane)
+    }
+
+    fn active_pane(&self) -> Option<&Entity<TerminalPane>> {
+        self.active.and_then(|id| self.pane_for(id))
+    }
+
+    /// Which kind of terminal the selected session runs.
+    fn active_kind(&self) -> Option<PaneKind> {
+        let id = self.active?;
+        let session = self.workspace.session(id)?;
+        Some(PaneKind::of(session.kind()))
+    }
+
+    fn kind_of(&self, id: SessionId) -> Option<PaneKind> {
+        self.workspace
+            .session(id)
+            .map(|session| PaneKind::of(session.kind()))
+    }
+
+    /// Takes the keyboard to the terminal of one session, when a window has one.
+    fn focus_pane(&self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_for(id) else {
+            return;
+        };
+        let handle = pane.read(cx).focus_handle().clone();
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
+        }
+    }
+
+    /// Adds a terminal for a session that just started and shows it.
+    fn push_pane(&mut self, tag: EventTag, pane: Entity<TerminalPane>, cx: &mut Context<Self>) {
+        // The pane reports what its process does; the entry is observed so the session
+        // list repeats the truth about that one session.
+        cx.observe(&pane, |view, pane, cx| view.sync_pane(pane, cx))
+            .detach();
+        self.panes.push(OpenPane { tag, pane });
+        self.active = Some(tag.session);
+        self.focus_pane(tag.session, cx);
+        cx.notify();
+    }
+
+    /// Ends the process of one session and drops its terminal.
+    ///
+    /// Only that session is touched: every other terminal keeps its process and its
+    /// screen, which is what makes closing one tab safe while the rest run.
+    fn drop_pane(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.panes.iter().position(|open| open.tag.session == id) else {
+            return false;
+        };
+        let open = self.panes.remove(index);
+        open.pane.update(cx, |pane, cx| pane.close(cx));
+        if self.active == Some(id) {
+            // The next tab takes over, or the previous one when this was the last: a
+            // shell never ends up with no terminal selected while one is still open.
+            self.active = self
+                .panes
+                .get(index)
+                .or_else(|| self.panes.last())
+                .map(|open| open.tag.session);
+            if let Some(next) = self.active {
+                self.focus_pane(next, cx);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Shows the terminal of one session, from wherever the user is (R7).
+    pub fn activate(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        // Only a session with a terminal can be shown: an attempt that is still
+        // connecting has nothing to draw, and a closed session is over. Selecting its
+        // tab therefore leaves the terminal on screen untouched.
+        if self.pane_for(id).is_none() {
+            return;
+        }
+        let Some(kind) = self.kind_of(id) else {
+            return;
+        };
+        self.active = Some(id);
+        // A terminal is only visible in a destination that lists its kind, so selecting
+        // one takes the user to that destination rather than leaving them on a page that
+        // cannot show what they just chose.
+        self.workspace.select(match kind {
+            PaneKind::Local => Destination::LocalShells,
+            PaneKind::Remote => Destination::Sessions,
+        });
+        self.focus_pane(id, cx);
+        cx.notify();
+    }
+
+    /// Closes one session: its process, its terminal and its tab (R7).
+    ///
+    /// Nothing else is closed. An attempt that has not become a terminal yet is ended
+    /// the same way, so a tab can be closed while its connection is still being made,
+    /// and the other sessions keep answering.
+    pub fn close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.id == id)
+            && let Some(mut attempt) = self.attempt.take()
+        {
+            attempt.session.close();
+        }
+        self.drop_pane(id, cx);
+        self.workspace.session_closed(id);
+        // A form that was showing this session can no longer be live: it goes away with
+        // the session it belonged to, and takes the secrets it held with it.
+        if self.form_session == Some(id) {
+            self.form_session = None;
+            if let Some(panel) = self.remote.as_mut() {
+                panel.clear_secrets();
+            }
+            self.remote = None;
+        }
+        if self.reconnect == Some(id) {
+            self.reconnect = None;
+        }
+        cx.notify();
+    }
+
+    /// Closes every session, which is what leaving the application does (R7).
+    ///
+    /// Each source is shut down through its own session, so the processes and the
+    /// connection threads end with the window instead of outliving it.
+    pub fn close_all_sessions(&mut self, cx: &mut Context<Self>) {
+        let ids = self.open_sessions();
+        for id in ids {
+            self.close_session(id, cx);
+        }
+        if let Some(mut attempt) = self.attempt.take() {
+            attempt.session.close();
+            self.workspace.session_closed(attempt.id);
+        }
+        self.remote = None;
+        self.form_session = None;
+        self.reconnect = None;
+    }
+
+    /// Starts another process for a session that ended (R7).
+    ///
+    /// The tab, its name and its target stay; the process, the terminal and the event
+    /// generation are new. Nothing typed into the old process is sent again: the new
+    /// terminal starts empty and only what the user types next reaches the new shell.
+    pub fn reconnect_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.workspace.session(id) else {
+            return;
+        };
+        if !session.state().can_reconnect() {
+            return;
+        }
+        let kind = session.kind().clone();
+        match kind {
+            SessionKind::Local { shell } => {
+                let Some(program) = shell else {
+                    let reason = self.strings().session_reconnect_no_shell.to_owned();
+                    self.refuse_reconnect(id, reason, cx);
+                    return;
+                };
+                // The old terminal is over: its process is gone, and the generation
+                // moves on so a late event from it can no longer reach the terminal
+                // that replaces it.
+                self.drop_pane(id, cx);
+                if !self.workspace.session_reconnecting(id) {
+                    return;
+                }
+                let name = self
+                    .workspace
+                    .shells()
+                    .iter()
+                    .find(|known| known.program() == program)
+                    .map_or_else(|| program.clone(), |known| known.name().to_owned());
+                self.start_local_pane(id, LocalShell::new(name, program), cx);
+            }
+            SessionKind::Remote { host } => {
+                let Some(host) = self.book.host(host).cloned() else {
+                    let reason = self.strings().session_reconnect_missing_host.to_owned();
+                    self.refuse_reconnect(id, reason, cx);
+                    return;
+                };
+                // A remote session needs credentials again: the password and the
+                // passphrase were handed to the previous attempt once and are gone. The
+                // form therefore opens with everything that is not a secret already
+                // filled in, and the attempt it starts reuses this session's id.
+                //
+                // Nothing is connecting yet, so the record keeps the reason it ended
+                // until the form really starts a new attempt: a tab that said
+                // "connecting" over an empty form would claim a connection nobody made.
+                self.drop_pane(id, cx);
+                self.reconnect = Some(id);
+                self.form_session = Some(id);
+                self.remote = Some(RemotePanel::new(&host));
+                self.sync_remote_fields(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Records that a reconnect could not start, and why.
+    fn refuse_reconnect(&mut self, id: SessionId, reason: String, cx: &mut Context<Self>) {
+        self.workspace
+            .session_failed(id, SessionFailure::ConnectionFailed { reason });
+        cx.notify();
     }
 
     /// Whether the free-text shell path field is on screen.
@@ -787,10 +1107,18 @@ impl ShelluneView {
     }
 
     /// Opens the connection form for one saved host.
+    ///
+    /// One form, one attempt: opening the form for another host ends the attempt that
+    /// was still running, and records it as closed rather than leaving a tab that claims
+    /// a connection nobody is watching any more.
     pub(crate) fn open_remote(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        if let Some(mut attempt) = self.attempt.take() {
+            attempt.session.close();
+            self.workspace.session_closed(attempt.id);
+        }
+        self.reconnect = None;
+        self.form_session = None;
         self.remote = Some(RemotePanel::new(host));
-        self.remote_session = None;
-        self.remote_session_id = None;
         self.sync_remote_fields(cx);
         cx.notify();
     }
@@ -848,33 +1176,56 @@ impl ShelluneView {
                 return;
             }
         };
-        // The record is created before the transport starts, so a host that never
-        // answers is listed as a session that did not open.
-        let session = self.workspace.register_remote_session(&host);
-        let id = session.id();
-        self.remote_session_id = Some(id);
+        // A reconnected session keeps its record: it is already `Connecting`, and a
+        // second record would leave the user with two tabs for one host.
+        let id = match self.reconnect.take() {
+            Some(id) => {
+                // The record is the one that ended; the reconnect is what moves it on
+                // to its next process.
+                if !self.workspace.session_reconnecting(id) {
+                    return;
+                }
+                id
+            }
+            None => {
+                // The record is created before the transport starts, so a host that
+                // never answers is listed as a session that did not open.
+                let session = self.workspace.register_remote_session(&host);
+                session.id()
+            }
+        };
 
         let known = remote::known_host_key(&self.trust_book, &host);
         let size = PtySize::new(100, 30);
         panel.set_status(RemoteStatus::Connecting);
-        self.remote_session = Some(RemoteSession::connect(ConnectRequest::new(
-            host.address(),
-            host.port().get(),
-            host.user(),
-            auth,
-            size,
-            known,
-        )));
+        // The session the open form belongs to, whether it is still connecting or
+        // already live: an answer to a trust question and a close both need it.
+        self.form_session = Some(id);
+        self.attempt = Some(Attempt {
+            id,
+            session: RemoteSession::connect(ConnectRequest::new(
+                host.address(),
+                host.port().get(),
+                host.user(),
+                auth,
+                size,
+                known,
+            )),
+            watching: false,
+        });
         self.watch_remote(cx);
         cx.notify();
     }
 
     /// Polls the attempt until it becomes a terminal or fails.
     fn watch_remote(&mut self, cx: &mut Context<Self>) {
-        if self.remote_watching || self.remote_session.is_none() {
-            return;
+        match self.attempt.as_ref() {
+            Some(attempt) if !attempt.watching => {}
+            _ => return,
         }
-        self.remote_watching = true;
+        if let Some(attempt) = self.attempt.as_mut() {
+            attempt.watching = true;
+        }
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(REMOTE_POLL_INTERVAL).await;
@@ -896,37 +1247,27 @@ impl ShelluneView {
     /// terminal once it exists, because the channel has already given those events up
     /// and there is nothing to read them from later.
     fn poll_remote(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(session) = self.remote_session.as_mut() else {
-            self.remote_watching = false;
+        let Some(id) = self.attempt.as_ref().map(|attempt| attempt.id) else {
             return false;
         };
-        let events = session.drain();
+        let events = match self.attempt.as_mut() {
+            Some(attempt) => attempt.session.drain(),
+            None => return false,
+        };
         let mut pending: Vec<SourceEvent> = Vec::new();
+        let mut prompt = None;
         let mut connected = false;
+        let mut failed = None;
         for event in events {
             match event {
-                RemoteEvent::HostKeyPrompt(prompt) => {
+                RemoteEvent::HostKeyPrompt(asked) => {
                     // Once the terminal is live the identity is settled, so a prompt
                     // arriving behind it is not a question the user can still answer.
-                    if connected {
-                        continue;
-                    }
-                    if let Some(panel) = self.remote.as_mut() {
-                        panel.set_status(RemoteStatus::VerifyingHost(prompt));
-                    }
-                    cx.notify();
-                }
-                RemoteEvent::Connected => {
-                    if connected {
-                        continue;
-                    }
-                    connected = true;
-                    let session = self.remote_session.take();
-                    self.remote_watching = false;
-                    if let Some(session) = session {
-                        self.on_remote_connected(session, cx);
+                    if !connected {
+                        prompt = Some(asked);
                     }
                 }
+                RemoteEvent::Connected => connected = true,
                 RemoteEvent::Failed(error) => {
                     if connected {
                         // The transport failed in the same batch that opened the
@@ -935,10 +1276,7 @@ impl ShelluneView {
                         pending.push(SourceEvent::Lost(error.to_string()));
                         continue;
                     }
-                    self.remote_session = None;
-                    self.remote_watching = false;
-                    self.on_remote_failed(&error, cx);
-                    return false;
+                    failed = Some(error);
                 }
                 RemoteEvent::Data(_) | RemoteEvent::Exited { .. } => {
                     if !connected {
@@ -954,62 +1292,80 @@ impl ShelluneView {
             }
         }
 
+        if let Some(prompt) = prompt {
+            if let Some(panel) = self.remote.as_mut() {
+                panel.set_status(RemoteStatus::VerifyingHost(prompt));
+            }
+            cx.notify();
+        }
+        if let Some(error) = failed {
+            if let Some(mut attempt) = self.attempt.take() {
+                attempt.session.close();
+            }
+            self.on_remote_failed(id, &error, cx);
+            return false;
+        }
         if !connected {
             return true;
         }
-        if let Some(pane) = self.pane.clone() {
-            pane.update(cx, |pane, cx| pane.adopt_events(pending, cx));
-        }
+        let Some(attempt) = self.attempt.take() else {
+            return false;
+        };
+        self.on_remote_connected(id, attempt.session, pending, cx);
         false
     }
 
-    /// Turns a session that reached the remote shell into the terminal pane.
-    fn on_remote_connected(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
-        let Some(panel) = self.remote.as_ref() else {
+    /// Turns a session that reached the remote shell into a terminal of its own.
+    fn on_remote_connected(
+        &mut self,
+        id: SessionId,
+        session: RemoteSession,
+        pending: Vec<SourceEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) else {
+            // The form was closed while the attempt was still being made: there is
+            // nothing left that could show this terminal, so the session is not claimed
+            // as open.
+            self.workspace.session_closed(id);
             return;
         };
-        let host = panel.host().clone();
+        let Some(tag) = self.workspace.session(id).map(|session| session.tag()) else {
+            return;
+        };
         let target = host.target();
         let grid = GridSize::initial();
         let font_size = self.workspace.local_font_size();
         let locale = self.workspace.locale();
         let pane = cx.new(|pane_cx| {
-            TerminalPane::start_remote(session, target, grid, font_size, locale, pane_cx)
+            TerminalPane::start_remote(session, tag, target, grid, font_size, locale, pane_cx)
         });
-        // The terminal takes the keyboard as soon as it is live, so what the user
-        // types next reaches the server instead of the form that started it.
-        if let Some(window) = cx.active_window() {
-            let handle = pane.read(cx).focus_handle().clone();
-            let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
-        }
-        let id = self.remote_session_id;
-        if let Some(id) = id {
-            self.workspace.session_verified_and_authenticated(id);
-            self.workspace.session_connected(id);
-            self.pane_session = Some(id);
-        }
-        cx.observe(&pane, |view, pane, cx| view.sync_pane(pane, cx))
-            .detach();
-        self.pane = Some(pane);
-        self.pane_kind = PaneKind::Remote;
+        // The batch the window drained before the pane existed belongs to this process,
+        // and reaches the grid only because the tag matches.
+        pane.update(cx, |pane, cx| pane.adopt_events(tag, pending, cx));
+        self.workspace.session_verified_and_authenticated(id);
+        self.workspace.session_connected(id);
+        self.form_session = Some(id);
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Live);
         }
         // The recent view only ever shows hosts that really answered.
         self.record_host_connection(host.id(), remote::now_unix(), cx);
-        cx.notify();
+        self.push_pane(tag, pane, cx);
     }
 
     /// Records an attempt that did not open, in both the form and the session list.
-    fn on_remote_failed(&mut self, error: &shellune_ssh::ConnectError, cx: &mut Context<Self>) {
+    fn on_remote_failed(
+        &mut self,
+        id: SessionId,
+        error: &shellune_ssh::ConnectError,
+        cx: &mut Context<Self>,
+    ) {
         let failure = RemoteFailure::from_error(error);
         if let Some(panel) = self.remote.as_mut() {
             panel.fail(failure);
         }
-        if let Some(id) = self.remote_session_id.take() {
-            self.workspace.session_failed(id, error.session_failure());
-            self.pane_session = None;
-        }
+        self.workspace.session_failed(id, error.session_failure());
         cx.notify();
     }
 
@@ -1028,12 +1384,16 @@ impl ShelluneView {
         let Some(prompt) = panel.status().prompt().cloned() else {
             return;
         };
+        let Some(id) = self.form_session else {
+            // Nothing is waiting for an answer, so no answer is recorded.
+            return;
+        };
         let strings = self.workspace.strings();
         let now = remote::now_unix();
 
         if !accept {
-            if let Some(session) = self.remote_session.as_mut() {
-                session.answer_host_key(false);
+            if let Some(attempt) = self.attempt.as_mut() {
+                attempt.session.answer_host_key(false);
             }
             if let Some(panel) = self.remote.as_mut() {
                 panel.fail(RemoteFailure::new(
@@ -1042,10 +1402,8 @@ impl ShelluneView {
                     false,
                 ));
             }
-            if let Some(id) = self.remote_session_id.take() {
-                self.workspace
-                    .session_failed(id, SessionFailure::HostKeyRejected);
-            }
+            self.workspace
+                .session_failed(id, SessionFailure::HostKeyRejected);
             cx.notify();
             return;
         }
@@ -1054,6 +1412,7 @@ impl ShelluneView {
         if let Err(error) = remote::accept_prompted_identity(&mut self.trust_book, &prompt, now) {
             self.trust_book = previous;
             self.refuse_with(
+                id,
                 RemoteFailure::new(error.to_string(), strings.remote_close, false),
                 cx,
             );
@@ -1062,6 +1421,7 @@ impl ShelluneView {
         if let Err(error) = self.trust.save(&self.trust_book) {
             self.trust_book = previous;
             self.refuse_with(
+                id,
                 RemoteFailure::new(error.to_string(), strings.remote_close, false),
                 cx,
             );
@@ -1072,16 +1432,17 @@ impl ShelluneView {
         // closed, a server that hung up) cannot be told to accept anything, so the
         // record is taken back rather than left claiming a decision that nothing used.
         let delivered = self
-            .remote_session
+            .attempt
             .as_mut()
-            .is_some_and(|session| session.answer_host_key(true));
+            .is_some_and(|attempt| attempt.session.answer_host_key(true));
         if !delivered {
             // The file gets the book that was there before this answer, so nothing
             // the retracted acceptance added survives a restart.
             self.trust_book = previous;
             let _ = self.trust.save(&self.trust_book);
-            self.remote_session = None;
-            self.remote_watching = false;
+            if let Some(mut attempt) = self.attempt.take() {
+                attempt.session.close();
+            }
             if let Some(panel) = self.remote.as_mut() {
                 panel.fail(RemoteFailure::new(
                     strings.trust_undelivered_note,
@@ -1089,16 +1450,14 @@ impl ShelluneView {
                     true,
                 ));
             }
-            if let Some(id) = self.remote_session_id.take() {
-                // The attempt ended before the decision could reach it, which is not
-                // a refusal of the identity: the record says the session never opened.
-                self.workspace.session_failed(
-                    id,
-                    SessionFailure::ConnectionFailed {
-                        reason: strings.trust_undelivered_note.to_owned(),
-                    },
-                );
-            }
+            // The attempt ended before the decision could reach it, which is not a
+            // refusal of the identity: the record says the session never opened.
+            self.workspace.session_failed(
+                id,
+                SessionFailure::ConnectionFailed {
+                    reason: strings.trust_undelivered_note.to_owned(),
+                },
+            );
             cx.notify();
             return;
         }
@@ -1109,19 +1468,18 @@ impl ShelluneView {
     }
 
     /// Ends an attempt because the identity could not be recorded.
-    fn refuse_with(&mut self, failure: RemoteFailure, cx: &mut Context<Self>) {
-        if let Some(session) = self.remote_session.as_mut() {
-            session.answer_host_key(false);
+    fn refuse_with(&mut self, id: SessionId, failure: RemoteFailure, cx: &mut Context<Self>) {
+        if let Some(attempt) = self.attempt.as_mut() {
+            attempt.session.answer_host_key(false);
         }
-        self.remote_session = None;
-        self.remote_watching = false;
+        if let Some(mut attempt) = self.attempt.take() {
+            attempt.session.close();
+        }
         if let Some(panel) = self.remote.as_mut() {
             panel.fail(failure);
         }
-        if let Some(id) = self.remote_session_id.take() {
-            self.workspace
-                .session_failed(id, SessionFailure::HostKeyRejected);
-        }
+        self.workspace
+            .session_failed(id, SessionFailure::HostKeyRejected);
         cx.notify();
     }
 
@@ -1139,13 +1497,13 @@ impl ShelluneView {
     ) {
         if let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) {
             let session = self.workspace.register_remote_session(&host);
-            self.remote_session_id = Some(session.id());
-            self.workspace
-                .session_verified_and_authenticated(session.id());
+            let id = session.id();
+            self.form_session = Some(id);
+            self.workspace.session_verified_and_authenticated(id);
+            let scripted = shellune_ssh::ScriptedSession::new();
+            scripted.push(RemoteEvent::HostKeyPrompt(prompt));
+            self.install_scripted_session(id, scripted, cx);
         }
-        let scripted = shellune_ssh::ScriptedSession::new();
-        scripted.push(RemoteEvent::HostKeyPrompt(prompt));
-        self.install_scripted_session(scripted, cx);
         // The prompt reaches the form the same way a real one does.
         self.poll_remote(cx);
     }
@@ -1154,12 +1512,16 @@ impl ShelluneView {
     #[cfg(test)]
     pub(crate) fn install_scripted_session(
         &mut self,
+        id: SessionId,
         mut scripted: shellune_ssh::ScriptedSession,
         cx: &mut Context<Self>,
     ) {
-        self.remote_session = Some(scripted.take_session());
+        self.attempt = Some(Attempt {
+            id,
+            session: scripted.take_session(),
+            watching: false,
+        });
         self.scripted = Some(scripted);
-        self.remote_watching = false;
         cx.notify();
     }
 
@@ -1177,13 +1539,22 @@ impl ShelluneView {
         let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) else {
             return;
         };
-        let session = self.workspace.register_remote_session(&host);
-        self.remote_session_id = Some(session.id());
+        let id = match self.reconnect.take() {
+            Some(id) => {
+                if !self.workspace.session_reconnecting(id) {
+                    return;
+                }
+                id
+            }
+            None => self.workspace.register_remote_session(&host).id(),
+        };
+        self.form_session = Some(id);
         let scripted = shellune_ssh::ScriptedSession::new();
         for event in events {
             scripted.push(event);
         }
-        self.install_scripted_session(scripted, cx);
+        // The script is moved into the view, which reads the answers it received.
+        self.install_scripted_session(id, scripted, cx);
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Connecting);
         }
@@ -1194,9 +1565,8 @@ impl ShelluneView {
     /// stopped would: the question stays on screen, but nothing can answer it.
     #[cfg(test)]
     pub(crate) fn end_scripted_attempt(&mut self, cx: &mut Context<Self>) {
-        self.remote_session = None;
+        self.attempt = None;
         self.scripted = None;
-        self.remote_watching = false;
         cx.notify();
     }
 
@@ -1232,9 +1602,12 @@ impl ShelluneView {
         let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) else {
             return;
         };
-        let session = self.workspace.register_remote_session(&host);
-        self.remote_session_id = Some(session.id());
-        self.on_remote_failed(&error, cx);
+        let id = match self.reconnect.take() {
+            Some(id) => id,
+            None => self.workspace.register_remote_session(&host).id(),
+        };
+        self.form_session = Some(id);
+        self.on_remote_failed(id, &error, cx);
     }
 
     /// Tries again with whatever the form holds now.
@@ -1247,18 +1620,16 @@ impl ShelluneView {
 
     /// Closes the connection form and the session it opened.
     fn close_remote(&mut self, cx: &mut Context<Self>) {
-        if let Some(session) = self.remote_session.as_mut() {
-            session.close();
+        if let Some(mut attempt) = self.attempt.take() {
+            attempt.session.close();
+            self.workspace.session_closed(attempt.id);
         }
-        self.remote_session = None;
-        self.remote_watching = false;
-        if let Some(id) = self.remote_session_id.take() {
-            self.workspace.session_closed(id);
-            self.pane_session = None;
+        if let Some(id) = self.form_session.take() {
+            self.close_session(id, cx);
         }
-        if let Some(pane) = self.pane.take() {
-            pane.update(cx, |pane, cx| pane.close(cx));
-        }
+        // A reconnect the user abandoned leaves its session as it was: disconnected,
+        // with the reason it ended, and nothing reopened behind their back.
+        self.reconnect = None;
         if let Some(panel) = self.remote.as_mut() {
             panel.clear_secrets();
         }
@@ -1316,7 +1687,7 @@ impl ShelluneView {
         }
         let shell = LocalShell::new(program.clone(), program);
         self.start_shell(shell, Some(window), cx);
-        if self.pane.is_some() {
+        if self.active_pane().is_some() {
             // The shell that started owns the keyboard, so what the user types next
             // goes to it. The field closes and, because this returns true, empties:
             // a second Return over the same path would start the shell again
@@ -1324,7 +1695,7 @@ impl ShelluneView {
             self.custom_shell_open = false;
             cx.notify();
         }
-        self.pane.is_some()
+        self.active_pane().is_some()
     }
 
     /// Starts whichever shell the picker currently points at.
@@ -1353,72 +1724,112 @@ impl ShelluneView {
 
     /// Starts a shell and, when it really started, records the session.
     ///
-    /// A launch failure replaces the section with the reason and keeps no pane, so
-    /// the destination cannot show a terminal that has no process behind it.
+    /// A new shell is a new tab: the sessions that are already open keep their
+    /// processes and their screens, which is the difference between opening a second
+    /// terminal and restarting the first one. A launch failure keeps no pane and no
+    /// session record, so the destination cannot show a terminal that has no process
+    /// behind it.
     fn start_shell(
         &mut self,
         shell: LocalShell,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.pane_session {
-            self.workspace.session_closed(session);
-        }
-        if self.remote.is_some() {
-            // One pane exists in this step, so starting a local shell ends the
-            // remote one instead of leaving a panel that claims a terminal it no
-            // longer has.
-            self.close_remote(cx);
-        }
-        self.pane = None;
-        self.pane_session = None;
-        self.pane_kind = PaneKind::Local;
-
+        self.local_error = None;
         let grid = GridSize::initial();
         let font_size = self.workspace.local_font_size();
         let locale = self.workspace.locale();
+        let session = self.workspace.register_local_session(&shell);
+        let id = session.id();
+        let tag = session.tag();
         let pane =
-            cx.new(|pane_cx| TerminalPane::start(shell.clone(), grid, font_size, locale, pane_cx));
+            cx.new(|pane_cx| TerminalPane::start(shell, tag, grid, font_size, locale, pane_cx));
         let state = pane.read(cx).state().clone();
         if !state.accepts_input() {
             let reason = state
                 .failure()
                 .map_or_else(|| state.label(locale), |failure| failure.to_string());
+            // A process that never ran is not a session: the record is dropped and the
+            // reason is reported where the picked shell is.
+            self.workspace.session_forgotten(id);
+            self.local_error = Some(reason.clone());
             self.workspace
                 .fail_local_start(Failure::new(reason, Recovery::ChooseShell));
             cx.notify();
             return;
         }
 
-        let session = self.workspace.register_local_session(&shell);
-        let id = session.id();
         self.workspace.session_connected(id);
         // The size the pane actually uses is the one the next session starts with.
         self.workspace
             .set_local_font_size(pane.read(cx).font_size());
-        cx.observe(&pane, |view, pane, cx| view.sync_pane(pane, cx))
-            .detach();
         if let Some(window) = window {
             let handle = pane.read(cx).focus_handle().clone();
             window.focus(&handle);
         }
-        self.pane = Some(pane);
-        self.pane_session = Some(id);
-        cx.notify();
+        self.push_pane(tag, pane, cx);
     }
 
-    /// Mirrors what the pane reports into the session list.
+    /// Starts the process of a session that is already recorded, and shows it.
     ///
-    /// The pane owns the truth about the process; the list only repeats it, so a
-    /// shell that exited cannot stay listed as running.
-    fn sync_pane(&mut self, pane: Entity<TerminalPane>, cx: &mut Context<Self>) {
-        let Some(session) = self.pane_session else {
+    /// The reconnect path uses this: the record, its title and its place in the list
+    /// are already there, so only the process and the terminal are new.
+    fn start_local_pane(&mut self, id: SessionId, shell: LocalShell, cx: &mut Context<Self>) {
+        let program = shell.program().to_owned();
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let Some(tag) = self.workspace.session(id).map(|session| session.tag()) else {
             return;
         };
+        let pane =
+            cx.new(|pane_cx| TerminalPane::start(shell, tag, grid, font_size, locale, pane_cx));
+        let state = pane.read(cx).state().clone();
+        if !state.accepts_input() {
+            let reason = state
+                .failure()
+                .map_or_else(|| state.label(locale), |failure| failure.to_string());
+            self.local_error = Some(reason.clone());
+            self.workspace.session_failed(
+                id,
+                SessionFailure::LocalShellLaunchFailed {
+                    shell: program,
+                    reason,
+                },
+            );
+            cx.notify();
+            return;
+        }
+        self.workspace.session_connected(id);
+        self.workspace
+            .set_local_font_size(pane.read(cx).font_size());
+        self.push_pane(tag, pane, cx);
+    }
+
+    /// Mirrors what one pane reports into the session it belongs to.
+    ///
+    /// The pane owns the truth about its process; the list only repeats it, so a shell
+    /// that exited cannot stay listed as running. The session is read from the pane's
+    /// own entry, so a pane can never update a session other than its own.
+    fn sync_pane(&mut self, pane: Entity<TerminalPane>, cx: &mut Context<Self>) {
+        let tag = pane.read(cx).tag();
+        let Some(id) = self
+            .panes
+            .iter()
+            .find(|open| open.pane.entity_id() == pane.entity_id())
+            .map(|open| open.tag.session)
+        else {
+            // The pane was closed: what it reports no longer describes a session the
+            // shell shows.
+            return;
+        };
+        if !self.workspace.session_accepts_event(tag) {
+            return;
+        }
         let state = pane.read(cx).state().clone();
         match state {
             PaneState::Live => {
-                self.workspace.session_connected(session);
+                self.workspace.session_connected(id);
             }
             PaneState::Exited { report } => {
                 // A shell that exits on its own is still over. Reporting the status it
@@ -1427,10 +1838,10 @@ impl ShelluneView {
                 let failure = report
                     .session_failure()
                     .unwrap_or(shellune_core::SessionFailure::ProcessExited { code: Some(0) });
-                self.workspace.session_failed(session, failure);
+                self.workspace.session_failed(id, failure);
             }
             PaneState::Failed(failure) => {
-                self.workspace.session_failed(session, failure);
+                self.workspace.session_failed(id, failure);
             }
         }
         cx.notify();
@@ -1612,7 +2023,7 @@ impl ShelluneView {
             );
         }
 
-        if let Some(pane) = &self.pane
+        if let Some(pane) = self.form_session.and_then(|id| self.pane_for(id))
             && matches!(status, RemoteStatus::Live)
         {
             // A terminal needs rows: inside a scrolling list it would otherwise be
@@ -3112,15 +3523,30 @@ impl ShelluneView {
         }
     }
 
+    /// Whether a destination shows the selected terminal instead of a list.
+    ///
+    /// "Local shells" lists local sessions and "Sessions" lists all of them, so a
+    /// server terminal belongs to the second and a local one to both. Showing a server
+    /// terminal under "Local shells" would mislabel what the user is looking at.
+    fn shows_terminal(&self, destination: Destination) -> bool {
+        match self.active_kind() {
+            Some(PaneKind::Local) => {
+                matches!(
+                    destination,
+                    Destination::LocalShells | Destination::Sessions
+                )
+            }
+            Some(PaneKind::Remote) => destination == Destination::Sessions,
+            None => false,
+        }
+    }
+
     fn destination_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let destination = self.workspace.destination();
         let state = self.workspace.state(destination);
 
-        let body = if destination == Destination::LocalShells
-            && self.pane.is_some()
-            && self.pane_kind == PaneKind::Local
-        {
+        let body = if self.shows_terminal(destination) {
             self.terminal_panel(cx)
         } else if destination == Destination::Hosts {
             // The hosts destination renders its own empty, failed and populated
@@ -3163,28 +3589,37 @@ impl ShelluneView {
             .debug_selector(|| "content".to_owned())
             .child(body);
         // A terminal fills the panel; a list of cards scrolls instead.
-        if destination == Destination::LocalShells
-            && self.pane.is_some()
-            && self.pane_kind == PaneKind::Local
-        {
+        if self.shows_terminal(destination) {
             container
         } else {
             container.overflow_y_scroll()
         }
     }
 
-    /// The terminal and the shell it runs, filling the destination panel.
+    /// The selected terminal, the session it belongs to and the shell it runs.
     fn terminal_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let metrics = self.metrics();
+        let destination = self.workspace.destination();
         let mut column = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .gap(metrics.scale(spacing::TIGHT))
-            .child(self.shell_picker(cx));
+            .gap(metrics.scale(spacing::TIGHT));
 
-        if let Some(pane) = &self.pane {
+        // A new shell can only be started where local shells live; the sessions
+        // destination lists every session and starts nothing.
+        if destination == Destination::LocalShells {
+            column = column.child(self.shell_picker(cx));
+        }
+
+        if let Some(reason) = &self.local_error {
+            column = column.child(self.notice_line(reason.clone(), Tone::Danger));
+        }
+
+        let id = self.active;
+        if let Some(pane) = self.active_pane() {
+            column = column.child(self.session_bar(id, cx));
             // A shell that ended keeps its last screen, but the reason it stopped is
             // stated above it instead of being left for the user to guess.
             if let Some(failure) = pane.read(cx).state().failure() {
@@ -3206,6 +3641,203 @@ impl ShelluneView {
             column = column.child(pane.clone());
         }
         column
+    }
+
+    /// One muted or coloured line under a heading.
+    fn notice_line(&self, text: String, tone: Tone) -> Div {
+        let metrics = self.metrics();
+        div()
+            .flex_none()
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .text_size(metrics.label_size())
+            .text_color(tone.text())
+            .debug_selector(|| "session.notice".to_owned())
+            .child(SharedString::from(text))
+    }
+
+    /// The tab of one session: what it is, what it runs and what it is doing.
+    ///
+    /// Every part R7 asks for is here and nowhere else: the name, the kind, the object
+    /// it talks to and the connection state are read from the session record, so a tab
+    /// cannot describe a session the domain model does not have.
+    fn session_tab(&self, id: SessionId, index: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let Some(session) = self.workspace.session(id) else {
+            return div().id(("session.tab", index));
+        };
+        let selected = self.active == Some(id);
+        let kind = PaneKind::of(session.kind());
+        let (kind_label, tone) = (
+            match kind {
+                PaneKind::Local => strings.session_kind_local,
+                PaneKind::Remote => strings.session_kind_remote,
+            },
+            session_tone(session.state()),
+        );
+        let label = match kind {
+            PaneKind::Local => session.title().to_owned(),
+            PaneKind::Remote => format!(
+                "{} · {}",
+                session.title(),
+                session_target(&self.book, session)
+            ),
+        };
+        let state_label = copy::session_state_label(session.state(), self.workspace.locale());
+        let selector = format!("session.tab.{index}");
+
+        div()
+            .id(("session.tab", index))
+            .debug_selector(move || selector.clone())
+            .flex()
+            .items_center()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(2.0))
+            .rounded(px(radius::SMALL))
+            .border_1()
+            .border_color(theme::swatch(if selected {
+                palette::ACCENT
+            } else {
+                palette::BORDER
+            }))
+            .bg(theme::swatch(if selected {
+                palette::SURFACE_SELECTED
+            } else {
+                palette::SURFACE_RAISED
+            }))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.activate(id, cx);
+            }))
+            .child(components::status_dot(tone, metrics))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(kind_label),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(label)),
+            )
+            .child(components::chip(state_label, tone, metrics))
+            .child(
+                div()
+                    .id(("session.tab.close", index))
+                    .debug_selector({
+                        let selector = format!("session.tab.close.{index}");
+                        move || selector.clone()
+                    })
+                    .flex_none()
+                    .px(metrics.scale(2.0))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.close_session(id, cx);
+                    }))
+                    .child(SharedString::from("×")),
+            )
+    }
+
+    /// The tabs of the sessions that are still open, in the order they were opened.
+    fn tab_strip(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let mut strip = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .px(metrics.scale(spacing::SECTION))
+            .py(metrics.scale(spacing::HAIRLINE))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_b_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "session.tabs".to_owned());
+
+        for (index, id) in self.tab_sessions().iter().enumerate() {
+            strip = strip.child(self.session_tab(*id, index, cx));
+        }
+        strip
+    }
+
+    /// The state, the object and the actions of the selected session.
+    fn session_bar(&self, id: Option<SessionId>, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let Some(session) = id.and_then(|id| self.workspace.session(id)) else {
+            return div();
+        };
+        let id = session.id();
+        let kind = match PaneKind::of(session.kind()) {
+            PaneKind::Local => strings.session_kind_local,
+            PaneKind::Remote => strings.session_kind_remote,
+        };
+        let target = match session.kind() {
+            SessionKind::Local { .. } => session.title().to_owned(),
+            SessionKind::Remote { .. } => session_target(&self.book, session),
+        };
+        let state_label = copy::session_state_label(session.state(), self.workspace.locale());
+        let tone = session_tone(session.state());
+        let can_reconnect = session.state().can_reconnect();
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "session.bar".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .min_w(px(0.0))
+                    .child(components::status_dot(tone, metrics))
+                    .child(components::chip(kind, tone, metrics))
+                    .child(components::stacked(
+                        session.title().to_owned(),
+                        target,
+                        metrics,
+                    ))
+                    .child(components::chip(state_label, tone, metrics)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .when(can_reconnect, |row| {
+                        row.child(self.text_button(
+                            SharedString::from("session.reconnect"),
+                            strings.session_reconnect,
+                            Tone::Accent,
+                            cx,
+                            move |view, cx| view.reconnect_session(id, cx),
+                        ))
+                    })
+                    .child(self.text_button(
+                        SharedString::from("session.close"),
+                        strings.session_close,
+                        Tone::Neutral,
+                        cx,
+                        move |view, cx| view.close_session(id, cx),
+                    )),
+            )
     }
 
     /// The shell choices and the free-text path field.
@@ -3504,7 +4136,11 @@ impl Render for ShelluneView {
             .on_action(cx.listener(|this, _: &ToggleLanguage, _window, cx| {
                 this.workspace.toggle_locale();
                 let locale = this.workspace.locale();
-                if let Some(pane) = this.pane.clone() {
+                // Every open terminal keeps its own labels, so each one is told: the
+                // ones that are not on screen must come back in the new language too.
+                let panes: Vec<Entity<TerminalPane>> =
+                    this.panes.iter().map(|open| open.pane.clone()).collect();
+                for pane in panes {
                     pane.update(cx, |pane, cx| pane.set_locale(locale, cx));
                 }
                 cx.notify();
@@ -3523,9 +4159,39 @@ impl Render for ShelluneView {
                     .h_full()
                     .child(self.header(cx))
                     .children(notice)
+                    .children((!self.tab_sessions().is_empty()).then(|| self.tab_strip(cx)))
                     .child(self.destination_panel(cx))
                     .child(self.status_bar()),
             )
+    }
+}
+
+/// The tone that carries a session state.
+///
+/// One place decides it, so a tab, a bar and a list row cannot disagree about whether
+/// a session is live, still connecting or over.
+fn session_tone(state: &SessionState) -> Tone {
+    match state {
+        SessionState::Connected => Tone::Positive,
+        SessionState::Connecting | SessionState::VerifyingHost | SessionState::Authenticating => {
+            Tone::Warning
+        }
+        SessionState::Disconnected(_) | SessionState::Failed(_) => Tone::Danger,
+        SessionState::Idle | SessionState::Closed => Tone::Neutral,
+    }
+}
+
+/// What a session talks to, as the user sees it: the host's address and user, or the
+/// program of a local shell.
+///
+/// A remote session keeps its host id, so a host that was renamed shows its new name and
+/// a host that was deleted shows the id instead of an empty space.
+fn session_target(book: &HostBook, session: &Session) -> String {
+    match session.kind() {
+        SessionKind::Local { shell } => shell.clone().unwrap_or_else(|| session.title().to_owned()),
+        SessionKind::Remote { host } => book
+            .host(*host)
+            .map_or_else(|| format!("host {host}"), HostConfig::target),
     }
 }
 

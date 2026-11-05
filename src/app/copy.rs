@@ -346,6 +346,18 @@ pub struct Strings {
     pub remote_failure_title: &'static str,
     /// Button that closes the remote panel.
     pub remote_close: &'static str,
+    /// Kind label of a shell on this machine, on the session tab and bar.
+    pub session_kind_local: &'static str,
+    /// Kind label of an SSH session, on the session tab and bar.
+    pub session_kind_remote: &'static str,
+    /// Button that closes one session.
+    pub session_close: &'static str,
+    /// Button that starts another process for a session that ended.
+    pub session_reconnect: &'static str,
+    /// Why a local session cannot be restarted.
+    pub session_reconnect_no_shell: &'static str,
+    /// Why a remote session's host cannot be connected to again.
+    pub session_reconnect_missing_host: &'static str,
 }
 
 /// English copy.
@@ -490,6 +502,12 @@ pub static ENGLISH: Strings = Strings {
     trust_undelivered_note: "The connection attempt had already ended, so the identity was neither accepted nor stored. Connect again to see it once more.",
     remote_failure_title: "The connection did not open",
     remote_close: "Close the connection panel",
+    session_kind_local: "Local",
+    session_kind_remote: "SSH",
+    session_close: "Close session",
+    session_reconnect: "Reconnect",
+    session_reconnect_no_shell: "This session has no program recorded, so it cannot be started again.",
+    session_reconnect_missing_host: "The saved host this session used is no longer there, so it cannot be connected to again.",
 };
 
 /// Chinese copy.
@@ -634,6 +652,12 @@ pub static CHINESE: Strings = Strings {
     trust_undelivered_note: "连接尝试已结束，该身份既未被接受也未被记录。请重新连接以再次查看。",
     remote_failure_title: "连接没有建立",
     remote_close: "关闭连接面板",
+    session_kind_local: "本地",
+    session_kind_remote: "SSH 远程",
+    session_close: "关闭会话",
+    session_reconnect: "重新连接",
+    session_reconnect_no_shell: "该会话没有记录可启动的程序，无法重新启动。",
+    session_reconnect_missing_host: "该会话使用的主机记录已被删除，无法再次连接。",
 };
 
 /// Hint for the section shortcuts, built for one platform.

@@ -588,11 +588,70 @@ impl Workspace {
 
     /// Records a failure that stopped a shell from starting at all.
     ///
-    /// The session list is left empty and the section becomes a failure, so no
-    /// phantom terminal appears where the shell refused to run.
+    /// No session is created for a process that never ran, so there is no phantom
+    /// terminal. The sessions that are already open are kept: one wrong shell path
+    /// says nothing about the terminals that are running, and dropping them would
+    /// close what the user did not ask to close.
     pub fn fail_local_start(&mut self, failure: Failure) {
+        let sessions = self.sessions.items().to_vec();
         self.sessions
-            .replace(SectionStatus::Failed(failure), Vec::new());
+            .replace(SectionStatus::Failed(failure), sessions);
+    }
+
+    /// Replaces the session list, for the model tests that pin one rule at a time.
+    #[cfg(test)]
+    pub fn set_sessions_for_test(&mut self, sessions: Vec<Session>) {
+        self.sessions.replace(SectionStatus::Ready, sessions);
+    }
+
+    /// One session, by identity.
+    #[must_use]
+    pub fn session(&self, id: SessionId) -> Option<&Session> {
+        self.sessions
+            .items()
+            .iter()
+            .find(|session| session.id() == id)
+    }
+
+    /// Whether an event from one process of a session still belongs to it.
+    ///
+    /// True only for the process the session currently runs: a late event from a
+    /// process that ended, or from one that a reconnect replaced, is not.
+    #[must_use]
+    pub fn session_accepts_event(&self, tag: shellune_core::EventTag) -> bool {
+        self.session(tag.session)
+            .is_some_and(|session| session.accepts_event(tag.generation))
+    }
+
+    /// Drops a record for a session whose process never ran.
+    ///
+    /// A shell that refused to start is not a session: the user did not get a
+    /// terminal, so leaving a record behind would list something that never existed.
+    /// Only an attempt that never became live may be forgotten this way.
+    pub fn session_forgotten(&mut self, id: SessionId) {
+        let remaining: Vec<Session> = self
+            .sessions
+            .items()
+            .iter()
+            .filter(|session| session.id() != id)
+            .cloned()
+            .collect();
+        let status = match self.sessions.status() {
+            SectionStatus::Failed(_) => self.sessions.status().clone(),
+            _ => SectionStatus::Ready,
+        };
+        self.sessions.replace(status, remaining);
+    }
+
+    /// Records that the user asked a session that ended to start another process.
+    ///
+    /// The record is the same one, so the tab keeps its name and its position; the
+    /// generation moves on, which is what ends the previous process' claim on it.
+    ///
+    /// Returns whether the session could be restarted: a live, pending or closed one
+    /// cannot.
+    pub fn session_reconnecting(&mut self, id: SessionId) -> bool {
+        self.transition(id, |session| session.begin_reconnect().is_ok())
     }
 
     fn transition(&mut self, id: SessionId, change: impl FnOnce(&mut Session) -> bool) -> bool {

@@ -28,7 +28,7 @@ use gpui::{
 };
 use std::ops::Range;
 
-use shellune_core::{LocalShell, SessionFailure};
+use shellune_core::{EventTag, LocalShell, SessionFailure};
 use shellune_ssh::{RemoteEvent, RemoteSession};
 use shellune_terminal::{
     CellSize, CursorShape, ExitReport, GridSize, Key, KeyModifiers, LocalSession, PtyEvent, Rgb,
@@ -272,6 +272,13 @@ impl PaneOrigin {
 
 /// One terminal view backed by a local shell or a remote session.
 pub struct TerminalPane {
+    /// Which session process this pane shows.
+    ///
+    /// Every event a source produces is checked against it before it is applied, and
+    /// the window passes events with the tag it drained them under, so a batch that
+    /// belongs to a process this pane does not show is dropped instead of being drawn
+    /// into the wrong terminal.
+    tag: EventTag,
     core: TerminalCore,
     source: Option<PaneSource>,
     /// What the pane is running: a program here, or a host over SSH.
@@ -308,6 +315,7 @@ impl TerminalPane {
     /// so the caller cannot present a terminal that has nothing behind it.
     pub fn start(
         shell: LocalShell,
+        tag: EventTag,
         grid: GridSize,
         font_size: f32,
         locale: Locale,
@@ -322,6 +330,7 @@ impl TerminalPane {
         };
 
         let mut pane = Self {
+            tag,
             core,
             source,
             origin: PaneOrigin::Local(shell),
@@ -351,6 +360,7 @@ impl TerminalPane {
     /// encoding a local shell uses.
     pub fn start_remote(
         session: RemoteSession,
+        tag: EventTag,
         target: impl Into<String>,
         grid: GridSize,
         font_size: f32,
@@ -362,6 +372,7 @@ impl TerminalPane {
         let target = target.into();
         let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
         let mut pane = Self {
+            tag,
             core,
             source: Some(PaneSource::Remote(session)),
             origin: PaneOrigin::Remote { target },
@@ -409,6 +420,7 @@ impl TerminalPane {
     #[cfg(test)]
     pub fn without_process(
         shell: LocalShell,
+        tag: EventTag,
         grid: GridSize,
         font_size: f32,
         locale: Locale,
@@ -417,6 +429,7 @@ impl TerminalPane {
         let font_size = sanitize_font_size(font_size);
         let grid = grid.clamped();
         Self {
+            tag,
             core: TerminalCore::new(grid.cols, grid.rows, 1000),
             source: None,
             origin: PaneOrigin::Local(shell),
@@ -443,6 +456,12 @@ impl TerminalPane {
         let effects = self.core.feed(bytes);
         self.apply_effects(effects, cx);
         cx.notify();
+    }
+
+    /// The session process this pane shows.
+    #[must_use]
+    pub fn tag(&self) -> EventTag {
+        self.tag
     }
 
     /// What the shell behind this pane is doing.
@@ -548,14 +567,26 @@ impl TerminalPane {
     /// the common case; the output cannot be given back to the channel, so it is
     /// handed over here and applied in the order it arrived. Dropping it would open
     /// the remote terminal with the first screen missing.
-    pub fn adopt_events(&mut self, events: Vec<SourceEvent>, cx: &mut Context<Self>) {
+    /// Returns whether the batch belonged to this pane: a batch drained under another
+    /// session or another process of this session is dropped, because applying it
+    /// would put one session's output into another one's screen.
+    pub fn adopt_events(
+        &mut self,
+        tag: EventTag,
+        events: Vec<SourceEvent>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if tag != self.tag {
+            return false;
+        }
         if events.is_empty() {
-            return;
+            return true;
         }
         for event in events {
             self.handle_event(event, cx);
         }
         cx.notify();
+        true
     }
 
     /// Applies every event that arrived since the last poll.

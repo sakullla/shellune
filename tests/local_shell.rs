@@ -457,107 +457,126 @@ fn a_program_that_exits_immediately_after_output_is_still_read() {
     assert_eq!(session.exited, Some(ExitReport::Clean));
 }
 
-/// Longest whole time the interrupt is given before the test says it did not stop.
+/// The command that floods the screen until it is interrupted.
 ///
-/// This is a budget for a machine, not a measurement of a shell: it only has to be
-/// large enough that a busy host cannot exhaust it, and small enough that a shell
-/// which never stops fails the run. The measurement this test really makes is the
-/// silence below, so the size of the budget does not weaken the assertion.
-const INTERRUPT_BUDGET: Duration = Duration::from_secs(60);
+/// The flood is driven by `cmd.exe` on Windows rather than by the PowerShell a new
+/// terminal starts with. That is a measurement, not a preference: the same single
+/// 0x03 byte stops this loop in 10-20ms in 8 of 8 runs, while a ConPTY PowerShell
+/// drops an injected Ctrl+C that arrives while it is still setting the pipeline up
+/// (5 of 10 lost in the T3 investigation). A test that has to guess when the shell
+/// is ready to be interrupted is the test that fails on a reviewer's machine, so
+/// this one runs the program whose interrupt handling is reliable.
+///
+/// `cmd.exe /q` is the interactive prompt with its banner suppressed: the loop is
+/// typed at the prompt, exactly as a user would type it, and Ctrl+C aborts the loop
+/// without leaving the shell.
+#[cfg(windows)]
+fn flood_command() -> (&'static str, Vec<&'static str>, &'static str) {
+    (
+        "cmd.exe",
+        vec!["/q"],
+        "for /l %i in (1,1,1000000000) do @echo tick",
+    )
+}
+
+/// The POSIX equivalent: the machine's own shell, flooding in a loop.
+///
+/// A terminal's Ctrl+C is the line discipline's `INTR`, which interrupts whatever
+/// runs in the foreground, so the volume of a shell script is not a question here.
+#[cfg(not(windows))]
+fn flood_command() -> (&'static str, Vec<&'static str>, &'static str) {
+    let shell = platform_default();
+    // The program string has to outlive this call, which is why the search's own
+    // allocation is handed over instead of being copied per branch.
+    let program: &'static str = Box::leak(shell.program().to_owned().into_boxed_str());
+    (
+        program,
+        Vec::new(),
+        "while true; do echo tick; sleep 0.01; done",
+    )
+}
+
+/// The command that proves the shell still takes input, and how many times the
+/// marker must appear on screen for the command to have really run.
+///
+/// A terminal echoes what is typed, so a marker inside the command line would let
+/// the echo satisfy the wait. `cmd.exe` echoes the whole line and then prints the
+/// output, so the marker appears twice only after the command ran; the POSIX branch
+/// splits the marker in the command itself, so once is already real output.
+fn follow_up_command() -> (&'static str, usize) {
+    if cfg!(windows) {
+        ("echo after-interrupt", 2)
+    } else {
+        ("echo 'after'-'interrupt'", 1)
+    }
+}
 
 /// How long the byte counter must stay unchanged before output counts as stopped.
 ///
-/// Deliberately generous. The fact under test is "the program stopped printing", not
-/// "it stopped within 1.5s": on a machine that also runs a cargo build the shell and
-/// this reader thread are both starved for whole seconds, so a short window reported
-/// silence that had only been a pause in scheduling. Five seconds of no growth cannot
-/// be produced by a process that is still printing — the endless command writes every
-/// 5-10ms whenever it is scheduled at all — while a real stop keeps the counter flat
-/// for ever.
-const QUIET_AFTER_STOP: Duration = Duration::from_secs(5);
+/// The counter is the only honest signal: the grid holds ~29 lines, so a screen that
+/// is merely full and a screen that stopped both look static. One second of a
+/// flooding loop that is still running is not reachable by scheduling alone — the
+/// loop prints every time it is scheduled at all — so a flat counter over the whole
+/// window, seen by a reader that kept running (below), is the stop.
+const STOP_WINDOW: Duration = Duration::from_secs(1);
 
-/// How many pump iterations the quiet window must have seen.
+/// How many reads the stop window must have contained.
 ///
-/// A single starved `sleep` can span the whole window; a reader that really ran is
-/// what makes the flat counter a measurement rather than an assumption. One iteration
-/// per 250ms of the window is far below what an idle machine does and far above what
-/// a thread that never woke up could show.
-const QUIET_WINDOW_PUMPS: u32 = 20;
+/// A single starved `sleep` could span the whole window; this is what turns the
+/// flat counter into a measurement instead of an assumption. The loop reads every
+/// [READ_INTERVAL], so an idle machine shows ~100 of them and a thread that never
+/// woke up shows none.
+const STOP_WINDOW_READS: u32 = 40;
 
-/// Bytes the endless command must have produced before the interrupt is sent, so
-/// that the interrupt lands on a program that is really mid-stream.
-///
-/// A small number on purpose: a busy machine prints slowly, and this condition is
-/// only there to prove the stream has started — the endless command guarantees it
-/// has not finished.
-const OUTPUT_BEFORE_INTERRUPT: u64 = 512;
+/// How often the reader looks for output while waiting for the stop.
+const READ_INTERVAL: Duration = Duration::from_millis(10);
 
-/// How long the endless command must already have been printing when the
-/// interrupt is sent.
+/// The most time the interrupt is given before the test says it did not stop.
 ///
-/// This is not slack for a guessed delay; it is where the interrupt is reliable.
-/// A ConPTY PowerShell ignores a Ctrl+C that arrives while it is still setting the
-/// pipeline up: measured here with a single 0x03, 5 of 10 interrupts sent 0.2s
-/// after the command were dropped and the command kept printing, while 44 of 44
-/// sent 2s or more in stopped it within 30-130ms. A user interrupts a command they
-/// have been watching, so that is the moment this test reproduces.
-const STREAM_ESTABLISHED: Duration = Duration::from_secs(3);
+/// Only a last resort: the measurement is the silence above. It is small because the
+/// interrupt is not supposed to need patience — the loop stops in ten milliseconds —
+/// so a run that reaches this budget has failed, not run slowly.
+const INTERRUPT_BUDGET: Duration = Duration::from_secs(20);
 
-/// How long the first Ctrl+C is given before the same key is pressed once more.
+/// Bytes the flood must have produced before the interrupt is sent.
 ///
-/// A dropped interrupt is not the PTY write path: a pipe does not lose a byte, the
-/// write reports no error, the same single 0x03 stops a flooding cmd.exe in
-/// 10-20ms, and every Ctrl+C pressed afterwards is honoured within 30-350ms. What
-/// is lost is the shell's own handling of the injected key, which no terminal can
-/// make atomic — Windows Terminal sends the same byte. One more press is what a
-/// user does, and the count is part of every failure message here.
-const RETRY_INTERRUPT_AFTER: Duration = Duration::from_secs(2);
+/// Not a delay: it proves the program is really mid-stream, which is the moment a
+/// user interrupts it. The flood is endless, so it cannot end by itself and make the
+/// test pass without an interrupt.
+const OUTPUT_BEFORE_INTERRUPT: u64 = 2048;
+
+/// How long the flood is given to produce those bytes.
+const FLOOD_BUDGET: Duration = Duration::from_secs(30);
 
 #[test]
 fn sustained_output_can_be_interrupted_and_the_shell_stays_usable() {
-    let Some(mut session) = Session::start() else {
+    let (program, args, command) = flood_command();
+    let Some(mut session) = Session::start_program(program, &args) else {
+        eprintln!("no interruptible program on this machine, skipping");
         return;
     };
 
-    // The command is endless on purpose. A bounded loop finishes by itself, so a
-    // shell that never received the interrupt still answers afterwards and the
-    // test would pass without having interrupted anything; worse, whether it does
-    // is decided by how fast the machine runs the loop.
-    if cfg!(windows) {
-        session.run("while ($true) { 'tick'; Start-Sleep -Milliseconds 5 }");
-    } else {
-        session.run("while true; do echo tick; sleep 0.01; done");
-    }
-
-    // Progress is counted in bytes read, not in visible "tick" lines: the screen
-    // is 30 rows and holds about 29 lines, so its content stops changing while the
-    // shell keeps printing. Only the byte counter keeps growing.
-    let baseline = session.bytes_read();
-    let started = Instant::now();
-    while session.bytes_read() - baseline < OUTPUT_BEFORE_INTERRUPT
-        || started.elapsed() < STREAM_ESTABLISHED
-    {
+    session.run(command);
+    let flood_started = Instant::now();
+    while session.bytes_read() < OUTPUT_BEFORE_INTERRUPT {
         session.pump();
         assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the endless command produced only {} bytes in {:?}; the shell never got going",
-            session.bytes_read() - baseline,
-            started.elapsed()
+            flood_started.elapsed() < FLOOD_BUDGET,
+            "the flood produced only {} bytes in {:?}; the program never got going",
+            session.bytes_read(),
+            flood_started.elapsed()
         );
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(READ_INTERVAL);
     }
 
-    // Then the user interrupts it with the control key a terminal must send. The
-    // business fact is measured from here: output has to stop.
+    // The fact under test is measured from here: one press, and output has to stop.
     let before_interrupt = session.bytes_read();
-    let first_press_at = Instant::now();
+    let pressed_at = Instant::now();
     session.write(&[0x03]);
-    let mut presses = 1;
-    let mut pressed_at = first_press_at;
 
-    let mut last_growth = first_press_at;
     let mut last_bytes = before_interrupt;
-    let mut quiet_pumps: u32 = 0;
+    let mut last_growth = pressed_at;
+    let mut reads_since_growth: u32 = 0;
     let stopped_after = loop {
         session.pump();
         let now = Instant::now();
@@ -565,67 +584,38 @@ fn sustained_output_can_be_interrupted_and_the_shell_stays_usable() {
         if bytes != last_bytes {
             last_bytes = bytes;
             last_growth = now;
-            quiet_pumps = 0;
+            reads_since_growth = 0;
         } else {
-            quiet_pumps += 1;
+            reads_since_growth += 1;
         }
         let silent_for = now.duration_since(last_growth);
-        // Output stopped only when the counter has been flat for the whole window and
-        // this thread was awake often enough during it to have seen a change.
-        if silent_for >= QUIET_AFTER_STOP && quiet_pumps >= QUIET_WINDOW_PUMPS {
+        if silent_for >= STOP_WINDOW && reads_since_growth >= STOP_WINDOW_READS {
             break last_growth.duration_since(pressed_at);
         }
-        if presses < 2
-            && now.duration_since(pressed_at) >= RETRY_INTERRUPT_AFTER
-            && now.duration_since(last_growth) < RETRY_INTERRUPT_AFTER
-        {
-            // The shell ignored the first key while it was still printing; the user
-            // presses it again. Nothing is pressed into silence, where it would only
-            // land on the prompt the stop is about to reveal.
-            session.write(&[0x03]);
-            presses += 1;
-            pressed_at = now;
-            continue;
-        }
         assert!(
-            now.duration_since(first_press_at) <= INTERRUPT_BUDGET,
-            "the shell was still printing {:?} after {presses} Ctrl+C press(es): \
-             {} bytes at the first press, {} bytes now, last new output {:?} after \
-             the last press, silent for {:?} of the {QUIET_AFTER_STOP:?} a stop needs, \
-             {quiet_pumps} of {QUIET_WINDOW_PUMPS} reads since that output",
-            now.duration_since(first_press_at),
+            now.duration_since(pressed_at) <= INTERRUPT_BUDGET,
+            "the program was still printing {:?} after one Ctrl+C: {} bytes at the \
+             press, {} bytes now, silent for {:?} of the {STOP_WINDOW:?} a stop needs, \
+             {reads_since_growth} of {STOP_WINDOW_READS} reads since that output",
+            now.duration_since(pressed_at),
             before_interrupt,
             bytes,
-            last_growth.duration_since(pressed_at),
             silent_for
         );
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(READ_INTERVAL);
     };
 
-    // Leaving the loop is the "output really stops" fact: the byte counter did not
-    // change for the whole quiet window while this thread kept reading. How long the
-    // stop took is only bounded, because a busy machine may take seconds to schedule
-    // the shell that has already been told to stop.
     assert!(
         stopped_after <= INTERRUPT_BUDGET,
-        "output only stopped {stopped_after:?} after the last Ctrl+C, later than the \
-         {INTERRUPT_BUDGET:?} the interrupt is given: {presses} press(es) since \
-         {before_interrupt} bytes, {last_bytes} bytes before it went quiet"
+        "output only stopped {stopped_after:?} after the Ctrl+C, later than the \
+         {INTERRUPT_BUDGET:?} the interrupt is given"
     );
 
-    // And the interruption stopped the program, not the session: the shell has to
-    // take another command. Nothing here waits a guessed amount of time either — a
-    // line typed while the program is still stopping is swallowed by it, so the
-    // same line is offered again until the shell answers.
-    //
-    // The marker is split across two literals in the command itself, because a
-    // terminal echoes what is typed: a literal marker would let the echo satisfy
-    // the wait before the command had run. Only real output contains it whole.
-    let command = if cfg!(windows) {
-        "Write-Output ('after' + '-interrupt')\r"
-    } else {
-        "echo 'after'-'interrupt'\r"
-    };
+    // The interrupt stopped the program, not the session: the shell has to take
+    // another command. Nothing waits a guessed amount here either — a line typed
+    // while the program is still stopping is swallowed by it, so the same line is
+    // offered again until the shell answers.
+    let (command, marker_count) = follow_up_command();
     let mut offers = 0;
     let mut next_offer = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -633,11 +623,11 @@ fn sustained_output_can_be_interrupted_and_the_shell_stays_usable() {
         session.pump();
         let snapshot = session.core.snapshot();
         let text = snapshot.text().join("\n");
-        if text.contains("after-interrupt") {
+        if text.matches("after-interrupt").count() >= marker_count {
             break text;
         }
         if Instant::now() >= next_offer {
-            session.write(command.as_bytes());
+            session.write(format!("{command}\r").as_bytes());
             offers += 1;
             next_offer = Instant::now() + Duration::from_millis(250);
         }
@@ -652,7 +642,7 @@ fn sustained_output_can_be_interrupted_and_the_shell_stays_usable() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(
-        screen.contains("after-interrupt"),
+        screen.matches("after-interrupt").count() >= marker_count,
         "the shell did not recover from the interrupt after {offers} attempt(s):\n{screen}"
     );
 }
