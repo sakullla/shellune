@@ -17,6 +17,8 @@ pub mod components;
 pub mod copy;
 pub mod nav;
 pub mod product;
+pub mod terminal;
+pub mod text_field;
 pub mod theme;
 mod view;
 pub mod workspace;

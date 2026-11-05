@@ -48,6 +48,22 @@ pub enum SessionFailure {
         /// The shell that was requested.
         shell: String,
     },
+    /// The local shell could not be started for a reason the system reported.
+    LocalShellLaunchFailed {
+        /// The shell that was requested.
+        shell: String,
+        /// What the system said, kept verbatim so it can be acted on.
+        reason: String,
+    },
+    /// The local shell exists but the system refused to run it.
+    ///
+    /// Kept apart from `LocalShellUnavailable` because the two need different
+    /// fixes: one is a wrong path, the other is a permission problem that
+    /// retyping the same path cannot solve.
+    LocalShellPermissionDenied {
+        /// The shell that was requested.
+        shell: String,
+    },
     /// The remote address refused or could not be reached.
     ConnectionRefused,
     /// The connection attempt timed out.
@@ -63,6 +79,11 @@ pub enum SessionFailure {
         /// Exit code, when the platform reported one.
         code: Option<i32>,
     },
+    /// The local shell was killed by a signal instead of exiting.
+    ProcessSignalled {
+        /// Name of the signal the system reported.
+        signal: String,
+    },
 }
 
 impl std::fmt::Display for SessionFailure {
@@ -70,6 +91,12 @@ impl std::fmt::Display for SessionFailure {
         match self {
             Self::LocalShellUnavailable { shell } => {
                 write!(formatter, "the local shell '{shell}' could not be started")
+            }
+            Self::LocalShellPermissionDenied { shell } => {
+                write!(
+                    formatter,
+                    "the local shell '{shell}' could not be started because access was denied"
+                )
             }
             Self::ConnectionRefused => formatter.write_str("the connection was refused"),
             Self::TimedOut => formatter.write_str("the connection timed out"),
@@ -82,6 +109,15 @@ impl std::fmt::Display for SessionFailure {
                 Some(code) => write!(formatter, "the shell exited with code {code}"),
                 None => formatter.write_str("the shell exited"),
             },
+            Self::ProcessSignalled { signal } => {
+                write!(formatter, "the shell was terminated by {signal}")
+            }
+            Self::LocalShellLaunchFailed { shell, reason } => {
+                write!(
+                    formatter,
+                    "the local shell '{shell}' could not be started: {reason}"
+                )
+            }
         }
     }
 }

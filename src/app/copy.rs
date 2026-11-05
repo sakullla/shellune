@@ -166,6 +166,24 @@ pub struct Strings {
     pub local_shell_fallback: &'static str,
     /// Hint shown when nothing is running at all.
     pub nothing_running: &'static str,
+    /// Label of the shell picker above the terminal.
+    pub shell_picker_label: &'static str,
+    /// Button that reveals the free-text shell path field.
+    pub shell_custom_button: &'static str,
+    /// Placeholder in the free-text shell path field.
+    pub shell_custom_placeholder: &'static str,
+    /// Shown when no shell was found on this machine.
+    pub shell_none_found: &'static str,
+    /// Terminal state: the shell is running.
+    pub terminal_live: &'static str,
+    /// Terminal state: the shell could not be started.
+    pub terminal_failed: &'static str,
+    /// Terminal state: the shell exited on its own.
+    pub terminal_exited: &'static str,
+    /// Terminal state: the shell was killed by a signal.
+    pub terminal_terminated: &'static str,
+    /// Button that copies the terminal selection.
+    pub terminal_copy: &'static str,
 }
 
 /// English copy.
@@ -220,6 +238,15 @@ pub static ENGLISH: Strings = Strings {
     count_transfers: "transfer",
     local_shell_fallback: "System shell",
     nothing_running: "Nothing is running yet.",
+    shell_picker_label: "Shell",
+    shell_custom_button: "Custom path",
+    shell_custom_placeholder: "Program name or full path, then Enter",
+    shell_none_found: "No shell was found on this machine. Enter a program path to start one.",
+    terminal_live: "Running",
+    terminal_failed: "Could not start",
+    terminal_exited: "Exited",
+    terminal_terminated: "Terminated",
+    terminal_copy: "Copy",
 };
 
 /// Chinese copy.
@@ -274,6 +301,15 @@ pub static CHINESE: Strings = Strings {
     count_transfers: "个传输",
     local_shell_fallback: "系统 Shell",
     nothing_running: "暂无正在运行的任务。",
+    shell_picker_label: "Shell 程序",
+    shell_custom_button: "自定义路径",
+    shell_custom_placeholder: "输入程序名或完整路径后按回车",
+    shell_none_found: "本机没有找到可用的 Shell。请输入程序路径来启动一个。",
+    terminal_live: "运行中",
+    terminal_failed: "启动失败",
+    terminal_exited: "已退出",
+    terminal_terminated: "被终止",
+    terminal_copy: "复制",
 };
 
 /// Hint for the section shortcuts, built for one platform.

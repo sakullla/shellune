@@ -1,0 +1,15 @@
+[package]
+name = "shellune-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal core, input encoding and local PTY for Shellune."
+publish = false
+
+[dependencies]
+shellune-core = { path = "../core" }
+alacritty_terminal = { workspace = true }
+portable-pty = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

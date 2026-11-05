@@ -12,10 +12,11 @@
 
 use gpui::prelude::*;
 use gpui::{
-    Context, Div, FocusHandle, FontWeight, IntoElement, Render, SharedString, Stateful, Window,
-    div, px,
+    Context, Div, Entity, FocusHandle, FontWeight, IntoElement, Render, SharedString, Stateful,
+    Window, div, px,
 };
-use shellune_core::{HostConfig, Session, SessionState, Transfer};
+use shellune_core::{HostConfig, LocalShell, Session, SessionId, SessionState, Transfer};
+use shellune_terminal::GridSize;
 
 use crate::app::actions::{
     CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
@@ -24,8 +25,10 @@ use crate::app::actions::{
 use crate::app::copy::{self, Locale, Strings};
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
+use crate::app::terminal::{PaneState, TerminalPane};
+use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
-use crate::app::workspace::{PrimaryOutcome, SectionState, Workspace};
+use crate::app::workspace::{Failure, PrimaryOutcome, Recovery, SectionState, Workspace};
 use crate::app::{components, theme::radius};
 
 /// The application shell view.
@@ -33,6 +36,11 @@ pub struct ShelluneView {
     workspace: Workspace,
     root_focus: FocusHandle,
     destination_focus: Vec<FocusHandle>,
+    /// The one local terminal this step delivers; multi-session arrives later.
+    pane: Option<Entity<TerminalPane>>,
+    pane_session: Option<SessionId>,
+    shell_path: Entity<TextField>,
+    custom_shell_open: bool,
 }
 
 impl ShelluneView {
@@ -44,11 +52,25 @@ impl ShelluneView {
     /// Builds the shell around an existing workspace, used by tests and by later
     /// tasks that restore state before the first frame.
     pub fn with_workspace(cx: &mut Context<Self>, workspace: Workspace) -> Self {
-        Self {
+        let placeholder = workspace.strings().shell_custom_placeholder;
+        let shell_path = cx.new(|cx| TextField::new(placeholder, cx));
+        let mut view = Self {
             workspace,
             root_focus: cx.focus_handle(),
             destination_focus: Destination::ALL.iter().map(|_| cx.focus_handle()).collect(),
-        }
+            pane: None,
+            pane_session: None,
+            shell_path,
+            custom_shell_open: false,
+        };
+        view.bind_shell_path(cx);
+        view
+    }
+
+    /// The terminal currently shown, if one was started.
+    #[cfg(test)]
+    pub fn pane(&self) -> Option<&Entity<TerminalPane>> {
+        self.pane.as_ref()
     }
 
     /// The current workspace state.
@@ -92,10 +114,139 @@ impl ShelluneView {
     }
 
     fn request_primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.destination() == Destination::LocalShells {
+            self.start_from_picker(window, cx);
+            return;
+        }
         if self.workspace.request_primary() == PrimaryOutcome::Unavailable {
             // Keep focus inside the shell so keyboard users are not dropped.
             let handle = self.root_focus.clone();
             window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Connects the free-text shell field to this view, so Enter starts a shell.
+    fn bind_shell_path(&mut self, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        self.shell_path.update(cx, |field, _cx| {
+            field.on_submit(move |text, app| {
+                let _ = view.update(app, |view, cx| view.start_custom_shell(text, cx));
+            });
+        });
+    }
+
+    /// Starts the shell named in the free-text field.
+    ///
+    /// The text is taken as written: a wrong path becomes a real launch failure,
+    /// which is the only honest answer to a program that does not exist.
+    fn start_custom_shell(&mut self, program: String, cx: &mut Context<Self>) {
+        let program = program.trim().to_owned();
+        if program.is_empty() {
+            return;
+        }
+        let shell = LocalShell::new(program.clone(), program);
+        self.start_shell(shell, None, cx);
+    }
+
+    /// Starts whichever shell the picker currently points at.
+    fn start_from_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = if self.custom_shell_open {
+            self.shell_path.read(cx).text().trim().to_owned()
+        } else {
+            String::new()
+        };
+        let shell = if typed.is_empty() {
+            match self.workspace.selected_shell() {
+                Some(shell) => shell.clone(),
+                None => {
+                    let reason = self.strings().shell_none_found.to_owned();
+                    self.workspace
+                        .fail_local_start(Failure::new(reason, Recovery::ChooseShell));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            LocalShell::new(typed.clone(), typed)
+        };
+        self.start_shell(shell, Some(window), cx);
+    }
+
+    /// Starts a shell and, when it really started, records the session.
+    ///
+    /// A launch failure replaces the section with the reason and keeps no pane, so
+    /// the destination cannot show a terminal that has no process behind it.
+    fn start_shell(
+        &mut self,
+        shell: LocalShell,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.pane_session {
+            self.workspace.session_closed(session);
+        }
+        self.pane = None;
+        self.pane_session = None;
+
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let pane =
+            cx.new(|pane_cx| TerminalPane::start(shell.clone(), grid, font_size, locale, pane_cx));
+        let state = pane.read(cx).state().clone();
+        if !state.accepts_input() {
+            let reason = state
+                .failure()
+                .map_or_else(|| state.label(locale), |failure| failure.to_string());
+            self.workspace
+                .fail_local_start(Failure::new(reason, Recovery::ChooseShell));
+            cx.notify();
+            return;
+        }
+
+        let session = self.workspace.register_local_session(&shell);
+        let id = session.id();
+        self.workspace.session_connected(id);
+        // The size the pane actually uses is the one the next session starts with.
+        self.workspace
+            .set_local_font_size(pane.read(cx).font_size());
+        cx.observe(&pane, |view, pane, cx| view.sync_pane(pane, cx))
+            .detach();
+        if let Some(window) = window {
+            let handle = pane.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
+        self.pane = Some(pane);
+        self.pane_session = Some(id);
+        cx.notify();
+    }
+
+    /// Mirrors what the pane reports into the session list.
+    ///
+    /// The pane owns the truth about the process; the list only repeats it, so a
+    /// shell that exited cannot stay listed as running.
+    fn sync_pane(&mut self, pane: Entity<TerminalPane>, cx: &mut Context<Self>) {
+        let Some(session) = self.pane_session else {
+            return;
+        };
+        let state = pane.read(cx).state().clone();
+        match state {
+            PaneState::Live => {
+                self.workspace.session_connected(session);
+            }
+            PaneState::Exited { report } => {
+                // A shell that exits on its own is still over. Reporting the status it
+                // exited with is the difference between "the session ended" and a
+                // session list that keeps claiming a process that is gone.
+                let failure = report
+                    .session_failure()
+                    .unwrap_or(shellune_core::SessionFailure::ProcessExited { code: Some(0) });
+                self.workspace.session_failed(session, failure);
+            }
+            PaneState::Failed(failure) => {
+                self.workspace.session_failed(session, failure);
+            }
         }
         cx.notify();
     }
@@ -427,13 +578,11 @@ impl ShelluneView {
             )
     }
 
-    fn destination_panel(&self) -> Stateful<Div> {
+    /// The card a section shows when it holds no rows.
+    fn section_card(&self, destination: Destination, state: SectionState) -> gpui::Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let destination = self.workspace.destination();
-        let state = self.workspace.state(destination);
-
-        let card = match state {
+        match state {
             SectionState::Planned => components::state_card(
                 Tone::Planned,
                 strings.planned_title,
@@ -494,29 +643,188 @@ impl ShelluneView {
                 metrics,
             ),
             SectionState::Populated => div().flex().flex_col().gap(metrics.scale(spacing::TIGHT)),
+        }
+    }
+
+    fn rows_for(&self, destination: Destination, list: gpui::Div) -> gpui::Div {
+        match destination {
+            Destination::LocalShells => self.local_rows(list),
+            Destination::Hosts => self.host_rows(list),
+            Destination::Sessions => self.session_rows(list),
+            Destination::Transfers => self.transfer_rows(list),
+        }
+    }
+
+    fn destination_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let destination = self.workspace.destination();
+        let state = self.workspace.state(destination);
+
+        let body = if destination == Destination::LocalShells && self.pane.is_some() {
+            self.terminal_panel(cx)
+        } else {
+            let card = self.section_card(destination, state);
+            if state == SectionState::Populated {
+                self.rows_for(destination, card)
+            } else if destination == Destination::LocalShells {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.panel_gap())
+                    .child(self.shell_picker(cx))
+                    .child(card)
+            } else {
+                card
+            }
         };
 
-        let card = match state {
-            SectionState::Populated => match destination {
-                Destination::LocalShells => self.local_rows(card),
-                Destination::Hosts => self.host_rows(card),
-                Destination::Sessions => self.session_rows(card),
-                Destination::Transfers => self.transfer_rows(card),
-            },
-            _ => card,
-        };
-
-        div()
+        let container = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
             .id("content.scroll")
-            .overflow_y_scroll()
             .p(metrics.scale(spacing::SECTION))
             .gap(metrics.panel_gap())
             .debug_selector(|| "content".to_owned())
-            .child(card)
+            .child(body);
+        // A terminal fills the panel; a list of cards scrolls instead.
+        if destination == Destination::LocalShells && self.pane.is_some() {
+            container
+        } else {
+            container.overflow_y_scroll()
+        }
+    }
+
+    /// The terminal and the shell it runs, filling the destination panel.
+    fn terminal_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let metrics = self.metrics();
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(self.shell_picker(cx));
+
+        if let Some(pane) = &self.pane {
+            // A shell that ended keeps its last screen, but the reason it stopped is
+            // stated above it instead of being left for the user to guess.
+            if let Some(failure) = pane.read(cx).state().failure() {
+                column = column.child(
+                    div()
+                        .flex_none()
+                        .px(metrics.scale(spacing::TIGHT))
+                        .py(metrics.scale(spacing::HAIRLINE))
+                        .rounded(px(radius::SMALL))
+                        .bg(theme::swatch(palette::SURFACE_RAISED))
+                        .border_1()
+                        .border_color(theme::swatch(palette::BORDER))
+                        .text_size(metrics.label_size())
+                        .text_color(Tone::Danger.text())
+                        .debug_selector(|| "terminal.failure".to_owned())
+                        .child(SharedString::from(failure.to_string())),
+                );
+            }
+            column = column.child(pane.clone());
+        }
+        column
+    }
+
+    /// The shell choices and the free-text path field.
+    fn shell_picker(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let mut row = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .flex_none()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "shell.picker".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.shell_picker_label),
+            );
+
+        if self.workspace.shells().is_empty() {
+            row = row.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Warning.text())
+                    .child(strings.shell_none_found),
+            );
+        }
+
+        for (index, shell) in self.workspace.shells().iter().enumerate() {
+            let selected = index == self.workspace.shell_choice();
+            row = row.child(
+                div()
+                    .id(("shell.choice", index))
+                    .debug_selector(move || format!("shell.choice.{index}"))
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(2.0))
+                    .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(if selected {
+                        palette::ACCENT_TINT
+                    } else {
+                        palette::SURFACE_RAISED
+                    }))
+                    .border_1()
+                    .border_color(theme::swatch(if selected {
+                        palette::ACCENT
+                    } else {
+                        palette::BORDER
+                    }))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(if selected {
+                        palette::ACCENT_ON_TINT
+                    } else {
+                        palette::TEXT_SECONDARY
+                    }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.workspace.select_shell(index);
+                        cx.notify();
+                    }))
+                    .child(SharedString::from(shell.name().to_owned())),
+            );
+        }
+
+        row = row.child(
+            div()
+                .id("shell.custom")
+                .debug_selector(|| "shell.custom".to_owned())
+                .px(metrics.scale(spacing::TIGHT))
+                .py(metrics.scale(2.0))
+                .rounded(px(radius::SMALL))
+                .bg(theme::swatch(if self.custom_shell_open {
+                    palette::SURFACE_SELECTED
+                } else {
+                    palette::SURFACE_RAISED
+                }))
+                .border_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.custom_shell_open = !this.custom_shell_open;
+                    if this.custom_shell_open {
+                        let handle = this.shell_path.read(cx).focus_handle().clone();
+                        window.focus(&handle);
+                    }
+                    cx.notify();
+                }))
+                .child(strings.shell_custom_button),
+        );
+
+        if self.custom_shell_open {
+            row = row.child(self.shell_path.clone());
+        }
+        row
     }
 
     fn local_rows(&self, list: Div) -> Div {
@@ -599,26 +907,26 @@ impl ShelluneView {
 
     fn host_row(&self, host: &HostConfig) -> Div {
         let metrics = self.metrics();
-        let strings = self.strings();
-        components::row(metrics)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .min_w(px(0.0))
-                    .child(components::status_dot(Tone::Neutral, metrics))
-                    .child(components::stacked(
-                        host.name().to_owned(),
-                        host.target(),
-                        metrics,
-                    )),
-            )
-            .child(components::chip(
-                host.group().unwrap_or(strings.count_hosts).to_owned(),
-                Tone::Neutral,
-                metrics,
-            ))
+        let row = components::row(metrics).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .min_w(px(0.0))
+                .child(components::status_dot(Tone::Neutral, metrics))
+                .child(components::stacked(
+                    host.name().to_owned(),
+                    host.target(),
+                    metrics,
+                )),
+        );
+        // A host without a group shows no group chip. Using the count unit as a
+        // fallback printed the word "host" in a place that means "group", which
+        // reads as a group named "host".
+        match host_group_chip(host) {
+            Some(group) => row.child(components::chip(group, Tone::Neutral, metrics)),
+            None => row,
+        }
     }
 
     fn transfer_row(&self, transfer: &Transfer) -> Div {
@@ -747,6 +1055,10 @@ impl Render for ShelluneView {
             }))
             .on_action(cx.listener(|this, _: &ToggleLanguage, _window, cx| {
                 this.workspace.toggle_locale();
+                let locale = this.workspace.locale();
+                if let Some(pane) = this.pane.clone() {
+                    pane.update(cx, |pane, cx| pane.set_locale(locale, cx));
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &DismissNotice, _window, cx| {
@@ -763,8 +1075,19 @@ impl Render for ShelluneView {
                     .h_full()
                     .child(self.header(cx))
                     .children(notice)
-                    .child(self.destination_panel())
+                    .child(self.destination_panel(cx))
                     .child(self.status_bar()),
             )
     }
+}
+
+/// The group label a host row shows, when the host belongs to a group.
+///
+/// A host without a group shows nothing rather than the count unit, which used to
+/// print the word "host" where a group name belongs.
+pub(crate) fn host_group_chip(host: &HostConfig) -> Option<String> {
+    host.group()
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(str::to_owned)
 }

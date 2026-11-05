@@ -9,13 +9,21 @@
 //! * the design tests check the palette, the copy and the platform conventions
 //!   against the numbers written down in `docs/design/02-shell-and-design-system.md`.
 
-use gpui::{Entity, Modifiers, Pixels, Size, TestAppContext, VisualTestContext, point, px, size};
-use shellune_core::{HostConfig, Session, SessionKind, SessionState, Transfer, TransferDirection};
+use gpui::prelude::*;
+use gpui::{
+    Entity, IntoElement, Modifiers, MouseButton, Pixels, Render, ScrollDelta, ScrollWheelEvent,
+    Size, TestAppContext, VisualTestContext, div, point, px, size,
+};
+use shellune_core::{
+    HostConfig, LocalShell, Session, SessionKind, SessionState, Transfer, TransferDirection,
+};
+use shellune_terminal::GridSize;
 
 use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, ToggleLanguage};
 use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
+use crate::app::terminal::{PaneState, TerminalPane};
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Tone, Zoom, palette,
 };
@@ -219,8 +227,12 @@ async fn language_and_text_size_shortcuts_are_wired(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut TestAppContext) {
+    // Host management is still unimplemented, so its primary action must say so
+    // instead of pretending a host was created.
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
+    focus_root(&view, cx);
+    cx.dispatch_action(GoToHosts);
     cx.run_until_parked();
 
     assert!(
@@ -238,14 +250,13 @@ async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut T
             workspace.notice(),
             Some(crate::app::workspace::Notice::UnavailableBuild)
         );
-        assert_eq!(
-            workspace.state(Destination::LocalShells),
-            SectionState::Planned
-        );
-        assert_eq!(workspace.item_count(Destination::LocalShells), 0);
+        assert_eq!(workspace.state(Destination::Hosts), SectionState::Planned);
         assert_eq!(workspace.item_count(Destination::Hosts), 0);
-        assert_eq!(workspace.item_count(Destination::Sessions), 0);
         assert_eq!(workspace.item_count(Destination::Transfers), 0);
+        assert!(
+            view.read(app).pane().is_none(),
+            "an unimplemented action must not start a terminal"
+        );
     });
     assert!(
         cx.debug_bounds("notice").is_some(),
@@ -426,7 +437,7 @@ fn local_and_all_session_destinations_stay_distinguishable() {
 #[test]
 fn an_unimplemented_action_reports_that_nothing_started() {
     let mut workspace = Workspace::new();
-    for destination in Destination::ALL {
+    for destination in [Destination::Hosts, Destination::Transfers] {
         workspace.select(destination);
         assert_eq!(workspace.request_primary(), PrimaryOutcome::Unavailable);
         assert_eq!(
@@ -436,6 +447,24 @@ fn an_unimplemented_action_reports_that_nothing_started() {
         assert_eq!(workspace.item_count(destination), 0);
         assert_eq!(workspace.state(destination), SectionState::Planned);
     }
+
+    // The session list is implemented but real and empty: it says so instead of
+    // claiming the capability is missing or showing a session that does not exist.
+    workspace.select(Destination::Sessions);
+    assert_eq!(workspace.state(Destination::Sessions), SectionState::Empty);
+    assert_eq!(workspace.request_primary(), PrimaryOutcome::Unavailable);
+    assert_eq!(workspace.item_count(Destination::Sessions), 0);
+}
+
+#[test]
+fn the_local_terminal_is_the_one_destination_that_can_act() {
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::LocalShells);
+    assert_eq!(workspace.request_primary(), PrimaryOutcome::Delegated);
+    assert!(!workspace.can_act(Destination::Hosts));
+    assert!(!workspace.can_act(Destination::Transfers));
+    // Nothing was started by the request itself: the view owns the process.
+    assert_eq!(workspace.item_count(Destination::LocalShells), 0);
 }
 
 #[test]
@@ -529,6 +558,15 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             count_transfers,
             local_shell_fallback,
             nothing_running,
+            shell_picker_label,
+            shell_custom_button,
+            shell_custom_placeholder,
+            shell_none_found,
+            terminal_live,
+            terminal_failed,
+            terminal_exited,
+            terminal_terminated,
+            terminal_copy,
         ]
     )
 }
@@ -810,6 +848,20 @@ fn a_live_session_is_the_only_positive_session_state() {
         }
     }
 
+    // A clean exit is not an error, and a non-zero exit is.
+    assert_eq!(
+        Tone::for_session_state(&SessionState::Disconnected(
+            shellune_core::SessionFailure::ProcessExited { code: Some(0) }
+        )),
+        Tone::Neutral
+    );
+    assert_eq!(
+        Tone::for_session_state(&SessionState::Disconnected(
+            shellune_core::SessionFailure::ProcessExited { code: Some(2) }
+        )),
+        Tone::Danger
+    );
+
     let mut transfer = Transfer::queued(
         shellune_core::SessionId::new(),
         TransferDirection::Upload,
@@ -821,4 +873,509 @@ fn a_live_session_is_the_only_positive_session_state() {
         .complete(3)
         .expect_err("queued transfers cannot complete");
     assert_ne!(Tone::for_transfer_state(transfer.state()), Tone::Positive);
+}
+
+#[test]
+fn a_host_without_a_group_shows_no_group_chip() {
+    let mut host = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("a valid host");
+    assert_eq!(crate::app::view::host_group_chip(&host), None);
+    host.set_group(Some("  "));
+    assert_eq!(
+        crate::app::view::host_group_chip(&host),
+        None,
+        "a blank group is not a group"
+    );
+    host.set_group(Some("Production"));
+    assert_eq!(
+        crate::app::view::host_group_chip(&host).as_deref(),
+        Some("Production")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Local terminal (R2, R8)
+// ---------------------------------------------------------------------------
+
+/// Mounts a bare terminal pane so the input path and the grid can be driven
+/// without going through the whole shell.
+struct PaneHarness {
+    pane: Entity<TerminalPane>,
+}
+
+impl Render for PaneHarness {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        div().size_full().child(self.pane.clone())
+    }
+}
+
+fn pane_with<'a>(
+    content: &str,
+    cx: &'a mut TestAppContext,
+) -> (Entity<TerminalPane>, &'a mut VisualTestContext) {
+    let pane = cx.new(|pane_cx| {
+        TerminalPane::without_process(
+            LocalShell::new("Test shell", "test-shell"),
+            GridSize::new(40, 10),
+            shellune_terminal::DEFAULT_FONT_SIZE,
+            Locale::English,
+            pane_cx,
+        )
+    });
+    let harness_pane = pane.clone();
+    let (_harness, cx) = cx.add_window_view(move |_window, _cx| PaneHarness { pane: harness_pane });
+
+    if !content.is_empty() {
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| pane.feed_for_test(content.as_bytes(), cx));
+        });
+    }
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    cx.update(|window, app| window.focus(pane.read(app).focus_handle()));
+    cx.run_until_parked();
+    (pane, cx)
+}
+
+#[gpui::test]
+async fn the_terminal_shows_the_rows_its_shell_wrote(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello\r\nworld", cx);
+    let viewport = cx.update(|window, _app| window.viewport_size());
+
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text()[0..2].to_vec()),
+        vec!["hello".to_owned(), "world".to_owned()]
+    );
+    // One drawn row per grid row, and the grid is measured from the element.
+    let grid = cx.update(|_window, app| pane.read(app).grid());
+    assert!(grid.rows > 0 && grid.cols > 0);
+    assert_fits_inside(
+        bounds_of(cx, "terminal.viewport"),
+        viewport,
+        "terminal grid",
+    );
+    assert_fits_inside(bounds_of(cx, "terminal.row.0"), viewport, "first grid row");
+    assert_fits_inside(bounds_of(cx, "terminal.bar"), viewport, "terminal bar");
+    assert!(
+        cx.debug_bounds("terminal.row.99").is_none(),
+        "the pane must not draw rows the grid does not have"
+    );
+}
+
+#[gpui::test]
+async fn typing_reaches_the_shell_through_the_input_path(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+
+    // Text arrives the way an input method commits it, not as key presses.
+    cx.simulate_input("echo hi");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"echo hi".to_vec(),
+        "typed text must reach the shell"
+    );
+
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"echo hi\r".to_vec(),
+        "Return must send the carriage return a shell expects"
+    );
+
+    cx.simulate_keystrokes("ctrl-c");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"echo hi\r\x03".to_vec(),
+        "Ctrl+C must interrupt, not be swallowed as a shortcut"
+    );
+
+    cx.simulate_keystrokes("up");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"echo hi\r\x03\x1b[A".to_vec(),
+        "an arrow key must send the cursor sequence"
+    );
+}
+
+#[gpui::test]
+async fn chinese_text_is_sent_as_utf8_and_composition_is_not_sent_early(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+
+    cx.simulate_input("你好");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        "你好".as_bytes().to_vec(),
+        "committed Chinese text must reach the shell as UTF-8"
+    );
+
+    // A composition that has not been committed yet stays out of the byte stream:
+    // it is shown next to the caret until the input method commits it.
+    let sent_before = cx.update(|_window, app| pane.read(app).sent().len());
+    let marked = cx.update(|window, app| {
+        use gpui::EntityInputHandler;
+        pane.update(app, |pane, cx| {
+            pane.replace_and_mark_text_in_range(None, "nihao", None, window, cx);
+            pane.marked_text_range(window, cx)
+        })
+    });
+    assert!(marked.is_some(), "the composition must be tracked");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().len()),
+        sent_before,
+        "an uncommitted composition must not be sent to the shell"
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("terminal.composition").is_some(),
+        "the composition must be visible while it is being typed"
+    );
+
+    // Committing replaces the composition with its final text and sends it once.
+    cx.update(|window, app| {
+        use gpui::EntityInputHandler;
+        pane.update(app, |pane, cx| {
+            pane.replace_text_in_range(None, "你好", window, cx);
+        });
+    });
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        "你好你好".as_bytes().to_vec(),
+        "the committed text is sent and not repeated"
+    );
+}
+
+#[gpui::test]
+async fn a_mouse_selection_is_copied_when_it_is_released(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello world", cx);
+    let viewport = bounds_of(cx, "terminal.viewport");
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    let origin = viewport.origin;
+    let y = origin.y + px(cell.height * 0.5);
+    let first = point(origin.x + px(cell.width * 0.5), y);
+    let fifth = point(origin.x + px(cell.width * 4.5), y);
+
+    cx.simulate_mouse_down(first, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(fifth, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(fifth, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        Some("hello".to_owned()),
+        "selecting with the mouse must put the text on the clipboard"
+    );
+    let clipboard =
+        cx.update(|_window, app| app.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(clipboard, Some("hello".to_owned()));
+}
+
+#[gpui::test]
+async fn the_wheel_scrolls_back_through_the_history(cx: &mut TestAppContext) {
+    let content = (0..60)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let (pane, cx) = pane_with(&content, cx);
+
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).display_offset()),
+        0,
+        "a new terminal starts at the live output"
+    );
+    let viewport = bounds_of(cx, "terminal.viewport");
+    let center = viewport.center();
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Lines(point(0.0, 3.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: Default::default(),
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_window, app| pane.read(app).display_offset()) > 0,
+        "the wheel must move the viewport back into the history"
+    );
+}
+
+#[gpui::test]
+async fn the_font_size_controls_change_the_grid(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("abc", cx);
+    let before = cx.update(|_window, app| {
+        let pane = pane.read(app);
+        (pane.font_size(), pane.grid().cols)
+    });
+
+    let bounds = bounds_of(cx, "terminal.font.increase");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+
+    let after = cx.update(|_window, app| {
+        let pane = pane.read(app);
+        (pane.font_size(), pane.grid().cols)
+    });
+    assert!(after.0 > before.0, "the control must raise the font size");
+    assert!(
+        after.1 <= before.1,
+        "a larger font must not fit more columns than before"
+    );
+
+    let bounds = bounds_of(cx, "terminal.font.decrease");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).font_size()),
+        before.0,
+        "the controls step back down again"
+    );
+}
+
+#[gpui::test]
+async fn a_shell_that_does_not_exist_shows_the_reason_and_keeps_no_session(
+    cx: &mut TestAppContext,
+) {
+    let mut workspace = Workspace::new();
+    workspace.set_shells(vec![LocalShell::new(
+        "Missing shell",
+        "shellune-no-such-shell-zz9",
+    )]);
+    workspace.select_shell(0);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let bounds = bounds_of(cx, "header.primary");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(view.pane().is_none(), "no terminal may be shown");
+        let workspace = view.workspace();
+        assert_eq!(
+            workspace.state(Destination::LocalShells),
+            SectionState::Failed
+        );
+        assert_eq!(workspace.item_count(Destination::LocalShells), 0);
+        let reason = workspace
+            .failure(Destination::LocalShells)
+            .map(Failure::reason)
+            .expect("the failure must say what went wrong");
+        assert!(
+            reason.contains("shellune-no-such-shell-zz9"),
+            "the reason must name the shell that failed: {reason}"
+        );
+    });
+    assert!(
+        cx.debug_bounds("terminal.viewport").is_none(),
+        "a failed launch must not draw a terminal"
+    );
+    assert!(
+        cx.debug_bounds("state.card").is_some(),
+        "the failure must be shown in the section card"
+    );
+}
+
+#[gpui::test]
+async fn the_picker_lists_the_shells_and_remembers_the_choice(cx: &mut TestAppContext) {
+    let mut workspace = Workspace::new();
+    workspace.set_shells(vec![
+        LocalShell::new("First", "first-shell"),
+        LocalShell::new("Second", "second-shell"),
+    ]);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("shell.choice.0").is_some());
+    let bounds = bounds_of(cx, "shell.choice.1");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        let workspace = view.read(app).workspace();
+        assert_eq!(workspace.shell_choice(), 1);
+        assert_eq!(
+            workspace.selected_shell().map(LocalShell::program),
+            Some("second-shell")
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_custom_shell_path_starts_exactly_what_was_typed(cx: &mut TestAppContext) {
+    let mut workspace = Workspace::new();
+    workspace.set_shells(Vec::new());
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let bounds = bounds_of(cx, "shell.custom");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("shell.path").is_some(),
+        "the path field must open"
+    );
+
+    cx.simulate_input("shellune-no-such-shell-qq1");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let workspace = view.workspace();
+        assert!(
+            view.pane().is_none(),
+            "a wrong path must not produce a terminal"
+        );
+        let reason = workspace
+            .failure(Destination::LocalShells)
+            .map(Failure::reason)
+            .unwrap_or_default();
+        assert!(
+            reason.contains("shellune-no-such-shell-qq1"),
+            "the failure must name the program that was typed: {reason}"
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_real_shell_starts_from_the_header_action(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        // Nothing to start on a machine without a shell; the other tests cover the
+        // failure that this produces.
+        return;
+    }
+
+    let bounds = bounds_of(cx, "header.primary");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("a terminal must be shown");
+    let (live, session_state, grid) = cx.update(|_window, app| {
+        let pane = pane.read(app);
+        (
+            matches!(pane.state(), PaneState::Live),
+            view.read(app)
+                .workspace()
+                .local_sessions()
+                .next()
+                .map(|session| session.state().clone()),
+            pane.grid(),
+        )
+    });
+    assert!(live, "the real shell process must be running");
+    assert_eq!(
+        session_state,
+        Some(SessionState::Connected),
+        "a started shell must be listed as connected"
+    );
+    assert!(grid.rows > 0 && grid.cols > 0);
+    assert_fits_inside(
+        bounds_of(cx, "terminal.viewport"),
+        cx.update(|window, _app| window.viewport_size()),
+        "the real terminal grid",
+    );
+
+    // The shell's own output must reach the grid through the same path the window
+    // uses: PTY -> terminal core -> the rows the view draws.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut screen = String::new();
+    while std::time::Instant::now() < deadline {
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                pane.pump_once(cx);
+            });
+        });
+        screen = cx.update(|_window, app| pane.read(app).visible_text().join("\n"));
+        if !screen.trim().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !screen.trim().is_empty(),
+        "the real shell printed nothing into the terminal grid"
+    );
+    assert!(
+        cx.debug_bounds("terminal.row.0").is_some(),
+        "the grid rows of the running shell must be drawn"
+    );
+}
+
+#[gpui::test]
+async fn a_real_shell_that_exits_stops_being_listed_as_connected(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+
+    let bounds = bounds_of(cx, "header.primary");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("a terminal must be shown");
+
+    // Leave the shell the way a user does.
+    cx.simulate_input("exit");
+    cx.simulate_keystrokes("enter");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut exited = false;
+    while std::time::Instant::now() < deadline {
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                pane.pump_once(cx);
+            });
+        });
+        exited =
+            cx.update(|_window, app| matches!(pane.read(app).state(), PaneState::Exited { .. }));
+        if exited {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(exited, "the shell exit was never noticed by the pane");
+
+    let state = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .local_sessions()
+            .next()
+            .map(|session| session.state().clone())
+    });
+    assert!(
+        matches!(
+            state,
+            Some(SessionState::Disconnected(_)) | Some(SessionState::Closed)
+        ),
+        "an exited shell must not stay listed as connected, got {state:?}"
+    );
+    // The last screen stays readable instead of the terminal disappearing.
+    assert!(
+        cx.debug_bounds("terminal.viewport").is_some(),
+        "the terminal keeps showing what the shell left behind"
+    );
 }

@@ -13,7 +13,9 @@
 //! cannot show a live session, a saved host or a finished transfer that no layer
 //! ever produced.
 
-use shellune_core::{HostConfig, Session, SessionKind, Transfer};
+use shellune_core::{
+    HostConfig, LocalShell, Session, SessionFailure, SessionId, SessionKind, Transfer,
+};
 
 use crate::app::copy::{Locale, Strings};
 use crate::app::nav::Destination;
@@ -200,6 +202,17 @@ impl<T> Section<T> {
         &self.items
     }
 
+    /// Items, so a session can record a lifecycle change in place.
+    pub fn items_mut(&mut self) -> &mut [T] {
+        &mut self.items
+    }
+
+    /// Replaces the whole result, keeping the status that justifies it.
+    pub fn replace(&mut self, status: SectionStatus, items: Vec<T>) {
+        self.status = status;
+        self.items = items;
+    }
+
     /// Number of items.
     pub fn count(&self) -> usize {
         self.items.len()
@@ -251,6 +264,9 @@ pub struct Workspace {
     sessions: Section<Session>,
     hosts: Section<HostConfig>,
     transfers: Section<Transfer>,
+    shells: Vec<LocalShell>,
+    shell_choice: usize,
+    local_font_size: f32,
     notice: Option<Notice>,
 }
 
@@ -270,9 +286,15 @@ impl Workspace {
             destination: Destination::LocalShells,
             locale: Locale::default(),
             zoom: Zoom::default(),
-            sessions: Section::planned(),
+            // The local terminal is implemented, so its section starts as a real,
+            // empty result instead of planned work. Which shell can be started is
+            // decided by probing this machine, not by the build.
+            sessions: Section::ready(Vec::new()),
             hosts: Section::planned(),
             transfers: Section::planned(),
+            shells: shellune_terminal::discover(),
+            shell_choice: 0,
+            local_font_size: shellune_terminal::DEFAULT_FONT_SIZE,
             notice: None,
         }
     }
@@ -437,9 +459,109 @@ impl Workspace {
 
     /// Whether the primary action of a destination has an implementation.
     ///
-    /// Every destination is still unimplemented in this build, so this is the one
-    /// place later tasks flip.
-    pub fn can_act(&self, _destination: Destination) -> bool {
-        false
+    /// The local terminal can always be attempted: a machine with no shell still
+    /// gets a real answer from the launch, which is more honest than greying the
+    /// action out. The other destinations arrive with their own steps.
+    pub fn can_act(&self, destination: Destination) -> bool {
+        matches!(destination, Destination::LocalShells)
+    }
+
+    /// Shells that exist on this machine.
+    pub fn shells(&self) -> &[LocalShell] {
+        &self.shells
+    }
+
+    /// Replaces the discovered shells, keeping the selection inside the list.
+    #[cfg(test)]
+    pub fn set_shells(&mut self, shells: Vec<LocalShell>) {
+        self.shells = shells;
+        if self.shell_choice >= self.shells.len() {
+            self.shell_choice = 0;
+        }
+    }
+
+    /// Index of the shell the primary action starts.
+    pub fn shell_choice(&self) -> usize {
+        self.shell_choice
+    }
+
+    /// The shell the primary action starts.
+    pub fn selected_shell(&self) -> Option<&LocalShell> {
+        self.shells.get(self.shell_choice)
+    }
+
+    /// Chooses which shell the primary action starts.
+    pub fn select_shell(&mut self, index: usize) {
+        if index < self.shells.len() {
+            self.shell_choice = index;
+        }
+    }
+
+    /// Font size the terminal starts at and remembers across sessions.
+    pub fn local_font_size(&self) -> f32 {
+        self.local_font_size
+    }
+
+    /// Records the font size the user chose in the terminal.
+    pub fn set_local_font_size(&mut self, size: f32) {
+        self.local_font_size = shellune_terminal::sanitize_font_size(size);
+    }
+
+    /// Creates a session record for a local shell that is starting.
+    pub fn register_local_session(&mut self, shell: &LocalShell) -> Session {
+        let mut session = Session::new(
+            SessionKind::Local {
+                shell: Some(shell.program().to_owned()),
+            },
+            shell.name(),
+        );
+        // A session that has not been connected yet must not be listed as live.
+        let _ = session.begin_connecting();
+        let mut sessions = self.sessions.items().to_vec();
+        sessions.push(session.clone());
+        self.sessions.replace(SectionStatus::Ready, sessions);
+        session
+    }
+
+    /// Records that a local session reached the live state.
+    pub fn session_connected(&mut self, id: SessionId) -> bool {
+        self.transition(id, |session| session.connected().is_ok())
+    }
+
+    /// Records why a session stopped being live.
+    pub fn session_failed(&mut self, id: SessionId, failure: SessionFailure) -> bool {
+        self.transition(id, |session| {
+            if session.state().was_live() {
+                session.disconnected(failure).is_ok()
+            } else {
+                session.fail(failure).is_ok()
+            }
+        })
+    }
+
+    /// Records that the user closed a session.
+    pub fn session_closed(&mut self, id: SessionId) -> bool {
+        self.transition(id, |session| session.close().is_ok())
+    }
+
+    /// Records a failure that stopped a shell from starting at all.
+    ///
+    /// The session list is left empty and the section becomes a failure, so no
+    /// phantom terminal appears where the shell refused to run.
+    pub fn fail_local_start(&mut self, failure: Failure) {
+        self.sessions
+            .replace(SectionStatus::Failed(failure), Vec::new());
+    }
+
+    fn transition(&mut self, id: SessionId, change: impl FnOnce(&mut Session) -> bool) -> bool {
+        let Some(session) = self
+            .sessions
+            .items_mut()
+            .iter_mut()
+            .find(|session| session.id() == id)
+        else {
+            return false;
+        };
+        change(session)
     }
 }

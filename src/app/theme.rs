@@ -159,6 +159,11 @@ impl Tone {
             | SessionState::VerifyingHost
             | SessionState::Authenticating => Self::Warning,
             SessionState::Connected => Self::Positive,
+            // A process that ended with status 0 ended as expected; painting that as
+            // an error would make a normal exit look like a failure.
+            SessionState::Disconnected(SessionFailure::ProcessExited { code: Some(0) }) => {
+                Self::Neutral
+            }
             SessionState::Disconnected(_) | SessionState::Failed(_) => Self::Danger,
             SessionState::Closed => Self::Planned,
         }
