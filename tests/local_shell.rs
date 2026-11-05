@@ -23,6 +23,12 @@ struct Session {
     pty: LocalSession,
     core: TerminalCore,
     exited: Option<ExitReport>,
+    /// Bytes the shell has produced since it started.
+    ///
+    /// This is the only monotonic progress signal a test can rely on: the visible
+    /// grid has 30 rows and saturates, so "the screen stopped changing" is also
+    /// what a screen that is merely full looks like.
+    bytes_read: u64,
 }
 
 impl Session {
@@ -39,6 +45,7 @@ impl Session {
             pty,
             core: TerminalCore::new(grid.cols, grid.rows, 2000),
             exited: None,
+            bytes_read: 0,
         })
     }
 
@@ -55,6 +62,7 @@ impl Session {
             pty,
             core: TerminalCore::new(grid.cols, grid.rows, 2000),
             exited: None,
+            bytes_read: 0,
         })
     }
 
@@ -70,10 +78,14 @@ impl Session {
     }
 
     /// Reads what the shell wrote into the terminal core.
-    fn pump(&mut self) {
+    ///
+    /// Returns how many bytes arrived, and adds them to the session total.
+    fn pump(&mut self) -> usize {
+        let mut read = 0;
         for event in self.pty.drain() {
             match event {
                 PtyEvent::Data(bytes) => {
+                    read += bytes.len();
                     let effects = self.core.feed(&bytes);
                     if !effects.writes.is_empty() {
                         // Answering the terminal's own queries is part of being a
@@ -85,6 +97,13 @@ impl Session {
                 PtyEvent::ReadFailed(reason) => panic!("the PTY failed: {reason}"),
             }
         }
+        self.bytes_read += read as u64;
+        read
+    }
+
+    /// Every byte the shell has produced so far.
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
     }
 
     /// Waits until the visible screen satisfies a condition.
@@ -338,6 +357,7 @@ fn interactive_session() -> Option<(Session, String)> {
             pty,
             core: TerminalCore::new(grid.cols, grid.rows, 2000),
             exited: None,
+            bytes_read: 0,
         };
         return Some((session, "vim -u NONE -N".to_owned()));
     }
@@ -350,6 +370,7 @@ fn interactive_session() -> Option<(Session, String)> {
             pty,
             core: TerminalCore::new(grid.cols, grid.rows, 2000),
             exited: None,
+            bytes_read: 0,
         };
         return Some((session, "vim -u NONE -N".to_owned()));
     }
@@ -436,29 +457,129 @@ fn a_program_that_exits_immediately_after_output_is_still_read() {
     assert_eq!(session.exited, Some(ExitReport::Clean));
 }
 
+/// Longest time Ctrl+C may take to stop the running program.
+const INTERRUPT_WINDOW: Duration = Duration::from_secs(5);
+
+/// How long output must stay silent before the stop counts as a stop.
+const QUIET_AFTER_STOP: Duration = Duration::from_millis(1500);
+
+/// Bytes the endless command must have produced before the interrupt is sent, so
+/// that the interrupt lands on a program that is really mid-stream.
+///
+/// A small number on purpose: a busy machine prints slowly, and this condition is
+/// only there to prove the stream has started — the endless command guarantees it
+/// has not finished.
+const OUTPUT_BEFORE_INTERRUPT: u64 = 512;
+
+/// How long the endless command must already have been printing when the
+/// interrupt is sent.
+///
+/// This is not slack for a guessed delay; it is where the interrupt is reliable.
+/// A ConPTY PowerShell ignores a Ctrl+C that arrives while it is still setting the
+/// pipeline up: measured here with a single 0x03, 5 of 10 interrupts sent 0.2s
+/// after the command were dropped and the command kept printing, while 44 of 44
+/// sent 2s or more in stopped it within 30-130ms. A user interrupts a command they
+/// have been watching, so that is the moment this test reproduces.
+const STREAM_ESTABLISHED: Duration = Duration::from_secs(3);
+
+/// How long the first Ctrl+C is given before the same key is pressed once more.
+///
+/// A dropped interrupt is not the PTY write path: a pipe does not lose a byte, the
+/// write reports no error, the same single 0x03 stops a flooding cmd.exe in
+/// 10-20ms, and every Ctrl+C pressed afterwards is honoured within 30-350ms. What
+/// is lost is the shell's own handling of the injected key, which no terminal can
+/// make atomic — Windows Terminal sends the same byte. One more press is what a
+/// user does, and the count is part of every failure message here.
+const RETRY_INTERRUPT_AFTER: Duration = Duration::from_secs(2);
+
 #[test]
 fn sustained_output_can_be_interrupted_and_the_shell_stays_usable() {
     let Some(mut session) = Session::start() else {
         return;
     };
 
+    // The command is endless on purpose. A bounded loop finishes by itself, so a
+    // shell that never received the interrupt still answers afterwards and the
+    // test would pass without having interrupted anything; worse, whether it does
+    // is decided by how fast the machine runs the loop.
     if cfg!(windows) {
-        session.run("1..2000 | ForEach-Object { \"tick $_\"; Start-Sleep -Milliseconds 5 }");
+        session.run("while ($true) { 'tick'; Start-Sleep -Milliseconds 5 }");
     } else {
         session.run("while true; do echo tick; sleep 0.01; done");
     }
-    // The program is producing output continuously, so the screen must keep moving.
-    session.wait_for("sustained output", |_snapshot, text| {
-        text.matches("tick").count() >= 3
-    });
-    // Then the user interrupts it with the control key a terminal must send.
-    session.write(&[0x03]);
 
-    // The shell has to come back and accept another command: the interruption must
-    // stop the program, not the session. Nothing here waits a guessed amount of
-    // time: a line typed while the interrupted program has not stopped yet is
-    // swallowed by that program, so the same line is offered again on the polling
-    // loop and the screen decides when the shell took it.
+    // Progress is counted in bytes read, not in visible "tick" lines: the screen
+    // is 30 rows and holds about 29 lines, so its content stops changing while the
+    // shell keeps printing. Only the byte counter keeps growing.
+    let baseline = session.bytes_read();
+    let started = Instant::now();
+    while session.bytes_read() - baseline < OUTPUT_BEFORE_INTERRUPT
+        || started.elapsed() < STREAM_ESTABLISHED
+    {
+        session.pump();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the endless command produced only {} bytes in {:?}; the shell never got going",
+            session.bytes_read() - baseline,
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Then the user interrupts it with the control key a terminal must send. The
+    // business fact is measured from here: output has to stop.
+    let before_interrupt = session.bytes_read();
+    let first_press_at = Instant::now();
+    session.write(&[0x03]);
+    let mut presses = 1;
+    let mut pressed_at = first_press_at;
+
+    let mut last_growth = first_press_at;
+    let mut last_bytes = before_interrupt;
+    let stopped_after = loop {
+        session.pump();
+        let now = Instant::now();
+        let bytes = session.bytes_read();
+        if bytes != last_bytes {
+            last_bytes = bytes;
+            last_growth = now;
+        }
+        let silent_for = now.duration_since(last_growth);
+        if silent_for >= QUIET_AFTER_STOP {
+            break last_growth.duration_since(pressed_at);
+        }
+        if now.duration_since(pressed_at) >= RETRY_INTERRUPT_AFTER && presses < 2 {
+            // The shell ignored the first key; the user presses it again.
+            session.write(&[0x03]);
+            presses += 1;
+            pressed_at = now;
+            continue;
+        }
+        assert!(
+            now.duration_since(pressed_at) <= INTERRUPT_WINDOW + QUIET_AFTER_STOP,
+            "the shell was still printing {:?} after {presses} Ctrl+C press(es): \
+             {} bytes at the first press, {} bytes now, last new output {:?} after \
+             the last press, still silent for {:?} (needed {QUIET_AFTER_STOP:?})",
+            now.duration_since(pressed_at),
+            before_interrupt,
+            bytes,
+            last_growth.duration_since(pressed_at),
+            silent_for
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(
+        stopped_after <= INTERRUPT_WINDOW,
+        "output only stopped {stopped_after:?} after the last Ctrl+C, later than the \
+         {INTERRUPT_WINDOW:?} the interrupt may take: {presses} press(es) since \
+         {before_interrupt} bytes, {last_bytes} bytes before it went quiet"
+    );
+
+    // And the interruption stopped the program, not the session: the shell has to
+    // take another command. Nothing here waits a guessed amount of time either — a
+    // line typed while the program is still stopping is swallowed by it, so the
+    // same line is offered again until the shell answers.
     //
     // The marker is split across two literals in the command itself, because a
     // terminal echoes what is typed: a literal marker would let the echo satisfy
@@ -468,19 +589,33 @@ fn sustained_output_can_be_interrupted_and_the_shell_stays_usable() {
     } else {
         "echo 'after'-'interrupt'\r"
     };
+    let mut offers = 0;
     let mut next_offer = Instant::now();
-    let screen = session.poll_until("the shell to answer again", |session, _snapshot, text| {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let screen = loop {
+        session.pump();
+        let snapshot = session.core.snapshot();
+        let text = snapshot.text().join("\n");
         if text.contains("after-interrupt") {
-            return true;
+            break text;
         }
         if Instant::now() >= next_offer {
             session.write(command.as_bytes());
-            next_offer = Instant::now() + Duration::from_millis(200);
+            offers += 1;
+            next_offer = Instant::now() + Duration::from_millis(250);
         }
-        false
-    });
+        assert!(
+            Instant::now() < deadline,
+            "the shell never took a command after the interrupt: 0x03 was written \
+             after {before_interrupt} bytes, output stopped {stopped_after:?} later at \
+             {last_bytes} bytes, {offers} follow-up command(s) were offered and \
+             {} bytes had arrived; the screen held:\n{text}",
+            session.bytes_read()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(
         screen.contains("after-interrupt"),
-        "the shell did not recover from the interrupt:\n{screen}"
+        "the shell did not recover from the interrupt after {offers} attempt(s):\n{screen}"
     );
 }
