@@ -1,0 +1,17 @@
+[package]
+name = "shellune-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Domain model for Shellune: hosts, sessions, transfers and safe errors."
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1.0.140"
