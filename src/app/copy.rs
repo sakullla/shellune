@@ -184,6 +184,60 @@ pub struct Strings {
     pub terminal_terminated: &'static str,
     /// Button that copies the terminal selection.
     pub terminal_copy: &'static str,
+    /// Placeholder in the host search field.
+    pub hosts_search_placeholder: &'static str,
+    /// Host list view: every saved host.
+    pub hosts_view_all: &'static str,
+    /// Host list view: hosts grouped by their group label.
+    pub hosts_view_groups: &'static str,
+    /// Host list view: hosts that were really connected, newest first.
+    pub hosts_view_recent: &'static str,
+    /// Shown when no connection has been recorded yet.
+    pub hosts_recent_empty: &'static str,
+    /// Shown when a search matches no saved host.
+    pub hosts_no_match: &'static str,
+    /// Group heading for hosts without a group label.
+    pub hosts_ungrouped: &'static str,
+    /// Form label: host name.
+    pub host_field_name: &'static str,
+    /// Form label: host address.
+    pub host_field_address: &'static str,
+    /// Form label: TCP port.
+    pub host_field_port: &'static str,
+    /// Form label: login user.
+    pub host_field_user: &'static str,
+    /// Form label: group label.
+    pub host_field_group: &'static str,
+    /// Title of the editor when a new host is being created.
+    pub host_editor_new: &'static str,
+    /// Title of the editor when a saved host is being changed.
+    pub host_editor_edit: &'static str,
+    /// Button that stores the form.
+    pub host_save: &'static str,
+    /// Button that closes the form without storing anything.
+    pub host_cancel: &'static str,
+    /// Button that opens a saved host in the editor.
+    pub host_edit: &'static str,
+    /// Button that starts deleting a saved host.
+    pub host_delete: &'static str,
+    /// Question shown before a host is deleted.
+    pub host_delete_question: &'static str,
+    /// Button that confirms the deletion.
+    pub host_delete_confirm: &'static str,
+    /// Note explaining what deleting a host does and does not touch.
+    pub host_delete_note: &'static str,
+    /// Feedback after a host was stored.
+    pub hosts_saved: &'static str,
+    /// Feedback after a host was removed.
+    pub hosts_deleted: &'static str,
+    /// Label introducing where the hosts are stored.
+    pub hosts_storage_label: &'static str,
+    /// Button that reads the host file again after a failure.
+    pub hosts_retry: &'static str,
+    /// Label introducing when a host was last reached.
+    pub host_last_connected: &'static str,
+    /// Unit after a count of successful connections.
+    pub host_connection_count: &'static str,
 }
 
 /// English copy.
@@ -208,7 +262,7 @@ pub static ENGLISH: Strings = Strings {
     state_planned: "Not in this build",
     planned_title: "This part is not built yet",
     planned_local: "the local terminal that starts a real shell, shows output and accepts typing arrives with the terminal step.",
-    planned_hosts: "saving, editing and importing hosts arrives with the host management step; nothing is stored or connected yet.",
+    planned_hosts: "importing an SSH configuration arrives with the import step; no configuration file has been read yet.",
     planned_sessions: "opening, switching and reconnecting sessions arrives with the session step; no terminal is running.",
     planned_transfers: "uploading and downloading over SFTP arrives with the transfer step; no file has been touched.",
     state_empty: "Empty",
@@ -247,6 +301,33 @@ pub static ENGLISH: Strings = Strings {
     terminal_exited: "Exited",
     terminal_terminated: "Terminated",
     terminal_copy: "Copy",
+    hosts_search_placeholder: "Search name, address, user or group",
+    hosts_view_all: "All hosts",
+    hosts_view_groups: "Groups",
+    hosts_view_recent: "Recent connections",
+    hosts_recent_empty: "No connection has been recorded yet. A host appears here after it really connected.",
+    hosts_no_match: "No saved host matches this search.",
+    hosts_ungrouped: "Ungrouped",
+    host_field_name: "Name",
+    host_field_address: "Address",
+    host_field_port: "Port",
+    host_field_user: "User",
+    host_field_group: "Group",
+    host_editor_new: "New host",
+    host_editor_edit: "Edit host",
+    host_save: "Save host",
+    host_cancel: "Cancel",
+    host_edit: "Edit",
+    host_delete: "Delete",
+    host_delete_question: "Delete this saved host?",
+    host_delete_confirm: "Delete host",
+    host_delete_note: "Only the saved record is removed; nothing on the server changes.",
+    hosts_saved: "Host saved. No connection was opened.",
+    hosts_deleted: "Host deleted.",
+    hosts_storage_label: "Saved in",
+    hosts_retry: "Read the file again",
+    host_last_connected: "Last connected",
+    host_connection_count: "connections",
 };
 
 /// Chinese copy.
@@ -271,7 +352,7 @@ pub static CHINESE: Strings = Strings {
     state_planned: "当前版本未包含",
     planned_title: "这部分还没有实现",
     planned_local: "真正启动 Shell、显示输出并接受输入的本地终端会随终端步骤一起提供。",
-    planned_hosts: "保存、编辑和导入主机随主机管理步骤一起提供；目前不会写入配置，也不会发起连接。",
+    planned_hosts: "导入 SSH 配置会随导入步骤一起提供；目前还没有读取任何配置文件。",
     planned_sessions: "打开、切换和重连会话随会话步骤一起提供；目前没有任何终端在运行。",
     planned_transfers: "通过 SFTP 上传与下载随传输步骤一起提供；目前没有改动任何文件。",
     state_empty: "空",
@@ -310,6 +391,33 @@ pub static CHINESE: Strings = Strings {
     terminal_exited: "已退出",
     terminal_terminated: "被终止",
     terminal_copy: "复制",
+    hosts_search_placeholder: "搜索名称、地址、用户名或分组",
+    hosts_view_all: "全部主机",
+    hosts_view_groups: "按分组",
+    hosts_view_recent: "最近连接",
+    hosts_recent_empty: "还没有连接记录。主机真正连接成功之后才会出现在这里。",
+    hosts_no_match: "没有符合这个搜索条件的主机。",
+    hosts_ungrouped: "未分组",
+    host_field_name: "名称",
+    host_field_address: "地址",
+    host_field_port: "端口",
+    host_field_user: "用户名",
+    host_field_group: "分组",
+    host_editor_new: "新建主机",
+    host_editor_edit: "编辑主机",
+    host_save: "保存主机",
+    host_cancel: "取消",
+    host_edit: "编辑",
+    host_delete: "删除",
+    host_delete_question: "要删除这台已保存的主机吗？",
+    host_delete_confirm: "删除主机",
+    host_delete_note: "只删除本地保存的记录，服务器上的内容不会改变。",
+    hosts_saved: "主机已保存，没有打开任何连接。",
+    hosts_deleted: "主机已删除。",
+    hosts_storage_label: "保存位置",
+    hosts_retry: "重新读取文件",
+    host_last_connected: "最近连接",
+    host_connection_count: "次连接",
 };
 
 /// Hint for the section shortcuts, built for one platform.

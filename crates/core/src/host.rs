@@ -90,7 +90,14 @@ pub struct HostConfig {
     group: Option<String>,
 }
 
+/// The stored shape of a host.
+///
+/// Unknown fields are rejected rather than ignored: a file that carries a
+/// password, a passphrase or any other field this build does not write is not a
+/// host record this build wrote, and loading it would silently accept a credential
+/// into a model that promises to hold none.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HostConfigWire {
     id: HostId,
     name: String,
@@ -344,5 +351,45 @@ mod tests {
             host.id()
         );
         assert!(serde_json::from_str::<HostConfig>(&invalid).is_err());
+    }
+    #[test]
+    fn deserialization_refuses_fields_this_build_does_not_write() {
+        // A stored host that carries a password is not a record this build wrote.
+        // Reading it would accept a credential into a model that has no field for
+        // one, so the whole record is rejected instead.
+        let host = HostConfig::new("web", "example.com", 22, "root").expect("valid host");
+        let with_password = format!(
+            r#"{{"id":"{}","name":"web","address":"example.com","port":22,"user":"root","group":null,"password":"hunter2"}}"#,
+            host.id()
+        );
+        let error = serde_json::from_str::<HostConfig>(&with_password)
+            .expect_err("a host record with a password must not load");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "the reason must name the problem: {error}"
+        );
+    }
+
+    #[test]
+    fn a_stored_host_cannot_carry_a_secret_in_its_own_text() {
+        // The guarantee is structural rather than a scrubber: the serialized form
+        // has exactly the six fields above, so there is nowhere for a password or a
+        // key passphrase to be written.
+        let host = HostConfig::new("web", "example.com", 22, "root").expect("valid host");
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&host).expect("host serializes"))
+                .expect("valid json");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("a host is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["address", "group", "id", "name", "port", "user"],
+            "a saved host may not grow a field that could hold a secret"
+        );
     }
 }

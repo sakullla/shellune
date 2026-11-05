@@ -1,0 +1,598 @@
+//! Host management state: the editor draft, the three list views and the messages.
+//!
+//! This module is render-independent on purpose. The validation, the search, the
+//! grouping and the recency ordering are all decided here, in plain Rust, so they
+//! can be tested without a window; `crate::app::view` only draws what this module
+//! reports.
+//!
+//! Two rules shape the state:
+//!
+//! * a draft is text until it is saved, so an invalid port is refused by the domain
+//!   constructor and the editor keeps what the user typed;
+//! * a message says what really happened. "Saved" never implies a connection was
+//!   opened, and a failure keeps the reason the storage layer produced.
+
+use shellune_core::{HostConfig, HostId, Port};
+use shellune_storage::{Group, HostBook, HostEdit, RecentHost, host_matches};
+
+use crate::app::copy::Strings;
+
+/// Which subset of the saved hosts the list shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostView {
+    /// Every saved host, in saved order.
+    #[default]
+    All,
+    /// The same hosts, grouped by group label.
+    Groups,
+    /// The hosts that were really reached, newest first.
+    Recent,
+}
+
+impl HostView {
+    /// Every view, in the order the switch shows them.
+    pub const ALL: [Self; 3] = [Self::All, Self::Groups, Self::Recent];
+
+    /// Label of the view switch entry.
+    pub fn label(self, strings: &Strings) -> &'static str {
+        match self {
+            Self::All => strings.hosts_view_all,
+            Self::Groups => strings.hosts_view_groups,
+            Self::Recent => strings.hosts_view_recent,
+        }
+    }
+
+    /// Debug selector of the view switch entry, used by the layout tests.
+    pub fn debug_selector(self) -> &'static str {
+        match self {
+            Self::All => "hosts.view.all",
+            Self::Groups => "hosts.view.groups",
+            Self::Recent => "hosts.view.recent",
+        }
+    }
+}
+
+/// One field of the host form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostField {
+    /// The display name.
+    Name,
+    /// The address the next connection dials.
+    Address,
+    /// The TCP port.
+    Port,
+    /// The login user.
+    User,
+    /// The optional group label.
+    Group,
+}
+
+impl HostField {
+    /// Every field, in form order.
+    pub const ALL: [Self; 5] = [
+        Self::Name,
+        Self::Address,
+        Self::Port,
+        Self::User,
+        Self::Group,
+    ];
+
+    /// Label shown in front of the field.
+    pub fn label(self, strings: &Strings) -> &'static str {
+        match self {
+            Self::Name => strings.host_field_name,
+            Self::Address => strings.host_field_address,
+            Self::Port => strings.host_field_port,
+            Self::User => strings.host_field_user,
+            Self::Group => strings.host_field_group,
+        }
+    }
+
+    /// Debug selector of the field, used by the tests.
+    pub fn debug_selector(self) -> &'static str {
+        match self {
+            Self::Name => "hosts.field.name",
+            Self::Address => "hosts.field.address",
+            Self::Port => "hosts.field.port",
+            Self::User => "hosts.field.user",
+            Self::Group => "hosts.field.group",
+        }
+    }
+}
+
+/// The text of one host form.
+///
+/// The values stay text until the form is saved: a port of "0" has to be visible in
+/// the field that produced it, so the editor keeps the text and asks the domain
+/// whether it is usable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostDraft {
+    editing: Option<HostId>,
+    name: String,
+    address: String,
+    port: String,
+    user: String,
+    group: String,
+}
+
+impl HostDraft {
+    /// An empty form for a new host.
+    #[must_use]
+    pub fn create() -> Self {
+        Self {
+            editing: None,
+            name: String::new(),
+            address: String::new(),
+            port: Port::DEFAULT.to_string(),
+            user: String::new(),
+            group: String::new(),
+        }
+    }
+
+    /// A form filled with a saved host.
+    #[must_use]
+    pub fn edit(host: &HostConfig) -> Self {
+        Self {
+            editing: Some(host.id()),
+            name: host.name().to_owned(),
+            address: host.address().to_owned(),
+            port: host.port().to_string(),
+            user: host.user().to_owned(),
+            group: host.group().unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// The host this form changes, when it is not a new one.
+    #[must_use]
+    pub fn editing(&self) -> Option<HostId> {
+        self.editing
+    }
+
+    /// The current text of one field.
+    #[must_use]
+    pub fn text(&self, field: HostField) -> &str {
+        match field {
+            HostField::Name => &self.name,
+            HostField::Address => &self.address,
+            HostField::Port => &self.port,
+            HostField::User => &self.user,
+            HostField::Group => &self.group,
+        }
+    }
+
+    /// Replaces the text of one field, returning whether it changed.
+    pub fn set_text(&mut self, field: HostField, text: impl Into<String>) -> bool {
+        let slot = match field {
+            HostField::Name => &mut self.name,
+            HostField::Address => &mut self.address,
+            HostField::Port => &mut self.port,
+            HostField::User => &mut self.user,
+            HostField::Group => &mut self.group,
+        };
+        let text = text.into();
+        if *slot == text {
+            return false;
+        }
+        *slot = text;
+        true
+    }
+
+    /// The validated change this form describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the domain rejected the values: an empty name, address or
+    /// user, an address with whitespace, or a port outside `1..=65535`. The text is
+    /// not changed, so the user can correct the field that was refused.
+    pub fn build(&self, existing: Option<&HostConfig>) -> Result<HostEdit, String> {
+        let port = parse_port(&self.port)?;
+        match existing {
+            Some(saved) => {
+                let mut host = saved.clone();
+                host.set_name(self.name.clone())
+                    .map_err(|error| error.to_string())?;
+                host.set_address(self.address.clone())
+                    .map_err(|error| error.to_string())?;
+                host.set_port(u32::from(port.get()))
+                    .map_err(|error| error.to_string())?;
+                host.set_user(self.user.clone())
+                    .map_err(|error| error.to_string())?;
+                host.set_group(Some(self.group.clone()));
+                Ok(HostEdit::replace(host))
+            }
+            None => {
+                let mut host = HostConfig::new(
+                    self.name.clone(),
+                    self.address.clone(),
+                    port.get(),
+                    self.user.clone(),
+                )
+                .map_err(|error| error.to_string())?;
+                host.set_group(Some(self.group.clone()));
+                Ok(HostEdit::create(host))
+            }
+        }
+    }
+}
+
+/// Parses the port field.
+///
+/// An empty field means the SSH default; anything else goes through the domain's
+/// range check, which is the only place that decides whether a port is usable.
+fn parse_port(text: &str) -> Result<Port, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Port::DEFAULT);
+    }
+    let raw: u32 = text
+        .parse()
+        .map_err(|_| format!("{text} is not a port number; use 1-65535"))?;
+    Port::new(raw).map_err(|error| error.to_string())
+}
+
+/// What the last action produced, in the words of the layer that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostsMessage {
+    text: String,
+    failed: bool,
+}
+
+impl HostsMessage {
+    /// The text to show.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether the action failed, which decides the tone.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+}
+
+/// Everything the hosts destination holds apart from the records themselves.
+#[derive(Debug, Default)]
+pub struct HostsPanel {
+    view: HostView,
+    search: String,
+    draft: Option<HostDraft>,
+    pending_delete: Option<HostId>,
+    message: Option<HostsMessage>,
+}
+
+impl HostsPanel {
+    /// A panel showing every saved host.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current list view.
+    #[must_use]
+    pub fn view(&self) -> HostView {
+        self.view
+    }
+
+    /// Switches the list view and clears a pending question, which belonged to what
+    /// the user was looking at.
+    pub fn select_view(&mut self, view: HostView) {
+        if self.view != view {
+            self.view = view;
+            self.pending_delete = None;
+        }
+    }
+
+    /// The current search phrase.
+    #[must_use]
+    pub fn search(&self) -> &str {
+        &self.search
+    }
+
+    /// Sets the search phrase, which every view applies.
+    pub fn set_search(&mut self, phrase: impl Into<String>) {
+        self.search = phrase.into();
+    }
+
+    /// The open form, if any.
+    #[must_use]
+    pub fn draft(&self) -> Option<&HostDraft> {
+        self.draft.as_ref()
+    }
+
+    /// The open form, for the fields to write into.
+    pub fn draft_mut(&mut self) -> Option<&mut HostDraft> {
+        self.draft.as_mut()
+    }
+
+    /// Whether a form is open.
+    #[must_use]
+    pub fn is_editing(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    /// Opens an empty form for a new host.
+    pub fn open_create(&mut self) {
+        self.draft = Some(HostDraft::create());
+        self.pending_delete = None;
+        self.clear_message();
+    }
+
+    /// Opens the form filled with a saved host.
+    pub fn open_edit(&mut self, host: &HostConfig) {
+        self.draft = Some(HostDraft::edit(host));
+        self.pending_delete = None;
+        self.clear_message();
+    }
+
+    /// Closes the form, keeping what was typed out of the records.
+    pub fn close_editor(&mut self) {
+        self.draft = None;
+    }
+
+    /// The host the user is about to delete.
+    #[must_use]
+    pub fn pending_delete(&self) -> Option<HostId> {
+        self.pending_delete
+    }
+
+    /// Asks the deletion question for one host.
+    pub fn ask_delete(&mut self, id: HostId) {
+        self.pending_delete = Some(id);
+        self.draft = None;
+    }
+
+    /// Drops the deletion question without touching the records.
+    pub fn cancel_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
+    /// Takes the confirmed deletion target.
+    pub fn take_delete(&mut self) -> Option<HostId> {
+        self.pending_delete.take()
+    }
+
+    /// The last message, if any.
+    #[must_use]
+    pub fn message(&self) -> Option<&HostsMessage> {
+        self.message.as_ref()
+    }
+
+    /// Records what the last action produced.
+    pub fn set_message(&mut self, text: impl Into<String>, failed: bool) {
+        self.message = Some(HostsMessage {
+            text: text.into(),
+            failed,
+        });
+    }
+
+    /// Removes the last message.
+    pub fn clear_message(&mut self) {
+        self.message = None;
+    }
+
+    /// The hosts the current view lists, filtered by the search phrase.
+    #[must_use]
+    pub fn filtered<'a>(&self, book: &'a HostBook) -> Vec<&'a HostConfig> {
+        book.search(&self.search)
+    }
+
+    /// The groups the current view lists, filtered by the search phrase.
+    #[must_use]
+    pub fn groups<'a>(&self, book: &'a HostBook) -> Vec<Group<'a>> {
+        HostBook::group(book.search(&self.search))
+    }
+
+    /// The reached hosts the recent view lists, filtered by the search phrase.
+    #[must_use]
+    pub fn recent<'a>(&self, book: &'a HostBook) -> Vec<RecentHost<'a>> {
+        book.recent_hosts()
+            .into_iter()
+            .filter(|recent| host_matches(recent.host, &self.search))
+            .collect()
+    }
+}
+
+/// Formats a Unix timestamp as UTC, without pulling a date library into the shell.
+///
+/// The recent view has to say *when* a host was reached, and a stored integer is not
+/// an answer a user can read. The conversion is the standard civil-from-days
+/// algorithm, and the tests pin it to known instants.
+#[must_use]
+pub fn format_unix(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let time = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        time / 3600,
+        (time % 3600) / 60
+    )
+}
+
+/// Days since 1970-01-01 to a calendar date (Howard Hinnant's civil_from_days).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shellune_storage::HostBook;
+
+    fn host(name: &str, address: &str, port: u16, user: &str, group: Option<&str>) -> HostConfig {
+        let mut host = HostConfig::new(name, address, port, user).expect("a valid host");
+        host.set_group(group);
+        host
+    }
+
+    #[test]
+    fn a_new_form_starts_with_the_default_port_and_no_content() {
+        let draft = HostDraft::create();
+        assert_eq!(draft.text(HostField::Port), "22");
+        assert_eq!(draft.text(HostField::Name), "");
+        assert_eq!(draft.editing(), None);
+        assert_eq!(
+            draft.build(None),
+            Err("host name cannot be empty".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_port_is_refused_by_the_domain_when_it_is_outside_the_tcp_range() {
+        let mut draft = HostDraft::create();
+        draft.set_text(HostField::Name, "web");
+        draft.set_text(HostField::Address, "10.0.0.5");
+        draft.set_text(HostField::User, "deploy");
+
+        draft.set_text(HostField::Port, "0");
+        let error = draft.build(None).expect_err("port 0 is not usable");
+        assert!(
+            error.contains("1-65535"),
+            "the reason names the range: {error}"
+        );
+
+        draft.set_text(HostField::Port, "70000");
+        let error = draft.build(None).expect_err("port 70000 is not usable");
+        assert!(
+            error.contains("70000"),
+            "the reason names the value: {error}"
+        );
+
+        draft.set_text(HostField::Port, "ssh");
+        let error = draft.build(None).expect_err("a word is not a port");
+        assert!(error.contains("ssh"), "the reason names the value: {error}");
+
+        draft.set_text(HostField::Port, "2222");
+        let edit = draft.build(None).expect("a valid host");
+        assert_eq!(edit.host().port().get(), 2222);
+        assert_eq!(edit.host().target(), "deploy@10.0.0.5:2222");
+        assert_eq!(edit.replaces(), None);
+    }
+
+    #[test]
+    fn an_empty_port_field_means_the_ssh_default() {
+        let mut draft = HostDraft::create();
+        draft.set_text(HostField::Name, "web");
+        draft.set_text(HostField::Address, "10.0.0.5");
+        draft.set_text(HostField::User, "deploy");
+        draft.set_text(HostField::Port, "   ");
+        let edit = draft.build(None).expect("an empty port is the default");
+        assert_eq!(edit.host().port().get(), 22);
+    }
+
+    #[test]
+    fn a_blank_group_is_no_group_and_an_edit_keeps_the_identifier() {
+        let saved = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
+        let mut draft = HostDraft::edit(&saved);
+        assert_eq!(draft.editing(), Some(saved.id()));
+        assert_eq!(draft.text(HostField::Group), "Prod");
+
+        draft.set_text(HostField::Group, "   ");
+        draft.set_text(HostField::Address, "web.example.org");
+        let edit = draft.build(Some(&saved)).expect("a valid edit");
+        assert_eq!(edit.host().id(), saved.id(), "an edit keeps the identifier");
+        assert_eq!(edit.replaces(), Some(saved.id()));
+        assert_eq!(edit.host().group(), None);
+        assert_eq!(edit.host().address(), "web.example.org");
+    }
+
+    #[test]
+    fn a_rejected_edit_leaves_the_saved_host_alone() {
+        let saved = host("web", "10.0.0.5", 22, "deploy", None);
+        let mut draft = HostDraft::edit(&saved);
+        draft.set_text(HostField::Port, "0");
+        assert!(draft.build(Some(&saved)).is_err());
+        assert_eq!(saved.port().get(), 22);
+        assert_eq!(
+            draft.text(HostField::Port),
+            "0",
+            "the field keeps what was typed"
+        );
+    }
+
+    #[test]
+    fn the_views_read_the_same_records_and_the_search_filters_all_of_them() {
+        let web = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
+        let api = host("api", "api.example.org", 2222, "svc", Some("prod"));
+        let lab = host("lab", "lab.internal", 22, "root", None);
+        let mut book = HostBook::from_hosts(vec![web.clone(), api, lab]).expect("distinct hosts");
+        book.record_connection(web.id(), 1_700_000_000)
+            .expect("recorded");
+
+        let mut panel = HostsPanel::new();
+        assert_eq!(panel.view(), HostView::All);
+        assert_eq!(panel.filtered(&book).len(), 3);
+        assert_eq!(panel.groups(&book).len(), 2);
+        assert_eq!(
+            panel.recent(&book).len(),
+            1,
+            "only a real connection is recent"
+        );
+
+        panel.set_search("prod");
+        assert_eq!(panel.filtered(&book).len(), 2);
+        assert_eq!(panel.groups(&book)[0].len(), 2);
+        assert_eq!(
+            panel.recent(&book).len(),
+            1,
+            "the recent view applies the same search"
+        );
+
+        panel.set_search("nothing matches this");
+        assert!(panel.filtered(&book).is_empty());
+        assert!(panel.groups(&book).is_empty());
+        assert!(panel.recent(&book).is_empty());
+    }
+
+    #[test]
+    fn opening_a_form_clears_a_previous_message_and_question() {
+        let saved = host("web", "10.0.0.5", 22, "deploy", None);
+        let mut panel = HostsPanel::new();
+        panel.set_message("Host saved.", false);
+        panel.ask_delete(saved.id());
+        assert_eq!(panel.pending_delete(), Some(saved.id()));
+
+        panel.open_create();
+        assert!(panel.is_editing());
+        assert_eq!(panel.pending_delete(), None);
+        assert!(panel.message().is_none());
+
+        panel.open_edit(&saved);
+        assert_eq!(panel.draft().and_then(HostDraft::editing), Some(saved.id()));
+        panel.close_editor();
+        assert!(!panel.is_editing());
+    }
+
+    #[test]
+    fn switching_the_view_drops_a_question_about_the_previous_one() {
+        let saved = host("web", "10.0.0.5", 22, "deploy", None);
+        let mut panel = HostsPanel::new();
+        panel.ask_delete(saved.id());
+        panel.select_view(HostView::Recent);
+        assert_eq!(panel.view(), HostView::Recent);
+        assert_eq!(panel.pending_delete(), None);
+    }
+
+    #[test]
+    fn unix_seconds_are_shown_as_a_readable_utc_instant() {
+        assert_eq!(format_unix(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_unix(1_700_000_000), "2023-11-14 22:13 UTC");
+        assert_eq!(format_unix(1_700_000_100), "2023-11-14 22:15 UTC");
+        assert_eq!(format_unix(951_782_400), "2000-02-29 00:00 UTC");
+    }
+}

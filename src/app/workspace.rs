@@ -390,6 +390,23 @@ impl Workspace {
         &self.hosts
     }
 
+    /// Replaces the saved hosts with what the storage layer really holds.
+    ///
+    /// The section is only ever filled from a loaded or saved file, so a populated
+    /// hosts list cannot appear before a store produced it.
+    pub fn replace_hosts(&mut self, status: SectionStatus, items: Vec<HostConfig>) {
+        self.hosts.replace(status, items);
+    }
+
+    /// Reports that the host file could not be read.
+    ///
+    /// The list is emptied in the same step: showing the previous records beside a
+    /// failure would claim they are still what is on disk.
+    pub fn fail_hosts(&mut self, failure: Failure) {
+        self.hosts
+            .replace(SectionStatus::Failed(failure), Vec::new());
+    }
+
     /// Transfer tasks.
     pub fn transfers(&self) -> &Section<Transfer> {
         &self.transfers
@@ -461,9 +478,11 @@ impl Workspace {
     ///
     /// The local terminal can always be attempted: a machine with no shell still
     /// gets a real answer from the launch, which is more honest than greying the
-    /// action out. The other destinations arrive with their own steps.
+    /// action out. Saving a host is the same kind of action: the store answers
+    /// whether it could be written, so the button is never greyed out on a guess.
+    /// The other destinations arrive with their own steps.
     pub fn can_act(&self, destination: Destination) -> bool {
-        matches!(destination, Destination::LocalShells)
+        matches!(destination, Destination::LocalShells | Destination::Hosts)
     }
 
     /// Shells that exist on this machine.

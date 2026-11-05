@@ -9,6 +9,9 @@
 //! * the design tests check the palette, the copy and the platform conventions
 //!   against the numbers written down in `docs/design/02-shell-and-design-system.md`.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use gpui::prelude::*;
 use gpui::{
     ClipboardItem, Entity, IntoElement, Modifiers, MouseButton, Pixels, Render, ScrollDelta,
@@ -17,9 +20,10 @@ use gpui::{
 use shellune_core::{
     HostConfig, LocalShell, Session, SessionKind, SessionState, Transfer, TransferDirection,
 };
+use shellune_storage::{HostBook, HostEdit, HostStore};
 use shellune_terminal::GridSize;
 
-use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, ToggleLanguage};
+use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage};
 use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
@@ -227,12 +231,12 @@ async fn language_and_text_size_shortcuts_are_wired(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut TestAppContext) {
-    // Host management is still unimplemented, so its primary action must say so
-    // instead of pretending a host was created.
+    // Transfers are still unimplemented, so their primary action must say so
+    // instead of pretending a transfer was started.
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     focus_root(&view, cx);
-    cx.dispatch_action(GoToHosts);
+    cx.dispatch_action(GoToTransfers);
     cx.run_until_parked();
 
     assert!(
@@ -250,9 +254,12 @@ async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut T
             workspace.notice(),
             Some(crate::app::workspace::Notice::UnavailableBuild)
         );
-        assert_eq!(workspace.state(Destination::Hosts), SectionState::Planned);
-        assert_eq!(workspace.item_count(Destination::Hosts), 0);
+        assert_eq!(
+            workspace.state(Destination::Transfers),
+            SectionState::Planned
+        );
         assert_eq!(workspace.item_count(Destination::Transfers), 0);
+        assert_eq!(workspace.item_count(Destination::Hosts), 0);
         assert!(
             view.read(app).pane().is_none(),
             "an unimplemented action must not start a terminal"
@@ -266,39 +273,57 @@ async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut T
 
 #[gpui::test]
 async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut TestAppContext) {
-    let scenarios = [
+    // The hosts destination is implemented, so the only non-populated state it can
+    // really be in is "empty". The other three are exercised on a destination that
+    // still has them, through the same state card.
+    let cases = [
         (
             "planned",
-            Section::<HostConfig>::planned(),
+            Destination::Transfers,
+            Workspace::with_sections(
+                Section::<Session>::planned(),
+                Section::<HostConfig>::planned(),
+                Section::<Transfer>::planned(),
+            ),
             SectionState::Planned,
         ),
         (
             "loading",
-            Section::<HostConfig>::loading(),
+            Destination::Transfers,
+            Workspace::with_sections(
+                Section::<Session>::planned(),
+                Section::<HostConfig>::planned(),
+                Section::<Transfer>::loading(),
+            ),
             SectionState::Loading,
         ),
         (
             "failed",
-            Section::<HostConfig>::failed(Failure::new(
-                "the host list could not be read",
-                Recovery::ImportConfig,
-            )),
+            Destination::Transfers,
+            Workspace::with_sections(
+                Section::<Session>::planned(),
+                Section::<HostConfig>::planned(),
+                Section::<Transfer>::failed(Failure::new(
+                    "the transfer list could not be read",
+                    Recovery::Retry,
+                )),
+            ),
             SectionState::Failed,
         ),
         (
             "empty",
-            Section::<HostConfig>::ready(Vec::new()),
+            Destination::Hosts,
+            Workspace::with_sections(
+                Section::<Session>::planned(),
+                Section::<HostConfig>::ready(Vec::new()),
+                Section::<Transfer>::planned(),
+            ),
             SectionState::Empty,
         ),
     ];
 
-    for (name, hosts, expected) in scenarios {
-        let mut workspace = Workspace::with_sections(
-            Section::<Session>::planned(),
-            hosts,
-            Section::<Transfer>::planned(),
-        );
-        workspace.select(Destination::Hosts);
+    for (name, destination, mut workspace, expected) in cases {
+        workspace.select(destination);
         let (view, cx) =
             cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
         cx.simulate_resize(design_window());
@@ -306,7 +331,7 @@ async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut Test
 
         let viewport = cx.update(|window, _app| window.viewport_size());
         assert_eq!(
-            cx.update(|_window, app| view.read(app).workspace().state(Destination::Hosts)),
+            cx.update(|_window, app| view.read(app).workspace().state(destination)),
             expected,
             "the {name} fixture did not keep its state"
         );
@@ -319,22 +344,32 @@ async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut Test
 }
 
 #[gpui::test]
-async fn a_failed_section_stays_failed_after_the_primary_action_is_requested(
-    cx: &mut TestAppContext,
-) {
-    let mut workspace = Workspace::with_sections(
-        Section::<Session>::planned(),
-        Section::<HostConfig>::failed(Failure::new(
-            "the saved host file is not readable",
-            Recovery::ImportConfig,
-        )),
-        Section::<Transfer>::planned(),
-    );
+async fn a_host_file_that_cannot_be_read_stays_failed_when_it_is_retried(cx: &mut TestAppContext) {
+    // A data directory that is a file cannot hold a host file. Retrying reads the
+    // same impossible path, so the failure has to survive the retry instead of
+    // turning into an empty host list.
+    let dir = TempDir::new("unreadable");
+    let root = dir.path().join("data");
+    std::fs::write(&root, "not a directory").expect("the sentinel file is written");
+
+    let mut workspace = Workspace::new();
     workspace.select(Destination::Hosts);
+    let store = HostStore::at(&root);
     let (view, cx) =
-        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+        cx.add_window_view(move |_window, cx| ShelluneView::with_store(cx, workspace, store));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).workspace().state(Destination::Hosts),
+            SectionState::Failed
+        );
+    });
+    assert!(
+        cx.debug_bounds("state.card").is_some(),
+        "the failure has to be visible where the hosts would be"
+    );
 
     let bounds = bounds_of(cx, "header.primary");
     let center = bounds.center();
@@ -345,9 +380,14 @@ async fn a_failed_section_stays_failed_after_the_primary_action_is_requested(
         let workspace = view.read(app).workspace();
         assert_eq!(workspace.state(Destination::Hosts), SectionState::Failed);
         assert_eq!(workspace.item_count(Destination::Hosts), 0);
-        assert_eq!(
-            workspace.failure(Destination::Hosts).map(Failure::reason),
-            Some("the saved host file is not readable")
+        let reason = workspace
+            .failure(Destination::Hosts)
+            .map(Failure::reason)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            reason.contains("hosts.json"),
+            "the reason names the file it could not read: {reason}"
         );
     });
 }
@@ -437,16 +477,19 @@ fn local_and_all_session_destinations_stay_distinguishable() {
 #[test]
 fn an_unimplemented_action_reports_that_nothing_started() {
     let mut workspace = Workspace::new();
-    for destination in [Destination::Hosts, Destination::Transfers] {
-        workspace.select(destination);
-        assert_eq!(workspace.request_primary(), PrimaryOutcome::Unavailable);
-        assert_eq!(
-            workspace.notice(),
-            Some(crate::app::workspace::Notice::UnavailableBuild)
-        );
-        assert_eq!(workspace.item_count(destination), 0);
-        assert_eq!(workspace.state(destination), SectionState::Planned);
-    }
+    // Transfers are still unimplemented: their primary action must report that
+    // nothing started rather than pretend a transfer was queued.
+    workspace.select(Destination::Transfers);
+    assert_eq!(workspace.request_primary(), PrimaryOutcome::Unavailable);
+    assert_eq!(
+        workspace.notice(),
+        Some(crate::app::workspace::Notice::UnavailableBuild)
+    );
+    assert_eq!(workspace.item_count(Destination::Transfers), 0);
+    assert_eq!(
+        workspace.state(Destination::Transfers),
+        SectionState::Planned
+    );
 
     // The session list is implemented but real and empty: it says so instead of
     // claiming the capability is missing or showing a session that does not exist.
@@ -457,11 +500,13 @@ fn an_unimplemented_action_reports_that_nothing_started() {
 }
 
 #[test]
-fn the_local_terminal_is_the_one_destination_that_can_act() {
+fn only_the_implemented_destinations_can_act() {
     let mut workspace = Workspace::new();
     workspace.select(Destination::LocalShells);
     assert_eq!(workspace.request_primary(), PrimaryOutcome::Delegated);
-    assert!(!workspace.can_act(Destination::Hosts));
+    // Saving a host is implemented, so its action is offered; the store answers
+    // whether the write worked rather than the button guessing.
+    assert!(workspace.can_act(Destination::Hosts));
     assert!(!workspace.can_act(Destination::Transfers));
     // Nothing was started by the request itself: the view owns the process.
     assert_eq!(workspace.item_count(Destination::LocalShells), 0);
@@ -470,11 +515,11 @@ fn the_local_terminal_is_the_one_destination_that_can_act() {
 #[test]
 fn selecting_another_destination_clears_a_stale_notice() {
     let mut workspace = Workspace::new();
-    workspace.select(Destination::Hosts);
+    workspace.select(Destination::Transfers);
     assert_eq!(workspace.request_primary(), PrimaryOutcome::Unavailable);
     assert!(workspace.notice().is_some());
 
-    workspace.select(Destination::Transfers);
+    workspace.select(Destination::Sessions);
     assert_eq!(workspace.notice(), None);
     workspace.dismiss_notice();
     assert_eq!(workspace.notice(), None);
@@ -567,6 +612,33 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_exited,
             terminal_terminated,
             terminal_copy,
+            hosts_search_placeholder,
+            hosts_view_all,
+            hosts_view_groups,
+            hosts_view_recent,
+            hosts_recent_empty,
+            hosts_no_match,
+            hosts_ungrouped,
+            host_field_name,
+            host_field_address,
+            host_field_port,
+            host_field_user,
+            host_field_group,
+            host_editor_new,
+            host_editor_edit,
+            host_save,
+            host_cancel,
+            host_edit,
+            host_delete,
+            host_delete_question,
+            host_delete_confirm,
+            host_delete_note,
+            hosts_saved,
+            hosts_deleted,
+            hosts_storage_label,
+            hosts_retry,
+            host_last_connected,
+            host_connection_count,
         ]
     )
 }
@@ -1479,4 +1551,580 @@ async fn a_real_shell_that_exits_stops_being_listed_as_connected(cx: &mut TestAp
         cx.debug_bounds("terminal.viewport").is_some(),
         "the terminal keeps showing what the shell left behind"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Host management (R3)
+// ---------------------------------------------------------------------------
+
+/// A directory that removes itself when the test ends.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "shellune-app-{}-{}-{tag}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(&path).expect("the test directory can be created");
+        Self { path }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    fn store(&self) -> HostStore {
+        HostStore::at(&self.path)
+    }
+
+    fn file(&self) -> PathBuf {
+        self.path.join("hosts.json")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Mounts the shell on the hosts destination with an explicit store.
+fn hosts_view(
+    cx: &mut TestAppContext,
+    store: HostStore,
+) -> (Entity<ShelluneView>, &mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_store(cx, workspace, store));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// Clicks the centre of a rendered element.
+fn click(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = bounds_of(cx, selector);
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// Clicks a form field and types into it, the way a user does.
+fn type_into(cx: &mut VisualTestContext, selector: &'static str, text: &str) {
+    click(cx, selector);
+    cx.simulate_input(text);
+    cx.run_until_parked();
+}
+
+/// Empties a field from its end, which is where the caret starts.
+fn clear_field(cx: &mut VisualTestContext, selector: &'static str, characters: usize) {
+    click(cx, selector);
+    for _ in 0..characters {
+        cx.simulate_keystrokes("backspace");
+    }
+    cx.run_until_parked();
+}
+
+fn stored_host(
+    name: &str,
+    address: &str,
+    port: u16,
+    user: &str,
+    group: Option<&str>,
+) -> HostConfig {
+    let mut host = HostConfig::new(name, address, port, user).expect("a valid test host");
+    host.set_group(group);
+    host
+}
+
+/// Writes a book with the given hosts, as a previous run would have left it.
+fn seed(store: &HostStore, hosts: Vec<HostConfig>) -> HostBook {
+    // A fresh book, not a load: some tests seed over a file that is deliberately
+    // damaged, and the point of the seed is what the next run must read.
+    let mut book = HostBook::new();
+    for host in hosts {
+        book.apply(&HostEdit::create(host))
+            .expect("the host is inserted");
+    }
+    store.save(&book).expect("the book saves");
+    book
+}
+
+#[gpui::test]
+async fn a_new_host_is_created_through_the_form_and_reaches_the_file(cx: &mut TestAppContext) {
+    let dir = TempDir::new("create");
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    assert!(
+        cx.debug_bounds("hosts.editor").is_none(),
+        "no form before the action"
+    );
+    assert!(
+        cx.debug_bounds("state.card").is_some(),
+        "an empty store explains itself"
+    );
+
+    click(cx, "header.primary");
+    assert!(
+        cx.debug_bounds("hosts.editor").is_some(),
+        "the primary action opens the form"
+    );
+
+    type_into(cx, "hosts.field.name", "build");
+    type_into(cx, "hosts.field.address", "10.0.0.7");
+    clear_field(cx, "hosts.field.port", 2);
+    cx.simulate_input("2222");
+    cx.run_until_parked();
+    type_into(cx, "hosts.field.user", "deploy");
+    type_into(cx, "hosts.field.group", "Prod");
+
+    click(cx, "hosts.save");
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let book = view.book();
+        assert_eq!(book.hosts().len(), 1, "one host was created");
+        let host = &book.hosts()[0];
+        assert_eq!(host.name(), "build");
+        assert_eq!(host.address(), "10.0.0.7");
+        assert_eq!(host.port().get(), 2222);
+        assert_eq!(host.user(), "deploy");
+        assert_eq!(host.group(), Some("Prod"));
+
+        let workspace = view.workspace();
+        assert_eq!(
+            workspace.state(Destination::Hosts),
+            SectionState::Populated,
+            "the saved host is a real result"
+        );
+        assert_eq!(workspace.item_count(Destination::Hosts), 1);
+        // Saving a host is not connecting to it.
+        assert_eq!(workspace.item_count(Destination::Sessions), 0);
+        assert_eq!(workspace.item_count(Destination::LocalShells), 0);
+        assert!(view.pane().is_none(), "no terminal was started");
+    });
+
+    // The debug bounds of this GPUI version accumulate across frames, so a closed
+    // form is asserted through the state and through what the list now shows.
+    assert!(
+        cx.update(|_window, app| !view.read(app).hosts_state().is_editing()),
+        "a stored host closes the form"
+    );
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "the list now holds the one saved host"
+    );
+    assert!(
+        cx.debug_bounds("hosts.row.0").is_some(),
+        "the new host is listed"
+    );
+    assert!(
+        cx.debug_bounds("hosts.message").is_some(),
+        "the shell says what happened"
+    );
+    assert!(dir.file().is_file(), "the record reached the disk");
+    assert!(
+        std::fs::read_to_string(dir.file())
+            .expect("the file is readable")
+            .contains("10.0.0.7"),
+        "the file holds the address that was typed"
+    );
+}
+
+#[gpui::test]
+async fn an_invalid_port_is_refused_and_nothing_is_written(cx: &mut TestAppContext) {
+    let dir = TempDir::new("port");
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    click(cx, "header.primary");
+    type_into(cx, "hosts.field.name", "web");
+    type_into(cx, "hosts.field.address", "10.0.0.5");
+    type_into(cx, "hosts.field.user", "deploy");
+    clear_field(cx, "hosts.field.port", 2);
+    cx.simulate_input("0");
+    cx.run_until_parked();
+
+    click(cx, "hosts.save");
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            view.book().hosts().is_empty(),
+            "a refused port must not create a host"
+        );
+        let draft = view
+            .hosts_state()
+            .draft()
+            .expect("the form stays open so the field can be corrected");
+        assert_eq!(draft.text(crate::app::hosts::HostField::Port), "0");
+        let message = view
+            .hosts_state()
+            .message()
+            .expect("the refusal is explained");
+        assert!(message.failed(), "a refusal is a failure");
+        assert!(
+            message.text().contains("1-65535"),
+            "the reason names the range: {}",
+            message.text()
+        );
+    });
+    assert!(
+        !dir.file().exists(),
+        "a refused input must not create the host file"
+    );
+    assert!(
+        cx.debug_bounds("hosts.message").is_some(),
+        "the reason is on screen"
+    );
+}
+
+#[gpui::test]
+async fn a_saved_host_is_listed_again_in_a_new_window_and_its_edit_is_persisted(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("edit");
+    let store = dir.store();
+    let book = seed(
+        &store,
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let id = book.hosts()[0].id();
+
+    // A new window on the same directory is what a restart looks like to the shell.
+    let (view, cx) = hosts_view(cx, HostStore::at(dir.path()));
+    assert!(
+        cx.debug_bounds("hosts.row.0").is_some(),
+        "the host saved by the previous run is listed"
+    );
+
+    click(cx, "hosts.edit.0");
+    assert!(cx.debug_bounds("hosts.editor").is_some());
+    cx.update(|_window, app| {
+        let draft = view
+            .read(app)
+            .hosts_state()
+            .draft()
+            .expect("a form is open");
+        assert_eq!(
+            draft.text(crate::app::hosts::HostField::Address),
+            "10.0.0.5"
+        );
+        assert_eq!(draft.text(crate::app::hosts::HostField::User), "deploy");
+        assert_eq!(draft.text(crate::app::hosts::HostField::Port), "22");
+    });
+
+    clear_field(cx, "hosts.field.address", "10.0.0.5".len());
+    cx.simulate_input("web.example.org");
+    cx.run_until_parked();
+    clear_field(cx, "hosts.field.user", "deploy".len());
+    cx.simulate_input("ops");
+    cx.run_until_parked();
+
+    click(cx, "hosts.save");
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let book = view.book();
+        assert_eq!(book.hosts().len(), 1, "an edit must not add a host");
+        let host = book.host(id).expect("the same record");
+        assert_eq!(host.target(), "ops@web.example.org:22");
+        assert_eq!(view.workspace().item_count(Destination::Sessions), 0);
+    });
+
+    let restarted = HostStore::at(dir.path()).load().expect("the file loads");
+    assert_eq!(restarted.hosts().len(), 1);
+    assert_eq!(
+        restarted.host(id).expect("the same record").target(),
+        "ops@web.example.org:22",
+        "the edited address and user are what the next run reads"
+    );
+}
+
+#[gpui::test]
+async fn the_three_views_and_the_search_read_the_one_saved_book(cx: &mut TestAppContext) {
+    let dir = TempDir::new("views");
+    let store = dir.store();
+    let book = seed(
+        &store,
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", Some("Prod")),
+            stored_host("api", "api.example.org", 2222, "svc", Some("Prod")),
+            stored_host("lab", "lab.internal", 22, "root", None),
+        ],
+    );
+    let web = book.hosts()[0].id();
+
+    let (view, cx) = hosts_view(cx, store);
+    assert!(cx.debug_bounds("hosts.row.0").is_some());
+    assert!(cx.debug_bounds("hosts.row.1").is_some());
+    assert!(cx.debug_bounds("hosts.row.2").is_some());
+    assert!(
+        cx.debug_bounds("hosts.row.3").is_none(),
+        "three hosts must not render four rows"
+    );
+
+    click(cx, "hosts.view.groups");
+    assert!(
+        cx.debug_bounds("hosts.group.0").is_some(),
+        "the named group has a heading"
+    );
+    assert!(
+        cx.debug_bounds("hosts.group.1").is_some(),
+        "the hosts without a group get their own heading"
+    );
+
+    click(cx, "hosts.view.recent");
+    assert!(
+        cx.debug_bounds("hosts.recent.empty").is_some(),
+        "saving a host is not connecting to it, so nothing is recent yet"
+    );
+    assert!(cx.debug_bounds("hosts.recent.0").is_none());
+
+    // The remote-connection step records a real connection through this path.
+    let recorded = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.record_host_connection(web, 1_700_000_000, cx)
+        })
+    });
+    assert!(recorded, "the recency record reached the file");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hosts.recent.0").is_some(),
+        "a host that really connected is listed in the recent view"
+    );
+    let reloaded = HostStore::at(dir.path()).load().expect("the file loads");
+    assert_eq!(reloaded.recent_hosts().len(), 1);
+    assert_eq!(reloaded.recent_hosts()[0].host.name(), "web");
+
+    click(cx, "hosts.view.all");
+    type_into(cx, "hosts.search", "api");
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "the search narrows the list to the one matching host"
+    );
+
+    type_into(cx, "hosts.search", "zzz");
+    assert!(
+        cx.debug_bounds("hosts.nomatch").is_some(),
+        "an empty search result says so instead of looking empty"
+    );
+    assert!(
+        cx.debug_bounds("hosts.list.0").is_some(),
+        "no row is left after a search that matches nothing"
+    );
+}
+
+#[gpui::test]
+async fn a_damaged_host_file_is_visible_and_only_a_real_read_clears_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("damaged");
+    std::fs::write(dir.file(), "{ this is not a host book }").expect("the damaged file is written");
+
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        let workspace = view.read(app).workspace();
+        assert_eq!(workspace.state(Destination::Hosts), SectionState::Failed);
+        assert_eq!(workspace.item_count(Destination::Hosts), 0);
+        let reason = workspace
+            .failure(Destination::Hosts)
+            .map(Failure::reason)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            reason.contains("hosts.json"),
+            "the reason names the file: {reason}"
+        );
+    });
+    assert!(
+        cx.debug_bounds("state.card").is_some(),
+        "the damage is visible where the hosts would be"
+    );
+
+    click(cx, "hosts.retry");
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).workspace().state(Destination::Hosts),
+            SectionState::Failed,
+            "retrying a file that is still damaged keeps the failure"
+        );
+    });
+
+    // A readable file is what clears it — not a retry on its own.
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    click(cx, "hosts.retry");
+    cx.update(|_window, app| {
+        let workspace = view.read(app).workspace();
+        assert_eq!(workspace.state(Destination::Hosts), SectionState::Populated);
+        assert_eq!(workspace.item_count(Destination::Hosts), 1);
+    });
+    assert!(cx.debug_bounds("hosts.row.0").is_some());
+}
+
+#[gpui::test]
+async fn a_write_that_the_platform_refuses_keeps_the_list_and_reports_the_reason(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("write-fail");
+    let store = dir.store();
+    seed(
+        &store,
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+
+    let (view, cx) = hosts_view(cx, store);
+
+    // The data directory becomes a file: the next save cannot even create the
+    // directory it would write into.
+    std::fs::remove_dir_all(dir.path()).expect("the directory is removed");
+    std::fs::write(dir.path(), "not a directory").expect("the path becomes a file");
+
+    click(cx, "header.primary");
+    type_into(cx, "hosts.field.name", "db");
+    type_into(cx, "hosts.field.address", "10.0.0.6");
+    type_into(cx, "hosts.field.user", "postgres");
+    click(cx, "hosts.save");
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(
+            view.book().hosts().len(),
+            1,
+            "a failed write must not add the host to the list"
+        );
+        assert_eq!(view.book().hosts()[0].name(), "web");
+        let message = view
+            .hosts_state()
+            .message()
+            .expect("the failure is explained");
+        assert!(message.failed());
+        assert!(
+            message.text().contains("could not be created")
+                || message.text().contains("could not be written"),
+            "the reason comes from the layer that failed: {}",
+            message.text()
+        );
+        assert_eq!(
+            view.workspace().state(Destination::Hosts),
+            SectionState::Populated,
+            "the list still shows what the file really holds"
+        );
+    });
+    assert!(cx.debug_bounds("hosts.message").is_some());
+}
+
+#[gpui::test]
+async fn deleting_a_host_asks_first_and_the_file_follows(cx: &mut TestAppContext) {
+    let dir = TempDir::new("delete");
+    let store = dir.store();
+    seed(
+        &store,
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", None),
+            stored_host("db", "10.0.0.6", 22, "postgres", None),
+        ],
+    );
+
+    let (view, cx) = hosts_view(cx, store);
+
+    click(cx, "hosts.delete.0");
+    assert!(
+        cx.debug_bounds("hosts.confirm").is_some(),
+        "deleting asks first"
+    );
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).book().hosts().len(),
+            2,
+            "a question deletes nothing"
+        );
+    });
+
+    click(cx, "hosts.confirm.cancel");
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().pending_delete().is_none()),
+        "cancelling drops the question"
+    );
+    assert!(
+        cx.debug_bounds("hosts.list.2").is_some(),
+        "cancelling keeps both hosts listed"
+    );
+
+    click(cx, "hosts.delete.0");
+    click(cx, "hosts.confirm.delete");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(view.book().hosts().len(), 1);
+        assert_eq!(view.workspace().item_count(Destination::Hosts), 1);
+        let message = view.hosts_state().message().expect("the result is stated");
+        assert!(!message.failed());
+    });
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "one host is left in the list"
+    );
+    let reloaded = HostStore::at(dir.path()).load().expect("the file loads");
+    assert_eq!(reloaded.hosts().len(), 1, "the deletion reached the file");
+
+    // The boundary: the last host can be deleted too, and an empty book is a real
+    // result rather than a planned capability.
+    click(cx, "hosts.delete.0");
+    click(cx, "hosts.confirm.delete");
+    cx.update(|_window, app| {
+        let workspace = view.read(app).workspace();
+        assert_eq!(workspace.state(Destination::Hosts), SectionState::Empty);
+        assert_eq!(workspace.item_count(Destination::Hosts), 0);
+    });
+    assert!(
+        cx.debug_bounds("state.card").is_some(),
+        "an empty book explains itself instead of listing nothing"
+    );
+    let reloaded = HostStore::at(dir.path())
+        .load()
+        .expect("an empty book loads");
+    assert_eq!(reloaded.hosts().len(), 0);
+}
+
+#[gpui::test]
+async fn the_host_form_edits_at_the_caret_instead_of_appending_only(cx: &mut TestAppContext) {
+    let dir = TempDir::new("caret");
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    click(cx, "header.primary");
+    type_into(cx, "hosts.field.name", "web");
+    // Home then typing inserts in front of the existing text, and Backspace removes
+    // the character before the caret. Appending only would make the field unusable
+    // for correcting a saved record.
+    click(cx, "hosts.field.name");
+    cx.simulate_keystrokes("home");
+    cx.simulate_input("my-");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("end");
+    cx.simulate_keystrokes("backspace");
+    cx.simulate_input("b");
+    cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        let draft = view
+            .read(app)
+            .hosts_state()
+            .draft()
+            .expect("a form is open")
+            .clone();
+        assert_eq!(
+            draft.text(crate::app::hosts::HostField::Name),
+            "my-web",
+            "typing at the caret and deleting before it must edit the text in place"
+        );
+    });
 }

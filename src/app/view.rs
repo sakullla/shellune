@@ -15,7 +15,8 @@ use gpui::{
     Context, Div, Entity, FocusHandle, FontWeight, IntoElement, Render, SharedString, Stateful,
     Window, div, px,
 };
-use shellune_core::{HostConfig, LocalShell, Session, SessionId, SessionState, Transfer};
+use shellune_core::{HostConfig, HostId, LocalShell, Session, SessionId, SessionState, Transfer};
+use shellune_storage::{HostBook, HostStore};
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{
@@ -23,12 +24,15 @@ use crate::app::actions::{
     NextDestination, PreviousDestination, ToggleLanguage,
 };
 use crate::app::copy::{self, Locale, Strings};
+use crate::app::hosts::{HostDraft, HostField, HostView, HostsPanel, format_unix};
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::terminal::{PaneState, TerminalPane};
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
-use crate::app::workspace::{Failure, PrimaryOutcome, Recovery, SectionState, Workspace};
+use crate::app::workspace::{
+    Failure, PrimaryOutcome, Recovery, SectionState, SectionStatus, Workspace,
+};
 use crate::app::{components, theme::radius};
 
 /// The application shell view.
@@ -41,10 +45,40 @@ pub struct ShelluneView {
     pane_session: Option<SessionId>,
     shell_path: Entity<TextField>,
     custom_shell_open: bool,
+    /// Where the saved hosts live.
+    store: HostStore,
+    /// What that file really held the last time it was read or written.
+    book: HostBook,
+    /// The host list views, the open form and the last message.
+    hosts: HostsPanel,
+    hosts_search: Entity<TextField>,
+    /// The five form fields, present only while the editor is open.
+    host_fields: Option<HostFields>,
+}
+
+/// The five fields of the host editor, in form order.
+struct HostFields {
+    name: Entity<TextField>,
+    address: Entity<TextField>,
+    port: Entity<TextField>,
+    user: Entity<TextField>,
+    group: Entity<TextField>,
+}
+
+impl HostFields {
+    fn get(&self, field: HostField) -> &Entity<TextField> {
+        match field {
+            HostField::Name => &self.name,
+            HostField::Address => &self.address,
+            HostField::Port => &self.port,
+            HostField::User => &self.user,
+            HostField::Group => &self.group,
+        }
+    }
 }
 
 impl ShelluneView {
-    /// Builds the shell in its initial state: every capability still unimplemented.
+    /// Builds the shell in its initial state, reading the saved hosts.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self::with_workspace(cx, Workspace::new())
     }
@@ -52,8 +86,19 @@ impl ShelluneView {
     /// Builds the shell around an existing workspace, used by tests and by later
     /// tasks that restore state before the first frame.
     pub fn with_workspace(cx: &mut Context<Self>, workspace: Workspace) -> Self {
+        Self::with_store(cx, workspace, default_store())
+    }
+
+    /// Builds the shell around an existing workspace and host store.
+    ///
+    /// The hosts section the caller passed decides where the records come from: a
+    /// planned section means "read the store", anything else means the caller has
+    /// already established the state and the store is only where saves will go.
+    pub fn with_store(cx: &mut Context<Self>, workspace: Workspace, store: HostStore) -> Self {
         let placeholder = workspace.strings().shell_custom_placeholder;
+        let search_placeholder = workspace.strings().hosts_search_placeholder;
         let shell_path = cx.new(|cx| TextField::new(placeholder, cx));
+        let hosts_search = cx.new(|cx| TextField::new(search_placeholder, cx));
         let mut view = Self {
             workspace,
             root_focus: cx.focus_handle(),
@@ -62,9 +107,46 @@ impl ShelluneView {
             pane_session: None,
             shell_path,
             custom_shell_open: false,
+            store,
+            book: HostBook::new(),
+            hosts: HostsPanel::new(),
+            hosts_search,
+            host_fields: None,
         };
         view.bind_shell_path(cx);
+        view.bind_host_search(cx);
+        view.restore_hosts(cx);
         view
+    }
+
+    /// Reads the saved hosts, or adopts the section the caller already built.
+    fn restore_hosts(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.workspace.hosts().status(), SectionStatus::Planned) {
+            self.reload_hosts(cx);
+            return;
+        }
+        // A restored section is a real result from the caller; seeding the book with
+        // it keeps the list and the records from disagreeing. Records that break the
+        // invariants are dropped rather than rendered: the store is the only place
+        // that can say what is really saved.
+        self.book =
+            HostBook::from_hosts(self.workspace.hosts().items().to_vec()).unwrap_or_default();
+    }
+
+    /// The saved records this shell last read or wrote.
+    ///
+    /// Read by the shell tests, and by the steps that record a real connection.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn book(&self) -> &HostBook {
+        &self.book
+    }
+
+    /// The host list views, the open form and the last message.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn hosts_state(&self) -> &HostsPanel {
+        &self.hosts
     }
 
     /// The terminal currently shown, if one was started.
@@ -130,6 +212,16 @@ impl ShelluneView {
             self.start_from_picker(window, cx);
             return;
         }
+        if self.workspace.destination() == Destination::Hosts {
+            // A destination whose records could not be read offers reading them
+            // again; every other state of it offers a new host.
+            if self.workspace.state(Destination::Hosts) == SectionState::Failed {
+                self.reload_hosts(cx);
+            } else {
+                self.open_create_host(cx);
+            }
+            return;
+        }
         if self.workspace.request_primary() == PrimaryOutcome::Unavailable {
             // Keep focus inside the shell so keyboard users are not dropped.
             let handle = self.root_focus.clone();
@@ -147,6 +239,241 @@ impl ShelluneView {
                     .unwrap_or(false)
             });
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Host management (R3)
+    // -----------------------------------------------------------------------
+
+    /// Mirrors the search field into the panel, so the list filters as the user types.
+    fn bind_host_search(&mut self, cx: &mut Context<Self>) {
+        let search = self.hosts_search.clone();
+        cx.observe(&search, |view, field, cx| {
+            let phrase = field.read(cx).text().to_owned();
+            if view.hosts.search() != phrase {
+                view.hosts.set_search(phrase);
+                cx.notify();
+            }
+        })
+        .detach();
+    }
+
+    /// Mirrors one form field into the draft and lets Enter save the form.
+    fn bind_host_field(&mut self, field: HostField, cx: &mut Context<Self>) {
+        let Some(entity) = self
+            .host_fields
+            .as_ref()
+            .map(|fields| fields.get(field).clone())
+        else {
+            return;
+        };
+
+        let view = cx.entity().downgrade();
+        entity.update(cx, |text_field, _cx| {
+            text_field.on_submit(move |_text, _window, app| {
+                view.update(app, |view, cx| {
+                    view.save_host(cx);
+                    // The field keeps its text: when the save was refused, the reason
+                    // points at what the user typed and must still be there.
+                    false
+                })
+                .unwrap_or(false)
+            });
+        });
+
+        cx.observe(&entity, move |view, text_field, cx| {
+            let text = text_field.read(cx).text().to_owned();
+            if let Some(draft) = view.hosts.draft_mut() {
+                draft.set_text(field, text);
+            }
+            cx.notify();
+        })
+        .detach();
+    }
+
+    /// Reads the host file again and reports what it really holds.
+    fn reload_hosts(&mut self, cx: &mut Context<Self>) {
+        match self.store.load() {
+            Ok(book) => {
+                self.book = book;
+                self.hosts.clear_message();
+                let items = self.book.hosts().to_vec();
+                self.workspace.replace_hosts(SectionStatus::Ready, items);
+            }
+            Err(error) => {
+                // A file that cannot be read is not an empty list: the section keeps
+                // the reason the storage layer produced and holds no records, so no
+                // host is shown that the file does not really contain.
+                self.book = HostBook::new();
+                self.host_fields = None;
+                self.workspace
+                    .fail_hosts(Failure::new(error.to_string(), Recovery::Retry));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens an empty form for a new host.
+    fn open_create_host(&mut self, cx: &mut Context<Self>) {
+        self.hosts.open_create();
+        self.open_host_fields(cx);
+    }
+
+    /// Opens the form filled with a saved host.
+    fn open_edit_host(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.hosts.open_edit(host);
+        self.open_host_fields(cx);
+    }
+
+    fn open_host_fields(&mut self, cx: &mut Context<Self>) {
+        let draft = self
+            .hosts
+            .draft()
+            .cloned()
+            .unwrap_or_else(HostDraft::create);
+        let strings = self.strings();
+        let name = cx.new(|cx| {
+            TextField::with_text(strings.host_field_name, draft.text(HostField::Name), cx)
+        });
+        let address = cx.new(|cx| {
+            TextField::with_text(
+                strings.host_field_address,
+                draft.text(HostField::Address),
+                cx,
+            )
+        });
+        let port = cx.new(|cx| {
+            TextField::with_text(strings.host_field_port, draft.text(HostField::Port), cx)
+        });
+        let user = cx.new(|cx| {
+            TextField::with_text(strings.host_field_user, draft.text(HostField::User), cx)
+        });
+        let group = cx.new(|cx| {
+            TextField::with_text(strings.host_field_group, draft.text(HostField::Group), cx)
+        });
+        self.host_fields = Some(HostFields {
+            name,
+            address,
+            port,
+            user,
+            group,
+        });
+        for field in HostField::ALL {
+            self.bind_host_field(field, cx);
+        }
+        cx.notify();
+    }
+
+    /// Closes the form without touching the saved records.
+    fn close_host_editor(&mut self, cx: &mut Context<Self>) {
+        self.hosts.close_editor();
+        self.host_fields = None;
+        cx.notify();
+    }
+
+    /// Validates the form and stores it when the domain accepts it.
+    fn save_host(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.hosts.draft().cloned() else {
+            return;
+        };
+        let saved = draft.editing().and_then(|id| self.book.host(id)).cloned();
+        let edit = match draft.build(saved.as_ref()) {
+            Ok(edit) => edit,
+            Err(reason) => {
+                // The form stays open with what the user typed, and the reason names
+                // the field the domain refused.
+                self.hosts.set_message(reason, true);
+                cx.notify();
+                return;
+            }
+        };
+
+        let mut next = self.book.clone();
+        if let Err(error) = next.apply(&edit) {
+            self.hosts.set_message(error.to_string(), true);
+            cx.notify();
+            return;
+        }
+        self.commit_hosts(next, self.strings().hosts_saved, cx);
+    }
+
+    /// Saves the records, and only then adopts them as the current state.
+    fn commit_hosts(&mut self, next: HostBook, message: &str, cx: &mut Context<Self>) {
+        match self.store.save(&next) {
+            Ok(()) => {
+                self.book = next;
+                self.hosts.close_editor();
+                self.host_fields = None;
+                self.hosts.set_message(message.to_owned(), false);
+                let items = self.book.hosts().to_vec();
+                self.workspace.replace_hosts(SectionStatus::Ready, items);
+            }
+            // The records on disk did not change, so neither does the list: the
+            // message carries the reason the write produced.
+            Err(error) => self.hosts.set_message(error.to_string(), true),
+        }
+        cx.notify();
+    }
+
+    /// Asks the deletion question for one host.
+    fn ask_delete_host(&mut self, id: HostId, cx: &mut Context<Self>) {
+        self.host_fields = None;
+        self.hosts.ask_delete(id);
+        cx.notify();
+    }
+
+    /// Drops the deletion question without touching anything.
+    fn cancel_delete_host(&mut self, cx: &mut Context<Self>) {
+        self.hosts.cancel_delete();
+        cx.notify();
+    }
+
+    /// Deletes the host the question is about, once the answer is stored.
+    fn confirm_delete_host(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.hosts.take_delete() else {
+            return;
+        };
+        let mut next = self.book.clone();
+        if let Err(error) = next.remove(id) {
+            self.hosts.set_message(error.to_string(), true);
+            cx.notify();
+            return;
+        }
+        self.commit_hosts(next, self.strings().hosts_deleted, cx);
+    }
+
+    /// Records that a host was really reached, and stores the record.
+    ///
+    /// The remote-connection step calls this after a session reached
+    /// `Connected`. Nothing in host management itself calls it, which is why saving
+    /// a host never makes it appear in the recent view.
+    ///
+    /// Returns whether the record reached the file.
+    #[allow(dead_code)]
+    pub fn record_host_connection(
+        &mut self,
+        id: HostId,
+        at_unix: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut next = self.book.clone();
+        if let Err(error) = next.record_connection(id, at_unix) {
+            self.hosts.set_message(error.to_string(), true);
+            cx.notify();
+            return false;
+        }
+        match self.store.save(&next) {
+            Ok(()) => {
+                self.book = next;
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.hosts.set_message(error.to_string(), true);
+                cx.notify();
+                false
+            }
+        }
     }
 
     /// Starts the shell named in the free-text field.
@@ -276,6 +603,527 @@ impl ShelluneView {
             }
         }
         cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // Hosts destination (R3)
+    // -----------------------------------------------------------------------
+
+    /// The hosts destination: where the records live, the search and view switch,
+    /// the form, the deletion question and the list the current view selects.
+    ///
+    /// A store that cannot be read renders as a state card with its reason and a
+    /// retry, because "no hosts" and "the file is broken" are different answers.
+    fn hosts_destination(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let state = self.workspace.state(Destination::Hosts);
+
+        match state {
+            SectionState::Planned | SectionState::Loading => {
+                return self.section_card(Destination::Hosts, state);
+            }
+            SectionState::Failed => {
+                return self
+                    .section_card(Destination::Hosts, state)
+                    .child(self.text_button(
+                        SharedString::from("hosts.retry"),
+                        strings.hosts_retry,
+                        Tone::Accent,
+                        cx,
+                        |view, cx| view.reload_hosts(cx),
+                    ));
+            }
+            SectionState::Empty | SectionState::Populated => {}
+        }
+
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(metrics.scale(spacing::SNUG))
+            .child(self.hosts_storage_line());
+
+        if let Some(message) = self.hosts.message() {
+            column = column.child(
+                div()
+                    .debug_selector(|| "hosts.message".to_owned())
+                    .text_size(metrics.label_size())
+                    .text_color(if message.failed() {
+                        Tone::Danger.text()
+                    } else {
+                        Tone::Positive.text()
+                    })
+                    .child(SharedString::from(message.text().to_owned())),
+            );
+        }
+
+        // An empty store with no search and no open form explains itself; anything
+        // else shows the tools and the list.
+        if self.book.hosts().is_empty()
+            && self.hosts.search().trim().is_empty()
+            && !self.hosts.is_editing()
+        {
+            return column.child(self.section_card(Destination::Hosts, state));
+        }
+
+        column = column.child(self.hosts_toolbar(cx));
+        if let Some(fields) = &self.host_fields {
+            column = column.child(self.host_editor(fields, cx));
+        }
+        if let Some(id) = self.hosts.pending_delete() {
+            column = column.child(self.host_delete_bar(id, cx));
+        }
+        column.child(self.hosts_list(cx))
+    }
+
+    /// Where the records are stored, said plainly.
+    fn hosts_storage_line(&self) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "hosts.storage".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.hosts_storage_label),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(SharedString::from(self.store.path().display().to_string())),
+            )
+    }
+
+    /// The search field and the three list views.
+    fn hosts_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "hosts.toolbar".to_owned())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .debug_selector(|| "hosts.search".to_owned())
+                    .child(self.hosts_search.clone()),
+            );
+
+        for view in HostView::ALL {
+            let selected = self.hosts.view() == view;
+            row = row.child(
+                div()
+                    .id(view.debug_selector())
+                    .debug_selector(move || view.debug_selector().to_owned())
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(2.0))
+                    .flex_none()
+                    .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(if selected {
+                        palette::ACCENT_TINT
+                    } else {
+                        palette::SURFACE_RAISED
+                    }))
+                    .border_1()
+                    .border_color(theme::swatch(if selected {
+                        palette::ACCENT
+                    } else {
+                        palette::BORDER
+                    }))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(if selected {
+                        palette::ACCENT_ON_TINT
+                    } else {
+                        palette::TEXT_SECONDARY
+                    }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.hosts.select_view(view);
+                        cx.notify();
+                    }))
+                    .child(view.label(strings)),
+            );
+        }
+        row
+    }
+
+    /// The form that creates or changes one host.
+    fn host_editor(&self, fields: &HostFields, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let editing = self.hosts.draft().and_then(HostDraft::editing).is_some();
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .w_full()
+            .p(metrics.scale(spacing::LOOSE))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "hosts.editor".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.title_size())
+                    .font_weight(metrics.title_weight())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(if editing {
+                        strings.host_editor_edit
+                    } else {
+                        strings.host_editor_new
+                    }),
+            );
+
+        for field in HostField::ALL {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(metrics.scale(64.0))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(field.label(strings)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .debug_selector(move || field.debug_selector().to_owned())
+                            .child(fields.get(field).clone()),
+                    ),
+            );
+        }
+
+        card.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .mt(metrics.scale(spacing::HAIRLINE))
+                .child(self.text_button(
+                    SharedString::from("hosts.save"),
+                    strings.host_save,
+                    Tone::Accent,
+                    cx,
+                    |view, cx| view.save_host(cx),
+                ))
+                .child(self.text_button(
+                    SharedString::from("hosts.cancel"),
+                    strings.host_cancel,
+                    Tone::Neutral,
+                    cx,
+                    |view, cx| view.close_host_editor(cx),
+                )),
+        )
+    }
+
+    /// The question shown before a host is deleted.
+    fn host_delete_bar(&self, id: HostId, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let target = self.book.host(id).map_or_else(String::new, |host| {
+            format!("{} ({})", host.name(), host.target())
+        });
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(metrics.scale(spacing::SNUG))
+            .w_full()
+            .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(Tone::Danger.text())
+            .debug_selector(|| "hosts.confirm".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.scale(1.0))
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(format!(
+                                "{} {target}",
+                                strings.host_delete_question
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(strings.host_delete_note),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(self.text_button(
+                        SharedString::from("hosts.confirm.delete"),
+                        strings.host_delete_confirm,
+                        Tone::Danger,
+                        cx,
+                        |view, cx| view.confirm_delete_host(cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from("hosts.confirm.cancel"),
+                        strings.host_cancel,
+                        Tone::Neutral,
+                        cx,
+                        |view, cx| view.cancel_delete_host(cx),
+                    )),
+            )
+    }
+
+    /// The saved hosts, in the shape the current view selects.
+    fn hosts_list(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        // The number of rows the current view lists is part of the selector, so a
+        // test can tell "the search narrowed the list" from "the list did not
+        // change" without reading text.
+        let entries = match self.hosts.view() {
+            HostView::All => self.hosts.filtered(&self.book).len(),
+            HostView::Groups => self
+                .hosts
+                .groups(&self.book)
+                .iter()
+                .map(shellune_storage::Group::len)
+                .sum(),
+            HostView::Recent => self.hosts.recent(&self.book).len(),
+        };
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .w_full()
+            .debug_selector(move || format!("hosts.list.{entries}"));
+
+        match self.hosts.view() {
+            HostView::All => {
+                let hosts = self.hosts.filtered(&self.book);
+                if hosts.is_empty() {
+                    return self.nothing_to_list(list);
+                }
+                for (index, host) in hosts.into_iter().enumerate() {
+                    list = list.child(self.host_row(index, host, cx));
+                }
+            }
+            HostView::Groups => {
+                let groups = self.hosts.groups(&self.book);
+                if groups.is_empty() {
+                    return self.nothing_to_list(list);
+                }
+                for (group_index, group) in groups.iter().enumerate() {
+                    let label = group.label().unwrap_or(strings.hosts_ungrouped);
+                    list = list.child(
+                        div()
+                            .debug_selector(move || format!("hosts.group.{group_index}"))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(format!("{label} · {}", group.len()))),
+                    );
+                    for host in group.hosts() {
+                        list = list.child(self.host_row(0, host, cx));
+                    }
+                }
+            }
+            HostView::Recent => {
+                let recent = self.hosts.recent(&self.book);
+                if recent.is_empty() {
+                    return list.child(self.hosts_recent_empty());
+                }
+                for (index, entry) in recent.into_iter().enumerate() {
+                    list = list.child(self.host_recent_row(index, entry, cx));
+                }
+            }
+        }
+        list
+    }
+
+    /// One saved host with the buttons that change it.
+    fn host_row(&self, index: usize, host: &HostConfig, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let id = host.id();
+        let edited = host.clone();
+
+        let mut row = components::row(metrics)
+            .debug_selector(move || format!("hosts.row.{index}"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .min_w(px(0.0))
+                    .child(components::status_dot(Tone::Neutral, metrics))
+                    .child(components::stacked(
+                        host.name().to_owned(),
+                        host.target(),
+                        metrics,
+                    )),
+            );
+        if let Some(group) = host_group_chip(host) {
+            row = row.child(components::chip(group, Tone::Neutral, metrics));
+        }
+        row.child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(self.text_button(
+                    SharedString::from(format!("hosts.edit.{index}")),
+                    strings.host_edit,
+                    Tone::Accent,
+                    cx,
+                    move |view, cx| view.open_edit_host(&edited, cx),
+                ))
+                .child(self.text_button(
+                    SharedString::from(format!("hosts.delete.{index}")),
+                    strings.host_delete,
+                    Tone::Danger,
+                    cx,
+                    move |view, cx| view.ask_delete_host(id, cx),
+                )),
+        )
+    }
+
+    /// One host that was really reached, with when it happened.
+    fn host_recent_row(
+        &self,
+        index: usize,
+        entry: shellune_storage::RecentHost<'_>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let edited = entry.host.clone();
+        let id = entry.host.id();
+        let last = format!(
+            "{} {} · {} {}",
+            strings.host_last_connected,
+            format_unix(entry.last_connected_unix),
+            entry.connections,
+            strings.host_connection_count
+        );
+
+        components::row(metrics)
+            .debug_selector(move || format!("hosts.recent.{index}"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .min_w(px(0.0))
+                    .child(components::status_dot(Tone::Positive, metrics))
+                    .child(components::stacked(
+                        entry.host.name().to_owned(),
+                        format!("{} · {last}", entry.host.target()),
+                        metrics,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(self.text_button(
+                        SharedString::from(format!("hosts.recent.edit.{index}")),
+                        strings.host_edit,
+                        Tone::Accent,
+                        cx,
+                        move |view, cx| view.open_edit_host(&edited, cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("hosts.recent.delete.{index}")),
+                        strings.host_delete,
+                        Tone::Danger,
+                        cx,
+                        move |view, cx| view.ask_delete_host(id, cx),
+                    )),
+            )
+    }
+
+    /// Nothing to list: a search that matched nothing says so, while an empty
+    /// book next to an open form just leaves the form to be filled.
+    fn nothing_to_list(&self, list: Div) -> Div {
+        if self.hosts.search().trim().is_empty() {
+            list
+        } else {
+            list.child(self.hosts_no_match())
+        }
+    }
+
+    fn hosts_no_match(&self) -> Div {
+        let metrics = self.metrics();
+        div()
+            .debug_selector(|| "hosts.nomatch".to_owned())
+            .text_size(metrics.label_size())
+            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+            .child(self.strings().hosts_no_match)
+    }
+
+    fn hosts_recent_empty(&self) -> Div {
+        let metrics = self.metrics();
+        div()
+            .debug_selector(|| "hosts.recent.empty".to_owned())
+            .text_size(metrics.label_size())
+            .text_color(theme::swatch(palette::TEXT_MUTED))
+            .child(self.strings().hosts_recent_empty)
+    }
+
+    /// A small command button that runs one action.
+    fn text_button(
+        &self,
+        id: SharedString,
+        label: impl Into<SharedString>,
+        tone: Tone,
+        cx: &mut Context<Self>,
+        click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let selector = id.to_string();
+        div()
+            .id(id)
+            .debug_selector(move || selector.clone())
+            .flex_none()
+            .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::SMALL))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .bg(theme::swatch(palette::SURFACE))
+            .text_size(metrics.label_size())
+            .text_color(tone.text())
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _event, _window, cx| click(this, cx)))
+            .child(label.into())
     }
 
     fn brand(&self) -> Div {
@@ -676,7 +1524,9 @@ impl ShelluneView {
     fn rows_for(&self, destination: Destination, list: gpui::Div) -> gpui::Div {
         match destination {
             Destination::LocalShells => self.local_rows(list),
-            Destination::Hosts => self.host_rows(list),
+            // The hosts destination renders through `hosts_panel`; this arm keeps
+            // the list untouched if a future layout routes it here.
+            Destination::Hosts => list,
             Destination::Sessions => self.session_rows(list),
             Destination::Transfers => self.transfer_rows(list),
         }
@@ -689,6 +1539,20 @@ impl ShelluneView {
 
         let body = if destination == Destination::LocalShells && self.pane.is_some() {
             self.terminal_panel(cx)
+        } else if destination == Destination::Hosts {
+            // The hosts destination renders its own empty, failed and populated
+            // states: the tools, the form and the list are one panel.
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .id("content.scroll")
+                .p(metrics.scale(spacing::SECTION))
+                .gap(metrics.panel_gap())
+                .debug_selector(|| "content".to_owned())
+                .overflow_y_scroll()
+                .child(self.hosts_destination(cx));
         } else {
             let card = self.section_card(destination, state);
             if state == SectionState::Populated {
@@ -849,7 +1713,13 @@ impl ShelluneView {
         );
 
         if self.custom_shell_open {
-            row = row.child(self.shell_path.clone());
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .debug_selector(|| "shell.path".to_owned())
+                    .child(self.shell_path.clone()),
+            );
         }
         row
     }
@@ -870,17 +1740,6 @@ impl ShelluneView {
                 div()
                     .debug_selector(move || format!("row.{index}"))
                     .child(self.session_row(session)),
-            );
-        }
-        list
-    }
-
-    fn host_rows(&self, mut list: Div) -> Div {
-        for (index, host) in self.workspace.hosts().items().iter().enumerate() {
-            list = list.child(
-                div()
-                    .debug_selector(move || format!("row.{index}"))
-                    .child(self.host_row(host)),
             );
         }
         list
@@ -930,30 +1789,6 @@ impl ShelluneView {
                 tone,
                 metrics,
             ))
-    }
-
-    fn host_row(&self, host: &HostConfig) -> Div {
-        let metrics = self.metrics();
-        let row = components::row(metrics).child(
-            div()
-                .flex()
-                .items_center()
-                .gap(metrics.scale(spacing::TIGHT))
-                .min_w(px(0.0))
-                .child(components::status_dot(Tone::Neutral, metrics))
-                .child(components::stacked(
-                    host.name().to_owned(),
-                    host.target(),
-                    metrics,
-                )),
-        );
-        // A host without a group shows no group chip. Using the count unit as a
-        // fallback printed the word "host" in a place that means "group", which
-        // reads as a group named "host".
-        match host_group_chip(host) {
-            Some(group) => row.child(components::chip(group, Tone::Neutral, metrics)),
-            None => row,
-        }
     }
 
     fn transfer_row(&self, transfer: &Transfer) -> Div {
@@ -1106,6 +1941,33 @@ impl Render for ShelluneView {
                     .child(self.status_bar()),
             )
     }
+}
+
+/// The store the shell reads when the caller does not supply one.
+#[cfg(not(test))]
+fn default_store() -> HostStore {
+    HostStore::default_location()
+}
+
+/// A scratch store, so a test that mounts the whole shell never reads or writes the
+/// developer's real data directory.
+#[cfg(test)]
+fn default_store() -> HostStore {
+    scratch_store()
+}
+
+/// A store in a directory of its own, unique to this test process.
+#[cfg(test)]
+pub(crate) fn scratch_store() -> HostStore {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let unique = format!(
+        "shellune-app-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    HostStore::at(std::env::temp_dir().join(unique))
 }
 
 /// The group label a host row shows, when the host belongs to a group.

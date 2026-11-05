@@ -5036,7 +5036,9 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "portable-pty",
+ "serde_json",
  "shellune-core",
+ "shellune-storage",
  "shellune-terminal",
 ]
 
@@ -5049,6 +5051,16 @@ dependencies = [
  "thiserror 2.0.21",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "shellune-storage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shellune-core",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

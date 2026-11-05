@@ -1,22 +1,32 @@
-//! A single-line text field with input-method support (R2, R8).
+//! A single-line text field with input-method support (R2, R3, R8).
 //!
-//! The shell path is the one place a user types free text before a terminal
-//! exists, so it needs the same input path every other text entry uses: an input
-//! method composes first and commits once, instead of sending a letter per key.
+//! The shell path and the host form are the places a user types free text before a
+//! terminal exists, so they need the same input path every other text entry uses:
+//! an input method composes first and commits once, instead of sending a letter per
+//! key.
 //!
-//! The model is deliberately small — one line, append and delete at the end, Enter
-//! submits, Escape clears — because a full editor is work the product does not need
-//! yet; a host form with richer editing arrives with the host management step.
+//! The model is one line with a caret: typing inserts at the caret, Backspace and
+//! Delete remove before and after it, and the arrow, Home and End keys move it.
+//! That is what makes a saved host editable without retyping the whole record, and
+//! it is deliberately not an editor: no selection, no undo, no wrapping.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle, KeyDownEvent,
-    Pixels, Render, SharedString, UTF16Selection, Window, canvas, div, px,
+    MouseButton, Pixels, Render, SharedString, UTF16Selection, Window, canvas, div, px,
 };
 
 use crate::app::theme::{self, Metrics, palette, radius, spacing};
+
+/// The character drawn where the caret is.
+///
+/// A typed bar rather than a measured one: the field is one line of plain text, and
+/// a real text layout for a caret would be worth building when the field grows
+/// selection. The tests read the model, not this character.
+const CARET: &str = "│";
 
 /// What the field does with the text the user submitted.
 ///
@@ -28,7 +38,11 @@ type SubmitHandler = Box<dyn Fn(String, &mut Window, &mut App) -> bool + 'static
 
 /// A one-line text input.
 pub struct TextField {
+    /// Element id, unique per field, so interactivity and click handling work.
+    id: SharedString,
     text: String,
+    /// Byte index into `text`, always on a character boundary.
+    caret: usize,
     marked: Option<String>,
     placeholder: SharedString,
     focus: FocusHandle,
@@ -38,8 +52,25 @@ pub struct TextField {
 impl TextField {
     /// Builds an empty field with a placeholder.
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        Self::with_text(placeholder, String::new(), cx)
+    }
+
+    /// Builds a field that already holds text, with the caret at the end.
+    pub fn with_text(
+        placeholder: impl Into<SharedString>,
+        text: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let text = text.into();
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let id = SharedString::from(format!(
+            "text-field.{}",
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         Self {
-            text: String::new(),
+            id,
+            caret: text.len(),
+            text,
             marked: None,
             placeholder: placeholder.into(),
             focus: cx.focus_handle(),
@@ -66,8 +97,54 @@ impl TextField {
 
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.text.clear();
+        self.caret = 0;
         self.marked = None;
         cx.notify();
+    }
+
+    /// Inserts text at the caret.
+    fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.text.insert_str(self.caret, text);
+        self.caret += text.len();
+        cx.notify();
+    }
+
+    fn backspace(&mut self, cx: &mut Context<Self>) {
+        let Some((index, _)) = self.text[..self.caret].char_indices().next_back() else {
+            return;
+        };
+        self.text.replace_range(index..self.caret, "");
+        self.caret = index;
+        cx.notify();
+    }
+
+    fn delete_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(character) = self.text[self.caret..].chars().next() else {
+            return;
+        };
+        let end = self.caret + character.len_utf8();
+        self.text.replace_range(self.caret..end, "");
+        cx.notify();
+    }
+
+    fn move_caret(&mut self, caret: usize, cx: &mut Context<Self>) {
+        if self.caret != caret {
+            self.caret = caret;
+            cx.notify();
+        }
+    }
+
+    fn caret_left(&mut self, cx: &mut Context<Self>) {
+        if let Some((index, _)) = self.text[..self.caret].char_indices().next_back() {
+            self.move_caret(index, cx);
+        }
+    }
+
+    fn caret_right(&mut self, cx: &mut Context<Self>) {
+        if let Some(character) = self.text[self.caret..].chars().next() {
+            let caret = self.caret + character.len_utf8();
+            self.move_caret(caret, cx);
+        }
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -88,28 +165,70 @@ impl TextField {
                 cx.stop_propagation();
             }
             "backspace" => {
-                if self.text.pop().is_some() {
-                    cx.notify();
-                }
+                self.backspace(cx);
+                cx.stop_propagation();
+            }
+            "delete" => {
+                self.delete_forward(cx);
+                cx.stop_propagation();
+            }
+            "left" => {
+                self.caret_left(cx);
+                cx.stop_propagation();
+            }
+            "right" => {
+                self.caret_right(cx);
+                cx.stop_propagation();
+            }
+            "home" => {
+                self.move_caret(0, cx);
+                cx.stop_propagation();
+            }
+            "end" => {
+                self.move_caret(self.text.len(), cx);
                 cx.stop_propagation();
             }
             _ => {}
         }
     }
+
+    /// The line to draw, including the caret where it currently is.
+    fn display(&self, focused: bool) -> String {
+        if self.text.is_empty() {
+            let placeholder = self.placeholder.to_string();
+            return if focused {
+                format!("{CARET}{placeholder}")
+            } else {
+                placeholder
+            };
+        }
+        match self.marked.as_deref() {
+            Some(marked) => format!(
+                "{}{marked}{}",
+                &self.text[..self.caret],
+                &self.text[self.caret..]
+            ),
+            None if focused => format!(
+                "{}{CARET}{}",
+                &self.text[..self.caret],
+                &self.text[self.caret..]
+            ),
+            None => self.text.clone(),
+        }
+    }
 }
 
 impl Render for TextField {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = Metrics::default();
         let entity = cx.entity();
         let focus = self.focus.clone();
-        let display = if self.text.is_empty() {
-            SharedString::from(self.placeholder.to_string())
-        } else {
-            SharedString::from(self.text.clone())
-        };
+        let focused = self.focus.is_focused(window);
+        let empty = self.text.is_empty();
+        let display = SharedString::from(self.display(focused));
 
         div()
+            .id(self.id.clone())
             .relative()
             .flex()
             .items_center()
@@ -120,15 +239,29 @@ impl Render for TextField {
             .rounded(px(radius::SMALL))
             .bg(theme::swatch(palette::SURFACE_RAISED))
             .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .border_color(theme::swatch(if focused {
+                palette::ACCENT
+            } else {
+                palette::BORDER_STRONG
+            }))
             .text_size(metrics.label_size())
-            .text_color(theme::swatch(if self.text.is_empty() {
+            .text_color(theme::swatch(if empty {
                 palette::TEXT_MUTED
             } else {
                 palette::TEXT_PRIMARY
             }))
             .track_focus(&self.focus)
-            .debug_selector(|| "shell.path".to_owned())
+            .cursor_text()
+            // Clicking a field puts the caret in it, which is what a form field has
+            // to do: a user who clicks the address of a saved host expects to type
+            // there, not to have to Tab into it.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, window, cx| {
+                    window.focus(&this.focus);
+                    cx.notify();
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx);
             }))
@@ -164,9 +297,9 @@ impl EntityInputHandler for TextField {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let end = self.text.encode_utf16().count();
+        let caret = self.text[..self.caret].encode_utf16().count();
         Some(UTF16Selection {
-            range: end..end,
+            range: caret..caret,
             reversed: false,
         })
     }
@@ -194,9 +327,10 @@ impl EntityInputHandler for TextField {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The composition was never inserted, so committing it only has to insert
+        // the final text once, at the caret.
         self.marked = None;
-        self.text.push_str(text);
-        cx.notify();
+        self.insert(text, cx);
     }
 
     fn replace_and_mark_text_in_range(

@@ -15,6 +15,7 @@
 
 pub mod components;
 pub mod copy;
+pub mod hosts;
 pub mod nav;
 pub mod product;
 pub mod terminal;
