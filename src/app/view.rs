@@ -16,7 +16,7 @@ use gpui::{
     Window, div, px,
 };
 use shellune_core::{HostConfig, HostId, LocalShell, Session, SessionId, SessionState, Transfer};
-use shellune_storage::{HostBook, HostStore};
+use shellune_storage::{HostBook, HostStore, ImportOutcome, ImportPreview, ImportedHost};
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{
@@ -24,7 +24,10 @@ use crate::app::actions::{
     NextDestination, PreviousDestination, ToggleLanguage,
 };
 use crate::app::copy::{self, Locale, Strings};
-use crate::app::hosts::{HostDraft, HostField, HostView, HostsPanel, format_unix};
+use crate::app::hosts::{
+    HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
+    import_message,
+};
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::terminal::{PaneState, TerminalPane};
@@ -54,6 +57,10 @@ pub struct ShelluneView {
     hosts_search: Entity<TextField>,
     /// The five form fields, present only while the editor is open.
     host_fields: Option<HostFields>,
+    /// The SSH configuration import panel and what the last read of a file showed.
+    import: ImportPanel,
+    /// The configuration path field, present only while that panel is open.
+    import_path: Option<Entity<TextField>>,
 }
 
 /// The five fields of the host editor, in form order.
@@ -112,6 +119,8 @@ impl ShelluneView {
             hosts: HostsPanel::new(),
             hosts_search,
             host_fields: None,
+            import: ImportPanel::new(),
+            import_path: None,
         };
         view.bind_shell_path(cx);
         view.bind_host_search(cx);
@@ -147,6 +156,20 @@ impl ShelluneView {
     #[must_use]
     pub fn hosts_state(&self) -> &HostsPanel {
         &self.hosts
+    }
+
+    /// The import panel and what the last read of a configuration file showed.
+    #[cfg(test)]
+    pub fn import_state(&self) -> &ImportPanel {
+        &self.import
+    }
+
+    /// Selects one host list view before the first frame, so a test can observe what
+    /// that view draws on its own instead of what an earlier frame left behind.
+    #[cfg(test)]
+    pub fn select_host_view_for_test(&mut self, view: HostView, cx: &mut Context<Self>) {
+        self.hosts.select_view(view);
+        cx.notify();
     }
 
     /// The terminal currently shown, if one was started.
@@ -442,6 +465,143 @@ impl ShelluneView {
         self.commit_hosts(next, self.strings().hosts_deleted, cx);
     }
 
+    // -----------------------------------------------------------------------
+    // SSH configuration import (R5)
+    // -----------------------------------------------------------------------
+
+    /// Mirrors the configuration path field into the panel and lets Enter preview it.
+    fn bind_import_path(&mut self, cx: &mut Context<Self>) {
+        let Some(field) = self.import_path.clone() else {
+            return;
+        };
+
+        let view = cx.entity().downgrade();
+        field.update(cx, |text_field, _cx| {
+            text_field.on_submit(move |_text, _window, app| {
+                view.update(app, |view, cx| {
+                    view.preview_import(cx);
+                    false
+                })
+                .unwrap_or(false)
+            });
+        });
+
+        cx.observe(&field, |view, text_field, cx| {
+            let text = text_field.read(cx).text().to_owned();
+            // A different path is a different question, so the previous preview goes
+            // away instead of being applied to a file nobody looked at.
+            view.import.set_path(text);
+            cx.notify();
+        })
+        .detach();
+    }
+
+    /// Opens the import panel on the file this platform's ssh would read.
+    ///
+    /// A second click does nothing: the panel already shows a reading of a file, and
+    /// replacing it would throw away a preview the user may be about to apply.
+    fn open_import(&mut self, cx: &mut Context<Self>) {
+        if self.import.is_open() {
+            return;
+        }
+        let path = match shellune_storage::default_config_path() {
+            Some(path) => path.display().to_string(),
+            None => shellune_storage::DEFAULT_CONFIG_TEXT.to_owned(),
+        };
+        self.open_import_at(path, cx);
+    }
+
+    /// Opens the import panel on a named file, through the same path a click takes.
+    #[cfg(test)]
+    pub fn open_import_for_test(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.open_import_at(path.to_owned(), cx);
+    }
+
+    fn open_import_at(&mut self, path: String, cx: &mut Context<Self>) {
+        self.import.open(path);
+        self.hosts.close_editor();
+        self.host_fields = None;
+        self.hosts.clear_message();
+        let placeholder = self.strings().import_path_placeholder;
+        let text = self.import.path().to_owned();
+        self.import_path = Some(cx.new(|cx| TextField::with_text(placeholder, text, cx)));
+        self.bind_import_path(cx);
+        cx.notify();
+    }
+
+    /// Closes the import panel without touching the saved hosts.
+    fn close_import(&mut self, cx: &mut Context<Self>) {
+        self.import.close();
+        self.import_path = None;
+        cx.notify();
+    }
+
+    /// Reads the named file and shows what importing it would do.
+    ///
+    /// A failure keeps the reason the importer produced, including the line that
+    /// could not be parsed, and leaves the saved hosts alone.
+    fn preview_import(&mut self, cx: &mut Context<Self>) {
+        let path = self.import.path().trim().to_owned();
+        if path.is_empty() {
+            self.import.set_error(self.strings().import_path_required);
+            cx.notify();
+            return;
+        }
+        match ImportPreview::from_file(&path) {
+            Ok(preview) => self.import.set_preview(preview),
+            Err(error) => self.import.set_error(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// Saves the hosts the preview offers, and says what it did not save.
+    fn apply_import(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.import.preview().cloned() else {
+            return;
+        };
+        let plan = preview.plan(&self.book);
+        let imported = plan.len();
+        // A host whose name was already saved is not imported at all, so it must not
+        // be counted as one that was imported and needs a look.
+        let review = preview
+            .hosts()
+            .iter()
+            .filter(|host| host.outcome() == ImportOutcome::NeedsReview && host.is_importable())
+            .filter(|host| {
+                !plan
+                    .skipped()
+                    .iter()
+                    .any(|skipped| skipped.alias() == host.alias())
+            })
+            .count();
+        let skipped = plan.skipped().len();
+
+        let mut next = self.book.clone();
+        if let Err(error) = plan.apply(&mut next) {
+            self.import.set_apply_error(error.to_string());
+            cx.notify();
+            return;
+        }
+
+        match self.store.save(&next) {
+            Ok(()) => {
+                self.book = next;
+                let items = self.book.hosts().to_vec();
+                self.workspace.replace_hosts(SectionStatus::Ready, items);
+                self.hosts.set_message(
+                    import_message(self.strings(), imported, review, skipped),
+                    false,
+                );
+                self.import.close();
+                self.import_path = None;
+            }
+            // The file did not change, so the preview stays: the same hosts can be
+            // applied again once the write is possible.
+            Err(error) => self.import.set_apply_error(error.to_string()),
+        }
+        cx.notify();
+    }
+
     /// Records that a host was really reached, and stores the record.
     ///
     /// The remote-connection step calls this after a session reached
@@ -658,16 +818,22 @@ impl ShelluneView {
             );
         }
 
-        // An empty store with no search and no open form explains itself; anything
-        // else shows the tools and the list.
+        // An empty store with no search, no open form and no open import explains
+        // itself; anything else shows the tools and the list.
         if self.book.hosts().is_empty()
             && self.hosts.search().trim().is_empty()
             && !self.hosts.is_editing()
+            && !self.import.is_open()
         {
-            return column.child(self.section_card(Destination::Hosts, state));
+            return column
+                .child(self.section_card(Destination::Hosts, state))
+                .child(self.hosts_import_entry(cx));
         }
 
         column = column.child(self.hosts_toolbar(cx));
+        if self.import.is_open() {
+            column = column.child(self.import_panel(cx));
+        }
         if let Some(fields) = &self.host_fields {
             column = column.child(self.host_editor(fields, cx));
         }
@@ -753,7 +919,38 @@ impl ShelluneView {
                     .child(view.label(strings)),
             );
         }
-        row
+        // Importing sits beside the views because it is how a list gets its first
+        // records; the panel it opens states its limits before anything is saved.
+        row.child(self.import_button(cx))
+    }
+
+    /// The button that opens the import panel.
+    fn import_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        self.text_button(
+            SharedString::from("hosts.import"),
+            self.strings().import_open,
+            Tone::Accent,
+            cx,
+            |view, cx| view.open_import(cx),
+        )
+    }
+
+    /// The import entry an empty list offers, since a first run has no hosts to show
+    /// beside it.
+    fn hosts_import_entry(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::SNUG))
+            .child(self.import_button(cx))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.import_read_only),
+            )
     }
 
     /// The form that creates or changes one host.
@@ -830,6 +1027,298 @@ impl ShelluneView {
                     |view, cx| view.close_host_editor(cx),
                 )),
         )
+    }
+
+    /// The import preview: the file it read, its limits and every host it describes.
+    ///
+    /// Nothing here is decided by the drawing code: the outcome, the notes and the
+    /// count of hosts that can be imported all come from the importer, which is what
+    /// keeps a partial import from looking like a complete one.
+    fn import_panel(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+
+        let path_field = match &self.import_path {
+            Some(field) => div()
+                .flex_1()
+                .min_w(px(0.0))
+                .debug_selector(|| "hosts.import.path".to_owned())
+                .child(field.clone()),
+            None => div().flex_1(),
+        };
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .w_full()
+            .p(metrics.scale(spacing::LOOSE))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "hosts.import.panel".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.title_size())
+                    .font_weight(metrics.title_weight())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(strings.import_title),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(metrics.scale(64.0))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(strings.import_path_label),
+                    )
+                    .child(path_field)
+                    .child(self.text_button(
+                        SharedString::from("hosts.import.preview"),
+                        strings.import_preview,
+                        Tone::Accent,
+                        cx,
+                        |view, cx| view.preview_import(cx),
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.import_read_only),
+            );
+
+        if let Some(error) = self.import.error() {
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.scale(1.0))
+                    .debug_selector(|| "hosts.import.error".to_owned())
+                    .child(
+                        div()
+                            .text_size(metrics.label_size())
+                            .text_color(Tone::Danger.text())
+                            .child(strings.import_error_title),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(SharedString::from(error.to_owned())),
+                    ),
+            );
+            if !self.import.keeps_preview() {
+                return card;
+            }
+        }
+
+        let Some(preview) = self.import.preview() else {
+            return card;
+        };
+
+        card = card.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .debug_selector(|| "hosts.import.source".to_owned())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(strings.import_source_label),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .min_w(px(0.0))
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .child(SharedString::from(preview.source().display().to_string())),
+                ),
+        );
+
+        card = card.child(self.import_limits(preview));
+
+        for (index, host) in preview.hosts().iter().enumerate() {
+            card = card.child(self.import_row(index, host));
+        }
+
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .mt(metrics.scale(spacing::HAIRLINE));
+
+        let offered = preview.importable_count();
+        if offered > 0 {
+            actions = actions.child(self.text_button(
+                SharedString::from("hosts.import.apply"),
+                SharedString::from(format!("{} · {offered}", strings.import_apply)),
+                Tone::Accent,
+                cx,
+                |view, cx| view.apply_import(cx),
+            ));
+        } else {
+            actions = actions.child(
+                div()
+                    .debug_selector(|| "hosts.import.nothing".to_owned())
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.import_nothing),
+            );
+        }
+
+        card.child(actions.child(self.text_button(
+            SharedString::from("hosts.import.close"),
+            strings.host_cancel,
+            Tone::Neutral,
+            cx,
+            |view, cx| view.close_import(cx),
+        )))
+    }
+
+    /// What the file could not contribute, stated before anything is applied.
+    fn import_limits(&self, preview: &ImportPreview) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let limits = preview.limits();
+        let ready = preview
+            .hosts()
+            .iter()
+            .filter(|host| host.outcome() == ImportOutcome::Ready && host.is_importable())
+            .count();
+
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(1.0))
+            .w_full()
+            .debug_selector(|| "hosts.import.limits".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.import_limits_title),
+            )
+            .child(caption_line(
+                format!(
+                    "{} {} · {} {} · {} {}",
+                    strings.import_outcome_ready,
+                    ready,
+                    strings.import_outcome_review,
+                    preview.review_count(),
+                    strings.import_outcome_blocked,
+                    preview.blocked_count()
+                ),
+                metrics,
+            ));
+
+        if !limits.ignored().is_empty() {
+            let keywords: Vec<String> = limits
+                .ignored()
+                .iter()
+                .map(|note| format!("{} (line {})", note.keyword(), note.line()))
+                .collect();
+            block = block.child(caption_line(
+                format!("{} · {}", strings.import_ignored_label, keywords.join(", ")),
+                metrics,
+            ));
+        }
+        if !limits.include_lines().is_empty() {
+            block = block.child(caption_line(
+                format!(
+                    "{} · {}",
+                    strings.import_include_label,
+                    line_list(limits.include_lines())
+                ),
+                metrics,
+            ));
+        }
+        if !limits.match_lines().is_empty() {
+            block = block.child(caption_line(
+                format!(
+                    "{} · {}",
+                    strings.import_match_label,
+                    line_list(limits.match_lines())
+                ),
+                metrics,
+            ));
+        }
+        if !preview.is_partial() {
+            block = block.child(caption_line(strings.import_limits_none.to_owned(), metrics));
+        }
+        block
+    }
+
+    /// One host the file describes, with the outcome and every reason behind it.
+    fn import_row(&self, index: usize, host: &ImportedHost) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let (tone, label) = match host.outcome() {
+            ImportOutcome::Ready => (Tone::Positive, strings.import_outcome_ready),
+            ImportOutcome::NeedsReview => (Tone::Warning, strings.import_outcome_review),
+            ImportOutcome::Blocked => (Tone::Danger, strings.import_outcome_blocked),
+        };
+        let chip = if host.is_importable() {
+            SharedString::from(label)
+        } else {
+            SharedString::from(format!("{label} · {}", strings.import_not_offered))
+        };
+
+        let mut row = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(1.0))
+            .w_full()
+            .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(move || format!("hosts.import.row.{index}"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .min_w(px(0.0))
+                            .child(components::status_dot(tone, metrics))
+                            .child(components::stacked(
+                                host.alias().to_owned(),
+                                host.summary(),
+                                metrics,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .child(components::chip(chip, tone, metrics)),
+                    ),
+            );
+
+        for note in host.notes() {
+            row = row.child(caption_line(note.reason().to_owned(), metrics));
+        }
+        row
     }
 
     /// The question shown before a host is deleted.
@@ -938,7 +1427,10 @@ impl ShelluneView {
                 if groups.is_empty() {
                     return self.nothing_to_list(list);
                 }
-                for (group_index, group) in groups.iter().enumerate() {
+                // The row numbering comes from one function that runs across the groups,
+                // so two rows of one list can never share an element id.
+                let offsets = group_row_offsets(&groups);
+                for (group_index, (group, offset)) in groups.iter().zip(offsets).enumerate() {
                     let label = group.label().unwrap_or(strings.hosts_ungrouped);
                     list = list.child(
                         div()
@@ -947,8 +1439,8 @@ impl ShelluneView {
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(SharedString::from(format!("{label} · {}", group.len()))),
                     );
-                    for host in group.hosts() {
-                        list = list.child(self.host_row(0, host, cx));
+                    for (row_index, host) in (offset..).zip(group.hosts()) {
+                        list = list.child(self.host_row(row_index, host, cx));
                     }
                 }
             }
@@ -1979,4 +2471,21 @@ pub(crate) fn host_group_chip(host: &HostConfig) -> Option<String> {
         .map(str::trim)
         .filter(|group| !group.is_empty())
         .map(str::to_owned)
+}
+
+/// A muted line of explanation under a row or a heading.
+fn caption_line(text: String, metrics: Metrics) -> Div {
+    div()
+        .text_size(metrics.caption_size())
+        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+        .child(SharedString::from(text))
+}
+
+/// One "line 3, line 7" list, for the lines a limit points at.
+fn line_list(lines: &[usize]) -> String {
+    lines
+        .iter()
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<String>>()
+        .join(", ")
 }

@@ -28,6 +28,10 @@ pub const CONFIG_KEYS: &[&str] = &[
     "port",
     "user",
     "group",
+    // A path, never key material: an imported `IdentityFile` is remembered so the
+    // next connection can offer it, and the key itself stays on disk where the
+    // user put it.
+    "identity_file",
     "host",
     "last_connected_unix",
     "connections",

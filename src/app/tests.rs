@@ -25,6 +25,7 @@ use shellune_terminal::GridSize;
 
 use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage};
 use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
+use crate::app::hosts::HostView;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::terminal::{PaneState, TerminalPane};
@@ -639,6 +640,29 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             hosts_retry,
             host_last_connected,
             host_connection_count,
+            import_open,
+            import_title,
+            import_path_label,
+            import_path_placeholder,
+            import_preview,
+            import_source_label,
+            import_read_only,
+            import_limits_title,
+            import_limits_none,
+            import_outcome_ready,
+            import_outcome_review,
+            import_outcome_blocked,
+            import_not_offered,
+            import_ignored_label,
+            import_include_label,
+            import_match_label,
+            import_nothing,
+            import_apply,
+            import_applied,
+            import_review_count,
+            import_skipped,
+            import_error_title,
+            import_path_required,
         ]
     )
 }
@@ -2127,4 +2151,311 @@ async fn the_host_form_edits_at_the_caret_instead_of_appending_only(cx: &mut Tes
             "typing at the caret and deleting before it must edit the text in place"
         );
     });
+}
+// ---------------------------------------------------------------------------
+// SSH configuration import (R5)
+// ---------------------------------------------------------------------------
+
+/// A configuration with one plain host, one host with an unapplied directive and one
+/// host that would need a jump host.
+const IMPORT_CONFIG: &str = "\
+Host web
+    HostName web.example.org
+    User deploy
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519
+
+Host db
+    HostName 10.0.0.6
+    User postgres
+    ServerAliveInterval 30
+
+Host through-bastion
+    HostName internal.example.org
+    User root
+    ProxyJump bastion.example.org
+";
+
+#[gpui::test]
+async fn the_import_panel_opens_on_the_platform_file_and_reads_a_named_one(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("import-open");
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    click(cx, "hosts.import");
+    assert!(
+        cx.debug_bounds("hosts.import.panel").is_some(),
+        "the button opens the import panel"
+    );
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let path = view.import_state().path().to_owned();
+        assert!(
+            path.ends_with("config") || path == shellune_storage::DEFAULT_CONFIG_TEXT,
+            "the panel points at the file ssh reads by default: {path}"
+        );
+        assert!(
+            view.import_state().preview().is_none(),
+            "nothing was read yet"
+        );
+    });
+}
+
+#[gpui::test]
+async fn an_import_preview_shows_its_limits_and_saves_only_the_hosts_it_offered(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("import-apply");
+    let config = dir.path().join("config");
+    std::fs::write(&config, IMPORT_CONFIG).expect("the test writes the configuration");
+    let before = std::fs::read(&config).expect("the configuration is readable");
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("hosts.import.panel").is_some());
+
+    click(cx, "hosts.import.preview");
+    assert!(
+        cx.debug_bounds("hosts.import.row.0").is_some(),
+        "the first host the file describes is listed"
+    );
+    assert!(
+        cx.debug_bounds("hosts.import.row.2").is_some(),
+        "the blocked host is listed too, with the reason it is not imported"
+    );
+    assert!(
+        cx.debug_bounds("hosts.import.limits").is_some(),
+        "the limits are shown before anything is applied"
+    );
+    cx.update(|_window, app| {
+        let preview = view
+            .read(app)
+            .import_state()
+            .preview()
+            .expect("the preview is kept while the panel is open");
+        assert_eq!(preview.importable_count(), 2);
+        assert_eq!(preview.blocked_count(), 1);
+        assert!(preview.is_partial());
+        assert!(
+            view.read(app).book().hosts().is_empty(),
+            "a preview writes nothing"
+        );
+    });
+    assert!(
+        !dir.file().exists(),
+        "a preview must not create the host file"
+    );
+
+    click(cx, "hosts.import.apply");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let book = view.book();
+        assert_eq!(book.hosts().len(), 2, "the two offered hosts were saved");
+        assert!(
+            book.hosts()
+                .iter()
+                .all(|host| host.name() != "through-bastion"),
+            "a host behind a jump host is not saved as a direct connection"
+        );
+        let web = book
+            .hosts()
+            .iter()
+            .find(|host| host.name() == "web")
+            .expect("web was imported");
+        assert_eq!(web.target(), "deploy@web.example.org:2222");
+        assert_eq!(web.identity_file(), Some("~/.ssh/id_ed25519"));
+        let message = view.hosts_state().message().expect("the result is stated");
+        assert!(!message.failed());
+        assert!(message.text().contains('2'), "{}", message.text());
+        assert!(
+            view.import_state().preview().is_none(),
+            "applying closes the preview"
+        );
+        assert_eq!(
+            view.workspace().state(Destination::Hosts),
+            SectionState::Populated
+        );
+        assert_eq!(
+            view.workspace().item_count(Destination::Sessions),
+            0,
+            "importing hosts opens no connection"
+        );
+    });
+    assert!(
+        cx.debug_bounds("hosts.row.0").is_some(),
+        "the imported hosts are ordinary rows"
+    );
+
+    // The SSH client's own file is untouched, and the application record is what the
+    // next launch reads.
+    let after = std::fs::read(&config).expect("the configuration is still readable");
+    assert_eq!(after, before, "the import must not change the source file");
+    let reloaded = HostStore::at(dir.path())
+        .load()
+        .expect("the saved book loads");
+    assert_eq!(reloaded.hosts().len(), 2);
+}
+
+#[gpui::test]
+async fn a_configuration_that_cannot_be_parsed_shows_the_line_and_imports_nothing(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("import-syntax");
+    let config = dir.path().join("config");
+    std::fs::write(
+        &config,
+        "Host web\n    HostName web.example.org\n    Port\n",
+    )
+    .expect("the test writes the configuration");
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+
+    assert!(
+        cx.debug_bounds("hosts.import.error").is_some(),
+        "the failure is shown where the preview would be"
+    );
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let error = view
+            .import_state()
+            .error()
+            .expect("the reason the file could not be read is kept");
+        assert!(
+            error.contains("line 3"),
+            "the reason names the line: {error}"
+        );
+        assert!(
+            error.contains("config"),
+            "the reason names the file: {error}"
+        );
+        assert!(view.import_state().preview().is_none());
+        assert!(view.book().hosts().is_empty(), "nothing was imported");
+    });
+    assert!(
+        !dir.file().exists(),
+        "a refused import must not create the host file"
+    );
+
+    // A file that does not exist is the other failure a user can cause.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&dir.path().join("nope").display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+    cx.update(|_window, app| {
+        let error = view
+            .read(app)
+            .import_state()
+            .error()
+            .expect("a missing file is reported");
+        assert!(error.contains("nope"), "the reason names the file: {error}");
+    });
+}
+
+#[gpui::test]
+async fn the_grouped_view_gives_every_row_its_own_identity(cx: &mut TestAppContext) {
+    let dir = TempDir::new("groups-rows");
+    let store = dir.store();
+    seed(
+        &store,
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", Some("Prod")),
+            stored_host("api", "api.example.org", 2222, "svc", Some("Prod")),
+            stored_host("lab", "lab.internal", 22, "root", None),
+        ],
+    );
+
+    // The grouped view is selected before the first frame, so the flat view never
+    // draws a row: what the assertions below see is what this view rendered.
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_store(cx, workspace, store));
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.select_host_view_for_test(HostView::Groups, cx)
+        });
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("hosts.group.0").is_some());
+    assert!(cx.debug_bounds("hosts.group.1").is_some());
+    // The group view lists one row per host, across both groups. Which number each
+    // row is drawn under is asserted where it is computed: two rows of one list must
+    // never share an element id, and the debug selectors of this GPUI version keep
+    // the bounds of earlier frames, so counting here would prove nothing.
+    assert!(
+        cx.debug_bounds("hosts.list.3").is_some(),
+        "both groups together still list all three hosts"
+    );
+    assert!(cx.debug_bounds("hosts.row.0").is_some());
+    assert!(cx.debug_bounds("hosts.row.2").is_some());
+}
+
+#[gpui::test]
+async fn an_import_whose_write_fails_keeps_the_preview_and_adds_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-write-fail");
+    let config = dir.path().join("config");
+    std::fs::write(
+        &config,
+        "Host web\n    HostName web.example.org\n    User deploy\n",
+    )
+    .expect("the test writes the configuration");
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+    assert!(cx.debug_bounds("hosts.import.row.0").is_some());
+
+    // The data directory becomes a file, so the next save cannot even create the
+    // directory it would write into.
+    std::fs::remove_dir_all(dir.path()).expect("the directory is removed");
+    std::fs::write(dir.path(), "not a directory").expect("the path becomes a file");
+
+    click(cx, "hosts.import.apply");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            view.book().hosts().is_empty(),
+            "a failed write must not add the hosts to the list"
+        );
+        let error = view
+            .import_state()
+            .error()
+            .expect("the reason the write failed is shown");
+        assert!(
+            error.contains("could not"),
+            "the reason comes from the layer that failed: {error}"
+        );
+        assert!(
+            view.import_state().keeps_preview(),
+            "the preview survives, so the same hosts can be applied again"
+        );
+    });
+    assert!(cx.debug_bounds("hosts.import.error").is_some());
+    assert!(
+        cx.debug_bounds("hosts.import.row.0").is_some(),
+        "the hosts that could not be written are still listed"
+    );
 }

@@ -88,6 +88,15 @@ pub struct HostConfig {
     port: Port,
     user: String,
     group: Option<String>,
+    /// The *path* of a private key file, never its contents.
+    ///
+    /// An imported SSH configuration sets `IdentityFile`; keeping the path lets a
+    /// later connection use the key the user already chose, while the record still
+    /// has nowhere to store key material or a passphrase. A host without one omits
+    /// the field entirely, so a record saved by a build that had no such field
+    /// stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_file: Option<String>,
 }
 
 /// The stored shape of a host.
@@ -105,6 +114,9 @@ struct HostConfigWire {
     port: Port,
     user: String,
     group: Option<String>,
+    /// Absent in files written before an imported key path was stored.
+    #[serde(default)]
+    identity_file: Option<String>,
 }
 
 impl TryFrom<HostConfigWire> for HostConfig {
@@ -127,6 +139,7 @@ impl TryFrom<HostConfigWire> for HostConfig {
                 .group
                 .map(|group| group.trim().to_owned())
                 .filter(|group| !group.is_empty()),
+            identity_file: normalize_identity_file(wire.identity_file),
         })
     }
 }
@@ -178,6 +191,7 @@ impl HostConfig {
             port: Port::new(u32::from(port))?,
             user: validate_user(user.into())?,
             group: None,
+            identity_file: None,
         })
     }
 
@@ -215,6 +229,16 @@ impl HostConfig {
     #[must_use]
     pub fn group(&self) -> Option<&str> {
         self.group.as_deref()
+    }
+
+    /// The private key file the next connection should offer, when one was
+    /// recorded (an imported `IdentityFile`).
+    ///
+    /// Only the path is kept: the key material and any passphrase stay out of the
+    /// record, of the document and of the logs.
+    #[must_use]
+    pub fn identity_file(&self) -> Option<&str> {
+        self.identity_file.as_deref()
     }
 
     /// `user@address:port`, the form used in confirmation prompts.
@@ -270,6 +294,20 @@ impl HostConfig {
             .map(|group: String| group.trim().to_owned())
             .filter(|group| !group.is_empty());
     }
+
+    /// Assigns or clears the private key path.
+    ///
+    /// A blank path clears the field, so an editor that submits an empty text box
+    /// removes the reference instead of storing nothing that looks like a key.
+    pub fn set_identity_file(&mut self, path: Option<impl Into<String>>) {
+        self.identity_file = normalize_identity_file(path.map(Into::into));
+    }
+}
+
+/// Trims a key path and turns a blank one into `None`.
+fn normalize_identity_file(path: Option<String>) -> Option<String> {
+    path.map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
 }
 
 #[cfg(test)]
@@ -391,5 +429,65 @@ mod tests {
             vec!["address", "group", "id", "name", "port", "user"],
             "a saved host may not grow a field that could hold a secret"
         );
+    }
+
+    #[test]
+    fn an_imported_key_path_is_a_path_and_nothing_else() {
+        let mut host = HostConfig::new("web", "example.com", 22, "root").expect("valid host");
+        host.set_identity_file(Some("  /home/deploy/.ssh/id_ed25519  "));
+        assert_eq!(host.identity_file(), Some("/home/deploy/.ssh/id_ed25519"));
+
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&host).expect("host serializes"))
+                .expect("valid json");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("a host is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "address",
+                "group",
+                "id",
+                "identity_file",
+                "name",
+                "port",
+                "user"
+            ],
+            "a key path adds exactly one field, and it holds a path"
+        );
+        assert_eq!(
+            value["identity_file"],
+            serde_json::json!("/home/deploy/.ssh/id_ed25519"),
+            "the stored value is the path the file named, not key material"
+        );
+
+        // A blank path is no path: an editor that submits an empty field clears it
+        // instead of recording something that looks like a key.
+        host.set_identity_file(Some("   "));
+        assert_eq!(host.identity_file(), None);
+        host.set_identity_file(Some("C:/keys/work key.pem"));
+        assert_eq!(
+            host.identity_file(),
+            Some("C:/keys/work key.pem"),
+            "a path with a space stays one path"
+        );
+    }
+
+    #[test]
+    fn a_host_file_written_before_key_paths_existed_still_loads() {
+        let host = HostConfig::new("web", "example.com", 22, "root").expect("valid host");
+        let without_field = format!(
+            r#"{{"id":"{}","name":"web","address":"example.com","port":22,"user":"root","group":null}}"#,
+            host.id()
+        );
+        let decoded: HostConfig =
+            serde_json::from_str(&without_field).expect("an older record still loads");
+        assert_eq!(decoded, host);
+        assert_eq!(decoded.identity_file(), None);
     }
 }

@@ -238,6 +238,53 @@ pub struct Strings {
     pub host_last_connected: &'static str,
     /// Unit after a count of successful connections.
     pub host_connection_count: &'static str,
+
+    /// Button that opens the SSH configuration import panel.
+    pub import_open: &'static str,
+    /// Title of the import panel.
+    pub import_title: &'static str,
+    /// Label of the configuration file field.
+    pub import_path_label: &'static str,
+    /// Placeholder in the configuration file field.
+    pub import_path_placeholder: &'static str,
+    /// Button that reads the file and shows what would be imported.
+    pub import_preview: &'static str,
+    /// Label introducing the path the preview really read.
+    pub import_source_label: &'static str,
+    /// Note that the configuration file is only read.
+    pub import_read_only: &'static str,
+    /// Title of the limits block shown before applying.
+    pub import_limits_title: &'static str,
+    /// Shown when the file was applied without limitation.
+    pub import_limits_none: &'static str,
+    /// Label for hosts the importer understood completely.
+    pub import_outcome_ready: &'static str,
+    /// Label for hosts that can be imported but need a review.
+    pub import_outcome_review: &'static str,
+    /// Label for hosts that are not imported because their path cannot be trusted.
+    pub import_outcome_blocked: &'static str,
+    /// Note on a host that will not be imported.
+    pub import_not_offered: &'static str,
+    /// Label introducing directives this build does not apply.
+    pub import_ignored_label: &'static str,
+    /// Label introducing the Include lines, whose files were not read.
+    pub import_include_label: &'static str,
+    /// Label introducing the Match blocks, whose conditions were not evaluated.
+    pub import_match_label: &'static str,
+    /// Shown when the file holds no host that could be imported.
+    pub import_nothing: &'static str,
+    /// Button that saves the hosts the preview offers.
+    pub import_apply: &'static str,
+    /// Prefix of the message left after an import.
+    pub import_applied: &'static str,
+    /// Unit used after the number of hosts that need a review.
+    pub import_review_count: &'static str,
+    /// Unit used after the number of hosts that were skipped.
+    pub import_skipped: &'static str,
+    /// Title of the block shown when the file could not be read or parsed.
+    pub import_error_title: &'static str,
+    /// Shown when the import panel was asked to read an empty path.
+    pub import_path_required: &'static str,
 }
 
 /// English copy.
@@ -328,6 +375,30 @@ pub static ENGLISH: Strings = Strings {
     hosts_retry: "Read the file again",
     host_last_connected: "Last connected",
     host_connection_count: "connections",
+
+    import_open: "Import SSH config",
+    import_title: "Import an SSH configuration",
+    import_path_label: "File",
+    import_path_placeholder: "Path to an SSH config file",
+    import_preview: "Preview",
+    import_source_label: "Read from",
+    import_read_only: "The file is only read; Shellune never writes to it.",
+    import_limits_title: "Before importing",
+    import_limits_none: "Every host in this file was read completely.",
+    import_outcome_ready: "Importable",
+    import_outcome_review: "Needs review",
+    import_outcome_blocked: "Blocked",
+    import_not_offered: "not imported",
+    import_ignored_label: "Not applied",
+    import_include_label: "Included files were not read",
+    import_match_label: "Match blocks were not evaluated",
+    import_nothing: "No host in this file can be imported as a direct connection yet.",
+    import_apply: "Import hosts",
+    import_applied: "Imported",
+    import_review_count: "need review",
+    import_skipped: "skipped",
+    import_error_title: "Nothing was imported",
+    import_path_required: "Name the configuration file to read.",
 };
 
 /// Chinese copy.
@@ -418,6 +489,30 @@ pub static CHINESE: Strings = Strings {
     hosts_retry: "重新读取文件",
     host_last_connected: "最近连接",
     host_connection_count: "次连接",
+
+    import_open: "导入 SSH 配置",
+    import_title: "导入 SSH 配置",
+    import_path_label: "配置文件",
+    import_path_placeholder: "SSH 配置文件的路径",
+    import_preview: "预览",
+    import_source_label: "读取自",
+    import_read_only: "只读取这个文件，不会写回原配置。",
+    import_limits_title: "导入前的限制",
+    import_limits_none: "这个文件里的每台主机都已完整读取。",
+    import_outcome_ready: "可直接导入",
+    import_outcome_review: "需要复核",
+    import_outcome_blocked: "已阻止",
+    import_not_offered: "不导入",
+    import_ignored_label: "未应用的指令",
+    import_include_label: "没有读取被包含的文件",
+    import_match_label: "没有评估 Match 条件块",
+    import_nothing: "这个文件里还没有可以直接导入的主机。",
+    import_apply: "导入主机",
+    import_applied: "已导入",
+    import_review_count: "需复核",
+    import_skipped: "已跳过",
+    import_error_title: "没有导入任何内容",
+    import_path_required: "请先填写要读取的配置文件路径。",
 };
 
 /// Hint for the section shortcuts, built for one platform.

@@ -11,6 +11,8 @@
 //!   every failure keeps the previous file intact.
 //! * `StoreEvent` — the closed set of log lines the store emits, so the logging
 //!   path can be tested for the absence of secrets instead of being trusted.
+//! * `ImportPreview` — what one SSH configuration file would contribute, read
+//!   without ever writing it, with every limitation named before anything is saved.
 //!
 //! Secrets are deliberately absent from the model: a `HostConfig` stores a name,
 //! an address, a port, a user and an optional group, and nothing else. Both the
@@ -23,6 +25,7 @@
 mod audit;
 mod book;
 mod error;
+mod ssh_config;
 mod store;
 
 pub use audit::{CONFIG_KEYS, LOG_FIELDS, StoreEvent};
@@ -30,4 +33,9 @@ pub use book::{
     FORMAT_VERSION, Group, HostBook, HostEdit, RecentConnection, RecentHost, host_matches,
 };
 pub use error::{BookError, StorageError};
+pub use ssh_config::{
+    DEFAULT_CONFIG_TEXT, ImportError, ImportLimits, ImportNote, ImportOutcome, ImportPlan,
+    ImportPreview, ImportedHost, NoteKind, SkippedHost, default_config_path, home_directory,
+    resolve_path,
+};
 pub use store::{FILE_NAME, HostStore};

@@ -13,7 +13,9 @@
 //!   opened, and a failure keeps the reason the storage layer produced.
 
 use shellune_core::{HostConfig, HostId, Port};
-use shellune_storage::{Group, HostBook, HostEdit, RecentHost, host_matches};
+use shellune_storage::{
+    DEFAULT_CONFIG_TEXT, Group, HostBook, HostEdit, ImportPreview, RecentHost, host_matches,
+};
 
 use crate::app::copy::Strings;
 
@@ -393,6 +395,146 @@ impl HostsPanel {
     }
 }
 
+/// The import panel: which configuration to read, and what reading it showed.
+///
+/// The panel holds the result of one read rather than a live view of the file.
+/// Changing the path drops the previous preview, so the hosts that can be applied are
+/// always the ones that were shown for that path; the file itself is never opened for
+/// writing, which is why nothing here has a save path of its own.
+#[derive(Debug)]
+pub struct ImportPanel {
+    open: bool,
+    path: String,
+    preview: Option<ImportPreview>,
+    error: Option<String>,
+}
+
+impl Default for ImportPanel {
+    fn default() -> Self {
+        Self {
+            open: false,
+            path: DEFAULT_CONFIG_TEXT.to_owned(),
+            preview: None,
+            error: None,
+        }
+    }
+}
+
+impl ImportPanel {
+    /// A closed panel pointing at the file the platform's ssh reads.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the panel is on screen.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Opens the panel on a path, dropping whatever the previous path showed.
+    pub fn open(&mut self, path: impl Into<String>) {
+        self.open = true;
+        self.path = path.into();
+        self.preview = None;
+        self.error = None;
+    }
+
+    /// Closes the panel. The path is kept for the next time it is opened.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.preview = None;
+        self.error = None;
+    }
+
+    /// The path the user typed.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Replaces the path, dropping a result that belongs to the previous one.
+    pub fn set_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        if path != self.path {
+            self.path = path;
+            self.preview = None;
+            self.error = None;
+        }
+    }
+
+    /// What the last read showed.
+    #[must_use]
+    pub fn preview(&self) -> Option<&ImportPreview> {
+        self.preview.as_ref()
+    }
+
+    /// Adopts a preview as the result to show.
+    pub fn set_preview(&mut self, preview: ImportPreview) {
+        self.preview = Some(preview);
+        self.error = None;
+    }
+
+    /// Why the file could not be read or parsed.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Reports a read or parse failure, which no preview can survive.
+    pub fn set_error(&mut self, reason: impl Into<String>) {
+        self.error = Some(reason.into());
+        self.preview = None;
+    }
+
+    /// Reports a failure that happened after the file was read.
+    ///
+    /// The preview stays on screen because it is still a true reading of the file, and
+    /// the reason says why the hosts could not be written instead.
+    pub fn set_apply_error(&mut self, reason: impl Into<String>) {
+        self.error = Some(reason.into());
+    }
+
+    /// Whether the reason on screen belongs to a read that did produce a preview.
+    #[must_use]
+    pub fn keeps_preview(&self) -> bool {
+        self.preview.is_some()
+    }
+}
+
+/// The row number the first host of each group starts at.
+///
+/// The numbering runs across the groups rather than restarting inside each one: two
+/// rows of one list must not share an element id, or the hover and active state of one
+/// follows the other. Deriving the number here, once, is what keeps a view from
+/// passing a constant by hand.
+#[must_use]
+pub fn group_row_offsets(groups: &[Group<'_>]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(groups.len());
+    let mut next = 0usize;
+    for group in groups {
+        offsets.push(next);
+        next += group.len();
+    }
+    offsets
+}
+
+/// The message an applied import leaves behind.
+///
+/// It states what was written, how much of it needs a look and how many hosts were
+/// skipped, so an import never reads as a plain success when part of it was dropped.
+#[must_use]
+pub fn import_message(strings: &Strings, imported: usize, review: usize, skipped: usize) -> String {
+    format!(
+        "{} {imported} {} · {} {review} · {} {skipped}",
+        strings.import_applied,
+        strings.count_hosts,
+        strings.import_review_count,
+        strings.import_skipped
+    )
+}
+
 /// Formats a Unix timestamp as UTC, without pulling a date library into the shell.
 ///
 /// The recent view has to say *when* a host was reached, and a stored integer is not
@@ -432,6 +574,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::copy::{CHINESE, ENGLISH};
     use shellune_storage::HostBook;
 
     fn host(name: &str, address: &str, port: u16, user: &str, group: Option<&str>) -> HostConfig {
@@ -594,5 +737,74 @@ mod tests {
         assert_eq!(format_unix(1_700_000_000), "2023-11-14 22:13 UTC");
         assert_eq!(format_unix(1_700_000_100), "2023-11-14 22:15 UTC");
         assert_eq!(format_unix(951_782_400), "2000-02-29 00:00 UTC");
+    }
+
+    #[test]
+    fn the_import_panel_drops_a_result_that_belongs_to_another_path() {
+        let mut panel = ImportPanel::new();
+        assert!(!panel.is_open());
+        assert_eq!(panel.path(), DEFAULT_CONFIG_TEXT);
+        assert!(panel.preview().is_none());
+        assert!(panel.error().is_none());
+
+        panel.open("C:/Users/example/.ssh/config");
+        assert!(panel.is_open());
+        assert_eq!(panel.path(), "C:/Users/example/.ssh/config");
+
+        let preview = ImportPreview::from_text(
+            "C:/Users/example/.ssh/config",
+            "Host web\n    HostName web.example.org\n    User deploy\n",
+        )
+        .expect("the file parses");
+        panel.set_preview(preview);
+        assert!(panel.preview().is_some());
+        assert!(panel.error().is_none());
+
+        // Editing the path is the start of another question, so the answer to the old
+        // one must not stay on screen where it could be applied to the new file.
+        panel.set_path("C:/Users/example/other-config");
+        assert!(panel.preview().is_none());
+        assert!(panel.error().is_none());
+
+        panel.set_error("the file could not be read");
+        assert!(panel.error().is_some());
+        assert!(panel.preview().is_none());
+
+        panel.close();
+        assert!(!panel.is_open());
+        assert!(panel.preview().is_none());
+        assert_eq!(
+            panel.path(),
+            "C:/Users/example/other-config",
+            "the path is kept for the next time the panel opens"
+        );
+    }
+
+    #[test]
+    fn an_import_message_states_what_was_written_and_what_was_not() {
+        let message = import_message(&ENGLISH, 2, 1, 3);
+        assert!(message.contains('2'), "{message}");
+        assert!(message.contains("Imported"), "{message}");
+        assert!(message.contains("need review"), "{message}");
+        assert!(message.contains("skipped"), "{message}");
+
+        let chinese = import_message(&CHINESE, 2, 1, 3);
+        assert!(chinese.contains("已导入"), "{chinese}");
+        assert!(chinese.contains("需复核"), "{chinese}");
+    }
+
+    #[test]
+    fn the_groups_of_a_list_number_their_rows_across_the_whole_list() {
+        let web = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
+        let api = host("api", "api.example.org", 2222, "svc", Some("prod"));
+        let lab = host("lab", "lab.internal", 22, "root", None);
+        let groups = HostBook::group(vec![&web, &api, &lab]);
+        assert_eq!(groups.len(), 2, "one named group and the ungrouped one");
+        assert_eq!(
+            group_row_offsets(&groups),
+            vec![0, 2],
+            "each group starts where the previous one ended, so no two rows share an index"
+        );
+        assert!(group_row_offsets(&[]).is_empty());
     }
 }
