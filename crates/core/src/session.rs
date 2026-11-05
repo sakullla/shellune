@@ -79,12 +79,48 @@ pub enum SessionFailure {
     ConnectionRefused,
     /// The connection attempt timed out.
     TimedOut,
-    /// The server presented an unknown or changed identity that was not accepted.
+    /// The transport could not be established or the handshake failed.
+    ///
+    /// Kept apart from `ConnectionRefused` and `TimedOut` because the reason comes from
+    /// the network stack or the protocol layer, and "connection refused" would be the
+    /// wrong advice for a protocol mismatch.
+    ConnectionFailed {
+        /// What the transport reported, already free of credentials.
+        reason: String,
+    },
+    /// The server presented an unknown identity that was not accepted.
     HostKeyRejected,
+    /// The server presented an identity that differs from the one that was trusted.
+    ///
+    /// This is the state that must never be resolved by connecting anyway: both
+    /// fingerprints are carried so the shell can show what changed.
+    HostIdentityChanged {
+        /// Key algorithm the server presents now.
+        algorithm: String,
+        /// Fingerprint that was trusted earlier.
+        stored: String,
+        /// Fingerprint the server presents now.
+        presented: String,
+    },
+    /// The system agent that was chosen is not reachable, or holds no usable key.
+    AgentUnavailable {
+        /// Which agent was tried.
+        agent: crate::AgentKind,
+    },
     /// The server rejected the offered credentials.
     AuthenticationFailed,
     /// The remote side closed the connection while the session was live.
     ConnectionLost,
+    /// A live remote session stopped accepting input or output.
+    ///
+    /// The reason is what the transport reported about the running session, so the
+    /// shell does not send the user to fix credentials that were already accepted.
+    RemoteIoFailed {
+        /// The host the session was talking to.
+        host: String,
+        /// What the transport reported.
+        reason: String,
+    },
     /// The local shell process exited.
     ProcessExited {
         /// Exit code, when the platform reported one.
@@ -114,6 +150,26 @@ impl std::fmt::Display for SessionFailure {
                     formatter,
                     "the local shell '{shell}' stopped responding: {reason}"
                 )
+            }
+            Self::ConnectionFailed { reason } => {
+                write!(
+                    formatter,
+                    "the connection could not be established: {reason}"
+                )
+            }
+            Self::HostIdentityChanged {
+                algorithm,
+                stored,
+                presented,
+            } => write!(
+                formatter,
+                "the server identity changed: {algorithm} was {stored}, the server presents {presented}"
+            ),
+            Self::AgentUnavailable { agent } => {
+                write!(formatter, "the {} is not available", agent.label())
+            }
+            Self::RemoteIoFailed { host, reason } => {
+                write!(formatter, "the SSH session to {host} stopped: {reason}")
             }
             Self::ConnectionRefused => formatter.write_str("the connection was refused"),
             Self::TimedOut => formatter.write_str("the connection timed out"),
@@ -520,6 +576,64 @@ mod tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), count);
+    }
+
+    #[test]
+    fn a_changed_identity_states_both_fingerprints_and_stays_failed() {
+        let mut session = remote_session();
+        session.begin_connecting().expect("starts");
+        session.begin_host_verification().expect("verifies");
+        let failure = SessionFailure::HostIdentityChanged {
+            algorithm: "ssh-ed25519".to_owned(),
+            stored: "SHA256:old".to_owned(),
+            presented: "SHA256:new".to_owned(),
+        };
+        session
+            .fail(failure.clone())
+            .expect("the change is recorded");
+
+        assert_eq!(session.state(), &SessionState::Failed(failure));
+        assert!(!session.state().accepts_input());
+
+        let text = SessionFailure::HostIdentityChanged {
+            algorithm: "ssh-ed25519".to_owned(),
+            stored: "SHA256:old".to_owned(),
+            presented: "SHA256:new".to_owned(),
+        }
+        .to_string();
+        assert!(text.contains("SHA256:old"), "{text}");
+        assert!(text.contains("SHA256:new"), "{text}");
+        assert!(text.contains("ssh-ed25519"), "{text}");
+    }
+
+    #[test]
+    fn transport_and_agent_failures_name_what_went_wrong() {
+        assert_eq!(
+            SessionFailure::ConnectionFailed {
+                reason: "connection reset by peer".to_owned()
+            }
+            .to_string(),
+            "the connection could not be established: connection reset by peer"
+        );
+        assert_eq!(
+            SessionFailure::AgentUnavailable {
+                agent: crate::AgentKind::OpenSshPipe
+            }
+            .to_string(),
+            "the Windows OpenSSH agent is not available"
+        );
+        let io = SessionFailure::RemoteIoFailed {
+            host: "deploy@10.0.0.7:22".to_owned(),
+            reason: "the channel was closed".to_owned(),
+        };
+        assert_eq!(
+            io.to_string(),
+            "the SSH session to deploy@10.0.0.7:22 stopped: the channel was closed"
+        );
+        assert!(
+            !io.to_string().contains("could not be established"),
+            "a session that ran must not read as a connect failure"
+        );
     }
 
     #[test]

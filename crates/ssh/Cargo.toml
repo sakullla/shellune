@@ -1,0 +1,23 @@
+[package]
+name = "shellune-ssh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SSH transport for Shellune: host trust, authentication and a remote PTY."
+publish = false
+
+[dependencies]
+russh = { workspace = true }
+sha2 = { workspace = true }
+shellune-core = { path = "../core" }
+tokio = { workspace = true }
+zeroize = { workspace = true }
+
+[features]
+# Builds the disposable OpenSSH server harness the tests start. It is behind a
+# feature so a release build of the application carries none of it.
+test-server = []
+
+[dev-dependencies]
+ssh-key = { version = "0.7.0-rc.11", features = ["ed25519"] }

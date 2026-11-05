@@ -18,6 +18,7 @@ pub mod copy;
 pub mod hosts;
 pub mod nav;
 pub mod product;
+pub mod remote;
 pub mod terminal;
 pub mod text_field;
 pub mod theme;

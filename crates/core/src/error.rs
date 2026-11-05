@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 /// A password or passphrase that never appears in formatted output.
@@ -55,7 +56,10 @@ impl fmt::Debug for SecretString {
 }
 
 /// Which system SSH agent was used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Serializable because a session that failed for want of an agent records which
+/// one, and a session is part of the saved state a shell can restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentKind {
     /// `SSH_AUTH_SOCK` on Unix.
     UnixSocket,

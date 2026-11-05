@@ -28,6 +28,9 @@ use crate::app::theme::{self, Metrics, palette, radius, spacing};
 /// selection. The tests read the model, not this character.
 const CARET: &str = "│";
 
+/// The character drawn in place of a masked character.
+const MASK: char = '•';
+
 /// What the field does with the text the user submitted.
 ///
 /// The window comes with it because a submit usually replaces the field with
@@ -47,6 +50,12 @@ pub struct TextField {
     placeholder: SharedString,
     focus: FocusHandle,
     submit: Option<SubmitHandler>,
+    /// Whether the line is drawn as bullets.
+    ///
+    /// A password or a passphrase is typed into a field like any other, but what is
+    /// on screen must not be readable over a shoulder. The model keeps the real text:
+    /// only the drawing changes, so the input method path stays exactly the same.
+    masked: bool,
 }
 
 impl TextField {
@@ -75,7 +84,34 @@ impl TextField {
             placeholder: placeholder.into(),
             focus: cx.focus_handle(),
             submit: None,
+            masked: false,
         }
+    }
+
+    /// Replaces the text, and puts the caret at its end.
+    ///
+    /// A field that is reused for another attempt has to start from what that
+    /// attempt needs, not from what was left in it.
+    pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.text = text.into();
+        self.caret = self.text.len();
+        self.marked = None;
+        cx.notify();
+    }
+
+    /// Draws the line as bullets instead of characters.
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        if self.masked != masked {
+            self.masked = masked;
+            cx.notify();
+        }
+    }
+
+    /// Whether the line is drawn as bullets.
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_masked(&self) -> bool {
+        self.masked
     }
 
     /// The current text.
@@ -194,6 +230,34 @@ impl TextField {
 
     /// The line to draw, including the caret where it currently is.
     fn display(&self, focused: bool) -> String {
+        if self.masked {
+            let bullets: String = self
+                .text
+                .chars()
+                .map(|_| MASK)
+                .chain(
+                    self.marked
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .map(|_| MASK),
+                )
+                .collect();
+            let before = self.text[..self.caret].chars().count();
+            return if focused && self.text.is_empty() && self.marked.is_none() {
+                format!("{CARET}{}", self.placeholder)
+            } else if focused {
+                let (head, tail) = bullets.split_at(
+                    bullets
+                        .char_indices()
+                        .nth(before)
+                        .map_or(bullets.len(), |(index, _)| index),
+                );
+                format!("{head}{CARET}{tail}")
+            } else {
+                bullets
+            };
+        }
         if self.text.is_empty() {
             let placeholder = self.placeholder.to_string();
             return if focused {

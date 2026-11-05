@@ -20,7 +20,7 @@ use gpui::{
 use shellune_core::{
     HostConfig, LocalShell, Session, SessionKind, SessionState, Transfer, TransferDirection,
 };
-use shellune_storage::{HostBook, HostEdit, HostStore};
+use shellune_storage::{HostBook, HostEdit, HostKey, HostStore, TrustStore};
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage};
@@ -28,6 +28,7 @@ use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
 use crate::app::hosts::HostView;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
+use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
 use crate::app::terminal::{PaneState, TerminalPane};
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Tone, Zoom, palette,
@@ -2581,4 +2582,583 @@ async fn an_import_whose_write_fails_keeps_the_preview_and_adds_nothing(cx: &mut
         cx.debug_bounds("hosts.import.row.0").is_some(),
         "the hosts that could not be written are still listed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Remote connections (R4, R6)
+// ---------------------------------------------------------------------------
+
+/// Mounts the shell on the hosts destination with its own host store and trust
+/// file, so a test never reads or writes the developer's records.
+fn hosts_view_with_trust<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// A presented identity a test can ask about.
+fn presented_key(byte: u8) -> shellune_ssh::PresentedKey {
+    shellune_ssh::PresentedKey {
+        algorithm: "ssh-ed25519".to_owned(),
+        fingerprint: shellune_core::sha256_fingerprint(&[byte; 32]).expect("a digest"),
+        public_key: "AAAAC3NzaC1lZDI1NTE5AAAAIK6Lk1FqcnKXBppTRsW38vMVUrRnrLv6rQbxs6aDboAs"
+            .to_owned(),
+    }
+}
+
+fn host_prompt(host: &HostConfig, byte: u8) -> shellune_ssh::HostKeyPrompt {
+    shellune_ssh::HostKeyPrompt {
+        host: host.address().to_owned(),
+        port: host.port().get(),
+        presented: presented_key(byte),
+    }
+}
+
+#[gpui::test]
+async fn connecting_to_a_saved_host_opens_a_form_with_its_saved_key(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-form");
+    let mut web = stored_host("web", "10.0.0.5", 22, "deploy", None);
+    web.set_identity_file(Some("/home/deploy/.ssh/id_ed25519"));
+    let book = seed(&dir.store(), vec![web]);
+    let saved = book.hosts()[0].clone();
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    // Saving a host is not connecting to it: no form is open before the click.
+    assert!(cx.debug_bounds("remote.panel").is_none());
+
+    click(cx, "hosts.connect.0");
+    assert!(
+        cx.debug_bounds("remote.panel").is_some(),
+        "the connection form is opened for the host that was chosen"
+    );
+    assert!(
+        cx.debug_bounds("remote.form").is_some(),
+        "the method chooser and its fields are on screen"
+    );
+    cx.update(|_window, app| {
+        let state = view
+            .read(app)
+            .remote_state()
+            .expect("a connection form is open");
+        assert_eq!(state.method(), MethodChoice::KeyFile);
+        assert_eq!(
+            state.key_path(),
+            saved.identity_file().expect("the saved key path"),
+            "the path the host already records is the one the connection offers"
+        );
+    });
+    assert!(
+        cx.debug_bounds("remote.key").is_some(),
+        "the key path field is shown for the key method"
+    );
+    assert!(
+        cx.debug_bounds("remote.passphrase").is_none(),
+        "a plain key does not ask for a passphrase"
+    );
+
+    // The other methods are one click away, and each shows the field it needs.
+    click(cx, "remote.method.agent");
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app)
+                .remote_state()
+                .expect("a form is open")
+                .method(),
+            MethodChoice::Agent,
+            "choosing the agent method switches what the form asks for"
+        );
+    });
+    click(cx, "remote.method.password");
+    assert!(
+        cx.debug_bounds("remote.password").is_some(),
+        "the password field belongs to the password method"
+    );
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app)
+                .remote_state()
+                .expect("a form is open")
+                .method(),
+            MethodChoice::Password
+        );
+    });
+}
+
+#[gpui::test]
+async fn the_password_field_is_masked(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-mask");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+
+    type_into(cx, "remote.password", "hunter2-correct-horse");
+    cx.update(|_window, app| {
+        let current = view.read(app);
+        let masked = current.remote_field_masked(MethodChoice::Password, app);
+        assert!(masked, "a password is typed into a masked field");
+        let state = current.remote_state().expect("a form is open");
+        assert_eq!(state.password(), "hunter2-correct-horse");
+    });
+}
+
+#[gpui::test]
+async fn an_unknown_identity_is_shown_with_its_algorithm_and_fingerprint(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-trust");
+    let book = seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let host = book.hosts()[0].clone();
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.show_trust_prompt(host_prompt(&host, 3), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("remote.trust").is_some(),
+        "an unknown identity is a question, not a connection"
+    );
+    assert!(
+        cx.debug_bounds("remote.trust.fingerprint").is_some(),
+        "the fingerprint is on screen where it can be compared"
+    );
+    cx.update(|_window, app| {
+        let state = view.read(app).remote_state().expect("a form is open");
+        assert!(
+            state.status().is_asking(),
+            "the form waits for the decision instead of offering to connect"
+        );
+        let prompt = state
+            .status()
+            .prompt()
+            .expect("the identity is being asked about");
+        assert_eq!(prompt.algorithm(), "ssh-ed25519");
+        assert_eq!(prompt.fingerprint(), presented_key(3).fingerprint);
+    });
+}
+
+#[gpui::test]
+async fn accepting_an_identity_writes_it_and_rejecting_writes_nothing(cx: &mut TestAppContext) {
+    let accepted_dir = TempDir::new("remote-accept");
+    let book = seed(
+        &accepted_dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let host = book.hosts()[0].clone();
+    let (view, cx) = hosts_view_with_trust(cx, &accepted_dir);
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.show_trust_prompt(host_prompt(&host, 4), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "remote.trust.accept");
+
+    cx.update(|_window, app| {
+        let trust = view.read(app).trust();
+        let entry = trust
+            .entry("10.0.0.5", 22)
+            .expect("the accepted identity is stored");
+        assert_eq!(entry.fingerprint(), presented_key(4).fingerprint);
+        assert_eq!(entry.algorithm(), "ssh-ed25519");
+    });
+    let written = TrustStore::at(accepted_dir.path())
+        .load()
+        .expect("the trust file is readable");
+    let comparable = HostKey::new(
+        "ssh-ed25519",
+        presented_key(4).fingerprint,
+        presented_key(4).public_key,
+    )
+    .expect("a comparable identity");
+    assert_eq!(
+        written.verdict("10.0.0.5", 22, &comparable),
+        shellune_storage::TrustVerdict::Trusted,
+        "the decision survives a reload, which is what makes it a decision"
+    );
+
+    // The same question, answered with a refusal, must leave no record.
+    let refused_dir = TempDir::new("remote-reject");
+    let book = seed(
+        &refused_dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let host = book.hosts()[0].clone();
+    let (view, cx) = hosts_view_with_trust(cx, &refused_dir);
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.show_trust_prompt(host_prompt(&host, 5), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "remote.trust.reject");
+
+    assert!(
+        !refused_dir
+            .path()
+            .join(shellune_storage::TRUST_FILE_NAME)
+            .exists(),
+        "a refusal writes no trust record"
+    );
+    assert!(cx.debug_bounds("remote.failure").is_some());
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            view.pane().is_none(),
+            "a refused identity opens no terminal"
+        );
+        let sessions = view.workspace().sessions();
+        let session = sessions.items().last().expect("the attempt was recorded");
+        assert!(
+            matches!(
+                session.state(),
+                SessionState::Failed(shellune_core::SessionFailure::HostKeyRejected)
+            ),
+            "the session says the identity was rejected, got {:?}",
+            session.state()
+        );
+    });
+}
+
+#[gpui::test]
+async fn an_attempt_that_fails_shows_the_reason_and_opens_no_terminal(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-failure");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.fail_remote_for_test(shellune_ssh::ConnectError::AuthRejected, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("remote.failure").is_some());
+    assert!(
+        cx.debug_bounds("remote.failure.reason").is_some(),
+        "the reason the transport gave is on screen"
+    );
+    assert!(
+        cx.debug_bounds("remote.failure.next").is_some(),
+        "the next step is stated, so the failure is actionable"
+    );
+    assert!(
+        cx.debug_bounds("remote.retry").is_some(),
+        "a rejected password can be retried with another method"
+    );
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            view.pane().is_none(),
+            "a failed attempt must not leave a terminal behind"
+        );
+        let sessions = view.workspace().sessions();
+        let session = sessions.items().last().expect("the attempt was recorded");
+        assert!(
+            matches!(session.state(), SessionState::Failed(_)),
+            "the session records the failure, got {:?}",
+            session.state()
+        );
+        assert!(
+            !view
+                .book()
+                .recents()
+                .iter()
+                .any(|recent| recent.connections() > 0),
+            "a failed attempt is not a recent connection"
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_changed_identity_is_blocked_without_offering_a_retry(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-changed");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.fail_remote_for_test(
+                shellune_ssh::ConnectError::HostKeyChanged {
+                    stored: presented_key(6).fingerprint,
+                    presented: presented_key(7),
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("remote.failure").is_some());
+    assert!(
+        cx.debug_bounds("remote.retry").is_none(),
+        "a changed identity is not a button to press again"
+    );
+    assert!(
+        cx.debug_bounds("remote.trust").is_none(),
+        "the new identity is never offered for acceptance in the same step"
+    );
+}
+
+/// Runs the remote poll loop until the panel says the attempt reached a state.
+///
+/// The poll loop in the application waits on the window's timer, which a test cannot
+/// advance, so the same call is driven directly here.
+fn pump_remote_until(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    what: &str,
+    mut done: impl FnMut(&RemotePanel) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.pump_remote_once(cx);
+            });
+        });
+        let reached = cx.update(|_window, app| {
+            view.read(app)
+                .remote_state()
+                .map(&mut done)
+                .unwrap_or(false)
+        });
+        if reached {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the attempt never reached {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[gpui::test]
+async fn a_real_ssh_session_opens_a_terminal_that_uses_the_shared_interactions(
+    cx: &mut TestAppContext,
+) {
+    if !shellune_ssh::testserver::Harness::is_available() {
+        eprintln!(
+            "SKIPPED the SSH session: this host cannot start a disposable OpenSSH server, \
+             so no remote terminal is verified here and none is claimed."
+        );
+        return;
+    }
+    static SERVER: std::sync::OnceLock<
+        Option<std::sync::Mutex<shellune_ssh::testserver::Harness>>,
+    > = std::sync::OnceLock::new();
+    let server = SERVER.get_or_init(|| {
+        shellune_ssh::testserver::Harness::start(
+            "app-session",
+            shellune_ssh::testserver::Harness::free_port(),
+        )
+        .ok()
+        .map(std::sync::Mutex::new)
+    });
+    let Some(server) = server.as_ref() else {
+        eprintln!("SKIPPED the SSH session: the disposable server could not be started.");
+        return;
+    };
+    let mut server = server.lock().unwrap_or_else(|error| error.into_inner());
+
+    let dir = TempDir::new("remote-session");
+    let host = HostConfig::new("lab", "127.0.0.1", server.port(), server.user())
+        .expect("a valid test host");
+    let host_id = host.id();
+    let book = seed(&dir.store(), vec![host]);
+    assert_eq!(book.recents().len(), 0);
+
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+    type_into(cx, "remote.password", server.password());
+    click(cx, "remote.connect");
+
+    // The first contact asks about the identity, and nothing is stored yet.
+    pump_remote_until(cx, &view, "the identity question", |panel| {
+        panel.status().is_asking()
+    });
+    assert!(
+        !dir.path().join(shellune_storage::TRUST_FILE_NAME).exists(),
+        "an unanswered identity writes nothing"
+    );
+    click(cx, "remote.trust.accept");
+
+    pump_remote_until(cx, &view, "a live session", |panel| {
+        matches!(panel.status(), RemoteStatus::Live)
+    });
+
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("a live connection shows a terminal");
+    let (grid, session) = cx.update(|_window, app| {
+        let pane = pane.read(app);
+        let session = view
+            .read(app)
+            .workspace()
+            .sessions()
+            .items()
+            .last()
+            .map(|session| (session.kind().clone(), session.state().clone()));
+        (pane.grid(), session)
+    });
+    assert!(
+        matches!(
+            session,
+            Some((shellune_core::SessionKind::Remote { host }, SessionState::Connected))
+                if host == host_id
+        ),
+        "the session is the remote one and it is connected, got {session:?}"
+    );
+    assert!(grid.cols > 0 && grid.rows > 0);
+    assert!(
+        cx.debug_bounds("terminal.viewport").is_some(),
+        "the shared terminal view draws the remote session"
+    );
+
+    // Input reaches the remote shell through the same path an input method commits
+    // text through, and the answer comes back into the same grid a local shell writes
+    // into, in the same UTF-8.
+    type_into_pane(cx, &pane, "echo shellune-远程-ok\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut screen = String::new();
+    while std::time::Instant::now() < deadline {
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                pane.pump_once(cx);
+            });
+        });
+        screen = cx.update(|_window, app| pane.read(app).visible_text().join("\n"));
+        if screen.contains("shellune-远程-ok") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        screen.contains("shellune-远程-ok"),
+        "the remote shell answered into the grid, got {screen:?}"
+    );
+
+    // A window resize has to reach the server's pseudo terminal, not only the grid.
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.pump_once(cx);
+        });
+    });
+    let resized = cx.update(|_window, app| pane.read(app).grid());
+    assert_ne!(
+        resized, grid,
+        "the pane re-measured the grid for the new size"
+    );
+    type_into_pane(cx, &pane, "stty size\n");
+    let expected = format!("{} {}", resized.rows, resized.cols);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut screen = String::new();
+    while std::time::Instant::now() < deadline {
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                pane.pump_once(cx);
+            });
+        });
+        screen = cx.update(|_window, app| pane.read(app).visible_text().join("\n"));
+        if screen.contains(&expected) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        screen.contains(&expected),
+        "the server reports the size the window asked for ({expected:?}), got {screen:?}"
+    );
+
+    // The identity is stored and the host is listed as recently connected, which
+    // only a connection that really happened can do.
+    let written = TrustStore::at(dir.path()).load().expect("the trust file");
+    assert_eq!(
+        written
+            .entry("127.0.0.1", server.port())
+            .map(|entry| entry.fingerprint().to_owned()),
+        Some(server.host_key_fingerprint()),
+        "the accepted identity is the one the server presented"
+    );
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let recent = view.book().recent_of(host_id).expect("a recent record");
+        assert_eq!(recent.connections(), 1, "one successful connection");
+    });
+
+    // Closing the panel ends the session and leaves no terminal behind.
+    click(cx, "remote.close");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            view.pane().is_none(),
+            "the terminal is gone with the session"
+        );
+        assert!(view.remote_state().is_none(), "the panel is closed");
+    });
+    let state = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .sessions()
+            .items()
+            .last()
+            .map(|session| session.state().clone())
+    });
+    assert_eq!(
+        state,
+        Some(SessionState::Closed),
+        "a closed remote session says so"
+    );
+    server.stop();
+}
+
+/// Sends text to a pane through the same entry the input method commits through.
+///
+/// The pane is mounted inside the shell view here, so a test cannot rely on the
+/// window's focus being on the terminal: this calls the commit path directly, which
+/// is what an input method does once it hands over the characters.
+fn type_into_pane(cx: &mut VisualTestContext, pane: &Entity<TerminalPane>, text: &str) {
+    use gpui::EntityInputHandler;
+
+    cx.update(|window, app| {
+        pane.update(app, |pane, cx| {
+            pane.replace_text_in_range(None, text, window, cx);
+        });
+    });
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.pump_once(cx);
+        });
+    });
 }

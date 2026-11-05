@@ -291,6 +291,59 @@ pub struct Strings {
     pub import_error_title: &'static str,
     /// Shown when the import panel was asked to read an empty path.
     pub import_path_required: &'static str,
+
+    /// Label of the password authentication method.
+    pub auth_password: &'static str,
+    /// Label of the plain private key method.
+    pub auth_key: &'static str,
+    /// Label of the passphrase protected key method.
+    pub auth_key_passphrase: &'static str,
+    /// Label of the system agent method.
+    pub auth_agent: &'static str,
+    /// What the password field is for.
+    pub auth_password_hint: &'static str,
+    /// What the key path field is for.
+    pub auth_key_hint: &'static str,
+    /// What the passphrase field is for.
+    pub auth_key_passphrase_hint: &'static str,
+    /// What the agent method uses.
+    pub auth_agent_hint: &'static str,
+    /// Shown when the password field is empty.
+    pub auth_missing_password: &'static str,
+    /// Shown when the key path field is empty.
+    pub auth_missing_key: &'static str,
+    /// Shown when the passphrase field is empty.
+    pub auth_missing_passphrase: &'static str,
+    /// Button that starts a remote session.
+    pub remote_connect: &'static str,
+    /// Status before an attempt started.
+    pub remote_idle: &'static str,
+    /// Status while the transport connects.
+    pub remote_connecting: &'static str,
+    /// Status while the user decides about the server identity.
+    pub remote_verifying: &'static str,
+    /// Status of a live remote session.
+    pub remote_live: &'static str,
+    /// Status of a failed attempt.
+    pub remote_failed: &'static str,
+    /// Title of the unknown host identity question.
+    pub trust_title: &'static str,
+    /// Explanation shown beside the fingerprint.
+    pub trust_body: &'static str,
+    /// Label of the key algorithm.
+    pub trust_algorithm: &'static str,
+    /// Label of the SHA-256 fingerprint.
+    pub trust_fingerprint: &'static str,
+    /// Button that stores the identity and connects.
+    pub trust_accept: &'static str,
+    /// Button that refuses the identity.
+    pub trust_reject: &'static str,
+    /// Shown after an identity was refused.
+    pub trust_rejected_note: &'static str,
+    /// Title of the failed attempt panel.
+    pub remote_failure_title: &'static str,
+    /// Button that closes the remote panel.
+    pub remote_close: &'static str,
 }
 
 /// English copy.
@@ -408,6 +461,32 @@ pub static ENGLISH: Strings = Strings {
     import_skipped: "skipped",
     import_error_title: "Nothing was imported",
     import_path_required: "Name the configuration file to read.",
+    auth_password: "Password",
+    auth_key: "Key file",
+    auth_key_passphrase: "Key file with passphrase",
+    auth_agent: "System agent",
+    auth_password_hint: "Used for this attempt only; Shellune never saves it.",
+    auth_key_hint: "A readable private key the server authorizes.",
+    auth_key_passphrase_hint: "The passphrase decrypts the key for this attempt only.",
+    auth_agent_hint: "Signs with a key the system agent already holds.",
+    auth_missing_password: "Enter the password for this host.",
+    auth_missing_key: "Choose the private key file to use.",
+    auth_missing_passphrase: "Enter the passphrase for this key.",
+    remote_connect: "Connect",
+    remote_idle: "Not connected yet",
+    remote_connecting: "Connecting",
+    remote_verifying: "Waiting for your decision",
+    remote_live: "SSH session live",
+    remote_failed: "Could not connect",
+    trust_title: "This server identity is not known yet",
+    trust_body: "Compare this fingerprint with the one the server's administrator can print. Nothing is stored until you accept it.",
+    trust_algorithm: "Algorithm",
+    trust_fingerprint: "SHA-256 fingerprint",
+    trust_accept: "Accept and connect",
+    trust_reject: "Reject",
+    trust_rejected_note: "The identity was rejected, so no terminal was opened and no trust record was written.",
+    remote_failure_title: "The connection did not open",
+    remote_close: "Close the connection panel",
 };
 
 /// Chinese copy.
@@ -525,6 +604,32 @@ pub static CHINESE: Strings = Strings {
     import_skipped: "已跳过",
     import_error_title: "没有导入任何内容",
     import_path_required: "请先填写要读取的配置文件路径。",
+    auth_password: "密码",
+    auth_key: "私钥文件",
+    auth_key_passphrase: "带口令的私钥",
+    auth_agent: "系统 Agent",
+    auth_password_hint: "仅用于本次连接，Shellune 不会保存。",
+    auth_key_hint: "服务器已授权、且本账号可读取的私钥。",
+    auth_key_passphrase_hint: "口令仅用于本次解密该私钥。",
+    auth_agent_hint: "使用系统 Agent 中已有的密钥完成签名。",
+    auth_missing_password: "请输入该主机的密码。",
+    auth_missing_key: "请选择要使用的私钥文件。",
+    auth_missing_passphrase: "请输入该私钥的口令。",
+    remote_connect: "连接",
+    remote_idle: "尚未连接",
+    remote_connecting: "正在连接",
+    remote_verifying: "等待你确认服务器身份",
+    remote_live: "SSH 会话已连接",
+    remote_failed: "连接未建立",
+    trust_title: "尚未信任该服务器身份",
+    trust_body: "请与服务器管理员可打印的指纹核对；在你接受之前不会写入任何记录。",
+    trust_algorithm: "算法",
+    trust_fingerprint: "SHA-256 指纹",
+    trust_accept: "接受并连接",
+    trust_reject: "拒绝",
+    trust_rejected_note: "已拒绝该身份，未打开终端，也未写入信任记录。",
+    remote_failure_title: "连接没有建立",
+    remote_close: "关闭连接面板",
 };
 
 /// Hint for the section shortcuts, built for one platform.

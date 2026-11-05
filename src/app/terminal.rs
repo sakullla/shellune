@@ -29,6 +29,7 @@ use gpui::{
 use std::ops::Range;
 
 use shellune_core::{LocalShell, SessionFailure};
+use shellune_ssh::{RemoteEvent, RemoteSession};
 use shellune_terminal::{
     CellSize, CursorShape, ExitReport, GridSize, Key, KeyModifiers, LocalSession, PtyEvent, Rgb,
     SelectionType, Snapshot, TerminalCore, TerminalEffects, encode_key, encode_paste, encode_text,
@@ -121,11 +122,136 @@ impl PaneState {
     }
 }
 
-/// One terminal view backed by a shell process.
+/// What feeds a pane.
+///
+/// The grid, the selection, the scrollback and the input encoding are the same for
+/// both, which is the point of the shared terminal core: only the byte source
+/// differs. A remote session is not a second terminal implementation.
+pub enum PaneSource {
+    /// A shell process on this machine.
+    Local(LocalSession),
+    /// A shell on a server, reached over SSH.
+    Remote(RemoteSession),
+}
+
+/// Something a source produced, in the terms the pane thinks in.
+pub enum SourceEvent {
+    /// Bytes a program wrote.
+    Data(Vec<u8>),
+    /// The program ended.
+    Exited(ExitReport),
+    /// The source stopped for a reason worth stating.
+    Lost(String),
+}
+
+impl PaneSource {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Local(session) => session.write(bytes).map_err(|error| error.to_string()),
+            Self::Remote(session) => session.write(bytes),
+        }
+    }
+
+    fn resize(&mut self, grid: GridSize) -> Result<(), String> {
+        match self {
+            Self::Local(session) => session.resize(grid),
+            Self::Remote(session) => session.resize(shellune_ssh::PtySize::new(
+                u32::try_from(grid.cols).unwrap_or(u32::MAX),
+                u32::try_from(grid.rows).unwrap_or(u32::MAX),
+            )),
+        }
+    }
+
+    fn drain(&mut self) -> Vec<SourceEvent> {
+        match self {
+            Self::Local(session) => session
+                .drain()
+                .into_iter()
+                .map(|event| match event {
+                    PtyEvent::Data(bytes) => SourceEvent::Data(bytes),
+                    PtyEvent::Exited(report) => SourceEvent::Exited(report),
+                    PtyEvent::ReadFailed(reason) => SourceEvent::Lost(reason),
+                })
+                .collect(),
+            Self::Remote(session) => {
+                let drained = session.drain();
+                drained
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        RemoteEvent::Data(bytes) => Some(SourceEvent::Data(bytes)),
+                        RemoteEvent::Exited { code } => Some(SourceEvent::Exited(match code {
+                            None | Some(0) => ExitReport::Clean,
+                            Some(code) => ExitReport::Code {
+                                code: i32::try_from(code).unwrap_or(i32::MAX),
+                            },
+                        })),
+                        // A prompt or a connection notice belongs to the shell, which
+                        // owns the session until the shell is live; reaching this point
+                        // with one would mean two owners, so it is ignored rather than
+                        // drawn as output.
+                        RemoteEvent::HostKeyPrompt(_) | RemoteEvent::Connected => None,
+                        RemoteEvent::Failed(error) => Some(SourceEvent::Lost(error.to_string())),
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        match self {
+            Self::Local(session) => session.close(),
+            Self::Remote(session) => session.close(),
+        }
+    }
+}
+
+/// What a pane is running, for labels and for the reason a failure names.
+#[derive(Clone, Debug)]
+pub enum PaneOrigin {
+    /// A program on this machine.
+    Local(LocalShell),
+    /// A shell on a server.
+    Remote {
+        /// The address the session talks to, as the user sees it.
+        target: String,
+    },
+}
+
+impl PaneOrigin {
+    /// What the pane calls the thing it runs.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Local(shell) => shell.name(),
+            Self::Remote { target } => target,
+        }
+    }
+
+    /// The failure a stopped source implies.
+    ///
+    /// A local program that started and then stopped needs different advice from an
+    /// SSH session that lost its channel, which is why the origin decides.
+    #[must_use]
+    pub fn lost_failure(&self, reason: String) -> SessionFailure {
+        match self {
+            Self::Local(shell) => SessionFailure::LocalShellIoFailed {
+                shell: shell.program().to_owned(),
+                reason,
+            },
+            Self::Remote { target } => SessionFailure::RemoteIoFailed {
+                host: target.clone(),
+                reason,
+            },
+        }
+    }
+}
+
+/// One terminal view backed by a local shell or a remote session.
 pub struct TerminalPane {
     core: TerminalCore,
-    source: Option<LocalSession>,
-    shell: LocalShell,
+    source: Option<PaneSource>,
+    /// What the pane is running: a program here, or a host over SSH.
+    origin: PaneOrigin,
     state: PaneState,
     /// Bytes written to the shell, kept so what the user typed can be inspected.
     ///
@@ -167,14 +293,14 @@ impl TerminalPane {
         let grid = grid.clamped();
         let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
         let (source, state) = match LocalSession::spawn(&shell, grid, None) {
-            Ok(session) => (Some(session), PaneState::Live),
+            Ok(session) => (Some(PaneSource::Local(session)), PaneState::Live),
             Err(error) => (None, PaneState::Failed(error.session_failure())),
         };
 
         let mut pane = Self {
             core,
             source,
-            shell,
+            origin: PaneOrigin::Local(shell),
             state,
             #[cfg(test)]
             sent: Vec::new(),
@@ -194,6 +320,64 @@ impl TerminalPane {
         pane
     }
 
+    /// Wraps a live remote session in a pane.
+    ///
+    /// The session has already reached the remote shell, so the pane starts live:
+    /// everything from here on is the same grid, selection, scrollback and input
+    /// encoding a local shell uses.
+    pub fn start_remote(
+        session: RemoteSession,
+        target: impl Into<String>,
+        grid: GridSize,
+        font_size: f32,
+        locale: Locale,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let font_size = sanitize_font_size(font_size);
+        let grid = grid.clamped();
+        let target = target.into();
+        let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
+        let mut pane = Self {
+            core,
+            source: Some(PaneSource::Remote(session)),
+            origin: PaneOrigin::Remote { target },
+            state: PaneState::Live,
+            #[cfg(test)]
+            sent: Vec::new(),
+            font_size,
+            cell: CellSize::for_font_size(font_size),
+            grid,
+            viewport: None,
+            focus: cx.focus_handle(),
+            dragging: false,
+            press: None,
+            marked: None,
+            last_copy: None,
+            locale,
+            polling: false,
+        };
+        pane.start_polling(cx);
+        pane
+    }
+
+    /// Shuts the source down because the user closed it.
+    ///
+    /// The last screen stays on display: dropping the grid on close would hide what
+    /// was on it, and the pane reports that it is no longer live either way.
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        if let Some(source) = self.source.as_mut() {
+            source.close();
+        }
+        self.source = None;
+        self.polling = false;
+        if self.state.accepts_input() {
+            self.state = PaneState::Exited {
+                report: ExitReport::Clean,
+            };
+        }
+        cx.notify();
+    }
+
     /// A pane with a terminal but no process.
     ///
     /// Tests use this to drive the grid deterministically; the application always
@@ -211,7 +395,7 @@ impl TerminalPane {
         Self {
             core: TerminalCore::new(grid.cols, grid.rows, 1000),
             source: None,
-            shell,
+            origin: PaneOrigin::Local(shell),
             state: PaneState::Live,
             #[cfg(test)]
             sent: Vec::new(),
@@ -338,7 +522,7 @@ impl TerminalPane {
     /// Returns whether polling should continue: a pane whose process ended stops
     /// polling instead of waking up for ever.
     fn drain_events(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(source) = self.source.as_ref() else {
+        let Some(source) = self.source.as_mut() else {
             return false;
         };
         let events = source.drain();
@@ -353,24 +537,21 @@ impl TerminalPane {
         live
     }
 
-    fn handle_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) -> bool {
+    fn handle_event(&mut self, event: SourceEvent, cx: &mut Context<Self>) -> bool {
         match event {
-            PtyEvent::Data(bytes) => {
+            SourceEvent::Data(bytes) => {
                 let effects = self.core.feed(&bytes);
                 self.apply_effects(effects, cx);
                 self.state.accepts_input()
             }
-            PtyEvent::Exited(report) => {
+            SourceEvent::Exited(report) => {
                 self.state = PaneState::Exited { report };
                 false
             }
-            PtyEvent::ReadFailed(reason) => {
-                // The shell did start; what failed is reading it. Saying it "could
+            SourceEvent::Lost(reason) => {
+                // The session did start; what failed is reading it. Saying it "could
                 // not be started" would send the user to fix a launch that worked.
-                self.state = PaneState::Failed(SessionFailure::LocalShellIoFailed {
-                    shell: self.shell.program().to_owned(),
-                    reason,
-                });
+                self.state = PaneState::Failed(self.origin.lost_failure(reason));
                 false
             }
         }
@@ -399,10 +580,8 @@ impl TerminalPane {
             return;
         };
         if let Err(error) = source.write(bytes) {
-            self.state = PaneState::Failed(SessionFailure::LocalShellIoFailed {
-                shell: self.shell.program().to_owned(),
-                reason: error.to_string(),
-            });
+            let failure = self.origin.lost_failure(error);
+            self.state = PaneState::Failed(failure);
             cx.notify();
         }
     }
@@ -658,7 +837,7 @@ impl TerminalPane {
                             .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
                             .truncate()
                             .debug_selector(|| "terminal.shell".to_owned())
-                            .child(SharedString::from(self.shell.name().to_owned())),
+                            .child(SharedString::from(self.origin.label().to_owned())),
                     )
                     .child(components::chip(
                         self.state.label(self.locale),

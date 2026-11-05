@@ -15,8 +15,13 @@ use gpui::{
     Context, Div, Entity, FocusHandle, FontWeight, IntoElement, Render, SharedString, Stateful,
     Window, div, px,
 };
-use shellune_core::{HostConfig, HostId, LocalShell, Session, SessionId, SessionState, Transfer};
-use shellune_storage::{HostBook, HostStore, ImportOutcome, ImportPreview, ImportedHost};
+use shellune_core::{
+    HostConfig, HostId, LocalShell, Session, SessionFailure, SessionId, SessionState, Transfer,
+};
+use shellune_ssh::{ConnectRequest, PtySize, RemoteEvent, RemoteSession};
+use shellune_storage::{
+    HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview, ImportedHost, TrustStore,
+};
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{
@@ -30,6 +35,7 @@ use crate::app::hosts::{
 };
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
+use crate::app::remote::{self, MethodChoice, RemoteFailure, RemotePanel, RemoteStatus};
 use crate::app::terminal::{PaneState, TerminalPane};
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
@@ -38,14 +44,39 @@ use crate::app::workspace::{
 };
 use crate::app::{components, theme::radius};
 
+/// Where the terminal on screen comes from.
+///
+/// One pane exists in this step, so the shell has to know whether the local
+/// destination or the host destination owns it: showing a remote terminal under
+/// "Local shells" would mislabel a server session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneKind {
+    Local,
+    Remote,
+}
+
+/// How often the shell looks for events from a connecting remote session.
+///
+/// Short enough that a trust question appears as the handshake reaches it, long
+/// enough that a slow connection does not cost a frame per byte.
+pub const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Height of the remote terminal inside the host destination.
+///
+/// A terminal squeezed into a few rows cannot show a command and its answer, so the
+/// panel keeps a size that is worth typing into.
+pub const REMOTE_TERMINAL_HEIGHT: f32 = 340.0;
+
 /// The application shell view.
 pub struct ShelluneView {
     workspace: Workspace,
     root_focus: FocusHandle,
     destination_focus: Vec<FocusHandle>,
-    /// The one local terminal this step delivers; multi-session arrives later.
+    /// The terminal this step shows; multi-session arrives later.
     pane: Option<Entity<TerminalPane>>,
     pane_session: Option<SessionId>,
+    /// Whether that terminal runs locally or on a server.
+    pane_kind: PaneKind,
     shell_path: Entity<TextField>,
     custom_shell_open: bool,
     /// Where the saved hosts live.
@@ -61,6 +92,29 @@ pub struct ShelluneView {
     import: ImportPanel,
     /// The configuration path field, present only while that panel is open.
     import_path: Option<Entity<TextField>>,
+    /// The remote connection form, present while a host is being connected to.
+    remote: Option<RemotePanel>,
+    /// The attempt in flight, before it becomes a terminal.
+    remote_session: Option<RemoteSession>,
+    /// The session record the attempt owns, once one exists.
+    remote_session_id: Option<SessionId>,
+    /// Whether a poll loop is already watching the attempt.
+    remote_watching: bool,
+    /// The credentials fields, created once and reused per attempt.
+    remote_fields: RemoteFields,
+    /// The accepted server identities.
+    trust: TrustStore,
+    /// What that file really held the last time it was read or written.
+    trust_book: HostTrust,
+    /// Why the trust file could not be read, when it could not.
+    trust_error: Option<String>,
+}
+
+/// The three credential fields of the remote form.
+struct RemoteFields {
+    password: Entity<TextField>,
+    key_path: Entity<TextField>,
+    passphrase: Entity<TextField>,
 }
 
 /// The six fields of the host editor, in form order.
@@ -104,16 +158,44 @@ impl ShelluneView {
     /// planned section means "read the store", anything else means the caller has
     /// already established the state and the store is only where saves will go.
     pub fn with_store(cx: &mut Context<Self>, workspace: Workspace, store: HostStore) -> Self {
+        Self::with_store_and_trust(cx, workspace, store, default_trust())
+    }
+
+    /// Builds the shell around an existing workspace, host store and trust file.
+    pub fn with_store_and_trust(
+        cx: &mut Context<Self>,
+        workspace: Workspace,
+        store: HostStore,
+        trust: TrustStore,
+    ) -> Self {
         let placeholder = workspace.strings().shell_custom_placeholder;
         let search_placeholder = workspace.strings().hosts_search_placeholder;
+        let strings = workspace.strings();
         let shell_path = cx.new(|cx| TextField::new(placeholder, cx));
         let hosts_search = cx.new(|cx| TextField::new(search_placeholder, cx));
+
+        // The credentials fields are created once and reused: a field that is
+        // recreated per attempt would lose the caret on every keystroke that
+        // redraws the panel.
+        let password = cx.new(|cx| {
+            let mut field = TextField::new(strings.auth_password, cx);
+            field.set_masked(true, cx);
+            field
+        });
+        let key_path = cx.new(|cx| TextField::new(strings.auth_key, cx));
+        let passphrase = cx.new(|cx| {
+            let mut field = TextField::new(strings.auth_key_passphrase, cx);
+            field.set_masked(true, cx);
+            field
+        });
+
         let mut view = Self {
             workspace,
             root_focus: cx.focus_handle(),
             destination_focus: Destination::ALL.iter().map(|_| cx.focus_handle()).collect(),
             pane: None,
             pane_session: None,
+            pane_kind: PaneKind::Local,
             shell_path,
             custom_shell_open: false,
             store,
@@ -123,11 +205,43 @@ impl ShelluneView {
             host_fields: None,
             import: ImportPanel::new(),
             import_path: None,
+            remote: None,
+            remote_session: None,
+            remote_session_id: None,
+            remote_watching: false,
+            remote_fields: RemoteFields {
+                password,
+                key_path,
+                passphrase,
+            },
+            trust,
+            trust_book: HostTrust::new(),
+            trust_error: None,
         };
         view.bind_shell_path(cx);
         view.bind_host_search(cx);
+        view.bind_remote_fields(cx);
         view.restore_hosts(cx);
+        view.restore_trust();
         view
+    }
+
+    /// Reads the accepted server identities, or reports that they could not be read.
+    ///
+    /// A trust file that cannot be read is not an empty library: the shell keeps no
+    /// records and says why, so an unreadable file can never silently turn into
+    /// "ask the user again" for a host they already accepted.
+    fn restore_trust(&mut self) {
+        match self.trust.load() {
+            Ok(trust) => {
+                self.trust_book = trust;
+                self.trust_error = None;
+            }
+            Err(error) => {
+                self.trust_book = HostTrust::new();
+                self.trust_error = Some(error.to_string());
+            }
+        }
     }
 
     /// Reads the saved hosts, or adopts the section the caller already built.
@@ -612,6 +726,406 @@ impl ShelluneView {
         cx.notify();
     }
 
+    // -----------------------------------------------------------------------
+    // Remote connections (R4, R6)
+    // -----------------------------------------------------------------------
+
+    /// Mirrors the three credential fields into the open form.
+    fn bind_remote_fields(&mut self, cx: &mut Context<Self>) {
+        let password = self.remote_fields.password.clone();
+        cx.observe(&password, |view, field, cx| {
+            let text = field.read(cx).text().to_owned();
+            if let Some(panel) = view.remote.as_mut() {
+                panel.set_password(text);
+            }
+            cx.notify();
+        })
+        .detach();
+
+        let key_path = self.remote_fields.key_path.clone();
+        cx.observe(&key_path, |view, field, cx| {
+            let text = field.read(cx).text().to_owned();
+            if let Some(panel) = view.remote.as_mut() {
+                panel.set_key_path(text);
+            }
+            cx.notify();
+        })
+        .detach();
+
+        let passphrase = self.remote_fields.passphrase.clone();
+        cx.observe(&passphrase, |view, field, cx| {
+            let text = field.read(cx).text().to_owned();
+            if let Some(panel) = view.remote.as_mut() {
+                panel.set_passphrase(text);
+            }
+            cx.notify();
+        })
+        .detach();
+    }
+
+    /// Copies the form's values into the fields, for a form that just opened.
+    fn sync_remote_fields(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.remote.as_ref() else {
+            return;
+        };
+        let password = panel.password().to_owned();
+        let key_path = panel.key_path().to_owned();
+        let passphrase = panel.passphrase().to_owned();
+        let password_field = self.remote_fields.password.clone();
+        let key_field = self.remote_fields.key_path.clone();
+        let passphrase_field = self.remote_fields.passphrase.clone();
+        // The fields are emptied for the new attempt: a secret typed for the previous
+        // host must not travel to this one.
+        password_field.update(cx, |field, cx| field.set_text(password, cx));
+        key_field.update(cx, |field, cx| field.set_text(key_path, cx));
+        passphrase_field.update(cx, |field, cx| field.set_text(passphrase, cx));
+    }
+
+    /// Opens the connection form for one saved host.
+    pub(crate) fn open_remote(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.remote = Some(RemotePanel::new(host));
+        self.remote_session = None;
+        self.remote_session_id = None;
+        self.sync_remote_fields(cx);
+        cx.notify();
+    }
+
+    /// The open connection form, if there is one.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn remote_state(&self) -> Option<&RemotePanel> {
+        self.remote.as_ref()
+    }
+
+    /// Why the trust file could not be read, when it could not.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn trust_error(&self) -> Option<&str> {
+        self.trust_error.as_deref()
+    }
+
+    /// The accepted identities this shell last read or wrote.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn trust(&self) -> &HostTrust {
+        &self.trust_book
+    }
+
+    /// Whether the field one method uses is drawn as bullets.
+    #[cfg(test)]
+    pub fn remote_field_masked(
+        &self,
+        method: crate::app::remote::MethodChoice,
+        cx: &gpui::App,
+    ) -> bool {
+        if method.needs_password() {
+            self.remote_fields.password.read(cx).is_masked()
+        } else {
+            self.remote_fields.passphrase.read(cx).is_masked()
+        }
+    }
+
+    /// Starts the attempt the form describes.
+    fn connect_remote(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.remote.as_mut() else {
+            return;
+        };
+        if panel.status().is_busy() {
+            return;
+        }
+        let strings = self.workspace.strings();
+        let host = panel.host().clone();
+        let auth = match panel.take_auth(strings) {
+            Ok(auth) => auth,
+            Err(reason) => {
+                panel.set_form_error(reason);
+                cx.notify();
+                return;
+            }
+        };
+        // The record is created before the transport starts, so a host that never
+        // answers is listed as a session that did not open.
+        let session = self.workspace.register_remote_session(&host);
+        let id = session.id();
+        self.remote_session_id = Some(id);
+
+        let known = remote::known_host_key(&self.trust_book, &host);
+        let size = PtySize::new(100, 30);
+        panel.set_status(RemoteStatus::Connecting);
+        self.remote_session = Some(RemoteSession::connect(ConnectRequest::new(
+            host.address(),
+            host.port().get(),
+            host.user(),
+            auth,
+            size,
+            known,
+        )));
+        self.watch_remote(cx);
+        cx.notify();
+    }
+
+    /// Polls the attempt until it becomes a terminal or fails.
+    fn watch_remote(&mut self, cx: &mut Context<Self>) {
+        if self.remote_watching || self.remote_session.is_none() {
+            return;
+        }
+        self.remote_watching = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REMOTE_POLL_INTERVAL).await;
+                match this.update(cx, |view, cx| view.poll_remote(cx)) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Applies what the attempt reported, returning whether to keep watching.
+    fn poll_remote(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.remote_session.as_mut() else {
+            self.remote_watching = false;
+            return false;
+        };
+        let events = session.drain();
+        for event in events {
+            match event {
+                RemoteEvent::HostKeyPrompt(prompt) => {
+                    if let Some(panel) = self.remote.as_mut() {
+                        panel.set_status(RemoteStatus::VerifyingHost(prompt));
+                    }
+                    cx.notify();
+                }
+                RemoteEvent::Connected => {
+                    let session = self.remote_session.take();
+                    self.remote_watching = false;
+                    if let Some(session) = session {
+                        self.on_remote_connected(session, cx);
+                    }
+                    return false;
+                }
+                RemoteEvent::Failed(error) => {
+                    self.remote_session = None;
+                    self.remote_watching = false;
+                    self.on_remote_failed(&error, cx);
+                    return false;
+                }
+                // Output and exit belong to the pane, which owns the session once it
+                // is live; seeing one here means the handover had not happened yet.
+                RemoteEvent::Data(_) | RemoteEvent::Exited { .. } => {}
+            }
+        }
+        true
+    }
+
+    /// Turns a session that reached the remote shell into the terminal pane.
+    fn on_remote_connected(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
+        let Some(panel) = self.remote.as_ref() else {
+            return;
+        };
+        let host = panel.host().clone();
+        let target = host.target();
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let pane = cx.new(|pane_cx| {
+            TerminalPane::start_remote(session, target, grid, font_size, locale, pane_cx)
+        });
+        // The terminal takes the keyboard as soon as it is live, so what the user
+        // types next reaches the server instead of the form that started it.
+        if let Some(window) = cx.active_window() {
+            let handle = pane.read(cx).focus_handle().clone();
+            let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
+        }
+        let id = self.remote_session_id;
+        if let Some(id) = id {
+            self.workspace.session_verified_and_authenticated(id);
+            self.workspace.session_connected(id);
+            self.pane_session = Some(id);
+        }
+        cx.observe(&pane, |view, pane, cx| view.sync_pane(pane, cx))
+            .detach();
+        self.pane = Some(pane);
+        self.pane_kind = PaneKind::Remote;
+        if let Some(panel) = self.remote.as_mut() {
+            panel.set_status(RemoteStatus::Live);
+        }
+        // The recent view only ever shows hosts that really answered.
+        self.record_host_connection(host.id(), remote::now_unix(), cx);
+        cx.notify();
+    }
+
+    /// Records an attempt that did not open, in both the form and the session list.
+    fn on_remote_failed(&mut self, error: &shellune_ssh::ConnectError, cx: &mut Context<Self>) {
+        let failure = RemoteFailure::from_error(error);
+        if let Some(panel) = self.remote.as_mut() {
+            panel.fail(failure);
+        }
+        if let Some(id) = self.remote_session_id.take() {
+            self.workspace.session_failed(id, error.session_failure());
+            self.pane_session = None;
+        }
+        cx.notify();
+    }
+
+    /// Answers the question about an unknown server identity.
+    ///
+    /// Accepting stores the identity first: a connection that was allowed because
+    /// the user pressed "accept" must not proceed while the record failed to save,
+    /// or the next start would ask again for a decision that was already made.
+    pub(crate) fn answer_trust(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let Some(panel) = self.remote.as_ref() else {
+            return;
+        };
+        let Some(prompt) = panel.status().prompt().cloned() else {
+            return;
+        };
+        let strings = self.workspace.strings();
+        let now = remote::now_unix();
+
+        if !accept {
+            if let Some(session) = self.remote_session.as_mut() {
+                session.answer_host_key(false);
+            }
+            if let Some(panel) = self.remote.as_mut() {
+                panel.fail(RemoteFailure::new(
+                    strings.trust_rejected_note,
+                    strings.remote_close,
+                    false,
+                ));
+            }
+            if let Some(id) = self.remote_session_id.take() {
+                self.workspace
+                    .session_failed(id, SessionFailure::HostKeyRejected);
+            }
+            cx.notify();
+            return;
+        }
+
+        let previous = self.trust_book.clone();
+        if let Err(error) = remote::accept_prompted_identity(&mut self.trust_book, &prompt, now) {
+            self.trust_book = previous;
+            self.refuse_with(
+                RemoteFailure::new(error.to_string(), strings.remote_close, false),
+                cx,
+            );
+            return;
+        }
+        if let Err(error) = self.trust.save(&self.trust_book) {
+            self.trust_book = previous;
+            self.refuse_with(
+                RemoteFailure::new(error.to_string(), strings.remote_close, false),
+                cx,
+            );
+            return;
+        }
+        if let Some(session) = self.remote_session.as_mut() {
+            session.answer_host_key(true);
+        }
+        if let Some(panel) = self.remote.as_mut() {
+            panel.set_status(RemoteStatus::Connecting);
+        }
+        cx.notify();
+    }
+
+    /// Ends an attempt because the identity could not be recorded.
+    fn refuse_with(&mut self, failure: RemoteFailure, cx: &mut Context<Self>) {
+        if let Some(session) = self.remote_session.as_mut() {
+            session.answer_host_key(false);
+        }
+        self.remote_session = None;
+        self.remote_watching = false;
+        if let Some(panel) = self.remote.as_mut() {
+            panel.fail(failure);
+        }
+        if let Some(id) = self.remote_session_id.take() {
+            self.workspace
+                .session_failed(id, SessionFailure::HostKeyRejected);
+        }
+        cx.notify();
+    }
+
+    /// Shows the identity question without a server, so a test can answer it.
+    ///
+    /// The session record is created exactly as a real attempt creates it before
+    /// dialling, so answering the question afterwards exercises the same paths the
+    /// transport would.
+    #[cfg(test)]
+    pub(crate) fn show_trust_prompt(
+        &mut self,
+        prompt: shellune_ssh::HostKeyPrompt,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) {
+            let session = self.workspace.register_remote_session(&host);
+            self.remote_session_id = Some(session.id());
+            self.workspace
+                .session_verified_and_authenticated(session.id());
+        }
+        if let Some(panel) = self.remote.as_mut() {
+            panel.set_status(RemoteStatus::VerifyingHost(prompt));
+        }
+        cx.notify();
+    }
+
+    /// Applies one round of remote events, the way the poll loop does.
+    ///
+    /// The loop itself waits on the window timer, which a test cannot advance, so a
+    /// test drives the same call directly.
+    #[cfg(test)]
+    pub(crate) fn pump_remote_once(&mut self, cx: &mut Context<Self>) -> bool {
+        self.poll_remote(cx)
+    }
+
+    /// Runs a failed attempt through the same path the transport uses.
+    ///
+    /// A test cannot open a real SSH connection to a host that refuses it inside the
+    /// window, so the failure is delivered here exactly as the poll loop delivers it:
+    /// through the session record and the form.
+    #[cfg(test)]
+    pub(crate) fn fail_remote_for_test(
+        &mut self,
+        error: shellune_ssh::ConnectError,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) else {
+            return;
+        };
+        let session = self.workspace.register_remote_session(&host);
+        self.remote_session_id = Some(session.id());
+        self.on_remote_failed(&error, cx);
+    }
+
+    /// Tries again with whatever the form holds now.
+    fn retry_remote(&mut self, cx: &mut Context<Self>) {
+        if let Some(panel) = self.remote.as_mut() {
+            panel.set_status(RemoteStatus::Idle);
+        }
+        self.connect_remote(cx);
+    }
+
+    /// Closes the connection form and the session it opened.
+    fn close_remote(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.remote_session.as_mut() {
+            session.close();
+        }
+        self.remote_session = None;
+        self.remote_watching = false;
+        if let Some(id) = self.remote_session_id.take() {
+            self.workspace.session_closed(id);
+            self.pane_session = None;
+        }
+        if let Some(pane) = self.pane.take() {
+            pane.update(cx, |pane, cx| pane.close(cx));
+        }
+        if let Some(panel) = self.remote.as_mut() {
+            panel.clear_secrets();
+        }
+        self.remote = None;
+        cx.notify();
+    }
+
     /// Records that a host was really reached, and stores the record.
     ///
     /// The remote-connection step calls this after a session reached
@@ -710,8 +1224,15 @@ impl ShelluneView {
         if let Some(session) = self.pane_session {
             self.workspace.session_closed(session);
         }
+        if self.remote.is_some() {
+            // One pane exists in this step, so starting a local shell ends the
+            // remote one instead of leaving a panel that claims a terminal it no
+            // longer has.
+            self.close_remote(cx);
+        }
         self.pane = None;
         self.pane_session = None;
+        self.pane_kind = PaneKind::Local;
 
         let grid = GridSize::initial();
         let font_size = self.workspace.local_font_size();
@@ -776,6 +1297,382 @@ impl ShelluneView {
     }
 
     // -----------------------------------------------------------------------
+    // Remote connections: the panel (R4, R6)
+    // -----------------------------------------------------------------------
+
+    /// The connection form, the trust question and the remote terminal.
+    ///
+    /// Everything on it is drawn from the state the transport reported: a host that
+    /// has not answered shows the form, an unknown identity shows the fingerprint and
+    /// two answers, and a live session shows the same terminal pane a local shell
+    /// uses. Nothing here can show a terminal for an attempt that failed.
+    fn remote_panel(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let Some(panel) = self.remote.as_ref() else {
+            return div();
+        };
+        let status = panel.status();
+        let host = panel.host();
+        let (status_label, tone) = match status {
+            RemoteStatus::Idle => (strings.remote_idle, Tone::Neutral),
+            RemoteStatus::Connecting => (strings.remote_connecting, Tone::Warning),
+            RemoteStatus::VerifyingHost(_) => (strings.remote_verifying, Tone::Warning),
+            RemoteStatus::Live => (strings.remote_live, Tone::Positive),
+            RemoteStatus::Failed(_) => (strings.remote_failed, Tone::Danger),
+        };
+
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(metrics.scale(spacing::TIGHT))
+            .p(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "remote.panel".to_owned());
+
+        column = column.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .min_w(px(0.0))
+                        .child(components::status_dot(tone, metrics))
+                        .child(components::stacked(
+                            host.name().to_owned(),
+                            host.target(),
+                            metrics,
+                        ))
+                        .child(components::chip(status_label, tone, metrics)),
+                )
+                .child(self.text_button(
+                    SharedString::from("remote.close"),
+                    strings.remote_close,
+                    Tone::Neutral,
+                    cx,
+                    |view, cx| view.close_remote(cx),
+                )),
+        );
+
+        if let Some(prompt) = status.prompt() {
+            let algorithm = prompt.algorithm().to_owned();
+            let fingerprint = prompt.fingerprint().to_owned();
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .p(metrics.scale(spacing::TIGHT))
+                    .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(palette::SURFACE))
+                    .border_1()
+                    .border_color(theme::swatch(palette::ACCENT))
+                    .debug_selector(|| "remote.trust".to_owned())
+                    .child(
+                        div()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(strings.trust_title),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(strings.trust_body),
+                    )
+                    .child(self.trust_line(
+                        strings.trust_algorithm,
+                        "remote.trust.algorithm",
+                        algorithm,
+                    ))
+                    .child(self.trust_line(
+                        strings.trust_fingerprint,
+                        "remote.trust.fingerprint",
+                        fingerprint,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .child(self.text_button(
+                                SharedString::from("remote.trust.accept"),
+                                strings.trust_accept,
+                                Tone::Positive,
+                                cx,
+                                |view, cx| view.answer_trust(true, cx),
+                            ))
+                            .child(self.text_button(
+                                SharedString::from("remote.trust.reject"),
+                                strings.trust_reject,
+                                Tone::Danger,
+                                cx,
+                                |view, cx| view.answer_trust(false, cx),
+                            )),
+                    ),
+            );
+        }
+
+        if let Some(failure) = status.failure() {
+            let reason = failure.reason().to_owned();
+            let next_step = failure.next_step().to_owned();
+            let retryable = failure.retryable();
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .p(metrics.scale(spacing::TIGHT))
+                    .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(palette::SURFACE))
+                    .border_1()
+                    .border_color(Tone::Danger.text())
+                    .debug_selector(|| "remote.failure".to_owned())
+                    .child(
+                        div()
+                            .text_size(metrics.label_size())
+                            .text_color(Tone::Danger.text())
+                            .child(strings.remote_failure_title),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(|| "remote.failure.reason".to_owned())
+                            .child(SharedString::from(reason)),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "remote.failure.next".to_owned())
+                            .child(SharedString::from(format!(
+                                "{}: {next_step}",
+                                strings.next_step
+                            ))),
+                    )
+                    .when(retryable, |card| {
+                        card.child(self.text_button(
+                            SharedString::from("remote.retry"),
+                            strings.recovery_retry,
+                            Tone::Accent,
+                            cx,
+                            |view, cx| view.retry_remote(cx),
+                        ))
+                    }),
+            );
+        }
+
+        if let Some(pane) = &self.pane
+            && matches!(status, RemoteStatus::Live)
+        {
+            // A terminal needs rows: inside a scrolling list it would otherwise be
+            // squeezed to the height of its own border. The sessions destination
+            // gives it the whole panel; here it keeps a usable fixed height.
+            column = column.child(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .h(px(REMOTE_TERMINAL_HEIGHT))
+                    .child(pane.clone()),
+            );
+        }
+
+        if !matches!(status, RemoteStatus::Live) && !status.is_asking() {
+            column = column.child(self.remote_form(cx));
+        }
+
+        column
+    }
+
+    /// One labelled value under the trust question.
+    fn trust_line(&self, label: &'static str, selector: &'static str, value: String) -> Div {
+        let metrics = self.metrics();
+        div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(move || selector.to_owned())
+                    .child(SharedString::from(value)),
+            )
+    }
+
+    /// The method chooser and the fields the chosen method needs.
+    fn remote_form(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let Some(panel) = self.remote.as_ref() else {
+            return div();
+        };
+        let method = panel.method();
+        let busy = panel.status().is_busy();
+
+        let mut form = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "remote.form".to_owned());
+
+        let mut methods = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT));
+        for choice in MethodChoice::ALL {
+            let selected = choice == method;
+            methods = methods.child(
+                div()
+                    .id(("remote.method", choice as usize))
+                    .debug_selector(move || choice.debug_selector().to_owned())
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(2.0))
+                    .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(if selected {
+                        palette::ACCENT_TINT
+                    } else {
+                        palette::SURFACE
+                    }))
+                    .border_1()
+                    .border_color(theme::swatch(if selected {
+                        palette::ACCENT
+                    } else {
+                        palette::BORDER
+                    }))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(if selected {
+                        palette::ACCENT_ON_TINT
+                    } else {
+                        palette::TEXT_SECONDARY
+                    }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        if let Some(panel) = this.remote.as_mut() {
+                            panel.select_method(choice);
+                        }
+                        cx.notify();
+                    }))
+                    .child(choice.label(strings)),
+            );
+        }
+        form = form.child(methods);
+        form = form.child(caption_line(method.hint(strings).to_owned(), metrics));
+
+        if method.needs_password() {
+            form = form.child(self.remote_field(
+                SharedString::from("remote.password"),
+                strings.auth_password,
+                self.remote_fields.password.clone(),
+            ));
+        }
+        if method.needs_key_path() {
+            form = form.child(self.remote_field(
+                SharedString::from("remote.key"),
+                strings.auth_key,
+                self.remote_fields.key_path.clone(),
+            ));
+        }
+        if method.needs_passphrase() {
+            form = form.child(self.remote_field(
+                SharedString::from("remote.passphrase"),
+                strings.auth_key_passphrase,
+                self.remote_fields.passphrase.clone(),
+            ));
+        }
+        if !method.needs_key_path() && !method.needs_password() {
+            form = form.child(caption_line(
+                format!(
+                    "{}: {}",
+                    strings.auth_agent,
+                    remote::default_agent().label()
+                ),
+                metrics,
+            ));
+        }
+
+        if let Some(reason) = panel.form_error() {
+            form = form.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Danger.text())
+                    .debug_selector(|| "remote.form.error".to_owned())
+                    .child(SharedString::from(reason.to_owned())),
+            );
+        }
+
+        if busy {
+            form = form.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Warning.text())
+                    .debug_selector(|| "remote.busy".to_owned())
+                    .child(strings.remote_connecting),
+            );
+        } else {
+            form = form.child(self.text_button(
+                SharedString::from("remote.connect"),
+                strings.remote_connect,
+                Tone::Accent,
+                cx,
+                |view, cx| view.connect_remote(cx),
+            ));
+        }
+        form
+    }
+
+    /// One labelled credential field.
+    fn remote_field(
+        &self,
+        selector: SharedString,
+        label: &'static str,
+        field: Entity<TextField>,
+    ) -> Div {
+        let metrics = self.metrics();
+        div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(120.0))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .debug_selector(move || selector.to_string())
+                    .child(field),
+            )
+    }
+
+    // -----------------------------------------------------------------------
     // Hosts destination (R3)
     // -----------------------------------------------------------------------
 
@@ -811,8 +1708,13 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
-            .gap(metrics.scale(spacing::SNUG))
-            .child(self.hosts_storage_line());
+            .gap(metrics.scale(spacing::SNUG));
+        // A connection in progress belongs at the top of the destination that
+        // started it, beside the host it is for.
+        if self.remote.is_some() {
+            column = column.child(self.remote_panel(cx));
+        }
+        column = column.child(self.hosts_storage_line());
 
         if let Some(message) = self.hosts.message() {
             column = column.child(
@@ -1512,12 +2414,20 @@ impl ShelluneView {
         if let Some(group) = host_group_chip(host) {
             row = row.child(components::chip(group, Tone::Neutral, metrics));
         }
+        let target = host.clone();
         row.child(
             div()
                 .flex()
                 .flex_none()
                 .items_center()
                 .gap(metrics.scale(spacing::TIGHT))
+                .child(self.text_button(
+                    SharedString::from(format!("hosts.connect.{index}")),
+                    strings.remote_connect,
+                    Tone::Positive,
+                    cx,
+                    move |view, cx| view.open_remote(&target, cx),
+                ))
                 .child(self.text_button(
                     SharedString::from(format!("hosts.edit.{index}")),
                     strings.host_edit,
@@ -1545,6 +2455,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let edited = entry.host.clone();
+        let reconnect_target = entry.host.clone();
         let id = entry.host.id();
         let last = format!(
             "{} {} · {} {}",
@@ -1575,6 +2486,13 @@ impl ShelluneView {
                     .flex_none()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
+                    .child(self.text_button(
+                        SharedString::from(format!("hosts.recent.connect.{index}")),
+                        strings.remote_connect,
+                        Tone::Positive,
+                        cx,
+                        move |view, cx| view.open_remote(&reconnect_target, cx),
+                    ))
                     .child(self.text_button(
                         SharedString::from(format!("hosts.recent.edit.{index}")),
                         strings.host_edit,
@@ -2059,7 +2977,10 @@ impl ShelluneView {
         let destination = self.workspace.destination();
         let state = self.workspace.state(destination);
 
-        let body = if destination == Destination::LocalShells && self.pane.is_some() {
+        let body = if destination == Destination::LocalShells
+            && self.pane.is_some()
+            && self.pane_kind == PaneKind::Local
+        {
             self.terminal_panel(cx)
         } else if destination == Destination::Hosts {
             // The hosts destination renders its own empty, failed and populated
@@ -2102,7 +3023,10 @@ impl ShelluneView {
             .debug_selector(|| "content".to_owned())
             .child(body);
         // A terminal fills the panel; a list of cards scrolls instead.
-        if destination == Destination::LocalShells && self.pane.is_some() {
+        if destination == Destination::LocalShells
+            && self.pane.is_some()
+            && self.pane_kind == PaneKind::Local
+        {
             container
         } else {
             container.overflow_y_scroll()
@@ -2476,6 +3400,18 @@ fn default_store() -> HostStore {
 #[cfg(test)]
 fn default_store() -> HostStore {
     scratch_store()
+}
+
+/// The trust file the shell reads when the caller does not supply one.
+#[cfg(not(test))]
+fn default_trust() -> TrustStore {
+    TrustStore::default_location()
+}
+
+/// A trust file of this test process's own, next to the scratch host file.
+#[cfg(test)]
+fn default_trust() -> TrustStore {
+    TrustStore::at(scratch_store().root())
 }
 
 /// A store in a directory of its own, unique to this test process.

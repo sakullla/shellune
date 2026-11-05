@@ -27,6 +27,7 @@ mod book;
 mod error;
 mod ssh_config;
 mod store;
+mod trust;
 
 pub use audit::{CONFIG_KEYS, LOG_FIELDS, StoreEvent};
 pub use book::{
@@ -39,3 +40,7 @@ pub use ssh_config::{
     resolve_path,
 };
 pub use store::{FILE_NAME, HostStore};
+pub use trust::{
+    HostKey, HostTrust, TRUST_FILE_NAME, TRUST_FORMAT_VERSION, TrustEntry, TrustError, TrustStore,
+    TrustVerdict, is_sha256_fingerprint,
+};

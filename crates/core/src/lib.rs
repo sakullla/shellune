@@ -12,6 +12,7 @@
 //! * user-facing text never contains a secret, which is why secrets use
 //!   [`SecretString`] and errors use fixed, structured variants.
 
+mod auth;
 mod error;
 pub mod fingerprint;
 mod host;
@@ -20,6 +21,7 @@ mod session;
 mod shell;
 mod task;
 
+pub use auth::{AuthMethod, AuthMethodKind};
 pub use error::{AgentKind, SecretString, SecurityError};
 pub use fingerprint::sha256_fingerprint;
 pub use host::{DEFAULT_SSH_PORT, HostConfig, HostValidationError, Port};

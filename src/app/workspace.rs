@@ -542,6 +542,29 @@ impl Workspace {
         session
     }
 
+    /// Creates a session record for a host that is being connected to.
+    ///
+    /// The record starts in `Connecting`, so a host that never answers is listed
+    /// as a session that did not open rather than one that is live.
+    pub fn register_remote_session(&mut self, host: &HostConfig) -> Session {
+        let mut session = Session::new(SessionKind::Remote { host: host.id() }, host.name());
+        let _ = session.begin_connecting();
+        let mut sessions = self.sessions.items().to_vec();
+        sessions.push(session.clone());
+        self.sessions.replace(SectionStatus::Ready, sessions);
+        session
+    }
+
+    /// Records that a remote session verified the host identity and authenticated.
+    ///
+    /// The two steps are one call because they happen in one place: the user
+    /// answered the identity question and the server accepted the credentials.
+    pub fn session_verified_and_authenticated(&mut self, id: SessionId) -> bool {
+        self.transition(id, |session| {
+            session.begin_host_verification().is_ok() && session.begin_authentication().is_ok()
+        })
+    }
+
     /// Records that a local session reached the live state.
     pub fn session_connected(&mut self, id: SessionId) -> bool {
         self.transition(id, |session| session.connected().is_ok())

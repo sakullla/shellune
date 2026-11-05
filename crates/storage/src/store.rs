@@ -136,7 +136,7 @@ impl HostStore {
     /// every case the file that was there before is untouched.
     pub fn save(&self, book: &HostBook) -> Result<(), StorageError> {
         let path = self.path();
-        match self.write_atomically(&path, book) {
+        match self.write_atomically(book) {
             Ok(()) => {
                 self.emit(&StoreEvent::Saved {
                     path,
@@ -156,27 +156,11 @@ impl HostStore {
         }
     }
 
-    fn write_atomically(&self, path: &Path, book: &HostBook) -> Result<(), StorageError> {
+    fn write_atomically(&self, book: &HostBook) -> Result<(), StorageError> {
         let bytes = serde_json::to_vec_pretty(book).map_err(|error| StorageError::Encode {
             reason: error.to_string(),
         })?;
-        std::fs::create_dir_all(&self.root).map_err(|error| StorageError::CreateDirectory {
-            path: self.root.clone(),
-            reason: error.to_string(),
-        })?;
-
-        let temp = self.root.join(format!(
-            ".{FILE_NAME}.tmp-{}-{}",
-            std::process::id(),
-            next_temp_sequence()
-        ));
-        let outcome = write_then_rename(&temp, path, &bytes);
-        if outcome.is_err() {
-            // Best effort: a leftover temporary file must not turn a failed save
-            // into a failed save plus a stray file.
-            let _ = std::fs::remove_file(&temp);
-        }
-        outcome
+        write_atomic_file(&self.root, FILE_NAME, &bytes)
     }
 
     fn emit(&self, event: &StoreEvent) {
@@ -192,6 +176,35 @@ impl HostStore {
             reason: error.to_string(),
         });
     }
+}
+
+/// Writes `bytes` to `name` inside `root`, atomically.
+///
+/// Shared with the trust store: both files are user data that a crash must not
+/// leave half written, and both need the same temporary-file-then-rename dance.
+/// A failure removes the temporary file, so a rejected save does not leave a stray
+/// file beside the real one.
+///
+/// # Errors
+///
+/// Returns the directory, write or replace failure, keeping the previous file.
+pub(crate) fn write_atomic_file(root: &Path, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
+    let path = root.join(name);
+    std::fs::create_dir_all(root).map_err(|error| StorageError::CreateDirectory {
+        path: root.to_owned(),
+        reason: error.to_string(),
+    })?;
+
+    let temp = root.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        next_temp_sequence()
+    ));
+    let outcome = write_then_rename(&temp, &path, bytes);
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    outcome
 }
 
 /// Writes the bytes to `temp`, flushes them, and then moves the file over `path`.
