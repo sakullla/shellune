@@ -12,6 +12,10 @@ default-run = "shellune"
 gpui = "=0.2.2"
 shellune-core = { path = "crates/core" }
 
+[dev-dependencies]
+# The GPUI test harness (TestAppContext / VisualTestContext) is behind this feature.
+gpui = { version = "=0.2.2", features = ["test-support"] }
+
 [workspace]
 members = ["crates/core"]
 resolver = "3"
