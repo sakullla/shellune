@@ -7,13 +7,13 @@
 //!   keyboard behaviour are observed rather than assumed;
 //! * the model tests pin down when a section may look successful;
 //! * the design tests check the palette, the copy and the platform conventions
-//!   against the numbers written down in `docs/design/design-system.md`.
+//!   against the numbers written down in `docs/design/02-shell-and-design-system.md`.
 
 use gpui::{Entity, Modifiers, Pixels, Size, TestAppContext, VisualTestContext, point, px, size};
 use shellune_core::{HostConfig, Session, SessionKind, SessionState, Transfer, TransferDirection};
 
 use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, ToggleLanguage};
-use crate::app::copy::{CHINESE, ENGLISH, Locale, Strings};
+use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::theme::{
@@ -503,6 +503,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             planned_sessions,
             planned_transfers,
             state_empty,
+            state_ready,
             state_loading,
             loading_title,
             loading_body,
@@ -520,7 +521,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             primary_transfers,
             unavailable_notice,
             object_label,
-            hint_nav,
+            hint_nav_action,
             zoom_control,
             language_control,
             count_hosts,
@@ -605,6 +606,106 @@ fn shortcuts_follow_each_platform_convention() {
         assert_eq!(destination.next().previous(), destination);
         assert_eq!(Destination::ALL[destination.index()], destination);
     }
+}
+
+#[test]
+fn the_navigation_hint_names_the_keys_the_keymap_binds() {
+    for platform in [Platform::Windows, Platform::MacOs, Platform::Linux] {
+        let hint = copy::nav_hint(&ENGLISH, platform);
+        // The hint joins the labels the rail actually shows for the first and last
+        // entries, so it cannot name a key this platform does not bind.
+        let first = Destination::LocalShells.shortcut_label(platform);
+        let last_digit = Destination::Transfers
+            .shortcut_label(platform)
+            .chars()
+            .last()
+            .expect("a shortcut label ends with a digit");
+        assert!(
+            hint.starts_with(&first),
+            "{platform:?} hint {hint:?} does not start with {first:?}"
+        );
+        // The printed range must end on the digit bound for the last entry.
+        let range = hint
+            .split_once(' ')
+            .map_or(hint.as_str(), |(range, _)| range);
+        assert!(
+            range.ends_with(last_digit),
+            "{platform:?} hint {hint:?} does not end with {last_digit:?}"
+        );
+        assert_eq!(
+            hint.contains("Ctrl"),
+            platform != Platform::MacOs,
+            "{platform:?} hint {hint:?} names a modifier the keymap does not bind"
+        );
+        assert!(
+            hint.contains(platform.shortcut_modifier()),
+            "{platform:?} hint {hint:?} omits the platform modifier"
+        );
+    }
+
+    // The Chinese table carries the same platform-derived range, not a
+    // Windows-only one.
+    let english = copy::nav_hint(&ENGLISH, Platform::MacOs);
+    let chinese = copy::nav_hint(&CHINESE, Platform::MacOs);
+    let range_of = |hint: &str| hint.split_once(' ').map(|(range, _)| range.to_owned());
+    assert_eq!(
+        range_of(&chinese),
+        range_of(&english),
+        "the Chinese hint must use the same range as the English one"
+    );
+    let hint = chinese;
+    assert!(
+        hint.contains("\u{5207}\u{6362}"),
+        "the Chinese hint lost its meaning: {hint}"
+    );
+}
+
+#[test]
+fn a_section_count_uses_the_unit_of_its_own_destination() {
+    assert_eq!(Destination::Hosts.count_unit(&ENGLISH), "host");
+    assert_eq!(Destination::Transfers.count_unit(&ENGLISH), "transfer");
+    assert_eq!(Destination::LocalShells.count_unit(&ENGLISH), "session");
+    assert_eq!(Destination::Sessions.count_unit(&ENGLISH), "session");
+    for destination in Destination::ALL {
+        assert_ne!(
+            destination.count_unit(&ENGLISH),
+            destination.label(&ENGLISH),
+            "{destination:?} uses its own name as a count unit"
+        );
+    }
+}
+
+#[test]
+fn a_status_chip_never_stands_in_for_a_count_or_a_unit() {
+    let units = [
+        ENGLISH.count_hosts,
+        ENGLISH.count_sessions,
+        ENGLISH.count_transfers,
+    ];
+    let states = [
+        SectionState::Planned,
+        SectionState::Loading,
+        SectionState::Empty,
+        SectionState::Failed,
+        SectionState::Populated,
+    ];
+    for state in states {
+        let label = state.chip_label(&ENGLISH);
+        assert!(
+            !units.contains(&label),
+            "{state:?} uses the unit word {label:?} as its status chip"
+        );
+        assert!(
+            !label.chars().any(|c| c.is_ascii_digit()),
+            "{state:?} chip carries a count: {label:?}"
+        );
+    }
+    assert_ne!(
+        SectionState::Populated.chip_label(&ENGLISH),
+        SectionState::Empty.chip_label(&ENGLISH),
+        "a section with real data must not read like an empty one"
+    );
+    assert_eq!(SectionState::Populated.chip_label(&ENGLISH), "Ready");
 }
 
 #[test]

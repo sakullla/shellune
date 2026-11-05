@@ -122,15 +122,18 @@ impl SectionState {
         }
     }
 
-    /// Chip label for the state, or `None` when a populated section shows a count
-    /// instead.
-    pub fn chip_label(self, strings: &Strings) -> Option<&'static str> {
+    /// Chip label for the state.
+    ///
+    /// Every state has one, including a populated section: the chip reports the
+    /// status and the count beside it reports the amount. Reusing a unit word as
+    /// the chip would say "session" where the reader expects a state.
+    pub fn chip_label(self, strings: &Strings) -> &'static str {
         match self {
-            Self::Planned => Some(strings.state_planned),
-            Self::Loading => Some(strings.state_loading),
-            Self::Empty => Some(strings.state_empty),
-            Self::Failed => Some(strings.state_failed),
-            Self::Populated => None,
+            Self::Planned => strings.state_planned,
+            Self::Loading => strings.state_loading,
+            Self::Empty => strings.state_empty,
+            Self::Failed => strings.state_failed,
+            Self::Populated => strings.state_ready,
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! The values here are the single source of truth for the palette, spacing,
 //! corner radii, type scale and zoom behaviour described in
-//! `docs/design/design-system.md`. Views reference tokens instead of literal
+//! `docs/design/02-shell-and-design-system.md`. Views reference tokens instead of literal
 //! colours or sizes, so a visual review only has to change this module.
 //!
 //! Two properties are checked by tests rather than trusted:

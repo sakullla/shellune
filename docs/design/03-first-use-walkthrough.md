@@ -83,7 +83,7 @@ Ctrl+1…4 在首帧就是死键。
 
 ## 4. 本次验证统计
 
-- `cargo test`：22 项通过（13 项 GPUI 布局与交互，7 项模型与文案，2 项配色对比度）。
+- `cargo test`：25 项通过（10 项 GPUI 布局与交互，12 项模型与文案，3 项配色对比度）。
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`：通过。
 - `cargo fmt --all -- --check`：通过。
 - 运行验证：应用在 Windows 11 / 150% 缩放下启动、接受键鼠输入、退出码与 stderr 为空（超时方式

@@ -12,6 +12,8 @@
 
 use shellune_core::{SessionState, TransferState};
 
+use crate::app::nav::Platform;
+
 /// UI language.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Locale {
@@ -106,6 +108,11 @@ pub struct Strings {
     pub planned_transfers: &'static str,
     /// Chip label for an empty, loaded section.
     pub state_empty: &'static str,
+    /// Chip label for a section holding real, non-empty data.
+    ///
+    /// It states the status, unlike the count next to it, which states the amount:
+    /// a unit word such as "session" must never stand in for a status.
+    pub state_ready: &'static str,
     /// Chip label for a section that is loading.
     pub state_loading: &'static str,
     /// Title shown while a section is loading.
@@ -140,8 +147,11 @@ pub struct Strings {
     pub unavailable_notice: &'static str,
     /// Label above the list of rows.
     pub object_label: &'static str,
-    /// Shortcut hint in the rail footer.
-    pub hint_nav: &'static str,
+    /// What the section shortcuts do, shown after the platform's key range.
+    ///
+    /// The key range itself is not stored here: it depends on the platform and is
+    /// built by [`nav_hint`] from [`crate::app::nav::Platform`].
+    pub hint_nav_action: &'static str,
     /// Label of the zoom control.
     pub zoom_control: &'static str,
     /// Label of the language toggle.
@@ -184,6 +194,7 @@ pub static ENGLISH: Strings = Strings {
     planned_sessions: "opening, switching and reconnecting sessions arrives with the session step; no terminal is running.",
     planned_transfers: "uploading and downloading over SFTP arrives with the transfer step; no file has been touched.",
     state_empty: "Empty",
+    state_ready: "Ready",
     state_loading: "Loading",
     loading_title: "Waiting for real data",
     loading_body: "Nothing is shown here until the system reports what actually exists.",
@@ -201,7 +212,7 @@ pub static ENGLISH: Strings = Strings {
     primary_transfers: "Start a transfer",
     unavailable_notice: "This action is not available in this build, so nothing was started.",
     object_label: "Current object",
-    hint_nav: "Ctrl+1-4 switches sections",
+    hint_nav_action: "switches sections",
     zoom_control: "Text size",
     language_control: "Language",
     count_hosts: "host",
@@ -237,6 +248,7 @@ pub static CHINESE: Strings = Strings {
     planned_sessions: "打开、切换和重连会话随会话步骤一起提供；目前没有任何终端在运行。",
     planned_transfers: "通过 SFTP 上传与下载随传输步骤一起提供；目前没有改动任何文件。",
     state_empty: "空",
+    state_ready: "已就绪",
     state_loading: "加载中",
     loading_title: "正在等待真实数据",
     loading_body: "在系统返回实际结果之前，这里不会显示任何内容。",
@@ -254,7 +266,7 @@ pub static CHINESE: Strings = Strings {
     primary_transfers: "开始传输",
     unavailable_notice: "当前版本没有实现这个操作，因此没有启动任何任务。",
     object_label: "当前对象",
-    hint_nav: "Ctrl+1-4 切换分区",
+    hint_nav_action: "切换分区",
     zoom_control: "文字大小",
     language_control: "语言",
     count_hosts: "台主机",
@@ -263,6 +275,15 @@ pub static CHINESE: Strings = Strings {
     local_shell_fallback: "系统 Shell",
     nothing_running: "暂无正在运行的任务。",
 };
+
+/// Hint for the section shortcuts, built for one platform.
+///
+/// The key range comes from [`Platform::shortcut_range`], which derives it from the
+/// same modifier and digits the keymap binds, so a macOS build reads "⌘1-4"
+/// instead of a hard-coded "Ctrl+1-4".
+pub fn nav_hint(strings: &Strings, platform: Platform) -> String {
+    format!("{} {}", platform.shortcut_range(), strings.hint_nav_action)
+}
 
 /// Localized label for a session lifecycle state.
 ///

@@ -49,6 +49,22 @@ impl Platform {
             Self::Windows | Self::Linux => "ctrl",
         }
     }
+
+    /// The whole navigation range, for example "Ctrl+1-4" or "⌘1-4".
+    ///
+    /// Derived from the same modifier and digits as `Destination::shortcut_label`
+    /// so the hint written in the rail cannot name a key this platform does not
+    /// bind.
+    pub fn shortcut_range(self) -> String {
+        let first = Destination::ALL[0].shortcut_digit();
+        let last = Destination::ALL[Destination::ALL.len() - 1].shortcut_digit();
+        match self {
+            Self::MacOs => format!("{}{}-{}", self.shortcut_modifier(), first, last),
+            Self::Windows | Self::Linux => {
+                format!("{}+{}-{}", self.shortcut_modifier(), first, last)
+            }
+        }
+    }
 }
 
 /// One top-level place in the application.
@@ -98,6 +114,18 @@ impl Destination {
             Self::Hosts => strings.nav_hosts_summary,
             Self::Sessions => strings.nav_sessions_summary,
             Self::Transfers => strings.nav_transfers_summary,
+        }
+    }
+
+    /// Unit word used after a count of the objects this destination holds.
+    ///
+    /// One unit per destination, so a count of hosts is never printed with the
+    /// word "session".
+    pub fn count_unit(self, strings: &Strings) -> &'static str {
+        match self {
+            Self::LocalShells | Self::Sessions => strings.count_sessions,
+            Self::Hosts => strings.count_hosts,
+            Self::Transfers => strings.count_transfers,
         }
     }
 

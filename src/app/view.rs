@@ -226,7 +226,8 @@ impl ShelluneView {
                     ),
             )
             .child(if count > 0 {
-                components::count_label(count, strings.count_sessions, metrics).into_any_element()
+                components::count_label(count, destination.count_unit(strings), metrics)
+                    .into_any_element()
             } else {
                 components::keycap(destination.shortcut_label(Platform::current()), metrics)
                     .into_any_element()
@@ -267,7 +268,10 @@ impl ShelluneView {
                 .mt_auto()
                 .text_size(metrics.caption_size())
                 .text_color(theme::swatch(palette::TEXT_MUTED))
-                .child(strings.hint_nav)
+                .child(SharedString::from(copy::nav_hint(
+                    strings,
+                    Platform::current(),
+                )))
                 .child(
                     div()
                         .id("zoom.control")
@@ -340,18 +344,14 @@ impl ShelluneView {
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
             .child(components::chip(
-                state.chip_label(strings).unwrap_or(strings.count_sessions),
+                state.chip_label(strings),
                 state.tone(),
                 metrics,
             ));
         if state == SectionState::Populated {
             chips = chips.child(components::count_label(
                 self.workspace.item_count(destination),
-                match destination {
-                    Destination::Hosts => strings.count_hosts,
-                    Destination::Transfers => strings.count_transfers,
-                    Destination::LocalShells | Destination::Sessions => strings.count_sessions,
-                },
+                destination.count_unit(strings),
                 metrics,
             ));
         }
