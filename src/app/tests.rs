@@ -2796,6 +2796,26 @@ async fn accepting_an_identity_writes_it_and_rejecting_writes_nothing(cx: &mut T
         "the decision survives a reload, which is what makes it a decision"
     );
 
+    // The record was written because the attempt that asked the question used the
+    // answer, so the answer must have reached it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let answers = cx.update(|_window, app| view.read(app).scripted_answers());
+        if !answers.is_empty() {
+            assert_eq!(
+                answers,
+                vec![shellune_ssh::TrustAnswer::Accept],
+                "the decision reached the attempt that asked the question"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the acceptance never reached the attempt, so the record would be a claim              nothing used"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
     // The same question, answered with a refusal, must leave no record.
     let refused_dir = TempDir::new("remote-reject");
     let book = seed(
@@ -2838,6 +2858,127 @@ async fn accepting_an_identity_writes_it_and_rejecting_writes_nothing(cx: &mut T
             session.state()
         );
     });
+}
+
+#[gpui::test]
+async fn a_connection_notice_and_the_first_output_arrive_in_one_batch(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-first-screen");
+    let book = seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let host = book.hosts()[0].clone();
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+
+    // The shell prints its banner the moment the shell request is accepted, so the
+    // connection notice and the first output come out of the channel together.
+    let first_screen = "Welcome to the lab\r\n$ ";
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(first_screen.as_bytes().to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let keep_watching =
+        cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    assert!(
+        !keep_watching,
+        "the attempt is over once the terminal exists"
+    );
+
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("a connection that reached the shell shows a terminal");
+    assert!(
+        cx.debug_bounds("terminal.viewport").is_some(),
+        "the terminal is on screen"
+    );
+    let screen = cx.update(|_window, app| pane.read(app).visible_text().join("\n"));
+    assert!(
+        screen.contains("Welcome to the lab"),
+        "the output that came with the connection notice is not discarded: {screen:?}"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .remote_state()
+            .map(|panel| panel.host().address().to_owned())),
+        Some(host.address().to_owned()),
+        "the terminal belongs to the host the attempt dialled"
+    );
+}
+
+#[gpui::test]
+async fn an_identity_accepted_after_the_attempt_ended_stores_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-undelivered");
+    let book = seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let host = book.hosts()[0].clone();
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.show_trust_prompt(host_prompt(&host, 9), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote.trust").is_some(),
+        "the question is on screen before it is answered"
+    );
+
+    // The attempt ends while the question is still up: the answer can no longer reach
+    // a connection, so accepting must not leave a record behind.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.end_scripted_attempt(cx));
+    });
+    click(cx, "remote.trust.accept");
+    cx.run_until_parked();
+
+    let stored = TrustStore::at(dir.path())
+        .load()
+        .expect("the trust file, if it was written at all, is readable");
+    assert!(
+        stored.entry("10.0.0.5", 22).is_none(),
+        "an answer nothing could use must not leave a trust record"
+    );
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            view.trust().is_empty(),
+            "the identity is not in the trust book either"
+        );
+        assert!(
+            view.pane().is_none(),
+            "an attempt that ended opens no terminal"
+        );
+        assert!(
+            view.remote_state()
+                .and_then(|state| state.status().failure().cloned())
+                .is_some(),
+            "the form says the decision could not be delivered"
+        );
+        let sessions = view.workspace().sessions();
+        let session = sessions.items().last().expect("the attempt was recorded");
+        assert!(
+            matches!(
+                session.state(),
+                SessionState::Failed(shellune_core::SessionFailure::ConnectionFailed { .. })
+            ),
+            "an attempt that ended is not a refused identity, got {:?}",
+            session.state()
+        );
+    });
+    assert!(cx.debug_bounds("remote.failure").is_some());
 }
 
 #[gpui::test]

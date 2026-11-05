@@ -144,6 +144,30 @@ pub enum SourceEvent {
     Lost(String),
 }
 
+impl SourceEvent {
+    /// The pane's view of an event a remote session reported.
+    ///
+    /// The window also uses this for a batch it drained before the pane existed —
+    /// a connection notice and the first output often arrive together — so both
+    /// paths agree on what output and an exit mean.
+    pub(crate) fn from_remote(event: RemoteEvent) -> Option<Self> {
+        match event {
+            RemoteEvent::Data(bytes) => Some(Self::Data(bytes)),
+            RemoteEvent::Exited { code } => Some(Self::Exited(match code {
+                None | Some(0) => ExitReport::Clean,
+                Some(code) => ExitReport::Code {
+                    code: i32::try_from(code).unwrap_or(i32::MAX),
+                },
+            })),
+            // A prompt or a connection notice belongs to the window, which owns the
+            // attempt until the terminal exists; reaching a pane with one would mean
+            // two owners, so it is ignored rather than drawn as output.
+            RemoteEvent::HostKeyPrompt(_) | RemoteEvent::Connected => None,
+            RemoteEvent::Failed(error) => Some(Self::Lost(error.to_string())),
+        }
+    }
+}
+
 impl PaneSource {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         match self {
@@ -515,6 +539,23 @@ impl TerminalPane {
             }
         })
         .detach();
+    }
+
+    /// Applies events the caller already took from the source.
+    ///
+    /// The window drains the attempt's event channel before this pane exists, and a
+    /// batch where the connection notice and the first output arrived together is
+    /// the common case; the output cannot be given back to the channel, so it is
+    /// handed over here and applied in the order it arrived. Dropping it would open
+    /// the remote terminal with the first screen missing.
+    pub fn adopt_events(&mut self, events: Vec<SourceEvent>, cx: &mut Context<Self>) {
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            self.handle_event(event, cx);
+        }
+        cx.notify();
     }
 
     /// Applies every event that arrived since the last poll.

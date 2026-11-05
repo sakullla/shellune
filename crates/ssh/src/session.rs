@@ -5,10 +5,13 @@
 //! commands, and nothing in the window ever awaits the network. That is what lets
 //! the same terminal pane drive a remote shell without knowing that SSH exists.
 //!
-//! Three rules hold:
+//! Four rules hold:
 //!
 //! * an unknown identity is only used after the user answers the question, so
 //!   check_server_key blocks on a decision instead of guessing;
+//! * the connect deadline belongs to the machine, not to the user: it covers TCP and
+//!   the key exchange up to the question about the identity, and stops there, so
+//!   comparing a fingerprint for a minute is never reported as a timeout;
 //! * a changed identity ends the attempt and is never turned into an "accept the new
 //!   key" flow, because the trust record must not be overwritten by a connection
 //!   that was not deliberately re-authorised;
@@ -16,6 +19,7 @@
 //!   method failing, and the user chooses another one, which is why nothing here
 //!   loops over methods behind the user's back.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -37,7 +41,13 @@ use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 /// the same over SSH.
 pub const TERM_VALUE: &str = "xterm-256color";
 
-/// How long a connection attempt may take before it is reported as a timeout.
+/// How long the machine part of an attempt may take.
+///
+/// It is a deadline for work no one has to think about: dialling, the key exchange
+/// and the moment the server identity is known. Once the user is asked about an
+/// unknown identity the clock is stopped, because the decision is theirs and no
+/// deadline of ours may overrule it; a session that is still waiting for that answer
+/// is reported as undecided, never as a timeout.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Keepalive interval, so a silently dropped network is noticed.
@@ -81,6 +91,44 @@ pub enum TrustAnswer {
     Reject,
 }
 
+/// How far a handshake got, as far as the connect deadline is concerned.
+///
+/// The attempt moves through these three stages once, in this order, and the
+/// deadline only applies during the first: everything after it is the user's work or
+/// the consequence of the user's decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandshakeStage {
+    /// TCP and the key exchange, before anything is asked of the user.
+    Machine = 0,
+    /// The identity question is on its way to the user; no deadline applies.
+    WaitingForUser = 1,
+    /// The user decided, or no decision was needed. Nothing here is timed out.
+    UserDecided = 2,
+}
+
+/// The stage of the handshake, shared between the deadline and the handler.
+///
+/// The handler runs inside the connect future the deadline wraps, so it can only
+/// report progress through a value like this one.
+#[derive(Debug, Default)]
+struct HandshakeProgress {
+    stage: AtomicU8,
+}
+
+impl HandshakeProgress {
+    fn stage(&self) -> HandshakeStage {
+        match self.stage.load(Ordering::SeqCst) {
+            1 => HandshakeStage::WaitingForUser,
+            2 => HandshakeStage::UserDecided,
+            _ => HandshakeStage::Machine,
+        }
+    }
+
+    fn set(&self, stage: HandshakeStage) {
+        self.stage.store(stage as u8, Ordering::SeqCst);
+    }
+}
+
 /// Everything one attempt needs.
 pub struct ConnectRequest {
     /// Host name or address, as saved.
@@ -95,6 +143,11 @@ pub struct ConnectRequest {
     pub size: PtySize,
     /// What the trust records say about this host before the attempt.
     pub known: KnownHostKey,
+    /// How long the machine part of the handshake may take.
+    ///
+    /// [CONNECT_TIMEOUT] unless a test needs the same behaviour without waiting
+    /// twenty real seconds for it.
+    pub connect_timeout: Duration,
 }
 
 impl ConnectRequest {
@@ -115,7 +168,15 @@ impl ConnectRequest {
             auth,
             size,
             known,
+            connect_timeout: CONNECT_TIMEOUT,
         }
+    }
+
+    /// The same request with another deadline for the machine part.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
     }
 
     /// The address the attempt dials, in the form error messages use.
@@ -154,6 +215,8 @@ enum Command {
 pub struct RemoteSession {
     commands: UnboundedSender<Command>,
     decisions: UnboundedSender<TrustAnswer>,
+    /// Tells the attempt to stop waiting for an answer it will never get.
+    cancelled: UnboundedSender<()>,
     events: UnboundedReceiver<RemoteEvent>,
     size: PtySize,
     closed: bool,
@@ -169,6 +232,7 @@ impl RemoteSession {
         let (commands, command_rx) = unbounded_channel();
         let (events, event_rx) = unbounded_channel();
         let (decisions, decision_rx) = unbounded_channel();
+        let (cancelled, cancel_rx) = unbounded_channel();
         let size = request.size;
 
         let failure_sender = events.clone();
@@ -185,13 +249,14 @@ impl RemoteSession {
                     }));
                     return;
                 };
-                runtime.block_on(run(request, command_rx, events, decision_rx));
+                runtime.block_on(run(request, command_rx, events, decision_rx, cancel_rx));
             })
             .expect("the SSH thread can be created");
 
         Self {
             commands,
             decisions,
+            cancelled,
             events: event_rx,
             size,
             closed: false,
@@ -200,10 +265,14 @@ impl RemoteSession {
 
     /// Answers the question about an unknown identity.
     ///
-    /// Returns whether the answer could be delivered; a question that is already
-    /// answered, or an attempt that ended, reports false instead of pretending the
-    /// decision still matters.
+    /// Returns whether the answer could be delivered. A caller that stores a trust
+    /// record because of this answer must check the result: false means the question
+    /// is no longer being asked — the attempt already ended, or it was closed — so
+    /// the record would claim a decision no connection ever used.
     pub fn answer_host_key(&mut self, accept: bool) -> bool {
+        if self.closed {
+            return false;
+        }
         let answer = if accept {
             TrustAnswer::Accept
         } else {
@@ -268,6 +337,11 @@ impl RemoteSession {
         }
         self.closed = true;
         let _ = self.commands.send(Command::Close);
+        // A form that closes while its identity question is on screen must also end
+        // the question: otherwise the attempt keeps waiting for an answer nobody can
+        // give any more, and the failure it eventually reports is a timeout for a
+        // server that answered at once.
+        let _ = self.cancelled.send(());
     }
 
     /// Whether [RemoteSession::close] was called.
@@ -289,8 +363,9 @@ async fn run(
     commands: UnboundedReceiver<Command>,
     events: UnboundedSender<RemoteEvent>,
     decisions: UnboundedReceiver<TrustAnswer>,
+    cancelled: UnboundedReceiver<()>,
 ) {
-    if let Err(error) = connect_and_shell(request, commands, &events, decisions).await {
+    if let Err(error) = connect_and_shell(request, commands, &events, decisions, cancelled).await {
         let _ = events.send(RemoteEvent::Failed(error));
     }
 }
@@ -300,6 +375,7 @@ async fn connect_and_shell(
     mut commands: UnboundedReceiver<Command>,
     events: &UnboundedSender<RemoteEvent>,
     decisions: UnboundedReceiver<TrustAnswer>,
+    cancelled: UnboundedReceiver<()>,
 ) -> Result<(), ConnectError> {
     let target = request.target();
     let material = Material::resolve(request.auth).await?;
@@ -310,27 +386,36 @@ async fn connect_and_shell(
         ..Default::default()
     });
     let recorded = Arc::new(Mutex::new(None::<ConnectError>));
+    let progress = Arc::new(HandshakeProgress::default());
     let handler = ClientHandler {
         host: request.host.clone(),
         port: request.port,
         known: request.known.clone(),
         events: events.clone(),
         decisions,
+        cancelled,
+        progress: Arc::clone(&progress),
         recorded: Arc::clone(&recorded),
     };
 
-    let connecting = client::connect(config, (request.host.as_str(), request.port), handler);
-    let mut handle = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
-        Err(_) => {
-            return Err(ConnectError::TimedOut { target });
-        }
-        Ok(Err(error)) => {
+    let mut handle = match dial(
+        config,
+        (request.host.as_str(), request.port),
+        handler,
+        &progress,
+        request.connect_timeout,
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(DialFailure::Timeout) => return Err(ConnectError::TimedOut { target }),
+        Err(DialFailure::Attempt(error)) => {
             // The handler knows more than the transport error does: it saw the
-            // identity that was refused or that changed, so its verdict wins.
+            // identity that was refused, that changed, or that was never decided on,
+            // so its verdict wins over the transport's own wording.
             let recorded = recorded.lock().ok().and_then(|slot| slot.clone());
             return Err(recorded.unwrap_or(error));
         }
-        Ok(Ok(handle)) => handle,
     };
 
     authenticate(&mut handle, &request.user, material).await?;
@@ -416,6 +501,55 @@ async fn connect_and_shell(
                 }
                 Some(_) => {}
             },
+        }
+    }
+}
+
+/// Why a dial stopped before it produced a connected handle.
+enum DialFailure {
+    /// The machine part of the handshake did not finish before the deadline.
+    Timeout,
+    /// The attempt ended with an error, which the handler may describe better.
+    Attempt(ConnectError),
+}
+
+/// Runs the handshake, but only the machine part of it under a deadline.
+///
+/// The deadline covers the dial and the key exchange, which is work nobody has to
+/// think about. It stops the moment the handler says the user is being asked about an
+/// unknown identity, and it never comes back: comparing a fingerprint and deciding
+/// what to do about it is the user's work, and a session that is still waiting for
+/// that answer is reported as undecided rather than as a slow server.
+async fn dial<A: tokio::net::ToSocketAddrs>(
+    config: Arc<client::Config>,
+    addrs: A,
+    handler: ClientHandler,
+    progress: &HandshakeProgress,
+    timeout: Duration,
+) -> Result<client::Handle<ClientHandler>, DialFailure> {
+    let mut connecting = Box::pin(client::connect(config, addrs, handler));
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        match progress.stage() {
+            // From here on the attempt is either waiting for the user or carrying out
+            // what the user decided; both finish without a deadline.
+            HandshakeStage::WaitingForUser | HandshakeStage::UserDecided => {
+                return connecting.as_mut().await.map_err(DialFailure::Attempt);
+            }
+            HandshakeStage::Machine => {}
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::select! {
+            result = connecting.as_mut() => return result.map_err(DialFailure::Attempt),
+            () = tokio::time::sleep(remaining) => {
+                // The question may have reached the user during the very poll that was
+                // running when the deadline passed; if it did, the wait is theirs.
+                if progress.stage() == HandshakeStage::Machine {
+                    return Err(DialFailure::Timeout);
+                }
+            }
         }
     }
 }
@@ -528,6 +662,9 @@ struct ClientHandler {
     known: KnownHostKey,
     events: UnboundedSender<RemoteEvent>,
     decisions: UnboundedReceiver<TrustAnswer>,
+    /// Fires when the caller stopped wanting an answer: the form was closed.
+    cancelled: UnboundedReceiver<()>,
+    progress: Arc<HandshakeProgress>,
     recorded: Arc<Mutex<Option<ConnectError>>>,
 }
 
@@ -546,6 +683,10 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        // The server identity is now known, so the part of the handshake that can be
+        // blamed on the network is over: from here on nothing is timed out.
+        self.progress.set(HandshakeStage::UserDecided);
+
         let Some(presented) = PresentedKey::from_server_key(server_public_key) else {
             self.record(ConnectError::HostKeyUnsupported {
                 reason: "the presented key has no SHA256 fingerprint".to_owned(),
@@ -574,20 +715,128 @@ impl client::Handler for ClientHandler {
                 Ok(false)
             }
             KnownHostKey::Unknown => {
+                // The user is asked, and the connect deadline stops here: a
+                // fingerprint that takes a minute to compare is a decision in
+                // progress, not a slow server.
+                self.progress.set(HandshakeStage::WaitingForUser);
                 let _ = self.events.send(RemoteEvent::HostKeyPrompt(HostKeyPrompt {
                     host: self.host.clone(),
                     port: self.port,
                     presented: presented.clone(),
                 }));
-                match self.decisions.recv().await {
+                let answer = {
+                    // Split borrows: both channels are awaited in the same select.
+                    let Self {
+                        decisions,
+                        cancelled,
+                        ..
+                    } = self;
+                    tokio::select! {
+                        answer = decisions.recv() => answer,
+                        // The form closed, or the session was dropped: nobody can
+                        // answer any more, so the attempt ends as undecided instead
+                        // of waiting for an answer that will never come.
+                        _ = cancelled.recv() => None,
+                    }
+                };
+                self.progress.set(HandshakeStage::UserDecided);
+                match answer {
                     Some(TrustAnswer::Accept) => Ok(true),
-                    _ => {
+                    Some(TrustAnswer::Reject) => {
                         self.record(ConnectError::HostKeyRejected { presented });
+                        Ok(false)
+                    }
+                    None => {
+                        self.record(ConnectError::HostKeyUndecided { presented });
                         Ok(false)
                     }
                 }
             }
         }
+    }
+}
+
+/// A session whose events are supplied by a test instead of a server.
+///
+/// The window has two states that a live server cannot be made to produce on
+/// demand: a batch where the connection notice and the first output arrive
+/// together, and an attempt that is still waiting for the identity question while
+/// the user answers it or closes the form. Only the events are scripted — the
+/// session type, its channels and everything the window does with them are the real
+/// ones, so a test here exercises the same path a connection uses.
+#[cfg(feature = "test-support")]
+pub struct ScriptedSession {
+    session: Option<RemoteSession>,
+    events: UnboundedSender<RemoteEvent>,
+    answers: Arc<Mutex<Vec<TrustAnswer>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl ScriptedSession {
+    /// A session that has reported nothing yet.
+    #[must_use]
+    pub fn new() -> Self {
+        let (commands, command_rx) = unbounded_channel();
+        let (events, event_rx) = unbounded_channel();
+        let (decisions, mut decision_rx) = unbounded_channel();
+        let (cancelled, cancel_rx) = unbounded_channel();
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&answers);
+        thread::Builder::new()
+            .name("shellune-ssh-scripted".to_owned())
+            .spawn(move || {
+                // Holding the command side open lets a test type into a scripted
+                // pane; what matters here is recording the answers the window gives,
+                // so a test can prove a decision really reached the transport.
+                let _commands = command_rx;
+                let _cancelled = cancel_rx;
+                while let Some(answer) = decision_rx.blocking_recv() {
+                    if let Ok(mut answers) = recorded.lock() {
+                        answers.push(answer);
+                    }
+                }
+            })
+            .expect("the scripted session thread can be created");
+        Self {
+            session: Some(RemoteSession {
+                commands,
+                decisions,
+                cancelled,
+                events: event_rx,
+                size: PtySize::default(),
+                closed: false,
+            }),
+            events,
+            answers,
+        }
+    }
+
+    /// Reports an event, exactly as the transport would report it.
+    pub fn push(&self, event: RemoteEvent) {
+        let _ = self.events.send(event);
+    }
+
+    /// The session to hand to a pane or a window. It can be taken once.
+    pub fn take_session(&mut self) -> RemoteSession {
+        self.session
+            .take()
+            .expect("a scripted session is taken exactly once")
+    }
+
+    /// The answers the window has given so far.
+    #[must_use]
+    pub fn answers(&self) -> Vec<TrustAnswer> {
+        self.answers
+            .lock()
+            .map(|answers| answers.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Default for ScriptedSession {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

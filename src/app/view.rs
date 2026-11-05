@@ -36,7 +36,7 @@ use crate::app::hosts::{
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{self, MethodChoice, RemoteFailure, RemotePanel, RemoteStatus};
-use crate::app::terminal::{PaneState, TerminalPane};
+use crate::app::terminal::{PaneState, SourceEvent, TerminalPane};
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
 use crate::app::workspace::{
@@ -108,6 +108,9 @@ pub struct ShelluneView {
     trust_book: HostTrust,
     /// Why the trust file could not be read, when it could not.
     trust_error: Option<String>,
+    /// The attempt a test scripted, kept so its answers can be inspected.
+    #[cfg(test)]
+    scripted: Option<shellune_ssh::ScriptedSession>,
 }
 
 /// The three credential fields of the remote form.
@@ -217,6 +220,8 @@ impl ShelluneView {
             trust,
             trust_book: HostTrust::new(),
             trust_error: None,
+            #[cfg(test)]
+            scripted: None,
         };
         view.bind_shell_path(cx);
         view.bind_host_search(cx);
@@ -883,40 +888,79 @@ impl ShelluneView {
     }
 
     /// Applies what the attempt reported, returning whether to keep watching.
+    ///
+    /// The events of one poll belong together: the shell usually prints its banner
+    /// and prompt immediately after the shell request is accepted, so the connection
+    /// notice and the first output arrive in the same batch far more often than not.
+    /// Everything drained after the notice is therefore kept and handed to the
+    /// terminal once it exists, because the channel has already given those events up
+    /// and there is nothing to read them from later.
     fn poll_remote(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(session) = self.remote_session.as_mut() else {
             self.remote_watching = false;
             return false;
         };
         let events = session.drain();
+        let mut pending: Vec<SourceEvent> = Vec::new();
+        let mut connected = false;
         for event in events {
             match event {
                 RemoteEvent::HostKeyPrompt(prompt) => {
+                    // Once the terminal is live the identity is settled, so a prompt
+                    // arriving behind it is not a question the user can still answer.
+                    if connected {
+                        continue;
+                    }
                     if let Some(panel) = self.remote.as_mut() {
                         panel.set_status(RemoteStatus::VerifyingHost(prompt));
                     }
                     cx.notify();
                 }
                 RemoteEvent::Connected => {
+                    if connected {
+                        continue;
+                    }
+                    connected = true;
                     let session = self.remote_session.take();
                     self.remote_watching = false;
                     if let Some(session) = session {
                         self.on_remote_connected(session, cx);
                     }
-                    return false;
                 }
                 RemoteEvent::Failed(error) => {
+                    if connected {
+                        // The transport failed in the same batch that opened the
+                        // terminal: the terminal reports it like any later failure
+                        // rather than the panel claiming a session that is gone.
+                        pending.push(SourceEvent::Lost(error.to_string()));
+                        continue;
+                    }
                     self.remote_session = None;
                     self.remote_watching = false;
                     self.on_remote_failed(&error, cx);
                     return false;
                 }
-                // Output and exit belong to the pane, which owns the session once it
-                // is live; seeing one here means the handover had not happened yet.
-                RemoteEvent::Data(_) | RemoteEvent::Exited { .. } => {}
+                RemoteEvent::Data(_) | RemoteEvent::Exited { .. } => {
+                    if !connected {
+                        // The transport announces the shell before it reports output,
+                        // so output can only belong to a notice that is already in this
+                        // batch; before one, there is no terminal to give it to.
+                        continue;
+                    }
+                    if let Some(event) = SourceEvent::from_remote(event) {
+                        pending.push(event);
+                    }
+                }
             }
         }
-        true
+
+        if !connected {
+            return true;
+        }
+        if let Some(pane) = self.pane.clone() {
+            pane.update(cx, |pane, cx| pane.adopt_events(pending, cx));
+        }
+        false
     }
 
     /// Turns a session that reached the remote shell into the terminal pane.
@@ -973,7 +1017,10 @@ impl ShelluneView {
     ///
     /// Accepting stores the identity first: a connection that was allowed because
     /// the user pressed "accept" must not proceed while the record failed to save,
-    /// or the next start would ask again for a decision that was already made.
+    /// or the next start would ask again for a decision that was already made. The
+    /// answer is then delivered, and if it cannot be — the attempt ended behind the
+    /// question — the record is taken back, so a stored identity always belongs to a
+    /// connection that really used it.
     pub(crate) fn answer_trust(&mut self, accept: bool, cx: &mut Context<Self>) {
         let Some(panel) = self.remote.as_ref() else {
             return;
@@ -1020,8 +1067,40 @@ impl ShelluneView {
             );
             return;
         }
-        if let Some(session) = self.remote_session.as_mut() {
-            session.answer_host_key(true);
+        // The record is only worth having if the connection actually uses it: an
+        // attempt that already ended (a timeout behind the question, a form that was
+        // closed, a server that hung up) cannot be told to accept anything, so the
+        // record is taken back rather than left claiming a decision that nothing used.
+        let delivered = self
+            .remote_session
+            .as_mut()
+            .is_some_and(|session| session.answer_host_key(true));
+        if !delivered {
+            // The file gets the book that was there before this answer, so nothing
+            // the retracted acceptance added survives a restart.
+            self.trust_book = previous;
+            let _ = self.trust.save(&self.trust_book);
+            self.remote_session = None;
+            self.remote_watching = false;
+            if let Some(panel) = self.remote.as_mut() {
+                panel.fail(RemoteFailure::new(
+                    strings.trust_undelivered_note,
+                    strings.remote_close,
+                    true,
+                ));
+            }
+            if let Some(id) = self.remote_session_id.take() {
+                // The attempt ended before the decision could reach it, which is not
+                // a refusal of the identity: the record says the session never opened.
+                self.workspace.session_failed(
+                    id,
+                    SessionFailure::ConnectionFailed {
+                        reason: strings.trust_undelivered_note.to_owned(),
+                    },
+                );
+            }
+            cx.notify();
+            return;
         }
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Connecting);
@@ -1046,11 +1125,12 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// Shows the identity question without a server, so a test can answer it.
+    /// Shows the identity question, asked by an attempt that is really waiting.
     ///
-    /// The session record is created exactly as a real attempt creates it before
-    /// dialling, so answering the question afterwards exercises the same paths the
-    /// transport would.
+    /// A live server cannot be made to present an unknown identity on demand inside
+    /// a test, so the attempt is a scripted one: it reports the same prompt event the
+    /// transport emits, and its answer channel is read, so a test can prove that a
+    /// decision which stores a record was actually delivered.
     #[cfg(test)]
     pub(crate) fn show_trust_prompt(
         &mut self,
@@ -1063,10 +1143,70 @@ impl ShelluneView {
             self.workspace
                 .session_verified_and_authenticated(session.id());
         }
+        let scripted = shellune_ssh::ScriptedSession::new();
+        scripted.push(RemoteEvent::HostKeyPrompt(prompt));
+        self.install_scripted_session(scripted, cx);
+        // The prompt reaches the form the same way a real one does.
+        self.poll_remote(cx);
+    }
+
+    /// Puts a session whose events a test supplies in place of a connecting attempt.
+    #[cfg(test)]
+    pub(crate) fn install_scripted_session(
+        &mut self,
+        mut scripted: shellune_ssh::ScriptedSession,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_session = Some(scripted.take_session());
+        self.scripted = Some(scripted);
+        self.remote_watching = false;
+        cx.notify();
+    }
+
+    /// Starts an attempt that reports the given events instead of dialling a host.
+    ///
+    /// Everything else is the real path: the session record is created where a real
+    /// attempt creates it, the form says it is connecting, and the events are applied
+    /// by the same poll the window uses.
+    #[cfg(test)]
+    pub(crate) fn script_remote_attempt(
+        &mut self,
+        events: Vec<RemoteEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) else {
+            return;
+        };
+        let session = self.workspace.register_remote_session(&host);
+        self.remote_session_id = Some(session.id());
+        let scripted = shellune_ssh::ScriptedSession::new();
+        for event in events {
+            scripted.push(event);
+        }
+        self.install_scripted_session(scripted, cx);
         if let Some(panel) = self.remote.as_mut() {
-            panel.set_status(RemoteStatus::VerifyingHost(prompt));
+            panel.set_status(RemoteStatus::Connecting);
         }
         cx.notify();
+    }
+
+    /// Ends the attempt behind an open question, the way a connection thread that
+    /// stopped would: the question stays on screen, but nothing can answer it.
+    #[cfg(test)]
+    pub(crate) fn end_scripted_attempt(&mut self, cx: &mut Context<Self>) {
+        self.remote_session = None;
+        self.scripted = None;
+        self.remote_watching = false;
+        cx.notify();
+    }
+
+    /// The answers the scripted attempt received, in the order they were given.
+    #[cfg(test)]
+    pub(crate) fn scripted_answers(&self) -> Vec<shellune_ssh::TrustAnswer> {
+        self.scripted
+            .as_ref()
+            .map(shellune_ssh::ScriptedSession::answers)
+            .unwrap_or_default()
     }
 
     /// Applies one round of remote events, the way the poll loop does.

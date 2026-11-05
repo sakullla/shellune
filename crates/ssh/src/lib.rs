@@ -20,8 +20,12 @@ pub mod hostkey;
 pub mod session;
 
 /// A disposable OpenSSH server, for the tests that need a real one.
-#[cfg(any(test, feature = "test-server"))]
+#[cfg(any(test, feature = "test-support"))]
 pub mod testserver;
+
+/// A session whose events come from a test rather than from a server.
+#[cfg(feature = "test-support")]
+pub use session::ScriptedSession;
 
 pub use error::ConnectError;
 pub use hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};

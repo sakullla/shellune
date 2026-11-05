@@ -184,6 +184,99 @@ fn an_unknown_server_identity_is_shown_with_its_algorithm_and_fingerprint() {
     );
 }
 
+/// The password attempt with a deadline a test can outlast.
+///
+/// The production deadline is twenty seconds, which no test should spend waiting: the
+/// same code runs with a much shorter one, so a decision that took longer than the
+/// deadline proves what the deadline covers.
+fn impatient(server: &Harness, known: KnownHostKey, timeout: Duration) -> RemoteSession {
+    RemoteSession::connect(
+        ConnectRequest::new(
+            "127.0.0.1",
+            server.port(),
+            server.user(),
+            password(server),
+            PtySize::new(100, 30),
+            known,
+        )
+        .with_connect_timeout(timeout),
+    )
+}
+
+#[test]
+fn comparing_a_fingerprint_takes_as_long_as_the_user_needs() {
+    if skip("a slow trust decision") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    // The deadline is long enough that dialling and the key exchange fit inside it
+    // comfortably, and the user's wait below is longer: that is the only way the
+    // difference between the machine's clock and the user's can be observed.
+    let deadline = Duration::from_secs(5);
+    let mut session = impatient(server, KnownHostKey::Unknown, deadline);
+    let RemoteEvent::HostKeyPrompt(prompt) = wait_for_outcome(&mut session) else {
+        panic!("the first contact must ask about the identity");
+    };
+    assert_eq!(prompt.port, server.port());
+
+    std::thread::sleep(deadline + Duration::from_secs(1));
+
+    // Nothing may have been decided behind the user's back: no timeout, no session.
+    let meanwhile = session.drain();
+    for event in &meanwhile {
+        assert!(
+            !matches!(event, RemoteEvent::Failed(_) | RemoteEvent::Connected),
+            "the server answered at once, so nothing may be reported while the question              is still open: {event:?}"
+        );
+    }
+    assert!(
+        session.answer_host_key(true),
+        "the question is still open long after the machine deadline"
+    );
+    let outcome = wait_for_outcome(&mut session);
+    assert!(
+        matches!(outcome, RemoteEvent::Connected),
+        "accepting after the deadline connects instead of timing out, got {outcome:?}"
+    );
+    session.close();
+}
+
+#[test]
+fn a_question_nobody_answers_ends_undecided_without_a_session() {
+    if skip("an abandoned trust decision") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let mut session = impatient(server, KnownHostKey::Unknown, Duration::from_secs(5));
+    let RemoteEvent::HostKeyPrompt(prompt) = wait_for_outcome(&mut session) else {
+        panic!("the first contact must ask about the identity");
+    };
+
+    // The form is closed while the question is on screen.
+    session.close();
+
+    let outcome = wait_for_outcome(&mut session);
+    match outcome {
+        RemoteEvent::Failed(ConnectError::HostKeyUndecided { presented }) => {
+            assert_eq!(
+                presented.fingerprint,
+                prompt.fingerprint(),
+                "the outcome names the identity that was never decided on"
+            );
+        }
+        other => {
+            panic!("an abandoned question is its own outcome, not a network failure, got {other:?}")
+        }
+    }
+
+    // Nothing was stored, and no terminal was opened, because no decision was made.
+    let store = scratch_trust("undecided");
+    assert!(
+        store.load().expect("first run").is_empty() && !store.path().exists(),
+        "an undecided identity writes no trust record"
+    );
+}
+
 #[test]
 fn accepting_the_identity_connects_stores_it_and_reconnects_without_a_question() {
     if skip("accepting a host identity") {

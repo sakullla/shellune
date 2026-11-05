@@ -34,6 +34,15 @@ pub enum ConnectError {
         /// The identity that was presented and refused.
         presented: PresentedKey,
     },
+    /// The attempt ended while the user had not decided about an unknown identity.
+    ///
+    /// Kept apart from [ConnectError::TimedOut] because the server answered at once:
+    /// the missing answer was the user's, so blaming the network would send them to
+    /// look at a connection that was never the problem.
+    HostKeyUndecided {
+        /// The identity that was presented and never decided on.
+        presented: PresentedKey,
+    },
     /// The server presents a different identity than the one that was trusted.
     HostKeyChanged {
         /// Fingerprint that was trusted.
@@ -125,6 +134,8 @@ impl ConnectError {
     /// server is not who it used to be, and repeating the attempt cannot fix that.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
+        // A missing decision is the one failure that connecting again fixes, because
+        // the same question is asked and can be answered this time.
         !matches!(
             self,
             Self::HostKeyChanged { .. } | Self::HostKeyUnsupported { .. }
@@ -139,6 +150,9 @@ impl ConnectError {
             Self::TimedOut { .. } => "Check the network and the address, then try again.",
             Self::Unreachable { .. } => "Check the address, then try again.",
             Self::HostKeyRejected { .. } => "The connection stops here; nothing was stored.",
+            Self::HostKeyUndecided { .. } => {
+                "Connect again and accept or refuse the identity while it is shown."
+            }
             Self::HostKeyChanged { .. } => {
                 "Do not continue. Check the server identity before trusting it again."
             }
@@ -191,6 +205,11 @@ impl ConnectError {
                 reason: reason.clone(),
             },
             Self::HostKeyRejected { .. } => SessionFailure::HostKeyRejected,
+            // Not a rejection and not a network problem: the session records that it
+            // could not be established, and the reason says which decision is missing.
+            Self::HostKeyUndecided { .. } => SessionFailure::ConnectionFailed {
+                reason: self.to_string(),
+            },
             Self::HostKeyChanged { stored, presented } => SessionFailure::HostIdentityChanged {
                 algorithm: presented.algorithm.clone(),
                 stored: stored.clone(),
@@ -256,6 +275,7 @@ impl ConnectError {
             Self::Refused { .. }
             | Self::TimedOut { .. }
             | Self::Unreachable { .. }
+            | Self::HostKeyUndecided { .. }
             | Self::HostKeyUnsupported { .. }
             | Self::PtyRejected { .. }
             | Self::Disconnected { .. } => None,
@@ -277,6 +297,11 @@ impl fmt::Display for ConnectError {
             Self::HostKeyRejected { presented } => write!(
                 formatter,
                 "the {} identity {} was not accepted",
+                presented.algorithm, presented.fingerprint
+            ),
+            Self::HostKeyUndecided { presented } => write!(
+                formatter,
+                "the {} identity {} was neither accepted nor refused before the attempt ended",
                 presented.algorithm, presented.fingerprint
             ),
             Self::HostKeyChanged { stored, presented } => write!(

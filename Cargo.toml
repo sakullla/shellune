@@ -22,8 +22,9 @@ gpui = { version = "=0.2.2", features = ["test-support"] }
 portable-pty = { workspace = true }
 # The host-storage integration tests read the written document as JSON.
 serde_json = { workspace = true }
-# The SSH tests drive a real OpenSSH server, started by the crate's own harness.
-shellune-ssh = { path = "crates/ssh", features = ["test-server"] }
+# The SSH tests drive a real OpenSSH server and scripted sessions, which the crate
+# only builds for tests.
+shellune-ssh = { path = "crates/ssh", features = ["test-support"] }
 
 [workspace]
 members = ["crates/core", "crates/ssh", "crates/storage", "crates/terminal"]

@@ -15,9 +15,10 @@ tokio = { workspace = true }
 zeroize = { workspace = true }
 
 [features]
-# Builds the disposable OpenSSH server harness the tests start. It is behind a
-# feature so a release build of the application carries none of it.
-test-server = []
+# The test doubles the window's tests need: the disposable OpenSSH server harness and
+# a session whose events are scripted. It is behind a feature so a release build of
+# the application carries none of it.
+test-support = []
 
 [dev-dependencies]
 ssh-key = { version = "0.7.0-rc.11", features = ["ed25519"] }

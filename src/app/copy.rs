@@ -340,6 +340,8 @@ pub struct Strings {
     pub trust_reject: &'static str,
     /// Shown after an identity was refused.
     pub trust_rejected_note: &'static str,
+    /// Shown when the attempt ended before the acceptance could reach it.
+    pub trust_undelivered_note: &'static str,
     /// Title of the failed attempt panel.
     pub remote_failure_title: &'static str,
     /// Button that closes the remote panel.
@@ -485,6 +487,7 @@ pub static ENGLISH: Strings = Strings {
     trust_accept: "Accept and connect",
     trust_reject: "Reject",
     trust_rejected_note: "The identity was rejected, so no terminal was opened and no trust record was written.",
+    trust_undelivered_note: "The connection attempt had already ended, so the identity was neither accepted nor stored. Connect again to see it once more.",
     remote_failure_title: "The connection did not open",
     remote_close: "Close the connection panel",
 };
@@ -628,6 +631,7 @@ pub static CHINESE: Strings = Strings {
     trust_accept: "接受并连接",
     trust_reject: "拒绝",
     trust_rejected_note: "已拒绝该身份，未打开终端，也未写入信任记录。",
+    trust_undelivered_note: "连接尝试已结束，该身份既未被接受也未被记录。请重新连接以再次查看。",
     remote_failure_title: "连接没有建立",
     remote_close: "关闭连接面板",
 };
