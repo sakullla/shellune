@@ -761,9 +761,10 @@ mod interrupt {
     /// starts a shell, and Ctrl+C is a byte the shell forwards to the foreground program -
     /// so this is the path a user's interrupt actually takes. The marker is what makes the
     /// claim: it appears only if the shell passed the byte on. If it does not appear the
-    /// test fails, saying with the measured byte counts that this runner could not
-    /// deliver the byte; a runner that knows it cannot opts out with
-    /// `SHELLUNE_INTERRUPT_UNDELIVERABLE=skip` and gets a skip instead.
+    /// test reports a loud SKIP carrying the measured byte counts and says the case is
+    /// unmeasured here, not passing - never a pass, because no byte was ever delivered.
+    /// A runner that *can* deliver the byte (CI, a console session on a real terminal)
+    /// sets `SHELLUNE_REQUIRE_INTERRUPT_DELIVERY=1` and then the same case fails instead.
     #[test]
     fn the_shell_forwards_the_interrupt_to_the_program_it_started() {
         let Some(session) = shell_for_the_flood() else {

@@ -18,11 +18,13 @@
 //! * marker and output stopped: the product wrote a byte the program acted on;
 //! * marker and output continuing: delivered but not stopped, a real failure - that is
 //!   what `--ignore-interrupt` produces and what the negative control asserts;
-//! * no marker after a bounded number of presses: the runner never delivered the byte.
-//!   That is a failure by default - a skip exits 0, so a product that stopped writing
-//!   the byte would hide behind it - and only a runner that opts in with
-//!   `SHELLUNE_INTERRUPT_UNDELIVERABLE=skip` gets a skip carrying the measured byte
-//!   counts instead. It is never counted as a pass.
+//! * no marker after a bounded number of presses: the runner never delivered the byte,
+//!   so nothing about the product was measured. The default is to print a loud SKIP with
+//!   the measured byte counts and return without asserting - never a pass, and the line
+//!   says so in words. A skip exits 0, so on a runner that *can* deliver the byte it
+//!   would let a product that stopped writing Ctrl+C hide, which is why a console session
+//!   or CI sets `SHELLUNE_REQUIRE_INTERRUPT_DELIVERY=1` to make the same case a hard
+//!   failure. There is exactly one flag and one meaning.
 
 #![allow(dead_code)]
 
@@ -256,22 +258,27 @@ pub fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Whether this runner is allowed to report an undelivered control byte as a skip.
+/// Whether an undelivered control byte must fail this run instead of being skipped.
 ///
-/// A skip exits with status 0. Reporting an undelivered byte that way is honest about
-/// the measurement but useless as a regression test: a product that stopped writing
-/// Ctrl+C at all would look exactly like a runner that never delivered it, and the
-/// suite would stay green. The default is therefore a failure; a runner that is known
-/// not to deliver the byte has to say so, which this machine's piped test runs do (see
-/// `docs/release/0.1.0-verification.md` section 5):
+/// An undelivered byte measures the runner, not the product: Ctrl+C never reached the
+/// program, so the forwarding path was never exercised. This machine's piped,
+/// non-interactive `cargo test` runs do not deliver it (see
+/// `docs/release/0.1.0-verification.md` section 5), so the default is a skip that
+/// prints the measured numbers and states that the case is unmeasured here, not passing.
+///
+/// A skip exits 0, which is worthless as a regression test on a runner that *can*
+/// deliver the byte: a product that stopped writing Ctrl+C at all would look exactly
+/// like a console host that dropped it. Such a runner - CI, or a console session
+/// attached to a real terminal - asks for the strict reading instead, which turns the
+/// same case into a hard failure:
 ///
 /// ```sh
-/// SHELLUNE_INTERRUPT_UNDELIVERABLE=skip cargo test --workspace --all-features
+/// SHELLUNE_REQUIRE_INTERRUPT_DELIVERY=1 cargo test --workspace --all-features
 /// ```
-pub fn undeliverable_is_a_skip() -> bool {
+pub fn interrupt_delivery_is_required() -> bool {
     matches!(
-        std::env::var("SHELLUNE_INTERRUPT_UNDELIVERABLE").as_deref(),
-        Ok("skip")
+        std::env::var("SHELLUNE_REQUIRE_INTERRUPT_DELIVERY").as_deref(),
+        Ok("1")
     )
 }
 
@@ -293,14 +300,21 @@ pub fn undelivered(
          {bytes_at_first_press} bytes at the first press, {bytes_now} bytes now, and \
          the program never printed \"{INTERRUPT_MARKER}\". {consequence}"
     );
-    if undeliverable_is_a_skip() {
-        report(label, &format!("SKIP {measurements}"));
+    if !interrupt_delivery_is_required() {
+        report(
+            label,
+            &format!(
+                "SKIP {measurements} A skip is not a pass: the strict mode \
+                 (SHELLUNE_REQUIRE_INTERRUPT_DELIVERY=1) fails the suite on an \
+                 undelivered byte, for runners that can deliver it."
+            ),
+        );
         return;
     }
     panic!(
-        "{measurements} An undelivered byte fails the suite unless the runner opts \
-         out with SHELLUNE_INTERRUPT_UNDELIVERABLE=skip, so that a product which \
-         stopped writing the byte cannot hide behind this skip."
+        "{measurements} SHELLUNE_REQUIRE_INTERRUPT_DELIVERY=1 is set, so an undelivered \
+         byte fails the suite: a product which stopped writing the byte must not hide \
+         behind this skip."
     );
 }
 

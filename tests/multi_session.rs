@@ -280,6 +280,14 @@ mod interrupt {
         }
     }
 
+    /// R7's isolation, measured by interrupting one of two live sessions.
+    ///
+    /// The marker is what makes the claim: the flood only reports an interrupt it was
+    /// handed, so a session that stays responsive while another one is quiet proves
+    /// nothing unless the byte arrived. When it does not arrive the test prints a loud
+    /// SKIP with the measured byte counts and states that the isolation of an interrupt
+    /// is unmeasured here, not passing; a runner that can deliver the byte sets
+    /// `SHELLUNE_REQUIRE_INTERRUPT_DELIVERY=1` and turns that skip into a failure.
     #[test]
     fn interrupting_one_session_leaves_the_other_responsive() {
         let _alone = support::exclusive();
