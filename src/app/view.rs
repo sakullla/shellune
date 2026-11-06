@@ -16,8 +16,8 @@ use gpui::{
     Window, div, px,
 };
 use shellune_core::{
-    BrowseState, EventTag, HostConfig, HostId, LocalShell, Session, SessionFailure, SessionId,
-    SessionKind, SessionState, Transfer,
+    BrowseState, EventTag, FileKind, HostConfig, HostId, LocalShell, Session, SessionFailure,
+    SessionId, SessionKind, SessionState, Transfer, join_path,
 };
 use shellune_ssh::{ConnectRequest, PtySize, RemoteEvent, RemoteSession};
 use shellune_storage::{
@@ -32,7 +32,7 @@ use crate::app::actions::{
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(test)]
 use crate::app::files::BrowseChannel;
-use crate::app::files::{FileViews, kind_label};
+use crate::app::files::{FileViews, FilesDialog, kind_label, problem_text};
 use crate::app::hosts::{
     HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
     import_message,
@@ -119,6 +119,12 @@ pub const FILES_PANEL_WIDTH: f32 = 340.0;
 /// that an idle file view costs almost nothing.
 pub const FILES_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
 
+/// How many items of a change report the panel lists.
+///
+/// A recursive delete of a large tree can reach hundreds of paths; the count line
+/// carries the whole number, so the list can stay a report and not a log.
+pub const FILES_REPORT_STEPS: usize = 12;
+
 /// The application shell view.
 pub struct ShelluneView {
     workspace: Workspace,
@@ -172,6 +178,10 @@ pub struct ShelluneView {
     files: FileViews,
     /// Whether the file views are being polled for answers.
     files_polling: bool,
+    /// The change the file view is asking about before anything is sent (R11).
+    files_dialog: Option<FilesDialog>,
+    /// The field of that question, present only while it has one.
+    files_field: Option<Entity<TextField>>,
     /// The attempt a test scripted, kept so its answers can be inspected.
     #[cfg(test)]
     scripted: Option<shellune_ssh::ScriptedSession>,
@@ -286,6 +296,8 @@ impl ShelluneView {
             trust_error: None,
             files: FileViews::new(),
             files_polling: false,
+            files_dialog: None,
+            files_field: None,
             #[cfg(test)]
             scripted: None,
         };
@@ -488,7 +500,7 @@ impl ShelluneView {
         open.pane.update(cx, |pane, cx| pane.close(cx));
         // The connection of this session ends with its terminal, so its file view goes
         // with it instead of keeping a path and a listing that nothing backs any more.
-        self.files.detach(id);
+        self.end_files(id);
         if self.active == Some(id) {
             // The next tab takes over, or the previous one when this was the last: a
             // shell never ends up with no terminal selected while one is still open.
@@ -1885,9 +1897,11 @@ impl ShelluneView {
                     .session_failure()
                     .unwrap_or(shellune_core::SessionFailure::ProcessExited { code: Some(0) });
                 self.workspace.session_failed(id, failure);
+                self.end_files(id);
             }
             PaneState::Failed(failure) => {
                 self.workspace.session_failed(id, failure);
+                self.end_files(id);
             }
         }
         cx.notify();
@@ -3744,6 +3758,7 @@ impl ShelluneView {
     /// path on screen is only ever one the server resolved.
     fn toggle_files(&mut self, id: SessionId, cx: &mut Context<Self>) {
         if self.files.is_open(id) {
+            self.close_files_question(id);
             self.files.close(id);
         } else if self.files.open(id) {
             self.watch_files(cx);
@@ -3752,6 +3767,10 @@ impl ShelluneView {
     }
 
     fn files_up(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        // Leaving the directory ends any question about an entry in it: the question
+        // names a target in the directory on screen, and a later answer would apply to
+        // wherever the user went next.
+        self.close_files_question(id);
         self.files.up(id);
         cx.notify();
     }
@@ -3762,7 +3781,177 @@ impl ShelluneView {
     }
 
     fn files_enter(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
+        self.close_files_question(id);
         self.files.enter(id, name);
+        cx.notify();
+    }
+
+    /// Drops the question of one session, if it has one.
+    fn close_files_question(&mut self, id: SessionId) {
+        if self
+            .files_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.session() == id)
+        {
+            self.files_dialog = None;
+            self.files_field = None;
+        }
+    }
+
+    /// Ends everything the file view of one session held (R9, R11).
+    ///
+    /// The connection ends with the session, so the listing ends with it too: a path
+    /// and its entries that nothing backs would keep showing files the user cannot
+    /// reach, and a question about one of them would outlive the server it was about.
+    /// The poll loop sees at its next tick that no view is left open and stops.
+    fn end_files(&mut self, id: SessionId) {
+        self.close_files_question(id);
+        self.files.detach(id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Changes to a remote directory (R11)
+    // -----------------------------------------------------------------------
+
+    /// Asks for the name of a new directory, without sending anything yet.
+    fn files_new(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if !self.files.is_open(id) {
+            return;
+        }
+        let placeholder = self.strings().files_new_placeholder;
+        let field = cx.new(|cx| TextField::new(placeholder, cx));
+        self.open_files_dialog(
+            FilesDialog::NewDirectory {
+                session: id,
+                text: String::new(),
+                problem: None,
+            },
+            field,
+            cx,
+        );
+    }
+
+    /// Asks what one entry should be called, with its current name already in the field.
+    fn files_ask_rename(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
+        if !self.files.is_open(id) {
+            return;
+        }
+        let placeholder = self.strings().files_rename_placeholder;
+        let field = cx.new(|cx| TextField::with_text(placeholder, name, cx));
+        self.open_files_dialog(
+            FilesDialog::Rename {
+                session: id,
+                from: name.to_owned(),
+                text: name.to_owned(),
+                problem: None,
+            },
+            field,
+            cx,
+        );
+    }
+
+    /// Asks whether one entry should be deleted, naming it and what it is (R11).
+    ///
+    /// Nothing is typed here, so no field is created and the keyboard stays where it
+    /// was: the question is answered with one of two buttons, and the target is a fact
+    /// from the listing rather than something the user could mistype.
+    fn files_ask_delete(
+        &mut self,
+        id: SessionId,
+        name: &str,
+        kind: FileKind,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.files.is_open(id) {
+            return;
+        }
+        self.files_dialog = Some(FilesDialog::Delete {
+            session: id,
+            name: name.to_owned(),
+            kind,
+        });
+        self.files_field = None;
+        cx.notify();
+    }
+
+    /// Shows a question and binds its field, sending nothing.
+    fn open_files_dialog(
+        &mut self,
+        dialog: FilesDialog,
+        field: Entity<TextField>,
+        cx: &mut Context<Self>,
+    ) {
+        self.files_dialog = Some(dialog);
+        let view = cx.entity().downgrade();
+        field.update(cx, |text_field, _cx| {
+            text_field.on_submit(move |_text, _window, app| {
+                view.update(app, |view, cx| {
+                    view.submit_files_change(cx);
+                    // The field keeps its text: a refused name must stay visible beside
+                    // the reason it was refused.
+                    false
+                })
+                .unwrap_or(false)
+            });
+        });
+        cx.observe(&field, move |view, text_field, cx| {
+            let text = text_field.read(cx).text().to_owned();
+            if let Some(dialog) = view.files_dialog.as_mut() {
+                dialog.set_text(text);
+            }
+            cx.notify();
+        })
+        .detach();
+        let handle = field.read(cx).focus_handle().clone();
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
+        }
+        self.files_field = Some(field);
+        cx.notify();
+    }
+
+    /// Closes the question without sending anything at all (R11).
+    ///
+    /// Cancelling is not a request the server has to refuse: the target never left
+    /// this process, so there is nothing on the server to undo.
+    fn files_cancel_change(&mut self, cx: &mut Context<Self>) {
+        self.files_dialog = None;
+        self.files_field = None;
+        cx.notify();
+    }
+
+    /// Sends the change the question described, or says why it cannot be sent.
+    fn submit_files_change(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.files_dialog.clone() else {
+            return;
+        };
+        let sent = match &dialog {
+            FilesDialog::NewDirectory { session, text, .. } => {
+                self.files.create_directory(*session, text)
+            }
+            FilesDialog::Rename {
+                session,
+                from,
+                text,
+                ..
+            } => self.files.rename(*session, from, text),
+            FilesDialog::Delete { session, name, .. } => self.files.delete(*session, name),
+        };
+        match sent {
+            Ok(()) => {
+                // The question is answered: the report and the next listing say the rest.
+                self.files_dialog = None;
+                self.files_field = None;
+                self.watch_files(cx);
+            }
+            Err(problem) => {
+                // A name this process can refuse on its own never reaches the server,
+                // so the question stays open with the reason beside it.
+                if let Some(dialog) = self.files_dialog.as_mut() {
+                    dialog.fail(problem);
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -3810,6 +3999,9 @@ impl ShelluneView {
         let host = browser.host().to_owned();
         let target = browser.target().to_owned();
         let path = browser.path().map(str::to_owned);
+        // Whether a change is with the server decides what the panel says while the
+        // answer is missing; the question itself reads its target from the browser.
+        let changing = browser.is_changing();
         let state = browser.state().clone();
 
         let header = div()
@@ -3849,9 +4041,12 @@ impl ShelluneView {
                         metrics,
                     ))
                     .child(
+                        // The path wraps instead of being cut off: a deep path is the
+                        // one thing the user needs to be able to read here, and an
+                        // ellipsis in the middle of it names no directory at all.
                         div()
+                            .flex_1()
                             .min_w(px(0.0))
-                            .truncate()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
                             .debug_selector(|| "files.path".to_owned())
@@ -3881,6 +4076,13 @@ impl ShelluneView {
                 Tone::Accent,
                 cx,
                 move |view, cx| view.files_refresh(id, cx),
+            ))
+            .child(self.text_button(
+                SharedString::from("files.new"),
+                strings.files_new,
+                Tone::Neutral,
+                cx,
+                move |view, cx| view.files_new(id, cx),
             ))
             .child(self.text_button(
                 SharedString::from("files.close"),
@@ -3964,7 +4166,7 @@ impl ShelluneView {
             }
         };
 
-        div()
+        let mut panel = div()
             .id("files.panel")
             .debug_selector(|| "files.panel".to_owned())
             .flex()
@@ -3979,8 +4181,282 @@ impl ShelluneView {
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .child(header)
-            .child(toolbar)
-            .child(body)
+            .child(toolbar);
+        // The question while one is open, otherwise the fact that a change is with the
+        // server. Both sit above the list: they are about the entries, not a part of them.
+        if let Some(question) = self.files_question(id, cx) {
+            panel = panel.child(question);
+        } else if changing {
+            panel = panel.child(
+                div()
+                    .flex_none()
+                    .rounded(px(radius::SMALL))
+                    .p(metrics.scale(spacing::HAIRLINE))
+                    .bg(theme::swatch(palette::SURFACE))
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Warning.text())
+                    .debug_selector(|| "files.pending".to_owned())
+                    .child(SharedString::from(strings.files_change_pending)),
+            );
+        }
+        panel = panel.child(body);
+        // What the last change really did, item by item, stays under the list.
+        if let Some(report) = self.files_report(id) {
+            panel = panel.child(report);
+        }
+        panel
+    }
+
+    /// The question about a change, when one is being asked for this session (R11).
+    ///
+    /// Every variant names the exact object: the full path, and for a deletion also the
+    /// kind and whether its contents go with it. Nothing on it sends anything until the
+    /// confirming button is pressed.
+    fn files_question(&self, id: SessionId, cx: &mut Context<Self>) -> Option<Div> {
+        let dialog = self
+            .files_dialog
+            .as_ref()
+            .filter(|dialog| dialog.session() == id)?;
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let directory = self
+            .files
+            .browser(id)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned);
+        let danger = matches!(dialog, FilesDialog::Delete { .. });
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .p(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(if danger {
+                palette::DANGER
+            } else {
+                palette::BORDER
+            }))
+            .debug_selector(|| "files.question".to_owned());
+
+        let heading = match dialog {
+            FilesDialog::NewDirectory { .. } => strings.files_new,
+            FilesDialog::Rename { .. } => strings.files_rename,
+            FilesDialog::Delete { .. } => strings.files_delete,
+        };
+        card = card.child(
+            div()
+                .text_size(metrics.label_size())
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .debug_selector(|| "files.question.heading".to_owned())
+                .child(SharedString::from(heading)),
+        );
+
+        match dialog {
+            FilesDialog::NewDirectory { .. } | FilesDialog::Rename { .. } => {
+                // A new folder goes into the directory on screen, so that is the target;
+                // a rename is about an entry that is already there, so its full path is.
+                let target = match dialog {
+                    FilesDialog::Rename { from, .. } => directory
+                        .as_deref()
+                        .map_or_else(|| from.clone(), |directory| join_path(directory, from)),
+                    _ => directory.clone().unwrap_or_default(),
+                };
+                card = card.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .debug_selector(|| "files.question.target".to_owned())
+                        .child(SharedString::from(target)),
+                );
+                if let Some(field) = &self.files_field {
+                    card = card.child(
+                        div()
+                            .flex_none()
+                            .debug_selector(|| "files.question.input".to_owned())
+                            .child(field.clone()),
+                    );
+                }
+                if let Some(problem) = dialog.problem() {
+                    card = card.child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(Tone::Danger.text())
+                            .debug_selector(|| "files.question.problem".to_owned())
+                            .child(SharedString::from(problem_text(problem, strings))),
+                    );
+                }
+                let confirm = match dialog {
+                    FilesDialog::Rename { .. } => strings.files_rename_confirm,
+                    _ => strings.files_create,
+                };
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .child(self.text_button(
+                            SharedString::from("files.question.confirm"),
+                            confirm,
+                            Tone::Accent,
+                            cx,
+                            |view, cx| view.submit_files_change(cx),
+                        ))
+                        .child(self.text_button(
+                            SharedString::from("files.question.cancel"),
+                            strings.files_cancel,
+                            Tone::Neutral,
+                            cx,
+                            |view, cx| view.files_cancel_change(cx),
+                        )),
+                );
+            }
+            FilesDialog::Delete { name, kind, .. } => {
+                let target = directory
+                    .as_deref()
+                    .map(|directory| join_path(directory, name))
+                    .unwrap_or_else(|| name.clone());
+                card = card.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .debug_selector(|| "files.question.target".to_owned())
+                        .child(SharedString::from(format!(
+                            "{}: {target}",
+                            strings.files_target_label
+                        ))),
+                );
+                card = card.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .debug_selector(|| "files.question.kind".to_owned())
+                        .child(SharedString::from(format!(
+                            "{}: {}",
+                            strings.files_kind_label,
+                            kind_label(*kind, strings)
+                        ))),
+                );
+                card = card.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "files.question.note".to_owned())
+                        .child(SharedString::from(if kind.is_directory() {
+                            strings.files_delete_recursive
+                        } else {
+                            strings.files_delete_file
+                        })),
+                );
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .child(self.text_button(
+                            SharedString::from("files.question.confirm"),
+                            strings.files_delete_confirm,
+                            Tone::Danger,
+                            cx,
+                            |view, cx| view.submit_files_change(cx),
+                        ))
+                        .child(self.text_button(
+                            SharedString::from("files.question.cancel"),
+                            strings.files_cancel,
+                            Tone::Neutral,
+                            cx,
+                            |view, cx| view.files_cancel_change(cx),
+                        )),
+                );
+            }
+        }
+        Some(card)
+    }
+
+    /// What the last change really did, item by item (R11).
+    ///
+    /// A change that failed in part is not a success with a footnote: the heading says
+    /// so, and every path the server refused is listed with the reason it gave.
+    fn files_report(&self, id: SessionId) -> Option<Div> {
+        let outcome = self.files.outcome(id)?;
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let done = outcome.succeeded();
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(metrics.scale(1.0))
+            .p(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(if done {
+                palette::BORDER
+            } else {
+                palette::DANGER
+            }))
+            .debug_selector(|| "files.report".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.label_size())
+                    .text_color(if done {
+                        Tone::Positive.text()
+                    } else {
+                        Tone::Danger.text()
+                    })
+                    .debug_selector(|| "files.report.heading".to_owned())
+                    .child(SharedString::from(if done {
+                        strings.files_change_done
+                    } else {
+                        strings.files_change_failed
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "files.report.count".to_owned())
+                    .child(SharedString::from(format!(
+                        "{} {}/{}",
+                        strings.files_change_changed,
+                        outcome.changed(),
+                        outcome.steps().len()
+                    ))),
+            );
+        for (index, step) in outcome.steps().iter().take(FILES_REPORT_STEPS).enumerate() {
+            let selector = format!("files.report.step.{index}");
+            let line = match step.failure() {
+                Some(failure) => format!("{} · {failure}", step.path()),
+                None => format!(
+                    "{} · {}",
+                    step.path(),
+                    step.kind()
+                        .map_or(strings.files_change_changed, |kind| kind_label(
+                            kind, strings
+                        ))
+                ),
+            };
+            card = card.child(
+                div()
+                    .min_w(px(0.0))
+                    .text_size(metrics.caption_size())
+                    .text_color(if step.failure().is_some() {
+                        Tone::Danger.text()
+                    } else {
+                        theme::swatch(palette::TEXT_SECONDARY)
+                    })
+                    .debug_selector(move || selector.clone())
+                    .child(SharedString::from(line)),
+            );
+        }
+        Some(card)
     }
 
     /// The row that leads to the parent directory.
@@ -4008,7 +4484,12 @@ impl ShelluneView {
             )))
     }
 
-    /// One entry of the listing.
+    /// One entry of the listing: what it is, and the two changes it allows (R11).
+    ///
+    /// The row is two lines because the entry keeps its own click - opening a
+    /// directory is not a change - while rename and delete are about the entry rather
+    /// than about opening it. Each button names its target when it is pressed, so a
+    /// narrow panel never leaves it unclear which row a question is about.
     fn files_row(
         &self,
         id: SessionId,
@@ -4017,24 +4498,26 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let metrics = self.metrics();
-        let label = kind_label(entry.kind(), self.strings());
+        let strings = self.strings();
+        let label = kind_label(entry.kind(), strings);
         let name = entry.name();
         let size = entry.size();
+        let kind = entry.kind();
         let openable = entry.is_directory();
         let owned = name.to_owned();
+        let rename = name.to_owned();
+        let delete = name.to_owned();
         let name_selector = format!("files.name.{index}");
-        let row = div()
+        let mut entry_row = div()
             .id(("files.entry", index))
             .debug_selector(move || format!("files.entry.{index}"))
             .flex()
             .items_center()
             .justify_between()
-            .flex_none()
             .gap(metrics.scale(spacing::TIGHT))
             .px(metrics.scale(spacing::HAIRLINE))
             .py(metrics.scale(2.0))
             .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE))
             .text_size(metrics.caption_size())
             .child(
                 div()
@@ -4058,18 +4541,45 @@ impl ShelluneView {
                     })),
             );
         if openable {
-            row.cursor_pointer()
-                .on_click(cx.listener(move |view, _event, _window, cx| {
+            entry_row = entry_row.cursor_pointer().on_click(cx.listener(
+                move |view, _event, _window, cx| {
                     view.files_enter(id, &owned, cx);
-                }))
-        } else {
-            row
+                },
+            ));
         }
+        div()
+            .id(("files.row", index))
+            .debug_selector(move || format!("files.row.{index}"))
+            .flex()
+            .flex_col()
+            .flex_none()
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE))
+            .child(entry_row)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .px(metrics.scale(spacing::HAIRLINE))
+                    .pb(metrics.scale(1.0))
+                    .child(self.text_button(
+                        SharedString::from(format!("files.rename.{index}")),
+                        strings.files_rename,
+                        Tone::Neutral,
+                        cx,
+                        move |view, cx| view.files_ask_rename(id, &rename, cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("files.delete.{index}")),
+                        strings.files_delete,
+                        Tone::Danger,
+                        cx,
+                        move |view, cx| view.files_ask_delete(id, &delete, kind, cx),
+                    )),
+            )
     }
-
-    /// Records that a session can browse, with answers a test supplies (R9).
-    ///
-    /// A scripted session has no server, so its connection cannot be browsed; the
     /// tests that check what the window does with a listing therefore attach their
     /// own channel here.
     #[cfg(test)]
@@ -4097,10 +4607,28 @@ impl ShelluneView {
         self.files.is_open(id)
     }
 
+    /// Whether a session's connection can still be browsed, for a test.
+    #[cfg(test)]
+    pub fn files_can_browse(&self, id: SessionId) -> bool {
+        self.files.can_browse(id)
+    }
+
     /// Applies what the file views reported, for a test that cannot wait for a timer.
     #[cfg(test)]
     pub(crate) fn pump_files_for_test(&mut self, cx: &mut Context<Self>) -> bool {
         self.pump_files(cx)
+    }
+
+    /// Whether the file view is asking about a change, for a test.
+    #[cfg(test)]
+    pub fn files_question_open(&self) -> bool {
+        self.files_dialog.is_some()
+    }
+
+    /// The text the open change question carries, for a test.
+    #[cfg(test)]
+    pub fn files_question_text(&self) -> Option<&str> {
+        self.files_dialog.as_ref().and_then(FilesDialog::text)
     }
 
     /// Why a session ended, and what the user can do about it (R12).

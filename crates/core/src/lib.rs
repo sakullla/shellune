@@ -26,7 +26,8 @@ pub use auth::{AuthMethod, AuthMethodKind};
 pub use error::{AgentKind, SecretString, SecurityError};
 pub use files::{
     BrowseFailure, BrowseRequest, BrowseResponse, BrowseState, DirEntry, DirectoryListing,
-    FileBrowser, FileKind, is_single_name, join_path, normalize_path, parent_path,
+    FileBrowser, FileKind, MutationAction, MutationOutcome, MutationStep, NameProblem, check_name,
+    is_single_name, join_path, normalize_path, parent_path,
 };
 pub use fingerprint::sha256_fingerprint;
 pub use host::{DEFAULT_SSH_PORT, HostConfig, HostValidationError, Port};

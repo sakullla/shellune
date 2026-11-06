@@ -22,6 +22,7 @@ use russh_sftp::client::{Config, SftpSession};
 use russh_sftp::protocol::{FileType, StatusCode};
 use shellune_core::{
     BrowseFailure, BrowseRequest, BrowseResponse, DirEntry, DirectoryListing, FileKind,
+    MutationAction, MutationOutcome, MutationStep, is_single_name, join_path,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -155,32 +156,63 @@ pub(crate) async fn serve(wiring: Wiring, commands: UnboundedSender<Command>) {
     }
 }
 
+/// What one answered request produced.
+enum Answer {
+    /// A directory was read.
+    Listed(DirectoryListing),
+    /// A change was attempted and reported path by path.
+    Changed(MutationOutcome),
+}
+
 /// Answers one request, opening the SFTP session on first use.
+///
+/// A change and a listing differ in one respect that matters here: a listing
+/// answers with one failure, while a change answers with a report - every path it
+/// reached and every reason the server gave for the ones it did not. That is why a
+/// failed delete of a non-empty directory is still an answer: the view must be able
+/// to say which items went and which stayed.
 async fn answer(
     session: &mut Option<SftpSession>,
     commands: &UnboundedSender<Command>,
     request: BrowseRequest,
 ) -> Result<BrowseResponse, BrowseFailure> {
     let number = request.request();
-    let requested = request.path().map(str::to_owned);
-
-    let outcome = {
-        let sftp = open_session(session, commands).await?;
-        match requested {
-            Some(path) => read_directory(sftp, path).await,
+    let result = match request {
+        BrowseRequest::Home { .. } => {
+            let sftp = open_session(session, commands).await?;
             // The login directory is asked of the server rather than guessed from
             // the user name: only the server knows where the account starts.
-            None => match canonicalize(sftp, ".").await {
-                Ok(home) => read_directory(sftp, home).await,
+            match canonicalize(sftp, ".").await {
+                Ok(home) => read_directory(sftp, home).await.map(Answer::Listed),
                 Err(failure) => Err(failure),
-            },
+            }
+        }
+        BrowseRequest::List { path, .. } => {
+            let sftp = open_session(session, commands).await?;
+            read_directory(sftp, path).await.map(Answer::Listed)
+        }
+        BrowseRequest::CreateDirectory {
+            directory, name, ..
+        } => {
+            let sftp = open_session(session, commands).await?;
+            Ok(Answer::Changed(
+                create_directory(sftp, &directory, &name).await,
+            ))
+        }
+        BrowseRequest::Rename { from, to, .. } => {
+            let sftp = open_session(session, commands).await?;
+            Ok(Answer::Changed(rename(sftp, from, to).await))
+        }
+        BrowseRequest::Delete { path, kind, .. } => {
+            let sftp = open_session(session, commands).await?;
+            Ok(Answer::Changed(delete(sftp, path, kind).await))
         }
     };
 
     // A session that could not be spoken to is dropped, so the next request opens a
     // fresh channel instead of repeating the same dead one. A refusal about the path
     // keeps the session: the connection is fine, the directory is not.
-    if outcome
+    if result
         .as_ref()
         .err()
         .is_some_and(BrowseFailure::is_connection_lost)
@@ -188,15 +220,199 @@ async fn answer(
         *session = None;
     }
 
-    let listing = outcome?;
-    Ok(BrowseResponse::Listed {
-        request: number,
-        path: listing.path().to_owned(),
-        entries: listing.entries().to_vec(),
-    })
+    match result? {
+        Answer::Listed(listing) => Ok(BrowseResponse::Listed {
+            request: number,
+            path: listing.path().to_owned(),
+            entries: listing.entries().to_vec(),
+        }),
+        Answer::Changed(outcome) => Ok(BrowseResponse::Changed {
+            request: number,
+            outcome,
+        }),
+    }
 }
 
-/// The SFTP session of this connection, opened on first use.
+/// Creates one directory, reporting a name that is already taken as exactly that.
+///
+/// The existence of the target is asked of the server before the create, because the
+/// SFTP failure code for "already there" is the same generic failure as every other
+/// refusal: without the check the user would read "Failure" and not know that the
+/// name was the problem.
+async fn create_directory(session: &SftpSession, directory: &str, name: &str) -> MutationOutcome {
+    let path = join_path(directory, name);
+    let action = MutationAction::CreateDirectory { path: path.clone() };
+    let target_kind = Some(FileKind::Directory);
+    match session.try_exists(&path).await {
+        Ok(true) => {
+            return MutationOutcome::refused(
+                action,
+                BrowseFailure::AlreadyExists { path: path.clone() },
+            );
+        }
+        Ok(false) => {}
+        Err(error) => return MutationOutcome::refused(action, describe(&error, &path)),
+    }
+    match session.create_dir(&path).await {
+        Ok(()) => MutationOutcome::new(action, vec![MutationStep::done(path, target_kind)]),
+        Err(error) => MutationOutcome::refused(action, describe(&error, &path)),
+    }
+}
+
+/// Renames one entry inside its own directory.
+///
+/// The new name must be free: a rename onto an existing entry would silently replace
+/// it, which is a deletion nobody asked for. The answer names the path that now
+/// exists, so a report reads as the directory's new state.
+async fn rename(session: &SftpSession, from: String, to: String) -> MutationOutcome {
+    let action = MutationAction::Rename {
+        from: from.clone(),
+        to: to.clone(),
+    };
+    if let Err(error) = session.symlink_metadata(&from).await {
+        return MutationOutcome::refused(action, describe(&error, &from));
+    }
+    match session.try_exists(&to).await {
+        Ok(true) => {
+            return MutationOutcome::refused(
+                action,
+                BrowseFailure::AlreadyExists { path: to.clone() },
+            );
+        }
+        Ok(false) => {}
+        Err(error) => return MutationOutcome::refused(action, describe(&error, &to)),
+    }
+    match session.rename(&from, &to).await {
+        Ok(()) => MutationOutcome::new(action, vec![MutationStep::done(to, None)]),
+        Err(error) => MutationOutcome::refused(action, describe(&error, &to)),
+    }
+}
+
+/// Deletes one entry, and everything inside it when it is a directory.
+///
+/// SFTP has no recursive delete, so the tree is walked first and then removed from
+/// the leaves up: a directory is only removed once the paths below it are gone, which
+/// is the only order the server accepts. Every step is reported, so a delete that
+/// partly happened is visible as the partial result it is.
+async fn delete(session: &SftpSession, path: String, kind: FileKind) -> MutationOutcome {
+    let action = MutationAction::Delete {
+        path: path.clone(),
+        kind,
+    };
+    let (order, mut steps) = removal_order(session, path, kind).await;
+    for (path, kind) in order.into_iter().rev() {
+        if steps
+            .iter()
+            .any(|step| !step.is_done() && step.path() == path)
+        {
+            // The walk already reported this path: a second reason about the same path
+            // would read as two different problems.
+            continue;
+        }
+        if kind.is_directory() && has_failed_below(&steps, &path) {
+            // Removing it now could only produce "directory not empty", which would
+            // point at the wrong path: the real reason is already in the report.
+            steps.push(MutationStep::failed(
+                path,
+                Some(kind),
+                BrowseFailure::Refused {
+                    reason: "an item inside this directory was not deleted, so the directory was left in place"
+                        .to_owned(),
+                },
+            ));
+            continue;
+        }
+        let outcome = if kind.is_directory() {
+            session.remove_dir(&path).await
+        } else {
+            session.remove_file(&path).await
+        };
+        match outcome {
+            Ok(()) => steps.push(MutationStep::done(path, Some(kind))),
+            Err(error) => steps.push(MutationStep::failed(
+                path.clone(),
+                Some(kind),
+                describe(&error, &path),
+            )),
+        }
+    }
+    MutationOutcome::new(action, steps)
+}
+
+/// Every path under one entry, parents before their contents.
+///
+/// The walk also reports what it could not read: a directory whose listing is
+/// refused stops the walk at that directory instead of inventing its contents. What
+/// it returns is the removal order reversed by the caller, and the failures it found
+/// on the way.
+async fn removal_order(
+    session: &SftpSession,
+    root: String,
+    kind: FileKind,
+) -> (Vec<(String, FileKind)>, Vec<MutationStep>) {
+    let mut order: Vec<(String, FileKind)> = Vec::new();
+    let mut steps: Vec<MutationStep> = Vec::new();
+    let mut pending: Vec<(String, Option<FileKind>)> = vec![(root, Some(kind))];
+    while let Some((path, known)) = pending.pop() {
+        let kind = match known {
+            Some(kind) => kind,
+            None => match session.symlink_metadata(&path).await {
+                Ok(metadata) => kind_of(&metadata),
+                Err(error) => {
+                    steps.push(MutationStep::failed(
+                        path.clone(),
+                        None,
+                        describe(&error, &path),
+                    ));
+                    continue;
+                }
+            },
+        };
+        if !kind.is_directory() {
+            order.push((path, kind));
+            continue;
+        }
+        match session.read_dir(&path).await {
+            Ok(children) => {
+                order.push((path.clone(), kind));
+                for child in children {
+                    let name = child.file_name();
+                    // "." and ".." are the walk's own navigation, not entries.
+                    if !is_single_name(&name) {
+                        continue;
+                    }
+                    pending.push((join_path(&path, &name), Some(kind_of(&child.metadata()))));
+                }
+            }
+            Err(error) => steps.push(MutationStep::failed(
+                path.clone(),
+                Some(kind),
+                describe(&error, &path),
+            )),
+        }
+    }
+    (order, steps)
+}
+
+/// Whether a path below this directory was already reported as unchanged.
+fn has_failed_below(steps: &[MutationStep], directory: &str) -> bool {
+    let prefix = format!("{directory}/");
+    steps
+        .iter()
+        .any(|step| !step.is_done() && step.path().starts_with(&prefix))
+}
+
+/// What one metadata record says an entry is.
+fn kind_of(metadata: &russh_sftp::client::fs::Metadata) -> FileKind {
+    match metadata.file_type() {
+        FileType::Dir => FileKind::Directory,
+        FileType::File => FileKind::File,
+        FileType::Symlink => FileKind::Symlink,
+        FileType::Other => FileKind::Other,
+    }
+}
+
+/// The SFTP session of this connection, opened on first use./// The SFTP session of this connection, opened on first use.
 async fn open_session<'a>(
     slot: &'a mut Option<SftpSession>,
     commands: &UnboundedSender<Command>,
@@ -257,12 +473,7 @@ async fn read_directory(
             .filter_map(|entry| {
                 let name = entry.file_name();
                 let metadata = entry.metadata();
-                let kind = match metadata.file_type() {
-                    FileType::Dir => FileKind::Directory,
-                    FileType::File => FileKind::File,
-                    FileType::Symlink => FileKind::Symlink,
-                    FileType::Other => FileKind::Other,
-                };
+                let kind = kind_of(&metadata);
                 let size = match kind {
                     FileKind::Directory => None,
                     _ => metadata.size,
@@ -366,6 +577,37 @@ mod tests {
         let failure = describe(&SftpError::IO("channel closed".to_owned()), "/home");
         assert!(failure.is_connection_lost());
         assert!(!failure.to_string().is_empty());
+    }
+
+    #[test]
+    fn a_directory_is_left_in_place_when_something_inside_it_was_refused() {
+        let steps = vec![
+            MutationStep::done("/home/deploy/tree/a.txt", Some(FileKind::File)),
+            MutationStep::failed(
+                "/home/deploy/tree/sub/locked.txt",
+                Some(FileKind::File),
+                BrowseFailure::PermissionDenied {
+                    path: "/home/deploy/tree/sub/locked.txt".to_owned(),
+                },
+            ),
+        ];
+        assert!(
+            has_failed_below(&steps, "/home/deploy/tree"),
+            "a refused item below stops the directory from being removed"
+        );
+        assert!(has_failed_below(&steps, "/home/deploy/tree/sub"));
+        assert!(
+            !has_failed_below(&steps, "/home/deploy/tree/sub/locked.txt"),
+            "an item is not below itself"
+        );
+        assert!(
+            !has_failed_below(&steps, "/home/deploy/tre"),
+            "a prefix of a name is not a parent directory"
+        );
+        assert!(
+            !has_failed_below(&steps[..1], "/home/deploy/tree"),
+            "items that were removed do not stop anything"
+        );
     }
 
     #[test]

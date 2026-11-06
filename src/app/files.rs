@@ -1,4 +1,5 @@
-//! The file view of a remote session: what is open, where it is and what arrived (R9).
+//! The file view of a remote session: what is open, where it is and what arrived
+//! (R9), and the changes it asks for (R11).
 //!
 //! The state machine that decides what a directory listing may say lives in
 //! shellune-core, because it has to be testable without a window. What lives here is
@@ -14,11 +15,17 @@
 //! The view asks for entries only after a real answer: pump() applies what came back
 //! and reports whether anything changed, and a request that could not even be
 //! delivered is turned into a connection failure for that one view.
+//!
+//! A change is asked for the same way, but it is answered differently: the answer is a
+//! report of every path the server reached, and the directory is listed again after it.
+//! The report says what happened; only the next listing says what the directory holds
+//! now, which is why the two are never mixed into one statement.
 
 use std::collections::HashMap;
 
 use shellune_core::{
-    BrowseFailure, BrowseRequest, BrowseResponse, FileBrowser, FileKind, SessionId,
+    BrowseFailure, BrowseRequest, BrowseResponse, FileBrowser, FileKind, MutationOutcome,
+    NameProblem, SessionId,
 };
 use shellune_ssh::FileLink;
 
@@ -115,6 +122,12 @@ impl FileViews {
         self.sessions.get(&session)?.browser.as_ref()
     }
 
+    /// What the last change in this view really did, when one was attempted.
+    #[must_use]
+    pub fn outcome(&self, session: SessionId) -> Option<&MutationOutcome> {
+        self.browser(session)?.last_outcome()
+    }
+
     /// Opens the file view of a session at the login directory.
     ///
     /// Opening is the only place that starts a browser, so a session that was never
@@ -139,9 +152,15 @@ impl FileViews {
         }
     }
 
-    /// Forgets a session entirely, which is what closing it does.
-    pub fn detach(&mut self, session: SessionId) {
+    /// Forgets a session entirely, which is what a closed connection does.
+    ///
+    /// The connection ends with the session, so the view of it ends too: a listing
+    /// that nothing backs would keep showing files the user cannot reach, and it would
+    /// keep the poll timer alive for a server that is no longer there.
+    pub fn detach(&mut self, session: SessionId) -> bool {
+        let had_view = self.is_open(session);
         self.sessions.remove(&session);
+        had_view
     }
 
     /// Asks for the parent of the directory shown.
@@ -159,18 +178,76 @@ impl FileViews {
         self.ask_from(session, |browser| browser.open(name))
     }
 
+    /// Asks for a new directory called name inside the directory on screen.
+    ///
+    /// A name the browser refuses produces the reason and sends nothing: an invalid
+    /// name or a collision is a fact about the listing on screen, so it is answered
+    /// before the server is involved.
+    pub fn create_directory(&mut self, session: SessionId, name: &str) -> Result<(), NameProblem> {
+        self.mutate(session, |browser| browser.create_directory(name))
+    }
+
+    /// Asks to rename one entry of the directory on screen.
+    pub fn rename(&mut self, session: SessionId, from: &str, to: &str) -> Result<(), NameProblem> {
+        self.mutate(session, |browser| browser.rename(from, to))
+    }
+
+    /// Asks to delete one entry of the directory on screen.
+    pub fn delete(&mut self, session: SessionId, name: &str) -> Result<(), NameProblem> {
+        self.mutate(session, |browser| browser.delete(name))
+    }
+
+    /// Runs one change of the browser and delivers it.
+    fn mutate(
+        &mut self,
+        session: SessionId,
+        ask: impl FnOnce(&mut FileBrowser) -> Result<BrowseRequest, NameProblem>,
+    ) -> Result<(), NameProblem> {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return Err(NameProblem::NoDirectory);
+        };
+        let Some(browser) = files.browser.as_mut() else {
+            return Err(NameProblem::NoDirectory);
+        };
+        let request = ask(browser)?;
+        Self::ask(files, request);
+        Ok(())
+    }
+
     /// Applies every answer that arrived, returning whether anything changed.
+    ///
+    /// A change is answered only by the server's own next listing: once the report is
+    /// in, the directory is listed again, so what stays on screen is what the server
+    /// really holds now and not what the change hoped for.
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
         for files in self.sessions.values_mut() {
-            let Some(browser) = files.browser.as_mut() else {
+            let responses = files.channel.drain();
+            if files.browser.is_none() {
                 continue;
-            };
-            for response in files.channel.drain() {
-                // An answer that does not belong to the request this browser is
-                // waiting for is dropped by the browser itself.
-                if browser.apply(response) {
-                    changed = true;
+            }
+            for response in responses {
+                let is_change = response.outcome().is_some();
+                let applied = {
+                    let Some(browser) = files.browser.as_mut() else {
+                        break;
+                    };
+                    // An answer that does not belong to the request this browser is
+                    // waiting for is dropped by the browser itself.
+                    browser.apply(response)
+                };
+                if !applied {
+                    continue;
+                }
+                changed = true;
+                if is_change {
+                    let refreshed = {
+                        let Some(browser) = files.browser.as_mut() else {
+                            break;
+                        };
+                        browser.refresh()
+                    };
+                    Self::ask(files, refreshed);
                 }
             }
         }
@@ -215,6 +292,115 @@ impl FileViews {
         false
     }
 }
+/// The question the file view is asking before anything is sent (R11).
+///
+/// A change to a server is asked for twice: once in the dialog, where the user sees
+/// the exact target, the kind and - for a directory - that its contents go too, and
+/// once when the answer arrives. Nothing is sent while this exists, so cancelling is
+/// never a request the server has to ignore.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilesDialog {
+    /// A new directory is named but not created.
+    NewDirectory {
+        /// The session whose directory it would go into.
+        session: SessionId,
+        /// What the user typed.
+        text: String,
+        /// Why the last attempt to send it was refused, when it was.
+        problem: Option<NameProblem>,
+    },
+    /// One entry is being renamed.
+    Rename {
+        /// The session whose directory holds the entry.
+        session: SessionId,
+        /// The entry as the listing named it.
+        from: String,
+        /// The name the user typed.
+        text: String,
+        /// Why the last attempt to send it was refused, when it was.
+        problem: Option<NameProblem>,
+    },
+    /// One entry is being deleted, with everything inside it.
+    Delete {
+        /// The session whose directory holds the entry.
+        session: SessionId,
+        /// The entry as the listing named it.
+        name: String,
+        /// What the entry is, as the listing reported it.
+        kind: FileKind,
+    },
+}
+
+impl FilesDialog {
+    /// The session this question belongs to.
+    #[must_use]
+    pub fn session(&self) -> SessionId {
+        match self {
+            Self::NewDirectory { session, .. }
+            | Self::Rename { session, .. }
+            | Self::Delete { session, .. } => *session,
+        }
+    }
+
+    /// The text the user is typing, when the question has a field.
+    #[cfg(test)]
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::NewDirectory { text, .. } | Self::Rename { text, .. } => Some(text),
+            Self::Delete { .. } => None,
+        }
+    }
+
+    /// Replaces the typed text and forgets the previous refusal.
+    pub fn set_text(&mut self, typed: String) {
+        match self {
+            Self::NewDirectory { text, problem, .. } | Self::Rename { text, problem, .. } => {
+                *text = typed;
+                *problem = None;
+            }
+            Self::Delete { .. } => {}
+        }
+    }
+
+    /// States why the text cannot be sent, keeping the text in front of the user.
+    pub fn fail(&mut self, failure: NameProblem) {
+        match self {
+            Self::NewDirectory { problem, .. } | Self::Rename { problem, .. } => {
+                *problem = Some(failure);
+            }
+            // A deletion has no text to correct; a refusal about it is answered by the
+            // browser instead of by this question.
+            Self::Delete { .. } => {}
+        }
+    }
+
+    /// Why the text cannot be sent, when it cannot.
+    #[must_use]
+    pub fn problem(&self) -> Option<&NameProblem> {
+        match self {
+            Self::NewDirectory { problem, .. } | Self::Rename { problem, .. } => problem.as_ref(),
+            Self::Delete { .. } => None,
+        }
+    }
+}
+
+/// What the view says about a name it refused, in the current language.
+///
+/// The domain names the reason; only the words come from here, because a reason the
+/// user cannot read is the same as no reason at all.
+#[must_use]
+pub fn problem_text(problem: &NameProblem, strings: &Strings) -> &'static str {
+    match problem {
+        NameProblem::NoDirectory => strings.files_problem_no_directory,
+        NameProblem::Empty => strings.files_problem_empty,
+        NameProblem::Navigation => strings.files_problem_navigation,
+        NameProblem::Separator => strings.files_problem_separator,
+        NameProblem::Taken => strings.files_problem_taken,
+        NameProblem::Missing => strings.files_problem_missing,
+        NameProblem::Unchanged => strings.files_problem_unchanged,
+    }
+}
 
 /// What the view prints for one kind of entry, in the current language.
 #[must_use]
@@ -232,47 +418,73 @@ mod tests {
     use super::*;
     use shellune_core::DirEntry;
 
-    /// A channel that records requests and answers the ones a test chooses.
+    /// What a scripted connection holds.
     #[derive(Default)]
-    struct FakeChannel {
+    struct FakeScript {
         sent: Vec<BrowseRequest>,
         answers: Vec<BrowseResponse>,
         accepting: bool,
     }
 
+    /// A channel that records requests and answers the ones a test chooses.
+    ///
+    /// The handle is shared with the test, because an answer to a change arrives after
+    /// the view exists: what the view does with it is the behaviour under test.
+    #[derive(Clone, Default)]
+    struct FakeChannel(std::sync::Arc<std::sync::Mutex<FakeScript>>);
+
     impl FakeChannel {
         fn accepting() -> Self {
-            Self {
-                sent: Vec::new(),
-                answers: Vec::new(),
-                accepting: true,
-            }
+            let channel = Self::default();
+            channel.0.lock().expect("a free lock").accepting = true;
+            channel
         }
 
-        fn reply(&mut self, request: u64, path: &str, names: &[(&str, FileKind)]) {
+        fn closed() -> Self {
+            Self::default()
+        }
+
+        fn reply(&self, request: u64, path: &str, names: &[(&str, FileKind)]) {
             let entries = names
                 .iter()
                 .filter_map(|(name, kind)| DirEntry::new(*name, *kind, None))
                 .collect();
-            self.answers.push(BrowseResponse::Listed {
-                request,
-                path: path.to_owned(),
-                entries,
-            });
+            self.0
+                .lock()
+                .expect("a free lock")
+                .answers
+                .push(BrowseResponse::Listed {
+                    request,
+                    path: path.to_owned(),
+                    entries,
+                });
+        }
+
+        fn changed(&self, request: u64, outcome: MutationOutcome) {
+            self.0
+                .lock()
+                .expect("a free lock")
+                .answers
+                .push(BrowseResponse::Changed { request, outcome });
+        }
+
+        fn requests(&self) -> Vec<BrowseRequest> {
+            self.0.lock().expect("a free lock").sent.clone()
         }
     }
 
     impl BrowseChannel for FakeChannel {
         fn send(&mut self, request: BrowseRequest) -> bool {
-            if !self.accepting {
+            let mut script = self.0.lock().expect("a free lock");
+            if !script.accepting {
                 return false;
             }
-            self.sent.push(request);
+            script.sent.push(request);
             true
         }
 
         fn drain(&mut self) -> Vec<BrowseResponse> {
-            std::mem::take(&mut self.answers)
+            std::mem::take(&mut self.0.lock().expect("a free lock").answers)
         }
     }
 
@@ -320,7 +532,7 @@ mod tests {
     #[test]
     fn a_listing_answer_becomes_visible_only_after_a_pump() {
         let session = SessionId::new();
-        let mut channel = FakeChannel::accepting();
+        let channel = FakeChannel::accepting();
         channel.reply(1, "/home/deploy", &[("docs", FileKind::Directory)]);
         let mut views = FileViews::new();
         views.attach(session, "web", "deploy@10.0.0.7:22", Box::new(channel));
@@ -337,9 +549,8 @@ mod tests {
     #[test]
     fn a_connection_that_cannot_take_the_request_says_so_at_once() {
         let session = SessionId::new();
-        let mut channel = FakeChannel::accepting();
-        channel.accepting = false;
-        let mut views = views(session, channel);
+        let views_channel = FakeChannel::closed();
+        let mut views = views(session, views_channel);
         views.open(session);
         let browser = views.browser(session).expect("open");
         assert!(
@@ -356,9 +567,9 @@ mod tests {
     fn one_session_never_shows_another_sessions_listing() {
         let first = SessionId::new();
         let second = SessionId::new();
-        let mut first_channel = FakeChannel::accepting();
+        let first_channel = FakeChannel::accepting();
         first_channel.reply(1, "/home/deploy/one", &[("one.txt", FileKind::File)]);
-        let mut second_channel = FakeChannel::accepting();
+        let second_channel = FakeChannel::accepting();
         second_channel.reply(1, "/home/other/two", &[("two.txt", FileKind::File)]);
 
         let mut views = FileViews::new();
@@ -389,7 +600,7 @@ mod tests {
     #[test]
     fn navigation_from_a_real_listing_asks_the_right_path() {
         let session = SessionId::new();
-        let mut channel = FakeChannel::accepting();
+        let channel = FakeChannel::accepting();
         channel.reply(
             1,
             "/home/deploy",
@@ -409,5 +620,208 @@ mod tests {
         let browser = views.browser(session).expect("open");
         assert!(browser.state().is_loading());
         assert_eq!(browser.path(), Some("/home/deploy/文档 与 空格"));
+    }
+
+    /// Opens one view whose directory is already listed by the server.
+    fn listed_view(channel: &FakeChannel) {
+        channel.reply(
+            1,
+            "/home/deploy",
+            &[("docs", FileKind::Directory), ("notes.txt", FileKind::File)],
+        );
+    }
+
+    #[test]
+    fn a_change_needs_a_listing_and_is_followed_by_the_servers_next_listing() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        listed_view(&channel);
+        let mut views = FileViews::new();
+        views.attach(
+            session,
+            "web",
+            "deploy@10.0.0.7:22",
+            Box::new(channel.clone()),
+        );
+        views.open(session);
+        assert_eq!(
+            views.create_directory(session, "logs"),
+            Err(NameProblem::NoDirectory),
+            "no directory was listed yet, so there is nowhere to create one"
+        );
+        views.pump();
+
+        assert_eq!(views.create_directory(session, "日志"), Ok(()));
+        let requests = channel.requests();
+        assert_eq!(
+            requests.last(),
+            Some(&BrowseRequest::CreateDirectory {
+                request: 2,
+                directory: "/home/deploy".to_owned(),
+                name: "日志".to_owned(),
+            }),
+            "the change names the directory on screen and the exact new name: {requests:?}"
+        );
+        assert!(
+            views.browser(session).is_some_and(FileBrowser::is_changing),
+            "the view knows a change is with the server"
+        );
+        assert!(
+            views
+                .browser(session)
+                .is_some_and(|browser| browser.state().listing().is_some()),
+            "the entries stay on screen while the change is in flight"
+        );
+
+        let outcome = MutationOutcome::new(
+            shellune_core::MutationAction::CreateDirectory {
+                path: "/home/deploy/日志".to_owned(),
+            },
+            vec![shellune_core::MutationStep::done(
+                "/home/deploy/日志",
+                Some(FileKind::Directory),
+            )],
+        );
+        channel.changed(2, outcome.clone());
+        assert!(views.pump(), "the report arrived");
+        assert_eq!(views.outcome(session), Some(&outcome));
+        assert!(
+            !views.browser(session).is_some_and(FileBrowser::is_changing),
+            "the change is answered"
+        );
+        let requests = channel.requests();
+        assert_eq!(
+            requests.last(),
+            Some(&BrowseRequest::List {
+                request: 3,
+                path: "/home/deploy".to_owned(),
+            }),
+            "the directory is read again instead of being assumed: {requests:?}"
+        );
+
+        channel.reply(
+            3,
+            "/home/deploy",
+            &[
+                ("docs", FileKind::Directory),
+                ("日志", FileKind::Directory),
+                ("notes.txt", FileKind::File),
+            ],
+        );
+        views.pump();
+        let names: Vec<String> = views
+            .browser(session)
+            .and_then(|browser| browser.state().listing())
+            .map(|listing| {
+                listing
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name().to_owned())
+                    .collect()
+            })
+            .expect("a listing is shown");
+        assert_eq!(
+            names,
+            vec!["docs".to_owned(), "日志".to_owned(), "notes.txt".to_owned()],
+            "the list after the change is the server's own answer"
+        );
+    }
+
+    #[test]
+    fn a_name_the_listing_refuses_is_answered_without_a_request() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        listed_view(&channel);
+        let mut views = FileViews::new();
+        views.attach(
+            session,
+            "web",
+            "deploy@10.0.0.7:22",
+            Box::new(channel.clone()),
+        );
+        views.open(session);
+        views.pump();
+        let sent = channel.requests().len();
+
+        assert_eq!(
+            views.delete(session, "not-listed"),
+            Err(NameProblem::Missing)
+        );
+        assert_eq!(
+            views.rename(session, "docs", "docs"),
+            Err(NameProblem::Unchanged)
+        );
+        assert_eq!(
+            views.rename(session, "docs", "notes.txt"),
+            Err(NameProblem::Taken)
+        );
+        assert_eq!(
+            channel.requests().len(),
+            sent,
+            "a name the listing already answers never reaches the server"
+        );
+    }
+
+    #[test]
+    fn a_delete_is_asked_for_with_the_kind_the_listing_reported() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        listed_view(&channel);
+        let mut views = FileViews::new();
+        views.attach(
+            session,
+            "web",
+            "deploy@10.0.0.7:22",
+            Box::new(channel.clone()),
+        );
+        views.open(session);
+        views.pump();
+
+        assert_eq!(views.delete(session, "docs"), Ok(()));
+        assert_eq!(
+            channel.requests().last(),
+            Some(&BrowseRequest::Delete {
+                request: 2,
+                path: "/home/deploy/docs".to_owned(),
+                kind: FileKind::Directory,
+            }),
+            "the confirmation and the request name the same object"
+        );
+        assert_eq!(views.rename(session, "notes.txt", "说明.txt"), Ok(()));
+        assert_eq!(
+            channel.requests().last(),
+            Some(&BrowseRequest::Rename {
+                request: 3,
+                from: "/home/deploy/notes.txt".to_owned(),
+                to: "/home/deploy/说明.txt".to_owned(),
+            }),
+            "a rename keeps the entry in its own directory"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_session_takes_its_view_and_its_answers_with_it() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        listed_view(&channel);
+        let mut views = FileViews::new();
+        views.attach(
+            session,
+            "web",
+            "deploy@10.0.0.7:22",
+            Box::new(channel.clone()),
+        );
+        views.open(session);
+        views.pump();
+        assert!(views.is_open(session));
+
+        assert!(views.detach(session), "the open view is reported as gone");
+        assert!(!views.is_open(session), "no path survives the connection");
+        assert!(!views.any_open(), "nothing is left to poll");
+        assert_eq!(
+            views.create_directory(session, "logs"),
+            Err(NameProblem::NoDirectory),
+            "a forgotten session cannot be changed"
+        );
     }
 }

@@ -393,6 +393,54 @@ pub struct Strings {
     pub files_kind_link: &'static str,
     /// Kind label of any other entry.
     pub files_kind_other: &'static str,
+    /// Button that opens the new-folder form.
+    pub files_new: &'static str,
+    /// Button that opens the rename form of one entry.
+    pub files_rename: &'static str,
+    /// Button that asks the delete question about one entry.
+    pub files_delete: &'static str,
+    /// Placeholder of the field that names a new folder.
+    pub files_new_placeholder: &'static str,
+    /// Placeholder of the field that holds the new name of an entry.
+    pub files_rename_placeholder: &'static str,
+    /// Button that sends the new directory.
+    pub files_create: &'static str,
+    /// Button that sends the rename.
+    pub files_rename_confirm: &'static str,
+    /// Button that sends the deletion.
+    pub files_delete_confirm: &'static str,
+    /// Button that closes a form without sending anything.
+    pub files_cancel: &'static str,
+    /// Label introducing the full path a question is about.
+    pub files_target_label: &'static str,
+    /// Label introducing the kind of the entry a question is about.
+    pub files_kind_label: &'static str,
+    /// Said about a directory that is deleted with everything inside it.
+    pub files_delete_recursive: &'static str,
+    /// Said about a file that is deleted.
+    pub files_delete_file: &'static str,
+    /// Said while a change waits for the server.
+    pub files_change_pending: &'static str,
+    /// Heading of a change the server applied completely.
+    pub files_change_done: &'static str,
+    /// Heading of a change the server refused in part.
+    pub files_change_failed: &'static str,
+    /// Word before the count of paths a change really reached.
+    pub files_change_changed: &'static str,
+    /// Reason a change cannot be asked for yet.
+    pub files_problem_no_directory: &'static str,
+    /// Reason: the name is empty.
+    pub files_problem_empty: &'static str,
+    /// Reason: the name is "." or "..".
+    pub files_problem_navigation: &'static str,
+    /// Reason: the name holds a separator.
+    pub files_problem_separator: &'static str,
+    /// Reason: the name is already in the listing.
+    pub files_problem_taken: &'static str,
+    /// Reason: the entry is not in the listing any more.
+    pub files_problem_missing: &'static str,
+    /// Reason: the new name is the old one.
+    pub files_problem_unchanged: &'static str,
 }
 
 /// English copy.
@@ -560,6 +608,30 @@ pub static ENGLISH: Strings = Strings {
     files_kind_file: "File",
     files_kind_link: "Link",
     files_kind_other: "Other",
+    files_new: "New folder",
+    files_rename: "Rename",
+    files_delete: "Delete",
+    files_new_placeholder: "Folder name",
+    files_rename_placeholder: "New name",
+    files_create: "Create",
+    files_rename_confirm: "Rename",
+    files_delete_confirm: "Delete",
+    files_cancel: "Cancel",
+    files_target_label: "Target",
+    files_kind_label: "Type",
+    files_delete_recursive: "This directory and everything inside it are deleted on the server. This cannot be undone.",
+    files_delete_file: "This file is deleted on the server. This cannot be undone.",
+    files_change_pending: "Waiting for the server\u{2026}",
+    files_change_done: "The server applied this change",
+    files_change_failed: "The server did not apply every part of this change",
+    files_change_changed: "changed",
+    files_problem_no_directory: "Open a directory before changing it.",
+    files_problem_empty: "A name cannot be empty.",
+    files_problem_navigation: "The names . and .. are navigation, not names.",
+    files_problem_separator: "A name cannot contain a separator; create one directory at a time.",
+    files_problem_taken: "An entry with that name already exists here.",
+    files_problem_missing: "That entry is no longer in this directory.",
+    files_problem_unchanged: "The name did not change.",
 };
 
 /// Chinese copy.
@@ -727,6 +799,30 @@ pub static CHINESE: Strings = Strings {
     files_kind_file: "文件",
     files_kind_link: "链接",
     files_kind_other: "其他",
+    files_new: "新建文件夹",
+    files_rename: "重命名",
+    files_delete: "删除",
+    files_new_placeholder: "文件夹名称",
+    files_rename_placeholder: "新名称",
+    files_create: "创建",
+    files_rename_confirm: "重命名",
+    files_delete_confirm: "删除",
+    files_cancel: "取消",
+    files_target_label: "目标",
+    files_kind_label: "类型",
+    files_delete_recursive: "这个目录及其中的全部内容都会在服务器上删除，且无法撤销。",
+    files_delete_file: "这个文件会在服务器上删除，且无法撤销。",
+    files_change_pending: "等待服务器\u{2026}",
+    files_change_done: "服务器已应用这次修改",
+    files_change_failed: "服务器没有完成这次修改的全部内容",
+    files_change_changed: "已修改",
+    files_problem_no_directory: "请先打开一个目录再修改。",
+    files_problem_empty: "名称不能为空。",
+    files_problem_navigation: "“.” 和 “..” 是导航，不是名称。",
+    files_problem_separator: "名称不能包含分隔符；请逐级创建目录。",
+    files_problem_taken: "这里已经有同名条目。",
+    files_problem_missing: "这个条目已不在当前目录中。",
+    files_problem_unchanged: "名称没有变化。",
 };
 
 /// Hint for the section shortcuts, built for one platform.

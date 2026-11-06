@@ -22,7 +22,10 @@
 
 use std::time::{Duration, Instant};
 
-use shellune_core::{AuthMethod, BrowseFailure, BrowseRequest, BrowseResponse, DirEntry, FileKind};
+use shellune_core::{
+    AuthMethod, BrowseFailure, BrowseRequest, BrowseResponse, DirEntry, FileKind, MutationOutcome,
+    MutationStep,
+};
 use shellune_ssh::testserver::Harness;
 use shellune_ssh::{ConnectRequest, FileLink, KnownHostKey, PtySize, RemoteEvent, RemoteSession};
 
@@ -147,6 +150,11 @@ fn list(link: &mut FileLink, request: u64, path: &str) -> Result<Vec<DirEntry>, 
             assert_eq!(answered, request);
             Err(failure)
         }
+        BrowseResponse::Changed {
+            request: answered, ..
+        } => {
+            panic!("listing {path} was answered with a change report ({answered})")
+        }
     }
 }
 
@@ -244,6 +252,7 @@ fn the_home_directory_is_listed_on_the_connection_the_shell_authenticated() {
             path
         }
         BrowseResponse::Failed { failure, .. } => panic!("the home directory failed: {failure}"),
+        BrowseResponse::Changed { .. } => panic!("the home request was answered with a change"),
     };
     assert!(
         home.starts_with('/'),
@@ -432,6 +441,7 @@ fn a_server_without_sftp_says_so_and_keeps_the_terminal() {
             "a server without an SFTP subsystem cannot list a directory, it answered with {} entries",
             entries.len()
         ),
+        BrowseResponse::Changed { .. } => panic!("a listing request was answered with a change"),
     }
 
     // The terminal was never involved: it still runs on the same connection.
@@ -440,5 +450,366 @@ fn a_server_without_sftp_says_so_and_keeps_the_terminal() {
         printed.contains("shellune-no-sftp"),
         "the shell answered after the SFTP refusal"
     );
+    session.close();
+}
+
+/// Sends one change and returns the report the server's answer produced.
+///
+/// A change is always answered with a report, even when the server refused it: the
+/// failures are inside the outcome, which is what lets the view state what really
+/// happened to each path.
+fn change(link: &mut FileLink, request: BrowseRequest) -> MutationOutcome {
+    assert!(link.send(request), "the request reaches the connection");
+    match answer(link) {
+        BrowseResponse::Changed { outcome, .. } => outcome,
+        BrowseResponse::Failed { failure, .. } => {
+            panic!("the change was refused outright instead of reported: {failure}")
+        }
+        BrowseResponse::Listed { .. } => panic!("a change is not answered with a listing"),
+    }
+}
+
+/// Whether the server really has this path.
+fn server_has(server: &Harness, path: &str) -> bool {
+    server
+        .as_user(&format!("test -e '{path}' && echo yes"))
+        .unwrap_or_default()
+        .contains("yes")
+}
+
+/// The names the server itself lists in one directory.
+fn server_names(server: &Harness, path: &str) -> Vec<String> {
+    let printed = server
+        .as_user(&format!("ls -A '{path}'"))
+        .expect("the server lists the directory");
+    let mut names: Vec<String> = printed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names
+}
+
+/// The names the browser lists in one directory.
+fn listed_names(link: &mut FileLink, request: u64, path: &str) -> Vec<String> {
+    let mut names: Vec<String> = list(link, request, path)
+        .expect("the directory is listed")
+        .into_iter()
+        .map(|entry| entry.name().to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_directory_is_created_renamed_and_deleted_on_the_server() {
+    if !Harness::is_available() {
+        eprintln!(
+            "SKIPPED changing a directory: this host cannot start a disposable OpenSSH \
+             server, so nothing is verified here and nothing is claimed."
+        );
+        return;
+    }
+    let server = own_server("sftp-mutate");
+    let home = server.home();
+    let mut session = live(&server);
+    let mut link = session
+        .take_file_link()
+        .expect("a live session is browsable");
+
+    // Creating a directory with Chinese characters and a space.
+    let created = format!("{home}/新建 目录");
+    let outcome = change(
+        &mut link,
+        BrowseRequest::CreateDirectory {
+            request: 1,
+            directory: home.clone(),
+            name: "新建 目录".to_owned(),
+        },
+    );
+    assert!(outcome.succeeded(), "the directory was created: {outcome}");
+    assert_eq!(outcome.steps()[0].path(), created);
+    assert!(
+        server_has(&server, &created),
+        "the directory really exists on the server"
+    );
+    let expected = server_names(&server, &home);
+    assert_eq!(
+        listed_names(&mut link, 2, &home),
+        expected,
+        "the listing after the change is the one the server reports"
+    );
+    assert!(
+        expected.contains(&"新建 目录".to_owned()),
+        "the new name is in the server's own listing: {expected:?}"
+    );
+
+    // The same name again is a conflict, and the server is not asked twice.
+    let outcome = change(
+        &mut link,
+        BrowseRequest::CreateDirectory {
+            request: 3,
+            directory: home.clone(),
+            name: "新建 目录".to_owned(),
+        },
+    );
+    assert!(
+        !outcome.succeeded(),
+        "an existing name is not a successful creation: {outcome}"
+    );
+    assert!(
+        matches!(
+            outcome.first_failure(),
+            Some(BrowseFailure::AlreadyExists { .. })
+        ),
+        "the conflict is named as one: {outcome}"
+    );
+
+    // Renaming it, in its own directory.
+    let renamed = format!("{home}/改名后");
+    let outcome = change(
+        &mut link,
+        BrowseRequest::Rename {
+            request: 4,
+            from: created.clone(),
+            to: renamed.clone(),
+        },
+    );
+    assert!(outcome.succeeded(), "the rename happened: {outcome}");
+    assert!(!server_has(&server, &created), "the old name is gone");
+    assert!(server_has(&server, &renamed), "the new name exists");
+    assert_eq!(
+        listed_names(&mut link, 5, &home),
+        server_names(&server, &home),
+        "the list after the rename is the server's list"
+    );
+
+    // A rename onto a name that is taken is refused, and nothing is replaced.
+    let outcome = change(
+        &mut link,
+        BrowseRequest::Rename {
+            request: 6,
+            from: renamed.clone(),
+            to: format!("{home}/{CHINESE_DIR}"),
+        },
+    );
+    assert!(
+        matches!(
+            outcome.first_failure(),
+            Some(BrowseFailure::AlreadyExists { .. })
+        ),
+        "a taken name is a conflict: {outcome}"
+    );
+    assert!(
+        server_has(&server, &renamed) && server_has(&server, &format!("{home}/{CHINESE_DIR}")),
+        "neither entry was touched by the refused rename"
+    );
+
+    // Deleting the empty directory, which really removes it.
+    let outcome = change(
+        &mut link,
+        BrowseRequest::Delete {
+            request: 7,
+            path: renamed.clone(),
+            kind: FileKind::Directory,
+        },
+    );
+    assert!(outcome.succeeded(), "the directory was deleted: {outcome}");
+    assert!(!server_has(&server, &renamed), "it is gone from the server");
+    assert_eq!(
+        listed_names(&mut link, 8, &home),
+        server_names(&server, &home),
+        "the list after the delete is the server's list"
+    );
+
+    shell_echo(&mut session, "shellune-after-mutations");
+    session.close();
+}
+
+#[test]
+fn a_recursive_delete_removes_the_contents_and_an_unwritable_one_is_reported_item_by_item() {
+    if !Harness::is_available() {
+        eprintln!(
+            "SKIPPED a recursive delete: this host cannot start a disposable OpenSSH \
+             server, so nothing is verified here and nothing is claimed."
+        );
+        return;
+    }
+    let server = own_server("sftp-delete");
+    let home = server.home();
+    let tree = format!("{home}/tree");
+    server
+        .as_user(&format!(
+            "set -e
+mkdir -p '{tree}/sub'
+printf 'a\n' > '{tree}/a.txt'
+printf 'b\n' > '{tree}/sub/b.txt'
+mkdir -p '{home}/locked'
+printf 'k\n' > '{home}/locked/keep.txt'
+chmod 500 '{home}/locked'"
+        ))
+        .expect("the fixtures are created");
+    let mut session = live(&server);
+    let mut link = session
+        .take_file_link()
+        .expect("a live session is browsable");
+
+    let outcome = change(
+        &mut link,
+        BrowseRequest::Delete {
+            request: 1,
+            path: tree.clone(),
+            kind: FileKind::Directory,
+        },
+    );
+    assert!(outcome.succeeded(), "the whole tree was deleted: {outcome}");
+    let removed: Vec<&str> = outcome.steps().iter().map(MutationStep::path).collect();
+    assert!(
+        removed.contains(&format!("{tree}/a.txt").as_str())
+            && removed.contains(&format!("{tree}/sub/b.txt").as_str()),
+        "every item the change reached is reported: {removed:?}"
+    );
+    assert_eq!(
+        removed.last().copied(),
+        Some(tree.as_str()),
+        "the directory itself is removed last, after its contents"
+    );
+    assert!(!server_has(&server, &tree), "the tree is really gone");
+    assert_eq!(
+        listed_names(&mut link, 2, &home),
+        server_names(&server, &home),
+        "the list matches the server after the recursive delete"
+    );
+
+    // A directory the account may read but not write: the items inside cannot be
+    // removed, and the report says which ones and why.
+    let locked = format!("{home}/locked");
+    let outcome = change(
+        &mut link,
+        BrowseRequest::Delete {
+            request: 3,
+            path: locked.clone(),
+            kind: FileKind::Directory,
+        },
+    );
+    assert!(
+        !outcome.succeeded(),
+        "a partial delete is not a success: {outcome}"
+    );
+    let failures: Vec<(&str, &BrowseFailure)> = outcome
+        .failures()
+        .filter_map(|step| step.failure().map(|failure| (step.path(), failure)))
+        .collect();
+    assert!(
+        failures
+            .iter()
+            .any(|(path, failure)| *path == format!("{locked}/keep.txt")
+                && matches!(failure, BrowseFailure::PermissionDenied { .. })),
+        "the refused file is reported with its reason: {failures:?}"
+    );
+    assert!(
+        server_has(&server, &format!("{locked}/keep.txt")),
+        "the file the server refused to remove is still there"
+    );
+
+    // A directory the account may not write is refused the same way for a creation and
+    // for a rename, and neither refusal changes anything.
+    let outcome = change(
+        &mut link,
+        BrowseRequest::CreateDirectory {
+            request: 5,
+            directory: locked.clone(),
+            name: "new".to_owned(),
+        },
+    );
+    assert!(
+        matches!(
+            outcome.first_failure(),
+            Some(BrowseFailure::PermissionDenied { .. })
+        ),
+        "a creation without write permission is refused with the reason: {outcome}"
+    );
+    assert!(!server_has(&server, &format!("{locked}/new")));
+
+    let outcome = change(
+        &mut link,
+        BrowseRequest::Rename {
+            request: 6,
+            from: format!("{locked}/keep.txt"),
+            to: format!("{locked}/renamed.txt"),
+        },
+    );
+    assert!(
+        matches!(
+            outcome.first_failure(),
+            Some(BrowseFailure::PermissionDenied { .. })
+        ),
+        "a rename without write permission is refused with the reason: {outcome}"
+    );
+    assert!(
+        server_has(&server, &format!("{locked}/keep.txt"))
+            && !server_has(&server, &format!("{locked}/renamed.txt")),
+        "the refused rename left the entry as it was"
+    );
+
+    server
+        .as_user(&format!("chmod 700 '{locked}'"))
+        .expect("the fixture is made writable again");
+
+    // The terminal was never involved, and the connection still serves both.
+    assert_eq!(
+        listed_names(&mut link, 7, &home),
+        server_names(&server, &home),
+        "the list still matches the server"
+    );
+    shell_echo(&mut session, "shellune-after-delete");
+    session.close();
+}
+
+#[test]
+fn a_change_to_a_path_that_does_not_exist_is_reported_as_missing() {
+    if skip("changing a missing path") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let home = server.home();
+    let missing = format!("{home}/no-such-entry");
+    let mut session = live(server);
+    let mut link = session
+        .take_file_link()
+        .expect("a live session is browsable");
+
+    let outcome = change(
+        &mut link,
+        BrowseRequest::Delete {
+            request: 1,
+            path: missing.clone(),
+            kind: FileKind::File,
+        },
+    );
+    assert!(!outcome.succeeded());
+    assert!(
+        matches!(
+            outcome.first_failure(),
+            Some(BrowseFailure::NotFound { .. })
+        ),
+        "a missing path is named as missing: {outcome}"
+    );
+
+    let outcome = change(
+        &mut link,
+        BrowseRequest::Rename {
+            request: 2,
+            from: missing.clone(),
+            to: format!("{home}/other"),
+        },
+    );
+    assert!(!outcome.succeeded());
+    assert!(matches!(
+        outcome.first_failure(),
+        Some(BrowseFailure::NotFound { .. })
+    ));
     session.close();
 }

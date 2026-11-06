@@ -4403,6 +4403,15 @@ impl FileAnswers {
             });
     }
 
+    /// Answers one request with the report of a change.
+    fn changed(&self, request: u64, outcome: shellune_core::MutationOutcome) {
+        self.0
+            .lock()
+            .expect("a free lock")
+            .answers
+            .push(shellune_core::BrowseResponse::Changed { request, outcome });
+    }
+
     /// Answers one request with a failure.
     fn fail(&self, request: u64, failure: shellune_core::BrowseFailure) {
         self.0
@@ -4738,5 +4747,497 @@ async fn a_connection_that_cannot_browse_says_so_without_ending_the_session(
             .and_then(|browser| browser.path().map(str::to_owned))),
         None,
         "a reopened view asks for the login directory again"
+    );
+}
+// ---------------------------------------------------------------------------
+// Changing the remote directory (R11)
+// ---------------------------------------------------------------------------
+
+/// Opens the file view of a live session on a directory with two entries.
+///
+/// The listing comes from a real answer, because a change is only ever asked for
+/// inside a directory the server really listed.
+fn open_files(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+) -> FileAnswers {
+    let answers = FileAnswers::accepting();
+    let channel = answers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(id, "web", "deploy@10.0.0.5:22", Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+    answers.reply(
+        1,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, view);
+    answers
+}
+
+/// The names the view shows, in the order it lists them.
+fn listed_names(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+) -> Vec<String> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .files_browser(id)
+            .and_then(|browser| browser.state().listing().cloned())
+            .map(|listing| {
+                listing
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+#[gpui::test]
+async fn a_new_folder_is_asked_for_and_the_result_is_the_servers_next_listing(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = open_files(cx, &view, id);
+    let before = answers.requests().len();
+
+    click(cx, "files.new");
+    assert!(
+        cx.debug_bounds("files.question").is_some(),
+        "a new folder is asked for before anything is sent"
+    );
+    assert_eq!(
+        answers.requests().len(),
+        before,
+        "opening the question sends no request"
+    );
+    type_into(cx, "files.question.input", "文档 新");
+    assert_eq!(
+        answers.requests().len(),
+        before,
+        "typing a name sends no request either"
+    );
+
+    click(cx, "files.question.confirm");
+    let sent = answers.requests();
+    assert_eq!(
+        sent.last(),
+        Some(&shellune_core::BrowseRequest::CreateDirectory {
+            request: 2,
+            directory: "/home/deploy".to_owned(),
+            name: "文档 新".to_owned(),
+        }),
+        "the name is sent exactly as typed, inside the directory on screen: {sent:?}"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_question_open()),
+        "the answered question is gone"
+    );
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .files_browser(id)
+            .is_some_and(shellune_core::FileBrowser::is_changing)),
+        "the panel knows the change is with the server"
+    );
+    assert_eq!(
+        listed_names(cx, &view, id),
+        vec!["docs".to_owned(), "notes.txt".to_owned()],
+        "the list is still the server's previous answer, not a guess"
+    );
+
+    // The server applied it. What the view shows next is the server's own listing.
+    answers.changed(
+        2,
+        shellune_core::MutationOutcome::new(
+            shellune_core::MutationAction::CreateDirectory {
+                path: "/home/deploy/文档 新".to_owned(),
+            },
+            vec![shellune_core::MutationStep::done(
+                "/home/deploy/文档 新",
+                Some(shellune_core::FileKind::Directory),
+            )],
+        ),
+    );
+    pump_files(cx, &view);
+    let sent = answers.requests();
+    assert_eq!(
+        sent.last(),
+        Some(&shellune_core::BrowseRequest::List {
+            request: 3,
+            path: "/home/deploy".to_owned(),
+        }),
+        "the directory is read again instead of being assumed: {sent:?}"
+    );
+    answers.reply(
+        3,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("文档 新", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        listed_names(cx, &view, id),
+        vec![
+            "docs".to_owned(),
+            "文档 新".to_owned(),
+            "notes.txt".to_owned()
+        ],
+        "the list after the change is the one the server reported"
+    );
+    assert!(
+        cx.debug_bounds("files.report").is_some(),
+        "what the server did is stated"
+    );
+    assert!(
+        !cx.update(|_window, app| view
+            .read(app)
+            .files_browser(id)
+            .is_some_and(shellune_core::FileBrowser::is_changing)),
+        "the change is no longer in flight"
+    );
+}
+
+#[gpui::test]
+async fn an_invalid_name_or_a_collision_never_reaches_the_server(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = open_files(cx, &view, id);
+    let before = answers.requests().len();
+
+    click(cx, "files.new");
+    type_into(cx, "files.question.input", "a/b");
+    click(cx, "files.question.confirm");
+    assert_eq!(
+        answers.requests().len(),
+        before,
+        "a name with a separator would be another path, so nothing is sent"
+    );
+    assert!(
+        cx.debug_bounds("files.question.problem").is_some(),
+        "the reason is shown beside the name"
+    );
+    assert!(
+        cx.debug_bounds("files.question").is_some(),
+        "the question stays open so the name can be corrected"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_text().map(str::to_owned)),
+        Some("a/b".to_owned()),
+        "the name the user typed stays in the field beside the reason"
+    );
+
+    // The same for a name that is already in the listing.
+    clear_field(cx, "files.question.input", "a/b".chars().count());
+    type_into(cx, "files.question.input", "docs");
+    click(cx, "files.question.confirm");
+    assert_eq!(
+        answers.requests().len(),
+        before,
+        "a name that is taken is a conflict, not a request"
+    );
+    assert!(cx.debug_bounds("files.question.problem").is_some());
+}
+
+#[gpui::test]
+async fn the_delete_question_names_the_target_and_a_partial_failure_is_reported(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = open_files(cx, &view, id);
+    let before = answers.requests().len();
+
+    // The first row is the directory, so the question is about a recursive delete.
+    // An entry with its own row and its own two actions fits in the panel: a question
+    // about a target the user cannot see is not a confirmation of anything.
+    let panel = bounds_of(cx, "files.panel");
+    let row = bounds_of(cx, "files.row.0");
+    assert!(
+        row.size.width <= panel.size.width,
+        "the row of an entry stays inside the file view: {row:?} vs {panel:?}"
+    );
+    assert!(
+        bounds_of(cx, "files.delete.0").size.width <= panel.size.width,
+        "the delete button of a row is inside the file view"
+    );
+
+    click(cx, "files.delete.0");
+    assert!(
+        cx.debug_bounds("files.question").is_some(),
+        "deleting asks first"
+    );
+    assert!(
+        cx.debug_bounds("files.question.target").is_some(),
+        "the full path is part of the question"
+    );
+    assert!(
+        cx.debug_bounds("files.question.kind").is_some(),
+        "what is being deleted is part of the question"
+    );
+    assert!(
+        cx.debug_bounds("files.question.note").is_some(),
+        "a directory takes its contents with it, and the question says so"
+    );
+
+    // Cancelling sends nothing at all.
+    click(cx, "files.question.cancel");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_question_open()),
+        "the question is closed"
+    );
+    assert_eq!(
+        answers.requests().len(),
+        before,
+        "cancelling a delete sends no change"
+    );
+    assert_eq!(
+        listed_names(cx, &view, id),
+        vec!["docs".to_owned(), "notes.txt".to_owned()],
+        "the list did not change either"
+    );
+
+    click(cx, "files.delete.0");
+    click(cx, "files.question.confirm");
+    let sent = answers.requests();
+    assert_eq!(
+        sent.last(),
+        Some(&shellune_core::BrowseRequest::Delete {
+            request: 2,
+            path: "/home/deploy/docs".to_owned(),
+            kind: shellune_core::FileKind::Directory,
+        }),
+        "the confirmed delete names the path and the kind: {sent:?}"
+    );
+
+    // The server removed one item and refused another, which is reported as such.
+    answers.changed(
+        2,
+        shellune_core::MutationOutcome::new(
+            shellune_core::MutationAction::Delete {
+                path: "/home/deploy/docs".to_owned(),
+                kind: shellune_core::FileKind::Directory,
+            },
+            vec![
+                shellune_core::MutationStep::done(
+                    "/home/deploy/docs/readme.txt",
+                    Some(shellune_core::FileKind::File),
+                ),
+                shellune_core::MutationStep::failed(
+                    "/home/deploy/docs/locked.txt",
+                    Some(shellune_core::FileKind::File),
+                    shellune_core::BrowseFailure::PermissionDenied {
+                        path: "/home/deploy/docs/locked.txt".to_owned(),
+                    },
+                ),
+                shellune_core::MutationStep::failed(
+                    "/home/deploy/docs",
+                    Some(shellune_core::FileKind::Directory),
+                    shellune_core::BrowseFailure::Refused {
+                        reason: "an item inside this directory was not deleted".to_owned(),
+                    },
+                ),
+            ],
+        ),
+    );
+    pump_files(cx, &view);
+    assert!(
+        cx.debug_bounds("files.report").is_some(),
+        "the result is reported"
+    );
+    assert!(
+        cx.debug_bounds("files.report.step.0").is_some()
+            && cx.debug_bounds("files.report.step.1").is_some()
+            && cx.debug_bounds("files.report.step.2").is_some(),
+        "every item the server reached is listed, not just the first failure"
+    );
+
+    // The list that follows is the server's, not the report's.
+    answers.reply(
+        3,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        listed_names(cx, &view, id),
+        vec!["docs".to_owned(), "notes.txt".to_owned()],
+        "the partially deleted directory is still there, because the server still has it"
+    );
+}
+
+#[gpui::test]
+async fn a_rename_sends_both_names_and_the_list_follows_the_server(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = open_files(cx, &view, id);
+
+    click(cx, "files.rename.1");
+    assert!(
+        cx.debug_bounds("files.question.target").is_some(),
+        "an entry is named by its full path before it is renamed"
+    );
+    clear_field(cx, "files.question.input", "notes.txt".chars().count());
+    type_into(cx, "files.question.input", "说明.txt");
+    click(cx, "files.question.confirm");
+    assert_eq!(
+        answers.requests().last(),
+        Some(&shellune_core::BrowseRequest::Rename {
+            request: 2,
+            from: "/home/deploy/notes.txt".to_owned(),
+            to: "/home/deploy/说明.txt".to_owned(),
+        }),
+        "both paths are named in the same directory"
+    );
+
+    answers.changed(
+        2,
+        shellune_core::MutationOutcome::new(
+            shellune_core::MutationAction::Rename {
+                from: "/home/deploy/notes.txt".to_owned(),
+                to: "/home/deploy/说明.txt".to_owned(),
+            },
+            vec![shellune_core::MutationStep::done(
+                "/home/deploy/说明.txt",
+                Some(shellune_core::FileKind::File),
+            )],
+        ),
+    );
+    pump_files(cx, &view);
+    answers.reply(
+        3,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("说明.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        listed_names(cx, &view, id),
+        vec!["docs".to_owned(), "说明.txt".to_owned()],
+        "the list after the rename is the server's own answer"
+    );
+    assert!(
+        cx.debug_bounds("files.report").is_some(),
+        "the report of what the server did is still there"
+    );
+}
+
+#[gpui::test]
+async fn a_change_of_another_request_never_reaches_this_directory(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = open_files(cx, &view, id);
+
+    // An answer with a number this view never asked for is dropped, like any other
+    // late answer: the directory on screen keeps the listing that really belongs to it.
+    answers.changed(
+        99,
+        shellune_core::MutationOutcome::new(
+            shellune_core::MutationAction::Delete {
+                path: "/home/other/secret".to_owned(),
+                kind: shellune_core::FileKind::File,
+            },
+            vec![shellune_core::MutationStep::done(
+                "/home/other/secret",
+                Some(shellune_core::FileKind::File),
+            )],
+        ),
+    );
+    pump_files(cx, &view);
+    assert!(
+        cx.debug_bounds("files.report").is_none(),
+        "a change report of another request is not shown here"
+    );
+    assert_eq!(
+        listed_names(cx, &view, id),
+        vec!["docs".to_owned(), "notes.txt".to_owned()],
+        "the listing of this host is untouched"
+    );
+}
+
+#[gpui::test]
+async fn a_session_that_ends_takes_its_file_view_and_the_polling_with_it(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let _answers = open_files(cx, &view, id);
+    assert!(
+        cx.debug_bounds("files.panel").is_some(),
+        "the file view is open"
+    );
+
+    // The connection ends while the file view is open.
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the terminal exists");
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+    let accepted = cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::Lost("the channel was closed".to_owned())],
+                cx,
+            )
+        })
+    });
+    assert!(accepted, "the event belongs to this session");
+    cx.run_until_parked();
+
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_visible(id)),
+        "a listing nothing backs is not kept after the connection ends"
+    );
+    let keeps_polling =
+        cx.update(|_window, app| view.update(app, |view, cx| view.pump_files_for_test(cx)));
+    assert!(
+        !keeps_polling,
+        "polling stops once no browsable session is left"
+    );
+    // The panel is drawn only while a view is open, so the model above is what decides
+    // whether it is there at all; the tab stops offering it for the same reason.
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_can_browse(id)),
+        "a connection that ended offers no file view any more"
+    );
+}
+
+#[gpui::test]
+async fn a_deep_path_is_readable_instead_of_being_cut_off(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = open_files(cx, &view, id);
+    let short = bounds_of(cx, "files.path");
+
+    let deep = format!("/home/deploy/{}/inner", "a-long-directory-name".repeat(5));
+    click(cx, "files.refresh");
+    answers.reply(2, &deep, &[("inner", shellune_core::FileKind::Directory)]);
+    pump_files(cx, &view);
+    let long = bounds_of(cx, "files.path");
+    assert!(
+        long.size.width <= bounds_of(cx, "files.panel").size.width,
+        "the path stays inside the panel"
+    );
+    assert!(
+        long.size.height > short.size.height,
+        "a deep path takes more lines instead of losing its end: {short:?} vs {long:?}"
     );
 }
