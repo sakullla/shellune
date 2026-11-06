@@ -17,6 +17,9 @@ use shellune_terminal::{
     platform_default, program_exists,
 };
 
+#[cfg(feature = "test-support")]
+mod support;
+
 /// One shell, its PTY and the terminal that parses what it writes.
 ///
 /// The tag is what the window uses to route an event: it names one session and one
@@ -240,116 +243,103 @@ fn a_shell_that_exits_reports_only_its_own_end() {
 /// Interrupting one session while another keeps running (R7).
 ///
 /// The flood is `shellune-flood`, the program the local-shell interrupt tests use: it
-/// prints one line every 5 ms, which is a stream a terminal can process input against.
-/// The loop that used to be typed into `cmd.exe` printed ~600 KB/s, and that rate
-/// starved the pseudo console's input so completely that nine Ctrl+C presses over 24 s
-/// were never processed - no test can measure an interrupt the console never handles.
-/// The program is built for tests only (`required-features = ["test-support"]`), and this
-/// module is behind the same feature.
+/// prints one line every 5 ms, a stream a terminal can process input against, and it prints
+/// `flood: interrupted` when its Ctrl+C handler runs. The loop that used to be typed
+/// into `cmd.exe` printed ~600 KB/s, and that rate starved the pseudo console's input
+/// so completely that nine Ctrl+C presses over 24 s were never processed - no test can
+/// measure an interrupt the console never handles.
+///
+/// The marker is what makes the result mean something: this runner was measured to drop the
+/// byte (`cargo test` failed 6 of 8 runs of the identical test binary, which passes 4 of
+/// 4 when run directly), and without the marker a stream that never stops cannot be told
+/// apart from output that was never told to stop. A press that produces no marker at all is
+/// reported as this runner not delivering the byte, not as a pass.
 #[cfg(feature = "test-support")]
 mod interrupt {
     use super::*;
+    use crate::support::{self, Flood, Outcome, Sample};
 
     /// The flood program, as Cargo built it for this test binary.
     const FLOOD_PROGRAM: &str = env!("CARGO_BIN_EXE_shellune-flood");
 
-    /// How long the flooded session must stay silent before its output counts as stopped,
-    /// and how many reads must have seen that silence.
+    /// The flood's session, read as bytes and text, with one Ctrl+C per press.
     ///
-    /// The counter, not the screen, is what is measured: a full grid and a stopped grid
-    /// look the same, so the only honest stop is output that really stopped arriving.
-    const STOP_WINDOW: Duration = Duration::from_secs(1);
-    const STOP_WINDOW_READS: u32 = 40;
+    /// The byte is written into this session's PTY, which is the same call the
+    /// application's Ctrl+C makes, and the other session keeps its own process.
+    impl Flood for Rig {
+        fn sample(&mut self) -> Sample {
+            self.pump();
+            Sample {
+                bytes: self.bytes,
+                text: self.core.snapshot().text().join("\n"),
+            }
+        }
 
-    /// How many of those windows the silence must last before it counts as a stop.
-    ///
-    /// One window is not proof on a busy machine: a console host that is not being
-    /// scheduled holds its output back, which looks exactly like a stop and is not one.
-    /// Two windows cost one more second and are not a wider window: the window is still
-    /// one second, measured twice without a byte in between.
-    const STOP_WINDOWS: u32 = 2;
-
-    /// How long the flood is given to produce its first bytes.
-    ///
-    /// Generous because a busy machine slows the console host rather than the program:
-    /// with a cold cargo build running, one measured run of the old loop printed only 1791
-    /// bytes in thirty seconds. The stop window is a different number and is never
-    /// widened.
-    const FLOOD_BUDGET: Duration = Duration::from_secs(90);
-
-    /// The most time the interrupt is given before the test says it did not stop.
-    ///
-    /// The stop window above is not widened for a slow machine; this is only the point at
-    /// which a session that is still printing is declared uninterruptible. Generous
-    /// because a console host under a cold cargo build is not scheduled for long
-    /// stretches - a line typed into `cmd.exe` under one sat unread for thirty seconds -
-    /// so the press can wait. The program prints every 5 ms and installs no handler, so
-    /// the press itself is not the slow part.
-    const INTERRUPT_BUDGET: Duration = Duration::from_secs(35);
+        fn press(&mut self) {
+            self.write(&[0x03]);
+        }
+    }
 
     #[test]
     fn interrupting_one_session_leaves_the_other_responsive() {
         // Two sessions, two processes: the flood in its own PTY, and a shell that has to
-        // keep answering while the flood is interrupted. The byte goes through the same
-        // PTY write the application's Ctrl+C uses.
+        // keep answering while the flood is interrupted.
         let (Some(mut flood), Some(mut other)) =
             (Rig::start_program(FLOOD_PROGRAM, &[]), Rig::start())
         else {
-            eprintln!("no flood program or shell on this machine, skipping");
+            support::report(
+                "multi_session",
+                "SKIP interrupting_one_session_leaves_the_other_responsive: no flood program \
+                 or shell on this machine",
+            );
             return;
         };
 
-        let started = Instant::now();
-        // The program is endless, so it cannot end by itself and make the test pass
-        // without an interrupt; these bytes only prove it is mid-stream.
-        while flood.bytes < 2048 {
-            flood.pump();
-            assert!(
-                started.elapsed() < FLOOD_BUDGET,
-                "the flood never started: {} bytes came back",
-                flood.bytes
-            );
-            std::thread::sleep(Duration::from_millis(10));
+        match support::interrupt_flood(&mut flood) {
+            Outcome::Stopped {
+                bytes_at_press,
+                stopped_after,
+                presses,
+            } => support::report(
+                "multi_session",
+                &format!(
+                    "the flooded session printed {} bytes, saw the Ctrl+C on press {presses} of \
+                     at most {}, and stopped after {stopped_after:?}",
+                    bytes_at_press,
+                    support::PRESS_LIMIT
+                ),
+            ),
+            Outcome::StillPrinting {
+                bytes_at_press,
+                bytes_now,
+                presses,
+            } => panic!(
+                "the flooded session saw the Ctrl+C and kept printing: {bytes_at_press} bytes \
+                 at press {presses}, {bytes_now} bytes now, no {:?} of silence within {:?}",
+                support::STOP_WINDOW * support::STOP_WINDOWS,
+                support::STOP_BUDGET
+            ),
+            Outcome::Undeliverable {
+                presses,
+                bytes_at_first_press,
+                bytes_now,
+            } => {
+                support::report(
+                    "multi_session",
+                    &format!(
+                        "SKIP interrupting_one_session_leaves_the_other_responsive: this runner \
+                         did not deliver the control byte into the flooded session - {presses} \
+                         presses, {} bytes at the first press, {} bytes now, and the program \
+                         never printed \"{}\". The isolation of an interrupt is unmeasured \
+                         here, not passing.",
+                        bytes_at_first_press,
+                        bytes_now,
+                        support::INTERRUPT_MARKER
+                    ),
+                );
+                return;
+            }
         }
-
-        // One Ctrl+C, and this session's output has to stop. One press is what a user
-        // does, and the flood prints every 5 ms with no handler installed, so the console
-        // has the input queue to itself between two lines; pressing again would hide a
-        // stream too dense to interrupt instead of reporting it.
-        let pressed = Instant::now();
-        flood.write(&[0x03]);
-
-        let mut last = flood.bytes;
-        let mut last_growth = pressed;
-        let mut quiet_reads = 0;
-        let stopped_after = loop {
-            flood.pump();
-            let now = Instant::now();
-            if flood.bytes != last {
-                last = flood.bytes;
-                last_growth = now;
-                quiet_reads = 0;
-            } else {
-                quiet_reads += 1;
-            }
-            if last_growth.elapsed() >= STOP_WINDOW * STOP_WINDOWS
-                && quiet_reads >= STOP_WINDOW_READS * STOP_WINDOWS
-            {
-                break last_growth.duration_since(pressed);
-            }
-            assert!(
-                pressed.elapsed() < INTERRUPT_BUDGET,
-                "the flooded session kept printing {:?} after one Ctrl+C, {} bytes so far",
-                pressed.elapsed(),
-                flood.bytes
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        eprintln!(
-            "multi_session: output stopped {stopped_after:?} after the press, {} bytes at \
-             the press",
-            last
-        );
 
         // The interrupted session is the only one that changed: the other one answers a
         // command typed after the interrupt.
