@@ -1687,7 +1687,14 @@ impl ShelluneView {
         }
         let shell = LocalShell::new(program.clone(), program);
         self.start_shell(shell, Some(window), cx);
-        if self.active_pane().is_some() {
+        // Only a start that really produced a terminal may take the field away. Asking
+        // whether *some* pane is on screen is not the same question: a shell that
+        // failed to launch leaves the previous terminal in place and selected, so the
+        // old check closed and emptied the field over the path it had just rejected,
+        // and the user could not correct it. A launch failure is reported through
+        // `local_error`, so that is what decides here.
+        let started = self.local_error.is_none() && self.active_pane().is_some();
+        if started {
             // The shell that started owns the keyboard, so what the user types next
             // goes to it. The field closes and, because this returns true, empties:
             // a second Return over the same path would start the shell again
@@ -1695,7 +1702,7 @@ impl ShelluneView {
             self.custom_shell_open = false;
             cx.notify();
         }
-        self.active_pane().is_some()
+        started
     }
 
     /// Starts whichever shell the picker currently points at.
@@ -3599,6 +3606,7 @@ impl ShelluneView {
     /// The selected terminal, the session it belongs to and the shell it runs.
     fn terminal_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let metrics = self.metrics();
+        let strings = self.strings();
         let destination = self.workspace.destination();
         let mut column = div()
             .flex()
@@ -3618,29 +3626,97 @@ impl ShelluneView {
         }
 
         let id = self.active;
+        let session = id.and_then(|id| self.workspace.session(id));
+        // Why the selected session ended, and whether it can be started again.
+        //
+        // The session record is asked first, not the pane: a refused reconnect is
+        // recorded on the session and leaves the pane holding the reason its old
+        // process ended, so a notice read from the pane alone would keep stating the
+        // older problem and never mention the reconnect at all.
+        let ended: Option<(SessionFailure, bool)> =
+            session.and_then(|session| match session.state() {
+                SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
+                    Some((failure.clone(), session.state().can_reconnect()))
+                }
+                _ => None,
+            });
+
         if let Some(pane) = self.active_pane() {
             column = column.child(self.session_bar(id, cx));
             // A shell that ended keeps its last screen, but the reason it stopped is
             // stated above it instead of being left for the user to guess.
-            if let Some(failure) = pane.read(cx).state().failure() {
-                column = column.child(
-                    div()
-                        .flex_none()
-                        .px(metrics.scale(spacing::TIGHT))
-                        .py(metrics.scale(spacing::HAIRLINE))
-                        .rounded(px(radius::SMALL))
-                        .bg(theme::swatch(palette::SURFACE_RAISED))
-                        .border_1()
-                        .border_color(theme::swatch(palette::BORDER))
-                        .text_size(metrics.label_size())
-                        .text_color(Tone::Danger.text())
-                        .debug_selector(|| "terminal.failure".to_owned())
-                        .child(SharedString::from(failure.to_string())),
-                );
+            if let Some((failure, reconnectable)) = ended {
+                column = column.child(self.failure_notice(&failure, reconnectable));
+            } else if let Some(failure) = pane.read(cx).state().failure() {
+                column = column.child(self.failure_notice(&failure, false));
             }
             column = column.child(pane.clone());
+        } else if let Some(session) = session {
+            // A session can outlive its terminal: a reconnect that was refused before
+            // it opened one, or a process that never started. The session still holds
+            // the reason, so it is drawn where the terminal would be instead of being
+            // recorded and shown nowhere.
+            column = column.child(self.session_bar(id, cx));
+            if let Some((failure, reconnectable)) = ended {
+                column = column.child(self.failure_notice(&failure, reconnectable));
+            } else {
+                // Nothing failed and there is nothing to draw: the reason is still
+                // said, because an empty panel would look like a terminal that is
+                // merely blank.
+                column = column.child(self.notice_line(
+                    format!(
+                        "{} · {}",
+                        strings.session_no_terminal,
+                        copy::session_state_label(session.state(), self.workspace.locale())
+                    ),
+                    Tone::Warning,
+                ));
+            }
         }
         column
+    }
+
+    /// Why a session ended, and what the user can do about it (R12).
+    ///
+    /// The reason and the next step are one notice because the requirement is about
+    /// both: an error the user cannot act on is only half reported. The step is the
+    /// action the session's own state allows - reconnect while it may be restarted,
+    /// close once it may not.
+    fn failure_notice(&self, failure: &SessionFailure, reconnectable: bool) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let step = if reconnectable {
+            strings.session_reconnect
+        } else {
+            strings.session_close
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .text_size(metrics.label_size())
+            .debug_selector(|| "terminal.failure".to_owned())
+            .child(
+                div()
+                    .text_color(Tone::Danger.text())
+                    .child(SharedString::from(failure.to_string())),
+            )
+            .child(
+                div()
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "terminal.failure.next".to_owned())
+                    .child(SharedString::from(format!(
+                        "{} · {step}",
+                        strings.next_step
+                    ))),
+            )
     }
 
     /// One muted or coloured line under a heading.
@@ -3982,9 +4058,22 @@ impl ShelluneView {
         let kind = theme::session_kind_label(session.kind(), strings.local_shell_fallback);
         // A failed or lost session shows the reason the transport reported instead
         // of a generic "disconnected", so the user can act on it.
+        // A failed or lost session states why it ended and, next to it, the action its
+        // own state allows (R12): a reason the user cannot act on is only half a
+        // report, and this row is the one place a session without a terminal is still
+        // shown.
         let detail = match session.state() {
             SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
-                format!("{kind} · {}", theme::session_failure_text(failure))
+                let step = if session.state().can_reconnect() {
+                    strings.session_reconnect
+                } else {
+                    strings.session_close
+                };
+                format!(
+                    "{kind} · {} · {} · {step}",
+                    theme::session_failure_text(failure),
+                    strings.next_step
+                )
             }
             state => format!("{kind} · {}", copy::session_state_label(state, locale)),
         };

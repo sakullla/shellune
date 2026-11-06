@@ -1524,6 +1524,58 @@ async fn a_custom_shell_that_starts_owns_the_keyboard(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open(
+    cx: &mut TestAppContext,
+) {
+    // The case the field used to get wrong: a terminal is already on screen, so
+    // "a pane exists" was true for a reason that had nothing to do with the path the
+    // user just typed. The field closed and emptied itself over a start that failed,
+    // and there was no way to correct the path.
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+
+    let bounds = bounds_of(cx, "header.primary");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).pane().is_some()),
+        "the first terminal must really be open for this case to mean anything"
+    );
+
+    let bounds = bounds_of(cx, "shell.custom");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("shell.path").is_some(),
+        "the path field must open"
+    );
+
+    cx.simulate_input("shellune-no-such-shell-qq3");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("shell.path").is_some(),
+        "a start that failed must leave the field open so the path can be corrected"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).shell_path_text(app)),
+        "shellune-no-such-shell-qq3",
+        "the typed path must survive its own failure"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).custom_shell_open()),
+        "the field stays open because nothing started from it"
+    );
+}
+
+#[gpui::test]
 async fn a_real_shell_starts_from_the_header_action(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
@@ -1650,6 +1702,16 @@ async fn a_real_shell_that_exits_stops_being_listed_as_connected(cx: &mut TestAp
     assert!(
         cx.debug_bounds("terminal.viewport").is_some(),
         "the terminal keeps showing what the shell left behind"
+    );
+    // Why it ended and what can be done about it are both on screen: a reason without
+    // the action it allows leaves the user to guess (R12).
+    assert!(
+        cx.debug_bounds("terminal.failure").is_some(),
+        "the reason the shell stopped must be stated above its last screen"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure.next").is_some(),
+        "the failure must state the next step, not only the reason"
     );
 }
 

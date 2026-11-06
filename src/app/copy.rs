@@ -358,6 +358,8 @@ pub struct Strings {
     pub session_reconnect_no_shell: &'static str,
     /// Why a remote session's host cannot be connected to again.
     pub session_reconnect_missing_host: &'static str,
+    /// Said where a selected session has no terminal to draw.
+    pub session_no_terminal: &'static str,
 }
 
 /// English copy.
@@ -508,6 +510,7 @@ pub static ENGLISH: Strings = Strings {
     session_reconnect: "Reconnect",
     session_reconnect_no_shell: "This session has no program recorded, so it cannot be started again.",
     session_reconnect_missing_host: "The saved host this session used is no longer there, so it cannot be connected to again.",
+    session_no_terminal: "This session has no terminal open",
 };
 
 /// Chinese copy.
@@ -658,6 +661,7 @@ pub static CHINESE: Strings = Strings {
     session_reconnect: "重新连接",
     session_reconnect_no_shell: "该会话没有记录可启动的程序，无法重新启动。",
     session_reconnect_missing_host: "该会话使用的主机记录已被删除，无法再次连接。",
+    session_no_terminal: "该会话当前没有终端",
 };
 
 /// Hint for the section shortcuts, built for one platform.
