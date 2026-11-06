@@ -155,10 +155,15 @@ gpui 0.2.2 的 Windows 后端在创建窗口时会把逻辑 bounds 换成设备�
   在 **0.183 s** 内消失，屏幕出现 `Control-C` 与提示符，随后键入的
   `cmd /c echo alive > 文件` 在 **0.021 s** 内写出文件。换成
   `cmd /c ping -n 60 127.0.0.1` 结果相同（0.184 s / 0.021 s）。
-- 同一路径在 debug 构建、release 构建和 gpui 测试窗口里给出相同结果。应用自己的
-  按键→编码→PTY 写入链路现在有回归用例（`src/app/tests.rs` 里的
-  `the_default_shell_stops_a_running_command_on_ctrl_c`），它覆盖的是出厂默认 Shell，
-  而不是 `tests/local_shell.rs` 用的 `cmd.exe`。
+- 同一路径在 debug 构建与 release 构建里给出相同结果。上面的数字全部来自进程表与文件
+  副作用（`PING.EXE` 是否还在、下一条命令有没有写出文件），不来自测试。应用自己的
+  按键→编码→PTY 写入这一半有回归用例（`src/app/tests.rs:1692` 的
+  `a_ctrl_c_reaches_the_default_shell_that_is_running_a_command`）：它在真实窗口里起
+  出厂默认 Shell、键入 `ping -n 60 127.0.0.1`，等屏幕上出现至少两个 `TTL=` 后按
+  Ctrl+C，只断言 pane 恰好写出一个 `0x03` 且会话仍为 Live；控制台宿主是否把该字节变成
+  中断事件不在它的断言里，端到端那一层由
+  `tests/local_shell.rs::interrupt::the_default_shell_forwards_the_interrupt_to_the_program_it_started`
+  在 PTY 层测（本机全量跑时该用例回声跳过，跳过不等于通过）。
 - 复审用的 `portable-pty` 探针与应用的差别不在 ConPTY。Windows PowerShell 启动后
   会先发 `ESC[6n`（设备状态查询）并等回答，**不回答它就永远不打印提示符**
   （本轮实测：30 s 内只收到 4 字节 `ESC[6n`，之后再无输出）。应用里的终端核心会

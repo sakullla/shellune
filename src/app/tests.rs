@@ -1799,6 +1799,9 @@ async fn escape_reaches_the_program_running_in_the_terminal(cx: &mut TestAppCont
         return;
     }
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    // The real bindings have to be installed or the window has no Escape binding at all
+    // and the key falls through to the pane no matter where the shortcut is scoped.
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
     let bounds = bounds_of(cx, "header.primary");
