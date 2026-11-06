@@ -325,18 +325,13 @@ mod interrupt {
                 bytes_at_first_press,
                 bytes_now,
             } => {
-                support::report(
+                support::undelivered(
                     "multi_session",
-                    &format!(
-                        "SKIP interrupting_one_session_leaves_the_other_responsive: this runner \
-                         did not deliver the control byte into the flooded session - {presses} \
-                         presses, {} bytes at the first press, {} bytes now, and the program \
-                         never printed \"{}\". The isolation of an interrupt is unmeasured \
-                         here, not passing.",
-                        bytes_at_first_press,
-                        bytes_now,
-                        support::INTERRUPT_MARKER
-                    ),
+                    "interrupting_one_session_leaves_the_other_responsive",
+                    presses,
+                    bytes_at_first_press,
+                    bytes_now,
+                    "The isolation of an interrupt is unmeasured here, not passing.",
                 );
                 return;
             }

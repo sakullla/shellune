@@ -81,7 +81,7 @@ pub fn action_button(label: impl Into<SharedString>, available: bool, metrics: M
 
 /// The card used for every non-populated section state.
 ///
-/// Empty, loading, failed and planned sections share one skeleton — tone, title,
+/// Empty, loading and failed sections share one skeleton — tone, title,
 /// body and an optional next step — so the difference between them is what the
 /// copy says and which tone carries it, never the shape of the card.
 pub fn state_card(

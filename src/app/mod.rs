@@ -70,15 +70,18 @@ pub const KEY_CONTEXT: &str = "Shellune";
 /// Key context of a terminal pane's grid.
 ///
 /// A terminal must receive the keys the shell expects; a shortcut bound to
-/// [KEY_CONTEXT] would otherwise be taken before the pane ever sees the key. Escape is
-/// the one that matters most: it is how Vim and less leave insert mode, and it used to
-/// be taken by the notice shortcut.
+/// [KEY_CONTEXT] would otherwise be taken before the pane ever sees the key. Two
+/// matter most: Escape, because it is how Vim and less leave insert mode, and Ctrl+L,
+/// which the shell reads as "clear the screen". Both used to be taken by a
+/// window-wide shortcut - the notice bar and the language toggle respectively.
 pub const TERMINAL_KEY_CONTEXT: &str = "Terminal";
 
 /// The context the application's own shortcuts apply in: everywhere but a terminal.
 ///
 /// Written as a predicate rather than a plain identifier because the pane is inside
-/// the shell context too, so excluding it has to be said out loud.
+/// the shell context too, so excluding it has to be said out loud. A shortcut that
+/// only works outside a terminal belongs here; the language control in the status bar
+/// is the in-terminal way to switch languages.
 pub const APP_KEY_CONTEXT: &str = "Shellune && !Terminal";
 
 /// Shortcuts for one platform.
@@ -120,9 +123,14 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
             Some(KEY_CONTEXT),
         ),
         KeyBinding::new(&format!("{modifier}-="), CycleTextSize, Some(KEY_CONTEXT)),
-        KeyBinding::new(&format!("{modifier}-l"), ToggleLanguage, Some(KEY_CONTEXT)),
-        // Escape only belongs to the application when no terminal has the keyboard:
-        // inside one it is a key the running program needs.
+        KeyBinding::new(
+            &format!("{modifier}-l"),
+            ToggleLanguage,
+            Some(APP_KEY_CONTEXT),
+        ),
+        // Escape and the language shortcut only belong to the application when no
+        // terminal has the keyboard: inside one they are keys the running program
+        // needs (Escape leaves Vim's insert mode, Ctrl+L clears the screen).
         KeyBinding::new("escape", DismissNotice, Some(APP_KEY_CONTEXT)),
     ]
 }

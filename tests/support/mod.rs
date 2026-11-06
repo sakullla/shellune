@@ -18,9 +18,11 @@
 //! * marker and output stopped: the product wrote a byte the program acted on;
 //! * marker and output continuing: delivered but not stopped, a real failure - that is
 //!   what `--ignore-interrupt` produces and what the negative control asserts;
-//! * no marker after a bounded number of presses: the runner never delivered the byte,
-//!   which is reported with the measured byte counts and skipped explicitly. It is
-//!   never counted as a pass, and never as a failure of the product either.
+//! * no marker after a bounded number of presses: the runner never delivered the byte.
+//!   That is a failure by default - a skip exits 0, so a product that stopped writing
+//!   the byte would hide behind it - and only a runner that opts in with
+//!   `SHELLUNE_INTERRUPT_UNDELIVERABLE=skip` gets a skip carrying the measured byte
+//!   counts instead. It is never counted as a pass.
 
 #![allow(dead_code)]
 
@@ -252,6 +254,54 @@ pub fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     // lock protects a machine resource, not shared state a panic could leave torn.
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether this runner is allowed to report an undelivered control byte as a skip.
+///
+/// A skip exits with status 0. Reporting an undelivered byte that way is honest about
+/// the measurement but useless as a regression test: a product that stopped writing
+/// Ctrl+C at all would look exactly like a runner that never delivered it, and the
+/// suite would stay green. The default is therefore a failure; a runner that is known
+/// not to deliver the byte has to say so, which this machine's piped test runs do (see
+/// `docs/release/0.1.0-verification.md` section 5):
+///
+/// ```sh
+/// SHELLUNE_INTERRUPT_UNDELIVERABLE=skip cargo test --workspace --all-features
+/// ```
+pub fn undeliverable_is_a_skip() -> bool {
+    matches!(
+        std::env::var("SHELLUNE_INTERRUPT_UNDELIVERABLE").as_deref(),
+        Ok("skip")
+    )
+}
+
+/// Ends a test whose control byte this runner never delivered.
+///
+/// The measured numbers are part of both endings: a failure and a skip say what was
+/// seen, so neither can be mistaken for a product that stopped. `label` is the test
+/// binary, `test` the case, `consequence` what stays unproven here.
+pub fn undelivered(
+    label: &str,
+    test: &str,
+    presses: u32,
+    bytes_at_first_press: u64,
+    bytes_now: u64,
+    consequence: &str,
+) {
+    let measurements = format!(
+        "{test}: this runner did not deliver the control byte - {presses} presses, \
+         {bytes_at_first_press} bytes at the first press, {bytes_now} bytes now, and \
+         the program never printed \"{INTERRUPT_MARKER}\". {consequence}"
+    );
+    if undeliverable_is_a_skip() {
+        report(label, &format!("SKIP {measurements}"));
+        return;
+    }
+    panic!(
+        "{measurements} An undelivered byte fails the suite unless the runner opts \
+         out with SHELLUNE_INTERRUPT_UNDELIVERABLE=skip, so that a product which \
+         stopped writing the byte cannot hide behind this skip."
+    );
 }
 
 /// Writes one line to the run's log, even from a test that passes.

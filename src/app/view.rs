@@ -3,7 +3,7 @@
 //! The composition follows the navigation model in [`crate::app::nav`] and the
 //! state model in [`crate::app::workspace`]. Render functions never decide whether a
 //! capability exists: they read [`SectionState`] and draw what it reports, which is
-//! what keeps a planned or failed section from looking finished.
+//! what keeps a loading or failed section from looking finished.
 //!
 //! Layout, in one sentence: a fixed navigation rail on the left, a header naming
 //! the current object, a scrollable destination panel, and a status bar that
@@ -253,7 +253,7 @@ impl ShelluneView {
     /// Builds the shell around an existing workspace and host store.
     ///
     /// The hosts section the caller passed decides where the records come from: a
-    /// planned section means "read the store", anything else means the caller has
+    /// loading section means "read the store", anything else means the caller has
     /// already established the state and the store is only where saves will go.
     pub fn with_store(cx: &mut Context<Self>, workspace: Workspace, store: HostStore) -> Self {
         Self::with_store_and_trust(cx, workspace, store, default_trust())
@@ -366,8 +366,12 @@ impl ShelluneView {
     }
 
     /// Reads the saved hosts, or adopts the section the caller already built.
+    ///
+    /// A `Loading` section is one nobody has filled in yet - that is how a fresh
+    /// workspace starts - so it means "this shell has to read the store". Anything else
+    /// is a result a caller already established.
     fn restore_hosts(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.workspace.hosts().status(), SectionStatus::Planned) {
+        if matches!(self.workspace.hosts().status(), SectionStatus::Loading) {
             self.reload_hosts(cx);
             return;
         }
@@ -2584,7 +2588,7 @@ impl ShelluneView {
         let state = self.workspace.state(Destination::Hosts);
 
         match state {
-            SectionState::Planned | SectionState::Loading => {
+            SectionState::Loading => {
                 return self.section_card(Destination::Hosts, state);
             }
             SectionState::Failed => {
@@ -3795,18 +3799,6 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         match state {
-            SectionState::Planned => components::state_card(
-                Tone::Planned,
-                strings.planned_title,
-                match destination {
-                    Destination::LocalShells => strings.planned_local,
-                    Destination::Hosts => strings.planned_hosts,
-                    Destination::Sessions => strings.planned_sessions,
-                    Destination::Transfers => strings.planned_transfers,
-                },
-                None,
-                metrics,
-            ),
             SectionState::Loading => components::state_card(
                 Tone::Warning,
                 strings.loading_title,
@@ -5815,7 +5807,25 @@ impl ShelluneView {
             ))
     }
 
-    fn status_bar(&self) -> Div {
+    /// Switches the interface language, and tells every open terminal about it.
+    ///
+    /// Two paths reach this: the shortcut, which only applies outside a terminal, and
+    /// the language control in the status bar, which is how the language is switched
+    /// while a terminal has the keyboard (there Ctrl+L belongs to the shell).
+    fn toggle_locale(&mut self, cx: &mut Context<Self>) {
+        self.workspace.toggle_locale();
+        let locale = self.workspace.locale();
+        // Every open terminal keeps its own labels, so each one is told: the ones
+        // that are not on screen must come back in the new language too.
+        let panes: Vec<Entity<TerminalPane>> =
+            self.panes.iter().map(|open| open.pane.clone()).collect();
+        for pane in panes {
+            pane.update(cx, |pane, cx| pane.set_locale(locale, cx));
+        }
+        cx.notify();
+    }
+
+    fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let locale: Locale = self.workspace.locale();
@@ -5845,13 +5855,24 @@ impl ShelluneView {
             .border_color(theme::swatch(palette::BORDER))
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(palette::TEXT_MUTED))
-            .child(SharedString::from(format!(
-                "{} {} · {} {}",
-                product::NAME,
-                self.version(),
-                strings.language_control,
-                locale.endonym()
-            )))
+            // The control is clickable because the shortcut it duplicates cannot be:
+            // inside a terminal Ctrl+L is the shell's own key.
+            .child(
+                div()
+                    .id("status.language")
+                    .debug_selector(|| "status.language".to_owned())
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.toggle_locale(cx);
+                    }))
+                    .child(SharedString::from(format!(
+                        "{} {} · {} {}",
+                        product::NAME,
+                        self.version(),
+                        strings.language_control,
+                        locale.endonym()
+                    ))),
+            )
             .child(
                 div()
                     .truncate()
@@ -5907,16 +5928,7 @@ impl Render for ShelluneView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleLanguage, _window, cx| {
-                this.workspace.toggle_locale();
-                let locale = this.workspace.locale();
-                // Every open terminal keeps its own labels, so each one is told: the
-                // ones that are not on screen must come back in the new language too.
-                let panes: Vec<Entity<TerminalPane>> =
-                    this.panes.iter().map(|open| open.pane.clone()).collect();
-                for pane in panes {
-                    pane.update(cx, |pane, cx| pane.set_locale(locale, cx));
-                }
-                cx.notify();
+                this.toggle_locale(cx);
             }))
             .on_action(cx.listener(|this, _: &DismissNotice, _window, cx| {
                 this.workspace.dismiss_notice();
@@ -5935,7 +5947,7 @@ impl Render for ShelluneView {
                     .children((!self.tab_sessions().is_empty()).then(|| self.tab_strip(cx)))
                     .children(self.close_transfer_question(cx))
                     .child(self.destination_panel(cx))
-                    .child(self.status_bar()),
+                    .child(self.status_bar(cx)),
             )
     }
 }

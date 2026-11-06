@@ -670,18 +670,13 @@ mod interrupt {
                 bytes_at_first_press,
                 bytes_now,
             } => {
-                support::report(
+                support::undelivered(
                     "local_shell",
-                    &format!(
-                        "SKIP sustained_output_can_be_interrupted_and_the_session_survives_it: \
-                         this runner did not deliver the control byte - {presses} presses, {} \
-                         bytes at the first press, {} bytes now, and the program never printed \
-                         \"{}\". The product's Ctrl+C path is therefore unmeasured here, not \
-                         passing.",
-                        bytes_at_first_press,
-                        bytes_now,
-                        support::INTERRUPT_MARKER
-                    ),
+                    "sustained_output_can_be_interrupted_and_the_session_survives_it",
+                    presses,
+                    bytes_at_first_press,
+                    bytes_now,
+                    "The product's Ctrl+C path is therefore unmeasured here, not passing.",
                 );
                 return;
             }
@@ -765,9 +760,10 @@ mod interrupt {
     /// The application never puts a program in a PTY of its own - the session always
     /// starts a shell, and Ctrl+C is a byte the shell forwards to the foreground program -
     /// so this is the path a user's interrupt actually takes. The marker is what makes the
-    /// claim: it appears only if the shell passed the byte on, and if it does not appear
-    /// the test reports that this runner could not measure the path instead of asserting
-    /// that it works.
+    /// claim: it appears only if the shell passed the byte on. If it does not appear the
+    /// test fails, saying with the measured byte counts that this runner could not
+    /// deliver the byte; a runner that knows it cannot opts out with
+    /// `SHELLUNE_INTERRUPT_UNDELIVERABLE=skip` and gets a skip instead.
     #[test]
     fn the_shell_forwards_the_interrupt_to_the_program_it_started() {
         let Some(session) = shell_for_the_flood() else {
@@ -817,7 +813,7 @@ mod interrupt {
     /// Starts the flood in `session`, presses Ctrl+C and reports what it measured.
     ///
     /// Shared so the factory shell is measured by exactly the same rules as `cmd.exe`;
-    /// `label` is what a skip names, because a skip has to be traceable to its test.
+    /// `label` is the test the failure or skip names, so either ending stays traceable.
     fn forwards_the_interrupt(mut session: Session, label: &str) {
         let _alone = support::exclusive();
         wait_until_it_takes_input(&mut session);
@@ -877,17 +873,13 @@ mod interrupt {
                 bytes_at_first_press,
                 bytes_now,
             } => {
-                support::report(
+                support::undelivered(
                     "local_shell",
-                    &format!(
-                        "SKIP {label}: this runner did not deliver the control byte through \
-                         the shell - {presses} presses, {} bytes at the first press, {} bytes \
-                         now, and the program never printed \"{}\". R8's shell path is \
-                         unmeasured here, not passing.",
-                        bytes_at_first_press,
-                        bytes_now,
-                        support::INTERRUPT_MARKER
-                    ),
+                    label,
+                    presses,
+                    bytes_at_first_press,
+                    bytes_now,
+                    "R8's shell path is unmeasured here, not passing.",
                 );
                 return;
             }
@@ -945,18 +937,14 @@ mod interrupt {
                 bytes_at_first_press,
                 bytes_now,
             } => {
-                support::report(
+                support::undelivered(
                     "local_shell",
-                    &format!(
-                        "SKIP a_flood_that_ignores_the_interrupt_never_looks_stopped: this \
-                         runner did not deliver the control byte - {presses} presses, {} bytes \
-                         at the first press, {} bytes now, and the program never printed \
-                         \"{}\". The negative control did not run, so nothing is proven about \
-                         the stop detection here.",
-                        bytes_at_first_press,
-                        bytes_now,
-                        support::INTERRUPT_MARKER
-                    ),
+                    "a_flood_that_ignores_the_interrupt_never_looks_stopped",
+                    presses,
+                    bytes_at_first_press,
+                    bytes_now,
+                    "The negative control did not run, so nothing is proven about the stop \
+                     detection here.",
                 );
             }
         }

@@ -1,10 +1,9 @@
 //! Shell state: destinations, sections and honest section status (R12, R18).
 //!
 //! The shell is written so that a section can only look successful when it holds
-//! data that justifies it. [`SectionStatus`] separates four situations that a
+//! data that justifies it. [`SectionStatus`] separates three situations that a
 //! naive "empty list" would collapse into one:
 //!
-//! * `Planned` — this build does not ship the capability, and no work exists;
 //! * `Loading` — work is in flight and nothing is known yet;
 //! * `Failed` — the last attempt failed, with a reason and a recovery step;
 //! * `Ready` — the system reported a real result, which may still be empty.
@@ -23,9 +22,9 @@ use crate::app::theme::{Metrics, Tone, Zoom};
 
 /// What the user can do about a failure.
 ///
-/// The variants are constructed by the layers that can fail; until they exist
-/// (`SectionStatus::Failed` is only reachable from tests in this build) the
-/// variant list documents the recovery paths the shell must be able to show.
+/// The variants are constructed by the layers that can fail - a host file that cannot
+/// be read produces [`Recovery::Retry`] today - and the rest document the recovery
+/// paths the shell must be able to show before a layer needs them.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recovery {
@@ -81,14 +80,12 @@ impl Failure {
 
 /// Reliability of the data behind a section.
 ///
-/// `Loading`, `Failed` and `Ready` are constructed by the steps that own a
-/// section; this build only produces `Planned` at runtime and exercises the other
-/// three through tests.
+/// Every capability this build ships produces one of these three: a section that has
+/// not been read yet is `Loading`, not "planned", because there is no capability left
+/// that this build does not have.
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SectionStatus {
-    /// Not implemented by this build; deliberately not an error.
-    Planned,
     /// A request is in flight.
     Loading,
     /// The last request failed.
@@ -100,8 +97,6 @@ pub enum SectionStatus {
 /// How a section should be drawn, derived from its status and contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SectionState {
-    /// The capability is not part of this build.
-    Planned,
     /// A request is in flight.
     Loading,
     /// A real result, and it is empty.
@@ -116,7 +111,6 @@ impl SectionState {
     /// Tone that carries the meaning of the state.
     pub fn tone(self) -> Tone {
         match self {
-            Self::Planned => Tone::Planned,
             Self::Loading => Tone::Warning,
             Self::Empty => Tone::Neutral,
             Self::Failed => Tone::Danger,
@@ -131,7 +125,6 @@ impl SectionState {
     /// the chip would say "session" where the reader expects a state.
     pub fn chip_label(self, strings: &Strings) -> &'static str {
         match self {
-            Self::Planned => strings.state_planned,
             Self::Loading => strings.state_loading,
             Self::Empty => strings.state_empty,
             Self::Failed => strings.state_failed,
@@ -141,8 +134,8 @@ impl SectionState {
 
     /// Whether the state may be drawn as a success.
     ///
-    /// This is the single place that decides it, so a view cannot mark a planned
-    /// or failed section as done.
+    /// This is the single place that decides it, so a view cannot mark a loading or
+    /// failed section as done.
     #[allow(dead_code)]
     pub fn is_success(self) -> bool {
         matches!(self, Self::Populated)
@@ -157,14 +150,6 @@ pub struct Section<T> {
 }
 
 impl<T> Section<T> {
-    /// A section this build does not implement yet.
-    pub fn planned() -> Self {
-        Self {
-            status: SectionStatus::Planned,
-            items: Vec::new(),
-        }
-    }
-
     /// A section whose request is in flight.
     #[allow(dead_code)]
     pub fn loading() -> Self {
@@ -221,7 +206,6 @@ impl<T> Section<T> {
     /// How the section should be drawn.
     pub fn state(&self) -> SectionState {
         match self.status {
-            SectionStatus::Planned => SectionState::Planned,
             SectionStatus::Loading => SectionState::Loading,
             SectionStatus::Failed(_) => SectionState::Failed,
             SectionStatus::Ready if self.items.is_empty() => SectionState::Empty,
@@ -277,20 +261,23 @@ impl Default for Workspace {
 }
 
 impl Workspace {
-    /// A workspace where every capability is still unimplemented.
+    /// A workspace where every capability is implemented and no data has been read yet.
     ///
-    /// Later tasks replace one section at a time with [`Section::ready`], which is
-    /// why the constructor starts from `Planned` rather than from empty lists.
+    /// Sessions and transfers start as real, empty results: an empty page means
+    /// "nothing is open" rather than "not built". Hosts start as `Loading`, because the
+    /// saved records really are unread until the shell has read the store, and a page
+    /// that showed "no hosts" before the file was read would be a claim no layer made.
     pub fn new() -> Self {
         Self {
             destination: Destination::LocalShells,
             locale: Locale::default(),
             zoom: Zoom::default(),
             // The local terminal is implemented, so its section starts as a real,
-            // empty result instead of planned work. Which shell can be started is
+            // empty result instead of unread work. Which shell can be started is
             // decided by probing this machine, not by the build.
             sessions: Section::ready(Vec::new()),
-            hosts: Section::planned(),
+            // Reading the store is what fills this in, so it starts unread.
+            hosts: Section::loading(),
             // The transfer list is a real, empty result: a task appears in it only
             // because a worker reported it, which is what lets an empty page mean
             // "nothing was transferred" (R10).

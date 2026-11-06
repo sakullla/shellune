@@ -300,7 +300,7 @@ async fn language_and_text_size_shortcuts_are_wired(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 #[gpui::test]
-async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut TestAppContext) {
+async fn an_unavailable_action_shows_a_notice_instead_of_starting_work(cx: &mut TestAppContext) {
     // The transfers page has no primary action of its own - a transfer is started from
     // the file view of a session - so its header action must say that nothing started
     // instead of pretending one was queued.
@@ -341,26 +341,15 @@ async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut T
 
 #[gpui::test]
 async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut TestAppContext) {
-    // The hosts destination is implemented, so the only non-populated state it can
-    // really be in is "empty". The other three are exercised on a destination that
-    // still has them, through the same state card.
+    // No capability of this build is "planned" any more, so the states a section can
+    // really be in are loading, failed and empty; all three go through one state card.
     let cases = [
-        (
-            "planned",
-            Destination::Transfers,
-            Workspace::with_sections(
-                Section::<Session>::planned(),
-                Section::<HostConfig>::planned(),
-                Section::<Transfer>::planned(),
-            ),
-            SectionState::Planned,
-        ),
         (
             "loading",
             Destination::Transfers,
             Workspace::with_sections(
-                Section::<Session>::planned(),
-                Section::<HostConfig>::planned(),
+                Section::<Session>::ready(Vec::new()),
+                Section::<HostConfig>::ready(Vec::new()),
                 Section::<Transfer>::loading(),
             ),
             SectionState::Loading,
@@ -369,8 +358,8 @@ async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut Test
             "failed",
             Destination::Transfers,
             Workspace::with_sections(
-                Section::<Session>::planned(),
-                Section::<HostConfig>::planned(),
+                Section::<Session>::ready(Vec::new()),
+                Section::<HostConfig>::ready(Vec::new()),
                 Section::<Transfer>::failed(Failure::new(
                     "the transfer list could not be read",
                     Recovery::Retry,
@@ -382,9 +371,9 @@ async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut Test
             "empty",
             Destination::Hosts,
             Workspace::with_sections(
-                Section::<Session>::planned(),
+                Section::<Session>::ready(Vec::new()),
                 Section::<HostConfig>::ready(Vec::new()),
-                Section::<Transfer>::planned(),
+                Section::<Transfer>::ready(Vec::new()),
             ),
             SectionState::Empty,
         ),
@@ -467,8 +456,8 @@ async fn a_populated_section_renders_one_row_per_real_object(cx: &mut TestAppCon
             connected_local_session("pwsh"),
             connected_local_session("cmd"),
         ]),
-        Section::<HostConfig>::planned(),
-        Section::<Transfer>::planned(),
+        Section::<HostConfig>::ready(Vec::new()),
+        Section::<Transfer>::ready(Vec::new()),
     );
     let (view, cx) =
         cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
@@ -495,7 +484,6 @@ async fn a_populated_section_renders_one_row_per_real_object(cx: &mut TestAppCon
 #[test]
 fn only_a_ready_section_with_items_can_look_successful() {
     let states = [
-        (Section::<u8>::planned(), SectionState::Planned),
         (Section::<u8>::loading(), SectionState::Loading),
         (
             Section::<u8>::failed(Failure::new("boom", Recovery::Retry)),
@@ -526,8 +514,8 @@ fn local_and_all_session_destinations_stay_distinguishable() {
     remote.begin_connecting().expect("starts");
     let workspace = Workspace::with_sections(
         Section::ready(vec![remote]),
-        Section::<HostConfig>::planned(),
-        Section::<Transfer>::planned(),
+        Section::<HostConfig>::ready(Vec::new()),
+        Section::<Transfer>::ready(Vec::new()),
     );
 
     assert_eq!(
@@ -636,12 +624,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             empty_sessions_body,
             empty_transfers_title,
             empty_transfers_body,
-            state_planned,
-            planned_title,
-            planned_local,
-            planned_hosts,
-            planned_sessions,
-            planned_transfers,
             state_empty,
             state_ready,
             state_loading,
@@ -904,7 +886,6 @@ fn a_status_chip_never_stands_in_for_a_count_or_a_unit() {
         ENGLISH.count_transfers,
     ];
     let states = [
-        SectionState::Planned,
         SectionState::Loading,
         SectionState::Empty,
         SectionState::Failed,
@@ -1852,6 +1833,119 @@ fn the_notice_shortcut_steps_aside_for_a_terminal() {
     );
 }
 
+/// Ctrl+L inside a terminal belongs to the program running in it.
+///
+/// The same defect class as Escape, found in delivery review: the language toggle was
+/// bound to the window-wide context, so a shell never received `0x0c` and nothing in
+/// it could clear the screen. Measured before the fix: the pane's byte log stayed
+/// empty and the interface language flipped instead.
+#[gpui::test]
+async fn ctrl_l_reaches_the_program_running_in_the_terminal(cx: &mut TestAppContext) {
+    let default_shell = shellune_terminal::platform_default();
+    if !shellune_terminal::program_exists(default_shell.program()) {
+        return;
+    }
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    // The real bindings have to be installed, or the window has no Ctrl+L binding at
+    // all and the key reaches the pane no matter where the shortcut is scoped.
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let bounds = bounds_of(cx, "header.primary");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("a terminal must be shown");
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "the terminal owns the keyboard when it starts"
+    );
+
+    cx.simulate_keystrokes("ctrl-l");
+    cx.run_until_parked();
+    let sent = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    assert_eq!(
+        sent,
+        vec![0x0c],
+        "Ctrl+L must reach the shell as clear-screen, not be taken by the language shortcut"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::English,
+        "the language must not change when Ctrl+L is pressed inside a terminal"
+    );
+
+    // The control in the status bar is the in-terminal path to the same intent: it has
+    // to keep working, or the shortcut above would have made the language unreachable.
+    let control = bounds_of(cx, "status.language");
+    let control_center = control.center();
+    cx.simulate_click(
+        point(control_center.x, control_center.y),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese,
+        "the language control must switch the interface language"
+    );
+    let after_click = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    assert_eq!(
+        after_click,
+        vec![0x0c],
+        "clicking the language control must not type into the shell"
+    );
+
+    // And the key keeps reaching the shell after the switch. Clicking a control takes
+    // the keyboard out of the pane - the status bar is outside the terminal, as it is
+    // for the text-size control - so the keyboard is given back the way a user does it.
+    let viewport = bounds_of(cx, "terminal.viewport");
+    let viewport_center = viewport.center();
+    cx.simulate_click(
+        point(viewport_center.x, viewport_center.y),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "clicking the terminal gives it the keyboard back"
+    );
+    cx.simulate_keystrokes("ctrl-l");
+    cx.run_until_parked();
+    let sent = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    assert_eq!(
+        sent,
+        vec![0x0c, 0x0c],
+        "Ctrl+L must keep reaching the shell whatever the interface language is"
+    );
+}
+
+/// The language shortcut must not be reachable while a terminal has the keyboard.
+///
+/// The behavioural test above runs through the pane's own key handler, which a test
+/// window drives even when a binding would win in the real window; this one pins the
+/// binding itself, the way the Escape test pins the notice shortcut.
+#[test]
+fn the_language_shortcut_steps_aside_for_a_terminal() {
+    let bindings = key_bindings(Platform::Windows);
+    let language = bindings
+        .iter()
+        .find(|binding| {
+            binding
+                .keystrokes()
+                .iter()
+                .any(|keystroke| keystroke.key() == "l")
+        })
+        .expect("the language shortcut is bound to L");
+    let predicate = format!("{:?}", language.predicate());
+    assert!(
+        predicate.contains("Not") && predicate.contains(crate::app::TERMINAL_KEY_CONTEXT),
+        "Ctrl+L has to be bound outside the terminal context, got {predicate}"
+    );
+}
+
 #[gpui::test]
 async fn a_real_shell_that_exits_stops_being_listed_as_connected(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -2515,7 +2609,7 @@ async fn deleting_a_host_asks_first_and_the_file_follows(cx: &mut TestAppContext
     assert_eq!(reloaded.hosts().len(), 1, "the deletion reached the file");
 
     // The boundary: the last host can be deleted too, and an empty book is a real
-    // result rather than a planned capability.
+    // result, not a missing capability.
     click(cx, "hosts.delete.0");
     click(cx, "hosts.confirm.delete");
     cx.update(|_window, app| {

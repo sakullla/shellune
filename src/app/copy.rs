@@ -94,18 +94,6 @@ pub struct Strings {
     pub empty_transfers_title: &'static str,
     /// Empty-state body on the transfers destination.
     pub empty_transfers_body: &'static str,
-    /// Chip label for a capability this build does not ship.
-    pub state_planned: &'static str,
-    /// Title of the planned panel.
-    pub planned_title: &'static str,
-    /// Body of the planned panel for local shells.
-    pub planned_local: &'static str,
-    /// Body of the planned panel for hosts.
-    pub planned_hosts: &'static str,
-    /// Body of the planned panel for sessions.
-    pub planned_sessions: &'static str,
-    /// Body of the planned panel for transfers.
-    pub planned_transfers: &'static str,
     /// Chip label for an empty, loaded section.
     pub state_empty: &'static str,
     /// Chip label for a section holding real, non-empty data.
@@ -506,12 +494,6 @@ pub static ENGLISH: Strings = Strings {
     empty_sessions_body: "Local and remote terminals appear here with their own name, type and state.",
     empty_transfers_title: "No transfer yet",
     empty_transfers_body: "Uploads and downloads list their source, target and progress here.",
-    state_planned: "Not in this build",
-    planned_title: "This part is not built yet",
-    planned_local: "the local terminal that starts a real shell, shows output and accepts typing arrives with the terminal step.",
-    planned_hosts: "importing an SSH configuration arrives with the import step; no configuration file has been read yet.",
-    planned_sessions: "opening, switching and reconnecting sessions arrives with the session step; no terminal is running.",
-    planned_transfers: "uploading and downloading over SFTP arrives with the transfer step; no file has been touched.",
     state_empty: "Empty",
     state_ready: "Ready",
     state_loading: "Loading",
@@ -719,12 +701,6 @@ pub static CHINESE: Strings = Strings {
     empty_sessions_body: "本地与远程终端会各自显示名称、类型和当前状态。",
     empty_transfers_title: "还没有传输任务",
     empty_transfers_body: "上传与下载会在这里显示源、目标和进度。",
-    state_planned: "当前版本未包含",
-    planned_title: "这部分还没有实现",
-    planned_local: "真正启动 Shell、显示输出并接受输入的本地终端会随终端步骤一起提供。",
-    planned_hosts: "导入 SSH 配置会随导入步骤一起提供；目前还没有读取任何配置文件。",
-    planned_sessions: "打开、切换和重连会话随会话步骤一起提供；目前没有任何终端在运行。",
-    planned_transfers: "通过 SFTP 上传与下载随传输步骤一起提供；目前没有改动任何文件。",
     state_empty: "空",
     state_ready: "已就绪",
     state_loading: "加载中",
