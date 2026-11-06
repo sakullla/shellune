@@ -188,9 +188,11 @@ impl Tone {
     /// Maps a transfer state to its tone; only `Completed` is positive.
     pub fn for_transfer_state(state: &TransferState) -> Self {
         match state {
-            TransferState::Queued | TransferState::Running { .. } => Self::Warning,
+            TransferState::Queued
+            | TransferState::AwaitingOverwrite { .. }
+            | TransferState::Running { .. } => Self::Warning,
             TransferState::Completed { .. } => Self::Positive,
-            TransferState::Failed(_) | TransferState::Cancelled => Self::Danger,
+            TransferState::Failed { .. } | TransferState::Cancelled { .. } => Self::Danger,
         }
     }
 }

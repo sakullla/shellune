@@ -12,6 +12,7 @@
 //! * [agent] reaches SSH_AUTH_SOCK, the Windows OpenSSH pipe or Pageant;
 //! * [session] runs the attempt and the remote shell;
 //! * [sftp] browses directories over the connection the shell already authenticated;
+//! * [transfer] moves file contents over that same connection, under a temporary name;
 //! * [error] keeps every failure free of credentials.
 
 pub mod agent;
@@ -20,6 +21,7 @@ pub mod error;
 pub mod hostkey;
 pub mod session;
 pub mod sftp;
+pub mod transfer;
 
 /// A disposable OpenSSH server, for the tests that need a real one.
 #[cfg(any(test, feature = "test-support"))]
@@ -35,3 +37,4 @@ pub use session::{
     CONNECT_TIMEOUT, ConnectRequest, PtySize, RemoteEvent, RemoteSession, TERM_VALUE, TrustAnswer,
 };
 pub use sftp::FileLink;
+pub use transfer::{TransferCommand, TransferLink, TransferRequest};

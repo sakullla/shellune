@@ -36,6 +36,7 @@ use crate::auth::load_private_key;
 use crate::error::ConnectError;
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 use crate::sftp::{self, ChannelFailure, FileLink};
+use crate::transfer::{self, TransferLink};
 
 /// Value of the TERM variable the remote shell is told about.
 ///
@@ -230,6 +231,8 @@ pub struct RemoteSession {
     closed: bool,
     /// The browsable side of this connection, until a file view takes it.
     files: Option<FileLink>,
+    /// The transfer side of this connection, until the window takes it.
+    transfers: Option<TransferLink>,
 }
 
 impl RemoteSession {
@@ -252,6 +255,14 @@ impl RemoteSession {
             requests: file_request_rx,
             responses: file_responses,
         };
+        // The transfer tasks of this connection: the window sends commands, the tasks
+        // report progress and outcomes with the identifier of the task they belong to.
+        let (transfer_commands, transfer_command_rx) = unbounded_channel();
+        let (transfer_events, transfer_event_rx) = unbounded_channel();
+        let transfers = transfer::Wiring {
+            commands: transfer_command_rx,
+            events: transfer_events,
+        };
         let size = request.size;
         // The file browser asks the loop for its channel through the same command
         // channel the terminal uses, so it needs a sender of its own.
@@ -273,12 +284,15 @@ impl RemoteSession {
                 };
                 runtime.block_on(run(
                     request,
-                    command_rx,
-                    events,
-                    decision_rx,
-                    cancel_rx,
-                    files,
-                    open_commands,
+                    Channels {
+                        commands: command_rx,
+                        events,
+                        decisions: decision_rx,
+                        cancelled: cancel_rx,
+                        files,
+                        transfers,
+                        open: open_commands,
+                    },
                 ));
             })
             .expect("the SSH thread can be created");
@@ -291,7 +305,17 @@ impl RemoteSession {
             size,
             closed: false,
             files: Some(FileLink::new(file_requests, file_response_rx)),
+            transfers: Some(TransferLink::new(transfer_commands, transfer_event_rx)),
         }
+    }
+
+    /// Takes the transfer side of this connection.
+    ///
+    /// Taken once, by the window, for the same reason [`RemoteSession::take_file_link`]
+    /// is: the transfers then run on the connection the shell already authenticated and
+    /// never ask for credentials a second time. None means it was already taken.
+    pub fn take_transfer_link(&mut self) -> Option<TransferLink> {
+        self.transfers.take()
     }
 
     /// Takes the browsable side of this connection.
@@ -398,40 +422,43 @@ impl Drop for RemoteSession {
     }
 }
 
-/// Runs one attempt to completion, reporting everything through the event channel.
-async fn run(
-    request: ConnectRequest,
+/// Everything one attempt reports to and takes commands from.
+///
+/// They travel as one value because they are created together and all belong to the same
+/// connection: the terminal's commands, the answers to the identity question, the two
+/// subsystem wirings, and the channel a browser or a transfer opens its own channel
+/// through.
+struct Channels {
     commands: UnboundedReceiver<Command>,
     events: UnboundedSender<RemoteEvent>,
     decisions: UnboundedReceiver<TrustAnswer>,
     cancelled: UnboundedReceiver<()>,
     files: sftp::Wiring,
-    open_commands: UnboundedSender<Command>,
-) {
-    if let Err(error) = connect_and_shell(
-        request,
-        commands,
-        &events,
-        decisions,
-        cancelled,
-        files,
-        open_commands,
-    )
-    .await
-    {
+    transfers: transfer::Wiring,
+    open: UnboundedSender<Command>,
+}
+
+/// Runs one attempt to completion, reporting everything through the event channel.
+async fn run(request: ConnectRequest, channels: Channels) {
+    let events = channels.events.clone();
+    if let Err(error) = connect_and_shell(request, channels).await {
         let _ = events.send(RemoteEvent::Failed(error));
     }
 }
 
 async fn connect_and_shell(
     request: ConnectRequest,
-    mut commands: UnboundedReceiver<Command>,
-    events: &UnboundedSender<RemoteEvent>,
-    decisions: UnboundedReceiver<TrustAnswer>,
-    cancelled: UnboundedReceiver<()>,
-    files: sftp::Wiring,
-    open_commands: UnboundedSender<Command>,
+    channels: Channels,
 ) -> Result<(), ConnectError> {
+    let Channels {
+        mut commands,
+        events,
+        decisions,
+        cancelled,
+        files,
+        transfers,
+        open: open_commands,
+    } = channels;
     let target = request.target();
     let material = Material::resolve(request.auth).await?;
 
@@ -509,7 +536,8 @@ async fn connect_and_shell(
     // The file browser works on this same authenticated connection: its task asks
     // the loop below for an SFTP channel and then runs on its own, so reading a
     // directory never stops the terminal from reading or writing.
-    tokio::spawn(sftp::serve(files, open_commands));
+    tokio::spawn(sftp::serve(files, open_commands.clone()));
+    tokio::spawn(transfer::serve(transfers, open_commands));
 
     let (mut read_half, write_half) = channel.split();
     let mut exit_code: Option<u32> = None;
@@ -899,9 +927,10 @@ impl ScriptedSession {
                 events: event_rx,
                 size: PtySize::default(),
                 closed: false,
-                // A scripted session has no server, so it has no browsable side: the
-                // window's tests supply the browser's answers themselves.
+                // A scripted session has no server, so it has no browsable side and no
+                // transfer side: the window's tests supply those answers themselves.
                 files: None,
+                transfers: None,
             }),
             events,
             answers,

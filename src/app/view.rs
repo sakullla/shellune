@@ -32,7 +32,9 @@ use crate::app::actions::{
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(test)]
 use crate::app::files::BrowseChannel;
-use crate::app::files::{FileViews, FilesDialog, kind_label, problem_text};
+use crate::app::files::{
+    FileViews, FilesDialog, kind_label, path_problem_text, problem_text, transfer_problem_text,
+};
 use crate::app::hosts::{
     HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
     import_message,
@@ -43,6 +45,11 @@ use crate::app::remote::{self, MethodChoice, RemoteFailure, RemotePanel, RemoteS
 use crate::app::terminal::{PaneState, SourceEvent, TerminalPane};
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
+#[cfg(test)]
+use crate::app::transfers::TransferChannel;
+use crate::app::transfers::{
+    PathProblem, TransferProblem, TransferViews, default_download_directory, file_name,
+};
 use crate::app::workspace::{
     Failure, PrimaryOutcome, Recovery, SectionState, SectionStatus, Workspace,
 };
@@ -176,6 +183,20 @@ pub struct ShelluneView {
     trust_error: Option<String>,
     /// The file views of the remote sessions, one per browsable connection.
     files: FileViews,
+    /// The transfers of the remote sessions and how far each one is (R10, R17).
+    transfers: TransferViews,
+    /// Why the last upload or download could not start at all (R10).
+    ///
+    /// A path this window refuses keeps its own question open; a connection that cannot
+    /// take the command has no field to point at, so the reason is kept here and shown
+    /// with the transfer list of that session.
+    transfer_problem: Option<(SessionId, TransferProblem)>,
+    /// The session whose close is waiting for the user's answer (R10).
+    ///
+    /// It exists only while a session with active transfers has been asked about:
+    /// closing it cancels those transfers, and that is a consequence the user has to see
+    /// before it happens.
+    closing: Option<SessionId>,
     /// Whether the file views are being polled for answers.
     files_polling: bool,
     /// The change the file view is asking about before anything is sent (R11).
@@ -295,6 +316,9 @@ impl ShelluneView {
             trust_book: HostTrust::new(),
             trust_error: None,
             files: FileViews::new(),
+            transfers: TransferViews::new(),
+            transfer_problem: None,
+            closing: None,
             files_polling: false,
             files_dialog: None,
             files_field: None,
@@ -569,6 +593,254 @@ impl ShelluneView {
             self.reconnect = None;
         }
         cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // Transfers (R10, R17)
+    // -----------------------------------------------------------------------
+
+    /// Asks for the local file to upload into the directory on screen (R10).
+    ///
+    /// The question names the directory, so where the file would land is visible before
+    /// anything is sent; the field is where the local path is typed.
+    fn files_ask_upload(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(directory) = self
+            .files
+            .browser(id)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let placeholder = self.strings().transfers_upload_placeholder;
+        let field = cx.new(|cx| TextField::new(placeholder, cx));
+        self.open_files_dialog(
+            FilesDialog::Upload {
+                session: id,
+                directory,
+                text: String::new(),
+                problem: None,
+            },
+            field,
+            cx,
+        );
+    }
+
+    /// Asks where one remote entry should be downloaded to (R10).
+    ///
+    /// The folder starts at this account's home directory: a real place on this machine
+    /// that the user can correct, instead of an empty field with no hint.
+    fn files_ask_download(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
+        let Some(directory) = self
+            .files
+            .browser(id)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let remote = join_path(&directory, name);
+        let placeholder = self.strings().transfers_download_placeholder;
+        let suggested = default_download_directory();
+        let field = cx.new(|cx| TextField::with_text(placeholder, &suggested, cx));
+        self.open_files_dialog(
+            FilesDialog::Download {
+                session: id,
+                remote,
+                text: suggested,
+                problem: None,
+            },
+            field,
+            cx,
+        );
+    }
+
+    /// Starts the upload the question described, or says why it cannot start.
+    fn start_upload(&mut self, id: SessionId, local: &str, cx: &mut Context<Self>) {
+        let directory = self
+            .files
+            .browser(id)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned);
+        let started = self.transfers.upload(id, local, directory.as_deref());
+        self.finish_transfer_question(id, started, cx);
+    }
+
+    /// Starts the download the question described, or says why it cannot start.
+    fn start_download(
+        &mut self,
+        id: SessionId,
+        remote: &str,
+        folder: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let started = self.transfers.download(id, remote, folder);
+        self.finish_transfer_question(id, started, cx);
+    }
+
+    /// Closes a transfer question and refreshes the window, or keeps it open with the
+    /// reason it could not start.
+    fn finish_transfer_question(
+        &mut self,
+        id: SessionId,
+        started: Result<shellune_core::TransferId, TransferProblem>,
+        cx: &mut Context<Self>,
+    ) {
+        match started {
+            Ok(_) => {
+                self.files_dialog = None;
+                self.files_field = None;
+                self.transfer_problem = None;
+                self.watch_files(cx);
+            }
+            Err(problem) => {
+                // A connection that cannot take the command is not a mistake in what was
+                // typed, so the field keeps no mark for it: the list reports the failed
+                // task with the connection problem it is.
+                let field_problem = match problem {
+                    TransferProblem::SourceNamesNoFile => Some(PathProblem::NoName),
+                    TransferProblem::DirectoryUnknown => Some(PathProblem::Empty),
+                    TransferProblem::CommandRefused => None,
+                };
+                match (field_problem, self.files_dialog.as_mut()) {
+                    (Some(field_problem), Some(dialog)) => dialog.fail_path(field_problem),
+                    _ => {
+                        self.files_dialog = None;
+                        self.files_field = None;
+                        // Nothing was typed wrongly here: the connection could not take
+                        // the command, so the reason is reported beside the list.
+                        self.transfer_problem = Some((id, problem));
+                    }
+                }
+            }
+        }
+        self.sync_transfer_section();
+        cx.notify();
+    }
+
+    /// Cancels one transfer (R10).
+    fn transfer_cancel(&mut self, id: shellune_core::TransferId, cx: &mut Context<Self>) {
+        self.transfers.cancel(id);
+        self.sync_transfer_section();
+        cx.notify();
+    }
+
+    /// Starts a new task for a transfer that failed (R17).
+    ///
+    /// It is a new task with a new identifier, never a continuation: the bytes begin
+    /// again at zero, and the failed attempt stays in the list beside it.
+    fn transfer_retry(&mut self, id: shellune_core::TransferId, cx: &mut Context<Self>) {
+        self.transfers.retry(id);
+        self.watch_files(cx);
+        self.sync_transfer_section();
+        cx.notify();
+    }
+
+    /// Answers the question about an existing target (R10).
+    fn transfer_decide(
+        &mut self,
+        id: shellune_core::TransferId,
+        choice: shellune_core::OverwriteChoice,
+        cx: &mut Context<Self>,
+    ) {
+        self.transfers.decide(id, choice);
+        self.sync_transfer_section();
+        cx.notify();
+    }
+
+    /// Copies what the transfers really are into the section the transfers page lists.
+    ///
+    /// The page and the panel therefore read one source: a task the worker has not
+    /// reported is queued on both, and a completed one is never shown as running.
+    fn sync_transfer_section(&mut self) {
+        let items = self.transfers.transfers().to_vec();
+        self.workspace.replace_transfers(items);
+    }
+
+    /// Asks before closing a session that is moving files (R10).
+    ///
+    /// Closing a session cancels the transfers that belong to it, so that consequence is
+    /// stated first, with how many tasks would stop. A session with nothing in flight
+    /// closes at once, because there is nothing to warn about.
+    pub fn request_close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.transfers.active_count(id) > 0 {
+            self.closing = Some(id);
+            cx.notify();
+            return;
+        }
+        self.close_session(id, cx);
+    }
+
+    /// Keeps the session open and its transfers running.
+    fn cancel_close_session(&mut self, cx: &mut Context<Self>) {
+        self.closing = None;
+        cx.notify();
+    }
+
+    /// Closes the session the warning is about (R10).
+    ///
+    /// Only the transfers of this session are cancelled: the tasks of every other
+    /// session keep running, because closing one tab says nothing about another.
+    fn confirm_close_session(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.closing.take() else {
+            return;
+        };
+        self.close_session(id, cx);
+    }
+
+    /// The question shown before a session with active transfers is closed (R10).
+    fn close_transfer_question(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let id = self.closing?;
+        let active = self.transfers.active_count(id);
+        if active == 0 {
+            return None;
+        }
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let target = self
+            .workspace
+            .session(id)
+            .map_or_else(String::new, |session| session.title().to_owned());
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .flex_none()
+                .gap(metrics.scale(spacing::TIGHT))
+                .px(metrics.scale(spacing::SECTION))
+                .py(metrics.scale(spacing::HAIRLINE))
+                .bg(theme::swatch(palette::SURFACE_RAISED))
+                .border_b_1()
+                .border_color(theme::swatch(palette::DANGER))
+                .text_size(metrics.caption_size())
+                .debug_selector(|| "session.close.question".to_owned())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .debug_selector(|| "session.close.question.text".to_owned())
+                        .child(SharedString::from(format!(
+                            "{}: {target} · {active}",
+                            strings.transfers_close_question
+                        ))),
+                )
+                .child(self.text_button(
+                    SharedString::from("session.close.cancel"),
+                    strings.transfers_close_cancel,
+                    Tone::Neutral,
+                    cx,
+                    |view, cx| view.cancel_close_session(cx),
+                ))
+                .child(self.text_button(
+                    SharedString::from("session.close.confirm"),
+                    strings.transfers_close_confirm,
+                    Tone::Danger,
+                    cx,
+                    move |view, cx| view.confirm_close_session(cx),
+                )),
+        )
     }
 
     /// Closes every session, which is what leaving the application does (R7).
@@ -1381,6 +1653,10 @@ impl ShelluneView {
         // session: the file view then asks on the connection that is already
         // authenticated, and never has to ask for credentials a second time.
         let file_link = session.take_file_link();
+        // The transfer side is taken here too, for the same reason: a transfer runs on
+        // the connection the shell already authenticated and never asks for credentials
+        // of its own.
+        let transfer_link = session.take_transfer_link();
         let grid = GridSize::initial();
         let font_size = self.workspace.local_font_size();
         let locale = self.workspace.locale();
@@ -1401,6 +1677,9 @@ impl ShelluneView {
         if let Some(link) = file_link {
             self.files
                 .attach(id, host.name(), host.target(), Box::new(link));
+        }
+        if let Some(link) = transfer_link {
+            self.transfers.attach(id, Box::new(link));
         }
         self.push_pane(tag, pane, cx);
     }
@@ -1897,10 +2176,17 @@ impl ShelluneView {
                     .session_failure()
                     .unwrap_or(shellune_core::SessionFailure::ProcessExited { code: Some(0) });
                 self.workspace.session_failed(id, failure);
+                // A transfer that was running on this connection has lost it: it is
+                // reported as failed, never as completed and never as something the user
+                // cancelled, so a partial file is never presented as a finished one.
+                self.transfers
+                    .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
                 self.end_files(id);
             }
             PaneState::Failed(failure) => {
                 self.workspace.session_failed(id, failure);
+                self.transfers
+                    .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
                 self.end_files(id);
             }
         }
@@ -3807,6 +4093,11 @@ impl ShelluneView {
     fn end_files(&mut self, id: SessionId) {
         self.close_files_question(id);
         self.files.detach(id);
+        // A transfer of this session has nowhere left to go: its connection is the one
+        // that just ended, so its tasks are cancelled while the tasks of every other
+        // session keep their state (R10).
+        self.transfers.detach(id);
+        self.sync_transfer_section();
     }
 
     // -----------------------------------------------------------------------
@@ -3869,6 +4160,7 @@ impl ShelluneView {
             session: id,
             name: name.to_owned(),
             kind,
+            problem: None,
         });
         self.files_field = None;
         cx.notify();
@@ -3921,10 +4213,35 @@ impl ShelluneView {
     }
 
     /// Sends the change the question described, or says why it cannot be sent.
+    ///
+    /// Every answer to this is visible. A deletion the browser refuses - the entry was
+    /// removed by someone else since the last Refresh, or its directory is no longer
+    /// open - keeps the question on screen with the reason beside it, because a
+    /// confirmation button that does nothing cannot be told apart from a broken one.
     fn submit_files_change(&mut self, cx: &mut Context<Self>) {
         let Some(dialog) = self.files_dialog.clone() else {
             return;
         };
+        // A transfer question is answered by the transfer view, not by the browser: it
+        // creates a task that the list below then reports on.
+        match &dialog {
+            FilesDialog::Upload { session, text, .. } => {
+                self.start_upload(*session, text, cx);
+                return;
+            }
+            FilesDialog::Download {
+                session,
+                remote,
+                text,
+                ..
+            } => {
+                self.start_download(*session, remote, text, cx);
+                return;
+            }
+            FilesDialog::NewDirectory { .. }
+            | FilesDialog::Rename { .. }
+            | FilesDialog::Delete { .. } => {}
+        }
         let sent = match &dialog {
             FilesDialog::NewDirectory { session, text, .. } => {
                 self.files.create_directory(*session, text)
@@ -3936,6 +4253,7 @@ impl ShelluneView {
                 ..
             } => self.files.rename(*session, from, text),
             FilesDialog::Delete { session, name, .. } => self.files.delete(*session, name),
+            FilesDialog::Upload { .. } | FilesDialog::Download { .. } => Ok(()),
         };
         match sent {
             Ok(()) => {
@@ -3979,10 +4297,19 @@ impl ShelluneView {
     /// a server whose files cannot be read is never reported as a terminal that
     /// ended.
     fn pump_files(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.files.pump() {
+        let listed = self.files.pump();
+        let transferred = self.transfers.pump();
+        if transferred {
+            // The transfers page reads one list, so it is refreshed in the same tick in
+            // which the task that changed it was applied.
+            self.sync_transfer_section();
+        }
+        if listed || transferred {
             cx.notify();
         }
-        let open = self.files.any_open();
+        // The loop keeps running while a view is open or a transfer is still able to
+        // change: a transfer outlives no view, and a finished one needs no timer.
+        let open = self.files.any_open() || self.transfers.any_active();
         if !open {
             self.files_polling = false;
         }
@@ -4083,6 +4410,15 @@ impl ShelluneView {
                 Tone::Neutral,
                 cx,
                 move |view, cx| view.files_new(id, cx),
+            ))
+            // The upload asks where the file is, the download is asked for from the row
+            // of the file it would copy: each question names its own object.
+            .child(self.text_button(
+                SharedString::from("files.upload"),
+                strings.transfers_upload,
+                Tone::Neutral,
+                cx,
+                move |view, cx| view.files_ask_upload(id, cx),
             ))
             .child(self.text_button(
                 SharedString::from("files.close"),
@@ -4204,7 +4540,255 @@ impl ShelluneView {
         if let Some(report) = self.files_report(id) {
             panel = panel.child(report);
         }
+        // What is moving, how far it is and what it became, for this session only: a
+        // transfer of another session belongs to that session's own list.
+        panel = panel.child(self.transfers_panel(id, cx));
         panel
+    }
+
+    /// The transfers of one session: their state, their progress and the actions left (R10).
+    ///
+    /// Every line here comes from the queue, so nothing is drawn that a worker did not
+    /// report. A task waiting for an overwrite decision is asked about above its own row,
+    /// with the exact target and two buttons, because the answer decides whether a file
+    /// that already exists is replaced.
+    fn transfers_panel(&self, id: SessionId, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let locale = self.workspace.locale();
+        let tasks: Vec<Transfer> = self.transfers.for_session(id).cloned().collect();
+        let active = tasks.iter().filter(|task| task.is_active()).count();
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(metrics.scale(1.0))
+            .debug_selector(|| "transfers.panel".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .child(components::chip(
+                        strings.transfers_heading,
+                        Tone::Neutral,
+                        metrics,
+                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "transfers.count".to_owned())
+                            .child(SharedString::from(format!("{active}"))),
+                    ),
+            );
+
+        if let Some((session, problem)) = &self.transfer_problem
+            && *session == id
+        {
+            card = card.child(
+                div()
+                    .flex_none()
+                    .p(metrics.scale(spacing::HAIRLINE))
+                    .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(palette::SURFACE))
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Danger.text())
+                    .debug_selector(|| "transfers.refused".to_owned())
+                    .child(SharedString::from(transfer_problem_text(problem, strings))),
+            );
+        }
+
+        if tasks.is_empty() {
+            card = card.child(
+                div()
+                    .flex_none()
+                    .p(metrics.scale(spacing::HAIRLINE))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "transfers.empty".to_owned())
+                    .child(SharedString::from(strings.transfers_empty)),
+            );
+            return card;
+        }
+
+        for (index, task) in tasks.iter().enumerate() {
+            if task.state().is_awaiting_overwrite() {
+                card = card.child(self.transfer_overwrite_question(index, task, cx));
+            }
+            card = card.child(self.session_transfer_row(index, task, locale, cx));
+        }
+        card
+    }
+
+    /// The question about a target that already exists (R10).
+    ///
+    /// Nothing has been written into the target while this is shown, so both answers are
+    /// safe: replacing writes the file, keeping it leaves the original exactly as it was.
+    fn transfer_overwrite_question(
+        &self,
+        index: usize,
+        task: &Transfer,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let id = task.id();
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .p(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(palette::DANGER))
+            .text_size(metrics.caption_size())
+            .debug_selector(move || format!("transfers.overwrite.{index}"))
+            .child(
+                div()
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(move || format!("transfers.overwrite.text.{index}"))
+                    .child(SharedString::from(format!(
+                        "{}: {}",
+                        strings.transfers_overwrite_question,
+                        task.destination()
+                    ))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .child(self.text_button(
+                        SharedString::from(format!("transfers.overwrite.replace.{index}")),
+                        strings.transfers_overwrite_replace,
+                        Tone::Danger,
+                        cx,
+                        move |view, cx| {
+                            view.transfer_decide(id, shellune_core::OverwriteChoice::Replace, cx);
+                        },
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("transfers.overwrite.keep.{index}")),
+                        strings.transfers_overwrite_keep,
+                        Tone::Neutral,
+                        cx,
+                        move |view, cx| {
+                            view.transfer_decide(
+                                id,
+                                shellune_core::OverwriteChoice::KeepExisting,
+                                cx,
+                            );
+                        },
+                    )),
+            )
+    }
+
+    /// One transfer of a session: what it moves, how far it is and what it became.
+    fn session_transfer_row(
+        &self,
+        index: usize,
+        task: &Transfer,
+        locale: Locale,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let tone = Tone::for_transfer_state(task.state());
+        let id = task.id();
+        let state_label = copy::transfer_state_label(task.state(), locale);
+        let mut detail = match task.state() {
+            shellune_core::TransferState::Running {
+                transferred,
+                total: Some(total),
+            } => {
+                // The share is printed only when the whole is known: a percentage
+                // beside no total would be a guess about how much is left.
+                let percent = task.state().permille().map_or(0, |permille| permille / 10);
+                format!("{state_label} · {percent}% · {transferred}/{total} B")
+            }
+            shellune_core::TransferState::Running { transferred, .. } => {
+                format!("{state_label} · {transferred} B")
+            }
+            shellune_core::TransferState::Failed { failure, .. } => {
+                format!("{state_label} · {failure}")
+            }
+            _ => state_label.to_owned(),
+        };
+        if let Some(residue) = task.state().residue() {
+            detail.push_str(&format!(" · {}: {residue}", strings.transfers_residue));
+        }
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::HAIRLINE));
+        if task.is_active() && !task.state().is_awaiting_overwrite() {
+            actions = actions.child(self.text_button(
+                SharedString::from(format!("transfers.cancel.{index}")),
+                strings.transfers_cancel,
+                Tone::Danger,
+                cx,
+                move |view, cx| view.transfer_cancel(id, cx),
+            ));
+        }
+        if matches!(
+            task.state(),
+            shellune_core::TransferState::Failed { .. }
+                | shellune_core::TransferState::Cancelled { .. }
+        ) {
+            actions = actions.child(self.text_button(
+                SharedString::from(format!("transfers.retry.{index}")),
+                strings.transfers_retry,
+                Tone::Neutral,
+                cx,
+                move |view, cx| view.transfer_retry(id, cx),
+            ));
+        }
+        div()
+            .id(("transfers.row", index))
+            .debug_selector(move || format!("transfers.row.{index}"))
+            .flex()
+            .flex_col()
+            .flex_none()
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE))
+            .p(metrics.scale(2.0))
+            .text_size(metrics.caption_size())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .min_w(px(0.0))
+                    .child(components::status_dot(tone, metrics))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(move || format!("transfers.name.{index}"))
+                            .child(SharedString::from(format!(
+                                "{} {} → {}",
+                                theme::transfer_direction_label(task.direction()),
+                                task.source(),
+                                task.destination()
+                            ))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_color(tone.text())
+                    .debug_selector(move || format!("transfers.state.{index}"))
+                    .child(SharedString::from(detail)),
+            )
+            .child(actions)
     }
 
     /// The question about a change, when one is being asked for this session (R11).
@@ -4245,6 +4829,8 @@ impl ShelluneView {
             FilesDialog::NewDirectory { .. } => strings.files_new,
             FilesDialog::Rename { .. } => strings.files_rename,
             FilesDialog::Delete { .. } => strings.files_delete,
+            FilesDialog::Upload { .. } => strings.transfers_upload,
+            FilesDialog::Download { .. } => strings.transfers_download,
         };
         card = card.child(
             div()
@@ -4255,13 +4841,27 @@ impl ShelluneView {
         );
 
         match dialog {
-            FilesDialog::NewDirectory { .. } | FilesDialog::Rename { .. } => {
-                // A new folder goes into the directory on screen, so that is the target;
-                // a rename is about an entry that is already there, so its full path is.
+            FilesDialog::NewDirectory { .. }
+            | FilesDialog::Rename { .. }
+            | FilesDialog::Upload { .. }
+            | FilesDialog::Download { .. } => {
+                // Each question names the object it would act on: a new folder goes into
+                // the directory on screen, a rename keeps the entry's full path, an upload
+                // names the directory its file would land in, and a download names the
+                // remote entry it would copy.
                 let target = match dialog {
                     FilesDialog::Rename { from, .. } => directory
                         .as_deref()
                         .map_or_else(|| from.clone(), |directory| join_path(directory, from)),
+                    FilesDialog::Upload {
+                        directory,
+                        text: typed,
+                        ..
+                    } => match file_name(typed) {
+                        Some(name) => join_path(directory, name),
+                        None => directory.clone(),
+                    },
+                    FilesDialog::Download { remote, .. } => remote.clone(),
                     _ => directory.clone().unwrap_or_default(),
                 };
                 card = card.child(
@@ -4290,8 +4890,19 @@ impl ShelluneView {
                             .child(SharedString::from(problem_text(problem, strings))),
                     );
                 }
+                if let Some(problem) = dialog.path_problem() {
+                    card = card.child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(Tone::Danger.text())
+                            .debug_selector(|| "files.question.problem".to_owned())
+                            .child(SharedString::from(path_problem_text(problem, strings))),
+                    );
+                }
                 let confirm = match dialog {
                     FilesDialog::Rename { .. } => strings.files_rename_confirm,
+                    FilesDialog::Upload { .. } => strings.transfers_upload_confirm,
+                    FilesDialog::Download { .. } => strings.transfers_download_confirm,
                     _ => strings.files_create,
                 };
                 card = card.child(
@@ -4353,6 +4964,19 @@ impl ShelluneView {
                             strings.files_delete_file
                         })),
                 );
+                // A deletion the browser refuses says so here. Without it, confirming a
+                // delete of an entry that is no longer in the directory - removed by
+                // someone else, or gone since the last Refresh - would look like a button
+                // that does nothing at all.
+                if let Some(problem) = dialog.problem() {
+                    card = card.child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(Tone::Danger.text())
+                            .debug_selector(|| "files.question.problem".to_owned())
+                            .child(SharedString::from(problem_text(problem, strings))),
+                    );
+                }
                 card = card.child(
                     div()
                         .flex()
@@ -4507,6 +5131,7 @@ impl ShelluneView {
         let owned = name.to_owned();
         let rename = name.to_owned();
         let delete = name.to_owned();
+        let download = name.to_owned();
         let name_selector = format!("files.name.{index}");
         let mut entry_row = div()
             .id(("files.entry", index))
@@ -4556,8 +5181,8 @@ impl ShelluneView {
             .rounded(px(radius::SMALL))
             .bg(theme::swatch(palette::SURFACE))
             .child(entry_row)
-            .child(
-                div()
+            .child({
+                let mut actions = div()
                     .flex()
                     .items_center()
                     .flex_wrap()
@@ -4570,15 +5195,26 @@ impl ShelluneView {
                         Tone::Neutral,
                         cx,
                         move |view, cx| view.files_ask_rename(id, &rename, cx),
-                    ))
-                    .child(self.text_button(
-                        SharedString::from(format!("files.delete.{index}")),
-                        strings.files_delete,
-                        Tone::Danger,
+                    ));
+                // Only a file has content to copy, so only a file offers a download: a
+                // directory that showed the button would promise a transfer it cannot do.
+                if !openable {
+                    actions = actions.child(self.text_button(
+                        SharedString::from(format!("files.download.{index}")),
+                        strings.transfers_download,
+                        Tone::Neutral,
                         cx,
-                        move |view, cx| view.files_ask_delete(id, &delete, kind, cx),
-                    )),
-            )
+                        move |view, cx| view.files_ask_download(id, &download, cx),
+                    ));
+                }
+                actions.child(self.text_button(
+                    SharedString::from(format!("files.delete.{index}")),
+                    strings.files_delete,
+                    Tone::Danger,
+                    cx,
+                    move |view, cx| view.files_ask_delete(id, &delete, kind, cx),
+                ))
+            })
     }
     /// tests that check what the window does with a listing therefore attach their
     /// own channel here.
@@ -4593,6 +5229,53 @@ impl ShelluneView {
     ) {
         self.files.attach(id, host, target, channel);
         cx.notify();
+    }
+
+    /// Attaches a scripted transfer channel to one session, for a test.
+    ///
+    /// The window creates the real one when a connection becomes live; a test that
+    /// checks what the window does with a running transfer therefore supplies its own.
+    #[cfg(test)]
+    pub(crate) fn attach_transfers_for_test(
+        &mut self,
+        id: SessionId,
+        channel: Box<dyn TransferChannel>,
+        cx: &mut Context<Self>,
+    ) {
+        self.transfers.attach(id, channel);
+        cx.notify();
+    }
+
+    /// The session whose close is being asked about, for a test.
+    #[cfg(test)]
+    pub fn closing_for_test(&self) -> Option<SessionId> {
+        self.closing
+    }
+
+    /// Replaces the text of the open question, for a test that types without a keyboard.
+    #[cfg(test)]
+    pub fn files_question_set_text_for_test(&mut self, text: &str) {
+        if let Some(dialog) = self.files_dialog.as_mut() {
+            dialog.set_text(text.to_owned());
+        }
+    }
+
+    /// Sends the open question, for a test that cannot press the confirm button.
+    #[cfg(test)]
+    pub(crate) fn submit_files_change_for_test(&mut self, cx: &mut Context<Self>) {
+        self.submit_files_change(cx);
+    }
+
+    /// Every transfer the window knows about, for a test.
+    #[cfg(test)]
+    pub fn transfer_tasks(&self) -> Vec<Transfer> {
+        self.transfers.transfers().to_vec()
+    }
+
+    /// How many tasks of one session can still change, for a test.
+    #[cfg(test)]
+    pub fn transfer_active_count(&self, id: SessionId) -> usize {
+        self.transfers.active_count(id)
     }
 
     /// The file view of one session, as the window holds it.
@@ -4779,7 +5462,7 @@ impl ShelluneView {
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.close_session(id, cx);
+                        this.request_close_session(id, cx);
                     }))
                     .child(SharedString::from("×")),
             )
@@ -4891,7 +5574,7 @@ impl ShelluneView {
                         strings.session_close,
                         Tone::Neutral,
                         cx,
-                        move |view, cx| view.close_session(id, cx),
+                        move |view, cx| view.request_close_session(id, cx),
                     )),
             )
     }
@@ -5229,6 +5912,7 @@ impl Render for ShelluneView {
                     .child(self.header(cx))
                     .children(notice)
                     .children((!self.tab_sessions().is_empty()).then(|| self.tab_strip(cx)))
+                    .children(self.close_transfer_question(cx))
                     .child(self.destination_panel(cx))
                     .child(self.status_bar()),
             )

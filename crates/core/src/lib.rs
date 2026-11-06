@@ -37,6 +37,6 @@ pub use session::{
 };
 pub use shell::LocalShell;
 pub use task::{
-    Transfer, TransferDirection, TransferEvent, TransferFailure, TransferState, TransferUpdate,
-    TransferUpdateError,
+    OverwriteChoice, Transfer, TransferDirection, TransferEvent, TransferFailure, TransferQueue,
+    TransferState, TransferUpdate, TransferUpdateError,
 };

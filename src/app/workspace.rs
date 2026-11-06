@@ -291,7 +291,10 @@ impl Workspace {
             // decided by probing this machine, not by the build.
             sessions: Section::ready(Vec::new()),
             hosts: Section::planned(),
-            transfers: Section::planned(),
+            // The transfer list is a real, empty result: a task appears in it only
+            // because a worker reported it, which is what lets an empty page mean
+            // "nothing was transferred" (R10).
+            transfers: Section::ready(Vec::new()),
             shells: shellune_terminal::discover(),
             shell_choice: 0,
             local_font_size: shellune_terminal::DEFAULT_FONT_SIZE,
@@ -410,6 +413,15 @@ impl Workspace {
     /// Transfer tasks.
     pub fn transfers(&self) -> &Section<Transfer> {
         &self.transfers
+    }
+
+    /// Replaces the transfer list with what the transfer view really holds.
+    ///
+    /// The items come from the same queue the panel reads, so the page cannot show a
+    /// task the panel does not have, and a completed transfer is listed as completed on
+    /// both.
+    pub fn replace_transfers(&mut self, items: Vec<Transfer>) {
+        self.transfers.replace(SectionStatus::Ready, items);
     }
 
     /// Sessions that run on this machine.

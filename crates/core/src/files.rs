@@ -232,8 +232,11 @@ impl std::fmt::Display for BrowseFailure {
             ),
             Self::NotFound { path } => write!(formatter, "{path} does not exist on the server"),
             Self::NotADirectory { path } => write!(formatter, "{path} is not a directory"),
+            // The same variant is returned by listings, creates, renames and deletes,
+            // so the sentence must not claim one of them: "read" here would describe a
+            // delete as something it never was.
             Self::PermissionDenied { path } => {
-                write!(formatter, "the server refused to read {path}")
+                write!(formatter, "the server refused access to {path}")
             }
             Self::AlreadyExists { path } => {
                 write!(formatter, "{path} already exists on the server")

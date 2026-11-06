@@ -106,6 +106,19 @@ runuser -u '{user}' -- bash '{file}'",
         self.wsl(&["bash", "-c", &command])
     }
 
+    /// Runs one shell script as root inside the disposable server's environment.
+    ///
+    /// A few conditions can only be made from outside the account - a disk that is
+    /// really full, for instance - and they have to be injected on the machine that
+    /// runs the server instead of being faked in the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the script wrote to the error stream.
+    pub fn as_root(&self, script: &str) -> Result<String, String> {
+        self.wsl(&["bash", "-c", script])
+    }
+
     /// Every line the server wrote to its log so far.
     ///
     /// The log is how a test shows that browsing a directory did not authenticate

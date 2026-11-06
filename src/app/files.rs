@@ -30,6 +30,7 @@ use shellune_core::{
 use shellune_ssh::FileLink;
 
 use crate::app::copy::Strings;
+use crate::app::transfers::{PathProblem, TransferProblem};
 
 /// Where a file view sends its requests and reads the answers.
 ///
@@ -292,12 +293,16 @@ impl FileViews {
         false
     }
 }
-/// The question the file view is asking before anything is sent (R11).
+/// The question the file view is asking before anything is sent (R11, R10).
 ///
 /// A change to a server is asked for twice: once in the dialog, where the user sees
 /// the exact target, the kind and - for a directory - that its contents go too, and
 /// once when the answer arrives. Nothing is sent while this exists, so cancelling is
 /// never a request the server has to ignore.
+///
+/// The two transfer questions are shaped the same way: the upload names the file and
+/// the directory it would land in, the download names the entry and the folder it would
+/// be written to. Neither starts a task until it is answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilesDialog {
     /// A new directory is named but not created.
@@ -328,6 +333,34 @@ pub enum FilesDialog {
         name: String,
         /// What the entry is, as the listing reported it.
         kind: FileKind,
+        /// Why the deletion could not be sent, when it could not.
+        ///
+        /// A confirmation that is answered with nothing is the one thing this dialog
+        /// must never do: the entry may have vanished since the listing was read, and
+        /// that is a reason the user has to see rather than a button that does nothing.
+        problem: Option<NameProblem>,
+    },
+    /// A local file is chosen for upload but nothing was sent yet.
+    Upload {
+        /// The session whose directory would receive the file.
+        session: SessionId,
+        /// The directory on screen, which is where the file would land.
+        directory: String,
+        /// The local path the user typed.
+        text: String,
+        /// Why the last attempt could not start, when it could not.
+        problem: Option<PathProblem>,
+    },
+    /// A remote entry is chosen for download but nothing was sent yet.
+    Download {
+        /// The session the entry belongs to.
+        session: SessionId,
+        /// The remote path of the entry.
+        remote: String,
+        /// The local directory the user typed.
+        text: String,
+        /// Why the last attempt could not start, when it could not.
+        problem: Option<PathProblem>,
     },
 }
 
@@ -338,7 +371,9 @@ impl FilesDialog {
         match self {
             Self::NewDirectory { session, .. }
             | Self::Rename { session, .. }
-            | Self::Delete { session, .. } => *session,
+            | Self::Delete { session, .. }
+            | Self::Upload { session, .. }
+            | Self::Download { session, .. } => *session,
         }
     }
 
@@ -347,7 +382,10 @@ impl FilesDialog {
     #[must_use]
     pub fn text(&self) -> Option<&str> {
         match self {
-            Self::NewDirectory { text, .. } | Self::Rename { text, .. } => Some(text),
+            Self::NewDirectory { text, .. }
+            | Self::Rename { text, .. }
+            | Self::Upload { text, .. }
+            | Self::Download { text, .. } => Some(text),
             Self::Delete { .. } => None,
         }
     }
@@ -359,6 +397,10 @@ impl FilesDialog {
                 *text = typed;
                 *problem = None;
             }
+            Self::Upload { text, problem, .. } | Self::Download { text, problem, .. } => {
+                *text = typed;
+                *problem = None;
+            }
             Self::Delete { .. } => {}
         }
     }
@@ -366,12 +408,22 @@ impl FilesDialog {
     /// States why the text cannot be sent, keeping the text in front of the user.
     pub fn fail(&mut self, failure: NameProblem) {
         match self {
-            Self::NewDirectory { problem, .. } | Self::Rename { problem, .. } => {
+            Self::NewDirectory { problem, .. }
+            | Self::Rename { problem, .. }
+            | Self::Delete { problem, .. } => {
                 *problem = Some(failure);
             }
-            // A deletion has no text to correct; a refusal about it is answered by the
-            // browser instead of by this question.
-            Self::Delete { .. } => {}
+            Self::Upload { .. } | Self::Download { .. } => {}
+        }
+    }
+
+    /// States why a transfer could not start, keeping what the user typed.
+    pub fn fail_path(&mut self, failure: PathProblem) {
+        match self {
+            Self::Upload { problem, .. } | Self::Download { problem, .. } => {
+                *problem = Some(failure);
+            }
+            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => {}
         }
     }
 
@@ -379,9 +431,43 @@ impl FilesDialog {
     #[must_use]
     pub fn problem(&self) -> Option<&NameProblem> {
         match self {
-            Self::NewDirectory { problem, .. } | Self::Rename { problem, .. } => problem.as_ref(),
-            Self::Delete { .. } => None,
+            Self::NewDirectory { problem, .. }
+            | Self::Rename { problem, .. }
+            | Self::Delete { problem, .. } => problem.as_ref(),
+            Self::Upload { .. } | Self::Download { .. } => None,
         }
+    }
+
+    /// Why a transfer could not start, when it could not.
+    #[must_use]
+    pub fn path_problem(&self) -> Option<&PathProblem> {
+        match self {
+            Self::Upload { problem, .. } | Self::Download { problem, .. } => problem.as_ref(),
+            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => None,
+        }
+    }
+}
+
+/// What the transfer questions say about a path the window refused, in the current
+/// language.
+///
+/// The domain names the reason; the words come from the string table, because a reason
+/// the user cannot read is the same as no reason at all.
+#[must_use]
+pub fn path_problem_text(problem: &PathProblem, strings: &Strings) -> &'static str {
+    match problem {
+        PathProblem::Empty => strings.transfers_problem_empty_path,
+        PathProblem::NoName => strings.transfers_problem_no_name,
+    }
+}
+
+/// What the view says when a transfer cannot be started at all.
+#[must_use]
+pub fn transfer_problem_text(problem: &TransferProblem, strings: &Strings) -> &'static str {
+    match problem {
+        TransferProblem::SourceNamesNoFile => strings.transfers_problem_no_source,
+        TransferProblem::DirectoryUnknown => strings.transfers_problem_no_directory,
+        TransferProblem::CommandRefused => strings.transfers_problem_no_connection,
     }
 }
 

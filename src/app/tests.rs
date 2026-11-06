@@ -301,8 +301,9 @@ async fn language_and_text_size_shortcuts_are_wired(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut TestAppContext) {
-    // Transfers are still unimplemented, so their primary action must say so
-    // instead of pretending a transfer was started.
+    // The transfers page has no primary action of its own - a transfer is started from
+    // the file view of a session - so its header action must say that nothing started
+    // instead of pretending one was queued.
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     focus_root(&view, cx);
@@ -324,10 +325,7 @@ async fn a_planned_capability_shows_a_notice_instead_of_starting_work(cx: &mut T
             workspace.notice(),
             Some(crate::app::workspace::Notice::UnavailableBuild)
         );
-        assert_eq!(
-            workspace.state(Destination::Transfers),
-            SectionState::Planned
-        );
+        assert_eq!(workspace.state(Destination::Transfers), SectionState::Empty);
         assert_eq!(workspace.item_count(Destination::Transfers), 0);
         assert_eq!(workspace.item_count(Destination::Hosts), 0);
         assert!(
@@ -547,8 +545,9 @@ fn local_and_all_session_destinations_stay_distinguishable() {
 #[test]
 fn an_unimplemented_action_reports_that_nothing_started() {
     let mut workspace = Workspace::new();
-    // Transfers are still unimplemented: their primary action must report that
-    // nothing started rather than pretend a transfer was queued.
+    // The transfers page is a real, empty result now, and it has no primary action of
+    // its own: asking for one must report that nothing started rather than pretend a
+    // transfer was queued.
     workspace.select(Destination::Transfers);
     assert_eq!(workspace.request_primary(), PrimaryOutcome::Unavailable);
     assert_eq!(
@@ -556,10 +555,7 @@ fn an_unimplemented_action_reports_that_nothing_started() {
         Some(crate::app::workspace::Notice::UnavailableBuild)
     );
     assert_eq!(workspace.item_count(Destination::Transfers), 0);
-    assert_eq!(
-        workspace.state(Destination::Transfers),
-        SectionState::Planned
-    );
+    assert_eq!(workspace.state(Destination::Transfers), SectionState::Empty);
 
     // The session list is implemented but real and empty: it says so instead of
     // claiming the capability is missing or showing a session that does not exist.
@@ -4497,6 +4493,55 @@ fn live_remote(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> Sessi
     id
 }
 
+/// Connects the seeded host again and returns the session that is new.
+///
+/// [live_remote] answers with the first connected session, which is the right answer
+/// only while there is one; a test that needs a second one has to say which it already
+/// has.
+fn live_remote_second(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    known: SessionId,
+) -> SessionId {
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"second ready\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+    let id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .find(|session| {
+                    session.id() != known
+                        && session.kind().is_remote()
+                        && matches!(session.state(), SessionState::Connected)
+                })
+                .map(|session| session.id())
+        })
+        .expect("the second remote session is live");
+    click(cx, "nav.sessions");
+    id
+}
+
 /// Applies what the file views reported, the way the poll loop does.
 fn pump_files(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) {
     cx.update(|_window, app| {
@@ -5239,5 +5284,474 @@ async fn a_deep_path_is_readable_instead_of_being_cut_off(cx: &mut TestAppContex
     assert!(
         long.size.height > short.size.height,
         "a deep path takes more lines instead of losing its end: {short:?} vs {long:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transfers (R10, R17)
+// ---------------------------------------------------------------------------
+
+/// The commands a transfer view sent in a test, and the events it receives.
+#[derive(Clone, Default)]
+struct TransferAnswers(std::sync::Arc<std::sync::Mutex<TransferScript>>);
+
+#[derive(Default)]
+struct TransferScript {
+    sent: Vec<shellune_ssh::TransferCommand>,
+    events: Vec<shellune_core::TransferEvent>,
+    accepting: bool,
+}
+
+impl TransferAnswers {
+    fn accepting() -> Self {
+        let answers = Self::default();
+        answers.0.lock().expect("a free lock").accepting = true;
+        answers
+    }
+
+    fn push(&self, event: shellune_core::TransferEvent) {
+        self.0.lock().expect("a free lock").events.push(event);
+    }
+
+    fn commands(&self) -> Vec<shellune_ssh::TransferCommand> {
+        self.0.lock().expect("a free lock").sent.clone()
+    }
+
+    /// The tasks the window asked the connection to start.
+    fn starts(&self) -> Vec<shellune_ssh::TransferRequest> {
+        self.commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                shellune_ssh::TransferCommand::Start(request) => Some(request),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn decisions(&self) -> Vec<(shellune_core::TransferId, shellune_core::OverwriteChoice)> {
+        self.commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                shellune_ssh::TransferCommand::Decide { transfer, choice } => {
+                    Some((transfer, choice))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cancels(&self) -> Vec<shellune_core::TransferId> {
+        self.commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                shellune_ssh::TransferCommand::Cancel { transfer } => Some(transfer),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl crate::app::transfers::TransferChannel for TransferAnswers {
+    fn send(&mut self, command: shellune_ssh::TransferCommand) -> bool {
+        let mut script = self.0.lock().expect("a free lock");
+        script.sent.push(command);
+        script.accepting
+    }
+
+    fn drain(&mut self) -> Vec<shellune_core::TransferEvent> {
+        std::mem::take(&mut self.0.lock().expect("a free lock").events)
+    }
+}
+
+/// Opens the file view of a live remote session and attaches a transfer channel.
+fn open_transfers(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+) -> (FileAnswers, TransferAnswers) {
+    let files = open_files(cx, view, id);
+    let transfers = TransferAnswers::accepting();
+    let channel = transfers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_transfers_for_test(id, Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    (files, transfers)
+}
+
+#[gpui::test]
+async fn an_upload_asks_for_the_file_and_then_reports_the_task_it_started(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    assert!(
+        cx.debug_bounds("transfers.panel").is_some(),
+        "the transfer list belongs to the file view"
+    );
+    assert!(
+        cx.debug_bounds("transfers.empty").is_some(),
+        "nothing was transferred yet, and that is said instead of implied"
+    );
+
+    // The question is asked before anything is sent.
+    click(cx, "files.upload");
+    assert!(
+        cx.debug_bounds("files.question").is_some(),
+        "the upload question names its target"
+    );
+    assert!(
+        transfers.starts().is_empty(),
+        "answering the question is what starts a task, not opening it"
+    );
+
+    // Typing the local path and confirming creates a real task on the connection.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/报告 终稿.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 1, "one task was started: {starts:?}");
+    assert_eq!(starts[0].source, "C:/work/报告 终稿.txt");
+    assert_eq!(
+        starts[0].destination, "/home/deploy/报告 终稿.txt",
+        "the file keeps its own name in the directory on screen"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(id)),
+        1
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_tasks().len()),
+        1,
+        "the list now holds the task instead of the empty note"
+    );
+    assert!(
+        cx.debug_bounds("transfers.row.0").is_some(),
+        "the task is drawn with its source and target"
+    );
+}
+
+#[gpui::test]
+async fn an_existing_target_is_asked_about_and_keeping_it_writes_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/notes.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let task = transfers.starts()[0].transfer;
+
+    // The worker found the target already there.
+    transfers.push(shellune_core::TransferEvent::target_exists(
+        task,
+        Some(2048),
+    ));
+    pump_files(cx, &view);
+    assert!(
+        cx.debug_bounds("transfers.overwrite.0").is_some(),
+        "the question names the target before anything is written"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).transfer_tasks()[0].state().is_success()),
+        "a target that exists is not a finished transfer"
+    );
+
+    // Keeping it sends the decision and ends as cancelled, never as complete.
+    click(cx, "transfers.overwrite.keep.0");
+    let decisions = transfers.decisions();
+    assert_eq!(
+        decisions,
+        vec![(task, shellune_core::OverwriteChoice::KeepExisting)]
+    );
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Cancelled { residue: None },
+    });
+    pump_files(cx, &view);
+    let tasks = cx.update(|_window, app| view.read(app).transfer_tasks());
+    assert!(!tasks[0].state().is_success());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(id)),
+        0
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).transfer_tasks()[0]
+            .state()
+            .is_awaiting_overwrite()),
+        "an answered question is not asked again"
+    );
+}
+
+#[gpui::test]
+async fn replacing_an_existing_target_is_what_the_user_confirmed(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/notes.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let task = transfers.starts()[0].transfer;
+    transfers.push(shellune_core::TransferEvent::target_exists(task, Some(16)));
+    pump_files(cx, &view);
+
+    click(cx, "transfers.overwrite.replace.0");
+    assert_eq!(
+        transfers.decisions(),
+        vec![(task, shellune_core::OverwriteChoice::Replace)]
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).transfer_tasks()[0]
+            .state()
+            .is_awaiting_overwrite()),
+        "the transfer only starts writing once the answer is applied"
+    );
+
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::OverwriteConfirmed,
+    });
+    transfers.push(shellune_core::TransferEvent::progress(task, 16, Some(16)));
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Completed { bytes: 16 },
+    });
+    pump_files(cx, &view);
+    assert!(
+        cx.update(|_window, app| view.read(app).transfer_tasks()[0].state().is_success()),
+        "the target really holds the content now"
+    );
+    // The transfers page reads the same list.
+    click(cx, "nav.transfers");
+    assert!(
+        cx.debug_bounds("row.0").is_some(),
+        "the finished transfer is listed on its own page"
+    );
+}
+
+#[gpui::test]
+async fn cancelling_a_transfer_stops_it_and_a_retry_is_a_new_task(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let task = transfers.starts()[0].transfer;
+    transfers.push(shellune_core::TransferEvent::progress(
+        task,
+        1024,
+        Some(4096),
+    ));
+    pump_files(cx, &view);
+
+    click(cx, "transfers.cancel.0");
+    assert_eq!(transfers.cancels(), vec![task]);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(id)),
+        0,
+        "a cancelled task is finished at once"
+    );
+
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Cancelled {
+            residue: Some("/home/deploy/.shellune-part-1".to_owned()),
+        },
+    });
+    pump_files(cx, &view);
+    let tasks = cx.update(|_window, app| view.read(app).transfer_tasks());
+    assert_eq!(
+        tasks[0].state().residue(),
+        Some("/home/deploy/.shellune-part-1"),
+        "a partial file that stayed behind is named"
+    );
+
+    // Retrying is a second task, not a continuation of the first.
+    click(cx, "transfers.retry.0");
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 2, "a retry starts a task of its own");
+    assert_ne!(starts[1].transfer, task);
+    assert_eq!(starts[1].source, "C:/work/report.txt");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_tasks().len()),
+        2,
+        "the cancelled task stays readable beside the new one"
+    );
+}
+
+#[gpui::test]
+async fn closing_a_session_with_a_running_transfer_warns_first_and_cancels_only_that_session(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let first = live_remote(cx, &view);
+    let (_files, first_transfers) = open_transfers(cx, &view, first);
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/a.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let task = first_transfers.starts()[0].transfer;
+
+    // A second session with a transfer of its own, which must survive.
+    let second = live_remote_second(cx, &view, first);
+    let (_files, second_transfers) = open_transfers(cx, &view, second);
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/b.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Closing the first session asks before it cancels anything.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.request_close_session(first, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.close.question").is_some(),
+        "the effect on the transfers is stated first"
+    );
+    assert!(
+        first_transfers.cancels().is_empty(),
+        "asking is not cancelling"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(first)),
+        1
+    );
+
+    // Cancelling the close leaves everything running.
+    click(cx, "session.close.cancel");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        None,
+        "the question goes away and nothing is closed"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(first)),
+        1,
+        "the session and its transfer are untouched"
+    );
+
+    // Confirming closes the session, cancels its own task and leaves the other one alone.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.request_close_session(first, cx));
+    });
+    cx.run_until_parked();
+    click(cx, "session.close.confirm");
+    assert_eq!(first_transfers.cancels(), vec![task]);
+    assert!(
+        second_transfers.cancels().is_empty(),
+        "the other session's transfer keeps running"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(second)),
+        1
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(first)
+            .map(|session| matches!(session.state(), SessionState::Closed))),
+        Some(true),
+        "the session really closed"
+    );
+}
+
+#[gpui::test]
+async fn a_delete_the_browser_refuses_keeps_its_question_and_says_why(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = open_files(cx, &view, id);
+
+    click(cx, "files.delete.1");
+    assert!(
+        cx.debug_bounds("files.question").is_some(),
+        "the delete question is open"
+    );
+
+    // The entry is gone from the directory: refreshing is what makes the confirmation
+    // stale, exactly as another person deleting it would.
+    click(cx, "files.refresh");
+    files.reply(
+        2,
+        "/home/deploy",
+        &[("docs", shellune_core::FileKind::Directory)],
+    );
+    pump_files(cx, &view);
+    click(cx, "files.question.confirm");
+    assert!(
+        cx.debug_bounds("files.question.problem").is_some(),
+        "a confirmation that cannot be sent states the reason instead of doing nothing"
+    );
+    assert!(
+        cx.debug_bounds("files.question").is_some(),
+        "the question stays open with the reason beside it"
+    );
+}
+
+#[gpui::test]
+async fn a_connection_that_cannot_take_a_transfer_says_so(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let _files = open_files(cx, &view, id);
+    // A channel whose connection is already gone.
+    let closed = TransferAnswers::default();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_transfers_for_test(id, Box::new(closed.clone()), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/a.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("transfers.refused").is_some(),
+        "a command that never left the process is reported where the list is"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(id)),
+        0,
+        "no task is left claiming to run"
     );
 }

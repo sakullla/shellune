@@ -23,6 +23,7 @@ pub mod remote;
 pub mod terminal;
 pub mod text_field;
 pub mod theme;
+pub mod transfers;
 mod view;
 pub mod workspace;
 

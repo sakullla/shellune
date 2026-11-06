@@ -441,6 +441,50 @@ pub struct Strings {
     pub files_problem_missing: &'static str,
     /// Reason: the new name is the old one.
     pub files_problem_unchanged: &'static str,
+    /// Heading of the transfer list of a session.
+    pub transfers_heading: &'static str,
+    /// Said when a session has no transfer yet.
+    pub transfers_empty: &'static str,
+    /// Button that asks for the local file to upload.
+    pub transfers_upload: &'static str,
+    /// Button that sends an upload.
+    pub transfers_upload_confirm: &'static str,
+    /// Placeholder of the field that holds the local file to upload.
+    pub transfers_upload_placeholder: &'static str,
+    /// Button that asks where one entry is downloaded to.
+    pub transfers_download: &'static str,
+    /// Button that sends a download.
+    pub transfers_download_confirm: &'static str,
+    /// Placeholder of the field that holds the local folder.
+    pub transfers_download_placeholder: &'static str,
+    /// Button that stops a transfer.
+    pub transfers_cancel: &'static str,
+    /// Button that starts a new task for one that did not finish.
+    pub transfers_retry: &'static str,
+    /// Word before the partial file a failed transfer left behind.
+    pub transfers_residue: &'static str,
+    /// Question asked before an existing target is replaced.
+    pub transfers_overwrite_question: &'static str,
+    /// Answer that replaces the existing target.
+    pub transfers_overwrite_replace: &'static str,
+    /// Answer that keeps the existing target.
+    pub transfers_overwrite_keep: &'static str,
+    /// Reason: the path is empty.
+    pub transfers_problem_empty_path: &'static str,
+    /// Reason: the path names no file.
+    pub transfers_problem_no_name: &'static str,
+    /// Reason: the source names no file.
+    pub transfers_problem_no_source: &'static str,
+    /// Reason: no directory is known for the target.
+    pub transfers_problem_no_directory: &'static str,
+    /// Reason: the connection cannot take the command.
+    pub transfers_problem_no_connection: &'static str,
+    /// Question asked before a session with running transfers is closed.
+    pub transfers_close_question: &'static str,
+    /// Answer that keeps a session open.
+    pub transfers_close_cancel: &'static str,
+    /// Answer that closes the session and cancels its transfers.
+    pub transfers_close_confirm: &'static str,
 }
 
 /// English copy.
@@ -632,6 +676,28 @@ pub static ENGLISH: Strings = Strings {
     files_problem_taken: "An entry with that name already exists here.",
     files_problem_missing: "That entry is no longer in this directory.",
     files_problem_unchanged: "The name did not change.",
+    transfers_heading: "Transfers",
+    transfers_empty: "Nothing is being moved for this session.",
+    transfers_upload: "Upload",
+    transfers_upload_confirm: "Upload",
+    transfers_upload_placeholder: "Local file, for example C:\\work\\report.txt",
+    transfers_download: "Download",
+    transfers_download_confirm: "Download",
+    transfers_download_placeholder: "Local folder",
+    transfers_cancel: "Cancel",
+    transfers_retry: "Retry",
+    transfers_residue: "Partial file left behind",
+    transfers_overwrite_question: "This target already exists",
+    transfers_overwrite_replace: "Replace it",
+    transfers_overwrite_keep: "Keep the existing one",
+    transfers_problem_empty_path: "Enter a path.",
+    transfers_problem_no_name: "The path must end with a file name.",
+    transfers_problem_no_source: "The source names no file.",
+    transfers_problem_no_directory: "Open a directory first.",
+    transfers_problem_no_connection: "The connection cannot take a transfer right now.",
+    transfers_close_question: "Closing this session cancels its transfers",
+    transfers_close_cancel: "Keep the session open",
+    transfers_close_confirm: "Close and cancel",
 };
 
 /// Chinese copy.
@@ -823,6 +889,28 @@ pub static CHINESE: Strings = Strings {
     files_problem_taken: "这里已经有同名条目。",
     files_problem_missing: "这个条目已不在当前目录中。",
     files_problem_unchanged: "名称没有变化。",
+    transfers_heading: "传输",
+    transfers_empty: "这个会话当前没有传输。",
+    transfers_upload: "上传",
+    transfers_upload_confirm: "上传",
+    transfers_upload_placeholder: "本地文件，例如 C:\\work\\报告.txt",
+    transfers_download: "下载",
+    transfers_download_confirm: "下载",
+    transfers_download_placeholder: "本地目录",
+    transfers_cancel: "取消",
+    transfers_retry: "重试",
+    transfers_residue: "残留的部分文件",
+    transfers_overwrite_question: "目标已经存在",
+    transfers_overwrite_replace: "覆盖它",
+    transfers_overwrite_keep: "保留原文件",
+    transfers_problem_empty_path: "请输入路径。",
+    transfers_problem_no_name: "路径必须以文件名结尾。",
+    transfers_problem_no_source: "源路径没有文件名。",
+    transfers_problem_no_directory: "请先打开一个目录。",
+    transfers_problem_no_connection: "连接当前无法接受传输。",
+    transfers_close_question: "关闭这个会话会取消它的传输",
+    transfers_close_cancel: "保持会话打开",
+    transfers_close_confirm: "关闭并取消",
 };
 
 /// Hint for the section shortcuts, built for one platform.
@@ -862,6 +950,10 @@ pub fn transfer_state_label(state: &TransferState, locale: Locale) -> String {
             Locale::English => "Queued".to_owned(),
             Locale::Chinese => "排队中".to_owned(),
         },
+        TransferState::AwaitingOverwrite { .. } => match locale {
+            Locale::English => "Waiting for your choice".to_owned(),
+            Locale::Chinese => "等待你的选择".to_owned(),
+        },
         TransferState::Running { .. } => match locale {
             Locale::English => "Running".to_owned(),
             Locale::Chinese => "进行中".to_owned(),
@@ -870,11 +962,11 @@ pub fn transfer_state_label(state: &TransferState, locale: Locale) -> String {
             Locale::English => "Completed".to_owned(),
             Locale::Chinese => "已完成".to_owned(),
         },
-        TransferState::Failed(_) => match locale {
+        TransferState::Failed { .. } => match locale {
             Locale::English => "Failed".to_owned(),
             Locale::Chinese => "失败".to_owned(),
         },
-        TransferState::Cancelled => match locale {
+        TransferState::Cancelled { .. } => match locale {
             Locale::English => "Cancelled".to_owned(),
             Locale::Chinese => "已取消".to_owned(),
         },
