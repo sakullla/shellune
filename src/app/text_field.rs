@@ -298,16 +298,20 @@ impl Render for TextField {
             .items_center()
             .flex_1()
             .min_w(px(0.0))
-            .h(metrics.scale(26.0))
-            .px(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .h(metrics.control_height())
+            .px(metrics.scale(spacing::SNUG - 2.0))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::CANVAS))
             .border_1()
             .border_color(theme::swatch(if focused {
                 palette::ACCENT
             } else {
                 palette::BORDER_STRONG
             }))
+            .when(!focused, |field| {
+                let hover = theme::swatch(palette::TEXT_MUTED);
+                field.hover(move |style| style.border_color(hover))
+            })
             .text_size(metrics.label_size())
             .text_color(theme::swatch(if empty {
                 palette::TEXT_MUTED

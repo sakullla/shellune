@@ -47,8 +47,8 @@ use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, s
 /// the point where typing feels delayed.
 pub const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(12);
 
-/// Height of the bar above the grid.
-pub const SHELL_BAR_HEIGHT: f32 = 38.0;
+/// Height of the status line under the grid.
+pub const SHELL_BAR_HEIGHT: f32 = 30.0;
 
 /// Width of the caret in logical pixels.
 const CARET_WIDTH: f32 = 2.0;
@@ -880,11 +880,21 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// The status line under the grid: the program, its state and the view controls.
+    ///
+    /// A live process needs no badge to say so - the session bar above already
+    /// states the connection - so the state is only spelled out once the program
+    /// stopped, in the tone of how it stopped.
     fn bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let tone = if self.state.accepts_input() {
+        let strings = self.locale.strings();
+        let live = self.state.accepts_input();
+        let tone = if live {
             Tone::Positive
         } else {
-            Tone::Danger
+            match self.state.failure() {
+                Some(failure) => Tone::for_failure(&failure),
+                None => Tone::Neutral,
+            }
         };
         div()
             .id("terminal.bar")
@@ -895,85 +905,98 @@ impl TerminalPane {
             .gap(metrics.scale(spacing::TIGHT))
             .h(px(SHELL_BAR_HEIGHT))
             .flex_none()
-            .px(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::SNUG))
+            .bg(theme::swatch(shell_palette::SURFACE))
+            .border_t_1()
+            .border_color(theme::swatch(shell_palette::BORDER))
+            .rounded_b(px(radius::LARGE))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
                     .min_w(px(0.0))
-                    .child(components::status_dot(Tone::Accent, metrics))
                     .child(
                         div()
-                            .text_size(metrics.label_size())
-                            .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                            .flex_none()
+                            .font_family(monospace_family())
+                            .text_size(metrics.caption_size())
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::swatch(shell_palette::ACCENT))
+                            .child(">_"),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
                             .truncate()
                             .debug_selector(|| "terminal.shell".to_owned())
                             .child(SharedString::from(self.origin.label().to_owned())),
                     )
-                    .child(components::chip(
-                        self.state.label(self.locale),
-                        tone,
-                        metrics,
-                    )),
+                    .when(!live, |row| {
+                        row.child(components::chip(
+                            self.state.label(self.locale),
+                            tone,
+                            metrics,
+                        ))
+                    }),
             )
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(self.control(
-                        "terminal.font.decrease",
-                        "A-",
-                        metrics,
-                        cx.listener(|this, _event, _window, cx| this.step_font_size(false, cx)),
-                    ))
-                    .child(self.control(
-                        "terminal.font.increase",
-                        "A+",
-                        metrics,
-                        cx.listener(|this, _event, _window, cx| this.step_font_size(true, cx)),
-                    ))
-                    .child(self.control(
-                        "terminal.copy",
-                        self.locale.strings().terminal_copy,
-                        metrics,
-                        cx.listener(|this, _event, _window, cx| this.copy_selection(cx)),
-                    ))
+                    .gap(metrics.scale(2.0))
+                    .child(
+                        components::icon_button("A\u{2212}", metrics)
+                            .h(metrics.scale(22.0))
+                            .min_w(metrics.scale(26.0))
+                            .id("terminal.font.decrease")
+                            .debug_selector(|| "terminal.font.decrease".to_owned())
+                            .tooltip(components::tooltip(strings.terminal_smaller))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.step_font_size(false, cx);
+                            })),
+                    )
+                    .child(
+                        components::icon_button("A+", metrics)
+                            .h(metrics.scale(22.0))
+                            .min_w(metrics.scale(26.0))
+                            .id("terminal.font.increase")
+                            .debug_selector(|| "terminal.font.increase".to_owned())
+                            .tooltip(components::tooltip(strings.terminal_larger))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.step_font_size(true, cx);
+                            })),
+                    )
+                    .child(
+                        components::icon_button(strings.terminal_copy, metrics)
+                            .h(metrics.scale(22.0))
+                            .px(metrics.scale(spacing::TIGHT))
+                            .id("terminal.copy")
+                            .debug_selector(|| "terminal.copy".to_owned())
+                            .tooltip(components::tooltip("Ctrl+Shift+C"))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.copy_selection(cx);
+                            })),
+                    )
+                    .child(
+                        components::divider_vertical(metrics)
+                            .h(metrics.scale(12.0))
+                            .mx(metrics.scale(spacing::HAIRLINE)),
+                    )
                     .child(
                         div()
+                            .font_family(monospace_family())
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(shell_palette::TEXT_MUTED))
                             .debug_selector(|| "terminal.grid.size".to_owned())
                             .child(SharedString::from(format!(
-                                "{}x{} · {}px",
+                                "{}\u{00D7}{} \u{00B7} {}px",
                                 self.grid.cols, self.grid.rows, self.font_size
                             ))),
                     ),
             )
-    }
-
-    fn control(
-        &self,
-        selector: &'static str,
-        label: &'static str,
-        metrics: Metrics,
-        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(selector)
-            .debug_selector(move || selector.to_owned())
-            .px(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(2.0))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(shell_palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(shell_palette::BORDER))
-            .text_size(metrics.caption_size())
-            .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
-            .cursor_pointer()
-            .on_click(on_click)
-            .child(label)
     }
 
     fn row(&self, index: usize, snapshot: &Snapshot) -> gpui::Div {
@@ -1081,11 +1104,14 @@ impl TerminalPane {
             }
         };
 
+        // The grid is laid out in the face its cells were measured in: drawn in the
+        // interface font, every column after the first would drift from its cell.
         let mut rows = div()
             .flex()
             .flex_col()
             .absolute()
             .inset_0()
+            .font_family(monospace_family())
             .debug_selector(|| "terminal.viewport".to_owned());
         for index in 0..snapshot.rows.len() {
             rows = rows.child(self.row(index, &snapshot));
@@ -1199,8 +1225,21 @@ impl Render for TerminalPane {
             .flex_col()
             .size_full()
             .min_h(px(0.0))
+            .child(
+                // A margin inside the frame keeps the first column off the border; the
+                // grid itself is measured inside it, so no cell is lost to the margin.
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .pl(metrics.scale(spacing::SNUG))
+                    .pr(metrics.scale(spacing::HAIRLINE))
+                    .py(metrics.scale(spacing::TIGHT))
+                    .bg(color_of(palette::BACKGROUND))
+                    .child(self.viewport(window, cx)),
+            )
             .child(self.bar(metrics, cx))
-            .child(self.viewport(window, cx))
     }
 }
 

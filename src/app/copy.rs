@@ -60,8 +60,6 @@ impl Locale {
 /// both languages at once, which is cheaper than a runtime fallback table.
 #[derive(Debug)]
 pub struct Strings {
-    /// Name of the navigation group.
-    pub workspace: &'static str,
     /// Navigation entry: local shells.
     pub nav_local: &'static str,
     /// One-line description of the local shells destination.
@@ -133,8 +131,6 @@ pub struct Strings {
     pub primary_transfers: &'static str,
     /// Feedback after an unavailable action was requested.
     pub unavailable_notice: &'static str,
-    /// Label above the list of rows.
-    pub object_label: &'static str,
     /// What the section shortcuts do, shown after the platform's key range.
     ///
     /// The key range itself is not stored here: it depends on the platform and is
@@ -154,8 +150,6 @@ pub struct Strings {
     pub local_shell_fallback: &'static str,
     /// Hint shown when nothing is running at all.
     pub nothing_running: &'static str,
-    /// Label of the shell picker above the terminal.
-    pub shell_picker_label: &'static str,
     /// Button that reveals the free-text shell path field.
     pub shell_custom_button: &'static str,
     /// Placeholder in the free-text shell path field.
@@ -172,6 +166,16 @@ pub struct Strings {
     pub terminal_terminated: &'static str,
     /// Button that copies the terminal selection.
     pub terminal_copy: &'static str,
+    /// Tooltip of the button that makes the terminal text smaller.
+    pub terminal_smaller: &'static str,
+    /// Tooltip of the button that makes the terminal text larger.
+    pub terminal_larger: &'static str,
+    /// Heading above the shell tiles and the shell menu.
+    pub shell_launch_title: &'static str,
+    /// Tooltip of the control that opens the shell menu.
+    pub shell_menu_hint: &'static str,
+    /// Primary action on the transfers page when no connection can browse files yet.
+    pub primary_transfers_connect: &'static str,
     /// Placeholder in the host search field.
     pub hosts_search_placeholder: &'static str,
     /// Host list view: every saved host.
@@ -477,7 +481,6 @@ pub struct Strings {
 
 /// English copy.
 pub static ENGLISH: Strings = Strings {
-    workspace: "Workspace",
     nav_local: "Local shells",
     nav_local_summary: "A shell on this machine",
     nav_hosts: "Hosts",
@@ -509,10 +512,9 @@ pub static ENGLISH: Strings = Strings {
     next_step: "Next step",
     primary_local: "New local shell",
     primary_hosts: "New host",
-    primary_sessions: "Open session",
-    primary_transfers: "Start a transfer",
+    primary_sessions: "New local shell",
+    primary_transfers: "Browse files",
     unavailable_notice: "This action is not available in this build, so nothing was started.",
-    object_label: "Current object",
     hint_nav_action: "switches sections",
     zoom_control: "Text size",
     language_control: "Language",
@@ -521,7 +523,6 @@ pub static ENGLISH: Strings = Strings {
     count_transfers: "transfer",
     local_shell_fallback: "System shell",
     nothing_running: "Nothing is running yet.",
-    shell_picker_label: "Shell",
     shell_custom_button: "Custom path",
     shell_custom_placeholder: "Program name or full path, then Enter",
     shell_none_found: "No shell was found on this machine. Enter a program path to start one.",
@@ -530,6 +531,11 @@ pub static ENGLISH: Strings = Strings {
     terminal_exited: "Exited",
     terminal_terminated: "Terminated",
     terminal_copy: "Copy",
+    terminal_smaller: "Smaller text",
+    terminal_larger: "Larger text",
+    shell_launch_title: "Start a shell",
+    shell_menu_hint: "Choose which shell to open",
+    primary_transfers_connect: "Connect to a host",
     hosts_search_placeholder: "Search name, address, user or group",
     hosts_view_all: "All hosts",
     hosts_view_groups: "Groups",
@@ -684,7 +690,6 @@ pub static ENGLISH: Strings = Strings {
 
 /// Chinese copy.
 pub static CHINESE: Strings = Strings {
-    workspace: "工作区",
     nav_local: "本地终端",
     nav_local_summary: "在本机上运行的 Shell",
     nav_hosts: "主机",
@@ -716,10 +721,9 @@ pub static CHINESE: Strings = Strings {
     next_step: "下一步",
     primary_local: "新建本地终端",
     primary_hosts: "新建主机",
-    primary_sessions: "打开会话",
-    primary_transfers: "开始传输",
+    primary_sessions: "新建本地终端",
+    primary_transfers: "浏览远程文件",
     unavailable_notice: "当前版本没有实现这个操作，因此没有启动任何任务。",
-    object_label: "当前对象",
     hint_nav_action: "切换分区",
     zoom_control: "文字大小",
     language_control: "语言",
@@ -728,7 +732,6 @@ pub static CHINESE: Strings = Strings {
     count_transfers: "个传输",
     local_shell_fallback: "系统 Shell",
     nothing_running: "暂无正在运行的任务。",
-    shell_picker_label: "Shell 程序",
     shell_custom_button: "自定义路径",
     shell_custom_placeholder: "输入程序名或完整路径后按回车",
     shell_none_found: "本机没有找到可用的 Shell。请输入程序路径来启动一个。",
@@ -737,6 +740,11 @@ pub static CHINESE: Strings = Strings {
     terminal_exited: "已退出",
     terminal_terminated: "被终止",
     terminal_copy: "复制",
+    terminal_smaller: "缩小字号",
+    terminal_larger: "放大字号",
+    shell_launch_title: "启动一个 Shell",
+    shell_menu_hint: "选择要打开的 Shell",
+    primary_transfers_connect: "连接主机",
     hosts_search_placeholder: "搜索名称、地址、用户名或分组",
     hosts_view_all: "全部主机",
     hosts_view_groups: "按分组",
@@ -896,6 +904,17 @@ pub static CHINESE: Strings = Strings {
 /// instead of a hard-coded "Ctrl+1-4".
 pub fn nav_hint(strings: &Strings, platform: Platform) -> String {
     format!("{} {}", platform.shortcut_range(), strings.hint_nav_action)
+}
+
+/// A count followed by its unit, in the grammar of the language.
+///
+/// English takes the plural for anything but one ("2 sessions"); Chinese units
+/// already read correctly after any number.
+pub fn counted(count: usize, unit: &str, locale: Locale) -> String {
+    match locale {
+        Locale::English if count != 1 => format!("{count} {unit}s"),
+        _ => format!("{count} {unit}"),
+    }
 }
 
 /// Localized label for a session lifecycle state.

@@ -6,9 +6,9 @@
 //! what keeps a loading or failed section from looking finished.
 //!
 //! Layout, in one sentence: a fixed navigation rail on the left, a header naming
-//! the current object, a scrollable destination panel, and a status bar that
-//! carries the product tagline, the counts that are actually non-zero, and the
-//! text-size control.
+//! the current object with its one main action, a tab strip while sessions are
+//! open, the destination panel (a framed terminal, or a centred reading column that
+//! scrolls), and a status bar with the non-zero counts and the language control.
 
 use gpui::prelude::*;
 use gpui::{
@@ -27,8 +27,9 @@ use shellune_terminal::GridSize;
 
 use crate::app::actions::{
     CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
-    NextDestination, PreviousDestination, ToggleLanguage,
+    NewLocalShell, NextDestination, PreviousDestination, ToggleLanguage,
 };
+use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(test)]
 use crate::app::files::BrowseChannel;
@@ -42,7 +43,7 @@ use crate::app::hosts::{
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{self, MethodChoice, RemoteFailure, RemotePanel, RemoteStatus};
-use crate::app::terminal::{PaneState, SourceEvent, TerminalPane};
+use crate::app::terminal::{self, PaneState, SourceEvent, TerminalPane};
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
 #[cfg(test)]
@@ -50,9 +51,7 @@ use crate::app::transfers::TransferChannel;
 use crate::app::transfers::{
     PathProblem, TransferProblem, TransferViews, default_download_directory, file_name,
 };
-use crate::app::workspace::{
-    Failure, PrimaryOutcome, Recovery, SectionState, SectionStatus, Workspace,
-};
+use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Workspace};
 use crate::app::{components, theme::radius};
 
 /// Where a terminal comes from.
@@ -132,6 +131,15 @@ pub const FILES_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// carries the whole number, so the list can stay a report and not a log.
 pub const FILES_REPORT_STEPS: usize = 12;
 
+/// The glyph of the control that opens a menu.
+const MENU_GLYPH: &str = "\u{25BE}";
+
+/// The glyph of a control that closes or dismisses something.
+const CLOSE_GLYPH: &str = "\u{00D7}";
+
+/// Ends a menu entry that asks for more input before it acts.
+const ELLIPSIS: &str = "\u{2026}";
+
 /// The application shell view.
 pub struct ShelluneView {
     workspace: Workspace,
@@ -151,7 +159,11 @@ pub struct ShelluneView {
     local_error: Option<String>,
     shell_path: Entity<TextField>,
     custom_shell_open: bool,
-    /// Where the saved hosts live.
+    /// Whether the "new shell" menu in the header is open.
+    ///
+    /// The menu is how another shell is started while a terminal fills the panel; the
+    /// empty destination shows the same choices as tiles instead.
+    shell_menu_open: bool,
     store: HostStore,
     /// What that file really held the last time it was read or written.
     book: HostBook,
@@ -296,6 +308,7 @@ impl ShelluneView {
             local_error: None,
             shell_path,
             custom_shell_open: false,
+            shell_menu_open: false,
             store,
             book: HostBook::new(),
             hosts: HostsPanel::new(),
@@ -806,18 +819,14 @@ impl ShelluneView {
             .session(id)
             .map_or_else(String::new, |session| session.title().to_owned());
         Some(
-            div()
-                .flex()
+            components::banner(Tone::Danger, metrics)
+                .flex_row()
                 .items_center()
                 .flex_wrap()
-                .flex_none()
                 .gap(metrics.scale(spacing::TIGHT))
-                .px(metrics.scale(spacing::SECTION))
-                .py(metrics.scale(spacing::HAIRLINE))
-                .bg(theme::swatch(palette::SURFACE_RAISED))
-                .border_b_1()
-                .border_color(theme::swatch(palette::DANGER))
-                .text_size(metrics.caption_size())
+                .mx(metrics.scale(spacing::SNUG))
+                .mt(metrics.scale(spacing::SNUG))
+                .w_auto()
                 .debug_selector(|| "session.close.question".to_owned())
                 .child(
                     div()
@@ -833,14 +842,14 @@ impl ShelluneView {
                 .child(self.text_button(
                     SharedString::from("session.close.cancel"),
                     strings.transfers_close_cancel,
-                    Tone::Neutral,
+                    Variant::Secondary,
                     cx,
                     |view, cx| view.cancel_close_session(cx),
                 ))
                 .child(self.text_button(
                     SharedString::from("session.close.confirm"),
                     strings.transfers_close_confirm,
-                    Tone::Danger,
+                    Variant::Danger,
                     cx,
                     move |view, cx| view.confirm_close_session(cx),
                 )),
@@ -938,6 +947,12 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Whether the header's shell menu is open, for a test.
+    #[cfg(test)]
+    pub fn shell_menu_open(&self) -> bool {
+        self.shell_menu_open
+    }
+
     /// Whether the free-text shell path field is on screen.
     #[cfg(test)]
     pub fn custom_shell_open(&self) -> bool {
@@ -991,26 +1006,42 @@ impl ShelluneView {
     }
 
     fn request_primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.destination() == Destination::LocalShells {
-            self.start_from_picker(window, cx);
-            return;
-        }
-        if self.workspace.destination() == Destination::Hosts {
-            // A destination whose records could not be read offers reading them
-            // again; every other state of it offers a new host.
-            if self.workspace.state(Destination::Hosts) == SectionState::Failed {
-                self.reload_hosts(cx);
-            } else {
-                self.open_create_host(cx);
+        match self.workspace.destination() {
+            // The sessions page lists local shells too, so its main button opens one;
+            // the new terminal is shown right there.
+            Destination::LocalShells | Destination::Sessions => {
+                self.new_local_shell(window, cx);
             }
-            return;
-        }
-        if self.workspace.request_primary() == PrimaryOutcome::Unavailable {
-            // Keep focus inside the shell so keyboard users are not dropped.
-            let handle = self.root_focus.clone();
-            window.focus(&handle);
+            Destination::Hosts => {
+                // A destination whose records could not be read offers reading them
+                // again; every other state of it offers a new host.
+                if self.workspace.state(Destination::Hosts) == SectionState::Failed {
+                    self.reload_hosts(cx);
+                } else {
+                    self.open_create_host(cx);
+                }
+            }
+            // A transfer starts from the file view of a connection, so the page's
+            // button goes there: to an open file view when a connection can browse,
+            // and to the saved hosts when none can yet. Nothing is started here.
+            Destination::Transfers => match self.browsable_session() {
+                Some(id) => {
+                    self.activate(id, cx);
+                    if !self.files.is_open(id) {
+                        self.toggle_files(id, cx);
+                    }
+                }
+                None => self.select(Destination::Hosts, window, cx),
+            },
         }
         cx.notify();
+    }
+
+    /// Opens the default shell in a new tab, from the header, the tab strip or the
+    /// shortcut.
+    fn new_local_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shell_menu_open = false;
+        self.start_from_picker(window, cx);
     }
 
     /// Connects the free-text shell field to this view, so Enter starts a shell.
@@ -2034,6 +2065,7 @@ impl ShelluneView {
             // a second Return over the same path would start the shell again
             // instead of reaching it.
             self.custom_shell_open = false;
+            self.shell_menu_open = false;
             cx.notify();
         }
         started
@@ -2223,16 +2255,8 @@ impl ShelluneView {
             RemoteStatus::Failed(_) => (strings.remote_failed, Tone::Danger),
         };
 
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap(metrics.scale(spacing::TIGHT))
-            .p(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
+        let mut column = components::card(metrics)
+            .border_color(theme::swatch(palette::BORDER_STRONG))
             .debug_selector(|| "remote.panel".to_owned());
 
         column = column.child(
@@ -2247,7 +2271,7 @@ impl ShelluneView {
                         .items_center()
                         .gap(metrics.scale(spacing::TIGHT))
                         .min_w(px(0.0))
-                        .child(components::status_dot(tone, metrics))
+                        .child(host_avatar(host.name(), false, metrics))
                         .child(components::stacked(
                             host.name().to_owned(),
                             host.target(),
@@ -2258,7 +2282,7 @@ impl ShelluneView {
                 .child(self.text_button(
                     SharedString::from("remote.close"),
                     strings.remote_close,
-                    Tone::Neutral,
+                    Variant::Ghost,
                     cx,
                     |view, cx| view.close_remote(cx),
                 )),
@@ -2268,25 +2292,20 @@ impl ShelluneView {
             let algorithm = prompt.algorithm().to_owned();
             let fingerprint = prompt.fingerprint().to_owned();
             column = column.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .p(metrics.scale(spacing::TIGHT))
-                    .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(palette::SURFACE))
-                    .border_1()
-                    .border_color(theme::swatch(palette::ACCENT))
+                components::banner(Tone::Warning, metrics)
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(spacing::SNUG))
                     .debug_selector(|| "remote.trust".to_owned())
                     .child(
                         div()
-                            .text_size(metrics.label_size())
+                            .text_size(metrics.body_size())
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .child(strings.trust_title),
                     )
                     .child(
                         div()
-                            .text_size(metrics.caption_size())
+                            .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
                             .child(strings.trust_body),
                     )
@@ -2308,14 +2327,14 @@ impl ShelluneView {
                             .child(self.text_button(
                                 SharedString::from("remote.trust.accept"),
                                 strings.trust_accept,
-                                Tone::Positive,
+                                Variant::Primary,
                                 cx,
                                 |view, cx| view.answer_trust(true, cx),
                             ))
                             .child(self.text_button(
                                 SharedString::from("remote.trust.reject"),
                                 strings.trust_reject,
-                                Tone::Danger,
+                                Variant::Danger,
                                 cx,
                                 |view, cx| view.answer_trust(false, cx),
                             )),
@@ -2328,19 +2347,14 @@ impl ShelluneView {
             let next_step = failure.next_step().to_owned();
             let retryable = failure.retryable();
             column = column.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .p(metrics.scale(spacing::TIGHT))
-                    .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(palette::SURFACE))
-                    .border_1()
-                    .border_color(Tone::Danger.text())
+                components::banner(Tone::Danger, metrics)
+                    .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                    .py(metrics.scale(spacing::SNUG))
                     .debug_selector(|| "remote.failure".to_owned())
                     .child(
                         div()
-                            .text_size(metrics.label_size())
+                            .text_size(metrics.body_size())
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Tone::Danger.text())
                             .child(strings.remote_failure_title),
                     )
@@ -2362,12 +2376,14 @@ impl ShelluneView {
                             ))),
                     )
                     .when(retryable, |card| {
-                        card.child(self.text_button(
-                            SharedString::from("remote.retry"),
-                            strings.recovery_retry,
-                            Tone::Accent,
-                            cx,
-                            |view, cx| view.retry_remote(cx),
+                        card.child(div().flex().pt(metrics.scale(spacing::HAIRLINE)).child(
+                            self.text_button(
+                                SharedString::from("remote.retry"),
+                                strings.recovery_retry,
+                                Variant::Primary,
+                                cx,
+                                |view, cx| view.retry_remote(cx),
+                            ),
                         ))
                     }),
             );
@@ -2381,9 +2397,15 @@ impl ShelluneView {
             // gives it the whole panel; here it keeps a usable fixed height.
             column = column.child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_none()
                     .w_full()
                     .h(px(REMOTE_TERMINAL_HEIGHT))
+                    .rounded(px(radius::LARGE))
+                    .bg(theme::swatch(palette::CANVAS))
+                    .border_1()
+                    .border_color(theme::swatch(palette::BORDER))
                     .child(pane.clone()),
             );
         }
@@ -2434,51 +2456,25 @@ impl ShelluneView {
         let mut form = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::TIGHT))
+            .gap(metrics.scale(spacing::SNUG - 2.0))
             .debug_selector(|| "remote.form".to_owned());
 
-        let mut methods = div()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT));
+        let mut methods = components::segmented(metrics);
         for choice in MethodChoice::ALL {
             let selected = choice == method;
             methods = methods.child(
-                div()
+                components::segment(choice.label(strings), selected, metrics)
                     .id(("remote.method", choice as usize))
                     .debug_selector(move || choice.debug_selector().to_owned())
-                    .px(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(2.0))
-                    .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(if selected {
-                        palette::ACCENT_TINT
-                    } else {
-                        palette::SURFACE
-                    }))
-                    .border_1()
-                    .border_color(theme::swatch(if selected {
-                        palette::ACCENT
-                    } else {
-                        palette::BORDER
-                    }))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(if selected {
-                        palette::ACCENT_ON_TINT
-                    } else {
-                        palette::TEXT_SECONDARY
-                    }))
-                    .cursor_pointer()
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         if let Some(panel) = this.remote.as_mut() {
                             panel.select_method(choice);
                         }
                         cx.notify();
-                    }))
-                    .child(choice.label(strings)),
+                    })),
             );
         }
-        form = form.child(methods);
+        form = form.child(div().flex().child(methods));
         form = form.child(caption_line(method.hint(strings).to_owned(), metrics));
 
         if method.needs_password() {
@@ -2532,13 +2528,13 @@ impl ShelluneView {
                     .child(strings.remote_connecting),
             );
         } else {
-            form = form.child(self.text_button(
+            form = form.child(div().flex().child(self.text_button(
                 SharedString::from("remote.connect"),
                 strings.remote_connect,
-                Tone::Accent,
+                Variant::Primary,
                 cx,
                 |view, cx| view.connect_remote(cx),
-            ));
+            )));
         }
         form
     }
@@ -2551,26 +2547,13 @@ impl ShelluneView {
         field: Entity<TextField>,
     ) -> Div {
         let metrics = self.metrics();
-        div()
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .min_w(px(0.0))
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(120.0))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(label),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .debug_selector(move || selector.to_string())
-                    .child(field),
-            )
+        components::field_row(label, metrics).child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .debug_selector(move || selector.to_string())
+                .child(field),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -2597,7 +2580,7 @@ impl ShelluneView {
                     .child(self.text_button(
                         SharedString::from("hosts.retry"),
                         strings.hosts_retry,
-                        Tone::Accent,
+                        Variant::Primary,
                         cx,
                         |view, cx| view.reload_hosts(cx),
                     ));
@@ -2619,15 +2602,17 @@ impl ShelluneView {
 
         if let Some(message) = self.hosts.message() {
             column = column.child(
-                div()
-                    .debug_selector(|| "hosts.message".to_owned())
-                    .text_size(metrics.label_size())
-                    .text_color(if message.failed() {
-                        Tone::Danger.text()
+                components::banner(
+                    if message.failed() {
+                        Tone::Danger
                     } else {
-                        Tone::Positive.text()
-                    })
-                    .child(SharedString::from(message.text().to_owned())),
+                        Tone::Positive
+                    },
+                    metrics,
+                )
+                .debug_selector(|| "hosts.message".to_owned())
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .child(SharedString::from(message.text().to_owned())),
             );
         }
 
@@ -2663,7 +2648,8 @@ impl ShelluneView {
         div()
             .flex()
             .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .min_w(px(0.0))
             .debug_selector(|| "hosts.storage".to_owned())
             .child(
                 div()
@@ -2684,57 +2670,37 @@ impl ShelluneView {
     fn hosts_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let mut row = div()
+        let mut views = components::segmented(metrics);
+        for view in HostView::ALL {
+            let selected = self.hosts.view() == view;
+            views = views.child(
+                components::segment(view.label(strings), selected, metrics)
+                    .id(view.debug_selector())
+                    .debug_selector(move || view.debug_selector().to_owned())
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.hosts.select_view(view);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        // Importing sits beside the views because it is how a list gets its first
+        // records; the panel it opens states its limits before anything is saved.
+        div()
             .flex()
             .items_center()
+            .flex_wrap()
             .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "hosts.toolbar".to_owned())
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
+                    .min_w(metrics.scale(180.0))
                     .debug_selector(|| "hosts.search".to_owned())
                     .child(self.hosts_search.clone()),
-            );
-
-        for view in HostView::ALL {
-            let selected = self.hosts.view() == view;
-            row = row.child(
-                div()
-                    .id(view.debug_selector())
-                    .debug_selector(move || view.debug_selector().to_owned())
-                    .px(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(2.0))
-                    .flex_none()
-                    .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(if selected {
-                        palette::ACCENT_TINT
-                    } else {
-                        palette::SURFACE_RAISED
-                    }))
-                    .border_1()
-                    .border_color(theme::swatch(if selected {
-                        palette::ACCENT
-                    } else {
-                        palette::BORDER
-                    }))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(if selected {
-                        palette::ACCENT_ON_TINT
-                    } else {
-                        palette::TEXT_SECONDARY
-                    }))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.hosts.select_view(view);
-                        cx.notify();
-                    }))
-                    .child(view.label(strings)),
-            );
-        }
-        // Importing sits beside the views because it is how a list gets its first
-        // records; the panel it opens states its limits before anything is saved.
-        row.child(self.import_button(cx))
+            )
+            .child(views)
+            .child(self.import_button(cx))
     }
 
     /// The button that opens the import panel.
@@ -2742,7 +2708,7 @@ impl ShelluneView {
         self.text_button(
             SharedString::from("hosts.import"),
             self.strings().import_open,
-            Tone::Accent,
+            Variant::Secondary,
             cx,
             |view, cx| view.open_import(cx),
         )
@@ -2772,50 +2738,28 @@ impl ShelluneView {
         let strings = self.strings();
         let editing = self.hosts.draft().and_then(HostDraft::editing).is_some();
 
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::TIGHT))
-            .w_full()
-            .p(metrics.scale(spacing::LOOSE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
+        let mut card = components::card(metrics)
+            .border_color(theme::swatch(palette::BORDER_STRONG))
             .debug_selector(|| "hosts.editor".to_owned())
-            .child(
-                div()
-                    .text_size(metrics.title_size())
-                    .font_weight(metrics.title_weight())
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(if editing {
-                        strings.host_editor_edit
-                    } else {
-                        strings.host_editor_new
-                    }),
-            );
+            .child(components::card_title(
+                if editing {
+                    strings.host_editor_edit
+                } else {
+                    strings.host_editor_new
+                },
+                None,
+                metrics,
+            ));
 
         for field in HostField::ALL {
             card = card.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(metrics.scale(64.0))
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(field.label(strings)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .debug_selector(move || field.debug_selector().to_owned())
-                            .child(fields.get(field).clone()),
-                    ),
+                components::field_row(field.label(strings), metrics).child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .debug_selector(move || field.debug_selector().to_owned())
+                        .child(fields.get(field).clone()),
+                ),
             );
         }
 
@@ -2833,14 +2777,14 @@ impl ShelluneView {
                 .child(self.text_button(
                     SharedString::from("hosts.save"),
                     strings.host_save,
-                    Tone::Accent,
+                    Variant::Primary,
                     cx,
                     |view, cx| view.save_host(cx),
                 ))
                 .child(self.text_button(
                     SharedString::from("hosts.cancel"),
                     strings.host_cancel,
-                    Tone::Neutral,
+                    Variant::Secondary,
                     cx,
                     |view, cx| view.close_host_editor(cx),
                 )),
@@ -2865,51 +2809,24 @@ impl ShelluneView {
             None => div().flex_1(),
         };
 
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::TIGHT))
-            .w_full()
-            .p(metrics.scale(spacing::LOOSE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
+        let mut card = components::card(metrics)
+            .border_color(theme::swatch(palette::BORDER_STRONG))
             .debug_selector(|| "hosts.import.panel".to_owned())
+            .child(components::card_title(
+                strings.import_title,
+                Some(SharedString::from(strings.import_read_only)),
+                metrics,
+            ))
             .child(
-                div()
-                    .text_size(metrics.title_size())
-                    .font_weight(metrics.title_weight())
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(strings.import_title),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(metrics.scale(64.0))
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(strings.import_path_label),
-                    )
+                components::field_row(strings.import_path_label, metrics)
                     .child(path_field)
                     .child(self.text_button(
                         SharedString::from("hosts.import.preview"),
                         strings.import_preview,
-                        Tone::Accent,
+                        Variant::Secondary,
                         cx,
                         |view, cx| view.preview_import(cx),
                     )),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.import_read_only),
             );
 
         if let Some(error) = self.import.error() {
@@ -2981,7 +2898,7 @@ impl ShelluneView {
             actions = actions.child(self.text_button(
                 SharedString::from("hosts.import.apply"),
                 SharedString::from(format!("{} · {offered}", strings.import_apply)),
-                Tone::Accent,
+                Variant::Primary,
                 cx,
                 |view, cx| view.apply_import(cx),
             ));
@@ -2998,7 +2915,7 @@ impl ShelluneView {
         card.child(actions.child(self.text_button(
             SharedString::from("hosts.import.close"),
             strings.host_cancel,
-            Tone::Neutral,
+            Variant::Secondary,
             cx,
             |view, cx| view.close_import(cx),
         )))
@@ -3162,18 +3079,11 @@ impl ShelluneView {
             format!("{} ({})", host.name(), host.target())
         });
 
-        div()
-            .flex()
+        components::banner(Tone::Danger, metrics)
+            .flex_row()
             .items_center()
             .justify_between()
             .gap(metrics.scale(spacing::SNUG))
-            .w_full()
-            .px(metrics.scale(spacing::SNUG))
-            .py(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(Tone::Danger.text())
             .debug_selector(|| "hosts.confirm".to_owned())
             .child(
                 div()
@@ -3207,14 +3117,14 @@ impl ShelluneView {
                     .child(self.text_button(
                         SharedString::from("hosts.confirm.delete"),
                         strings.host_delete_confirm,
-                        Tone::Danger,
+                        Variant::Danger,
                         cx,
                         |view, cx| view.confirm_delete_host(cx),
                     ))
                     .child(self.text_button(
                         SharedString::from("hosts.confirm.cancel"),
                         strings.host_cancel,
-                        Tone::Neutral,
+                        Variant::Secondary,
                         cx,
                         |view, cx| view.cancel_delete_host(cx),
                     )),
@@ -3268,9 +3178,16 @@ impl ShelluneView {
                     list = list.child(
                         div()
                             .debug_selector(move || format!("hosts.group.{group_index}"))
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(format!("{label} · {}", group.len()))),
+                            .flex()
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .pt(metrics.scale(if group_index == 0 {
+                                0.0
+                            } else {
+                                spacing::TIGHT
+                            }))
+                            .child(components::section_label(label.to_owned(), metrics))
+                            .child(components::badge(group.len(), Tone::Neutral, metrics)),
                     );
                     for (row_index, host) in (offset..).zip(group.hosts()) {
                         list = list.child(self.host_row(row_index, host, cx));
@@ -3302,10 +3219,11 @@ impl ShelluneView {
             .child(
                 div()
                     .flex()
+                    .flex_1()
                     .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
+                    .gap(metrics.scale(spacing::SNUG))
                     .min_w(px(0.0))
-                    .child(components::status_dot(Tone::Neutral, metrics))
+                    .child(host_avatar(host.name(), false, metrics))
                     .child(components::stacked(
                         host.name().to_owned(),
                         host.target(),
@@ -3325,21 +3243,21 @@ impl ShelluneView {
                 .child(self.text_button(
                     SharedString::from(format!("hosts.connect.{index}")),
                     strings.remote_connect,
-                    Tone::Positive,
+                    Variant::Soft,
                     cx,
                     move |view, cx| view.open_remote(&target, cx),
                 ))
                 .child(self.text_button(
                     SharedString::from(format!("hosts.edit.{index}")),
                     strings.host_edit,
-                    Tone::Accent,
+                    Variant::Ghost,
                     cx,
                     move |view, cx| view.open_edit_host(&edited, cx),
                 ))
                 .child(self.text_button(
                     SharedString::from(format!("hosts.delete.{index}")),
                     strings.host_delete,
-                    Tone::Danger,
+                    Variant::Ghost,
                     cx,
                     move |view, cx| view.ask_delete_host(id, cx),
                 )),
@@ -3371,10 +3289,11 @@ impl ShelluneView {
             .child(
                 div()
                     .flex()
+                    .flex_1()
                     .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
+                    .gap(metrics.scale(spacing::SNUG))
                     .min_w(px(0.0))
-                    .child(components::status_dot(Tone::Positive, metrics))
+                    .child(host_avatar(entry.host.name(), true, metrics))
                     .child(components::stacked(
                         entry.host.name().to_owned(),
                         format!("{} · {last}", entry.host.target()),
@@ -3390,21 +3309,21 @@ impl ShelluneView {
                     .child(self.text_button(
                         SharedString::from(format!("hosts.recent.connect.{index}")),
                         strings.remote_connect,
-                        Tone::Positive,
+                        Variant::Soft,
                         cx,
                         move |view, cx| view.open_remote(&reconnect_target, cx),
                     ))
                     .child(self.text_button(
                         SharedString::from(format!("hosts.recent.edit.{index}")),
                         strings.host_edit,
-                        Tone::Accent,
+                        Variant::Ghost,
                         cx,
                         move |view, cx| view.open_edit_host(&edited, cx),
                     ))
                     .child(self.text_button(
                         SharedString::from(format!("hosts.recent.delete.{index}")),
                         strings.host_delete,
-                        Tone::Danger,
+                        Variant::Ghost,
                         cx,
                         move |view, cx| view.ask_delete_host(id, cx),
                     )),
@@ -3440,47 +3359,60 @@ impl ShelluneView {
     }
 
     /// A small command button that runs one action.
+    ///
+    /// The variant carries the weight of the action, not its colour: a form's
+    /// confirming button is [`Variant::Primary`], a removal is [`Variant::Danger`],
+    /// and a toolbar command stays [`Variant::Ghost`] until it is pointed at.
     fn text_button(
         &self,
         id: SharedString,
         label: impl Into<SharedString>,
-        tone: Tone,
+        variant: Variant,
         cx: &mut Context<Self>,
         click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
         let metrics = self.metrics();
         let selector = id.to_string();
-        div()
+        components::compact_button(label, variant, metrics)
             .id(id)
             .debug_selector(move || selector.clone())
-            .flex_none()
-            .px(metrics.scale(spacing::SNUG))
-            .py(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::SMALL))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .bg(theme::swatch(palette::SURFACE))
-            .text_size(metrics.label_size())
-            .text_color(tone.text())
-            .cursor_pointer()
             .on_click(cx.listener(move |this, _event, _window, cx| click(this, cx)))
-            .child(label.into())
     }
 
     fn brand(&self) -> Div {
         let metrics = self.metrics();
-        let strings = self.strings();
         div()
             .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .px(metrics.scale(spacing::SNUG))
-            .py(metrics.scale(spacing::BASE))
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::SNUG - 2.0))
+            .h(metrics.header_height())
+            .px(metrics.scale(spacing::BASE))
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
+                    .justify_center()
+                    .w(metrics.scale(28.0))
+                    .h(metrics.scale(28.0))
+                    .rounded(px(radius::MEDIUM))
+                    .bg(gpui::linear_gradient(
+                        135.0,
+                        gpui::linear_color_stop(theme::swatch(palette::ACCENT_HOVER), 0.0),
+                        gpui::linear_color_stop(theme::swatch(palette::ACCENT), 1.0),
+                    ))
+                    .font_family(terminal::monospace_family())
+                    .text_size(metrics.label_size())
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::swatch(palette::ON_ACCENT))
+                    .child(">_"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w(px(0.0))
                     .child(
                         div()
                             .text_size(metrics.display_size())
@@ -3490,20 +3422,11 @@ impl ShelluneView {
                     )
                     .child(
                         div()
+                            .truncate()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(format!(
-                                "{} · {}",
-                                product::PRONUNCIATION,
-                                strings.workspace
-                            ))),
+                            .child(product::PRONUNCIATION),
                     ),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(product::TAGLINE_ZH),
             )
     }
 
@@ -3516,95 +3439,145 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let state = self.workspace.state(destination);
-        let tone = state.tone();
         let selected = self.workspace.destination() == destination;
         let focused = self.destination_focus(destination).is_focused(window);
-
-        let background = if selected {
-            palette::SURFACE_SELECTED
-        } else {
-            palette::SURFACE
-        };
-        let label_color = if selected {
-            palette::TEXT_PRIMARY
-        } else {
-            palette::TEXT_SECONDARY
-        };
-        let border = if focused {
-            palette::ACCENT
-        } else if selected {
-            palette::BORDER_STRONG
-        } else {
-            palette::SURFACE
+        // The dot only carries a colour when the destination has something to say:
+        // a live session, a failure, a load in flight. An idle entry stays quiet.
+        let tone = match state {
+            SectionState::Populated => self.destination_tone(destination),
+            state => state.tone(),
         };
 
         let index = destination.index();
         let count = self.workspace.item_count(destination);
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        let hover_text = theme::swatch(palette::TEXT_PRIMARY);
 
-        div()
+        let mut entry = div()
             .id(("nav", index))
+            .relative()
             .flex()
             .items_center()
-            .justify_between()
-            .gap(metrics.scale(spacing::TIGHT))
+            .gap(metrics.scale(spacing::SNUG - 2.0))
             .h(metrics.nav_row_height())
-            .px(metrics.scale(spacing::TIGHT))
+            .pl(metrics.scale(spacing::SNUG))
+            .pr(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(background))
             .border_1()
-            .border_color(theme::swatch(border))
+            .border_color(if focused {
+                theme::swatch(palette::ACCENT)
+            } else {
+                theme::clear()
+            })
             .text_size(metrics.body_size())
-            .text_color(theme::swatch(label_color))
+            .cursor_pointer()
             .track_focus(self.destination_focus(destination))
             .debug_selector(move || destination.debug_selector().to_owned())
             .on_click(cx.listener(move |this, _event, window, cx| {
                 this.select(Destination::ALL[index], window, cx);
-            }))
+            }));
+        entry = if selected {
+            entry
+                .bg(theme::swatch(palette::SURFACE_SELECTED))
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .font_weight(FontWeight::MEDIUM)
+                // The accent bar marks the current object without moving the label.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(metrics.scale(9.0))
+                        .w(metrics.scale(3.0))
+                        .h(metrics.scale(14.0))
+                        .rounded(metrics.scale(2.0))
+                        .bg(theme::swatch(palette::ACCENT)),
+                )
+        } else {
+            entry
+                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .hover(move |style| style.bg(hover).text_color(hover_text))
+        };
+
+        entry
+            .child(components::status_dot(tone, metrics))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
+                    .flex_1()
                     .min_w(px(0.0))
-                    // The accent bar marks the current object; it is drawn in the
-                    // row colour when the entry is not selected, so the row does
-                    // not shift when the selection moves.
-                    .child(
-                        div()
-                            .w(metrics.scale(2.0))
-                            .h(metrics.scale(16.0))
-                            .rounded(metrics.scale(1.0))
-                            .bg(theme::swatch(if selected {
-                                palette::ACCENT
-                            } else {
-                                background
-                            })),
-                    )
-                    .child(components::status_dot(tone, metrics))
-                    .child(
-                        div()
-                            .truncate()
-                            .font_weight(if selected {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .child(destination.label(strings)),
-                    ),
+                    .truncate()
+                    .child(destination.label(strings)),
             )
             .child(if count > 0 {
-                components::count_label(count, destination.count_unit(strings), metrics)
-                    .into_any_element()
+                components::badge(
+                    count,
+                    if selected {
+                        Tone::Accent
+                    } else {
+                        Tone::Neutral
+                    },
+                    metrics,
+                )
+                .into_any_element()
             } else {
                 components::keycap(destination.shortcut_label(Platform::current()), metrics)
                     .into_any_element()
             })
     }
 
+    /// The tone a populated destination's dot is drawn in.
+    ///
+    /// A list of sessions is green only while one of them is live; a list where every
+    /// session ended says so instead of looking healthy, and a transfer in flight shows
+    /// as work in progress.
+    fn destination_tone(&self, destination: Destination) -> Tone {
+        let sessions: Vec<&Session> = match destination {
+            Destination::LocalShells => self.workspace.local_sessions().collect(),
+            Destination::Sessions => self.workspace.sessions().items().iter().collect(),
+            Destination::Transfers => {
+                let running = self
+                    .workspace
+                    .transfers()
+                    .items()
+                    .iter()
+                    .any(Transfer::is_active);
+                return if running {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                };
+            }
+            Destination::Hosts => return Tone::Neutral,
+        };
+        if sessions
+            .iter()
+            .any(|session| session.state() == &SessionState::Connected)
+        {
+            Tone::Positive
+        } else if sessions
+            .iter()
+            .any(|session| session_tone(session.state()) == Tone::Warning)
+        {
+            Tone::Warning
+        } else {
+            Tone::Neutral
+        }
+    }
+
     fn rail(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let mut rail = div()
+        let mut nav = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(2.0))
+            .px(metrics.scale(spacing::TIGHT))
+            .pt(metrics.scale(spacing::HAIRLINE));
+        for destination in Destination::ALL {
+            nav = nav.child(self.nav_entry(destination, window, cx));
+        }
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+
+        div()
             .flex()
             .flex_col()
             .flex_none()
@@ -3614,56 +3587,49 @@ impl ShelluneView {
             .border_r_1()
             .border_color(theme::swatch(palette::BORDER))
             .child(self.brand())
+            .child(nav)
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(metrics.scale(2.0))
-                    .px(metrics.scale(spacing::TIGHT)),
-            );
-
-        for destination in Destination::ALL {
-            rail = rail.child(self.nav_entry(destination, window, cx));
-        }
-
-        rail.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .p(metrics.scale(spacing::TIGHT))
-                .mt_auto()
-                .text_size(metrics.caption_size())
-                .text_color(theme::swatch(palette::TEXT_MUTED))
-                .child(SharedString::from(copy::nav_hint(
-                    strings,
-                    Platform::current(),
-                )))
-                .child(
-                    div()
-                        .id("zoom.control")
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .px(metrics.scale(spacing::TIGHT))
-                        .py(metrics.scale(spacing::HAIRLINE))
-                        .rounded(px(radius::SMALL))
-                        .border_1()
-                        .border_color(theme::swatch(palette::BORDER))
-                        .debug_selector(|| "zoom.control".to_owned())
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.workspace.cycle_text_size();
-                            cx.notify();
-                        }))
-                        .child(strings.zoom_control)
-                        .child(
-                            div()
-                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                .child(self.workspace.zoom().label()),
-                        ),
-                ),
-        )
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .p(metrics.scale(spacing::TIGHT))
+                    .mt_auto()
+                    .child(
+                        div()
+                            .px(metrics.scale(spacing::HAIRLINE))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(copy::nav_hint(
+                                strings,
+                                Platform::current(),
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .id("zoom.control")
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .h(metrics.compact_control_height())
+                            .px(metrics.scale(spacing::TIGHT))
+                            .rounded(px(radius::MEDIUM))
+                            .border_1()
+                            .border_color(theme::swatch(palette::BORDER))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .debug_selector(|| "zoom.control".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.workspace.cycle_text_size();
+                                cx.notify();
+                            }))
+                            .child(strings.zoom_control)
+                            .child(components::keycap(self.workspace.zoom().label(), metrics)),
+                    ),
+            )
     }
 
     fn notice_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
@@ -3672,55 +3638,145 @@ impl ShelluneView {
         let strings = self.strings();
         Some(
             div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(metrics.scale(spacing::TIGHT))
-                .px(metrics.scale(spacing::BASE))
-                .py(metrics.scale(spacing::TIGHT))
-                .bg(theme::swatch(palette::SURFACE_RAISED))
-                .border_b_1()
-                .border_color(theme::swatch(palette::BORDER))
-                .text_size(metrics.label_size())
-                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .flex_none()
+                .px(metrics.scale(spacing::LOOSE - 4.0))
+                .pt(metrics.scale(spacing::SNUG))
                 .debug_selector(|| "notice".to_owned())
-                .child(notice.text(strings))
                 .child(
-                    div()
-                        .id("notice.dismiss")
-                        .px(metrics.scale(spacing::TIGHT))
-                        .py(metrics.scale(2.0))
-                        .rounded(px(radius::SMALL))
-                        .text_color(Tone::Accent.text())
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.workspace.dismiss_notice();
-                            cx.notify();
-                        }))
-                        .child("✕"),
+                    components::banner(Tone::Warning, metrics)
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(notice.text(strings)),
+                        )
+                        .child(
+                            components::icon_button(CLOSE_GLYPH, metrics)
+                                .id("notice.dismiss")
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.workspace.dismiss_notice();
+                                    cx.notify();
+                                })),
+                        ),
                 ),
         )
     }
 
-    fn header(&self, cx: &mut Context<Self>) -> Div {
+    /// Whether the header offers the shell menu beside its main button.
+    ///
+    /// The menu replaces the shell tiles once a terminal fills the panel, and on the
+    /// sessions page, whose main button opens a local shell as well.
+    fn offers_shell_menu(&self) -> bool {
+        match self.workspace.destination() {
+            Destination::LocalShells => self.shows_terminal(Destination::LocalShells),
+            Destination::Sessions => true,
+            Destination::Hosts | Destination::Transfers => false,
+        }
+    }
+
+    /// The label of the header's main button, which can depend on what is open.
+    fn header_primary_label(&self, destination: Destination) -> &'static str {
+        let strings = self.strings();
+        match destination {
+            Destination::Transfers if self.browsable_session().is_none() => {
+                strings.primary_transfers_connect
+            }
+            destination => self.primary_label(destination, strings),
+        }
+    }
+
+    fn header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let destination = self.workspace().destination();
         let state = self.workspace().state(destination);
-        let mut chips = div()
+
+        // What the page holds, said once: the summary, and the amount when there is one.
+        let subtitle = if state == SectionState::Populated {
+            format!(
+                "{} · {}",
+                destination.summary(strings),
+                copy::counted(
+                    self.workspace.item_count(destination),
+                    destination.count_unit(strings),
+                    self.workspace.locale()
+                )
+            )
+        } else {
+            destination.summary(strings).to_owned()
+        };
+
+        let mut title_row = div()
             .flex()
             .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .child(components::chip(
+            .gap(metrics.scale(spacing::TIGHT + 2.0))
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .text_size(metrics.heading_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .truncate()
+                    .debug_selector(|| "header.title".to_owned())
+                    .child(destination.label(strings)),
+            );
+        // A ready page needs no badge to say so; loading and failure do, because they
+        // change what the content below can be trusted for.
+        if matches!(state, SectionState::Loading | SectionState::Failed) {
+            title_row = title_row.child(components::chip(
                 state.chip_label(strings),
                 state.tone(),
                 metrics,
             ));
-        if state == SectionState::Populated {
-            chips = chips.child(components::count_label(
-                self.workspace.item_count(destination),
-                destination.count_unit(strings),
-                metrics,
-            ));
+        }
+
+        let mut actions = div()
+            .relative()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .child(
+                div()
+                    .id("header.primary")
+                    .debug_selector(|| "header.primary".to_owned())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.request_primary(window, cx);
+                    }))
+                    .child(components::action_button(
+                        self.header_primary_label(destination),
+                        true,
+                        metrics,
+                    )),
+            );
+        if self.offers_shell_menu() {
+            let open = self.shell_menu_open;
+            actions = actions.child(
+                components::button(MENU_GLYPH, Variant::Secondary, metrics)
+                    .w(metrics.control_height())
+                    .px(px(0.0))
+                    .when(open, |button| {
+                        button
+                            .bg(theme::swatch(palette::SURFACE_SELECTED))
+                            .border_color(theme::swatch(palette::BORDER_STRONG))
+                    })
+                    .id("shell.menu")
+                    .debug_selector(|| "shell.menu".to_owned())
+                    .when(!open, |button| {
+                        button.tooltip(components::tooltip(strings.shell_menu_hint))
+                    })
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.shell_menu_open = !this.shell_menu_open;
+                        cx.notify();
+                    })),
+            );
+            if open {
+                actions = actions.child(self.shell_menu(window, cx));
+            }
         }
 
         div()
@@ -3730,7 +3786,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::BASE))
             .h(metrics.header_height())
             .flex_none()
-            .px(metrics.scale(spacing::BASE))
+            .px(metrics.scale(spacing::LOOSE - 4.0))
             .bg(theme::swatch(palette::CANVAS))
             .border_b_1()
             .border_color(theme::swatch(palette::BORDER))
@@ -3740,58 +3796,208 @@ impl ShelluneView {
                     .flex_col()
                     .gap(metrics.scale(1.0))
                     .min_w(px(0.0))
+                    .child(title_row)
                     .child(
                         div()
+                            .truncate()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(format!(
-                                "{} · {}",
-                                strings.object_label,
-                                destination.label(strings)
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(metrics.scale(spacing::SNUG))
-                            .child(
-                                div()
-                                    .text_size(metrics.heading_size())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .truncate()
-                                    .debug_selector(|| "header.title".to_owned())
-                                    .child(destination.label(strings)),
-                            )
-                            .child(chips),
+                            .child(SharedString::from(subtitle)),
                     ),
             )
+            .child(actions)
+    }
+
+    /// The menu under the header's shell control: every shell, and a typed path.
+    ///
+    /// Picking a shell opens it in a new tab at once, which is what the control is
+    /// for; the choice is also remembered as the one the main button opens next. A
+    /// transparent layer behind the menu closes it on any click outside.
+    fn shell_menu(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let viewport = window.viewport_size();
+
+        let mut menu = div()
+            .flex()
+            .flex_col()
+            .w(metrics.scale(300.0))
+            .p(metrics.scale(spacing::HAIRLINE))
+            .gap(metrics.scale(1.0))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .shadow_lg()
+            .debug_selector(|| "shell.picker".to_owned())
+            .child(
+                components::section_label(strings.shell_launch_title, metrics)
+                    .px(metrics.scale(spacing::TIGHT))
+                    .pt(metrics.scale(spacing::HAIRLINE))
+                    .pb(metrics.scale(2.0)),
+            );
+
+        if self.workspace.shells().is_empty() {
+            menu = menu.child(
+                div()
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(spacing::HAIRLINE))
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Warning.text())
+                    .child(strings.shell_none_found),
+            );
+        }
+        for (index, shell) in self.workspace.shells().iter().enumerate() {
+            let selected = index == self.workspace.shell_choice();
+            menu = menu.child(
+                self.menu_item(
+                    shell.name().to_owned(),
+                    Some(program_label(shell.program())),
+                    selected,
+                )
+                .id(("shell.choice", index))
+                .debug_selector(move || format!("shell.choice.{index}"))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.launch_choice(index, window, cx);
+                })),
+            );
+        }
+        menu = menu
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
+                    .h(px(1.0))
+                    .mx(metrics.scale(spacing::HAIRLINE))
+                    .my(metrics.scale(spacing::HAIRLINE))
+                    .bg(theme::swatch(palette::BORDER)),
+            )
+            .child(
+                self.menu_item(
+                    format!("{}{ELLIPSIS}", strings.shell_custom_button),
+                    None,
+                    self.custom_shell_open,
+                )
+                .id("shell.custom")
+                .debug_selector(|| "shell.custom".to_owned())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.toggle_custom_shell(window, cx);
+                })),
+            );
+        if self.custom_shell_open {
+            menu = menu.child(
+                div()
+                    .p(metrics.scale(spacing::HAIRLINE))
+                    .debug_selector(|| "shell.path".to_owned())
+                    .child(self.shell_path.clone()),
+            );
+        }
+
+        div()
+            .child(gpui::deferred(
+                gpui::anchored().position(gpui::Point::default()).child(
+                    div()
+                        .id("shell.menu.backdrop")
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .occlude()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.close_shell_menu(cx);
+                            }),
+                        ),
+                ),
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .top(metrics.control_height() + metrics.scale(spacing::HAIRLINE + 2.0))
+                    .right(px(0.0))
                     .child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(destination.summary(strings)),
-                    )
-                    .child(
-                        div()
-                            .id("header.primary")
-                            .debug_selector(|| "header.primary".to_owned())
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.request_primary(window, cx);
-                            }))
-                            .child(components::action_button(
-                                self.primary_label(destination, strings),
-                                self.workspace.can_act(destination),
-                                metrics,
-                            )),
+                        gpui::deferred(
+                            gpui::anchored()
+                                .anchor(gpui::Corner::TopRight)
+                                .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                                .child(div().occlude().child(menu)),
+                        )
+                        .with_priority(1),
                     ),
             )
+    }
+
+    /// One line of a menu: a name, an optional detail and whether it is the current one.
+    fn menu_item(&self, label: String, detail: Option<String>, selected: bool) -> Div {
+        let metrics = self.metrics();
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .h(metrics.control_height())
+            .px(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::SMALL))
+            .text_size(metrics.label_size())
+            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .child(
+                div()
+                    .flex_none()
+                    .w(metrics.scale(6.0))
+                    .h(metrics.scale(6.0))
+                    .rounded(metrics.scale(3.0))
+                    .bg(if selected {
+                        theme::swatch(palette::ACCENT)
+                    } else {
+                        theme::clear()
+                    }),
+            )
+            .child(div().flex_none().child(SharedString::from(label)))
+            .children(detail.map(|detail| {
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_right()
+                    .font_family(terminal::monospace_family())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(SharedString::from(detail))
+            }))
+    }
+
+    /// Closes the shell menu, and with it the path field inside it.
+    fn close_shell_menu(&mut self, cx: &mut Context<Self>) {
+        if self.shell_menu_open {
+            self.shell_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Opens or closes the typed-path field, giving it the keyboard when it opens.
+    fn toggle_custom_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.custom_shell_open = !self.custom_shell_open;
+        if self.custom_shell_open {
+            let handle = self.shell_path.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Remembers one shell as the default and opens it in a new tab.
+    fn launch_choice(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.select_shell(index);
+        // A choice is not a typed path: the field closes so its text cannot win.
+        self.custom_shell_open = false;
+        self.shell_menu_open = false;
+        self.start_from_picker(window, cx);
+        cx.notify();
+    }
+
+    /// The first remote session whose connection can list files, if any.
+    fn browsable_session(&self) -> Option<SessionId> {
+        self.tab_sessions()
+            .into_iter()
+            .find(|id| self.files.can_browse(*id))
     }
 
     /// The card a section shows when it holds no rows.
@@ -3842,7 +4048,7 @@ impl ShelluneView {
                 Some(SharedString::from(format!(
                     "{} · {}",
                     strings.next_step,
-                    self.primary_label(destination, strings)
+                    self.header_primary_label(destination)
                 ))),
                 metrics,
             ),
@@ -3850,13 +4056,18 @@ impl ShelluneView {
         }
     }
 
-    fn rows_for(&self, destination: Destination, list: gpui::Div) -> gpui::Div {
+    fn rows_for(
+        &self,
+        destination: Destination,
+        list: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         match destination {
-            Destination::LocalShells => self.local_rows(list),
+            Destination::LocalShells => self.local_rows(list, cx),
             // The hosts destination renders through `hosts_panel`; this arm keeps
             // the list untouched if a future layout routes it here.
             Destination::Hosts => list,
-            Destination::Sessions => self.session_rows(list),
+            Destination::Sessions => self.session_rows(list, cx),
             Destination::Transfers => self.transfer_rows(list),
         }
     }
@@ -3884,61 +4095,205 @@ impl ShelluneView {
         let destination = self.workspace.destination();
         let state = self.workspace.state(destination);
 
-        let body = if self.shows_terminal(destination) {
-            self.terminal_panel(cx)
-        } else if destination == Destination::Hosts {
-            // The hosts destination renders its own empty, failed and populated
-            // states: the tools, the form and the list are one panel.
+        // A terminal fills the panel edge to edge, less a small margin; everything
+        // else is a reading column that scrolls.
+        if self.shows_terminal(destination) {
             return div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h(px(0.0))
                 .id("content.scroll")
-                .p(metrics.scale(spacing::SECTION))
-                .gap(metrics.panel_gap())
+                .p(metrics.scale(spacing::SNUG))
                 .debug_selector(|| "content".to_owned())
-                .overflow_y_scroll()
-                .child(self.hosts_destination(cx));
+                .child(self.terminal_panel(cx));
+        }
+
+        let body = if destination == Destination::Hosts {
+            // The hosts destination renders its own empty, failed and populated
+            // states: the tools, the form and the list are one panel.
+            self.hosts_destination(cx)
         } else {
             let card = self.section_card(destination, state);
             if state == SectionState::Populated {
-                self.rows_for(destination, card)
+                self.rows_for(destination, card, cx)
             } else if destination == Destination::LocalShells {
                 div()
                     .flex()
                     .flex_col()
                     .gap(metrics.panel_gap())
-                    .child(self.shell_picker(cx))
                     .child(card)
+                    .child(self.shell_launcher(cx))
             } else {
                 card
             }
         };
 
-        let container = div()
+        div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
             .id("content.scroll")
-            .p(metrics.scale(spacing::SECTION))
-            .gap(metrics.panel_gap())
             .debug_selector(|| "content".to_owned())
-            .child(body);
-        // A terminal fills the panel; a list of cards scrolls instead.
-        if self.shows_terminal(destination) {
-            container
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(metrics.content_max_width())
+                    .mx_auto()
+                    .px(metrics.scale(spacing::LOOSE - 4.0))
+                    .py(metrics.scale(spacing::LOOSE - 4.0))
+                    .gap(metrics.panel_gap())
+                    .child(body),
+            )
+    }
+
+    /// The shells this machine offers, as tiles that open one in a click (R2).
+    ///
+    /// The empty local page is where a first shell is started, so the choices are
+    /// laid out in full instead of hiding in a menu; the tile that is the default
+    /// for the header's button is marked.
+    fn shell_launcher(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let mut tiles = div()
+            .flex()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT + 2.0));
+
+        for (index, shell) in self.workspace.shells().iter().enumerate() {
+            let selected = index == self.workspace.shell_choice();
+            tiles = tiles.child(
+                self.shell_tile(
+                    shell.name().to_owned(),
+                    Some(program_label(shell.program())),
+                    selected,
+                )
+                .id(("shell.choice", index))
+                .debug_selector(move || format!("shell.choice.{index}"))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.launch_choice(index, window, cx);
+                })),
+            );
+        }
+        tiles = tiles.child(
+            self.shell_tile(
+                format!("{}{ELLIPSIS}", strings.shell_custom_button),
+                None,
+                self.custom_shell_open,
+            )
+            .id("shell.custom")
+            .debug_selector(|| "shell.custom".to_owned())
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.toggle_custom_shell(window, cx);
+            })),
+        );
+
+        let mut launcher = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT + 2.0))
+            .debug_selector(|| "shell.picker".to_owned())
+            .child(components::section_label(
+                strings.shell_launch_title,
+                metrics,
+            ));
+        if self.workspace.shells().is_empty() {
+            launcher = launcher.child(
+                div()
+                    .text_size(metrics.label_size())
+                    .text_color(Tone::Warning.text())
+                    .child(strings.shell_none_found),
+            );
+        }
+        launcher = launcher.child(tiles);
+        if self.custom_shell_open {
+            launcher = launcher.child(
+                div()
+                    .w_full()
+                    .debug_selector(|| "shell.path".to_owned())
+                    .child(self.shell_path.clone()),
+            );
+        }
+        launcher.child(
+            div()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(match self.workspace.locale() {
+                    Locale::English => product::TAGLINE_EN,
+                    Locale::Chinese => product::TAGLINE_ZH,
+                }),
+        )
+    }
+
+    /// One launcher tile: the shell's name and the program it runs.
+    fn shell_tile(&self, name: String, program: Option<String>, selected: bool) -> Div {
+        let metrics = self.metrics();
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        let hover_border = theme::swatch(palette::BORDER_STRONG);
+        let tile = div()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(metrics.scale(2.0))
+            .w(metrics.scale(196.0))
+            .h(metrics.scale(58.0))
+            .px(metrics.scale(spacing::SNUG + 2.0))
+            .rounded(px(radius::LARGE))
+            .border_1()
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(terminal::monospace_family())
+                            .text_size(metrics.label_size())
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::swatch(palette::ACCENT))
+                            .child(">_"),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(metrics.body_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(name)),
+                    ),
+            )
+            .children(program.map(|program| {
+                div()
+                    .truncate()
+                    .font_family(terminal::monospace_family())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(SharedString::from(program))
+            }));
+        if selected {
+            tile.bg(theme::swatch(palette::ACCENT_TINT))
+                .border_color(theme::swatch(palette::ACCENT))
         } else {
-            container.overflow_y_scroll()
+            tile.bg(theme::swatch(palette::SURFACE_RAISED))
+                .border_color(theme::swatch(palette::BORDER))
+                .hover(move |style| style.bg(hover).border_color(hover_border))
         }
     }
 
     /// The selected terminal, the session it belongs to and the shell it runs.
+    ///
+    /// The terminal sits in one frame with the bar of its session on top, so the
+    /// name, the state and the actions are read in the same place as the output.
     fn terminal_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let destination = self.workspace.destination();
         let mut column = div()
             .flex()
             .flex_col()
@@ -3946,12 +4301,7 @@ impl ShelluneView {
             .min_h(px(0.0))
             .gap(metrics.scale(spacing::TIGHT));
 
-        // A new shell can only be started where local shells live; the sessions
-        // destination lists every session and starts nothing.
-        if destination == Destination::LocalShells {
-            column = column.child(self.shell_picker(cx));
-        }
-
+        // A shell that failed to start says so above the terminal that is still open.
         if let Some(reason) = &self.local_error {
             column = column.child(self.notice_line(reason.clone(), Tone::Danger));
         }
@@ -3972,38 +4322,62 @@ impl ShelluneView {
                 _ => None,
             });
 
+        let mut frame = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::CANVAS))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER));
+
         if let Some(pane) = self.active_pane() {
-            column = column.child(self.session_bar(id, cx));
+            frame = frame.child(self.session_bar(id, cx));
             // A shell that ended keeps its last screen, but the reason it stopped is
             // stated above it instead of being left for the user to guess.
-            if let Some((failure, reconnectable)) = ended {
-                column = column.child(self.failure_notice(&failure, reconnectable));
-            } else if let Some(failure) = pane.read(cx).state().failure() {
-                column = column.child(self.failure_notice(&failure, false));
+            let notice = if let Some((failure, reconnectable)) = ended {
+                Some(self.failure_notice(&failure, reconnectable))
+            } else {
+                pane.read(cx)
+                    .state()
+                    .failure()
+                    .map(|failure| self.failure_notice(&failure, false))
+            };
+            if let Some(notice) = notice {
+                frame = frame.child(
+                    div()
+                        .flex_none()
+                        .px(metrics.scale(spacing::SNUG))
+                        .pt(metrics.scale(spacing::SNUG))
+                        .child(notice),
+                );
             }
-            column = column.child(pane.clone());
+            frame = frame.child(pane.clone());
         } else if let Some(session) = session {
             // A session can outlive its terminal: a reconnect that was refused before
             // it opened one, or a process that never started. The session still holds
             // the reason, so it is drawn where the terminal would be instead of being
             // recorded and shown nowhere.
-            column = column.child(self.session_bar(id, cx));
-            if let Some((failure, reconnectable)) = ended {
-                column = column.child(self.failure_notice(&failure, reconnectable));
+            frame = frame.child(self.session_bar(id, cx));
+            let notice = if let Some((failure, reconnectable)) = ended {
+                self.failure_notice(&failure, reconnectable)
             } else {
                 // Nothing failed and there is nothing to draw: the reason is still
                 // said, because an empty panel would look like a terminal that is
                 // merely blank.
-                column = column.child(self.notice_line(
+                self.notice_line(
                     format!(
                         "{} · {}",
                         strings.session_no_terminal,
                         copy::session_state_label(session.state(), self.workspace.locale())
                     ),
                     Tone::Warning,
-                ));
-            }
+                )
+            };
+            frame = frame.child(div().p(metrics.scale(spacing::SNUG)).child(notice));
         }
+        column = column.child(frame);
         self.with_files_panel(column, id, cx)
     }
 
@@ -4017,7 +4391,7 @@ impl ShelluneView {
             .flex()
             .flex_1()
             .min_h(px(0.0))
-            .gap(metrics.scale(spacing::TIGHT))
+            .gap(metrics.scale(spacing::SNUG))
             .child(
                 div()
                     .flex()
@@ -4334,9 +4708,9 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
-                    .child(components::chip(
+                    .child(components::kind_badge(
                         strings.files_host_label,
-                        Tone::Neutral,
+                        true,
                         metrics,
                     ))
                     .child(
@@ -4344,6 +4718,7 @@ impl ShelluneView {
                             .min_w(px(0.0))
                             .truncate()
                             .text_size(metrics.body_size())
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector(|| "files.host".to_owned())
                             .child(SharedString::from(format!("{host} · {target}"))),
@@ -4354,9 +4729,9 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
-                    .child(components::chip(
+                    .child(components::kind_badge(
                         strings.files_path_label,
-                        Tone::Neutral,
+                        false,
                         metrics,
                     ))
                     .child(
@@ -4366,6 +4741,7 @@ impl ShelluneView {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
+                            .font_family(terminal::monospace_family())
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
                             .debug_selector(|| "files.path".to_owned())
@@ -4385,21 +4761,21 @@ impl ShelluneView {
             .child(self.text_button(
                 SharedString::from("files.up"),
                 strings.files_up,
-                Tone::Accent,
+                Variant::Ghost,
                 cx,
                 move |view, cx| view.files_up(id, cx),
             ))
             .child(self.text_button(
                 SharedString::from("files.refresh"),
                 strings.files_refresh,
-                Tone::Accent,
+                Variant::Ghost,
                 cx,
                 move |view, cx| view.files_refresh(id, cx),
             ))
             .child(self.text_button(
                 SharedString::from("files.new"),
                 strings.files_new,
-                Tone::Neutral,
+                Variant::Ghost,
                 cx,
                 move |view, cx| view.files_new(id, cx),
             ))
@@ -4408,14 +4784,14 @@ impl ShelluneView {
             .child(self.text_button(
                 SharedString::from("files.upload"),
                 strings.transfers_upload,
-                Tone::Neutral,
+                Variant::Soft,
                 cx,
                 move |view, cx| view.files_ask_upload(id, cx),
             ))
             .child(self.text_button(
                 SharedString::from("files.close"),
                 strings.files_close,
-                Tone::Neutral,
+                Variant::Ghost,
                 cx,
                 move |view, cx| view.toggle_files(id, cx),
             ));
@@ -4502,10 +4878,10 @@ impl ShelluneView {
             .flex_none()
             .w(metrics.scale(FILES_PANEL_WIDTH))
             .min_h(px(0.0))
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .p(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .gap(metrics.scale(spacing::TIGHT))
+            .p(metrics.scale(spacing::SNUG))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .child(header)
@@ -4562,18 +4938,21 @@ impl ShelluneView {
                     .items_center()
                     .flex_wrap()
                     .gap(metrics.scale(spacing::HAIRLINE))
-                    .child(components::chip(
+                    .child(components::section_label(
                         strings.transfers_heading,
-                        Tone::Neutral,
                         metrics,
                     ))
                     .child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .debug_selector(|| "transfers.count".to_owned())
-                            .child(SharedString::from(format!("{active}"))),
+                        components::badge(
+                            active,
+                            if active > 0 {
+                                Tone::Accent
+                            } else {
+                                Tone::Neutral
+                            },
+                            metrics,
+                        )
+                        .debug_selector(|| "transfers.count".to_owned()),
                     ),
             );
 
@@ -4633,10 +5012,12 @@ impl ShelluneView {
             .flex_col()
             .flex_none()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_1()
+            .pl(metrics.scale(spacing::TIGHT))
+            .pr(metrics.scale(spacing::HAIRLINE))
+            .py(metrics.scale(spacing::HAIRLINE + 2.0))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::DANGER_TINT))
+            .border_l(metrics.scale(3.0))
             .border_color(theme::swatch(palette::DANGER))
             .text_size(metrics.caption_size())
             .debug_selector(move || format!("transfers.overwrite.{index}"))
@@ -4659,7 +5040,7 @@ impl ShelluneView {
                     .child(self.text_button(
                         SharedString::from(format!("transfers.overwrite.replace.{index}")),
                         strings.transfers_overwrite_replace,
-                        Tone::Danger,
+                        Variant::Danger,
                         cx,
                         move |view, cx| {
                             view.transfer_decide(id, shellune_core::OverwriteChoice::Replace, cx);
@@ -4668,7 +5049,7 @@ impl ShelluneView {
                     .child(self.text_button(
                         SharedString::from(format!("transfers.overwrite.keep.{index}")),
                         strings.transfers_overwrite_keep,
-                        Tone::Neutral,
+                        Variant::Secondary,
                         cx,
                         move |view, cx| {
                             view.transfer_decide(
@@ -4735,7 +5116,7 @@ impl ShelluneView {
             actions = actions.child(self.text_button(
                 SharedString::from(format!("transfers.cancel.{index}")),
                 strings.transfers_cancel,
-                Tone::Danger,
+                Variant::Ghost,
                 cx,
                 move |view, cx| view.transfer_cancel(id, cx),
             ));
@@ -4748,7 +5129,7 @@ impl ShelluneView {
             actions = actions.child(self.text_button(
                 SharedString::from(format!("transfers.retry.{index}")),
                 strings.transfers_retry,
-                Tone::Neutral,
+                Variant::Secondary,
                 cx,
                 move |view, cx| view.transfer_retry(id, cx),
             ));
@@ -4759,9 +5140,11 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_none()
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE))
-            .p(metrics.scale(2.0))
+            .gap(metrics.scale(2.0))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::HAIRLINE + 2.0))
             .text_size(metrics.caption_size())
             .child(
                 div()
@@ -4811,21 +5194,10 @@ impl ShelluneView {
             .and_then(|browser| browser.current_directory())
             .map(str::to_owned);
         let danger = matches!(dialog, FilesDialog::Delete { .. });
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .p(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_1()
-            .border_color(theme::swatch(if danger {
-                palette::DANGER
-            } else {
-                palette::BORDER
-            }))
-            .debug_selector(|| "files.question".to_owned());
+        let mut card =
+            components::banner(if danger { Tone::Danger } else { Tone::Accent }, metrics)
+                .gap(metrics.scale(spacing::TIGHT - 2.0))
+                .debug_selector(|| "files.question".to_owned());
 
         let heading = match dialog {
             FilesDialog::NewDirectory { .. } => strings.files_new,
@@ -4916,14 +5288,14 @@ impl ShelluneView {
                         .child(self.text_button(
                             SharedString::from("files.question.confirm"),
                             confirm,
-                            Tone::Accent,
+                            Variant::Primary,
                             cx,
                             |view, cx| view.submit_files_change(cx),
                         ))
                         .child(self.text_button(
                             SharedString::from("files.question.cancel"),
                             strings.files_cancel,
-                            Tone::Neutral,
+                            Variant::Secondary,
                             cx,
                             |view, cx| view.files_cancel_change(cx),
                         )),
@@ -4988,14 +5360,14 @@ impl ShelluneView {
                         .child(self.text_button(
                             SharedString::from("files.question.confirm"),
                             strings.files_delete_confirm,
-                            Tone::Danger,
+                            Variant::Danger,
                             cx,
                             |view, cx| view.submit_files_change(cx),
                         ))
                         .child(self.text_button(
                             SharedString::from("files.question.cancel"),
                             strings.files_cancel,
-                            Tone::Neutral,
+                            Variant::Secondary,
                             cx,
                             |view, cx| view.files_cancel_change(cx),
                         )),
@@ -5014,48 +5386,37 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let done = outcome.succeeded();
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(metrics.scale(1.0))
-            .p(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_1()
-            .border_color(theme::swatch(if done {
-                palette::BORDER
-            } else {
-                palette::DANGER
-            }))
-            .debug_selector(|| "files.report".to_owned())
-            .child(
-                div()
-                    .text_size(metrics.label_size())
-                    .text_color(if done {
-                        Tone::Positive.text()
-                    } else {
-                        Tone::Danger.text()
-                    })
-                    .debug_selector(|| "files.report.heading".to_owned())
-                    .child(SharedString::from(if done {
-                        strings.files_change_done
-                    } else {
-                        strings.files_change_failed
-                    })),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "files.report.count".to_owned())
-                    .child(SharedString::from(format!(
-                        "{} {}/{}",
-                        strings.files_change_changed,
-                        outcome.changed(),
-                        outcome.steps().len()
-                    ))),
-            );
+        let mut card =
+            components::banner(if done { Tone::Positive } else { Tone::Danger }, metrics)
+                .gap(metrics.scale(1.0))
+                .debug_selector(|| "files.report".to_owned())
+                .child(
+                    div()
+                        .text_size(metrics.label_size())
+                        .text_color(if done {
+                            Tone::Positive.text()
+                        } else {
+                            Tone::Danger.text()
+                        })
+                        .debug_selector(|| "files.report.heading".to_owned())
+                        .child(SharedString::from(if done {
+                            strings.files_change_done
+                        } else {
+                            strings.files_change_failed
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "files.report.count".to_owned())
+                        .child(SharedString::from(format!(
+                            "{} {}/{}",
+                            strings.files_change_changed,
+                            outcome.changed(),
+                            outcome.steps().len()
+                        ))),
+                );
         for (index, step) in outcome.steps().iter().take(FILES_REPORT_STEPS).enumerate() {
             let selector = format!("files.report.step.{index}");
             let line = match step.failure() {
@@ -5094,11 +5455,11 @@ impl ShelluneView {
             .flex()
             .items_center()
             .flex_none()
-            .px(metrics.scale(spacing::HAIRLINE))
-            .py(metrics.scale(2.0))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE))
-            .text_size(metrics.caption_size())
+            .px(metrics.scale(spacing::TIGHT))
+            .h(metrics.compact_control_height())
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .text_size(metrics.label_size())
             .text_color(theme::swatch(palette::TEXT_SECONDARY))
             .cursor_pointer()
             .on_click(cx.listener(move |view, _event, _window, cx| {
@@ -5142,14 +5503,15 @@ impl ShelluneView {
             .items_center()
             .justify_between()
             .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::HAIRLINE))
+            .px(metrics.scale(spacing::TIGHT))
             .py(metrics.scale(2.0))
             .rounded(px(radius::SMALL))
-            .text_size(metrics.caption_size())
+            .text_size(metrics.label_size())
             .child(
                 div()
                     .min_w(px(0.0))
                     .truncate()
+                    .when(openable, |name| name.font_weight(FontWeight::MEDIUM))
                     .text_color(theme::swatch(if openable {
                         palette::TEXT_PRIMARY
                     } else {
@@ -5161,6 +5523,7 @@ impl ShelluneView {
             .child(
                 div()
                     .flex_none()
+                    .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(SharedString::from(match size {
                         Some(bytes) => format!("{label} · {bytes} B"),
@@ -5174,14 +5537,17 @@ impl ShelluneView {
                 },
             ));
         }
+        let hover = theme::swatch(palette::SURFACE_HOVER);
         div()
             .id(("files.row", index))
             .debug_selector(move || format!("files.row.{index}"))
             .flex()
             .flex_col()
             .flex_none()
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE))
+            .py(metrics.scale(2.0))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .hover(move |style| style.bg(hover))
             .child(entry_row)
             .child({
                 let mut actions = div()
@@ -5194,7 +5560,7 @@ impl ShelluneView {
                     .child(self.text_button(
                         SharedString::from(format!("files.rename.{index}")),
                         strings.files_rename,
-                        Tone::Neutral,
+                        Variant::Ghost,
                         cx,
                         move |view, cx| view.files_ask_rename(id, &rename, cx),
                     ));
@@ -5204,7 +5570,7 @@ impl ShelluneView {
                     actions = actions.child(self.text_button(
                         SharedString::from(format!("files.download.{index}")),
                         strings.transfers_download,
-                        Tone::Neutral,
+                        Variant::Ghost,
                         cx,
                         move |view, cx| view.files_ask_download(id, &download, cx),
                     ));
@@ -5212,7 +5578,7 @@ impl ShelluneView {
                 actions.child(self.text_button(
                     SharedString::from(format!("files.delete.{index}")),
                     strings.files_delete,
-                    Tone::Danger,
+                    Variant::Ghost,
                     cx,
                     move |view, cx| view.files_ask_delete(id, &delete, kind, cx),
                 ))
@@ -5338,29 +5704,20 @@ impl ShelluneView {
         } else {
             strings.session_close
         };
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .px(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .text_size(metrics.label_size())
+        // A process that ended with status 0 is stated in the neutral tone: the reason
+        // is still shown, but a normal exit is not an error.
+        let tone = Tone::for_failure(failure);
+        components::banner(tone, metrics)
             .debug_selector(|| "terminal.failure".to_owned())
             .child(
                 div()
-                    // A process that ended with status 0 is stated in the neutral tone:
-                    // the reason is still shown, but a normal exit is not an error.
-                    .text_color(Tone::for_failure(failure).text())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .child(SharedString::from(failure.to_string())),
             )
             .child(
                 div()
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .debug_selector(|| "terminal.failure.next".to_owned())
                     .child(SharedString::from(format!(
                         "{} · {step}",
@@ -5369,28 +5726,22 @@ impl ShelluneView {
             )
     }
 
-    /// One muted or coloured line under a heading.
+    /// One coloured notice line under a heading.
     fn notice_line(&self, text: String, tone: Tone) -> Div {
         let metrics = self.metrics();
-        div()
-            .flex_none()
-            .px(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .text_size(metrics.label_size())
-            .text_color(tone.text())
+        components::banner(tone, metrics)
+            .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .debug_selector(|| "session.notice".to_owned())
             .child(SharedString::from(text))
     }
 
     /// The tab of one session: what it is, what it runs and what it is doing.
     ///
-    /// Every part R7 asks for is here and nowhere else: the name, the kind, the object
-    /// it talks to and the connection state are read from the session record, so a tab
-    /// cannot describe a session the domain model does not have.
+    /// Every part R7 asks for is here: the name, the kind and the connection state are
+    /// read from the session record, so a tab cannot describe a session the domain
+    /// model does not have. The state is a coloured dot while the session is live and
+    /// is spelled out once it is anything else; the object it talks to is on the
+    /// session bar and in the tab's tooltip.
     fn session_tab(&self, id: SessionId, index: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
@@ -5399,96 +5750,121 @@ impl ShelluneView {
         };
         let selected = self.active == Some(id);
         let kind = PaneKind::of(session.kind());
-        let (kind_label, tone) = (
-            match kind {
-                PaneKind::Local => strings.session_kind_local,
-                PaneKind::Remote => strings.session_kind_remote,
-            },
-            session_tone(session.state()),
-        );
-        let label = match kind {
-            PaneKind::Local => session.title().to_owned(),
-            PaneKind::Remote => format!(
-                "{} · {}",
-                session.title(),
-                session_target(&self.book, session)
-            ),
-        };
+        let tone = session_tone(session.state());
         let state_label = copy::session_state_label(session.state(), self.workspace.locale());
+        let live = session.state() == &SessionState::Connected;
+        let kind_label = match kind {
+            PaneKind::Local => strings.session_kind_local,
+            PaneKind::Remote => strings.session_kind_remote,
+        };
+        let tooltip = format!(
+            "{} · {kind_label} · {} · {state_label}",
+            session.title(),
+            session_target(&self.book, session)
+        );
         let selector = format!("session.tab.{index}");
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        let hover_text = theme::swatch(palette::TEXT_PRIMARY);
 
-        div()
+        let mut tab = div()
             .id(("session.tab", index))
             .debug_selector(move || selector.clone())
             .flex()
             .items_center()
             .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .px(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(2.0))
-            .rounded(px(radius::SMALL))
+            .max_w(metrics.scale(260.0))
+            .gap(metrics.scale(spacing::TIGHT - 1.0))
+            .h(metrics.tab_height())
+            .pl(metrics.scale(spacing::SNUG - 2.0))
+            .pr(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::MEDIUM))
             .border_1()
-            .border_color(theme::swatch(if selected {
-                palette::ACCENT
-            } else {
-                palette::BORDER
-            }))
-            .bg(theme::swatch(if selected {
-                palette::SURFACE_SELECTED
-            } else {
-                palette::SURFACE_RAISED
-            }))
+            .text_size(metrics.label_size())
             .cursor_pointer()
+            .tooltip(components::tooltip(tooltip))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.activate(id, cx);
-            }))
-            .child(components::status_dot(tone, metrics))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(kind_label),
-            )
+            }));
+        tab = if selected {
+            tab.bg(theme::swatch(palette::SURFACE_SELECTED))
+                .border_color(theme::swatch(palette::BORDER_STRONG))
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+        } else {
+            tab.border_color(theme::clear())
+                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .hover(move |style| style.bg(hover).text_color(hover_text))
+        };
+
+        tab.child(components::status_dot(tone, metrics))
+            .when(kind == PaneKind::Remote, |tab| {
+                tab.child(components::kind_badge(kind_label, true, metrics))
+            })
             .child(
                 div()
                     .min_w(px(0.0))
                     .truncate()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(SharedString::from(label)),
+                    .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
+                    .child(SharedString::from(self.tab_title(id, index))),
             )
-            .child(components::chip(state_label, tone, metrics))
+            .when(!live, |tab| {
+                tab.child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(tone.text())
+                        .child(SharedString::from(state_label)),
+                )
+            })
             .child(
-                div()
+                components::icon_button(CLOSE_GLYPH, metrics)
+                    .min_w(metrics.scale(20.0))
+                    .h(metrics.scale(20.0))
                     .id(("session.tab.close", index))
                     .debug_selector({
                         let selector = format!("session.tab.close.{index}");
                         move || selector.clone()
                     })
-                    .flex_none()
-                    .px(metrics.scale(2.0))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .cursor_pointer()
                     .on_click(cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
                         this.request_close_session(id, cx);
-                    }))
-                    .child(SharedString::from("×")),
+                    })),
             )
     }
 
-    /// The tabs of the sessions that are still open, in the order they were opened.
+    /// The label of one tab: the session's title, numbered when an earlier tab has
+    /// the same one, so two shells of one program can be told apart at a glance.
+    fn tab_title(&self, id: SessionId, index: usize) -> String {
+        let Some(title) = self.workspace.session(id).map(Session::title) else {
+            return String::new();
+        };
+        let tabs = self.tab_sessions();
+        let same = |other: &SessionId| {
+            self.workspace
+                .session(*other)
+                .is_some_and(|session| session.title() == title)
+        };
+        let before = tabs.iter().take(index).filter(|other| same(other)).count();
+        let total = tabs.iter().filter(|other| same(other)).count();
+        if total > 1 {
+            format!("{title} {}", before + 1)
+        } else {
+            title.to_owned()
+        }
+    }
+
+    /// The tabs of the sessions that are still open, in the order they were opened,
+    /// and the button that opens another local shell.
     fn tab_strip(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
+        let strings = self.strings();
         let mut strip = div()
             .flex()
             .items_center()
             .flex_wrap()
             .flex_none()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .px(metrics.scale(spacing::SECTION))
-            .py(metrics.scale(spacing::HAIRLINE))
+            .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(spacing::HAIRLINE + 1.0))
             .bg(theme::swatch(palette::SURFACE))
             .border_b_1()
             .border_color(theme::swatch(palette::BORDER))
@@ -5497,7 +5873,20 @@ impl ShelluneView {
         for (index, id) in self.tab_sessions().iter().enumerate() {
             strip = strip.child(self.session_tab(*id, index, cx));
         }
-        strip
+        strip.child(
+            components::icon_button("+", metrics)
+                .text_size(metrics.body_size())
+                .id("session.tab.new")
+                .debug_selector(|| "session.tab.new".to_owned())
+                .tooltip(components::tooltip(SharedString::from(format!(
+                    "{} ({})",
+                    strings.primary_local,
+                    new_shell_shortcut_label(Platform::current())
+                ))))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.new_local_shell(window, cx);
+                })),
+        )
     }
 
     /// The state, the object and the actions of the selected session.
@@ -5508,14 +5897,17 @@ impl ShelluneView {
             return div();
         };
         let id = session.id();
-        let kind = match PaneKind::of(session.kind()) {
+        let kind = PaneKind::of(session.kind());
+        let kind_label = match kind {
             PaneKind::Local => strings.session_kind_local,
             PaneKind::Remote => strings.session_kind_remote,
         };
         let target = match session.kind() {
-            SessionKind::Local { .. } => session.title().to_owned(),
+            SessionKind::Local { .. } => program_label(&session_target(&self.book, session)),
             SessionKind::Remote { .. } => session_target(&self.book, session),
         };
+        // A local shell's program is often its own title; saying it twice is noise.
+        let target = (target != session.title()).then_some(target);
         let state_label = copy::session_state_label(session.state(), self.workspace.locale());
         let tone = session_tone(session.state());
         let can_reconnect = may_reconnect(session);
@@ -5533,9 +5925,9 @@ impl ShelluneView {
                     strings.files_open
                 },
                 if files_open {
-                    Tone::Neutral
+                    Variant::Secondary
                 } else {
-                    Tone::Accent
+                    Variant::Soft
                 },
                 cx,
                 move |view, cx| view.toggle_files(id, cx),
@@ -5548,6 +5940,12 @@ impl ShelluneView {
             .justify_between()
             .flex_none()
             .gap(metrics.scale(spacing::TIGHT))
+            .h(metrics.scale(42.0))
+            .px(metrics.scale(spacing::SNUG))
+            .bg(theme::swatch(palette::SURFACE))
+            .rounded_t(px(radius::LARGE))
+            .border_b_1()
+            .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "session.bar".to_owned())
             .child(
                 div()
@@ -5556,25 +5954,44 @@ impl ShelluneView {
                     .gap(metrics.scale(spacing::TIGHT))
                     .min_w(px(0.0))
                     .child(components::status_dot(tone, metrics))
-                    .child(components::chip(kind, tone, metrics))
-                    .child(components::stacked(
-                        session.title().to_owned(),
-                        target,
+                    .child(components::kind_badge(
+                        kind_label,
+                        kind == PaneKind::Remote,
                         metrics,
                     ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(metrics.scale(240.0))
+                            .truncate()
+                            .text_size(metrics.body_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(session.title().to_owned())),
+                    )
+                    .children(target.map(|target| {
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(terminal::monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(target))
+                    }))
                     .child(components::chip(state_label, tone, metrics)),
             )
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
+                    .gap(metrics.scale(spacing::HAIRLINE))
                     .when_some(files_button, |row, button| row.child(button))
                     .when(can_reconnect, |row| {
                         row.child(self.text_button(
                             SharedString::from("session.reconnect"),
                             strings.session_reconnect,
-                            Tone::Accent,
+                            Variant::Primary,
                             cx,
                             move |view, cx| view.reconnect_session(id, cx),
                         ))
@@ -5582,130 +5999,45 @@ impl ShelluneView {
                     .child(self.text_button(
                         SharedString::from("session.close"),
                         strings.session_close,
-                        Tone::Neutral,
+                        Variant::Ghost,
                         cx,
                         move |view, cx| view.request_close_session(id, cx),
                     )),
             )
     }
 
-    /// The shell choices and the free-text path field.
-    fn shell_picker(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let mut row = div()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .flex_none()
-            .gap(metrics.scale(spacing::TIGHT))
-            .debug_selector(|| "shell.picker".to_owned())
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.shell_picker_label),
-            );
-
-        if self.workspace.shells().is_empty() {
-            row = row.child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(Tone::Warning.text())
-                    .child(strings.shell_none_found),
-            );
-        }
-
-        for (index, shell) in self.workspace.shells().iter().enumerate() {
-            let selected = index == self.workspace.shell_choice();
-            row = row.child(
-                div()
-                    .id(("shell.choice", index))
-                    .debug_selector(move || format!("shell.choice.{index}"))
-                    .px(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(2.0))
-                    .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(if selected {
-                        palette::ACCENT_TINT
-                    } else {
-                        palette::SURFACE_RAISED
-                    }))
-                    .border_1()
-                    .border_color(theme::swatch(if selected {
-                        palette::ACCENT
-                    } else {
-                        palette::BORDER
-                    }))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(if selected {
-                        palette::ACCENT_ON_TINT
-                    } else {
-                        palette::TEXT_SECONDARY
-                    }))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.workspace.select_shell(index);
-                        cx.notify();
-                    }))
-                    .child(SharedString::from(shell.name().to_owned())),
-            );
-        }
-
-        row = row.child(
-            div()
-                .id("shell.custom")
-                .debug_selector(|| "shell.custom".to_owned())
-                .px(metrics.scale(spacing::TIGHT))
-                .py(metrics.scale(2.0))
-                .rounded(px(radius::SMALL))
-                .bg(theme::swatch(if self.custom_shell_open {
-                    palette::SURFACE_SELECTED
-                } else {
-                    palette::SURFACE_RAISED
-                }))
-                .border_1()
-                .border_color(theme::swatch(palette::BORDER))
-                .text_size(metrics.caption_size())
-                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.custom_shell_open = !this.custom_shell_open;
-                    if this.custom_shell_open {
-                        let handle = this.shell_path.read(cx).focus_handle().clone();
-                        window.focus(&handle);
-                    }
-                    cx.notify();
-                }))
-                .child(strings.shell_custom_button),
-        );
-
-        if self.custom_shell_open {
-            row = row.child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .debug_selector(|| "shell.path".to_owned())
-                    .child(self.shell_path.clone()),
-            );
-        }
-        row
-    }
-
-    fn local_rows(&self, list: Div) -> Div {
+    fn local_rows(&self, list: Div, cx: &mut Context<Self>) -> Div {
         let sessions: Vec<&Session> = self.workspace.local_sessions().collect();
-        self.session_rows_from(list, &sessions)
+        self.session_rows_from(list, &sessions, cx)
     }
 
-    fn session_rows(&self, list: Div) -> Div {
+    fn session_rows(&self, list: Div, cx: &mut Context<Self>) -> Div {
         let sessions: Vec<&Session> = self.workspace.sessions().items().iter().collect();
-        self.session_rows_from(list, &sessions)
+        self.session_rows_from(list, &sessions, cx)
     }
 
-    fn session_rows_from(&self, mut list: Div, sessions: &[&Session]) -> Div {
+    fn session_rows_from(
+        &self,
+        mut list: Div,
+        sessions: &[&Session],
+        cx: &mut Context<Self>,
+    ) -> Div {
         for (index, session) in sessions.iter().enumerate() {
+            let id = session.id();
+            // A row whose session still has a terminal opens it; one that has none
+            // only reports, because there is nothing to show.
+            let openable = self.pane_for(id).is_some();
             list = list.child(
                 div()
+                    .id(("row", index))
                     .debug_selector(move || format!("row.{index}"))
+                    .when(openable, |row| {
+                        row.cursor_pointer().on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.activate(id, cx);
+                            },
+                        ))
+                    })
                     .child(self.session_row(session)),
             );
         }
@@ -5729,8 +6061,7 @@ impl ShelluneView {
         let locale = self.workspace.locale();
         let tone = Tone::for_session_state(session.state());
         let kind = theme::session_kind_label(session.kind(), strings.local_shell_fallback);
-        // A failed or lost session shows the reason the transport reported instead
-        // of a generic "disconnected", so the user can act on it.
+        let remote = PaneKind::of(session.kind()) == PaneKind::Remote;
         // A failed or lost session states why it ended and, next to it, the action its
         // own state allows (R12): a reason the user cannot act on is only half a
         // report, and this row is the one place a session without a terminal is still
@@ -5743,21 +6074,30 @@ impl ShelluneView {
                     strings.session_close
                 };
                 format!(
-                    "{kind} · {} · {} · {step}",
+                    "{} · {} · {step}",
                     theme::session_failure_text(failure),
                     strings.next_step
                 )
             }
-            state => format!("{kind} · {}", copy::session_state_label(state, locale)),
+            _ => session_target(&self.book, session),
         };
         components::row(metrics)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
+                    .gap(metrics.scale(spacing::SNUG))
                     .min_w(px(0.0))
                     .child(components::status_dot(tone, metrics))
+                    .child(components::kind_badge(
+                        if remote {
+                            strings.session_kind_remote.to_owned()
+                        } else {
+                            kind
+                        },
+                        remote,
+                        metrics,
+                    ))
                     .child(components::stacked(
                         session.title().to_owned(),
                         detail,
@@ -5780,20 +6120,21 @@ impl ShelluneView {
                 div()
                     .flex()
                     .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
+                    .gap(metrics.scale(spacing::SNUG))
                     .min_w(px(0.0))
                     .child(components::status_dot(tone, metrics))
+                    .child(components::kind_badge(
+                        theme::transfer_direction_label(transfer.direction()),
+                        false,
+                        metrics,
+                    ))
                     .child(components::stacked(
-                        format!(
-                            "{} {}",
-                            theme::transfer_direction_label(transfer.direction()),
-                            transfer.source()
-                        ),
+                        transfer.source().to_owned(),
                         // The same line the session panel draws, residue included: a
                         // task whose session is gone can only be read here, and a
                         // partial file it left is what the user has to act on.
                         format!(
-                            "→ {} · {}",
+                            "\u{2192} {} · {}",
                             transfer.destination(),
                             self.transfer_detail(transfer)
                         ),
@@ -5832,16 +6173,28 @@ impl ShelluneView {
         let hosts = self.workspace.hosts().count();
         let sessions = self.workspace.sessions().count();
         let transfers = self.workspace.transfers().count();
-        let counts = if hosts + sessions + transfers == 0 {
+        let live = self
+            .workspace
+            .sessions()
+            .items()
+            .iter()
+            .any(|session| session.state() == &SessionState::Connected);
+        let parts: Vec<String> = [
+            (sessions, strings.count_sessions),
+            (transfers, strings.count_transfers),
+            (hosts, strings.count_hosts),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, unit)| copy::counted(count, unit, locale))
+        .collect();
+        let counts = if parts.is_empty() {
             strings.nothing_running.to_owned()
         } else {
-            format!(
-                "{hosts} {hosts_unit} · {sessions} {sessions_unit} · {transfers} {transfers_unit}",
-                hosts_unit = strings.count_hosts,
-                sessions_unit = strings.count_sessions,
-                transfers_unit = strings.count_transfers
-            )
+            parts.join(" · ")
         };
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        let hover_text = theme::swatch(palette::TEXT_PRIMARY);
 
         div()
             .flex()
@@ -5850,36 +6203,57 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::BASE))
             .h(metrics.status_bar_height())
             .flex_none()
-            .px(metrics.scale(spacing::BASE))
+            .px(metrics.scale(spacing::SNUG))
+            .bg(theme::swatch(palette::SURFACE))
             .border_t_1()
             .border_color(theme::swatch(palette::BORDER))
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(palette::TEXT_MUTED))
-            // The control is clickable because the shortcut it duplicates cannot be:
-            // inside a terminal Ctrl+L is the shell's own key.
             .child(
                 div()
-                    .id("status.language")
-                    .debug_selector(|| "status.language".to_owned())
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.toggle_locale(cx);
-                    }))
-                    .child(SharedString::from(format!(
-                        "{} {} · {} {}",
-                        product::NAME,
-                        self.version(),
-                        strings.language_control,
-                        locale.endonym()
-                    ))),
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT - 2.0))
+                    .min_w(px(0.0))
+                    .child(components::status_dot(
+                        if live { Tone::Positive } else { Tone::Neutral },
+                        metrics,
+                    ))
+                    .child(div().truncate().child(SharedString::from(counts))),
             )
             .child(
                 div()
-                    .truncate()
-                    .debug_selector(|| "status.tagline".to_owned())
-                    .child(product::TAGLINE_EN),
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    // The control is clickable because the shortcut it duplicates
+                    // cannot be: inside a terminal Ctrl+L is the shell's own key.
+                    .child(
+                        div()
+                            .id("status.language")
+                            .debug_selector(|| "status.language".to_owned())
+                            .flex()
+                            .items_center()
+                            .h(metrics.scale(20.0))
+                            .px(metrics.scale(spacing::TIGHT - 2.0))
+                            .rounded(px(radius::SMALL))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover).text_color(hover_text))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.toggle_locale(cx);
+                            }))
+                            .child(SharedString::from(format!(
+                                "{} · {}",
+                                strings.language_control,
+                                locale.endonym()
+                            ))),
+                    )
+                    .child(components::divider_vertical(metrics).h(metrics.scale(12.0)))
+                    .child(div().debug_selector(|| "status.version".to_owned()).child(
+                        SharedString::from(format!("{} {}", product::NAME, self.version())),
+                    )),
             )
-            .child(SharedString::from(counts))
     }
 
     fn version(&self) -> &'static str {
@@ -5931,8 +6305,16 @@ impl Render for ShelluneView {
                 this.toggle_locale(cx);
             }))
             .on_action(cx.listener(|this, _: &DismissNotice, _window, cx| {
+                // Escape closes whatever floats first: an open menu, then the notice.
+                if this.shell_menu_open {
+                    this.close_shell_menu(cx);
+                    return;
+                }
                 this.workspace.dismiss_notice();
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NewLocalShell, window, cx| {
+                this.new_local_shell(window, cx);
             }))
             .child(self.rail(window, cx))
             .child(
@@ -5942,7 +6324,7 @@ impl Render for ShelluneView {
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
-                    .child(self.header(cx))
+                    .child(self.header(window, cx))
                     .children(notice)
                     .children((!self.tab_sessions().is_empty()).then(|| self.tab_strip(cx)))
                     .children(self.close_transfer_question(cx))
@@ -5950,6 +6332,18 @@ impl Render for ShelluneView {
                     .child(self.status_bar(cx)),
             )
     }
+}
+
+/// The file name of a program path, which is what a person recognises it by.
+///
+/// "C:\\Windows\\System32\\cmd.exe" reads as "cmd.exe"; a bare name stays as it is.
+fn program_label(program: &str) -> String {
+    file_name(program).unwrap_or(program).to_owned()
+}
+
+/// The shortcut label of "new local shell" on one platform.
+fn new_shell_shortcut_label(platform: Platform) -> &'static str {
+    platform.new_shell_label()
 }
 
 /// The tone that carries a session state.
@@ -6037,6 +6431,43 @@ pub(crate) fn scratch_store() -> HostStore {
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
     HostStore::at(std::env::temp_dir().join(unique))
+}
+
+/// A rounded square with the initials of a host, so a list is scanned by name shape.
+///
+/// A host that was really reached before is tinted in the positive tone, the same
+/// rule the recent view uses for its dot; every other host is drawn in the accent.
+fn host_avatar(name: &str, reached: bool, metrics: Metrics) -> Div {
+    let initials: String = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .take(2)
+        .filter_map(|part| part.chars().next())
+        .flat_map(char::to_uppercase)
+        .collect();
+    let initials = if initials.is_empty() {
+        "#".to_owned()
+    } else {
+        initials
+    };
+    let (background, text) = if reached {
+        (palette::POSITIVE_TINT, palette::POSITIVE)
+    } else {
+        (palette::ACCENT_TINT, palette::ACCENT_ON_TINT)
+    };
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(metrics.scale(32.0))
+        .h(metrics.scale(32.0))
+        .rounded(px(radius::MEDIUM))
+        .bg(theme::swatch(background))
+        .text_size(metrics.label_size())
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::swatch(text))
+        .child(SharedString::from(initials))
 }
 
 /// The group label a host row shows, when the host belongs to a group.

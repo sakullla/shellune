@@ -22,30 +22,42 @@ use shellune_core::{SessionFailure, SessionKind, SessionState, TransferDirection
 /// object. Status colours are the only saturated hues, which keeps a busy
 /// session list readable.
 pub mod palette {
-    /// Application background behind the navigation rail and content.
-    pub const CANVAS: u32 = 0x0b0d12;
-    /// Default panel surface.
-    pub const SURFACE: u32 = 0x12151c;
-    /// Raised surface for rows, cards and the header.
-    pub const SURFACE_RAISED: u32 = 0x181c25;
-    /// Surface used for the selected navigation entry.
-    pub const SURFACE_SELECTED: u32 = 0x1e2431;
+    /// Application background: the content area and the terminal itself.
+    pub const CANVAS: u32 = 0x0c0e13;
+    /// Chrome surface: the navigation rail, the tab strip and the status bar.
+    pub const SURFACE: u32 = 0x111419;
+    /// Raised surface for cards, rows and inputs.
+    pub const SURFACE_RAISED: u32 = 0x171b22;
+    /// Surface under the pointer, one step above [`SURFACE_RAISED`].
+    pub const SURFACE_HOVER: u32 = 0x1c212a;
+    /// Surface used for the selected navigation entry, tab or choice.
+    pub const SURFACE_SELECTED: u32 = 0x212734;
     /// Hairline border between regions.
-    pub const BORDER: u32 = 0x272e3b;
-    /// Border of an element that owns keyboard focus.
-    pub const BORDER_STRONG: u32 = 0x3a4354;
+    pub const BORDER: u32 = 0x232934;
+    /// Border of controls and of an element under the pointer.
+    pub const BORDER_STRONG: u32 = 0x343c4b;
     /// Primary text: titles and the current object.
-    pub const TEXT_PRIMARY: u32 = 0xeef1f7;
+    pub const TEXT_PRIMARY: u32 = 0xedf0f6;
     /// Secondary text: body copy and list metadata.
-    pub const TEXT_SECONDARY: u32 = 0xbcc4d4;
+    pub const TEXT_SECONDARY: u32 = 0xb6bece;
     /// Muted text: hints, counts and the status bar.
     pub const TEXT_MUTED: u32 = 0x939db0;
     /// Accent used for the selected destination and primary actions.
     pub const ACCENT: u32 = 0x9db4ff;
+    /// Accent under the pointer, for a solid primary button.
+    pub const ACCENT_HOVER: u32 = 0xb7c8ff;
+    /// Text drawn on a solid [`ACCENT`] fill.
+    pub const ON_ACCENT: u32 = 0x0b1022;
     /// Accent tint for filled accent surfaces.
-    pub const ACCENT_TINT: u32 = 0x2a3350;
+    pub const ACCENT_TINT: u32 = 0x222b45;
     /// Text and icons drawn on [`ACCENT_TINT`].
     pub const ACCENT_ON_TINT: u32 = 0xc8d5ff;
+    /// Dark tint behind a positive chip or banner.
+    pub const POSITIVE_TINT: u32 = 0x14271f;
+    /// Dark tint behind a warning chip or banner.
+    pub const WARNING_TINT: u32 = 0x2a2315;
+    /// Dark tint behind a danger chip, banner or destructive button.
+    pub const DANGER_TINT: u32 = 0x2d1a1f;
     /// Live and completed status.
     pub const POSITIVE: u32 = 0x64d8a8;
     /// Waiting, verifying or in-progress status.
@@ -69,18 +81,16 @@ pub mod spacing {
     pub const BASE: f32 = 16.0;
     /// 24px — between panels.
     pub const LOOSE: f32 = 24.0;
-    /// 32px — around empty states.
-    pub const SECTION: f32 = 32.0;
 }
 
 /// Corner radii in logical pixels.
 pub mod radius {
-    /// Chips and small controls.
+    /// Chips, keycaps and small controls.
     pub const SMALL: f32 = 6.0;
-    /// Rows and inputs.
-    pub const MEDIUM: f32 = 9.0;
-    /// Panels and the empty-state card.
-    pub const LARGE: f32 = 14.0;
+    /// Buttons, rows, tabs and inputs.
+    pub const MEDIUM: f32 = 8.0;
+    /// Cards, menus and the terminal frame.
+    pub const LARGE: f32 = 12.0;
 }
 
 /// Type scale in logical pixels.
@@ -92,16 +102,24 @@ pub mod type_scale {
     /// Body copy and list rows.
     pub const BODY: f32 = 13.0;
     /// Panel title.
-    pub const TITLE: f32 = 16.0;
+    pub const TITLE: f32 = 15.0;
     /// Destination title in the header.
-    pub const HEADING: f32 = 20.0;
+    pub const HEADING: f32 = 18.0;
     /// Product name mark.
-    pub const DISPLAY: f32 = 26.0;
+    pub const DISPLAY: f32 = 15.0;
 }
 
 /// Colour helper so views do not call `rgb` with literals.
 pub fn swatch(hex: u32) -> Rgba {
     rgb(hex)
+}
+
+/// A fully transparent colour, for a border or fill that only appears in some states.
+///
+/// Keeping the border in place, invisible, means an element does not shift by a
+/// pixel when it becomes selected or focused.
+pub fn clear() -> Rgba {
+    gpui::rgba(0x0000_0000)
 }
 
 /// Semantic colour role attached to a state label, chip or dot.
@@ -139,11 +157,23 @@ impl Tone {
         }
     }
 
-    /// Surface colour behind a chip in this tone.
+    /// Surface colour behind a chip or banner in this tone.
+    ///
+    /// Each status tone gets its own dark tint, so a chip reads by colour before it
+    /// is read by word; the tints stay dark enough that the tone's text keeps its
+    /// contrast on them.
     pub fn chip_background(self) -> Rgba {
+        swatch(self.tint())
+    }
+
+    /// The raw token behind [`Tone::chip_background`].
+    pub fn tint(self) -> u32 {
         match self {
-            Self::Accent => swatch(palette::ACCENT_TINT),
-            _ => swatch(palette::SURFACE_RAISED),
+            Self::Accent => palette::ACCENT_TINT,
+            Self::Positive => palette::POSITIVE_TINT,
+            Self::Warning => palette::WARNING_TINT,
+            Self::Danger => palette::DANGER_TINT,
+            Self::Neutral | Self::Planned => palette::SURFACE_SELECTED,
         }
     }
 
@@ -263,27 +293,50 @@ impl Metrics {
 
     /// Width of the navigation rail.
     pub fn rail_width(self) -> Pixels {
-        self.scale(232.0)
+        self.scale(212.0)
     }
 
     /// Height of the header that names the current object.
     pub fn header_height(self) -> Pixels {
-        self.scale(60.0)
+        self.scale(56.0)
     }
 
     /// Height of one navigation entry.
     pub fn nav_row_height(self) -> Pixels {
-        self.scale(38.0)
+        self.scale(34.0)
     }
 
     /// Height of one list row.
     pub fn list_row_height(self) -> Pixels {
-        self.scale(46.0)
+        self.scale(52.0)
     }
 
     /// Height of the status bar.
     pub fn status_bar_height(self) -> Pixels {
+        self.scale(28.0)
+    }
+
+    /// Height of a standard button, input or segmented control.
+    pub fn control_height(self) -> Pixels {
         self.scale(30.0)
+    }
+
+    /// Height of a compact control inside a toolbar.
+    pub fn compact_control_height(self) -> Pixels {
+        self.scale(26.0)
+    }
+
+    /// Height of one session tab.
+    pub fn tab_height(self) -> Pixels {
+        self.scale(30.0)
+    }
+
+    /// Widest a reading column of cards and rows grows to.
+    ///
+    /// Lists and forms stop widening here so a maximised window does not stretch a
+    /// host row across a whole monitor; the terminal ignores it and fills the panel.
+    pub fn content_max_width(self) -> Pixels {
+        self.scale(960.0)
     }
 
     /// Gap between panels.

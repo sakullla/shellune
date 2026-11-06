@@ -39,7 +39,7 @@ use gpui::{
 
 use crate::app::actions::{
     CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
-    NextDestination, PreviousDestination, ToggleLanguage,
+    NewLocalShell, NextDestination, PreviousDestination, ToggleLanguage,
 };
 use crate::app::nav::{Destination, Platform};
 
@@ -59,7 +59,8 @@ pub mod actions {
             PreviousDestination,
             CycleTextSize,
             ToggleLanguage,
-            DismissNotice
+            DismissNotice,
+            NewLocalShell
         ]
     );
 }
@@ -123,6 +124,13 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
             Some(KEY_CONTEXT),
         ),
         KeyBinding::new(&format!("{modifier}-="), CycleTextSize, Some(KEY_CONTEXT)),
+        // Opening a shell works from inside a terminal too, so it is bound to the
+        // shell context; the shifted form keeps Ctrl+T for the running program.
+        KeyBinding::new(
+            platform.new_shell_keystroke(),
+            NewLocalShell,
+            Some(KEY_CONTEXT),
+        ),
         KeyBinding::new(
             &format!("{modifier}-l"),
             ToggleLanguage,

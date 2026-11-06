@@ -21,9 +21,9 @@ pub const FOREGROUND: Rgb = Rgb {
 
 /// Default terminal background, matching the shell canvas token.
 pub const BACKGROUND: Rgb = Rgb {
-    r: 0x0b,
-    g: 0x0d,
-    b: 0x12,
+    r: 0x0c,
+    g: 0x0e,
+    b: 0x13,
 };
 
 /// Default cursor colour, matching the accent token.

@@ -218,6 +218,11 @@ impl<T> Section<T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Notice {
     /// The requested action does not exist in this build.
+    ///
+    /// Every main button of the redesigned header does real work (the transfers page
+    /// leads to a file view or to the hosts), so the window no longer raises this; the
+    /// model keeps the honest answer for a request that has no implementation.
+    #[cfg_attr(not(test), allow(dead_code))]
     UnavailableBuild,
 }
 
@@ -232,6 +237,7 @@ impl Notice {
 
 /// What happened when the header's primary action was requested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum PrimaryOutcome {
     /// Nothing was started, and the user was told why.
     Unavailable,
@@ -465,6 +471,7 @@ impl Workspace {
     /// A capability this build does not implement reports
     /// [`PrimaryOutcome::Unavailable`] and shows a notice instead of pretending the
     /// action happened.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn request_primary(&mut self) -> PrimaryOutcome {
         if !self.can_act(self.destination) {
             self.notice = Some(Notice::UnavailableBuild);
@@ -480,6 +487,7 @@ impl Workspace {
     /// action out. Saving a host is the same kind of action: the store answers
     /// whether it could be written, so the button is never greyed out on a guess.
     /// The other destinations arrive with their own steps.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn can_act(&self, destination: Destination) -> bool {
         matches!(destination, Destination::LocalShells | Destination::Hosts)
     }

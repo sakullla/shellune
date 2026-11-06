@@ -300,20 +300,16 @@ async fn language_and_text_size_shortcuts_are_wired(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 #[gpui::test]
-async fn an_unavailable_action_shows_a_notice_instead_of_starting_work(cx: &mut TestAppContext) {
-    // The transfers page has no primary action of its own - a transfer is started from
-    // the file view of a session - so its header action must say that nothing started
-    // instead of pretending one was queued.
+async fn the_transfers_action_leads_to_the_hosts_when_nothing_can_browse(cx: &mut TestAppContext) {
+    // The transfers page has no transfer of its own to start - a transfer is started
+    // from the file view of a session - so with no connection that can browse, its
+    // header action takes the user to the hosts instead of pretending one was queued.
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     focus_root(&view, cx);
     cx.dispatch_action(GoToTransfers);
     cx.run_until_parked();
 
-    assert!(
-        cx.debug_bounds("notice").is_none(),
-        "no notice before an action"
-    );
     let bounds = bounds_of(cx, "header.primary");
     let center = bounds.center();
     cx.simulate_click(point(center.x, center.y), Modifiers::default());
@@ -322,21 +318,23 @@ async fn an_unavailable_action_shows_a_notice_instead_of_starting_work(cx: &mut 
     cx.update(|_window, app| {
         let workspace = view.read(app).workspace();
         assert_eq!(
+            workspace.destination(),
+            Destination::Hosts,
+            "the action leads to where a connection is made"
+        );
+        assert_eq!(
             workspace.notice(),
-            Some(crate::app::workspace::Notice::UnavailableBuild)
+            None,
+            "nothing failed, so nothing is noticed"
         );
         assert_eq!(workspace.state(Destination::Transfers), SectionState::Empty);
         assert_eq!(workspace.item_count(Destination::Transfers), 0);
         assert_eq!(workspace.item_count(Destination::Hosts), 0);
         assert!(
             view.read(app).pane().is_none(),
-            "an unimplemented action must not start a terminal"
+            "leading to the hosts must not start a terminal"
         );
     });
-    assert!(
-        cx.debug_bounds("notice").is_some(),
-        "the notice explaining that nothing started must be visible"
-    );
 }
 
 #[gpui::test]
@@ -607,7 +605,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
     string_fields!(
         strings,
         [
-            workspace,
             nav_local,
             nav_local_summary,
             nav_hosts,
@@ -642,7 +639,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             primary_sessions,
             primary_transfers,
             unavailable_notice,
-            object_label,
             hint_nav_action,
             zoom_control,
             language_control,
@@ -651,7 +647,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             count_transfers,
             local_shell_fallback,
             nothing_running,
-            shell_picker_label,
             shell_custom_button,
             shell_custom_placeholder,
             shell_none_found,
@@ -915,8 +910,8 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
     let bindings = key_bindings(Platform::current());
     assert_eq!(
         bindings.len(),
-        Destination::ALL.len() + 5,
-        "four destinations, next and previous, zoom, language and dismiss"
+        Destination::ALL.len() + 6,
+        "four destinations, next and previous, zoom, new shell, language and dismiss"
     );
 }
 
@@ -1522,7 +1517,16 @@ async fn a_custom_shell_that_starts_owns_the_keyboard(cx: &mut TestAppContext) {
         1,
         "a second Return must not start the shell again"
     );
-    // The field emptied itself, so reopening it cannot offer the same path again.
+    // The field emptied itself, so reopening it cannot offer the same path again. The
+    // terminal now fills the page, so the field is reached through the header's menu.
+    assert!(
+        !cx.update(|_window, app| view.read(app).shell_menu_open()),
+        "the menu closed once its path became a session"
+    );
+    let bounds = bounds_of(cx, "shell.menu");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
     let bounds = bounds_of(cx, "shell.custom");
     let center = bounds.center();
     cx.simulate_click(point(center.x, center.y), Modifiers::default());
@@ -1558,6 +1562,11 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
         "the first terminal must really be open for this case to mean anything"
     );
 
+    // With a terminal on screen the shell choices live in the header's menu.
+    let bounds = bounds_of(cx, "shell.menu");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
     let bounds = bounds_of(cx, "shell.custom");
     let center = bounds.center();
     cx.simulate_click(point(center.x, center.y), Modifiers::default());
@@ -1584,6 +1593,46 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
         cx.update(|_window, app| view.read(app).custom_shell_open()),
         "the field stays open because nothing started from it"
     );
+}
+
+#[gpui::test]
+async fn a_shell_picked_from_the_menu_opens_another_tab_and_closes_the_menu(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    assert!(
+        cx.debug_bounds("shell.menu").is_none(),
+        "the empty page shows the shells as tiles, not behind a menu"
+    );
+
+    click(cx, "header.primary");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().local_sessions().count()),
+        1,
+        "the main button opened the first shell"
+    );
+
+    click(cx, "shell.menu");
+    assert!(
+        cx.debug_bounds("shell.choice.0").is_some(),
+        "the menu lists the shells"
+    );
+    click(cx, "shell.choice.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().local_sessions().count()),
+        2,
+        "a shell picked from the menu opens in a tab of its own"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).shell_menu_open()),
+        "picking a shell closes the menu"
+    );
+    assert!(cx.debug_bounds("session.tab.1").is_some());
 }
 
 #[gpui::test]

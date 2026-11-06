@@ -50,6 +50,25 @@ impl Platform {
         }
     }
 
+    /// Keystroke that opens a new local shell, in the GPUI keymap syntax.
+    ///
+    /// Ctrl+T alone belongs to programs running in the terminal on Windows and
+    /// Linux, so the shifted form is used there, as other terminals do.
+    pub fn new_shell_keystroke(self) -> &'static str {
+        match self {
+            Self::MacOs => "cmd-t",
+            Self::Windows | Self::Linux => "ctrl-shift-t",
+        }
+    }
+
+    /// Label of [`Platform::new_shell_keystroke`].
+    pub fn new_shell_label(self) -> &'static str {
+        match self {
+            Self::MacOs => "\u{2318}T",
+            Self::Windows | Self::Linux => "Ctrl+Shift+T",
+        }
+    }
+
     /// The whole navigation range, for example "Ctrl+1-4" or "⌘1-4".
     ///
     /// Derived from the same modifier and digits as `Destination::shortcut_label`
