@@ -8,3 +8,9 @@
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Packaging output
+/dist/
+
+# Python helpers that packaging scripts may leave behind
+__pycache__/

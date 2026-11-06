@@ -1,0 +1,84 @@
+# Builds the per-platform artifacts that packaging/ describes.
+#
+# Signing and notarisation run only when the repository provides the secrets below;
+# without them the artifacts stay unsigned, which the release notes state. This
+# workflow has not been executed: there is no remote to run it on.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release
+      - name: Portable bundle
+        run: python packaging/windows/make-portable.py --binary target/release/shellune.exe
+      - name: Installer (NSIS)
+        shell: bash
+        run: |
+          choco install nsis -y --no-progress
+          "/c/Program Files (x86)/NSIS/makensis.exe" packaging/windows/shellune.nsi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shellune-windows-x86_64
+          path: dist/*
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release
+      - name: App bundle
+        run: python3 packaging/macos/make-app-bundle.py --binary target/release/shellune
+      - name: Sign and notarise
+        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+          codesign --force --options runtime --timestamp \
+            --sign "Developer ID Application" dist/Shellune.app
+          ditto -c -k --keepParent dist/Shellune.app dist/Shellune-macos-arm64.zip
+          xcrun notarytool submit dist/Shellune-macos-arm64.zip \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple dist/Shellune.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shellune-macos-arm64
+          path: dist/
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the graphics headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev libwayland-dev libxkbcommon-dev libx11-xcb-dev \
+            libxcb1-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release
+      - name: Tarball
+        run: python3 packaging/linux/make-tarball.py --binary target/release/shellune
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shellune-linux-x86_64
+          path: dist/

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Shellune
+GenericName=Terminal
+GenericName[zh_CN]=终端
+Comment=连接远程，也专注本地。
+Comment[zh_CN]=连接远程，也专注本地。
+Comment[en]=A modern terminal for local shells, SSH, and SFTP.
+Exec=shellune
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;ssh;sftp;
+StartupNotify=true
+StartupWMClass=shellune
