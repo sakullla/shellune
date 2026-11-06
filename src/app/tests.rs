@@ -738,6 +738,22 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             session_reconnect,
             session_reconnect_no_shell,
             session_reconnect_missing_host,
+            files_open,
+            files_close,
+            files_host_label,
+            files_path_label,
+            files_up,
+            files_refresh,
+            files_parent_row,
+            files_loading,
+            files_empty,
+            files_unknown_path,
+            files_failed,
+            files_terminal_note,
+            files_kind_directory,
+            files_kind_file,
+            files_kind_link,
+            files_kind_other,
         ]
     )
 }
@@ -4340,4 +4356,387 @@ async fn a_reconnect_that_can_never_work_offers_close_instead(cx: &mut TestAppCo
     });
     cx.run_until_parked();
     assert_eq!(session_state(cx, &view, id), Some(SessionState::Closed));
+}
+
+// ---------------------------------------------------------------------------
+// The file view of a remote session (R9, R12)
+// ---------------------------------------------------------------------------
+
+/// The answers a file view receives in a test, and the requests it made.
+#[derive(Clone, Default)]
+struct FileAnswers(std::sync::Arc<std::sync::Mutex<FileScript>>);
+
+#[derive(Default)]
+struct FileScript {
+    sent: Vec<shellune_core::BrowseRequest>,
+    answers: Vec<shellune_core::BrowseResponse>,
+    accepting: bool,
+}
+
+impl FileAnswers {
+    /// A channel that accepts requests.
+    fn accepting() -> Self {
+        let answers = Self::default();
+        answers.0.lock().expect("a free lock").accepting = true;
+        answers
+    }
+
+    /// A channel whose connection is already gone.
+    fn closed() -> Self {
+        Self::default()
+    }
+
+    /// Answers one request with a real-looking directory.
+    fn reply(&self, request: u64, path: &str, entries: &[(&str, shellune_core::FileKind)]) {
+        let entries = entries
+            .iter()
+            .filter_map(|(name, kind)| shellune_core::DirEntry::new(*name, *kind, None))
+            .collect();
+        self.0
+            .lock()
+            .expect("a free lock")
+            .answers
+            .push(shellune_core::BrowseResponse::Listed {
+                request,
+                path: path.to_owned(),
+                entries,
+            });
+    }
+
+    /// Answers one request with a failure.
+    fn fail(&self, request: u64, failure: shellune_core::BrowseFailure) {
+        self.0
+            .lock()
+            .expect("a free lock")
+            .answers
+            .push(shellune_core::BrowseResponse::Failed { request, failure });
+    }
+
+    /// Everything the view asked for so far.
+    fn requests(&self) -> Vec<shellune_core::BrowseRequest> {
+        self.0.lock().expect("a free lock").sent.clone()
+    }
+}
+
+impl crate::app::files::BrowseChannel for FileAnswers {
+    fn send(&mut self, request: shellune_core::BrowseRequest) -> bool {
+        let mut script = self.0.lock().expect("a free lock");
+        script.sent.push(request);
+        script.accepting
+    }
+
+    fn drain(&mut self) -> Vec<shellune_core::BrowseResponse> {
+        std::mem::take(&mut self.0.lock().expect("a free lock").answers)
+    }
+}
+
+/// Mounts the shell on a store holding one host, as the connection tests do.
+fn remote_view(cx: &mut TestAppContext) -> (Entity<ShelluneView>, &mut VisualTestContext) {
+    let dir = TempDir::new("files-view");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let workspace = Workspace::new();
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// Connects the seeded host through a scripted attempt and returns its session.
+fn live_remote(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> SessionId {
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"remote ready\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+    let id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .find(|session| {
+                    session.kind().is_remote() && matches!(session.state(), SessionState::Connected)
+                })
+                .map(|session| session.id())
+        })
+        .expect("the remote session is live");
+    // A remote terminal is only drawn on the sessions destination.
+    click(cx, "nav.sessions");
+    id
+}
+
+/// Applies what the file views reported, the way the poll loop does.
+fn pump_files(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) {
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.pump_files_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn the_file_view_names_its_host_and_shows_the_directory_the_server_listed(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+
+    let answers = FileAnswers::accepting();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(
+                id,
+                "web",
+                "deploy@10.0.0.5:22",
+                Box::new(answers.clone()),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    // Nothing is browsed before the user asks for it.
+    assert!(
+        cx.debug_bounds("files.panel").is_none(),
+        "a session that was not opened for files shows no file view"
+    );
+    assert!(
+        cx.debug_bounds("session.files").is_some(),
+        "a connection that can browse offers the file view"
+    );
+
+    click(cx, "session.files");
+    assert!(
+        cx.debug_bounds("files.panel").is_some(),
+        "the file view is drawn beside the terminal"
+    );
+    assert!(
+        cx.debug_bounds("files.loading").is_some(),
+        "nothing is claimed before the server answers"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .files_browser(id)
+            .and_then(|browser| { browser.path().map(str::to_owned) })),
+        None,
+        "no path is invented while the answer is missing"
+    );
+    let sent = answers.requests();
+    assert_eq!(sent.len(), 1, "one request was made: {sent:?}");
+    assert_eq!(
+        sent[0],
+        shellune_core::BrowseRequest::Home { request: 1 },
+        "the first request asks the server for the login directory"
+    );
+
+    answers.reply(
+        1,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("文档 与 空格", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+
+    assert!(
+        cx.debug_bounds("files.host").is_some(),
+        "the host is always named beside the path"
+    );
+    assert!(cx.debug_bounds("files.path").is_some());
+    assert!(
+        cx.debug_bounds("files.entry.0").is_some() && cx.debug_bounds("files.entry.2").is_some(),
+        "every entry the server reported is listed"
+    );
+    assert!(
+        cx.debug_bounds("files.parent").is_some(),
+        "a directory that has a parent offers the way up"
+    );
+    // The file view shares the panel with the terminal without pushing it out of the
+    // window, which is what keeps the terminal usable while a directory is open.
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert_fits_inside(bounds_of(cx, "files.panel"), viewport, "file view");
+    assert_fits_inside(
+        bounds_of(cx, "terminal.viewport"),
+        viewport,
+        "terminal grid",
+    );
+    let state = cx
+        .update(|_window, app| {
+            view.read(app)
+                .files_browser(id)
+                .and_then(|browser| browser.state().listing().cloned())
+        })
+        .expect("a real listing is shown");
+    assert_eq!(state.path(), "/home/deploy");
+    let names: Vec<&str> = state.entries().iter().map(|entry| entry.name()).collect();
+    assert_eq!(
+        names,
+        vec!["docs", "文档 与 空格", "notes.txt"],
+        "directories first, and a Chinese name with spaces is kept as it is"
+    );
+
+    // Opening a directory asks the server for exactly that path.
+    click(cx, "files.entry.0");
+    let sent = answers.requests();
+    assert_eq!(
+        sent.last(),
+        Some(&shellune_core::BrowseRequest::List {
+            request: 2,
+            path: "/home/deploy/docs".to_owned(),
+        }),
+        "the entry is opened as the path it is in: {sent:?}"
+    );
+    answers.reply(
+        2,
+        "/home/deploy/docs",
+        &[("deep.txt", shellune_core::FileKind::File)],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .files_browser(id)
+            .and_then(|browser| browser.path().map(str::to_owned))),
+        Some("/home/deploy/docs".to_owned())
+    );
+
+    // The parent comes back through the same connection.
+    click(cx, "files.up");
+    let sent = answers.requests();
+    assert_eq!(
+        sent.last(),
+        Some(&shellune_core::BrowseRequest::List {
+            request: 3,
+            path: "/home/deploy".to_owned(),
+        }),
+        "going up asks for the parent of the path that is really open"
+    );
+    answers.reply(
+        3,
+        "/home/deploy",
+        &[("docs", shellune_core::FileKind::Directory)],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .files_browser(id)
+            .and_then(|browser| browser.path().map(str::to_owned))),
+        Some("/home/deploy".to_owned())
+    );
+
+    // A refused directory is stated, and the terminal is still the live session it
+    // was: an SFTP failure is not a disconnected shell.
+    click(cx, "files.refresh");
+    answers.fail(
+        4,
+        shellune_core::BrowseFailure::PermissionDenied {
+            path: "/home/deploy".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+    assert!(
+        cx.debug_bounds("files.failure").is_some(),
+        "the failure is drawn where the listing was"
+    );
+    assert!(
+        cx.debug_bounds("files.failure.reason").is_some(),
+        "the reason the server gave is part of the failure"
+    );
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .files_browser(id)
+            .is_some_and(|browser| browser.state().listing().is_none())),
+        "a failed directory is not kept as a listing"
+    );
+    assert_eq!(
+        session_state(cx, &view, id),
+        Some(SessionState::Connected),
+        "a directory that cannot be read never marks the terminal as ended"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure").is_none(),
+        "the terminal shows no failure notice of its own"
+    );
+}
+
+#[gpui::test]
+async fn a_connection_that_cannot_browse_says_so_without_ending_the_session(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(
+                id,
+                "web",
+                "deploy@10.0.0.5:22",
+                Box::new(FileAnswers::closed()),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+
+    // The request never left the process, so the view says so at once instead of
+    // waiting for an answer that cannot come.
+    assert!(
+        cx.debug_bounds("files.failure").is_some(),
+        "a connection that cannot take the request is reported"
+    );
+    assert_eq!(
+        session_state(cx, &view, id),
+        Some(SessionState::Connected),
+        "the terminal is untouched by a file view that has no connection"
+    );
+
+    // Closing the view leaves the terminal and the session exactly as they were.
+    click(cx, "files.close");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_visible(id)),
+        "closing the file view leaves the session without one"
+    );
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connected));
+
+    // Reopening starts from nowhere: the previous attempt left no path behind.
+    click(cx, "session.files");
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .files_browser(id)
+            .and_then(|browser| browser.path().map(str::to_owned))),
+        None,
+        "a reopened view asks for the login directory again"
+    );
 }

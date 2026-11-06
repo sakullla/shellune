@@ -11,6 +11,7 @@
 //! * [auth] reads a private key file, decrypting it when a passphrase was given;
 //! * [agent] reaches SSH_AUTH_SOCK, the Windows OpenSSH pipe or Pageant;
 //! * [session] runs the attempt and the remote shell;
+//! * [sftp] browses directories over the connection the shell already authenticated;
 //! * [error] keeps every failure free of credentials.
 
 pub mod agent;
@@ -18,6 +19,7 @@ pub mod auth;
 pub mod error;
 pub mod hostkey;
 pub mod session;
+pub mod sftp;
 
 /// A disposable OpenSSH server, for the tests that need a real one.
 #[cfg(any(test, feature = "test-support"))]
@@ -32,3 +34,4 @@ pub use hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 pub use session::{
     CONNECT_TIMEOUT, ConnectRequest, PtySize, RemoteEvent, RemoteSession, TERM_VALUE, TrustAnswer,
 };
+pub use sftp::FileLink;

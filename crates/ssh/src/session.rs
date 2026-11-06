@@ -26,14 +26,16 @@ use std::time::Duration;
 
 use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
-use russh::{ChannelMsg, Disconnect};
+use russh::{Channel, ChannelMsg, Disconnect};
 use shellune_core::{AgentKind, AuthMethod};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 
 use crate::agent;
 use crate::auth::load_private_key;
 use crate::error::ConnectError;
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
+use crate::sftp::{self, ChannelFailure, FileLink};
 
 /// Value of the TERM variable the remote shell is told about.
 ///
@@ -205,10 +207,16 @@ pub enum RemoteEvent {
 }
 
 /// What the window tells the connection thread to do.
-enum Command {
+pub(crate) enum Command {
     Write(Vec<u8>),
     Resize(PtySize),
     Close,
+    /// Open an SFTP subsystem channel for the file browser of this connection.
+    ///
+    /// The channel is opened here because this loop is the only owner of the
+    /// connection handle; the answer is dropped unanswered when the loop ends, which
+    /// is how a browser waiting for it learns the connection is gone.
+    Sftp(oneshot::Sender<Result<Channel<client::Msg>, ChannelFailure>>),
 }
 
 /// A remote session, from the first handshake to its last byte.
@@ -220,6 +228,8 @@ pub struct RemoteSession {
     events: UnboundedReceiver<RemoteEvent>,
     size: PtySize,
     closed: bool,
+    /// The browsable side of this connection, until a file view takes it.
+    files: Option<FileLink>,
 }
 
 impl RemoteSession {
@@ -233,7 +243,19 @@ impl RemoteSession {
         let (events, event_rx) = unbounded_channel();
         let (decisions, decision_rx) = unbounded_channel();
         let (cancelled, cancel_rx) = unbounded_channel();
+        // The file browser of this connection: requests go to the connection thread,
+        // answers come back here. Both exist before the connection does, so a file
+        // view opened at any point has somewhere to ask and somewhere to listen.
+        let (file_requests, file_request_rx) = unbounded_channel();
+        let (file_responses, file_response_rx) = unbounded_channel();
+        let files = sftp::Wiring {
+            requests: file_request_rx,
+            responses: file_responses,
+        };
         let size = request.size;
+        // The file browser asks the loop for its channel through the same command
+        // channel the terminal uses, so it needs a sender of its own.
+        let open_commands = commands.clone();
 
         let failure_sender = events.clone();
         thread::Builder::new()
@@ -249,7 +271,15 @@ impl RemoteSession {
                     }));
                     return;
                 };
-                runtime.block_on(run(request, command_rx, events, decision_rx, cancel_rx));
+                runtime.block_on(run(
+                    request,
+                    command_rx,
+                    events,
+                    decision_rx,
+                    cancel_rx,
+                    files,
+                    open_commands,
+                ));
             })
             .expect("the SSH thread can be created");
 
@@ -260,7 +290,18 @@ impl RemoteSession {
             events: event_rx,
             size,
             closed: false,
+            files: Some(FileLink::new(file_requests, file_response_rx)),
         }
+    }
+
+    /// Takes the browsable side of this connection.
+    ///
+    /// It is taken once, by the window, before the terminal owns the session: the
+    /// file view then keeps asking on this connection, which is why browsing a
+    /// server never asks for credentials a second time. None means the link was
+    /// already taken, or that the session was created without one.
+    pub fn take_file_link(&mut self) -> Option<FileLink> {
+        self.files.take()
     }
 
     /// Answers the question about an unknown identity.
@@ -364,8 +405,20 @@ async fn run(
     events: UnboundedSender<RemoteEvent>,
     decisions: UnboundedReceiver<TrustAnswer>,
     cancelled: UnboundedReceiver<()>,
+    files: sftp::Wiring,
+    open_commands: UnboundedSender<Command>,
 ) {
-    if let Err(error) = connect_and_shell(request, commands, &events, decisions, cancelled).await {
+    if let Err(error) = connect_and_shell(
+        request,
+        commands,
+        &events,
+        decisions,
+        cancelled,
+        files,
+        open_commands,
+    )
+    .await
+    {
         let _ = events.send(RemoteEvent::Failed(error));
     }
 }
@@ -376,6 +429,8 @@ async fn connect_and_shell(
     events: &UnboundedSender<RemoteEvent>,
     decisions: UnboundedReceiver<TrustAnswer>,
     cancelled: UnboundedReceiver<()>,
+    files: sftp::Wiring,
+    open_commands: UnboundedSender<Command>,
 ) -> Result<(), ConnectError> {
     let target = request.target();
     let material = Material::resolve(request.auth).await?;
@@ -451,6 +506,11 @@ async fn connect_and_shell(
 
     let _ = events.send(RemoteEvent::Connected);
 
+    // The file browser works on this same authenticated connection: its task asks
+    // the loop below for an SFTP channel and then runs on its own, so reading a
+    // directory never stops the terminal from reading or writing.
+    tokio::spawn(sftp::serve(files, open_commands));
+
     let (mut read_half, write_half) = channel.split();
     let mut exit_code: Option<u32> = None;
     loop {
@@ -470,6 +530,11 @@ async fn connect_and_shell(
                             reason: error.to_string(),
                         });
                     }
+                }
+                Some(Command::Sftp(reply)) => {
+                    // One round trip, inside the loop: the channel has to be opened
+                    // where the connection handle is, and this is the only owner.
+                    let _ = reply.send(open_sftp_channel(&handle).await);
                 }
                 Some(Command::Resize(next)) => {
                     if let Err(error) = write_half
@@ -503,6 +568,35 @@ async fn connect_and_shell(
             },
         }
     }
+}
+
+/// Opens an SFTP subsystem channel on the live connection.
+///
+/// A server without an SFTP subsystem answers the subsystem request with a failure.
+/// That is a statement about the server's configuration and not about the shell, so
+/// it is reported as its own kind of failure: the terminal keeps running, and the
+/// file view says the server has no SFTP instead of claiming the session ended.
+async fn open_sftp_channel(
+    handle: &client::Handle<ClientHandler>,
+) -> Result<Channel<client::Msg>, ChannelFailure> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| ChannelFailure::Lost {
+            reason: error.to_string(),
+        })?;
+    channel
+        .request_subsystem(true, sftp::SFTP_SUBSYSTEM)
+        .await
+        .map_err(|error| match error {
+            russh::Error::RequestDenied => ChannelFailure::Unavailable {
+                reason: "the server refused the sftp subsystem".to_owned(),
+            },
+            other => ChannelFailure::Lost {
+                reason: other.to_string(),
+            },
+        })?;
+    Ok(channel)
 }
 
 /// Why a dial stopped before it produced a connected handle.
@@ -805,6 +899,9 @@ impl ScriptedSession {
                 events: event_rx,
                 size: PtySize::default(),
                 closed: false,
+                // A scripted session has no server, so it has no browsable side: the
+                // window's tests supply the browser's answers themselves.
+                files: None,
             }),
             events,
             answers,

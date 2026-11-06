@@ -360,6 +360,39 @@ pub struct Strings {
     pub session_reconnect_missing_host: &'static str,
     /// Said where a selected session has no terminal to draw.
     pub session_no_terminal: &'static str,
+
+    /// Button that opens the file view of a remote session.
+    pub files_open: &'static str,
+    /// Button that closes the file view.
+    pub files_close: &'static str,
+    /// Label introducing the host a path belongs to.
+    pub files_host_label: &'static str,
+    /// Label introducing the current path.
+    pub files_path_label: &'static str,
+    /// Button that lists the parent directory.
+    pub files_up: &'static str,
+    /// Button that lists the current directory again.
+    pub files_refresh: &'static str,
+    /// Row that leads to the parent directory.
+    pub files_parent_row: &'static str,
+    /// Shown while a directory is being read.
+    pub files_loading: &'static str,
+    /// Shown when a directory is really empty.
+    pub files_empty: &'static str,
+    /// Shown while no path is known yet.
+    pub files_unknown_path: &'static str,
+    /// Shown when a directory could not be read.
+    pub files_failed: &'static str,
+    /// Said beside a file view failure, so the terminal is not read as failed too.
+    pub files_terminal_note: &'static str,
+    /// Kind label of a directory entry.
+    pub files_kind_directory: &'static str,
+    /// Kind label of a file entry.
+    pub files_kind_file: &'static str,
+    /// Kind label of a symbolic link entry.
+    pub files_kind_link: &'static str,
+    /// Kind label of any other entry.
+    pub files_kind_other: &'static str,
 }
 
 /// English copy.
@@ -511,6 +544,22 @@ pub static ENGLISH: Strings = Strings {
     session_reconnect_no_shell: "This session has no program recorded, so it cannot be started again.",
     session_reconnect_missing_host: "The saved host this session used is no longer there, so it cannot be connected to again.",
     session_no_terminal: "This session has no terminal open",
+    files_open: "Files",
+    files_close: "Close files",
+    files_host_label: "Host",
+    files_path_label: "Path",
+    files_up: "Up",
+    files_refresh: "Refresh",
+    files_parent_row: "Parent directory",
+    files_loading: "Reading the directory…",
+    files_empty: "This directory is empty.",
+    files_unknown_path: "Waiting for the server",
+    files_failed: "The directory could not be read",
+    files_terminal_note: "The terminal keeps running; only this file view is affected.",
+    files_kind_directory: "Directory",
+    files_kind_file: "File",
+    files_kind_link: "Link",
+    files_kind_other: "Other",
 };
 
 /// Chinese copy.
@@ -662,6 +711,22 @@ pub static CHINESE: Strings = Strings {
     session_reconnect_no_shell: "该会话没有记录可启动的程序，无法重新启动。",
     session_reconnect_missing_host: "该会话使用的主机记录已被删除，无法再次连接。",
     session_no_terminal: "该会话当前没有终端",
+    files_open: "文件",
+    files_close: "关闭文件视图",
+    files_host_label: "主机",
+    files_path_label: "当前路径",
+    files_up: "上级",
+    files_refresh: "刷新",
+    files_parent_row: "上级目录",
+    files_loading: "正在读取目录…",
+    files_empty: "这个目录是空的。",
+    files_unknown_path: "等待服务器返回",
+    files_failed: "无法读取这个目录",
+    files_terminal_note: "终端仍在运行，只有这个文件视图受影响。",
+    files_kind_directory: "目录",
+    files_kind_file: "文件",
+    files_kind_link: "链接",
+    files_kind_other: "其他",
 };
 
 /// Hint for the section shortcuts, built for one platform.

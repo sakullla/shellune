@@ -16,8 +16,8 @@ use gpui::{
     Window, div, px,
 };
 use shellune_core::{
-    EventTag, HostConfig, HostId, LocalShell, Session, SessionFailure, SessionId, SessionKind,
-    SessionState, Transfer,
+    BrowseState, EventTag, HostConfig, HostId, LocalShell, Session, SessionFailure, SessionId,
+    SessionKind, SessionState, Transfer,
 };
 use shellune_ssh::{ConnectRequest, PtySize, RemoteEvent, RemoteSession};
 use shellune_storage::{
@@ -30,6 +30,9 @@ use crate::app::actions::{
     NextDestination, PreviousDestination, ToggleLanguage,
 };
 use crate::app::copy::{self, Locale, Strings};
+#[cfg(test)]
+use crate::app::files::BrowseChannel;
+use crate::app::files::{FileViews, kind_label};
 use crate::app::hosts::{
     HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
     import_message,
@@ -104,6 +107,18 @@ pub const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// panel keeps a size that is worth typing into.
 pub const REMOTE_TERMINAL_HEIGHT: f32 = 340.0;
 
+/// Width of the file view beside the terminal.
+///
+/// Beside rather than above: a directory list and a terminal are two things a user
+/// reads at the same time, and stacking them leaves neither enough rows.
+pub const FILES_PANEL_WIDTH: f32 = 340.0;
+
+/// How often the shell looks for answers from a file view.
+///
+/// Short enough that a directory appears as soon as the server answers, long enough
+/// that an idle file view costs almost nothing.
+pub const FILES_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
+
 /// The application shell view.
 pub struct ShelluneView {
     workspace: Workspace,
@@ -153,6 +168,10 @@ pub struct ShelluneView {
     trust_book: HostTrust,
     /// Why the trust file could not be read, when it could not.
     trust_error: Option<String>,
+    /// The file views of the remote sessions, one per browsable connection.
+    files: FileViews,
+    /// Whether the file views are being polled for answers.
+    files_polling: bool,
     /// The attempt a test scripted, kept so its answers can be inspected.
     #[cfg(test)]
     scripted: Option<shellune_ssh::ScriptedSession>,
@@ -265,6 +284,8 @@ impl ShelluneView {
             trust,
             trust_book: HostTrust::new(),
             trust_error: None,
+            files: FileViews::new(),
+            files_polling: false,
             #[cfg(test)]
             scripted: None,
         };
@@ -465,6 +486,9 @@ impl ShelluneView {
         };
         let open = self.panes.remove(index);
         open.pane.update(cx, |pane, cx| pane.close(cx));
+        // The connection of this session ends with its terminal, so its file view goes
+        // with it instead of keeping a path and a listing that nothing backs any more.
+        self.files.detach(id);
         if self.active == Some(id) {
             // The next tab takes over, or the previous one when this was the last: a
             // shell never ends up with no terminal selected while one is still open.
@@ -1326,7 +1350,7 @@ impl ShelluneView {
     fn on_remote_connected(
         &mut self,
         id: SessionId,
-        session: RemoteSession,
+        mut session: RemoteSession,
         pending: Vec<SourceEvent>,
         cx: &mut Context<Self>,
     ) {
@@ -1341,6 +1365,10 @@ impl ShelluneView {
             return;
         };
         let target = host.target();
+        // The browsable side of this connection is taken before the terminal owns the
+        // session: the file view then asks on the connection that is already
+        // authenticated, and never has to ask for credentials a second time.
+        let file_link = session.take_file_link();
         let grid = GridSize::initial();
         let font_size = self.workspace.local_font_size();
         let locale = self.workspace.locale();
@@ -1358,6 +1386,10 @@ impl ShelluneView {
         }
         // The recent view only ever shows hosts that really answered.
         self.record_host_connection(host.id(), remote::now_unix(), cx);
+        if let Some(link) = file_link {
+            self.files
+                .attach(id, host.name(), host.target(), Box::new(link));
+        }
         self.push_pane(tag, pane, cx);
     }
 
@@ -3680,7 +3712,395 @@ impl ShelluneView {
                 ));
             }
         }
-        column
+        self.with_files_panel(column, id, cx)
+    }
+
+    /// The terminal, with the file view beside it while one is open (R9).
+    fn with_files_panel(&self, column: Div, id: Option<SessionId>, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let Some(id) = id.filter(|id| self.files.is_open(*id)) else {
+            return column;
+        };
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .child(column),
+            )
+            .child(self.files_panel(id, cx))
+    }
+
+    /// Opens or closes the file view of one session (R9).
+    ///
+    /// Opening asks the connection for the login directory and nothing else, so the
+    /// path on screen is only ever one the server resolved.
+    fn toggle_files(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.files.is_open(id) {
+            self.files.close(id);
+        } else if self.files.open(id) {
+            self.watch_files(cx);
+        }
+        cx.notify();
+    }
+
+    fn files_up(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.files.up(id);
+        cx.notify();
+    }
+
+    fn files_refresh(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.files.refresh(id);
+        cx.notify();
+    }
+
+    fn files_enter(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
+        self.files.enter(id, name);
+        cx.notify();
+    }
+
+    /// Polls the file views for answers, until none of them is open.
+    fn watch_files(&mut self, cx: &mut Context<Self>) {
+        if self.files_polling {
+            return;
+        }
+        self.files_polling = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(FILES_POLL_INTERVAL).await;
+                match this.update(cx, |view, cx| view.pump_files(cx)) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Applies what the file views reported, returning whether to keep polling.
+    ///
+    /// A failure here touches the file view only: the session keeps its own state, so
+    /// a server whose files cannot be read is never reported as a terminal that
+    /// ended.
+    fn pump_files(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.files.pump() {
+            cx.notify();
+        }
+        let open = self.files.any_open();
+        if !open {
+            self.files_polling = false;
+        }
+        open
+    }
+
+    /// The file view: the host it belongs to, the path it shows and its entries.
+    fn files_panel(&self, id: SessionId, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let Some(browser) = self.files.browser(id) else {
+            return div().id("files.panel");
+        };
+        let host = browser.host().to_owned();
+        let target = browser.target().to_owned();
+        let path = browser.path().map(str::to_owned);
+        let state = browser.state().clone();
+
+        let header = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "files.header".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(components::chip(
+                        strings.files_host_label,
+                        Tone::Neutral,
+                        metrics,
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(metrics.body_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(|| "files.host".to_owned())
+                            .child(SharedString::from(format!("{host} · {target}"))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(components::chip(
+                        strings.files_path_label,
+                        Tone::Neutral,
+                        metrics,
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "files.path".to_owned())
+                            .child(SharedString::from(
+                                path.clone()
+                                    .unwrap_or_else(|| strings.files_unknown_path.to_owned()),
+                            )),
+                    ),
+            );
+
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .child(self.text_button(
+                SharedString::from("files.up"),
+                strings.files_up,
+                Tone::Accent,
+                cx,
+                move |view, cx| view.files_up(id, cx),
+            ))
+            .child(self.text_button(
+                SharedString::from("files.refresh"),
+                strings.files_refresh,
+                Tone::Accent,
+                cx,
+                move |view, cx| view.files_refresh(id, cx),
+            ))
+            .child(self.text_button(
+                SharedString::from("files.close"),
+                strings.files_close,
+                Tone::Neutral,
+                cx,
+                move |view, cx| view.toggle_files(id, cx),
+            ));
+
+        let body: gpui::AnyElement = match state {
+            BrowseState::Loading => div()
+                .flex_none()
+                .rounded(px(radius::SMALL))
+                .p(metrics.scale(spacing::TIGHT))
+                .bg(theme::swatch(palette::SURFACE))
+                .text_size(metrics.caption_size())
+                .text_color(Tone::Warning.text())
+                .debug_selector(|| "files.loading".to_owned())
+                .child(SharedString::from(strings.files_loading))
+                .into_any_element(),
+            BrowseState::Failed(failure) => div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .rounded(px(radius::SMALL))
+                .p(metrics.scale(spacing::TIGHT))
+                .bg(theme::swatch(palette::SURFACE))
+                .border_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .debug_selector(|| "files.failure".to_owned())
+                .child(
+                    div()
+                        .text_size(metrics.label_size())
+                        .text_color(Tone::Danger.text())
+                        .child(SharedString::from(strings.files_failed)),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .debug_selector(|| "files.failure.reason".to_owned())
+                        .child(SharedString::from(failure.to_string())),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "files.failure.note".to_owned())
+                        .child(SharedString::from(strings.files_terminal_note)),
+                )
+                .into_any_element(),
+            BrowseState::Ready(listing) => {
+                let mut list = div()
+                    .id("files.list")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .gap(metrics.scale(1.0))
+                    .overflow_y_scroll()
+                    .debug_selector(|| "files.list".to_owned());
+                if path.as_deref().is_some_and(|path| path != "/") {
+                    list = list.child(self.files_parent_row(id, cx));
+                }
+                if listing.is_empty() {
+                    list = list.child(
+                        div()
+                            .flex_none()
+                            .p(metrics.scale(spacing::HAIRLINE))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "files.empty".to_owned())
+                            .child(SharedString::from(strings.files_empty)),
+                    );
+                }
+                for (index, entry) in listing.entries().iter().enumerate() {
+                    list = list.child(self.files_row(id, index, entry, cx));
+                }
+                list.into_any_element()
+            }
+        };
+
+        div()
+            .id("files.panel")
+            .debug_selector(|| "files.panel".to_owned())
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(metrics.scale(FILES_PANEL_WIDTH))
+            .min_h(px(0.0))
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .p(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .child(header)
+            .child(toolbar)
+            .child(body)
+    }
+
+    /// The row that leads to the parent directory.
+    fn files_parent_row(&self, id: SessionId, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        div()
+            .id("files.parent")
+            .debug_selector(|| "files.parent".to_owned())
+            .flex()
+            .items_center()
+            .flex_none()
+            .px(metrics.scale(spacing::HAIRLINE))
+            .py(metrics.scale(2.0))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE))
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+            .cursor_pointer()
+            .on_click(cx.listener(move |view, _event, _window, cx| {
+                view.files_up(id, cx);
+            }))
+            .child(SharedString::from(format!(
+                "..  {}",
+                self.strings().files_parent_row
+            )))
+    }
+
+    /// One entry of the listing.
+    fn files_row(
+        &self,
+        id: SessionId,
+        index: usize,
+        entry: &shellune_core::DirEntry,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let label = kind_label(entry.kind(), self.strings());
+        let name = entry.name();
+        let size = entry.size();
+        let openable = entry.is_directory();
+        let owned = name.to_owned();
+        let name_selector = format!("files.name.{index}");
+        let row = div()
+            .id(("files.entry", index))
+            .debug_selector(move || format!("files.entry.{index}"))
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_none()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::HAIRLINE))
+            .py(metrics.scale(2.0))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE))
+            .text_size(metrics.caption_size())
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_color(theme::swatch(if openable {
+                        palette::TEXT_PRIMARY
+                    } else {
+                        palette::TEXT_SECONDARY
+                    }))
+                    .debug_selector(move || name_selector.clone())
+                    .child(SharedString::from(name.to_owned())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(SharedString::from(match size {
+                        Some(bytes) => format!("{label} · {bytes} B"),
+                        None => label.to_owned(),
+                    })),
+            );
+        if openable {
+            row.cursor_pointer()
+                .on_click(cx.listener(move |view, _event, _window, cx| {
+                    view.files_enter(id, &owned, cx);
+                }))
+        } else {
+            row
+        }
+    }
+
+    /// Records that a session can browse, with answers a test supplies (R9).
+    ///
+    /// A scripted session has no server, so its connection cannot be browsed; the
+    /// tests that check what the window does with a listing therefore attach their
+    /// own channel here.
+    #[cfg(test)]
+    pub(crate) fn attach_files_for_test(
+        &mut self,
+        id: SessionId,
+        host: &str,
+        target: &str,
+        channel: Box<dyn BrowseChannel>,
+        cx: &mut Context<Self>,
+    ) {
+        self.files.attach(id, host, target, channel);
+        cx.notify();
+    }
+
+    /// The file view of one session, as the window holds it.
+    #[cfg(test)]
+    pub fn files_browser(&self, id: SessionId) -> Option<&shellune_core::FileBrowser> {
+        self.files.browser(id)
+    }
+
+    /// Whether the file view of a session is open.
+    #[cfg(test)]
+    pub fn files_visible(&self, id: SessionId) -> bool {
+        self.files.is_open(id)
+    }
+
+    /// Applies what the file views reported, for a test that cannot wait for a timer.
+    #[cfg(test)]
+    pub(crate) fn pump_files_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.pump_files(cx)
     }
 
     /// Why a session ended, and what the user can do about it (R12).
@@ -3878,6 +4298,28 @@ impl ShelluneView {
         let state_label = copy::session_state_label(session.state(), self.workspace.locale());
         let tone = session_tone(session.state());
         let can_reconnect = may_reconnect(session);
+        // Only a connection that can really browse offers the file view: a local
+        // session has no server to ask, and a session whose connection ended has no
+        // directory left to show.
+        let browsable = self.files.can_browse(id);
+        let files_open = self.files.is_open(id);
+        let files_button = browsable.then(|| {
+            self.text_button(
+                SharedString::from("session.files"),
+                if files_open {
+                    strings.files_close
+                } else {
+                    strings.files_open
+                },
+                if files_open {
+                    Tone::Neutral
+                } else {
+                    Tone::Accent
+                },
+                cx,
+                move |view, cx| view.toggle_files(id, cx),
+            )
+        });
 
         div()
             .flex()
@@ -3906,6 +4348,7 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
+                    .when_some(files_button, |row, button| row.child(button))
                     .when(can_reconnect, |row| {
                         row.child(self.text_button(
                             SharedString::from("session.reconnect"),
