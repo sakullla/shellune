@@ -1101,6 +1101,9 @@ impl TerminalPane {
             .overflow_hidden()
             .bg(color_of(palette::BACKGROUND))
             .cursor_text()
+            // The grid declares its own key context so the application's shortcuts
+            // can step aside: inside a terminal Escape belongs to the program.
+            .key_context(crate::app::TERMINAL_KEY_CONTEXT)
             .track_focus(&self.focus)
             .on_children_prepainted(listener)
             .child(rows)

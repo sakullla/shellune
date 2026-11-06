@@ -67,6 +67,20 @@ pub mod actions {
 /// Key context that scopes the shell's shortcuts.
 pub const KEY_CONTEXT: &str = "Shellune";
 
+/// Key context of a terminal pane's grid.
+///
+/// A terminal must receive the keys the shell expects; a shortcut bound to
+/// [KEY_CONTEXT] would otherwise be taken before the pane ever sees the key. Escape is
+/// the one that matters most: it is how Vim and less leave insert mode, and it used to
+/// be taken by the notice shortcut.
+pub const TERMINAL_KEY_CONTEXT: &str = "Terminal";
+
+/// The context the application's own shortcuts apply in: everywhere but a terminal.
+///
+/// Written as a predicate rather than a plain identifier because the pane is inside
+/// the shell context too, so excluding it has to be said out loud.
+pub const APP_KEY_CONTEXT: &str = "Shellune && !Terminal";
+
 /// Shortcuts for one platform.
 ///
 /// The navigation digits follow the platform convention: ⌘1-4 on macOS, Ctrl+1-4
@@ -107,7 +121,9 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
         ),
         KeyBinding::new(&format!("{modifier}-="), CycleTextSize, Some(KEY_CONTEXT)),
         KeyBinding::new(&format!("{modifier}-l"), ToggleLanguage, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", DismissNotice, Some(KEY_CONTEXT)),
+        // Escape only belongs to the application when no terminal has the keyboard:
+        // inside one it is a key the running program needs.
+        KeyBinding::new("escape", DismissNotice, Some(APP_KEY_CONTEXT)),
     ]
 }
 

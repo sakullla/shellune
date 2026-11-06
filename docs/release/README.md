@@ -49,6 +49,10 @@ Attach the archives from `dist/` and their `.sha256` files. State in the
 announcement which platforms were actually run, not only built — see
 `0.1.0-verification.md` for what that means for this version.
 
+The window captures that back up the verification record are committed under
+`docs/release/visual/` (see the README there for what each one shows); they are
+part of the repository, not of the archives.
+
 ## 5. What a release must never claim
 
 Shellune 0.1.0 has no split-screen terminals, no jump-host support, no port

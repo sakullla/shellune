@@ -118,8 +118,9 @@ Ctrl+1…4 在首帧就是死键。
 正好等于 `DEFAULT_WINDOW_SIZE`。
 
 gpui 0.2.2 的 Windows 后端在创建窗口时会把逻辑 bounds 换成设备像素
-（`platform/windows/window.rs` 的 `handle_new_window` 里
-`bounds.to_device_pixels(scale_factor)`），所以首帧不是"1120 物理像素"，而是设计的
+（`platform/windows/window.rs` 的 `retrieve_window_placement`，见该函数里
+`let bounds = bounds.to_device_pixels(scale_factor);` 一行；创建窗口的
+`WindowsWindow` 构造处调用它，`WindowsWindow::resize` 也做同一次换算），所以首帧不是"1120 物理像素"，而是设计的
 1120×720 逻辑像素。T2 记下的"客户区 1120×720 物理像素"是测量方式的产物：在 150%
 缩放下，未声明 DPI 感知的查询与截图给出的是虚拟化后的数值，不能当作布局尺寸。
 
@@ -142,35 +143,49 @@ gpui 0.2.2 的 Windows 后端在创建窗口时会把逻辑 bounds 换成设备�
 窗口尺寸变化传到 PTY 的实测数字（95×21 ↔ 66×12）说明 resize 链路是通的，这比 T2 的
 纯布局断言更接近 R8 的"调整窗口尺寸后光标与内容区域随之更新"。
 
-### 6.4 本轮发现、未修正的问题：Ctrl+C 不能中断前台命令
+### 6.4 复核：Ctrl+C 能中断；本轮真正修掉的是另一个缺陷（Escape 进不了终端）
 
-在打包产物里：
+上一轮在这台机器上记录过"在打包产物里 Ctrl+C 不能中断 `ping`"，并把原因写成
+"ConPTY 在 PowerShell 前台不把 `0x03` 转成控制事件（PSReadLine 把控制台输入置于
+不处理控制键的模式）"。本轮按同一条件重跑，**这个现象不复现，那条根因也不成立**：
 
-1. 在 PowerShell 中执行 `ping -n 20 127.0.0.1` 或 `cmd /c ping -n 20 127.0.0.1`，
-   等 3 秒后按 Ctrl+C。
-2. 观测：界面持续变化（28,396 像素/秒；按 Ctrl+C 后仍有 23,983 像素/秒），提示符
-   2.5 秒内没有回来，之后键入的命令要等命令自己结束才执行。
-3. 同一台机器的 Windows Terminal 里跑同样的 `cmd /c ping -n 20 127.0.0.1`，
-   Ctrl+C 后 3 秒内提示符恢复（用"再执行一条写文件的命令并检查文件"验证）。
+- 在重新打包的 release 产物
+  （`dist/Shellune-0.1.0-windows-x86_64-portable/shellune.exe`）里，本地默认 Shell
+  （Windows PowerShell）执行 `ping -n 60 127.0.0.1`，按 Ctrl+C 后 `PING.EXE`
+  在 **0.183 s** 内消失，屏幕出现 `Control-C` 与提示符，随后键入的
+  `cmd /c echo alive > 文件` 在 **0.021 s** 内写出文件。换成
+  `cmd /c ping -n 60 127.0.0.1` 结果相同（0.184 s / 0.021 s）。
+- 同一路径在 debug 构建、release 构建和 gpui 测试窗口里给出相同结果。应用自己的
+  按键→编码→PTY 写入链路现在有回归用例（`src/app/tests.rs` 里的
+  `the_default_shell_stops_a_running_command_on_ctrl_c`），它覆盖的是出厂默认 Shell，
+  而不是 `tests/local_shell.rs` 用的 `cmd.exe`。
+- 复审用的 `portable-pty` 探针与应用的差别不在 ConPTY。Windows PowerShell 启动后
+  会先发 `ESC[6n`（设备状态查询）并等回答，**不回答它就永远不打印提示符**
+  （本轮实测：30 s 内只收到 4 字节 `ESC[6n`，之后再无输出）。应用里的终端核心会
+  回答这个查询；探针如果把 `0x03` 写进一个还没起来的 Shell，测到的不是中断。
+  把查询回答补上之后，探针得到的结论与应用一致（`Control-C`、输出在 61 ms 内停住、
+  下一条命令 123 ms 内写出文件）。
 
-字节级追踪（临时 `eprintln`，已回退）显示按键确实被处理并写出：
-`key "c" ctrl=true` → `write [3]`；同一路径下 `ctrl+a` → `write [1]`、
-`tab` → `write [9]`、`up` → `write [27,91,65]`。
-同一台机器上，用 `portable-pty` 写的最小复现程序向 `cmd /c ping` 写入 `0x03` 能中断它。
+所以"ConPTY 不把 `0x03` 变成控制事件"这句解释被撤回，
+`AttachConsole` + `GenerateConsoleCtrlEvent` 也不再是候选修复方向：那会把应用自己的
+控制台牵进来，而问题本来不在那里。
 
-因此应用侧的编码与写入没有丢字节，问题出在 ConPTY 把该字节转成控制事件的那一步：
-PowerShell 作为前台 Shell 时没有发生（PSReadLine 把控制台输入置于不处理控制键的
-模式）。它是真实缺陷，不是"平台不支持"——同机同命令在 Windows Terminal 上正常。
-本轮既没有把 `0x03` 换成控制台控制事件（需要 `AttachConsole` /
-`GenerateConsoleCtrlEvent`，会牵动应用自身的控制台），也没有把结论改成"已验证"。
-R8 的"执行持续输出命令后能够中断"因此仍未满足，已写入
-`docs/release/0.1.0-verification.md` 与发布说明的已知问题。
+本轮走查真正发现并修掉的缺陷是 **Escape 键到不了终端**。`escape` 在 T2 被绑定成
+"关闭提示条"（`KeyBinding::new("escape", DismissNotice, Some(KEY_CONTEXT))`），它在
+整个窗口范围内优先于终端的按键处理，终端因此收不到 `0x1b`。后果很具体：Vim 起得来、
+能进插入模式，但按 Escape 退不出插入模式，`:q!` 被当成正文输入（本轮实测：未修时
+缓冲区里出现 `vim was here:q!`，`-- INSERT --` 仍在）。修法是给终端网格自己的按键
+上下文（`Terminal`），并把"关闭提示条"限制为 `Shellune && !Terminal`；修后同一操作
+序列能退出 Vim 并回到 PowerShell。`src/app/tests.rs` 里同时加了行为用例和绑定断言
+（后者在撤回修法时确实失败，所以它不是空跑）。截图见 `docs/release/visual/`。
 
-### 6.5 本轮仍未覆盖
+### 6.5 本轮仍然没有的东西
 
-- 真实中文输入法：字符是通过 Unicode 文本事件送入的（显示与提交一致），但没有驱动
-  Windows 输入法的候选窗与组合过程。
-- Vim / tmux / top 的交互式全屏验证：MSYS 的 Vim 能在本地 Shell 里启动，但本轮没有
-  拿到可信的全屏结果（没有辅助功能树，也无法校对渲染文本），只有自动化测试里
-  PTY 层面的证据。
-- macOS 与 Linux：未运行。
+- macOS 与 Linux：未运行，无截图，仍按未验证对待。
+- 真实中文输入法：本轮驱动了微软拼音的组合与上屏（`nihao` → `你好`、`shijie` →
+  `世界`），终端里显示与回显一致；但候选窗本身只在截图里留证，没有做逐像素校对。
+- Vim / top / tmux：三者在运行窗口里跑过（MSYS Vim、WSL2 Debian 的 top 与 tmux），
+  屏幕文本与截图都留证；没有把每一格文字与源码比对，只有"全屏接管、光标、退出与还原"
+  这些可观察结论。
+- `Ctrl+L` 仍是"切换语言"快捷键，因此在终端里按 `Ctrl+L` 不会把 `C-l` 送给 Shell。
+  这是 T2 定下的快捷键，本轮没有改，写在这里作为已知限制。

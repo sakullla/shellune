@@ -239,6 +239,21 @@ fn watch_for_stop(
     }
 }
 
+/// Serialises the interrupt tests of one test binary.
+///
+/// Each of them floods its own pseudo console and then measures whether the control
+/// byte came back out as an interrupt. Run in parallel on one machine they starve each
+/// other - the console host is busy printing for another session - and an undelivered
+/// press is indistinguishable from a product that does not interrupt. Holding this
+/// lock is what keeps the measurement about the product rather than the scheduler.
+pub fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding it must not poison the rest of the file: the
+    // lock protects a machine resource, not shared state a panic could leave torn.
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Writes one line to the run's log, even from a test that passes.
 ///
 /// `eprintln!` goes through the harness's output capture and is only shown when a test

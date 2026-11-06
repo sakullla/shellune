@@ -1676,6 +1676,179 @@ async fn a_real_shell_starts_from_the_header_action(cx: &mut TestAppContext) {
     );
 }
 
+/// R8 in the path the product actually ships: the default local shell, not `cmd.exe`.
+///
+/// The interrupt tests in `tests/local_shell.rs` drive `cmd.exe`, which is not what a
+/// local terminal starts on Windows. This test starts a terminal the way a user does,
+/// types a program that keeps running, and presses Ctrl+C through the pane's own key
+/// handler. What it asserts is the pane's half: the press becomes exactly one `0x03`
+/// in the default shell's PTY while the program is still printing, and the session
+/// survives it. Whether the console host turns that byte into an interrupt is not
+/// something a test window can schedule, so it is measured against the same default
+/// shell at the PTY level by
+/// `tests/local_shell.rs::interrupt::the_default_shell_forwards_the_interrupt_to_the_program_it_started`
+/// and in the running application in `docs/release/0.1.0-verification.md` 7.1.
+#[gpui::test]
+async fn a_ctrl_c_reaches_the_default_shell_that_is_running_a_command(cx: &mut TestAppContext) {
+    let default_shell = shellune_terminal::platform_default();
+    if !shellune_terminal::program_exists(default_shell.program()) {
+        return;
+    }
+    #[cfg(windows)]
+    assert!(
+        default_shell
+            .program()
+            .to_ascii_lowercase()
+            .contains("windowspowershell"),
+        "this test must cover the shell a local terminal starts on Windows, got {}",
+        default_shell.program()
+    );
+
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let bounds = bounds_of(cx, "header.primary");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("a terminal must be shown");
+
+    // The shell that runs is the machine's default one, not the `cmd.exe` the PTY-level
+    // interrupt tests use; that is the gap this test closes.
+    let title = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .local_sessions()
+            .next()
+            .map(|session| session.title().to_owned())
+            .unwrap_or_default()
+    });
+    assert!(
+        title.contains(default_shell.name()),
+        "the session has to be the default shell {}, not {title}",
+        default_shell.name()
+    );
+
+    // The prompt has to be there before anything is typed, exactly as for a user.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut screen = String::new();
+    while std::time::Instant::now() < deadline {
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| pane.pump_once(cx));
+        });
+        screen = cx.update(|_window, app| pane.read(app).visible_text().join("\n"));
+        if !screen.trim().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !screen.trim().is_empty(),
+        "the shell never printed a prompt"
+    );
+
+    cx.simulate_input("ping -n 60 127.0.0.1");
+    cx.simulate_keystrokes("enter");
+    // The program has to be really running before the key is pressed, or the press proves
+    // nothing: a ping prints one reply per second and `TTL=` is the part of that line no
+    // locale changes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut replies = 0;
+    while std::time::Instant::now() < deadline {
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| pane.pump_once(cx));
+        });
+        screen = cx.update(|_window, app| pane.read(app).visible_text().join("\n"));
+        replies = screen.matches("TTL=").count();
+        if replies >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        replies >= 2,
+        "the command must be printing before Ctrl+C means anything: {replies} replies on \
+         screen. The screen held:\n{screen}"
+    );
+
+    let before = cx.update(|_window, app| pane.read(app).sent().len());
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    let sent = cx.update(|_window, app| pane.read(app).sent()[before..].to_vec());
+    assert_eq!(
+        sent,
+        vec![0x03],
+        "Ctrl+C must send exactly one interrupt byte to the default shell, got {sent:?}"
+    );
+    let live = cx.update(|_window, app| matches!(pane.read(app).state(), PaneState::Live));
+    assert!(live, "an interrupt must end the command, not the session");
+}
+
+/// Escape inside a terminal belongs to the program running in it.
+///
+/// Found in the T11 walkthrough: Vim started in the local terminal could not leave
+/// insert mode, because the application's notice shortcut took Escape before the
+/// pane's key handler saw it. The grid declares its own key context now and the
+/// shortcut is bound to the shell context without it.
+#[gpui::test]
+async fn escape_reaches_the_program_running_in_the_terminal(cx: &mut TestAppContext) {
+    let default_shell = shellune_terminal::platform_default();
+    if !shellune_terminal::program_exists(default_shell.program()) {
+        return;
+    }
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let bounds = bounds_of(cx, "header.primary");
+    let center = bounds.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("a terminal must be shown");
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "the terminal owns the keyboard when it starts"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let sent = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    assert_eq!(
+        sent,
+        vec![0x1b],
+        "Escape must reach the shell as a key, not be taken by the application"
+    );
+}
+
+/// The notice shortcut must not be reachable while a terminal has the keyboard.
+///
+/// The behavioural test above runs through the pane's own key handler, which a test
+/// window drives even when a binding would win in the real window; this one pins the
+/// binding itself, which is what made Vim in the shipped application impossible to
+/// leave (measured: with the plain shell context Vim stayed in insert mode and the
+/// quit command was typed into the buffer; with this predicate Vim exited).
+#[test]
+fn the_notice_shortcut_steps_aside_for_a_terminal() {
+    let bindings = key_bindings(Platform::Windows);
+    let escape = bindings
+        .iter()
+        .find(|binding| {
+            binding
+                .keystrokes()
+                .iter()
+                .any(|keystroke| keystroke.key() == "escape")
+        })
+        .expect("the notice shortcut is bound to Escape");
+    let predicate = format!("{:?}", escape.predicate());
+    assert!(
+        predicate.contains("Not") && predicate.contains(crate::app::TERMINAL_KEY_CONTEXT),
+        "Escape has to be bound outside the terminal context, got {predicate}"
+    );
+}
+
 #[gpui::test]
 async fn a_real_shell_that_exits_stops_being_listed_as_connected(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));

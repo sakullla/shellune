@@ -282,6 +282,7 @@ mod interrupt {
 
     #[test]
     fn interrupting_one_session_leaves_the_other_responsive() {
+        let _alone = support::exclusive();
         // Two sessions, two processes: the flood in its own PTY, and a shell that has to
         // keep answering while the flood is interrupted.
         let (Some(mut flood), Some(mut other)) =

@@ -631,6 +631,7 @@ mod interrupt {
 
     #[test]
     fn sustained_output_can_be_interrupted_and_the_session_survives_it() {
+        let _alone = support::exclusive();
         let Some(mut session) = Session::start_program(FLOOD_PROGRAM, &[]) else {
             support::report(
                 "local_shell",
@@ -734,6 +735,19 @@ mod interrupt {
         }
     }
 
+    /// The command that starts the flood from `shell`.
+    ///
+    /// PowerShell needs its call operator in front of a quoted path, otherwise it prints
+    /// the string instead of running it; `cmd.exe` takes the quoted path directly.
+    fn flood_command_for(shell: &LocalShell) -> String {
+        let program = shell.program().to_ascii_lowercase();
+        if cfg!(windows) && (program.contains("powershell") || program.contains("pwsh")) {
+            format!("& \"{FLOOD_PROGRAM}\"")
+        } else {
+            flood_command()
+        }
+    }
+
     /// The shell the flood is started from: the one R8's user path goes through.
     ///
     /// `cmd.exe` on Windows (`/q` only silences command echo), the platform shell
@@ -756,7 +770,7 @@ mod interrupt {
     /// that it works.
     #[test]
     fn the_shell_forwards_the_interrupt_to_the_program_it_started() {
-        let Some(mut session) = shell_for_the_flood() else {
+        let Some(session) = shell_for_the_flood() else {
             support::report(
                 "local_shell",
                 "SKIP the_shell_forwards_the_interrupt_to_the_program_it_started: no shell to \
@@ -764,10 +778,52 @@ mod interrupt {
             );
             return;
         };
+        forwards_the_interrupt(
+            session,
+            "the_shell_forwards_the_interrupt_to_the_program_it_started",
+        );
+    }
 
+    /// The same measurement on the shell a local terminal starts by default.
+    ///
+    /// On Windows that is Windows PowerShell, not the `cmd.exe` the test above uses; the
+    /// factory path is exactly where the interrupt went unmeasured.
+    #[test]
+    fn the_default_shell_forwards_the_interrupt_to_the_program_it_started() {
+        let Some(session) = Session::start() else {
+            support::report(
+                "local_shell",
+                "SKIP the_default_shell_forwards_the_interrupt_to_the_program_it_started: no \
+                 shell on this machine",
+            );
+            return;
+        };
+        #[cfg(windows)]
+        assert!(
+            session
+                .shell
+                .program()
+                .to_ascii_lowercase()
+                .contains("windowspowershell"),
+            "the shell a local terminal starts on Windows is Windows PowerShell, got {}",
+            session.shell.program()
+        );
+        forwards_the_interrupt(
+            session,
+            "the_default_shell_forwards_the_interrupt_to_the_program_it_started",
+        );
+    }
+
+    /// Starts the flood in `session`, presses Ctrl+C and reports what it measured.
+    ///
+    /// Shared so the factory shell is measured by exactly the same rules as `cmd.exe`;
+    /// `label` is what a skip names, because a skip has to be traceable to its test.
+    fn forwards_the_interrupt(mut session: Session, label: &str) {
+        let _alone = support::exclusive();
         wait_until_it_takes_input(&mut session);
         let before_launch = session.bytes_read();
-        session.run(&flood_command());
+        let command = flood_command_for(&session.shell);
+        session.run(&command);
 
         // The command has to be running before the byte is sent, otherwise the press
         // interrupts the prompt instead of the program.
@@ -824,10 +880,10 @@ mod interrupt {
                 support::report(
                     "local_shell",
                     &format!(
-                        "SKIP the_shell_forwards_the_interrupt_to_the_program_it_started: this \
-                         runner did not deliver the control byte through the shell - {presses} \
-                         presses, {} bytes at the first press, {} bytes now, and the program \
-                         never printed \"{}\". R8's shell path is unmeasured here, not passing.",
+                        "SKIP {label}: this runner did not deliver the control byte through \
+                         the shell - {presses} presses, {} bytes at the first press, {} bytes \
+                         now, and the program never printed \"{}\". R8's shell path is \
+                         unmeasured here, not passing.",
                         bytes_at_first_press,
                         bytes_now,
                         support::INTERRUPT_MARKER
@@ -850,6 +906,7 @@ mod interrupt {
     /// passes the assertion below, the interrupt test above proves nothing.
     #[test]
     fn a_flood_that_ignores_the_interrupt_never_looks_stopped() {
+        let _alone = support::exclusive();
         let Some(mut session) = Session::start_program(FLOOD_PROGRAM, &["--ignore-interrupt"])
         else {
             support::report(
