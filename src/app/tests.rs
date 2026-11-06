@@ -5692,6 +5692,95 @@ async fn closing_a_session_with_a_running_transfer_warns_first_and_cancels_only_
 }
 
 #[gpui::test]
+async fn a_connection_that_ends_mid_transfer_names_the_partial_file_it_left(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/报告 终稿.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let started = transfers.starts();
+    let task = started[0].transfer;
+    let destination = started[0].destination.clone();
+    transfers.push(shellune_core::TransferEvent::progress(
+        task,
+        1024,
+        Some(4096),
+    ));
+    pump_files(cx, &view);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(id)),
+        1,
+        "the task is moving bytes"
+    );
+
+    // The connection ends while the bytes are moving, exactly as the transport reports
+    // it. The task's own worker dies with it and can never report the file it was
+    // writing, so the window has to name it.
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the remote terminal exists");
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+    let accepted = cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::Lost("the channel was closed".to_owned())],
+                cx,
+            )
+        })
+    });
+    assert!(accepted, "the event belongs to this session");
+    cx.run_until_parked();
+
+    let tasks = cx.update(|_window, app| view.read(app).transfer_tasks());
+    let failed = tasks
+        .iter()
+        .find(|listed| listed.id() == task)
+        .expect("the task stays readable after its session ended");
+    assert!(
+        failed.state().failure().is_some(),
+        "a lost connection is a failure, not a transfer that keeps running: {:?}",
+        failed.state()
+    );
+    let residue = failed
+        .state()
+        .residue()
+        .expect("the partial file the task was writing is named");
+    let parent = destination
+        .rsplit_once('/')
+        .map(|(directory, _name)| directory)
+        .expect("the target is inside a directory");
+    assert_eq!(
+        residue,
+        format!("{parent}/{}{task}", shellune_core::PARTIAL_PREFIX),
+        "the residue is the temporary file the worker was writing beside the target"
+    );
+
+    // The row the user reads carries it: the file view is closed with the session, so
+    // the transfers page is where a task of a gone session is still shown.
+    let detail = cx
+        .update(|_window, app| view.read(app).transfer_detail_for_test(task))
+        .expect("the task is listed");
+    assert!(
+        detail.contains(residue),
+        "the panel has to show the partial file, not hide it: {detail:?}"
+    );
+    assert!(
+        detail.contains(ENGLISH.transfers_residue),
+        "and it has to say what the path is: {detail:?}"
+    );
+}
+
+#[gpui::test]
 async fn a_delete_the_browser_refuses_keeps_its_question_and_says_why(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);

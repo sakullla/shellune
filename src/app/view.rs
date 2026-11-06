@@ -4555,7 +4555,6 @@ impl ShelluneView {
     fn transfers_panel(&self, id: SessionId, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let locale = self.workspace.locale();
         let tasks: Vec<Transfer> = self.transfers.for_session(id).cloned().collect();
         let active = tasks.iter().filter(|task| task.is_active()).count();
 
@@ -4619,7 +4618,7 @@ impl ShelluneView {
             if task.state().is_awaiting_overwrite() {
                 card = card.child(self.transfer_overwrite_question(index, task, cx));
             }
-            card = card.child(self.session_transfer_row(index, task, locale, cx));
+            card = card.child(self.session_transfer_row(index, task, cx));
         }
         card
     }
@@ -4690,19 +4689,15 @@ impl ShelluneView {
             )
     }
 
-    /// One transfer of a session: what it moves, how far it is and what it became.
-    fn session_transfer_row(
-        &self,
-        index: usize,
-        task: &Transfer,
-        locale: Locale,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let metrics = self.metrics();
+    /// One transfer's detail line: what it is doing, why it stopped and what it left.
+    ///
+    /// The session's own list and the transfers page draw the same line. They have to:
+    /// a task whose session ended is closed off the file view, so the page is the only
+    /// place it can still be read - and a partial file it left behind is exactly what
+    /// the user has to be told there.
+    fn transfer_detail(&self, task: &Transfer) -> String {
         let strings = self.strings();
-        let tone = Tone::for_transfer_state(task.state());
-        let id = task.id();
-        let state_label = copy::transfer_state_label(task.state(), locale);
+        let state_label = copy::transfer_state_label(task.state(), self.workspace.locale());
         let mut detail = match task.state() {
             shellune_core::TransferState::Running {
                 transferred,
@@ -4724,6 +4719,21 @@ impl ShelluneView {
         if let Some(residue) = task.state().residue() {
             detail.push_str(&format!(" · {}: {residue}", strings.transfers_residue));
         }
+        detail
+    }
+
+    /// One transfer of a session: what it moves, how far it is and what it became.
+    fn session_transfer_row(
+        &self,
+        index: usize,
+        task: &Transfer,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let tone = Tone::for_transfer_state(task.state());
+        let id = task.id();
+        let detail = self.transfer_detail(task);
         let mut actions = div()
             .flex()
             .items_center()
@@ -5278,6 +5288,14 @@ impl ShelluneView {
         self.transfers.active_count(id)
     }
 
+    /// What a transfer's row says, exactly as the panel and the page draw it.
+    #[cfg(test)]
+    pub fn transfer_detail_for_test(&self, id: shellune_core::TransferId) -> Option<String> {
+        self.transfers
+            .get(id)
+            .map(|task| self.transfer_detail(task))
+    }
+
     /// The file view of one session, as the window holds it.
     #[cfg(test)]
     pub fn files_browser(&self, id: SessionId) -> Option<&shellune_core::FileBrowser> {
@@ -5779,10 +5797,13 @@ impl ShelluneView {
                             theme::transfer_direction_label(transfer.direction()),
                             transfer.source()
                         ),
+                        // The same line the session panel draws, residue included: a
+                        // task whose session is gone can only be read here, and a
+                        // partial file it left is what the user has to act on.
                         format!(
                             "→ {} · {}",
                             transfer.destination(),
-                            copy::transfer_state_label(transfer.state(), locale)
+                            self.transfer_detail(transfer)
                         ),
                         metrics,
                     )),

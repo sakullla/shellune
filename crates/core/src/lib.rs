@@ -37,6 +37,6 @@ pub use session::{
 };
 pub use shell::LocalShell;
 pub use task::{
-    OverwriteChoice, Transfer, TransferDirection, TransferEvent, TransferFailure, TransferQueue,
-    TransferState, TransferUpdate, TransferUpdateError,
+    OverwriteChoice, PARTIAL_PREFIX, Transfer, TransferDirection, TransferEvent, TransferFailure,
+    TransferQueue, TransferState, TransferUpdate, TransferUpdateError, partial_path,
 };

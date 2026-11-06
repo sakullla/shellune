@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use shellune_core::{
-    AuthMethod, OverwriteChoice, TransferDirection, TransferEvent, TransferFailure, TransferId,
-    TransferUpdate,
+    AuthMethod, OverwriteChoice, PARTIAL_PREFIX, TransferDirection, TransferEvent, TransferFailure,
+    TransferId, TransferUpdate,
 };
 use shellune_ssh::testserver::Harness;
 use shellune_ssh::{
@@ -719,14 +719,22 @@ fn a_target_that_cannot_be_replaced_is_reported_without_claiming_success() {
                 TransferFailure::FinalizeFailed,
                 "a target that cannot be replaced is a finalize failure"
             );
-            if let Some(residue) = residue {
-                let listing = server_listing(server, &directory);
-                let name = residue.rsplit('/').next().unwrap_or_default().to_owned();
-                assert!(
-                    listing.contains(&name),
-                    "a residue that is reported really exists: {listing:?}"
-                );
-            }
+            // The bytes did arrive: the complete copy is the only one there is, so it is
+            // kept and named instead of being deleted with the failure.
+            let residue = residue.expect(
+                "a replacement that failed after the bytes were written names the complete copy",
+            );
+            let listing = server_listing(server, &directory);
+            let name = residue.rsplit('/').next().unwrap_or_default().to_owned();
+            assert!(
+                listing.contains(&name),
+                "a residue that is reported really exists: {listing:?}"
+            );
+            assert_eq!(
+                server_size(server, &residue),
+                Some(bytes.len() as u64),
+                "the file that is named holds the whole upload, not a fragment"
+            );
         }
         other => panic!("a failed replacement must not complete: {other:?}"),
     }
@@ -854,6 +862,37 @@ fn a_connection_that_ends_mid_transfer_never_reports_completion() {
             "the target cannot be the whole file if the transfer was interrupted"
         );
     }
+
+    // The worker's own report cannot arrive - its task died with the runtime - so the
+    // path the window reports on a lost connection is derived from the task itself. It
+    // has to be the file the server really kept, or the report would send the user to a
+    // place where there is nothing.
+    let reported = shellune_core::partial_path(TransferDirection::Upload, &remote, id);
+    let listing = server_listing(server, &directory);
+    let name = reported.rsplit('/').next().unwrap_or_default().to_owned();
+    assert!(
+        listing.contains(&name),
+        "the partial file a lost connection is reported with is the one the server left: \
+         {reported} is not in {listing:?}"
+    );
+    assert!(
+        server_size(server, &reported).is_some_and(|size| size > 0),
+        "the named file holds the bytes that were already sent, that is why it is named"
+    );
+    assert_eq!(
+        name,
+        format!("{PARTIAL_PREFIX}{id}"),
+        "and it is the recognizable temporary name of this very task"
+    );
+
+    // The partial file has been read and named, so the directory this case worked in is
+    // removed: a run of this test must not leave a .shellune-part file of its own in the
+    // account's home for the next one.
+    shell(server, &format!("rm -rf '{directory}'")).expect("the directory can be removed");
+    assert!(
+        !server_is_directory(server, &directory),
+        "the interrupted run cleans up after itself"
+    );
     let _ = std::fs::remove_dir_all(&scratch);
 }
 

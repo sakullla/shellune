@@ -13,7 +13,10 @@
 //!   target, which is why [`TransferUpdate::Completed`] means "the target holds the
 //!   content" and never "the temporary file was written";
 //! * a cancellation or failure removes the temporary file and says so when it could
-//!   not, because a partial file nobody mentions is worse than one that is named;
+//!   not, because a partial file nobody mentions is worse than one that is named. The
+//!   one case that does not remove it is a replacement that failed after the old target
+//!   was already gone: there the completed copy is the only one left, so it is kept and
+//!   named instead;
 //! * every event carries the task's [`TransferId`], so a message from an attempt that
 //!   already ended cannot make a newer task look finished. Retrying starts a new task
 //!   from zero bytes: nothing here resumes a previous attempt.
@@ -27,7 +30,7 @@ use russh_sftp::client::{Config, SftpSession};
 use russh_sftp::protocol::StatusCode;
 use shellune_core::{
     OverwriteChoice, Transfer, TransferDirection, TransferEvent, TransferFailure, TransferId,
-    TransferUpdate, join_path, parent_path,
+    TransferUpdate, parent_path,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -40,8 +43,10 @@ use crate::sftp::{ChannelFailure, REQUEST_TIMEOUT_SECS};
 /// The prefix of the file a transfer writes before the target's own name exists.
 ///
 /// It is recognizable on purpose: a leftover of this shape names itself as a partial
-/// transfer, in a directory listing, without any other tool having to explain it.
-pub const PARTIAL_PREFIX: &str = ".shellune-part-";
+/// transfer, in a directory listing, without any other tool having to explain it. The
+/// value and the rule that builds the path live in shellune-core, so the window can name
+/// the same file after a connection that ended.
+pub const PARTIAL_PREFIX: &str = shellune_core::PARTIAL_PREFIX;
 
 /// How many bytes are moved between two checks of the cancel channel.
 ///
@@ -442,20 +447,18 @@ async fn upload(session: &SftpSession, request: &TransferRequest, job: &mut Job)
         // A target that cannot be removed - a directory, or a name the server refuses to
         // touch - is the final replacement failing: the temporary file is complete, the
         // target is not what the user asked for, and only the server can say what it now
-        // holds.
+        // holds. The complete copy stays where it is and is named as the residue: it is
+        // the only good copy left, so deleting it would lose both.
         if session.remove_file(&target).await.is_err() {
-            return End::Failed(
-                TransferFailure::FinalizeFailed,
-                discard_remote(session, &temporary).await,
-            );
+            return End::Failed(TransferFailure::FinalizeFailed, Some(temporary));
         }
     }
     match session.rename(&temporary, &target).await {
         Ok(()) => End::Completed(written),
-        Err(_) => End::Failed(
-            TransferFailure::FinalizeFailed,
-            discard_remote(session, &temporary).await,
-        ),
+        // The target was already removed, so both copies would be lost by discarding
+        // this one: the bytes are complete, they simply never got the name the user
+        // asked for. It is kept and reported instead.
+        Err(_) => End::Failed(TransferFailure::FinalizeFailed, Some(temporary)),
     }
 }
 
@@ -537,17 +540,20 @@ async fn download(session: &SftpSession, request: &TransferRequest, job: &mut Jo
     // that is still open would otherwise report a finalize failure for a finished copy.
     drop(destination);
 
+    // As on the upload side: once the old target is gone, the completed copy is the
+    // only one left, so a replacement that fails keeps it and names it instead of
+    // throwing it away.
     if existing && tokio::fs::remove_file(&target).await.is_err() {
         return End::Failed(
             TransferFailure::FinalizeFailed,
-            discard_local(&temporary).await,
+            Some(temporary.display().to_string()),
         );
     }
     match tokio::fs::rename(&temporary, &target).await {
         Ok(()) => End::Completed(written),
         Err(_) => End::Failed(
             TransferFailure::FinalizeFailed,
-            discard_local(&temporary).await,
+            Some(temporary.display().to_string()),
         ),
     }
 }
@@ -572,22 +578,21 @@ async fn ask_about_target(existing: bool, total: Option<u64>, job: &mut Job) -> 
 }
 
 /// The temporary name a target's content is written under, in its own directory.
+///
+/// The path is shellune-core's answer ([shellune_core::partial_path]), not a second
+/// opinion: the window derives the leftover of a task whose worker died from the same
+/// rule, and two derivations that disagree would name two different files.
 fn remote_partial(target: &str, id: TransferId) -> String {
-    let name = format!("{PARTIAL_PREFIX}{id}");
-    match parent_path(target) {
-        Some(parent) if parent != "/" => join_path(&parent, &name),
-        Some(_) => format!("/{name}"),
-        None => name,
-    }
+    shellune_core::partial_path(TransferDirection::Upload, target, id)
 }
 
 /// The temporary name a local target is written under, beside the target.
 fn local_partial(target: &Path, id: TransferId) -> PathBuf {
-    let name = format!("{PARTIAL_PREFIX}{id}");
-    match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-        _ => PathBuf::from(name),
-    }
+    PathBuf::from(shellune_core::partial_path(
+        TransferDirection::Download,
+        &target.to_string_lossy(),
+        id,
+    ))
 }
 
 /// Removes a partial remote file, naming it when it could not be removed.

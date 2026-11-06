@@ -291,7 +291,10 @@ impl TransferViews {
     /// ended leaves behind.
     ///
     /// The reason is the transport's, so the list says a session was lost instead of
-    /// showing a transfer that appears to be still running.
+    /// showing a transfer that appears to be still running. A task that was moving bytes
+    /// keeps its own report: its worker died with the connection and can no longer say
+    /// anything, so the queue names the temporary file that task was writing - the file
+    /// is still on the far side, and a user who is not told about it finds it later.
     pub fn session_lost(&mut self, session: SessionId, failure: TransferFailure) -> bool {
         !self.queue.fail_session(session, failure).is_empty()
     }
@@ -663,7 +666,7 @@ mod tests {
     fn a_lost_connection_fails_the_transfers_it_was_running() {
         let session = SessionId::new();
         let channel = FakeChannel::accepting();
-        let mut views = views(session, channel);
+        let mut views = views(session, channel.clone());
         let id = views
             .upload(session, "C:/work/a.txt", Some("/home/deploy"))
             .expect("the upload starts");
@@ -675,7 +678,68 @@ mod tests {
             Some(&TransferFailure::ConnectionLost)
         );
         assert!(!task.state().is_success());
+        assert_eq!(
+            task.state().residue(),
+            None,
+            "a task that never started wrote nothing, so nothing is named"
+        );
         assert!(!views.any_active());
+    }
+
+    #[test]
+    fn a_lost_connection_names_the_partial_file_the_task_was_writing() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut uploads = views(session, channel.clone());
+        let id = uploads
+            .upload(session, "C:/work/report.txt", Some("/home/deploy"))
+            .expect("the upload starts");
+        channel.push(TransferEvent::progress(id, 2048, Some(4096)));
+        uploads.pump();
+        let expected = format!("/home/deploy/{}{id}", shellune_core::PARTIAL_PREFIX);
+        assert_eq!(
+            uploads.get(id).expect("the task is listed").partial_path(),
+            expected,
+            "the residue is the temporary file the worker writes, in the target directory"
+        );
+
+        assert!(uploads.session_lost(session, TransferFailure::ConnectionLost));
+        let task = uploads.get(id).expect("the task is listed");
+        assert_eq!(
+            task.state().failure(),
+            Some(&TransferFailure::ConnectionLost),
+            "the reason is still the transport's"
+        );
+        assert_eq!(
+            task.state().residue(),
+            Some(expected.as_str()),
+            "the file the bytes were going into is named instead of being dropped with the session"
+        );
+
+        // A download names the same way, beside its local target.
+        let second = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut downloads = views(second, channel.clone());
+        let id = downloads
+            .download(second, "/home/deploy/说明.txt", "C:/work")
+            .expect("the download starts");
+        channel.push(TransferEvent::progress(id, 128, Some(256)));
+        downloads.pump();
+        let expected = downloads
+            .get(id)
+            .expect("the task is listed")
+            .partial_path()
+            .to_owned();
+        assert!(downloads.session_lost(second, TransferFailure::ConnectionLost));
+        assert_eq!(
+            downloads
+                .get(id)
+                .expect("the task is listed")
+                .state()
+                .residue(),
+            Some(expected.as_str()),
+            "a download names the local temporary file it was writing"
+        );
     }
 
     #[test]

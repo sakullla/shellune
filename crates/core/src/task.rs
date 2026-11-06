@@ -14,14 +14,18 @@
 //!   content. It is only reachable from [`TransferState::Running`], which is what stops
 //!   "the temporary file was written" from being reported as a finished transfer;
 //! * [`TransferState::Failed`] and [`TransferState::Cancelled`] - the transfer did not
-//!   finish. Both carry the leftover path when a partial file could not be removed, so
-//!   a residue is stated instead of being silently pretended away.
+//!   finish. Both carry the leftover path when a partial file could not be removed - or
+//!   when the connection ended under a running task, whose worker can no longer report
+//!   anything - so a residue is stated instead of being silently pretended away.
 //!
 //! Retrying is a new task with a new [`TransferId`]: nothing here resumes bytes, which
 //! is why [`TransferQueue::retry`] builds a fresh [`Transfer`] from the same two paths.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
+use crate::files::{join_path, parent_path};
 use crate::ids::{SessionId, TransferId};
 
 /// Which way bytes move.
@@ -40,6 +44,42 @@ impl TransferDirection {
         match self {
             Self::Upload => "Upload",
             Self::Download => "Download",
+        }
+    }
+}
+
+/// The prefix of the file a transfer writes before the target's own name exists.
+///
+/// It is recognizable on purpose: a leftover of this shape names itself as a partial
+/// transfer in a directory listing, without any other tool having to explain it. The
+/// constant lives here because the temporary path is part of what a task is: a window
+/// whose connection died still has to be able to say which file the task left.
+pub const PARTIAL_PREFIX: &str = ".shellune-part-";
+
+/// The temporary path a task writes before the target's own name exists.
+///
+/// The two directions mean two different file systems, so each is named the way it is
+/// written: an upload writes beside its remote target with '/' separators, and a
+/// download writes beside its local target with whatever separator this platform uses.
+/// Both can be derived from the task alone, which is what lets a report name the
+/// leftover of a transfer whose worker never came back.
+#[must_use]
+pub fn partial_path(direction: TransferDirection, destination: &str, id: TransferId) -> String {
+    let name = format!("{PARTIAL_PREFIX}{id}");
+    match direction {
+        TransferDirection::Upload => match parent_path(destination) {
+            Some(parent) if parent != "/" => join_path(&parent, &name),
+            Some(_) => format!("/{name}"),
+            None => name,
+        },
+        TransferDirection::Download => {
+            let target = Path::new(destination);
+            match target.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => {
+                    parent.join(&name).to_string_lossy().into_owned()
+                }
+                _ => name,
+            }
         }
     }
 }
@@ -150,7 +190,8 @@ pub enum TransferState {
     Failed {
         /// Why it stopped.
         failure: TransferFailure,
-        /// A partial file left behind, when it could not be removed.
+        /// A partial file left behind: one that could not be removed, or the temporary
+        /// file a running task was writing when its connection ended.
         residue: Option<String>,
     },
     /// Cancelled by the user.
@@ -193,9 +234,11 @@ impl TransferState {
 
     /// The partial file that was left behind, when one was.
     ///
-    /// A path here means "this is not the target content and it is still on disk": it is
-    /// shown to the user instead of being hidden, because a partial file nobody mentions
-    /// is worse than one that is named.
+    /// A path here means "this is not the target content": it is shown to the user
+    /// instead of being hidden, because a partial file nobody mentions is worse than one
+    /// that is named. A worker that removed the file it could not keep reports nothing;
+    /// a worker that could not remove it names it, and so does a task whose connection
+    /// ended while it was writing, because its worker never came back to say anything.
     #[must_use]
     pub fn residue(&self) -> Option<&str> {
         match self {
@@ -429,6 +472,32 @@ impl Transfer {
     #[must_use]
     pub fn destination(&self) -> &str {
         &self.destination
+    }
+
+    /// The temporary path this task writes before the target's own name exists.
+    ///
+    /// It is derivable from the task alone, which is why the window can name the file a
+    /// task was writing even when the connection ended before the worker could report
+    /// anything.
+    #[must_use]
+    pub fn partial_path(&self) -> String {
+        partial_path(self.direction, &self.destination, self.id)
+    }
+
+    /// The partial file this task may have left on disk when its connection ended.
+    ///
+    /// Only a task that was running can have created a temporary file: a queued task
+    /// has not been started, and one waiting for an answer about an existing target has
+    /// written nothing at all, so neither names a residue. The path is where the bytes
+    /// were going, not a file this crate has looked at - the server's disk is not
+    /// visible from here - and it is named because a partial file nobody mentions is
+    /// the one thing worse than a partial file.
+    #[must_use]
+    pub fn residue_on_loss(&self) -> Option<String> {
+        match self.state {
+            TransferState::Running { .. } => Some(self.partial_path()),
+            _ => None,
+        }
     }
 
     /// Current state.
@@ -749,7 +818,10 @@ impl TransferQueue {
     /// Reports every active task of a session as failed, returning their identifiers.
     ///
     /// A connection that ended cannot leave a task claiming it is still moving bytes,
-    /// so the tasks of that session end with it and say why.
+    /// so the tasks of that session end with it and say why. A task that was running
+    /// also names the temporary file it was writing ([Transfer::residue_on_loss]): its
+    /// worker died with the connection and cannot report it, and a partial file the user
+    /// is never told about outlives the session that produced it.
     pub fn fail_session(
         &mut self,
         session: SessionId,
@@ -760,7 +832,11 @@ impl TransferQueue {
             .filter(|transfer| transfer.session() == session && transfer.is_active())
             .filter_map(|transfer| {
                 let id = transfer.id();
-                transfer.fail(failure.clone()).ok().map(|()| id)
+                let residue = transfer.residue_on_loss();
+                transfer
+                    .fail_with(failure.clone(), residue)
+                    .ok()
+                    .map(|()| id)
             })
             .collect()
     }
@@ -1169,5 +1245,136 @@ mod tests {
             "the completed state survives"
         );
         assert!(queue.active().is_empty());
+    }
+
+    #[test]
+    fn a_temporary_name_is_derivable_from_the_task_alone() {
+        let id = TransferId::from_uuid(uuid::Uuid::nil());
+        assert_eq!(
+            partial_path(TransferDirection::Upload, "/home/deploy/report.txt", id),
+            format!("/home/deploy/{PARTIAL_PREFIX}{id}"),
+            "an upload writes beside its remote target"
+        );
+        assert_eq!(
+            partial_path(TransferDirection::Upload, "/report.txt", id),
+            format!("/{PARTIAL_PREFIX}{id}"),
+            "a target in the root keeps a single separator"
+        );
+        assert_eq!(
+            partial_path(TransferDirection::Upload, "report.txt", id),
+            format!("/{PARTIAL_PREFIX}{id}"),
+            "a remote target is an absolute path, so a bare name is read as one in the root"
+        );
+
+        let download = partial_path(
+            TransferDirection::Download,
+            "/home/deploy/报告 终稿.txt",
+            id,
+        );
+        assert_eq!(
+            download,
+            Path::new("/home/deploy")
+                .join(format!("{PARTIAL_PREFIX}{id}"))
+                .to_string_lossy()
+                .into_owned(),
+            "a download writes beside its local target, as this platform writes paths"
+        );
+        assert!(
+            !download.contains("报告"),
+            "the temporary file cannot be mistaken for the target: {download}"
+        );
+        assert_eq!(
+            partial_path(TransferDirection::Download, "report.txt", id),
+            format!("{PARTIAL_PREFIX}{id}"),
+            "a target with no directory is written beside the working directory"
+        );
+    }
+
+    #[test]
+    fn a_task_names_its_temporary_file_the_same_way_wherever_it_is_asked() {
+        let task = upload();
+        assert_eq!(
+            task.partial_path(),
+            partial_path(task.direction(), task.destination(), task.id())
+        );
+        assert_eq!(task.residue_on_loss(), None, "a queued task wrote nothing");
+
+        let id = task.id();
+        let mut running = started(upload());
+        running
+            .apply(TransferEvent::progress(id, 1024, Some(4096)))
+            .expect("progress applies");
+        assert_eq!(
+            running.residue_on_loss(),
+            Some(running.partial_path()),
+            "a running task was writing that file, so it is named"
+        );
+
+        let mut waiting = upload();
+        waiting
+            .apply(TransferEvent::target_exists(waiting.id(), Some(10)))
+            .expect("the question applies");
+        assert_eq!(
+            waiting.residue_on_loss(),
+            None,
+            "nothing is written while the overwrite question is open"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_ends_names_the_partial_file_of_its_running_tasks_only() {
+        let session = SessionId::new();
+        let mut queue = TransferQueue::new();
+        let running = Transfer::queued(
+            session,
+            TransferDirection::Upload,
+            "C:/work/report.txt",
+            "/home/deploy/report.txt",
+        );
+        let running_id = queue.add(running.clone());
+        queue
+            .apply(&TransferEvent::progress(running_id, 512, Some(1024)))
+            .expect("progress applies");
+        let queued_id = queue.add(Transfer::queued(
+            session,
+            TransferDirection::Download,
+            "/home/deploy/other.txt",
+            "C:/work/other.txt",
+        ));
+
+        let failed = queue.fail_session(session, TransferFailure::ConnectionLost);
+        assert_eq!(failed.len(), 2, "every active task of the session ends");
+
+        let partial = queue
+            .get(running_id)
+            .expect("the task is listed")
+            .partial_path();
+        assert_eq!(
+            partial,
+            format!("/home/deploy/{PARTIAL_PREFIX}{running_id}")
+        );
+        assert_eq!(
+            queue
+                .get(running_id)
+                .expect("the task is listed")
+                .state()
+                .residue(),
+            Some(partial.as_str()),
+            "the file the bytes were going into is named, not hidden"
+        );
+        assert_eq!(
+            queue.get(running_id).map(|task| task.state().failure()),
+            Some(Some(&TransferFailure::ConnectionLost)),
+            "and the task is reported as the failure it was"
+        );
+        assert_eq!(
+            queue
+                .get(queued_id)
+                .expect("the task is listed")
+                .state()
+                .residue(),
+            None,
+            "a task that never ran left no partial file to name"
+        );
     }
 }
