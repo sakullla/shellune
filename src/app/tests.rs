@@ -1033,6 +1033,24 @@ fn a_live_session_is_the_only_positive_session_state() {
         Tone::Danger
     );
 
+    // The same rule for a reason without a state: the notice above a finished terminal and
+    // the session bar both take their tone from it, so a clean exit is never drawn as an
+    // error (R12).
+    assert_eq!(
+        Tone::for_failure(&shellune_core::SessionFailure::ProcessExited { code: Some(0) }),
+        Tone::Neutral
+    );
+    assert_eq!(
+        Tone::for_failure(&shellune_core::SessionFailure::ProcessExited { code: Some(2) }),
+        Tone::Danger
+    );
+    // A shell that never got going but exited cleanly is not a failure either.
+    assert_eq!(
+        Tone::for_session_state(&SessionState::Failed(
+            shellune_core::SessionFailure::ProcessExited { code: Some(0) }
+        )),
+        Tone::Neutral
+    );
     let mut transfer = Transfer::queued(
         shellune_core::SessionId::new(),
         TransferDirection::Upload,
@@ -4201,4 +4219,125 @@ async fn leaving_the_application_closes_every_session(cx: &mut TestAppContext) {
             "every session is closed when the application leaves"
         );
     }
+}
+#[gpui::test]
+async fn a_reconnect_that_can_never_work_offers_close_instead(cx: &mut TestAppContext) {
+    // The reachable path: a remote session that is disconnected, and whose saved host is
+    // deleted before the user presses reconnect. Nothing about that can be fixed by
+    // another attempt, so the session must stop advertising reconnect and name the step
+    // that works - closing it (R12).
+    let dir = TempDir::new("multi-reconnect-refused");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"live\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .find(|session| session.kind().is_remote())
+                .map(|session| session.id())
+        })
+        .expect("the remote session exists");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the remote terminal exists");
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::Lost("the channel was closed".to_owned())],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(matches!(
+        session_state(cx, &view, id),
+        Some(SessionState::Disconnected(_))
+    ));
+
+    // The user deletes the host the session was using.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.delete.0");
+    click(cx, "hosts.confirm.delete");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        0,
+        "the host is gone"
+    );
+    click(cx, "nav.sessions");
+
+    // Pressing reconnect now refuses, and the refusal is recorded as a reason no attempt
+    // can resolve.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.reconnect_session(id, cx));
+    });
+    cx.run_until_parked();
+    let state = session_state(cx, &view, id);
+    assert!(
+        matches!(
+            state,
+            Some(SessionState::Disconnected(
+                shellune_core::SessionFailure::ReconnectUnavailable { .. }
+            ))
+        ),
+        "a refused reconnect keeps its reason, got {state:?}"
+    );
+
+    // What the user sees: the reason, and close as the step - not a reconnect button that
+    // would only refuse again.
+    assert!(
+        cx.debug_bounds("terminal.failure").is_some(),
+        "the reason the session cannot come back is stated"
+    );
+    assert!(
+        cx.debug_bounds("session.close").is_some(),
+        "closing the finished session is offered"
+    );
+    assert!(
+        cx.debug_bounds("session.reconnect").is_none(),
+        "a session that can never be reconnected must not offer the button"
+    );
+
+    // The step that was offered is the step that works.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.close_session(id, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Closed));
 }

@@ -5945,12 +5945,14 @@ name = "shellune"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "libc",
  "portable-pty",
  "serde_json",
  "shellune-core",
  "shellune-ssh",
  "shellune-storage",
  "shellune-terminal",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -160,12 +160,28 @@ impl Tone {
             | SessionState::Authenticating => Self::Warning,
             SessionState::Connected => Self::Positive,
             // A process that ended with status 0 ended as expected; painting that as
-            // an error would make a normal exit look like a failure.
-            SessionState::Disconnected(SessionFailure::ProcessExited { code: Some(0) }) => {
+            // an error would make a normal exit look like a failure. Whether it was live
+            // first is not the question - the reason it ended is.
+            SessionState::Disconnected(failure) | SessionState::Failed(failure)
+                if failure.ended_as_expected() =>
+            {
                 Self::Neutral
             }
             SessionState::Disconnected(_) | SessionState::Failed(_) => Self::Danger,
             SessionState::Closed => Self::Planned,
+        }
+    }
+
+    /// Maps the reason a session ended to the tone it may be drawn in.
+    ///
+    /// The same rule as [Self::for_session_state], for the places that hold a reason
+    /// without a state: a process that ended with status 0 is stated in the neutral tone
+    /// and every other reason is a real failure (R12).
+    pub fn for_failure(failure: &SessionFailure) -> Self {
+        if failure.ended_as_expected() {
+            Self::Neutral
+        } else {
+            Self::Danger
         }
     }
 

@@ -581,6 +581,14 @@ impl Workspace {
         })
     }
 
+    /// Replaces the reason an ended session states.
+    ///
+    /// Used when a reconnect is refused: the session stays ended, but the reason now says
+    /// that another attempt cannot work, so the surface can name the step that does (R12).
+    pub fn session_end_restated(&mut self, id: SessionId, failure: SessionFailure) -> bool {
+        self.transition(id, |session| session.restate_end(failure).is_ok())
+    }
+
     /// Records that the user closed a session.
     pub fn session_closed(&mut self, id: SessionId) -> bool {
         self.transition(id, |session| session.close().is_ok())

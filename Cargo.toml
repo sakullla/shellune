@@ -8,12 +8,34 @@ license = "GPL-3.0-only"
 publish = false
 default-run = "shellune"
 
+[features]
+# Builds the test-only flood program in src/bin/shellune-flood.rs. Everything the
+# interrupt tests need is in it, so a build without this feature - including every
+# release build - contains no test program at all.
+test-support = ["dep:windows-sys", "dep:libc"]
+
+[[bin]]
+name = "shellune-flood"
+path = "src/bin/shellune-flood.rs"
+# Off unless the feature is asked for: the helper exists for the integration tests,
+# not for users, so it is never in a release artifact.
+required-features = ["test-support"]
+
 [dependencies]
 gpui = "=0.2.2"
 shellune-core = { path = "crates/core" }
 shellune-ssh = { path = "crates/ssh" }
 shellune-storage = { path = "crates/storage" }
 shellune-terminal = { path = "crates/terminal" }
+
+[target.'cfg(windows)'.dependencies]
+# The test-only flood program has to be able to ignore Ctrl+C, which is a console
+# call. Optional, because only that program uses it.
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# The same no-op Ctrl+C handler on Unix is one signal() call.
+libc = { version = "0.2.191", optional = true }
 
 [dev-dependencies]
 # The GPUI test harness (TestAppContext / VisualTestContext) is behind this feature.

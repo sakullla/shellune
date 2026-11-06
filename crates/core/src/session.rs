@@ -88,6 +88,16 @@ pub enum SessionFailure {
         /// What the transport reported, already free of credentials.
         reason: String,
     },
+    /// A reconnect was asked for, and no process can be started for it.
+    ///
+    /// Kept apart from [Self::ConnectionFailed] because the next step differs: a
+    /// transport failure is worth another attempt, while a session whose shell or saved
+    /// host is no longer there is finished as it stands. Offering "reconnect" for that
+    /// would send the user round a loop that always refuses.
+    ReconnectUnavailable {
+        /// Why no further process can be started for this session, phrased for the user.
+        reason: String,
+    },
     /// The server presented an unknown identity that was not accepted.
     HostKeyRejected,
     /// The server presented an identity that differs from the one that was trusted.
@@ -133,6 +143,28 @@ pub enum SessionFailure {
     },
 }
 
+impl SessionFailure {
+    /// Whether this is a process that ended the way it was asked to.
+    ///
+    /// An exit with status 0 is what a user's own `exit` does. It is still recorded as
+    /// the reason the session ended - the tab has to say how it ended - but it is not a
+    /// failure, and drawing it as one would make a normal exit look like an error.
+    #[must_use]
+    pub fn ended_as_expected(&self) -> bool {
+        matches!(self, Self::ProcessExited { code: Some(0) })
+    }
+
+    /// Whether starting another process can resolve this failure.
+    ///
+    /// False for a refused reconnect: the cause (no shell record, no saved host) is not
+    /// something another attempt changes, so the user's next step is to close the
+    /// session instead of pressing reconnect again.
+    #[must_use]
+    pub fn reconnect_can_help(&self) -> bool {
+        !matches!(self, Self::ReconnectUnavailable { .. })
+    }
+}
+
 impl std::fmt::Display for SessionFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -173,6 +205,9 @@ impl std::fmt::Display for SessionFailure {
             }
             Self::ConnectionRefused => formatter.write_str("the connection was refused"),
             Self::TimedOut => formatter.write_str("the connection timed out"),
+            Self::ReconnectUnavailable { reason } => {
+                write!(formatter, "this session cannot be reconnected: {reason}")
+            }
             Self::HostKeyRejected => formatter.write_str("the server identity was not accepted"),
             Self::AuthenticationFailed => {
                 formatter.write_str("the server rejected the credentials")
@@ -499,6 +534,37 @@ impl Session {
         )
     }
 
+    /// Replaces the reason an ended session states, and nothing else.
+    ///
+    /// Something can be learned about a session after it ended, and the reason it states
+    /// then may have a next step the earlier one did not: a reconnect that was refused.
+    /// Only an ended session has a reason to replace. A live, pending or closed one is
+    /// refused, because nothing about it was learned and its state is not the caller's to
+    /// rewrite.
+    ///
+    /// # Errors
+    ///
+    /// Returns SessionTransitionError::Illegal unless the session ended with
+    /// [SessionState::Disconnected] or [SessionState::Failed], and
+    /// SessionTransitionError::AlreadyClosed for a closed session.
+    pub fn restate_end(&mut self, failure: SessionFailure) -> Result<(), SessionTransitionError> {
+        match self.state {
+            SessionState::Disconnected(_) => {
+                self.state = SessionState::Disconnected(failure);
+                Ok(())
+            }
+            SessionState::Failed(_) => {
+                self.state = SessionState::Failed(failure);
+                Ok(())
+            }
+            SessionState::Closed => Err(SessionTransitionError::AlreadyClosed),
+            _ => Err(SessionTransitionError::Illegal {
+                from: self.state.label(),
+                to: "the same state with a new reason",
+            }),
+        }
+    }
+
     /// Starts another process for a session that ended.
     ///
     /// This is the manual reconnect: it is refused for a session that is still live,
@@ -611,6 +677,78 @@ mod tests {
         );
         assert!(!session.state().accepts_input());
         assert!(session.state().was_live());
+    }
+
+    #[test]
+    fn a_refused_reconnect_is_restated_on_the_ended_session_only() {
+        // A session that already ended cannot move to "ended" again, so a refusal is a new
+        // reason for the same state - which is allowed only where there is one to replace.
+        let mut session = remote_session();
+        session.begin_connecting().expect("starts connecting");
+        session.begin_host_verification().expect("verifies host");
+        session.begin_authentication().expect("authenticates");
+        session.connected().expect("connects");
+        session
+            .disconnected(SessionFailure::ConnectionLost)
+            .expect("a live session disconnects");
+        assert!(session.state().can_reconnect());
+
+        let refusal = SessionFailure::ReconnectUnavailable {
+            reason: "the saved host is gone".to_owned(),
+        };
+        session
+            .restate_end(refusal.clone())
+            .expect("the ended session states the refusal");
+        assert_eq!(
+            session.state(),
+            &SessionState::Disconnected(refusal.clone())
+        );
+        assert!(!refusal.reconnect_can_help());
+        assert!(!refusal.ended_as_expected());
+
+        // A pending session has no end reason to replace.
+        let mut pending = remote_session();
+        pending.begin_connecting().expect("starts connecting");
+        assert_eq!(
+            pending.restate_end(refusal.clone()),
+            Err(SessionTransitionError::Illegal {
+                from: "Connecting",
+                to: "the same state with a new reason",
+            })
+        );
+
+        // A closed session is final.
+        session.close().expect("closes");
+        assert_eq!(
+            session.restate_end(refusal),
+            Err(SessionTransitionError::AlreadyClosed)
+        );
+    }
+
+    #[test]
+    fn only_a_clean_exit_ended_as_expected() {
+        assert!(
+            SessionFailure::ProcessExited { code: Some(0) }.ended_as_expected(),
+            "status 0 is what a user's own exit does"
+        );
+        assert!(!SessionFailure::ProcessExited { code: Some(1) }.ended_as_expected());
+        assert!(!SessionFailure::ProcessExited { code: None }.ended_as_expected());
+        assert!(
+            !SessionFailure::ProcessSignalled {
+                signal: "SIGTERM".to_owned()
+            }
+            .ended_as_expected(),
+            "a shell that was killed did not end as asked"
+        );
+
+        // Only a refused reconnect is beyond another attempt.
+        assert!(SessionFailure::ConnectionLost.reconnect_can_help());
+        assert!(
+            !SessionFailure::ReconnectUnavailable {
+                reason: "the saved host is gone".to_owned()
+            }
+            .reconnect_can_help()
+        );
     }
 
     #[test]

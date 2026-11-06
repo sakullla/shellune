@@ -562,7 +562,7 @@ impl ShelluneView {
         let Some(session) = self.workspace.session(id) else {
             return;
         };
-        if !session.state().can_reconnect() {
+        if !may_reconnect(session) {
             return;
         }
         let kind = session.kind().clone();
@@ -613,9 +613,16 @@ impl ShelluneView {
     }
 
     /// Records that a reconnect could not start, and why.
+    ///
+    /// Recorded as [SessionFailure::ReconnectUnavailable] rather than as a transport
+    /// failure: nothing about these causes changes by pressing reconnect again, so the
+    /// session must stop offering it and name the step that does work - closing it (R12).
     fn refuse_reconnect(&mut self, id: SessionId, reason: String, cx: &mut Context<Self>) {
+        // The session has already ended, and a transition to "ended" again would be
+        // refused exactly where the refusal matters, so the reason is restated instead:
+        // the session stays ended, and it now also says that no attempt can bring it back.
         self.workspace
-            .session_failed(id, SessionFailure::ConnectionFailed { reason });
+            .session_end_restated(id, SessionFailure::ReconnectUnavailable { reason });
         cx.notify();
     }
 
@@ -3636,7 +3643,7 @@ impl ShelluneView {
         let ended: Option<(SessionFailure, bool)> =
             session.and_then(|session| match session.state() {
                 SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
-                    Some((failure.clone(), session.state().can_reconnect()))
+                    Some((failure.clone(), may_reconnect(session)))
                 }
                 _ => None,
             });
@@ -3705,7 +3712,9 @@ impl ShelluneView {
             .debug_selector(|| "terminal.failure".to_owned())
             .child(
                 div()
-                    .text_color(Tone::Danger.text())
+                    // A process that ended with status 0 is stated in the neutral tone:
+                    // the reason is still shown, but a normal exit is not an error.
+                    .text_color(Tone::for_failure(failure).text())
                     .child(SharedString::from(failure.to_string())),
             )
             .child(
@@ -3868,7 +3877,7 @@ impl ShelluneView {
         };
         let state_label = copy::session_state_label(session.state(), self.workspace.locale());
         let tone = session_tone(session.state());
-        let can_reconnect = session.state().can_reconnect();
+        let can_reconnect = may_reconnect(session);
 
         div()
             .flex()
@@ -4064,7 +4073,7 @@ impl ShelluneView {
         // shown.
         let detail = match session.state() {
             SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
-                let step = if session.state().can_reconnect() {
+                let step = if may_reconnect(session) {
                     strings.session_reconnect
                 } else {
                     strings.session_close
@@ -4265,8 +4274,27 @@ fn session_tone(state: &SessionState) -> Tone {
         SessionState::Connecting | SessionState::VerifyingHost | SessionState::Authenticating => {
             Tone::Warning
         }
-        SessionState::Disconnected(_) | SessionState::Failed(_) => Tone::Danger,
+        // The reason decides, not just the state: a shell that exited with status 0
+        // ended as asked, and the bar must not call that a failure (R12).
+        SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
+            Tone::for_failure(failure)
+        }
         SessionState::Idle | SessionState::Closed => Tone::Neutral,
+    }
+}
+
+/// Whether the manual reconnect can start another process for this session.
+///
+/// Two things have to hold: the state allows a restart at all, and the reason it ended
+/// is one that another attempt can resolve. A refused reconnect carries its own reason,
+/// so a session that can never be started again stops advertising the button that would
+/// only refuse it again.
+fn may_reconnect(session: &Session) -> bool {
+    match session.state() {
+        SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
+            failure.reconnect_can_help()
+        }
+        state => state.can_reconnect(),
     }
 }
 
