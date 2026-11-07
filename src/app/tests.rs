@@ -1867,11 +1867,20 @@ async fn a_ctrl_c_reaches_the_default_shell_that_is_running_a_command(cx: &mut T
         "the shell never printed a prompt"
     );
 
-    cx.simulate_input("ping -n 60 127.0.0.1");
-    cx.simulate_keystrokes("enter");
     // The program has to be really running before the key is pressed, or the press proves
-    // nothing: a ping prints one reply per second and `TTL=` is the part of that line no
-    // locale changes.
+    // nothing. On Windows a ping prints one reply per second and `TTL=` is the part of
+    // that line no locale changes. Elsewhere ping takes other flags and often needs raw
+    // socket rights, so a shell loop prints a marker instead; the marker is computed by
+    // the shell, so the echoed command line itself never counts as a reply.
+    #[cfg(windows)]
+    let (command, marker) = ("ping -n 60 127.0.0.1", "TTL=");
+    #[cfg(not(windows))]
+    let (command, marker) = (
+        "while :; do echo shellune-$((40+2)); sleep 0.5; done",
+        "shellune-42",
+    );
+    cx.simulate_input(command);
+    cx.simulate_keystrokes("enter");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut replies = 0;
     while std::time::Instant::now() < deadline {
@@ -1879,7 +1888,7 @@ async fn a_ctrl_c_reaches_the_default_shell_that_is_running_a_command(cx: &mut T
             pane.update(app, |pane, cx| pane.pump_once(cx));
         });
         screen = cx.update(|_window, app| pane.read(app).visible_text().join("\n"));
-        replies = screen.matches("TTL=").count();
+        replies = screen.matches(marker).count();
         if replies >= 2 {
             break;
         }

@@ -50,6 +50,8 @@ shellune-ssh = { path = "crates/ssh", features = ["test-support"] }
 
 [workspace]
 members = ["crates/core", "crates/ssh", "crates/storage", "crates/terminal"]
+# The patched third-party crates are dependencies, not members of this workspace.
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
@@ -76,6 +78,11 @@ thiserror = "2.0.12"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
 zeroize = "1.8.1"
+
+# xattr 0.2.3 (pulled in by gpui through zed-async-tar) names libc::ENOATTR on
+# Linux, which current libc releases no longer export; see vendor/README.md.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
 
 [profile.release]
 strip = "symbols"
