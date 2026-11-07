@@ -316,6 +316,11 @@ impl Metrics {
         self.scale(208.0)
     }
 
+    /// Width of the sidebar when it is collapsed to its icons.
+    pub fn collapsed_rail_width(self) -> Pixels {
+        self.scale(56.0)
+    }
+
     /// Height of the header that names the current object.
     pub fn header_height(self) -> Pixels {
         self.scale(52.0)

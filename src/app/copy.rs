@@ -593,6 +593,10 @@ pub struct Strings {
     pub host_dialog_close: &'static str,
     /// Connection form: a remembered secret could not be read; the reason follows.
     pub remote_saved_secret_failed: &'static str,
+    /// Sidebar button and palette action: collapse the sidebar.
+    pub sidebar_collapse: &'static str,
+    /// Sidebar button and palette action: expand the sidebar.
+    pub sidebar_expand: &'static str,
 }
 
 /// English copy.
@@ -853,6 +857,8 @@ pub static ENGLISH: Strings = Strings {
     host_save_connect: "Save and connect",
     host_dialog_close: "Close",
     remote_saved_secret_failed: "The saved password could not be read",
+    sidebar_collapse: "Collapse sidebar",
+    sidebar_expand: "Expand sidebar",
 };
 
 /// Chinese copy.
@@ -1113,6 +1119,8 @@ pub static CHINESE: Strings = Strings {
     host_save_connect: "保存并连接",
     host_dialog_close: "关闭",
     remote_saved_secret_failed: "无法读取已保存的密码",
+    sidebar_collapse: "收起侧边栏",
+    sidebar_expand: "展开侧边栏",
 };
 
 /// A count followed by its unit, in the grammar of the language.

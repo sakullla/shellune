@@ -31,7 +31,7 @@ use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions,
     GoToTransfers, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
     PreviousTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage,
+    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage, ToggleSidebar,
 };
 use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
@@ -237,6 +237,8 @@ pub struct ShelluneView {
     /// shortcut shows every session instead, which is the only place closed records
     /// and their actions are listed while tabs are open.
     session_terminal: bool,
+    /// Whether the sidebar is collapsed to its icons.
+    rail_collapsed: bool,
     /// Whether the host dialog's first field takes the keyboard on the next draw.
     focus_host_dialog: bool,
     /// The session row whose menu is open, and where it was opened.
@@ -383,6 +385,7 @@ impl ShelluneView {
             tab_menu: None,
             session_menu: None,
             focus_host_dialog: false,
+            rail_collapsed: false,
             session_terminal: false,
             #[cfg(test)]
             scripted: None,
@@ -3651,7 +3654,7 @@ impl ShelluneView {
     }
 
     /// The product mark: a gradient tile with a prompt, the name and how it is said.
-    fn brand(&self) -> Div {
+    fn brand(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         div()
             .flex()
@@ -3659,29 +3662,28 @@ impl ShelluneView {
             .items_center()
             .gap(metrics.scale(spacing::SNUG - 2.0))
             .h(metrics.header_height())
-            .px(metrics.scale(spacing::BASE - 2.0))
+            .pl(metrics.scale(spacing::BASE - 2.0))
+            .pr(metrics.scale(spacing::TIGHT))
             .child(brand_mark(metrics.scale(28.0), metrics))
             .child(
+                // The pronunciation is one hover away: the row keeps room for the
+                // sidebar button without cutting the name.
                 div()
-                    .flex()
-                    .items_baseline()
-                    .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                    .id("brand.name")
+                    .flex_1()
                     .min_w(px(0.0))
-                    .child(
-                        div()
-                            .text_size(metrics.display_size())
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(product::NAME),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(product::PRONUNCIATION),
-                    ),
+                    .truncate()
+                    .text_size(metrics.display_size())
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .tooltip(components::tooltip(SharedString::from(format!(
+                        "{} · {}",
+                        product::NAME,
+                        product::PRONUNCIATION
+                    ))))
+                    .child(product::NAME),
             )
+            .child(self.rail_toggle(cx))
     }
 
     fn nav_entry(
@@ -3713,6 +3715,7 @@ impl ShelluneView {
             destination.shortcut_label(Platform::current())
         );
 
+        let collapsed = self.rail_collapsed;
         let mut entry = div()
             .id(("nav", index))
             .group(group.clone())
@@ -3721,8 +3724,12 @@ impl ShelluneView {
             .items_center()
             .gap(metrics.scale(spacing::SNUG - 2.0))
             .h(metrics.nav_row_height())
-            .pl(metrics.scale(spacing::SNUG - 2.0))
-            .pr(metrics.scale(spacing::TIGHT))
+            .when(collapsed, |entry| entry.justify_center())
+            .when(!collapsed, |entry| {
+                entry
+                    .pl(metrics.scale(spacing::SNUG - 2.0))
+                    .pr(metrics.scale(spacing::TIGHT))
+            })
             .rounded(px(radius::MEDIUM))
             .border_1()
             // The ring marks keyboard focus that has moved off the current page; on
@@ -3757,15 +3764,27 @@ impl ShelluneView {
         };
 
         let live = !matches!(tone, Tone::Neutral | Tone::Planned);
-        entry
-            .child(
-                icons::icon(
-                    destination_icon(destination),
-                    metrics.icon_size(),
-                    icon_color,
+        let icon = icons::icon(
+            destination_icon(destination),
+            metrics.icon_size(),
+            icon_color,
+        )
+        .group_hover(group, move |style| style.text_color(hover_text));
+        if collapsed {
+            // Only the icon, with the state as a dot on its corner; the name and the
+            // shortcut are in the tooltip.
+            return entry.child(icon).when(live, |entry| {
+                entry.child(
+                    div()
+                        .absolute()
+                        .top(metrics.scale(6.0))
+                        .right(metrics.scale(6.0))
+                        .child(components::status_dot(tone, metrics)),
                 )
-                .group_hover(group, move |style| style.text_color(hover_text)),
-            )
+            });
+        }
+        entry
+            .child(icon)
             .child(
                 div()
                     .flex_1()
@@ -3855,12 +3874,19 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .gap(metrics.scale(2.0))
-            .px(metrics.scale(spacing::TIGHT + 2.0))
+            .px(metrics.scale(if self.rail_collapsed {
+                spacing::TIGHT
+            } else {
+                spacing::TIGHT + 2.0
+            }))
             .pt(metrics.scale(spacing::TIGHT));
         for destination in Destination::ALL {
             nav = nav.child(self.nav_entry(destination, window, cx));
         }
 
+        if self.rail_collapsed {
+            return self.collapsed_rail(nav, cx);
+        }
         div()
             .flex()
             .flex_col()
@@ -3870,7 +3896,8 @@ impl ShelluneView {
             .bg(theme::swatch(palette::SURFACE))
             .border_r_1()
             .border_color(theme::swatch(palette::BORDER))
-            .child(self.brand())
+            .debug_selector(|| "rail".to_owned())
+            .child(self.brand(cx))
             .child(self.palette_trigger(cx))
             .child(nav)
             .child(
@@ -4001,6 +4028,151 @@ impl ShelluneView {
                 Platform::current().palette_label(),
                 metrics,
             ))
+    }
+
+    /// Collapses the sidebar to its icons, or expands it again.
+    pub fn toggle_rail(&mut self, cx: &mut Context<Self>) {
+        self.rail_collapsed = !self.rail_collapsed;
+        cx.notify();
+    }
+
+    /// Whether the sidebar is collapsed.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn rail_collapsed(&self) -> bool {
+        self.rail_collapsed
+    }
+
+    /// The button that collapses or expands the sidebar, with its shortcut.
+    fn rail_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let label = if self.rail_collapsed {
+            strings.sidebar_expand
+        } else {
+            strings.sidebar_collapse
+        };
+        components::icon_only_button(Icon::Sidebar, metrics)
+            .id("rail.toggle")
+            .debug_selector(|| "rail.toggle".to_owned())
+            .tooltip(components::tooltip(SharedString::from(format!(
+                "{label} ({})",
+                Platform::current().sidebar_label()
+            ))))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_rail(cx);
+            }))
+    }
+
+    /// The sidebar collapsed to its icons: the brand, search, the pages and the two
+    /// settings, each named in its tooltip.
+    fn collapsed_rail(&self, nav: Div, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let platform = Platform::current();
+        let square = |icon: Icon, id: &'static str, tooltip: String| {
+            components::icon_only_button(icon, metrics)
+                .size(metrics.scale(36.0))
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .tooltip(components::tooltip(SharedString::from(tooltip)))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(metrics.collapsed_rail_width())
+            .h_full()
+            .bg(theme::swatch(palette::SURFACE))
+            .border_r_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "rail".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .h(metrics.header_height())
+                    .child(brand_mark(metrics.scale(28.0), metrics)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(metrics.scale(2.0))
+                    .child(self.rail_toggle(cx).size(metrics.scale(36.0)))
+                    .child(
+                        square(
+                            Icon::Search,
+                            "palette.open",
+                            format!(
+                                "{} ({})",
+                                strings.palette_hint_short,
+                                platform.palette_label()
+                            ),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.toggle_palette(window, cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(nav)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(metrics.scale(2.0))
+                    .pb(metrics.scale(spacing::SNUG))
+                    .mt_auto()
+                    .child(
+                        square(
+                            Icon::Globe,
+                            "status.language",
+                            format!(
+                                "{} · {}",
+                                strings.language_control,
+                                self.workspace.locale().endonym()
+                            ),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.toggle_locale(cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        square(
+                            Icon::TextSize,
+                            "zoom.control",
+                            format!(
+                                "{} · {}",
+                                strings.zoom_control,
+                                self.workspace.zoom().label()
+                            ),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.workspace.cycle_text_size();
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(div().pt(metrics.scale(spacing::HAIRLINE)).child(
+                        components::status_dot(
+                            if self.any_live() {
+                                Tone::Positive
+                            } else {
+                                Tone::Neutral
+                            },
+                            metrics,
+                        ),
+                    )),
+            )
     }
 
     /// One quiet setting at the foot of the sidebar: an icon, a name and its value.
@@ -6929,6 +7101,9 @@ impl Render for ShelluneView {
             }))
             .on_action(cx.listener(|this, _: &NewLocalShell, window, cx| {
                 this.new_local_shell(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
+                this.toggle_rail(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.toggle_palette(window, cx);

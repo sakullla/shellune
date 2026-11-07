@@ -236,6 +236,20 @@ impl ShelluneView {
             current: false,
         });
         entries.push(Entry {
+            command: Command::ToggleSidebar,
+            group: Group::Actions,
+            title: if self.rail_collapsed {
+                strings.sidebar_expand
+            } else {
+                strings.sidebar_collapse
+            }
+            .to_owned(),
+            detail: String::new(),
+            shortcut: Some(platform.sidebar_label().to_owned()),
+            icon: Icon::Sidebar,
+            current: false,
+        });
+        entries.push(Entry {
             command: Command::CycleTextSize,
             group: Group::Actions,
             title: strings.palette_text_size.to_owned(),
@@ -317,6 +331,7 @@ impl ShelluneView {
             }
             Command::CloseTab(id) => self.request_close_session(id, cx),
             Command::ToggleLanguage => self.toggle_locale(cx),
+            Command::ToggleSidebar => self.toggle_rail(cx),
             Command::CycleTextSize => {
                 self.workspace.cycle_text_size();
                 cx.notify();

@@ -43,7 +43,7 @@ use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions,
     GoToTransfers, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
     PreviousTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage,
+    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage, ToggleSidebar,
 };
 use crate::app::nav::{Destination, Platform};
 
@@ -77,7 +77,8 @@ pub mod actions {
             SelectTab6,
             SelectTab7,
             SelectTab8,
-            SelectTab9
+            SelectTab9,
+            ToggleSidebar
         ]
     );
 }
@@ -164,6 +165,11 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
         KeyBinding::new(
             platform.close_tab_keystroke(),
             CloseActiveTab,
+            Some(KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            platform.sidebar_keystroke(),
+            ToggleSidebar,
             Some(KEY_CONTEXT),
         ),
         KeyBinding::new(

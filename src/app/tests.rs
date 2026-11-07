@@ -751,6 +751,8 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             tab_menu_close,
             tab_menu_close_others,
             tab_menu_close_right,
+            sidebar_collapse,
+            sidebar_expand,
             host_auth_title,
             host_secret_passphrase,
             host_remember_password,
@@ -971,9 +973,10 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
     let bindings = key_bindings(Platform::current());
     assert_eq!(
         bindings.len(),
-        Destination::ALL.len() + 6 + 4 + crate::app::TAB_JUMP_COUNT,
+        Destination::ALL.len() + 6 + 5 + crate::app::TAB_JUMP_COUNT,
         "four destinations, next and previous, zoom, new shell, language and dismiss; \
-         the palette, close tab, next and previous tab; and one jump per tab digit"
+         the palette, the sidebar, close tab, next and previous tab; and one jump per \
+         tab digit"
     );
 }
 
@@ -6958,4 +6961,45 @@ async fn the_startup_command_is_typed_once_the_connection_is_live(cx: &mut TestA
         Destination::Sessions,
         "the terminal that was connected is shown at once"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Collapsing the sidebar
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn the_sidebar_collapses_to_its_icons_and_navigation_keeps_working(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    let wide = bounds_of(cx, "rail").size.width;
+
+    click(cx, "rail.toggle");
+    assert!(cx.update(|_window, app| view.read(app).rail_collapsed()));
+    // The rail is drawn again at its narrow width (bounds of a selector keep the latest
+    // frame that drew it, and both widths draw "rail").
+    let narrow = bounds_of(cx, "rail").size.width;
+    assert!(
+        narrow < wide / 2.0,
+        "collapsed to its icons: {narrow:?} vs {wide:?}"
+    );
+
+    // Every page is still one click away, by its icon.
+    click(cx, "nav.hosts");
+    assert_eq!(destination_of(&view, cx), Destination::Hosts);
+    let viewport = minimum_window();
+    for destination in Destination::ALL {
+        assert_fits_inside(
+            bounds_of(cx, destination.debug_selector()),
+            viewport,
+            destination.debug_selector(),
+        );
+    }
+
+    // The shortcut expands it again from anywhere in the window.
+    focus_root(&view, cx);
+    cx.simulate_keystrokes(Platform::current().sidebar_keystroke());
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).rail_collapsed()));
 }

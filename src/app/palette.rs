@@ -35,6 +35,8 @@ pub enum Command {
     ToggleLanguage,
     /// Steps the interface text size.
     CycleTextSize,
+    /// Collapses or expands the sidebar.
+    ToggleSidebar,
 }
 
 /// The section an entry is listed under when nothing is typed.
