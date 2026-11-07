@@ -22,7 +22,8 @@ use shellune_core::{
 };
 use shellune_ssh::{ConnectRequest, PtySize, RemoteEvent, RemoteSession};
 use shellune_storage::{
-    HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview, ImportedHost, TrustStore,
+    HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview, ImportedHost, SecretStore,
+    TrustStore,
 };
 use shellune_terminal::GridSize;
 
@@ -30,7 +31,7 @@ use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions,
     GoToTransfers, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
     PreviousTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage,
+    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage, ToggleSidebar,
 };
 use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
@@ -48,7 +49,7 @@ use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{self, MethodChoice, RemoteFailure, RemotePanel, RemoteStatus};
 use crate::app::terminal::{self, PaneState, SourceEvent, TerminalPane};
-use crate::app::text_field::TextField;
+use crate::app::text_field::{Browse, TextField};
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
 #[cfg(test)]
 use crate::app::transfers::TransferChannel;
@@ -58,7 +59,11 @@ use crate::app::transfers::{
 use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Workspace};
 use crate::app::{components, theme::radius};
 
+mod host_dialog;
 mod overlays;
+mod sessions;
+mod titlebar;
+pub use titlebar::{TRAFFIC_LIGHT_POSITION, custom_titlebar};
 
 /// Where a terminal comes from.
 ///
@@ -215,6 +220,9 @@ pub struct ShelluneView {
     files_dialog: Option<FilesDialog>,
     /// The field of that question, present only while it has one.
     files_field: Option<Entity<TextField>>,
+    /// Where remembered passwords and passphrases are kept: the system credential store,
+    /// or memory in tests.
+    secrets: std::sync::Arc<dyn SecretStore>,
     /// The command palette's search field, present only while the palette is open.
     palette: Option<Entity<TextField>>,
     /// What the palette's field held when the list was last ranked.
@@ -225,6 +233,22 @@ pub struct ShelluneView {
     palette_scroll: gpui::ScrollHandle,
     /// The tab whose menu is open, and where the pointer opened it.
     tab_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
+    /// Whether the sessions page shows the selected terminal rather than the list.
+    ///
+    /// Selecting a tab shows its terminal; going to the page from the sidebar or its
+    /// shortcut shows every session instead, which is the only place closed records
+    /// and their actions are listed while tabs are open.
+    session_terminal: bool,
+    /// Whether the sidebar is collapsed to its icons.
+    rail_collapsed: bool,
+    /// What the user chose for the palette.
+    theme_choice: theme::ThemeChoice,
+    /// Whether the window already tells this view when the system palette changes.
+    watching_appearance: bool,
+    /// Whether the host dialog's first field takes the keyboard on the next draw.
+    focus_host_dialog: bool,
+    /// The session row whose menu is open, and where it was opened.
+    session_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// The attempt a test scripted, kept so its answers can be inspected.
     #[cfg(test)]
     scripted: Option<shellune_ssh::ScriptedSession>,
@@ -237,7 +261,7 @@ struct RemoteFields {
     passphrase: Entity<TextField>,
 }
 
-/// The six fields of the host editor, in form order.
+/// The fields of the host dialog, in form order.
 struct HostFields {
     name: Entity<TextField>,
     address: Entity<TextField>,
@@ -245,6 +269,8 @@ struct HostFields {
     user: Entity<TextField>,
     group: Entity<TextField>,
     identity: Entity<TextField>,
+    secret: Entity<TextField>,
+    startup: Entity<TextField>,
 }
 
 impl HostFields {
@@ -256,6 +282,8 @@ impl HostFields {
             HostField::User => &self.user,
             HostField::Group => &self.group,
             HostField::IdentityFile => &self.identity,
+            HostField::Secret => &self.secret,
+            HostField::StartupCommand => &self.startup,
         }
     }
 }
@@ -291,7 +319,11 @@ impl ShelluneView {
         let placeholder = workspace.strings().shell_custom_placeholder;
         let search_placeholder = workspace.strings().hosts_search_placeholder;
         let strings = workspace.strings();
-        let shell_path = cx.new(|cx| TextField::new(placeholder, cx));
+        let shell_path = cx.new(|cx| {
+            let mut field = TextField::new(placeholder, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        });
         let hosts_search = cx.new(|cx| TextField::new(search_placeholder, cx));
 
         // The credentials fields are created once and reused: a field that is
@@ -300,12 +332,18 @@ impl ShelluneView {
         let password = cx.new(|cx| {
             let mut field = TextField::new(strings.auth_password, cx);
             field.set_masked(true, cx);
+            field.set_revealable(true, cx);
             field
         });
-        let key_path = cx.new(|cx| TextField::new(strings.auth_key, cx));
+        let key_path = cx.new(|cx| {
+            let mut field = TextField::new(strings.auth_key, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        });
         let passphrase = cx.new(|cx| {
             let mut field = TextField::new(strings.auth_key_passphrase, cx);
             field.set_masked(true, cx);
+            field.set_revealable(true, cx);
             field
         });
 
@@ -338,6 +376,7 @@ impl ShelluneView {
             trust,
             trust_book: HostTrust::new(),
             trust_error: None,
+            secrets: default_secrets(),
             files: FileViews::new(),
             transfers: TransferViews::new(),
             transfer_problem: None,
@@ -350,6 +389,12 @@ impl ShelluneView {
             palette_selected: 0,
             palette_scroll: gpui::ScrollHandle::new(),
             tab_menu: None,
+            session_menu: None,
+            focus_host_dialog: false,
+            rail_collapsed: false,
+            theme_choice: theme::ThemeChoice::default(),
+            watching_appearance: false,
+            session_terminal: false,
             #[cfg(test)]
             scripted: None,
         };
@@ -540,6 +585,7 @@ impl ShelluneView {
             .detach();
         self.panes.push(OpenPane { tag, pane });
         self.active = Some(tag.session);
+        self.session_terminal = true;
         self.focus_pane(tag.session, cx);
         cx.notify();
     }
@@ -585,6 +631,7 @@ impl ShelluneView {
             return;
         };
         self.active = Some(id);
+        self.session_terminal = true;
         // A terminal is only visible in a destination that lists its kind, so selecting
         // one takes the user to that destination rather than leaving them on a page that
         // cannot show what they just chose.
@@ -689,7 +736,11 @@ impl ShelluneView {
             return;
         };
         let placeholder = self.strings().transfers_upload_placeholder;
-        let field = cx.new(|cx| TextField::new(placeholder, cx));
+        let field = cx.new(|cx| {
+            let mut field = TextField::new(placeholder, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        });
         self.open_files_dialog(
             FilesDialog::Upload {
                 session: id,
@@ -718,7 +769,11 @@ impl ShelluneView {
         let remote = join_path(&directory, name);
         let placeholder = self.strings().transfers_download_placeholder;
         let suggested = default_download_directory();
-        let field = cx.new(|cx| TextField::with_text(placeholder, &suggested, cx));
+        let field = cx.new(|cx| {
+            let mut field = TextField::with_text(placeholder, &suggested, cx);
+            field.set_browse(Browse::Directory, cx);
+            field
+        });
         self.open_files_dialog(
             FilesDialog::Download {
                 session: id,
@@ -987,9 +1042,27 @@ impl ShelluneView {
                 self.form_session = Some(id);
                 self.remote = Some(RemotePanel::new(&host));
                 self.sync_remote_fields(cx);
+                // A host that remembers how to sign in reconnects in one click too.
+                self.connect_when_ready(&host, cx);
                 cx.notify();
             }
         }
+    }
+
+    /// What the credential store holds for a host, for tests.
+    #[cfg(test)]
+    pub fn saved_secret_for_test(&self, id: HostId) -> Option<String> {
+        self.secrets
+            .load(id)
+            .ok()
+            .flatten()
+            .map(|secret| secret.expose().to_owned())
+    }
+
+    /// Whether the session bar offers the reconnect button for this session.
+    #[cfg(test)]
+    pub fn offers_reconnect(&self, id: SessionId) -> bool {
+        self.workspace.session(id).is_some_and(may_reconnect)
     }
 
     /// Records that a reconnect could not start, and why.
@@ -1058,6 +1131,10 @@ impl ShelluneView {
 
     /// Selects a destination, moving keyboard focus with it.
     fn select(&mut self, destination: Destination, window: &mut Window, cx: &mut Context<Self>) {
+        if destination == Destination::Sessions {
+            // The page itself was asked for: it lists the sessions.
+            self.session_terminal = false;
+        }
         self.workspace.select(destination);
         let handle = self.destination_focus(destination).clone();
         window.focus(&handle);
@@ -1145,7 +1222,7 @@ impl ShelluneView {
         entity.update(cx, |text_field, _cx| {
             text_field.on_submit(move |_text, _window, app| {
                 view.update(app, |view, cx| {
-                    view.save_host(cx);
+                    let _ = view.save_host(cx);
                     // The field keeps its text: when the save was refused, the reason
                     // points at what the user typed and must still be there.
                     false
@@ -1225,9 +1302,31 @@ impl ShelluneView {
             TextField::with_text(strings.host_field_group, draft.text(HostField::Group), cx)
         });
         let identity = cx.new(|cx| {
-            TextField::with_text(
+            let mut field = TextField::with_text(
                 strings.host_field_identity,
                 draft.text(HostField::IdentityFile),
+                cx,
+            );
+            field.set_browse(Browse::File, cx);
+            field
+        });
+        let secret_placeholder = if draft.has_saved_secret() {
+            strings.host_secret_saved_placeholder
+        } else if draft.auth().needs_passphrase() {
+            strings.host_secret_passphrase
+        } else {
+            strings.auth_password
+        };
+        let secret = cx.new(|cx| {
+            let mut field = TextField::new(secret_placeholder, cx);
+            field.set_masked(true, cx);
+            field.set_revealable(true, cx);
+            field
+        });
+        let startup = cx.new(|cx| {
+            TextField::with_text(
+                strings.host_startup_placeholder,
+                draft.text(HostField::StartupCommand),
                 cx,
             )
         });
@@ -1238,10 +1337,13 @@ impl ShelluneView {
             user,
             group,
             identity,
+            secret,
+            startup,
         });
         for field in HostField::ALL {
             self.bind_host_field(field, cx);
         }
+        self.focus_host_dialog = true;
         cx.notify();
     }
 
@@ -1253,10 +1355,11 @@ impl ShelluneView {
     }
 
     /// Validates the form and stores it when the domain accepts it.
-    fn save_host(&mut self, cx: &mut Context<Self>) {
-        let Some(draft) = self.hosts.draft().cloned() else {
-            return;
-        };
+    ///
+    /// Returns the id of the host that was saved, or `None` when the dialog stays open
+    /// with the reason it was refused.
+    fn save_host(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
+        let draft = self.hosts.draft().cloned()?;
         let saved = draft.editing().and_then(|id| self.book.host(id)).cloned();
         let edit = match draft.build(saved.as_ref()) {
             Ok(edit) => edit,
@@ -1265,7 +1368,7 @@ impl ShelluneView {
                 // the field the domain refused.
                 self.hosts.set_message(reason, true);
                 cx.notify();
-                return;
+                return None;
             }
         };
 
@@ -1273,9 +1376,50 @@ impl ShelluneView {
         if let Err(error) = next.apply(&edit) {
             self.hosts.set_message(error.to_string(), true);
             cx.notify();
-            return;
+            return None;
+        }
+        if !self.store_host_secret(&draft, edit.host(), saved.as_ref(), cx) {
+            return None;
         }
         self.commit_hosts(next, self.strings().hosts_saved, cx);
+        // The dialog closes only when the file was really written.
+        self.host_fields.is_none().then(|| edit.id())
+    }
+
+    /// Puts the secret typed in the form into the system store, or takes it out.
+    ///
+    /// Runs before the record is written: a host whose file says "remembered" must have
+    /// its secret in the store. Returns whether saving the record may go on; when the
+    /// store refuses, the dialog stays open with the reason.
+    fn store_host_secret(
+        &mut self,
+        draft: &HostDraft,
+        host: &HostConfig,
+        saved: Option<&HostConfig>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let strings = self.strings();
+        if host.remembers_secret() {
+            // Nothing typed keeps what is saved: the draft only remembers when there is
+            // something to remember.
+            if let Some(secret) = draft.typed_secret() {
+                let secret = shellune_core::SecretString::new(secret);
+                if let Err(error) = self.secrets.save(host.id(), &secret) {
+                    self.hosts
+                        .set_message(format!("{}: {error}", strings.host_secret_failed), true);
+                    cx.notify();
+                    return false;
+                }
+            }
+        } else if saved.is_some_and(HostConfig::remembers_secret) {
+            // Turning remembering off removes the secret; a store that cannot be reached
+            // leaves an entry nobody reads, which is not a reason to keep the old flag.
+            let _ = self.secrets.forget(host.id());
+        }
+        if let Some(draft) = self.hosts.draft_mut() {
+            draft.clear_secret();
+        }
+        true
     }
 
     /// Saves the records, and only then adopts them as the current state.
@@ -1315,10 +1459,17 @@ impl ShelluneView {
             return;
         };
         let mut next = self.book.clone();
-        if let Err(error) = next.remove(id) {
-            self.hosts.set_message(error.to_string(), true);
-            cx.notify();
-            return;
+        let removed = match next.remove(id) {
+            Ok(removed) => removed,
+            Err(error) => {
+                self.hosts.set_message(error.to_string(), true);
+                cx.notify();
+                return;
+            }
+        };
+        // A deleted host's secret has nobody left to use it.
+        if removed.remembers_secret() {
+            let _ = self.secrets.forget(id);
         }
         self.commit_hosts(next, self.strings().hosts_deleted, cx);
     }
@@ -1382,7 +1533,11 @@ impl ShelluneView {
         self.hosts.clear_message();
         let placeholder = self.strings().import_path_placeholder;
         let text = self.import.path().to_owned();
-        self.import_path = Some(cx.new(|cx| TextField::with_text(placeholder, text, cx)));
+        self.import_path = Some(cx.new(|cx| {
+            let mut field = TextField::with_text(placeholder, text, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        }));
         self.bind_import_path(cx);
         cx.notify();
     }
@@ -1529,7 +1684,59 @@ impl ShelluneView {
         self.form_session = None;
         self.remote = Some(RemotePanel::new(host));
         self.sync_remote_fields(cx);
+        self.connect_when_ready(host, cx);
         cx.notify();
+    }
+
+    /// Fills in what the host remembers and connects when nothing is left to ask.
+    ///
+    /// A host whose sign-in was chosen in its dialog connects in one click: the saved
+    /// password or passphrase comes from the system store, a key file or the agent needs
+    /// nothing typed. Anything missing - no choice yet, a secret not remembered, a store
+    /// that cannot be read - leaves the form open, saying why when there is a reason.
+    fn connect_when_ready(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        let Some(kind) = host.auth() else {
+            return;
+        };
+        let secret = if host.remembers_secret() {
+            match self.secrets.load(host.id()) {
+                Ok(secret) => secret,
+                Err(error) => {
+                    let reason = format!("{}: {error}", self.strings().remote_saved_secret_failed);
+                    if let Some(panel) = self.remote.as_mut() {
+                        panel.set_form_error(reason);
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let Some(panel) = self.remote.as_mut() else {
+            return;
+        };
+        let ready = match kind {
+            shellune_core::AuthMethodKind::Agent => true,
+            shellune_core::AuthMethodKind::KeyFile => !panel.key_path().trim().is_empty(),
+            shellune_core::AuthMethodKind::Password => match &secret {
+                Some(secret) => {
+                    panel.set_password(secret.expose());
+                    true
+                }
+                None => false,
+            },
+            shellune_core::AuthMethodKind::EncryptedKeyFile => match &secret {
+                Some(secret) if !panel.key_path().trim().is_empty() => {
+                    panel.set_passphrase(secret.expose());
+                    true
+                }
+                _ => false,
+            },
+        };
+        if ready {
+            self.sync_remote_fields(cx);
+            self.connect_remote(cx);
+        }
     }
 
     /// The open connection form, if there is one.
@@ -1775,7 +1982,16 @@ impl ShelluneView {
         if let Some(link) = transfer_link {
             self.transfers.attach(id, Box::new(link));
         }
+        // The command the host asks for is typed once the shell is there, as the user
+        // would type it; the remote side keeps it until its prompt reads it.
+        if let Some(command) = host.startup_command() {
+            let line = format!("{command}\r");
+            pane.update(cx, |pane, cx| pane.type_text(&line, cx));
+        }
         self.push_pane(tag, pane, cx);
+        // The new terminal is what the user connected for, so it is shown at once
+        // instead of leaving them on the hosts page with a tab to find.
+        self.activate(id, cx);
     }
 
     /// Records an attempt that did not open, in both the form and the session list.
@@ -2404,7 +2620,8 @@ impl ShelluneView {
 
         if let Some(failure) = status.failure() {
             let reason = failure.reason().to_owned();
-            let next_step = failure.next_step().to_owned();
+            let next_step =
+                copy::next_step_text(failure.next_step(), self.workspace.locale()).to_owned();
             let retryable = failure.retryable();
             column = column.child(
                 components::banner(Tone::Danger, metrics)
@@ -2677,7 +2894,12 @@ impl ShelluneView {
         if self.remote.is_some() {
             column = column.child(self.remote_panel(cx));
         }
-        if let Some(message) = self.hosts.message() {
+        // While the host dialog is open, its own refusals are shown inside it.
+        if let Some(message) = self
+            .hosts
+            .message()
+            .filter(|message| !(message.failed() && self.host_fields.is_some()))
+        {
             column = column.child(
                 components::banner(
                     if message.failed() {
@@ -2711,9 +2933,6 @@ impl ShelluneView {
         column = column.child(self.hosts_toolbar(cx));
         if self.import.is_open() {
             column = column.child(self.import_panel(cx));
-        }
-        if let Some(fields) = &self.host_fields {
-            column = column.child(self.host_editor(fields, cx));
         }
         if let Some(id) = self.hosts.pending_delete() {
             column = column.child(self.host_delete_bar(id, cx));
@@ -2825,120 +3044,6 @@ impl ShelluneView {
                     .text_center()
                     .child(strings.import_read_only),
             )
-    }
-
-    /// The form that creates or changes one host.
-    fn host_editor(&self, fields: &HostFields, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let editing = self.hosts.draft().and_then(HostDraft::editing).is_some();
-
-        let mut card = components::card(metrics)
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .debug_selector(|| "hosts.editor".to_owned())
-            .child(components::card_title(
-                if editing {
-                    strings.host_editor_edit
-                } else {
-                    strings.host_editor_new
-                },
-                None,
-                metrics,
-            ));
-
-        // Two fields to a line, paired by what a person fills in together: the name
-        // and its group, the address and its port, the user and the key.
-        let cell = |field: HostField, grow: f32| {
-            div()
-                .flex()
-                .flex_col()
-                .flex_grow()
-                .flex_basis(gpui::relative(grow))
-                .min_w(px(0.0))
-                .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                .child(
-                    div()
-                        .text_size(metrics.caption_size())
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .child(field.label(strings)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .w_full()
-                        .min_w(px(0.0))
-                        .debug_selector(move || field.debug_selector().to_owned())
-                        .child(fields.get(field).clone()),
-                )
-        };
-        let line = |left: Div, right: Div| {
-            div()
-                .flex()
-                .w_full()
-                .gap(metrics.scale(spacing::SNUG))
-                .child(left)
-                .child(right)
-        };
-        card = card
-            .child(line(
-                cell(HostField::Name, 0.5),
-                cell(HostField::Group, 0.5),
-            ))
-            .child(line(
-                cell(HostField::Address, 0.75),
-                cell(HostField::Port, 0.25),
-            ))
-            .child(line(
-                cell(HostField::User, 0.5),
-                cell(HostField::IdentityFile, 0.5),
-            ));
-
-        // The key path is the only part of a key this application knows; saying so in
-        // the form is what keeps an imported IdentityFile editable without pretending
-        // the key itself is managed here.
-        card.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(metrics.scale(spacing::SNUG))
-                .mt(metrics.scale(spacing::HAIRLINE))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(caption_line(strings.host_identity_note.to_owned(), metrics)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            self.text_button(
-                                SharedString::from("hosts.cancel"),
-                                strings.host_cancel,
-                                Variant::Ghost,
-                                cx,
-                                |view, cx| view.close_host_editor(cx),
-                            )
-                            .h(metrics.control_height()),
-                        )
-                        .child(
-                            self.text_button(
-                                SharedString::from("hosts.save"),
-                                strings.host_save,
-                                Variant::Primary,
-                                cx,
-                                |view, cx| view.save_host(cx),
-                            )
-                            .h(metrics.control_height())
-                            .px(metrics.scale(spacing::BASE)),
-                        ),
-                ),
-        )
     }
 
     /// The import preview: the file it read, its limits and every host it describes.
@@ -3554,37 +3659,52 @@ impl ShelluneView {
     }
 
     /// The product mark: a gradient tile with a prompt, the name and how it is said.
-    fn brand(&self) -> Div {
+    fn brand(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
+        // The macOS window buttons sit at the left of this row.
+        let left = if Platform::current() == Platform::MacOs {
+            titlebar::TRAFFIC_LIGHT_ROOM
+        } else {
+            spacing::BASE - 2.0
+        };
         div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(spacing::SNUG - 2.0))
             .h(metrics.header_height())
-            .px(metrics.scale(spacing::BASE - 2.0))
-            .child(brand_mark(metrics.scale(28.0), metrics))
+            .pr(metrics.scale(spacing::TIGHT))
             .child(
-                div()
+                self.drag_area("brand.drag")
                     .flex()
-                    .items_baseline()
-                    .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                    .flex_1()
+                    .h_full()
+                    .items_center()
+                    .gap(metrics.scale(spacing::SNUG - 2.0))
                     .min_w(px(0.0))
+                    .pl(metrics.scale(left))
+                    .when(Platform::current() != Platform::MacOs, |row| {
+                        row.child(brand_mark(metrics.scale(28.0), metrics))
+                    })
                     .child(
+                        // The pronunciation is one hover away: the row keeps room for the
+                        // sidebar button without cutting the name.
                         div()
+                            .id("brand.name")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
                             .text_size(metrics.display_size())
                             .font_weight(FontWeight::BOLD)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .tooltip(components::tooltip(SharedString::from(format!(
+                                "{} · {}",
+                                product::NAME,
+                                product::PRONUNCIATION
+                            ))))
                             .child(product::NAME),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(product::PRONUNCIATION),
                     ),
             )
+            .child(self.rail_toggle(cx))
     }
 
     fn nav_entry(
@@ -3616,6 +3736,7 @@ impl ShelluneView {
             destination.shortcut_label(Platform::current())
         );
 
+        let collapsed = self.rail_collapsed;
         let mut entry = div()
             .id(("nav", index))
             .group(group.clone())
@@ -3624,8 +3745,12 @@ impl ShelluneView {
             .items_center()
             .gap(metrics.scale(spacing::SNUG - 2.0))
             .h(metrics.nav_row_height())
-            .pl(metrics.scale(spacing::SNUG - 2.0))
-            .pr(metrics.scale(spacing::TIGHT))
+            .when(collapsed, |entry| entry.justify_center())
+            .when(!collapsed, |entry| {
+                entry
+                    .pl(metrics.scale(spacing::SNUG - 2.0))
+                    .pr(metrics.scale(spacing::TIGHT))
+            })
             .rounded(px(radius::MEDIUM))
             .border_1()
             // The ring marks keyboard focus that has moved off the current page; on
@@ -3660,15 +3785,27 @@ impl ShelluneView {
         };
 
         let live = !matches!(tone, Tone::Neutral | Tone::Planned);
-        entry
-            .child(
-                icons::icon(
-                    destination_icon(destination),
-                    metrics.icon_size(),
-                    icon_color,
+        let icon = icons::icon(
+            destination_icon(destination),
+            metrics.icon_size(),
+            icon_color,
+        )
+        .group_hover(group, move |style| style.text_color(hover_text));
+        if collapsed {
+            // Only the icon, with the state as a dot on its corner; the name and the
+            // shortcut are in the tooltip.
+            return entry.child(icon).when(live, |entry| {
+                entry.child(
+                    div()
+                        .absolute()
+                        .top(metrics.scale(6.0))
+                        .right(metrics.scale(6.0))
+                        .child(components::status_dot(tone, metrics)),
                 )
-                .group_hover(group, move |style| style.text_color(hover_text)),
-            )
+            });
+        }
+        entry
+            .child(icon)
             .child(
                 div()
                     .flex_1()
@@ -3758,12 +3895,19 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .gap(metrics.scale(2.0))
-            .px(metrics.scale(spacing::TIGHT + 2.0))
+            .px(metrics.scale(if self.rail_collapsed {
+                spacing::TIGHT
+            } else {
+                spacing::TIGHT + 2.0
+            }))
             .pt(metrics.scale(spacing::TIGHT));
         for destination in Destination::ALL {
             nav = nav.child(self.nav_entry(destination, window, cx));
         }
 
+        if self.rail_collapsed {
+            return self.collapsed_rail(nav, cx);
+        }
         div()
             .flex()
             .flex_col()
@@ -3773,7 +3917,8 @@ impl ShelluneView {
             .bg(theme::swatch(palette::SURFACE))
             .border_r_1()
             .border_color(theme::swatch(palette::BORDER))
-            .child(self.brand())
+            .debug_selector(|| "rail".to_owned())
+            .child(self.brand(cx))
             .child(self.palette_trigger(cx))
             .child(nav)
             .child(
@@ -3790,6 +3935,20 @@ impl ShelluneView {
                             .mb(metrics.scale(spacing::TIGHT))
                             .h(px(1.0))
                             .bg(theme::swatch(palette::BORDER)),
+                    )
+                    .child(
+                        self.rail_control(
+                            self.theme_icon(),
+                            strings.theme_control,
+                            self.theme_label(),
+                        )
+                        .id("theme.control")
+                        .debug_selector(|| "theme.control".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.cycle_theme(cx);
+                            },
+                        )),
                     )
                     // The language control is clickable because the shortcut it
                     // duplicates cannot be: inside a terminal Ctrl+L is the shell's key.
@@ -3904,6 +4063,211 @@ impl ShelluneView {
                 Platform::current().palette_label(),
                 metrics,
             ))
+    }
+
+    /// Steps the theme: system, light, dark.
+    pub fn cycle_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme_choice = self.theme_choice.next();
+        self.repaint_terminals(cx);
+        cx.notify();
+    }
+
+    /// The theme the user chose.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn theme_choice(&self) -> theme::ThemeChoice {
+        self.theme_choice
+    }
+
+    /// Asks every terminal to draw again, so a new palette reaches the ones that are
+    /// not on screen too.
+    fn repaint_terminals(&self, cx: &mut Context<Self>) {
+        for open in &self.panes {
+            open.pane.update(cx, |_pane, cx| cx.notify());
+        }
+    }
+
+    /// The name of the current theme choice.
+    fn theme_label(&self) -> &'static str {
+        let strings = self.strings();
+        match self.theme_choice {
+            theme::ThemeChoice::System => strings.theme_system,
+            theme::ThemeChoice::Light => strings.theme_light,
+            theme::ThemeChoice::Dark => strings.theme_dark,
+        }
+    }
+
+    /// The icon of the current theme choice.
+    fn theme_icon(&self) -> Icon {
+        match self.theme_choice {
+            theme::ThemeChoice::System => Icon::Monitor,
+            theme::ThemeChoice::Light => Icon::Sun,
+            theme::ThemeChoice::Dark => Icon::Moon,
+        }
+    }
+
+    /// Collapses the sidebar to its icons, or expands it again.
+    pub fn toggle_rail(&mut self, cx: &mut Context<Self>) {
+        self.rail_collapsed = !self.rail_collapsed;
+        cx.notify();
+    }
+
+    /// Whether the sidebar is collapsed.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn rail_collapsed(&self) -> bool {
+        self.rail_collapsed
+    }
+
+    /// The button that collapses or expands the sidebar, with its shortcut.
+    fn rail_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let label = if self.rail_collapsed {
+            strings.sidebar_expand
+        } else {
+            strings.sidebar_collapse
+        };
+        components::icon_only_button(Icon::Sidebar, metrics)
+            .id("rail.toggle")
+            .debug_selector(|| "rail.toggle".to_owned())
+            .tooltip(components::tooltip(SharedString::from(format!(
+                "{label} ({})",
+                Platform::current().sidebar_label()
+            ))))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_rail(cx);
+            }))
+    }
+
+    /// The sidebar collapsed to its icons: the brand, search, the pages and the two
+    /// settings, each named in its tooltip.
+    fn collapsed_rail(&self, nav: Div, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let platform = Platform::current();
+        let square = |icon: Icon, id: &'static str, tooltip: String| {
+            components::icon_only_button(icon, metrics)
+                .size(metrics.scale(36.0))
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .tooltip(components::tooltip(SharedString::from(tooltip)))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(if Platform::current() == Platform::MacOs {
+                metrics.scale(titlebar::TRAFFIC_LIGHT_ROOM + 4.0)
+            } else {
+                metrics.collapsed_rail_width()
+            })
+            .h_full()
+            .bg(theme::swatch(palette::SURFACE))
+            .border_r_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "rail".to_owned())
+            .child(
+                self.drag_area("brand.drag")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .h(metrics.header_height())
+                    // On macOS the window buttons take this place.
+                    .when(Platform::current() != Platform::MacOs, |row| {
+                        row.child(brand_mark(metrics.scale(28.0), metrics))
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(metrics.scale(2.0))
+                    .child(self.rail_toggle(cx).size(metrics.scale(36.0)))
+                    .child(
+                        square(
+                            Icon::Search,
+                            "palette.open",
+                            format!(
+                                "{} ({})",
+                                strings.palette_hint_short,
+                                platform.palette_label()
+                            ),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.toggle_palette(window, cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(nav)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(metrics.scale(2.0))
+                    .pb(metrics.scale(spacing::SNUG))
+                    .mt_auto()
+                    .child(
+                        square(
+                            self.theme_icon(),
+                            "theme.control",
+                            format!("{} · {}", strings.theme_control, self.theme_label()),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.cycle_theme(cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        square(
+                            Icon::Globe,
+                            "status.language",
+                            format!(
+                                "{} · {}",
+                                strings.language_control,
+                                self.workspace.locale().endonym()
+                            ),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.toggle_locale(cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        square(
+                            Icon::TextSize,
+                            "zoom.control",
+                            format!(
+                                "{} · {}",
+                                strings.zoom_control,
+                                self.workspace.zoom().label()
+                            ),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.workspace.cycle_text_size();
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(div().pt(metrics.scale(spacing::HAIRLINE)).child(
+                        components::status_dot(
+                            if self.any_live() {
+                                Tone::Positive
+                            } else {
+                                Tone::Neutral
+                            },
+                            metrics,
+                        ),
+                    )),
+            )
     }
 
     /// One quiet setting at the foot of the sidebar: an icon, a name and its value.
@@ -4159,23 +4523,42 @@ impl ShelluneView {
             }
         }
 
+        // The blank part of the row is the window's caption: it drags the window. The
+        // tabs and buttons stay outside it, so a press on them is never a drag.
         let leading = if terminal_mode {
-            self.tab_row(cx)
-        } else {
             div()
+                .id("header.leading")
                 .flex()
-                .flex_col()
-                .gap(metrics.scale(1.0))
+                .flex_1()
+                .h_full()
+                .items_center()
                 .min_w(px(0.0))
-                .child(title_row)
+                .child(self.tab_row(cx).flex_initial())
+                .child(self.drag_area("header.drag").flex_1().h_full())
+        } else {
+            self.drag_area("header.drag")
+                .flex()
+                .flex_1()
+                .h_full()
+                .items_center()
+                .min_w(px(0.0))
                 .child(
                     div()
-                        .truncate()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .child(SharedString::from(subtitle)),
+                        .flex()
+                        .flex_col()
+                        .gap(metrics.scale(1.0))
+                        .min_w(px(0.0))
+                        .child(title_row)
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(SharedString::from(subtitle)),
+                        ),
                 )
         };
+        let controls = self.window_controls(window, cx);
 
         div()
             .flex()
@@ -4189,7 +4572,11 @@ impl ShelluneView {
             } else {
                 spacing::LOOSE
             }))
-            .pr(metrics.scale(spacing::SNUG))
+            .pr(if controls.is_some() {
+                px(0.0)
+            } else {
+                metrics.scale(spacing::SNUG)
+            })
             .bg(theme::swatch(if terminal_mode {
                 palette::SURFACE
             } else {
@@ -4199,6 +4586,7 @@ impl ShelluneView {
             .border_color(theme::swatch(palette::BORDER))
             .child(leading)
             .child(actions)
+            .children(controls)
     }
 
     /// The menu under the header's shell control: every shell, and a typed path.
@@ -4491,12 +4879,10 @@ impl ShelluneView {
     fn shows_terminal(&self, destination: Destination) -> bool {
         match self.active_kind() {
             Some(PaneKind::Local) => {
-                matches!(
-                    destination,
-                    Destination::LocalShells | Destination::Sessions
-                )
+                destination == Destination::LocalShells
+                    || (destination == Destination::Sessions && self.session_terminal)
             }
-            Some(PaneKind::Remote) => destination == Destination::Sessions,
+            Some(PaneKind::Remote) => destination == Destination::Sessions && self.session_terminal,
             None => false,
         }
     }
@@ -6587,6 +6973,9 @@ impl ShelluneView {
         sessions: &[&Session],
         cx: &mut Context<Self>,
     ) -> Div {
+        if let Some(bar) = self.closed_sessions_bar(sessions, cx) {
+            list = list.child(bar);
+        }
         for (index, session) in sessions.iter().enumerate() {
             let id = session.id();
             // A row whose session still has a terminal opens it; one that has none
@@ -6598,12 +6987,17 @@ impl ShelluneView {
                     .debug_selector(move || format!("row.{index}"))
                     .when(openable, |row| {
                         row.cursor_pointer().on_click(cx.listener(
-                            move |this, _event, _window, cx| {
-                                this.activate(id, cx);
+                            move |this, _event, window, cx| {
+                                this.activate_in(id, window, cx);
                             },
                         ))
                     })
-                    .child(self.session_row(session)),
+                    // Every row, open or closed, offers its actions on a right click.
+                    .on_mouse_down(
+                        sessions::MENU_BUTTON,
+                        self.session_row_menu_listener(id, cx),
+                    )
+                    .child(self.session_row(session, self.session_row_actions(id, index, cx))),
             );
         }
         list
@@ -6620,7 +7014,9 @@ impl ShelluneView {
         list
     }
 
-    fn session_row(&self, session: &Session) -> Div {
+    /// One session in a list: what it is on the left, its state and `actions` on the
+    /// right.
+    fn session_row(&self, session: &Session, actions: Div) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let locale = self.workspace.locale();
@@ -6669,11 +7065,19 @@ impl ShelluneView {
                         metrics,
                     )),
             )
-            .child(components::chip(
-                copy::session_state_label(session.state(), locale),
-                tone,
-                metrics,
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(components::chip(
+                        copy::session_state_label(session.state(), locale),
+                        tone,
+                        metrics,
+                    ))
+                    .child(actions),
+            )
     }
 
     fn transfer_row(&self, transfer: &Transfer) -> Div {
@@ -6738,6 +7142,38 @@ impl ShelluneView {
 
 impl Render for ShelluneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Small views that are not handed the workspace (a text field's menu) read the
+        // language from here.
+        self.workspace.locale().set_current();
+        // The palette is decided before anything is drawn: the user's choice, or the
+        // system's when the choice is to follow it, which the window reports when it
+        // changes.
+        if !self.watching_appearance {
+            self.watching_appearance = true;
+            cx.observe_window_appearance(window, |this, _window, cx| {
+                this.repaint_terminals(cx);
+                cx.notify();
+            })
+            .detach();
+        }
+        let system_dark = matches!(
+            window.appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
+        theme::set_appearance(self.theme_choice.appearance(system_dark));
+        // A panel that closed while one of its fields had the keyboard leaves nothing
+        // focused, and every shortcut would then go nowhere; the page takes it back.
+        if window.focused(cx).is_none() {
+            let destination = self.workspace.destination();
+            let handle = self.destination_focus(destination).clone();
+            window.focus(&handle);
+        }
+        if std::mem::take(&mut self.focus_host_dialog)
+            && let Some(fields) = &self.host_fields
+        {
+            let handle = fields.name.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);
 
@@ -6786,8 +7222,16 @@ impl Render for ShelluneView {
                     this.close_palette(window, cx);
                     return;
                 }
+                if this.host_fields.is_some() {
+                    this.close_host_editor(cx);
+                    return;
+                }
                 if this.tab_menu.is_some() {
                     this.close_tab_menu(window, cx);
+                    return;
+                }
+                if this.session_menu.is_some() {
+                    this.close_session_menu(window, cx);
                     return;
                 }
                 if this.shell_menu_open {
@@ -6800,12 +7244,19 @@ impl Render for ShelluneView {
             .on_action(cx.listener(|this, _: &NewLocalShell, window, cx| {
                 this.new_local_shell(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| {
+                this.toggle_rail(cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.toggle_palette(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseActiveTab, _window, cx| {
+            .on_action(cx.listener(|this, _: &CloseActiveTab, window, cx| {
                 if let Some(id) = this.active {
                     this.request_close_session(id, cx);
+                    // The tab that takes over gets the keyboard through this window;
+                    // the pane's own focus call cannot reach it while the action runs,
+                    // and the next shortcut would otherwise go nowhere.
+                    this.restore_focus(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
@@ -6845,6 +7296,8 @@ impl Render for ShelluneView {
             }))
             .children(self.palette_overlay(window, cx))
             .children(self.tab_menu_overlay(window, cx))
+            .children(self.session_menu_overlay(window, cx))
+            .children(self.host_dialog_overlay(window, cx))
             .child(self.rail(window, cx))
             .child(
                 div()
@@ -6953,6 +7406,18 @@ fn default_store() -> HostStore {
 #[cfg(test)]
 fn default_store() -> HostStore {
     scratch_store()
+}
+
+/// The credential store the shell keeps remembered secrets in.
+#[cfg(not(test))]
+fn default_secrets() -> std::sync::Arc<dyn SecretStore> {
+    std::sync::Arc::new(shellune_storage::SystemSecrets)
+}
+
+/// Memory only, so a test never reads or writes the machine's credential store.
+#[cfg(test)]
+fn default_secrets() -> std::sync::Arc<dyn SecretStore> {
+    std::sync::Arc::new(shellune_storage::MemorySecrets::new())
 }
 
 /// The trust file the shell reads when the caller does not supply one.

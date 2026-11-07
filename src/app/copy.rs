@@ -42,6 +42,19 @@ impl Locale {
         }
     }
 
+    /// The language the window is drawn in right now.
+    ///
+    /// Set by the window each time it draws; small views that are not handed the
+    /// workspace, such as a text field's context menu, read it here.
+    pub fn current() -> Self {
+        CURRENT_LOCALE.with(std::cell::Cell::get)
+    }
+
+    /// Records the language the window is being drawn in; see [`Locale::current`].
+    pub fn set_current(self) {
+        CURRENT_LOCALE.with(|current| current.set(self));
+    }
+
     /// The other language.
     pub fn toggle(self) -> Self {
         let index = Self::ALL
@@ -50,6 +63,12 @@ impl Locale {
             .unwrap_or(0);
         Self::ALL[(index + 1) % Self::ALL.len()]
     }
+}
+
+thread_local! {
+    /// The language the window is drawn in; per thread, because a test runs its window
+    /// on its own thread and must not see another test's choice.
+    static CURRENT_LOCALE: std::cell::Cell<Locale> = const { std::cell::Cell::new(Locale::English) };
 }
 
 /// One column of UI copy.
@@ -518,6 +537,76 @@ pub struct Strings {
     pub tab_menu_close_others: &'static str,
     /// Tab menu: close the tabs after this one.
     pub tab_menu_close_right: &'static str,
+    /// Session menu: show the terminal.
+    pub session_menu_open: &'static str,
+    /// Session menu: start a closed session again.
+    pub session_menu_reopen: &'static str,
+    /// Session menu: close the tab, keep the record.
+    pub session_menu_close: &'static str,
+    /// Session menu: close if needed and remove the record.
+    pub session_menu_remove: &'static str,
+    /// Session menu and list: remove every closed record.
+    pub session_menu_remove_closed: &'static str,
+    /// Tooltip of the row's more-actions button.
+    pub session_more: &'static str,
+    /// List toolbar: how many closed records there are, before the count.
+    pub session_closed_summary: &'static str,
+    /// Text field menu: cut the selection.
+    pub field_cut: &'static str,
+    /// Text field menu: copy the selection.
+    pub field_copy: &'static str,
+    /// Text field menu: paste.
+    pub field_paste: &'static str,
+    /// Text field menu: select everything.
+    pub field_select_all: &'static str,
+    /// Tooltip: show a hidden password.
+    pub field_reveal: &'static str,
+    /// Tooltip: hide the password again.
+    pub field_conceal: &'static str,
+    /// Button beside a path field that opens the system file chooser.
+    pub field_browse: &'static str,
+    /// Host dialog: heading of the sign-in choice.
+    pub host_auth_title: &'static str,
+    /// Host dialog: label of the key passphrase field.
+    pub host_secret_passphrase: &'static str,
+    /// Host dialog: checkbox that keeps the password.
+    pub host_remember_password: &'static str,
+    /// Host dialog: checkbox that keeps the passphrase.
+    pub host_remember_passphrase: &'static str,
+    /// Host dialog: where a remembered secret is kept.
+    pub host_remember_note: &'static str,
+    /// Host dialog: placeholder of the secret field when one is saved.
+    pub host_secret_saved_placeholder: &'static str,
+    /// Host dialog: the system store refused the secret; the reason follows.
+    pub host_secret_failed: &'static str,
+    /// Host dialog: label of the startup command.
+    pub host_startup_label: &'static str,
+    /// Host dialog: placeholder of the startup command.
+    pub host_startup_placeholder: &'static str,
+    /// Host dialog: what the startup command does.
+    pub host_startup_note: &'static str,
+    /// Host dialog: what the agent method needs.
+    pub host_agent_note: &'static str,
+    /// Host dialog: save and open a connection at once.
+    pub host_save_connect: &'static str,
+    /// Tooltip of the dialog's close button.
+    pub host_dialog_close: &'static str,
+    /// Connection form: a remembered secret could not be read; the reason follows.
+    pub remote_saved_secret_failed: &'static str,
+    /// Sidebar button and palette action: collapse the sidebar.
+    pub sidebar_collapse: &'static str,
+    /// Sidebar button and palette action: expand the sidebar.
+    pub sidebar_expand: &'static str,
+    /// Sidebar control: the palette the window is drawn in.
+    pub theme_control: &'static str,
+    /// Theme value: follow the operating system.
+    pub theme_system: &'static str,
+    /// Theme value: light.
+    pub theme_light: &'static str,
+    /// Theme value: dark.
+    pub theme_dark: &'static str,
+    /// Palette action: step the theme.
+    pub palette_theme: &'static str,
 }
 
 /// English copy.
@@ -750,6 +839,41 @@ pub static ENGLISH: Strings = Strings {
     tab_menu_close: "Close tab",
     tab_menu_close_others: "Close other tabs",
     tab_menu_close_right: "Close tabs to the right",
+    session_menu_open: "Open",
+    session_menu_reopen: "Reopen",
+    session_menu_close: "Close",
+    session_menu_remove: "Remove",
+    session_menu_remove_closed: "Remove all closed",
+    session_more: "More actions",
+    session_closed_summary: "Closed sessions",
+    field_cut: "Cut",
+    field_copy: "Copy",
+    field_paste: "Paste",
+    field_select_all: "Select all",
+    field_reveal: "Show",
+    field_conceal: "Hide",
+    field_browse: "Browse…",
+    host_auth_title: "Sign in with",
+    host_secret_passphrase: "Key passphrase",
+    host_remember_password: "Remember password",
+    host_remember_passphrase: "Remember passphrase",
+    host_remember_note: "Kept in the system credential store (Keychain or Credential Manager), never in the host file.",
+    host_secret_saved_placeholder: "Saved; leave empty to keep it",
+    host_secret_failed: "The password was not saved to the system credential store",
+    host_startup_label: "Run after connecting",
+    host_startup_placeholder: "For example cd /srv && tmux attach",
+    host_startup_note: "Typed into the remote shell once, each time the connection opens.",
+    host_agent_note: "Uses a key already loaded into the system SSH agent; nothing to fill in here.",
+    host_save_connect: "Save and connect",
+    host_dialog_close: "Close",
+    remote_saved_secret_failed: "The saved password could not be read",
+    sidebar_collapse: "Collapse sidebar",
+    sidebar_expand: "Expand sidebar",
+    theme_control: "Theme",
+    theme_system: "System",
+    theme_light: "Light",
+    theme_dark: "Dark",
+    palette_theme: "Change theme",
 };
 
 /// Chinese copy.
@@ -982,6 +1106,41 @@ pub static CHINESE: Strings = Strings {
     tab_menu_close: "关闭标签",
     tab_menu_close_others: "关闭其他标签",
     tab_menu_close_right: "关闭右侧标签",
+    session_menu_open: "打开",
+    session_menu_reopen: "重新打开",
+    session_menu_close: "关闭",
+    session_menu_remove: "删除",
+    session_menu_remove_closed: "清除所有已关闭",
+    session_more: "更多操作",
+    session_closed_summary: "已关闭的会话",
+    field_cut: "剪切",
+    field_copy: "复制",
+    field_paste: "粘贴",
+    field_select_all: "全选",
+    field_reveal: "显示",
+    field_conceal: "隐藏",
+    field_browse: "浏览…",
+    host_auth_title: "登录方式",
+    host_secret_passphrase: "私钥口令",
+    host_remember_password: "记住密码",
+    host_remember_passphrase: "记住口令",
+    host_remember_note: "保存在系统凭据库（钥匙串 / 凭据管理器），不会写入主机文件。",
+    host_secret_saved_placeholder: "已保存；留空则保持不变",
+    host_secret_failed: "密码没有保存到系统凭据库",
+    host_startup_label: "连接后运行",
+    host_startup_placeholder: "例如 cd /srv && tmux attach",
+    host_startup_note: "每次连接成功后，在远程 Shell 中自动执行一次。",
+    host_agent_note: "使用系统 SSH Agent 中已加载的密钥，这里无需填写。",
+    host_save_connect: "保存并连接",
+    host_dialog_close: "关闭",
+    remote_saved_secret_failed: "无法读取已保存的密码",
+    sidebar_collapse: "收起侧边栏",
+    sidebar_expand: "展开侧边栏",
+    theme_control: "主题",
+    theme_system: "跟随系统",
+    theme_light: "浅色",
+    theme_dark: "深色",
+    palette_theme: "切换主题",
 };
 
 /// A count followed by its unit, in the grammar of the language.
@@ -1042,6 +1201,54 @@ pub fn transfer_state_label(state: &TransferState, locale: Locale) -> String {
         TransferState::Cancelled { .. } => match locale {
             Locale::English => "Cancelled".to_owned(),
             Locale::Chinese => "已取消".to_owned(),
+        },
+    }
+}
+
+/// The next step an SSH failure suggests, in the interface language.
+///
+/// The SSH layer words its advice in English and does not know the interface language;
+/// its sentence is the key here. A sentence this table does not know is shown as it
+/// came, so a new hint is never hidden, only untranslated until it is added (a test
+/// checks that every hint the SSH layer has today is here).
+#[must_use]
+pub fn next_step_text(english: &str, locale: Locale) -> &str {
+    match locale {
+        Locale::English => english,
+        Locale::Chinese => match english {
+            "Check the address and port, then connect again." => "检查地址和端口，然后重新连接。",
+            "Check the network and the address, then try again." => "检查网络和地址，然后重试。",
+            "Check the address, then try again." => "检查地址，然后重试。",
+            "The connection stops here; nothing was stored." => "连接到此为止，没有保存任何内容。",
+            "Connect again and accept or refuse the identity while it is shown." => {
+                "重新连接，并在身份信息显示时选择接受或拒绝。"
+            }
+            "Do not continue. Check the server identity before trusting it again." => {
+                "不要继续。重新信任之前，先核实服务器身份。"
+            }
+            "The server key cannot be compared; connect with a client that supports it." => {
+                "无法比对这台服务器的密钥；请改用支持它的客户端连接。"
+            }
+            "Check the credentials, or change the authentication method." => {
+                "检查凭据，或者换一种登录方式。"
+            }
+            "Choose a key file this account can read." => "选择一个本账号可以读取的私钥文件。",
+            "Enter the key passphrase to continue." => "输入私钥口令后继续。",
+            "Enter the correct passphrase for this key." => "输入这个私钥的正确口令。",
+            "Choose a key file Shellune can read." => "选择一个 Shellune 能识别的私钥文件。",
+            "Start the system SSH agent, then connect again." => {
+                "启动系统 SSH Agent，然后重新连接。"
+            }
+            "Load a key into the agent, then connect again." => {
+                "把私钥加载到 Agent 中，然后重新连接。"
+            }
+            "Use another identity, or a key file instead." => "换一个身份，或改用私钥文件。",
+            "Load an identity the server accepts." => "加载一个服务器接受的身份。",
+            "The server refused a terminal; use another account." => {
+                "服务器拒绝分配终端；请换一个账号。"
+            }
+            "Connect again to open a new session." => "重新连接以打开新的会话。",
+            other => other,
         },
     }
 }

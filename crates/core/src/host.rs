@@ -4,6 +4,7 @@
 //! port in `1..=65535`, whether it was built in code, edited later or read back from
 //! storage. Saving a host never implies a connection was made.
 
+use crate::auth::AuthMethodKind;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::HostId;
@@ -97,6 +98,23 @@ pub struct HostConfig {
     /// stays byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_file: Option<String>,
+    /// How the next connection signs in, when the user chose it in the host form.
+    ///
+    /// A kind, never a secret. Absent for a host saved before the choice existed, which
+    /// keeps asking at connect time as it always did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<AuthMethodKind>,
+    /// Whether the password or key passphrase of this host is kept in the system
+    /// credential store.
+    ///
+    /// Only the fact is recorded here; the secret itself never enters this record or
+    /// its file. Knowing it without asking the credential store means a host that has
+    /// nothing saved never makes the system store prompt.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    remember_secret: bool,
+    /// A command typed into the remote shell once each connection is live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup_command: Option<String>,
 }
 
 /// The stored shape of a host.
@@ -117,6 +135,13 @@ struct HostConfigWire {
     /// Absent in files written before an imported key path was stored.
     #[serde(default)]
     identity_file: Option<String>,
+    /// Absent in files written before the sign-in choice was stored.
+    #[serde(default)]
+    auth: Option<AuthMethodKind>,
+    #[serde(default)]
+    remember_secret: bool,
+    #[serde(default)]
+    startup_command: Option<String>,
 }
 
 impl TryFrom<HostConfigWire> for HostConfig {
@@ -140,6 +165,9 @@ impl TryFrom<HostConfigWire> for HostConfig {
                 .map(|group| group.trim().to_owned())
                 .filter(|group| !group.is_empty()),
             identity_file: normalize_identity_file(wire.identity_file),
+            auth: wire.auth,
+            remember_secret: wire.remember_secret,
+            startup_command: normalize_command(wire.startup_command),
         })
     }
 }
@@ -192,6 +220,9 @@ impl HostConfig {
             user: validate_user(user.into())?,
             group: None,
             identity_file: None,
+            auth: None,
+            remember_secret: false,
+            startup_command: None,
         })
     }
 
@@ -239,6 +270,25 @@ impl HostConfig {
     #[must_use]
     pub fn identity_file(&self) -> Option<&str> {
         self.identity_file.as_deref()
+    }
+
+    /// How the next connection signs in, when the user chose it.
+    #[must_use]
+    pub fn auth(&self) -> Option<AuthMethodKind> {
+        self.auth
+    }
+
+    /// Whether this host's password or passphrase is kept in the system credential
+    /// store.
+    #[must_use]
+    pub fn remembers_secret(&self) -> bool {
+        self.remember_secret
+    }
+
+    /// The command typed into the remote shell once a connection is live.
+    #[must_use]
+    pub fn startup_command(&self) -> Option<&str> {
+        self.startup_command.as_deref()
     }
 
     /// `user@address:port`, the form used in confirmation prompts.
@@ -302,6 +352,47 @@ impl HostConfig {
     pub fn set_identity_file(&mut self, path: Option<impl Into<String>>) {
         self.identity_file = normalize_identity_file(path.map(Into::into));
     }
+
+    /// Chooses how the next connection signs in, or leaves it to be asked.
+    pub fn set_auth(&mut self, auth: Option<AuthMethodKind>) {
+        self.auth = auth;
+        // A method that reads no secret has nothing to remember.
+        if !auth.is_some_and(|kind| kind.needs_password() || kind.needs_passphrase()) {
+            self.remember_secret = false;
+        }
+    }
+
+    /// Records whether the secret of this host is in the system credential store.
+    ///
+    /// Only a method that reads a secret can remember one.
+    pub fn set_remember_secret(&mut self, remember: bool) {
+        self.remember_secret = remember
+            && self
+                .auth
+                .is_some_and(|kind| kind.needs_password() || kind.needs_passphrase());
+    }
+
+    /// Sets or clears the command run after connecting. A blank command clears it.
+    pub fn set_startup_command(&mut self, command: Option<impl Into<String>>) {
+        self.startup_command = normalize_command(command.map(Into::into));
+    }
+}
+
+/// Trims a startup command, joins its lines, and turns a blank one into `None`.
+///
+/// The command is typed into the shell as one line followed by Enter, so a line break
+/// inside it would run half of it early; lines are joined with "; " instead.
+fn normalize_command(command: Option<String>) -> Option<String> {
+    command
+        .map(|command| {
+            command
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|command| !command.is_empty())
 }
 
 /// Trims a key path and turns a blank one into `None`.
@@ -489,5 +580,62 @@ mod tests {
             serde_json::from_str(&without_field).expect("an older record still loads");
         assert_eq!(decoded, host);
         assert_eq!(decoded.identity_file(), None);
+    }
+}
+
+#[cfg(test)]
+mod sign_in_tests {
+    use super::*;
+
+    fn host() -> HostConfig {
+        HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("valid")
+    }
+
+    #[test]
+    fn a_host_without_the_new_fields_reads_and_writes_as_before() {
+        let host = host();
+        let json = serde_json::to_string(&host).expect("serializes");
+        for field in ["auth", "remember_secret", "startup_command"] {
+            assert!(
+                !json.contains(field),
+                "{field} is written only when set: {json}"
+            );
+        }
+        let back: HostConfig = serde_json::from_str(&json).expect("reads");
+        assert_eq!(back, host);
+    }
+
+    #[test]
+    fn the_sign_in_choice_and_the_command_round_trip() {
+        let mut host = host();
+        host.set_auth(Some(AuthMethodKind::Password));
+        host.set_remember_secret(true);
+        host.set_startup_command(Some("  cd /srv\n tmux attach  "));
+        let json = serde_json::to_string(&host).expect("serializes");
+        assert!(json.contains("\"auth\":\"password\""), "{json}");
+        let back: HostConfig = serde_json::from_str(&json).expect("reads");
+        assert_eq!(back.auth(), Some(AuthMethodKind::Password));
+        assert!(back.remembers_secret());
+        assert_eq!(back.startup_command(), Some("cd /srv; tmux attach"));
+    }
+
+    #[test]
+    fn only_a_method_with_a_secret_can_remember_one() {
+        let mut host = host();
+        host.set_remember_secret(true);
+        assert!(
+            !host.remembers_secret(),
+            "no method chosen, nothing to remember"
+        );
+        host.set_auth(Some(AuthMethodKind::Password));
+        host.set_remember_secret(true);
+        assert!(host.remembers_secret());
+        host.set_auth(Some(AuthMethodKind::Agent));
+        assert!(
+            !host.remembers_secret(),
+            "switching to the agent drops the flag"
+        );
+        host.set_startup_command(Some("   "));
+        assert_eq!(host.startup_command(), None);
     }
 }

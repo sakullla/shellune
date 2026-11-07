@@ -12,7 +12,7 @@
 //! * a message says what really happened. "Saved" never implies a connection was
 //!   opened, and a failure keeps the reason the storage layer produced.
 
-use shellune_core::{HostConfig, HostId, Port};
+use shellune_core::{AuthMethodKind, HostConfig, HostId, Port};
 use shellune_storage::{
     DEFAULT_CONFIG_TEXT, Group, HostBook, HostEdit, ImportPreview, RecentHost, host_matches,
 };
@@ -72,17 +72,26 @@ pub enum HostField {
     /// The editor only ever holds a path: Shellune never reads the key file, so there
     /// is nothing here that could hold a key or its passphrase.
     IdentityFile,
+    /// The password or key passphrase, typed to be remembered.
+    ///
+    /// The draft holds it only while the form is open; it is handed to the system
+    /// credential store on save and never reaches the host record.
+    Secret,
+    /// The command typed into the remote shell after connecting.
+    StartupCommand,
 }
 
 impl HostField {
     /// Every field, in form order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Name,
         Self::Address,
         Self::Port,
         Self::User,
         Self::Group,
         Self::IdentityFile,
+        Self::Secret,
+        Self::StartupCommand,
     ];
 
     /// Label shown in front of the field.
@@ -94,6 +103,8 @@ impl HostField {
             Self::User => strings.host_field_user,
             Self::Group => strings.host_field_group,
             Self::IdentityFile => strings.host_field_identity,
+            Self::Secret => strings.auth_password,
+            Self::StartupCommand => strings.host_startup_label,
         }
     }
 
@@ -106,6 +117,8 @@ impl HostField {
             Self::User => "hosts.field.user",
             Self::Group => "hosts.field.group",
             Self::IdentityFile => "hosts.field.identity",
+            Self::Secret => "hosts.field.secret",
+            Self::StartupCommand => "hosts.field.startup",
         }
     }
 }
@@ -124,6 +137,15 @@ pub struct HostDraft {
     user: String,
     group: String,
     identity: String,
+    /// How the host signs in.
+    auth: AuthMethodKind,
+    /// Whether the password or passphrase is kept in the system credential store.
+    remember: bool,
+    /// Whether the store already holds one for this host, so an empty field keeps it.
+    has_saved_secret: bool,
+    /// The secret typed in this form; empty means "keep what is saved".
+    secret: String,
+    startup: String,
 }
 
 impl HostDraft {
@@ -138,6 +160,11 @@ impl HostDraft {
             user: String::new(),
             group: String::new(),
             identity: String::new(),
+            auth: AuthMethodKind::Password,
+            remember: true,
+            has_saved_secret: false,
+            secret: String::new(),
+            startup: String::new(),
         }
     }
 
@@ -152,7 +179,74 @@ impl HostDraft {
             user: host.user().to_owned(),
             group: host.group().unwrap_or_default().to_owned(),
             identity: host.identity_file().unwrap_or_default().to_owned(),
+            // A host saved before the choice existed signs in with its key when it has
+            // one, and with a password otherwise, which is what its form offered.
+            auth: host.auth().unwrap_or(if host.identity_file().is_some() {
+                AuthMethodKind::KeyFile
+            } else {
+                AuthMethodKind::Password
+            }),
+            remember: host.remembers_secret() || host.auth().is_none(),
+            has_saved_secret: host.remembers_secret(),
+            secret: String::new(),
+            startup: host.startup_command().unwrap_or_default().to_owned(),
         }
+    }
+
+    /// How the host signs in.
+    #[must_use]
+    pub fn auth(&self) -> AuthMethodKind {
+        self.auth
+    }
+
+    /// Chooses how the host signs in, returning whether it changed.
+    pub fn set_auth(&mut self, auth: AuthMethodKind) -> bool {
+        let changed = self.auth != auth;
+        self.auth = auth;
+        changed
+    }
+
+    /// Whether the secret of this method is to be remembered.
+    #[must_use]
+    pub fn remember(&self) -> bool {
+        self.remember
+    }
+
+    pub fn set_remember(&mut self, remember: bool) {
+        self.remember = remember;
+    }
+
+    /// Whether the system store already holds this host's secret.
+    #[must_use]
+    pub fn has_saved_secret(&self) -> bool {
+        self.has_saved_secret
+    }
+
+    /// Whether the chosen method reads a password or a passphrase.
+    #[must_use]
+    pub fn needs_secret(&self) -> bool {
+        self.auth.needs_password() || self.auth.needs_passphrase()
+    }
+
+    /// Whether the form will keep a secret in the system store when saved.
+    ///
+    /// Only when there is one to keep: a secret typed now, or one already saved. A
+    /// host saved with the box ticked and nothing typed signs in by asking, which is
+    /// what "save it now, type the password when connecting" needs.
+    #[must_use]
+    pub fn keeps_secret(&self) -> bool {
+        self.needs_secret() && self.remember && (!self.secret.is_empty() || self.has_saved_secret)
+    }
+
+    /// The secret typed in this form, when one was typed.
+    #[must_use]
+    pub fn typed_secret(&self) -> Option<&str> {
+        (!self.secret.is_empty()).then_some(self.secret.as_str())
+    }
+
+    /// Forgets the typed secret, once it has been handed to the store.
+    pub fn clear_secret(&mut self) {
+        self.secret.clear();
     }
 
     /// The host this form changes, when it is not a new one.
@@ -171,6 +265,8 @@ impl HostDraft {
             HostField::User => &self.user,
             HostField::Group => &self.group,
             HostField::IdentityFile => &self.identity,
+            HostField::Secret => &self.secret,
+            HostField::StartupCommand => &self.startup,
         }
     }
 
@@ -183,6 +279,8 @@ impl HostDraft {
             HostField::User => &mut self.user,
             HostField::Group => &mut self.group,
             HostField::IdentityFile => &mut self.identity,
+            HostField::Secret => &mut self.secret,
+            HostField::StartupCommand => &mut self.startup,
         };
         let text = text.into();
         if *slot == text {
@@ -215,7 +313,8 @@ impl HostDraft {
                 host.set_group(Some(self.group.clone()));
                 // A blank field clears the path instead of storing an empty string, and
                 // the value is only ever the path to the key.
-                host.set_identity_file(Some(self.identity.clone()));
+                host.set_identity_file(self.identity_for_method());
+                self.apply_sign_in(&mut host);
                 Ok(HostEdit::replace(host))
             }
             None => {
@@ -227,10 +326,23 @@ impl HostDraft {
                 )
                 .map_err(|error| error.to_string())?;
                 host.set_group(Some(self.group.clone()));
-                host.set_identity_file(Some(self.identity.clone()));
+                host.set_identity_file(self.identity_for_method());
+                self.apply_sign_in(&mut host);
                 Ok(HostEdit::create(host))
             }
         }
+    }
+
+    /// The key path to store: kept only for a method that reads a key file.
+    fn identity_for_method(&self) -> Option<String> {
+        self.auth.needs_key_path().then(|| self.identity.clone())
+    }
+
+    /// Writes the sign-in choice and the startup command into a record.
+    fn apply_sign_in(&self, host: &mut HostConfig) {
+        host.set_auth(Some(self.auth));
+        host.set_remember_secret(self.keeps_secret());
+        host.set_startup_command(Some(self.startup.clone()));
     }
 }
 

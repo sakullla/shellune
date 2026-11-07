@@ -8,6 +8,9 @@ description = "Versioned, atomic host storage for Shellune."
 publish = false
 
 [dependencies]
+# The system credential store: Windows Credential Manager, the macOS keychain, and the
+# Secret Service on Linux (through zbus, pure Rust, so no system library is needed).
+keyring = "4.2"
 shellune-core = { path = "../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }

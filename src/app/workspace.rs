@@ -13,7 +13,7 @@
 //! ever produced.
 
 use shellune_core::{
-    HostConfig, LocalShell, Session, SessionFailure, SessionId, SessionKind, Transfer,
+    HostConfig, LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState, Transfer,
 };
 
 use crate::app::copy::{Locale, Strings};
@@ -656,6 +656,31 @@ impl Workspace {
             _ => SectionStatus::Ready,
         };
         self.sessions.replace(status, remaining);
+    }
+
+    /// The sessions whose tab was closed: records the user can remove.
+    pub fn closed_sessions(&self) -> Vec<SessionId> {
+        self.sessions
+            .items()
+            .iter()
+            .filter(|session| matches!(session.state(), SessionState::Closed))
+            .map(Session::id)
+            .collect()
+    }
+
+    /// Removes the record of a session whose tab was closed.
+    ///
+    /// Only a closed session may go: a record that still has a tab is what the tab
+    /// reports from, so removing it would leave a terminal nobody can describe.
+    /// Returns whether the record was removed.
+    pub fn session_removed(&mut self, id: SessionId) -> bool {
+        let closed = self
+            .session(id)
+            .is_some_and(|session| matches!(session.state(), SessionState::Closed));
+        if closed {
+            self.session_forgotten(id);
+        }
+        closed
     }
 
     /// Records that the user asked a session that ended to start another process.

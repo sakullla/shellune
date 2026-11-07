@@ -27,6 +27,8 @@ pub mod text_field;
 pub mod theme;
 pub mod transfers;
 mod view;
+#[cfg(test)]
+pub use view::custom_titlebar as titlebar_for_test;
 pub mod workspace;
 
 #[cfg(test)]
@@ -43,7 +45,7 @@ use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions,
     GoToTransfers, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
     PreviousTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage,
+    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage, ToggleSidebar,
 };
 use crate::app::nav::{Destination, Platform};
 
@@ -77,7 +79,8 @@ pub mod actions {
             SelectTab6,
             SelectTab7,
             SelectTab8,
-            SelectTab9
+            SelectTab9,
+            ToggleSidebar
         ]
     );
 }
@@ -167,6 +170,11 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
             Some(KEY_CONTEXT),
         ),
         KeyBinding::new(
+            platform.sidebar_keystroke(),
+            ToggleSidebar,
+            Some(KEY_CONTEXT),
+        ),
+        KeyBinding::new(
             platform.tab_cycle_keystrokes().0,
             NextTab,
             Some(KEY_CONTEXT),
@@ -228,9 +236,15 @@ fn open_main_window(cx: &mut App) -> Result<(), String> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(min_width), px(min_height))),
+        // Windows and macOS draw no title bar of their own: the top row of the window
+        // is the caption (see `view::titlebar`). Linux keeps the system's.
         titlebar: Some(TitlebarOptions {
             title: Some(product::NAME.into()),
-            ..Default::default()
+            appears_transparent: view::custom_titlebar(Platform::current()),
+            traffic_light_position: (Platform::current() == Platform::MacOs).then(|| {
+                let (x, y) = view::TRAFFIC_LIGHT_POSITION;
+                gpui::point(px(x), px(y))
+            }),
         }),
         app_id: Some(product::APP_ID.to_string()),
         ..Default::default()

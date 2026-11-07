@@ -57,6 +57,9 @@ const CARET_WIDTH: f32 = 2.0;
 /// Background of a selected cell.
 const SELECTION_BACKGROUND: u32 = 0x2c33_5cff;
 
+/// Selection behind the text in the light palette.
+const SELECTION_BACKGROUND_LIGHT: u32 = 0xc9d1_ffff;
+
 /// Font family the grid is laid out in.
 ///
 /// A terminal needs one advance width for every cell; each platform ships its own
@@ -720,6 +723,11 @@ impl TerminalPane {
         }
     }
 
+    /// Sends text to the program as if it had been typed.
+    pub fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.write(text.as_bytes(), cx);
+    }
+
     /// Puts the selection on the clipboard.
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
         let Some(text) = self.core.selection_text().filter(|text| !text.is_empty()) else {
@@ -1172,7 +1180,8 @@ impl TerminalPane {
 }
 
 fn color_of(color: Rgb) -> gpui::Rgba {
-    gpui::rgb(u32::from(color.r) << 16 | u32::from(color.g) << 8 | u32::from(color.b))
+    let value = u32::from(color.r) << 16 | u32::from(color.g) << 8 | u32::from(color.b);
+    gpui::rgb(theme::terminal_color(value))
 }
 
 fn append_run(
@@ -1190,7 +1199,10 @@ fn append_run(
         return element;
     };
     let background = if selected {
-        gpui::rgba(SELECTION_BACKGROUND)
+        gpui::rgba(match theme::appearance() {
+            theme::Appearance::Dark => SELECTION_BACKGROUND,
+            theme::Appearance::Light => SELECTION_BACKGROUND_LIGHT,
+        })
     } else {
         background
     };

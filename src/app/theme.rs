@@ -126,7 +126,173 @@ pub mod type_scale {
 
 /// Colour helper so views do not call `rgb` with literals.
 pub fn swatch(hex: u32) -> Rgba {
-    rgb(hex)
+    rgb(resolve(hex))
+}
+
+/// Which palette the window is drawn in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Appearance {
+    /// The dark palette: the tokens' own values.
+    #[default]
+    Dark,
+    /// The light palette, looked up from the dark tokens.
+    Light,
+}
+
+/// What the user chose for the palette.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThemeChoice {
+    /// Follow the operating system's light or dark setting.
+    #[default]
+    System,
+    /// Always light.
+    Light,
+    /// Always dark.
+    Dark,
+}
+
+impl ThemeChoice {
+    /// The order the theme control steps through.
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    /// The next choice in [`ThemeChoice::ALL`].
+    #[must_use]
+    pub fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    /// The palette to draw in, given whether the system is in dark mode.
+    #[must_use]
+    pub fn appearance(self, system_dark: bool) -> Appearance {
+        match self {
+            Self::System if system_dark => Appearance::Dark,
+            Self::System | Self::Light => Appearance::Light,
+            Self::Dark => Appearance::Dark,
+        }
+    }
+}
+
+thread_local! {
+    /// The palette the window is being drawn in; per thread, so tests that each run a
+    /// window on their own thread never see another test's choice.
+    static APPEARANCE: std::cell::Cell<Appearance> = const { std::cell::Cell::new(Appearance::Dark) };
+}
+
+/// The palette the window is drawn in now.
+#[must_use]
+pub fn appearance() -> Appearance {
+    APPEARANCE.with(std::cell::Cell::get)
+}
+
+/// Sets the palette the next draws use; the window calls it before drawing.
+pub fn set_appearance(appearance: Appearance) {
+    APPEARANCE.with(|current| current.set(appearance));
+}
+
+/// The value a token has in the current palette.
+///
+/// The tokens are the dark palette's values; the light palette is a table keyed by
+/// them, so every view keeps naming one token and gets the value that fits.
+#[must_use]
+pub fn resolve(token: u32) -> u32 {
+    match appearance() {
+        Appearance::Dark => token,
+        Appearance::Light => light_value(token),
+    }
+}
+
+/// The light value of a dark token; a value that is not a token is returned as it is.
+#[must_use]
+pub fn light_value(token: u32) -> u32 {
+    light::TABLE
+        .iter()
+        .find(|(dark, _)| *dark == token)
+        .map_or(token, |(_, light)| *light)
+}
+
+/// The light palette, as pairs of (dark token, light value).
+pub mod light {
+    use super::palette as dark;
+
+    /// Every token of [`super::palette`] and its light value.
+    pub const TABLE: &[(u32, u32)] = &[
+        (dark::CANVAS, 0xfcfcfd),
+        (dark::SURFACE, 0xf3f4f7),
+        (dark::SURFACE_RAISED, 0xffffff),
+        (dark::SURFACE_HOVER, 0xe9ebf0),
+        (dark::SURFACE_SELECTED, 0xe3e6ed),
+        (dark::BORDER, 0xe2e4ea),
+        (dark::BORDER_STRONG, 0xc9cdd6),
+        (dark::TEXT_PRIMARY, 0x1b1d24),
+        (dark::TEXT_SECONDARY, 0x454a57),
+        (dark::TEXT_MUTED, 0x5f6574),
+        (dark::ACCENT, 0x4653cf),
+        (dark::ACCENT_HOVER, 0x3a46bd),
+        (dark::ON_ACCENT, 0xffffff),
+        (dark::ACCENT_TINT, 0xe5e8ff),
+        (dark::ACCENT_ON_TINT, 0x2f3ba8),
+        (dark::POSITIVE_TINT, 0xe1f4ea),
+        (dark::WARNING_TINT, 0xfaefd8),
+        (dark::DANGER_TINT, 0xfce6e9),
+        (dark::POSITIVE, 0x17734a),
+        (dark::WARNING, 0x815400),
+        (dark::DANGER, 0xbb2c45),
+        (dark::PLANNED, 0x5f6574),
+        (dark::BRAND_END, 0x8a57ec),
+        // Host avatars after the accent pair they share their first entry with.
+        (dark::AVATARS[1].0, 0xefe6ff),
+        (dark::AVATARS[1].1, 0x6234b8),
+        (dark::AVATARS[2].0, 0xdcf2ee),
+        (dark::AVATARS[2].1, 0x0f6a5f),
+        (dark::AVATARS[3].0, 0xf9edd2),
+        (dark::AVATARS[3].1, 0x7a5000),
+        (dark::AVATARS[4].0, 0xfce4ee),
+        (dark::AVATARS[4].1, 0xa1285f),
+        (dark::AVATARS[5].0, 0xdfeefc),
+        (dark::AVATARS[5].1, 0x1b5f9e),
+    ];
+
+    /// The terminal's default colours and its 16 ANSI colours, light.
+    ///
+    /// Keyed by the dark values of `shellune_terminal::palette`; a colour a program
+    /// set itself (256-colour or true colour) is drawn as it asked.
+    pub const TERMINAL: &[(u32, u32)] = &[
+        (0xe6e9f0, 0x1f2329), // foreground
+        (0x0b0c10, 0xfcfcfd), // background
+        (0x8fa0ff, 0x4653cf), // cursor
+        (0x2b313d, 0x3a3e48), // black
+        (0xff8d99, 0xc8334a), // red
+        (0x64d8a8, 0x2a7a3f), // green
+        (0xf3c66c, 0x8a5c00), // yellow
+        (0x9db4ff, 0x3157c9), // blue
+        (0xd7a0ff, 0x8c35a8), // magenta
+        (0x7fd8e8, 0x0b7286), // cyan
+        (0xb5bdcc, 0x80879a), // white
+        (0x828b9c, 0x646b7b), // bright black
+        (0xffb3bc, 0xb52a3f), // bright red
+        (0x8de6c0, 0x246c37), // bright green
+        (0xf8d894, 0x7a5100), // bright yellow
+        (0xbccbff, 0x2a4cb6), // bright blue
+        (0xe3c4ff, 0x7b2b95), // bright magenta
+        (0xa8e9f4, 0x0a6474), // bright cyan
+        (0xeef1f7, 0x4a4f5c), // bright white
+    ];
+}
+
+/// A terminal colour in the current palette.
+#[must_use]
+pub fn terminal_color(color: u32) -> u32 {
+    match appearance() {
+        Appearance::Dark => color,
+        Appearance::Light => light::TERMINAL
+            .iter()
+            .find(|(dark, _)| *dark == color)
+            .map_or(color, |(_, light)| *light),
+    }
 }
 
 /// A colour at a reduced opacity, for borders and hairlines that should recede.
@@ -314,6 +480,11 @@ impl Metrics {
     /// Width of the navigation rail.
     pub fn rail_width(self) -> Pixels {
         self.scale(208.0)
+    }
+
+    /// Width of the sidebar when it is collapsed to its icons.
+    pub fn collapsed_rail_width(self) -> Pixels {
+        self.scale(56.0)
     }
 
     /// Height of the header that names the current object.

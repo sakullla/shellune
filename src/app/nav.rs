@@ -87,6 +87,24 @@ impl Platform {
         }
     }
 
+    /// Keystroke that collapses or expands the sidebar.
+    ///
+    /// Shifted outside macOS: Ctrl+B is the tmux prefix, typed all day in a terminal.
+    pub fn sidebar_keystroke(self) -> &'static str {
+        match self {
+            Self::MacOs => "cmd-b",
+            Self::Windows | Self::Linux => "ctrl-shift-b",
+        }
+    }
+
+    /// Label of [`Platform::sidebar_keystroke`].
+    pub fn sidebar_label(self) -> &'static str {
+        match self {
+            Self::MacOs => "\u{2318}B",
+            Self::Windows | Self::Linux => "Ctrl+Shift+B",
+        }
+    }
+
     /// Keystroke that closes the session on screen.
     ///
     /// Ctrl+W alone deletes a word in the shell, so the shifted form is used outside

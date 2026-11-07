@@ -46,11 +46,43 @@ pub enum Icon {
     Search,
     /// A plug: connect.
     Plug,
+    /// A bin: remove a record.
+    Trash,
+    /// Three dots: more actions.
+    More,
+    /// A panel edge: collapse or expand the sidebar.
+    Sidebar,
+    /// A sun: the light theme.
+    Sun,
+    /// A moon: the dark theme.
+    Moon,
+    /// A screen: follow the system theme.
+    Monitor,
+    /// A bar: minimise the window.
+    Minimize,
+    /// A square: maximise the window.
+    Maximize,
+    /// Two squares: restore the window.
+    Restore,
+    /// A key: key file sign-in.
+    Key,
+    /// A padlock: password sign-in.
+    Lock,
+    /// A triangle: a command run after connecting.
+    Play,
+    /// An eye: show a hidden password.
+    Eye,
+    /// A struck eye: hide the password again.
+    EyeOff,
+    /// An open folder: choose a file.
+    FolderOpen,
+    /// A tick: a checked box.
+    Check,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 33] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -68,6 +100,22 @@ impl Icon {
         Self::ArrowRight,
         Self::Search,
         Self::Plug,
+        Self::Trash,
+        Self::More,
+        Self::Sidebar,
+        Self::Sun,
+        Self::Moon,
+        Self::Monitor,
+        Self::Minimize,
+        Self::Maximize,
+        Self::Restore,
+        Self::Key,
+        Self::Lock,
+        Self::Play,
+        Self::Eye,
+        Self::EyeOff,
+        Self::FolderOpen,
+        Self::Check,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -90,6 +138,22 @@ impl Icon {
             Self::ArrowRight => "icons/arrow-right.svg",
             Self::Search => "icons/search.svg",
             Self::Plug => "icons/plug.svg",
+            Self::Trash => "icons/trash.svg",
+            Self::More => "icons/more.svg",
+            Self::Sidebar => "icons/sidebar.svg",
+            Self::Sun => "icons/sun.svg",
+            Self::Moon => "icons/moon.svg",
+            Self::Monitor => "icons/monitor.svg",
+            Self::Minimize => "icons/minimize.svg",
+            Self::Maximize => "icons/maximize.svg",
+            Self::Restore => "icons/restore.svg",
+            Self::Key => "icons/key.svg",
+            Self::Lock => "icons/lock.svg",
+            Self::Play => "icons/play.svg",
+            Self::Eye => "icons/eye.svg",
+            Self::EyeOff => "icons/eye-off.svg",
+            Self::FolderOpen => "icons/folder-open.svg",
+            Self::Check => "icons/check.svg",
         }
     }
 
@@ -133,6 +197,42 @@ impl Icon {
             Self::Plug => {
                 r#"<path d="M9 3v5"/><path d="M15 3v5"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v4"/>"#
             }
+            Self::Trash => {
+                r#"<path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"/><path d="M9 7V4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V7"/>"#
+            }
+            Self::More => r#"<path d="M5 12h.01"/><path d="M12 12h.01"/><path d="M19 12h.01"/>"#,
+            Self::Sidebar => {
+                r#"<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/>"#
+            }
+            Self::Sun => {
+                r#"<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2"/><path d="M12 19.5v2"/><path d="M4.6 4.6l1.4 1.4"/><path d="M18 18l1.4 1.4"/><path d="M2.5 12h2"/><path d="M19.5 12h2"/><path d="M4.6 19.4L6 18"/><path d="M18 6l1.4-1.4"/>"#
+            }
+            Self::Moon => r#"<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>"#,
+            Self::Monitor => {
+                r#"<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8"/><path d="M12 16v4"/>"#
+            }
+            Self::Minimize => r#"<path d="M6 12h12"/>"#,
+            Self::Maximize => r#"<rect x="5.5" y="5.5" width="13" height="13" rx="1.5"/>"#,
+            Self::Restore => {
+                r#"<rect x="5" y="8.5" width="10.5" height="10.5" rx="1.5"/><path d="M8.5 8.5V6.5A1.5 1.5 0 0 1 10 5h7.5A1.5 1.5 0 0 1 19 6.5V14a1.5 1.5 0 0 1-1.5 1.5h-2"/>"#
+            }
+            Self::Key => {
+                r#"<circle cx="8" cy="15" r="4"/><path d="M11 12l8-8"/><path d="M16 7l3 3"/><path d="M14 9l2 2"/>"#
+            }
+            Self::Lock => {
+                r#"<rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>"#
+            }
+            Self::Play => r#"<path d="M7 5l12 7-12 7z"/>"#,
+            Self::Eye => {
+                r#"<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/>"#
+            }
+            Self::EyeOff => {
+                r#"<path d="M3 3l18 18"/><path d="M10.6 5.6A9.6 9.6 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-3 3.8"/><path d="M6.6 6.6C4 8.3 2.5 12 2.5 12S6 18.5 12 18.5a9 9 0 0 0 4.4-1.1"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>"#
+            }
+            Self::FolderOpen => {
+                r#"<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V11"/><path d="M3 7v10a2 2 0 0 0 2 2h12.5a2 2 0 0 0 1.9-1.4L21.5 12H7.2a2 2 0 0 0-1.9 1.4L3 19"/>"#
+            }
+            Self::Check => r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#,
         }
     }
 

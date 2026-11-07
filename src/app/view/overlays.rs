@@ -104,7 +104,7 @@ impl ShelluneView {
     }
 
     /// Focuses the terminal on screen, or the current page when there is none.
-    fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         let destination = self.workspace.destination();
         if self.shows_terminal(destination)
             && let Some(pane) = self.active_pane()
@@ -236,6 +236,29 @@ impl ShelluneView {
             current: false,
         });
         entries.push(Entry {
+            command: Command::CycleTheme,
+            group: Group::Actions,
+            title: strings.palette_theme.to_owned(),
+            detail: self.theme_label().to_owned(),
+            shortcut: None,
+            icon: self.theme_icon(),
+            current: false,
+        });
+        entries.push(Entry {
+            command: Command::ToggleSidebar,
+            group: Group::Actions,
+            title: if self.rail_collapsed {
+                strings.sidebar_expand
+            } else {
+                strings.sidebar_collapse
+            }
+            .to_owned(),
+            detail: String::new(),
+            shortcut: Some(platform.sidebar_label().to_owned()),
+            icon: Icon::Sidebar,
+            current: false,
+        });
+        entries.push(Entry {
             command: Command::CycleTextSize,
             group: Group::Actions,
             title: strings.palette_text_size.to_owned(),
@@ -317,6 +340,8 @@ impl ShelluneView {
             }
             Command::CloseTab(id) => self.request_close_session(id, cx),
             Command::ToggleLanguage => self.toggle_locale(cx),
+            Command::ToggleSidebar => self.toggle_rail(cx),
+            Command::CycleTheme => self.cycle_theme(cx),
             Command::CycleTextSize => {
                 self.workspace.cycle_text_size();
                 cx.notify();
@@ -854,7 +879,7 @@ impl ShelluneView {
 
 /// Places a tab menu at the pointer, inside the window and below the tab bar, so it
 /// never covers the tab's own tooltip or the tab it belongs to.
-fn clamp_menu(
+pub(super) fn clamp_menu(
     position: Point<Pixels>,
     viewport: gpui::Size<Pixels>,
     width: Pixels,

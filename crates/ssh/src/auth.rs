@@ -31,7 +31,11 @@ pub fn load_private_key(
             reason: "no key file was chosen".to_owned(),
         });
     }
-    let key_path = Path::new(chosen);
+    // `~` is the home folder in every SSH configuration, and a host imported from one
+    // keeps the path as it was written; the file system does not expand it, so a path
+    // like `~/.ssh/id_ed25519` would otherwise be looked up literally and not found.
+    let expanded = expand_home(chosen);
+    let key_path = expanded.as_path();
 
     // The file holds the private key itself, so the text is zeroed when it is
     // dropped instead of being left in an ordinary String.
@@ -107,5 +111,86 @@ mod tests {
         assert!(matches!(error, ConnectError::KeyInvalid { .. }));
         assert!(error.to_string().contains("garbage"), "{error}");
         std::fs::remove_file(path).ok();
+    }
+}
+
+/// Replaces a leading `~` (alone, or before `/` or `\\`) with the user's home folder.
+///
+/// Anything else is returned unchanged, including `~user/...`, which names another
+/// account's home and is not this program's to resolve, and a path when no home folder
+/// is known.
+#[must_use]
+pub fn expand_home(path: &str) -> std::path::PathBuf {
+    expand_home_with(path, home_dir().as_deref())
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    let windows_home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+    } else {
+        None
+    };
+    windows_home
+        .or_else(|| std::env::var_os("HOME"))
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn expand_home_with(path: &str, home: Option<&Path>) -> std::path::PathBuf {
+    let Some(home) = home else {
+        return std::path::PathBuf::from(path);
+    };
+    if path == "~" {
+        return home.to_path_buf();
+    }
+    match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        Some(rest) => home.join(rest),
+        None => std::path::PathBuf::from(path),
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    #[test]
+    fn a_leading_tilde_is_the_home_folder() {
+        let home = Path::new("/home/ada");
+        assert_eq!(
+            expand_home_with("~/.ssh/id_ed25519", Some(home)),
+            home.join(".ssh/id_ed25519")
+        );
+        assert_eq!(
+            expand_home_with("~\\.ssh\\id_rsa", Some(home)),
+            home.join(".ssh\\id_rsa")
+        );
+        assert_eq!(expand_home_with("~", Some(home)), home.to_path_buf());
+    }
+
+    #[test]
+    fn other_paths_are_left_alone() {
+        let home = Path::new("/home/ada");
+        for path in ["/etc/key", "keys/~/x", "~bob/.ssh/id", "C:\\keys\\id"] {
+            assert_eq!(expand_home_with(path, Some(home)), Path::new(path));
+        }
+        assert_eq!(
+            expand_home_with("~/.ssh/id", None),
+            Path::new("~/.ssh/id"),
+            "without a known home the path is not guessed"
+        );
+    }
+
+    #[test]
+    fn a_tilde_key_path_is_read_from_the_home_folder() {
+        // The error names the path as the user wrote it, but the read went to the
+        // expanded one: a missing file under a real home says so with the OS reason.
+        let error = load_private_key("~/shellune-no-such-key-7c1e", None)
+            .expect_err("the key does not exist");
+        match error {
+            ConnectError::KeyUnreadable { path, .. } => {
+                assert_eq!(path, "~/shellune-no-such-key-7c1e");
+            }
+            other => panic!("expected KeyUnreadable, got {other:?}"),
+        }
     }
 }
