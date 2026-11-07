@@ -67,6 +67,21 @@ define_id! {
     TransferId
 }
 
+define_id! {
+    /// Identifies one saved port-forwarding rule.
+    ForwardId
+}
+
+define_id! {
+    /// Identifies one workspace tab.
+    TabId
+}
+
+define_id! {
+    /// Identifies one pane inside a workspace tab.
+    PaneId
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use shellune_core::{HostConfig, HostValidationError, Port};
+use shellune_core::{HostConfig, HostId, HostValidationError, JumpFault, Port};
 use shellune_storage::{
     BookError, CONFIG_KEYS, FORMAT_VERSION, HostBook, HostEdit, HostStore, LOG_FIELDS, StorageError,
 };
@@ -744,4 +744,187 @@ fn words(line: &str) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Jump chains and ProxyCommand
+// ---------------------------------------------------------------------------
+
+/// A script whose execution would create `marker`. Saving must not run it.
+fn side_effect_script(dir: &Path) -> (PathBuf, PathBuf) {
+    let marker = dir.join("proxy-ran.txt");
+    let script = if cfg!(windows) {
+        let script = dir.join("should-not-run.cmd");
+        std::fs::write(
+            &script,
+            format!("@echo off\r\necho leaked>\"{}\"\r\n", marker.display()),
+        )
+        .expect("the script can be written");
+        script
+    } else {
+        let script = dir.join("should-not-run.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho leaked > \"{}\"\n", marker.display()),
+        )
+        .expect("the script can be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script)
+                .expect("the script exists")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions)
+                .expect("the script can be marked executable");
+        }
+        script
+    };
+    (script, marker)
+}
+
+#[test]
+fn an_old_host_file_without_jump_or_proxy_fields_still_loads() {
+    let dir = TempDir::new("legacy-host");
+    let host = host("web", "10.0.0.5", 22, "deploy", None);
+    dir.write_file(&format!(
+        r#"{{"version":1,"hosts":[{{"id":"{}","name":"web","address":"10.0.0.5","port":22,"user":"deploy","group":null}}],"recents":[]}}"#,
+        host.id()
+    ));
+
+    let book = dir
+        .store()
+        .load()
+        .expect("a file from before jump chains loads");
+    let restored = book.host(host.id()).expect("the host is there");
+    assert_eq!(restored.name(), "web");
+    assert!(restored.jumps().is_empty());
+    assert_eq!(restored.proxy_command(), None);
+    assert_eq!(restored.target(), "deploy@10.0.0.5:22");
+}
+
+#[test]
+fn jump_references_and_a_proxy_command_survive_a_restart_and_are_not_executed() {
+    let dir = TempDir::new("jumps");
+    let (script, marker) = side_effect_script(dir.path());
+    let secret = "hunter2-host-secret";
+    let store = dir.store();
+    let bastion = saved(&store, host("bastion", "10.0.0.2", 22, "jump", None));
+    let mut web = host("web", "10.0.0.5", 2222, "deploy", Some("Prod"));
+    web.set_jumps([bastion.id()]);
+    web.set_proxy_command(Some(format!("  {}  ", script.display())));
+    let web = saved(&store, web);
+
+    assert!(!marker.exists(), "saving a ProxyCommand must not run it");
+    let restarted = HostStore::at(dir.path()).load().expect("the file loads");
+    let restored = restarted.host(web.id()).expect("the host is still there");
+    assert_eq!(restored.jumps(), &[bastion.id()]);
+    assert_eq!(
+        restored.proxy_command(),
+        Some(script.display().to_string()).as_deref()
+    );
+    assert_eq!(restored, &web);
+    assert!(!marker.exists(), "loading a ProxyCommand must not run it");
+
+    let bytes = dir.read_file();
+    assert!(
+        !bytes.contains(secret),
+        "a secret that was never stored must not appear"
+    );
+    assert!(bytes.contains("proxy_command"));
+    assert!(bytes.contains("jumps"));
+    let document: serde_json::Value = serde_json::from_str(&bytes).expect("json");
+    let mut keys = Vec::new();
+    collect_keys(&document, &mut keys);
+    for key in &keys {
+        assert!(CONFIG_KEYS.contains(&key.as_str()), "unexpected key {key}");
+        assert!(
+            !key.to_lowercase().contains("password") && !key.to_lowercase().contains("secret"),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn a_cycle_and_a_deleted_jump_are_local_and_the_book_still_loads() {
+    let dir = TempDir::new("jump-faults");
+    let store = dir.store();
+    let mut gateway = host("gateway", "10.0.0.2", 22, "jump", None);
+    let mut bastion = host("bastion", "10.0.0.3", 22, "jump", None);
+    gateway.set_jumps([bastion.id()]);
+    bastion.set_jumps([gateway.id()]);
+    let gateway = saved(&store, gateway);
+    let bastion = saved(&store, bastion);
+    let mut web = host("web", "10.0.0.5", 22, "deploy", None);
+    let missing = HostId::new();
+    web.set_jumps([missing]);
+    let web = saved(&store, web);
+    let lab = saved(&store, host("lab", "10.0.0.9", 22, "root", None));
+
+    let book = HostStore::at(dir.path())
+        .load()
+        .expect("faults do not discard the book");
+    assert_eq!(book.hosts().len(), 4);
+    assert_eq!(
+        book.host(web.id()).expect("web").jumps(),
+        &[missing],
+        "a bad reference is kept so it can be repaired"
+    );
+
+    let faults = book.jump_faults();
+    assert!(
+        faults.iter().any(|fault| matches!(
+            fault,
+            JumpFault::Cycle { path, .. }
+                if path.contains(&gateway.id()) && path.contains(&bastion.id())
+        )),
+        "the loop names both hops: {faults:?}"
+    );
+    assert!(
+        faults.iter().any(|fault| matches!(
+            fault,
+            JumpFault::MissingHop {
+                host,
+                index: 0,
+                missing: id,
+                ..
+            } if *host == web.id() && *id == missing
+        )),
+        "the missing hop stays attached to web: {faults:?}"
+    );
+    assert!(
+        faults.iter().all(|fault| match fault {
+            JumpFault::MissingHop { host, .. } => *host == web.id(),
+            JumpFault::Cycle { path, .. } => path.contains(&gateway.id()),
+            JumpFault::UnknownHost { .. } => false,
+        }),
+        "lab is not part of either fault: {faults:?}"
+    );
+    let blocked = book
+        .connection_jump_fault(web.id())
+        .expect("web cannot be connected");
+    assert!(blocked.message().contains(&missing.to_string()));
+    assert!(blocked.message().contains("Remove that hop"));
+    assert!(blocked.message().contains("Nothing was connected"));
+    assert!(!blocked.message().contains("hunter2"));
+    assert!(book.connection_jump_fault(lab.id()).is_none());
+
+    let mut without_bastion = book;
+    without_bastion.remove(bastion.id()).expect("removed");
+    store.save(&without_bastion).expect("saved");
+    let restarted = HostStore::at(dir.path()).load().expect("loads");
+    assert!(restarted.host(bastion.id()).is_none());
+    assert_eq!(
+        restarted.host(gateway.id()).expect("gateway").jumps(),
+        &[bastion.id()],
+        "deleting a hop target does not rewrite the chain that cited it"
+    );
+    let after = restarted
+        .connection_jump_fault(gateway.id())
+        .expect("now missing");
+    assert!(matches!(
+        after,
+        JumpFault::MissingHop { .. } | JumpFault::Cycle { .. }
+    ));
+    assert!(after.message().contains("Nothing was connected"));
 }

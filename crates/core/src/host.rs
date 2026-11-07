@@ -1,8 +1,14 @@
-//! Validated SSH host configuration (R3).
+//! Validated SSH host configuration (R3, R10).
 //!
 //! A [`HostConfig`] can only exist with a non-empty name, address and user plus a
 //! port in `1..=65535`, whether it was built in code, edited later or read back from
 //! storage. Saving a host never implies a connection was made.
+//!
+//! A host may name an ordered jump chain and a ProxyCommand. Both are configuration:
+//! the chain is a list of saved host ids, and the command is text. Neither is
+//! dialed or executed by this module. A password still has nowhere to live.
+
+use std::collections::HashMap;
 
 use crate::auth::AuthMethodKind;
 use serde::{Deserialize, Serialize};
@@ -115,6 +121,20 @@ pub struct HostConfig {
     /// A command typed into the remote shell once each connection is live.
     #[serde(skip_serializing_if = "Option::is_none")]
     startup_command: Option<String>,
+    /// Ordered jump hosts visited before this one.
+    ///
+    /// Each entry is the id of a saved host, not a copy of that host and not a
+    /// secret. Absent on records written before jump chains existed, which is a
+    /// direct connection. The list is not dialed here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    jumps: Vec<HostId>,
+    /// ProxyCommand text for this host.
+    ///
+    /// The text is what a later, confirmed connection would run. Persisting or
+    /// restoring the host does not run it, and the field is not a place to put a
+    /// password: there is still no secret field beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_command: Option<String>,
 }
 
 /// The stored shape of a host.
@@ -142,6 +162,12 @@ struct HostConfigWire {
     remember_secret: bool,
     #[serde(default)]
     startup_command: Option<String>,
+    /// Absent in files written before jump chains existed.
+    #[serde(default)]
+    jumps: Vec<HostId>,
+    /// Absent in files written before ProxyCommand was stored.
+    #[serde(default)]
+    proxy_command: Option<String>,
 }
 
 impl TryFrom<HostConfigWire> for HostConfig {
@@ -168,6 +194,8 @@ impl TryFrom<HostConfigWire> for HostConfig {
             auth: wire.auth,
             remember_secret: wire.remember_secret,
             startup_command: normalize_command(wire.startup_command),
+            jumps: wire.jumps,
+            proxy_command: normalize_proxy_command(wire.proxy_command),
         })
     }
 }
@@ -223,6 +251,8 @@ impl HostConfig {
             auth: None,
             remember_secret: false,
             startup_command: None,
+            jumps: Vec::new(),
+            proxy_command: None,
         })
     }
 
@@ -289,6 +319,24 @@ impl HostConfig {
     #[must_use]
     pub fn startup_command(&self) -> Option<&str> {
         self.startup_command.as_deref()
+    }
+
+    /// Jump hosts visited before this one, in order.
+    ///
+    /// Empty means a direct connection. The ids are references; a missing or
+    /// cyclic reference is reported by [`jump_faults`] and is not dialed here.
+    #[must_use]
+    pub fn jumps(&self) -> &[HostId] {
+        &self.jumps
+    }
+
+    /// ProxyCommand text, when the user configured one.
+    ///
+    /// This is the command that would need an explicit confirmation before it
+    /// could run. Reading the host does not run it.
+    #[must_use]
+    pub fn proxy_command(&self) -> Option<&str> {
+        self.proxy_command.as_deref()
     }
 
     /// `user@address:port`, the form used in confirmation prompts.
@@ -376,6 +424,17 @@ impl HostConfig {
     pub fn set_startup_command(&mut self, command: Option<impl Into<String>>) {
         self.startup_command = normalize_command(command.map(Into::into));
     }
+
+    /// Replaces the jump chain. Order is kept, including entries that do not
+    /// resolve yet, so an edit can be saved and repaired instead of discarded.
+    pub fn set_jumps(&mut self, jumps: impl IntoIterator<Item = HostId>) {
+        self.jumps = jumps.into_iter().collect();
+    }
+
+    /// Sets or clears the ProxyCommand. A blank command clears it and nothing is run.
+    pub fn set_proxy_command(&mut self, command: Option<impl Into<String>>) {
+        self.proxy_command = normalize_proxy_command(command.map(Into::into));
+    }
 }
 
 /// Trims a startup command, joins its lines, and turns a blank one into `None`.
@@ -395,10 +454,231 @@ fn normalize_command(command: Option<String>) -> Option<String> {
         .filter(|command| !command.is_empty())
 }
 
+/// Trims a ProxyCommand and turns a blank one into `None`.
+///
+/// The text is stored unchanged apart from surrounding whitespace. Newlines stay
+/// in the value so a round trip does not invent a different command, and nothing
+/// in this path invokes a shell.
+fn normalize_proxy_command(command: Option<String>) -> Option<String> {
+    command
+        .map(|command| command.trim().to_owned())
+        .filter(|command| !command.is_empty())
+}
+
 /// Trims a key path and turns a blank one into `None`.
 fn normalize_identity_file(path: Option<String>) -> Option<String> {
     path.map(|path| path.trim().to_owned())
         .filter(|path| !path.is_empty())
+}
+
+/// Why a jump chain cannot be used, limited to the hop that is wrong.
+///
+/// The host records themselves stay loaded. A fault names the host a person can
+/// edit and the change that makes the chain usable; it does not mean a connection
+/// was attempted.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum JumpFault {
+    /// The host being connected is not in the saved set.
+    #[error("{message}")]
+    UnknownHost {
+        /// The id that was asked for.
+        host: HostId,
+        /// What to do next. Never includes a secret.
+        message: String,
+    },
+    /// One hop points at a host that is not saved.
+    #[error("{message}")]
+    MissingHop {
+        /// The host whose jump list contains the bad reference.
+        host: HostId,
+        /// Zero-based position of the bad hop in that host's list.
+        index: usize,
+        /// The id that is not saved.
+        missing: HostId,
+        /// What to do next. Never includes a secret.
+        message: String,
+    },
+    /// Following the chain returns to a host already on the path.
+    #[error("{message}")]
+    Cycle {
+        /// The loop, with the first host repeated at the end.
+        path: Vec<HostId>,
+        /// What to do next. Never includes a secret.
+        message: String,
+    },
+}
+
+impl JumpFault {
+    /// The explanation a person can act on.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::UnknownHost { message, .. }
+            | Self::MissingHop { message, .. }
+            | Self::Cycle { message, .. } => message,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    White,
+    Gray,
+    Black,
+}
+
+fn index_hosts(hosts: &[HostConfig]) -> HashMap<HostId, &HostConfig> {
+    hosts.iter().map(|host| (host.id(), host)).collect()
+}
+
+fn host_label(id: HostId, hosts: &HashMap<HostId, &HostConfig>) -> String {
+    match hosts.get(&id) {
+        Some(host) => format!("\"{}\" ({id})", host.name()),
+        None => id.to_string(),
+    }
+}
+
+/// Every direct jump problem in `hosts`.
+///
+/// A missing hop is reported on the host that names it. A cycle is reported
+/// once, as the loop itself. Hosts that are not part of either stay out of the
+/// list, and the records are not modified.
+#[must_use]
+pub fn jump_faults(hosts: &[HostConfig]) -> Vec<JumpFault> {
+    let by_id = index_hosts(hosts);
+    let mut faults = Vec::new();
+    let mut color: HashMap<HostId, Visit> = HashMap::new();
+    let mut stack = Vec::new();
+    for host in hosts {
+        if color.get(&host.id()).copied().unwrap_or(Visit::White) == Visit::White {
+            trace_jumps(host.id(), &by_id, &mut color, &mut stack, &mut faults);
+        }
+    }
+    faults
+}
+
+/// The first jump problem on the way to `target`, if connecting it would be invalid.
+///
+/// `None` means the chain resolves. This does not open a socket or a process.
+#[must_use]
+pub fn connection_jump_fault(hosts: &[HostConfig], target: HostId) -> Option<JumpFault> {
+    let by_id = index_hosts(hosts);
+    let mut stack = Vec::new();
+    follow(target, target, &by_id, &mut stack).err()
+}
+
+fn trace_jumps(
+    id: HostId,
+    by_id: &HashMap<HostId, &HostConfig>,
+    color: &mut HashMap<HostId, Visit>,
+    stack: &mut Vec<HostId>,
+    faults: &mut Vec<JumpFault>,
+) {
+    color.insert(id, Visit::Gray);
+    stack.push(id);
+    if let Some(host) = by_id.get(&id) {
+        for (index, hop) in host.jumps().iter().enumerate() {
+            if !by_id.contains_key(hop) {
+                faults.push(missing_hop(id, id, index, *hop, by_id));
+                continue;
+            }
+            match color.get(hop).copied().unwrap_or(Visit::White) {
+                Visit::Gray => {
+                    let start = stack.iter().position(|item| item == hop).unwrap_or(0);
+                    let mut path = stack[start..].to_vec();
+                    path.push(*hop);
+                    faults.push(cycle_fault(id, &path, by_id));
+                }
+                Visit::White => trace_jumps(*hop, by_id, color, stack, faults),
+                Visit::Black => {}
+            }
+        }
+    }
+    stack.pop();
+    color.insert(id, Visit::Black);
+}
+
+fn follow(
+    origin: HostId,
+    current: HostId,
+    by_id: &HashMap<HostId, &HostConfig>,
+    stack: &mut Vec<HostId>,
+) -> Result<(), JumpFault> {
+    if let Some(start) = stack.iter().position(|id| *id == current) {
+        let mut path = stack[start..].to_vec();
+        path.push(current);
+        return Err(cycle_fault(origin, &path, by_id));
+    }
+    let Some(host) = by_id.get(&current) else {
+        return Err(if stack.is_empty() {
+            JumpFault::UnknownHost {
+                host: current,
+                message: format!(
+                    "Host {current} is not saved, so it cannot be connected. Choose a saved host. Nothing was connected."
+                ),
+            }
+        } else {
+            missing_hop(origin, *stack.last().unwrap_or(&current), 0, current, by_id)
+        });
+    };
+    stack.push(current);
+    for (index, hop) in host.jumps().iter().enumerate() {
+        if !by_id.contains_key(hop) {
+            return Err(missing_hop(origin, current, index, *hop, by_id));
+        }
+        follow(origin, *hop, by_id, stack)?;
+    }
+    stack.pop();
+    Ok(())
+}
+
+fn missing_hop(
+    origin: HostId,
+    owner: HostId,
+    index: usize,
+    missing: HostId,
+    by_id: &HashMap<HostId, &HostConfig>,
+) -> JumpFault {
+    let hop_number = index + 1;
+    let owner_label = host_label(owner, by_id);
+    let message = if origin == owner {
+        format!(
+            "{owner_label} jump {hop_number} references host {missing}, which is not saved. Remove that hop or restore the host before connecting. Nothing was connected."
+        )
+    } else {
+        format!(
+            "{} cannot be connected because {owner_label} jump {hop_number} references host {missing}, which is not saved. Remove that hop or restore the host. Nothing was connected.",
+            host_label(origin, by_id)
+        )
+    };
+    JumpFault::MissingHop {
+        host: owner,
+        index,
+        missing,
+        message,
+    }
+}
+
+fn cycle_fault(origin: HostId, path: &[HostId], by_id: &HashMap<HostId, &HostConfig>) -> JumpFault {
+    let rendered = path
+        .iter()
+        .map(|id| host_label(*id, by_id))
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    let origin_label = host_label(origin, by_id);
+    let message = if path.contains(&origin) {
+        format!(
+            "Jump chain loops: {rendered}. Remove the hop that returns to an earlier host before connecting. Nothing was connected."
+        )
+    } else {
+        format!(
+            "{origin_label} cannot be connected because the jump chain loops: {rendered}. Remove the hop that returns to an earlier host. Nothing was connected."
+        )
+    };
+    JumpFault::Cycle {
+        path: path.to_vec(),
+        message,
+    }
 }
 
 #[cfg(test)]
@@ -595,7 +875,13 @@ mod sign_in_tests {
     fn a_host_without_the_new_fields_reads_and_writes_as_before() {
         let host = host();
         let json = serde_json::to_string(&host).expect("serializes");
-        for field in ["auth", "remember_secret", "startup_command"] {
+        for field in [
+            "auth",
+            "remember_secret",
+            "startup_command",
+            "jumps",
+            "proxy_command",
+        ] {
             assert!(
                 !json.contains(field),
                 "{field} is written only when set: {json}"
@@ -637,5 +923,87 @@ mod sign_in_tests {
         );
         host.set_startup_command(Some("   "));
         assert_eq!(host.startup_command(), None);
+    }
+}
+
+#[cfg(test)]
+mod jump_tests {
+    use super::*;
+
+    fn named(name: &str) -> HostConfig {
+        HostConfig::new(name, "10.0.0.5", 22, "deploy").expect("valid")
+    }
+
+    #[test]
+    fn a_jump_chain_and_proxy_command_round_trip_without_a_secret_field() {
+        let bastion = named("bastion");
+        let mut target = named("web");
+        let secret = "hunter2-not-a-field";
+        target.set_jumps([bastion.id()]);
+        target.set_proxy_command(Some("  ssh -W %h:%p bastion  "));
+        target.set_proxy_command(Some("   "));
+        assert_eq!(target.proxy_command(), None, "a blank command clears it");
+        target.set_proxy_command(Some(" ssh -W %h:%p bastion "));
+
+        let json = serde_json::to_string(&target).expect("serializes");
+        assert!(!json.contains(secret), "{json}");
+        assert!(!json.contains("password"), "{json}");
+        let back: HostConfig = serde_json::from_str(&json).expect("reads");
+        assert_eq!(back.jumps(), &[bastion.id()]);
+        assert_eq!(back.proxy_command(), Some("ssh -W %h:%p bastion"));
+        assert_eq!(back, target);
+    }
+
+    #[test]
+    fn a_cycle_and_a_missing_hop_are_local_and_leave_other_hosts_alone() {
+        let mut gateway = named("gateway");
+        let mut bastion = named("bastion");
+        let mut web = named("web");
+        let lab = named("lab");
+        let missing = HostId::new();
+        gateway.set_jumps([bastion.id()]);
+        bastion.set_jumps([gateway.id()]);
+        web.set_jumps([lab.id(), missing]);
+
+        let hosts = [gateway.clone(), bastion.clone(), web.clone(), lab.clone()];
+        let faults = jump_faults(&hosts);
+        assert!(
+            faults.iter().any(|fault| matches!(
+                fault,
+                JumpFault::Cycle { path, .. } if path.first() == Some(&gateway.id())
+                    && path.contains(&bastion.id())
+            )),
+            "the loop is named, got {faults:?}"
+        );
+        assert!(
+            faults.iter().any(|fault| matches!(
+                fault,
+                JumpFault::MissingHop { host, index: 1, missing: id, .. }
+                    if *host == web.id() && *id == missing
+            )),
+            "only web's second hop is missing, got {faults:?}"
+        );
+        assert!(
+            faults
+                .iter()
+                .all(|fault| !format!("{fault:?}").contains("lab")
+                    || matches!(fault, JumpFault::MissingHop { .. })),
+            "lab itself is not a broken host"
+        );
+        let web_fault = connection_jump_fault(&hosts, web.id()).expect("web is blocked");
+        assert!(web_fault.message().contains("not saved"));
+        assert!(web_fault.message().contains("Remove that hop"));
+        assert!(web_fault.message().contains("Nothing was connected"));
+        assert!(connection_jump_fault(&hosts, lab.id()).is_none());
+
+        let cycle = connection_jump_fault(&hosts, gateway.id()).expect("gateway loops");
+        assert!(cycle.message().contains("loops"));
+        assert!(!cycle.message().contains("hunter2"));
+        assert!(
+            connection_jump_fault(&hosts, HostId::new())
+                .expect("unknown")
+                .message()
+                .contains("Choose a saved host")
+        );
     }
 }

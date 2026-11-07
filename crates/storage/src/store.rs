@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::audit::StoreEvent;
 use crate::book::{FORMAT_VERSION, HostBook};
-use crate::error::StorageError;
+use crate::error::{PersistError, StorageError};
 
 /// Name of the file inside the data directory.
 pub const FILE_NAME: &str = "hosts.json";
@@ -295,4 +296,193 @@ pub fn data_directory() -> PathBuf {
 fn next_temp_sequence() -> u64 {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Keys that mean a credential. A document that contains one is refused before
+/// its values are copied into an error or a domain type.
+const SECRET_KEYS: &[&str] = &[
+    "password",
+    "passphrase",
+    "secret",
+    "token",
+    "credential",
+    "credentials",
+    "private_key",
+    "privatekey",
+    "private-key",
+];
+
+/// Reads a versioned JSON document, or `T::default` when the file is not there yet.
+///
+/// A newer `version` is reported as unsupported before the rest of the document is
+/// interpreted, so fields this build has never seen are not called corruption.
+/// The previous file is not rewritten. A key that names a secret is refused with
+/// the key, not the value.
+///
+/// # Errors
+///
+/// Returns [`PersistError`] for a read failure, a damaged document, a secret field
+/// or a newer format.
+pub(crate) fn load_versioned<T>(
+    root: &Path,
+    file_name: &str,
+    supported: u32,
+    label: &'static str,
+    validate: impl FnOnce(&T) -> Result<(), String>,
+) -> Result<T, PersistError>
+where
+    T: DeserializeOwned + Default,
+{
+    let path = root.join(file_name);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound && !root.is_file() => {
+            return Ok(T::default());
+        }
+        Err(error) => {
+            return Err(PersistError::Read {
+                label,
+                path,
+                reason: error.to_string(),
+            });
+        }
+    };
+
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| PersistError::Corrupt {
+            label,
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
+    let version = match value.get("version") {
+        None => {
+            return Err(PersistError::Corrupt {
+                label,
+                path,
+                reason: "the document has no format version. Leave the file unchanged and restore a copy this build wrote."
+                    .to_owned(),
+            });
+        }
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(_) => None,
+    };
+    let Some(version) = version.and_then(|version| u32::try_from(version).ok()) else {
+        return Err(PersistError::Corrupt {
+            label,
+            path,
+            reason: "the format version is not a whole number this build can read. Leave the file unchanged."
+                .to_owned(),
+        });
+    };
+    if version > supported {
+        return Err(PersistError::UnsupportedVersion {
+            label,
+            path,
+            found: version,
+            supported,
+        });
+    }
+    if version == 0 {
+        return Err(PersistError::Corrupt {
+            label,
+            path,
+            reason: "format version 0 was never written by Shellune".to_owned(),
+        });
+    }
+    if let Some(key) = find_secret_key(&value) {
+        return Err(PersistError::Corrupt {
+            label,
+            path,
+            reason: format!(
+                "the document contains the field \"{key}\", which cannot be stored. Remove that field; its value was not kept."
+            ),
+        });
+    }
+
+    let parsed: T = serde_json::from_value(value).map_err(|error| PersistError::Corrupt {
+        label,
+        path: path.clone(),
+        reason: error.to_string(),
+    })?;
+    validate(&parsed).map_err(|reason| PersistError::Corrupt {
+        label,
+        path,
+        reason,
+    })?;
+    Ok(parsed)
+}
+
+/// Writes `bytes` as `file_name` inside `root` without leaving a partial file.
+///
+/// # Errors
+///
+/// Returns [`PersistError`] when the directory, the temporary file or the replace
+/// fails. The previous file is left as it was.
+pub(crate) fn save_versioned(
+    root: &Path,
+    file_name: &str,
+    label: &'static str,
+    bytes: &[u8],
+) -> Result<(), PersistError> {
+    write_atomic_file(root, file_name, bytes).map_err(|error| map_write_error(error, label))
+}
+
+fn map_write_error(error: StorageError, label: &'static str) -> PersistError {
+    match error {
+        StorageError::CreateDirectory { path, reason } => PersistError::CreateDirectory {
+            label,
+            path,
+            reason,
+        },
+        StorageError::Write { path, reason } => PersistError::Write {
+            label,
+            path,
+            reason,
+        },
+        StorageError::Replace { path, reason } => PersistError::Replace {
+            label,
+            path,
+            reason,
+        },
+        StorageError::Encode { reason } => PersistError::Encode { label, reason },
+        StorageError::Read { path, reason } | StorageError::Corrupt { path, reason } => {
+            PersistError::Write {
+                label,
+                path,
+                reason,
+            }
+        }
+        StorageError::UnsupportedVersion {
+            path,
+            found,
+            supported,
+        } => PersistError::Write {
+            label,
+            path,
+            reason: format!("format {found} is newer than {supported}"),
+        },
+    }
+}
+
+fn find_secret_key(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if is_secret_key(key) {
+                    return Some(key.clone());
+                }
+                if let Some(found) = find_secret_key(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(find_secret_key),
+        _ => None,
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_KEYS.contains(&lower.as_str())
 }

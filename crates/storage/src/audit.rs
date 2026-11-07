@@ -35,6 +35,32 @@ pub const CONFIG_KEYS: &[&str] = &[
     "host",
     "last_connected_unix",
     "connections",
+    // Jump targets are host ids. The command is the ProxyCommand text, not a
+    // secret and not something the store executes.
+    "jumps",
+    "proxy_command",
+    // Forwarding rules: endpoints and the host that would carry the tunnel.
+    "rules",
+    "kind",
+    "listen",
+    "target",
+    // Workspace snapshot: tabs, pane tree and panel arrangement.
+    "tabs",
+    "active_tab",
+    "panel",
+    "title",
+    "root",
+    "active_pane",
+    "node",
+    "pane",
+    "axis",
+    "ratio",
+    "first",
+    "second",
+    "mode",
+    "shell",
+    "visible",
+    "section",
 ];
 
 /// Every field a log line may contain.

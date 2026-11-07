@@ -16,11 +16,13 @@ mod auth;
 mod error;
 mod files;
 pub mod fingerprint;
+mod forward;
 mod host;
 mod ids;
 mod session;
 mod shell;
 mod task;
+mod workspace;
 
 pub use auth::{AuthMethod, AuthMethodKind};
 pub use error::{AgentKind, SecretString, SecurityError};
@@ -30,8 +32,15 @@ pub use files::{
     is_single_name, join_path, normalize_path, parent_path,
 };
 pub use fingerprint::sha256_fingerprint;
-pub use host::{DEFAULT_SSH_PORT, HostConfig, HostValidationError, Port};
-pub use ids::{HostId, SessionId, TransferId};
+pub use forward::{
+    Endpoint, FORWARD_FORMAT_VERSION, ForwardBook, ForwardBookError, ForwardBuildError,
+    ForwardFault, ForwardKind, ForwardRule,
+};
+pub use host::{
+    DEFAULT_SSH_PORT, HostConfig, HostValidationError, JumpFault, Port, connection_jump_fault,
+    jump_faults,
+};
+pub use ids::{ForwardId, HostId, PaneId, SessionId, TabId, TransferId};
 pub use session::{
     EventTag, Session, SessionFailure, SessionKind, SessionState, SessionTransitionError,
 };
@@ -39,4 +48,9 @@ pub use shell::LocalShell;
 pub use task::{
     OverwriteChoice, PARTIAL_PREFIX, Transfer, TransferDirection, TransferEvent, TransferFailure,
     TransferQueue, TransferState, TransferUpdate, TransferUpdateError, partial_path,
+};
+pub use workspace::{
+    PaneNode, PaneTarget, PanelConfig, PanelSection, PendingConnection, PendingPane, RestoredNode,
+    RestoredTab, RestoredWorkspace, SplitAxis, SplitRatio, TerminalMode, WORKSPACE_FORMAT_VERSION,
+    WorkspaceBuildError, WorkspaceIssue, WorkspaceSnapshot, WorkspaceTab,
 };

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use shellune_core::{HostConfig, HostId};
+use shellune_core::{HostConfig, HostId, JumpFault, jump_faults};
 
 use crate::error::BookError;
 
@@ -377,6 +377,23 @@ impl HostBook {
         labels.sort_unstable();
         labels.dedup();
         labels
+    }
+
+    /// Jump-chain problems in this book.
+    ///
+    /// A cycle or a hop that names a deleted host is local to that chain. The
+    /// book stays loaded, and reporting the fault does not open a connection.
+    #[must_use]
+    pub fn jump_faults(&self) -> Vec<JumpFault> {
+        jump_faults(&self.hosts)
+    }
+
+    /// The first jump problem that would block connecting `target`.
+    ///
+    /// `None` means the chain resolves. Nothing is dialed.
+    #[must_use]
+    pub fn connection_jump_fault(&self, target: HostId) -> Option<JumpFault> {
+        shellune_core::connection_jump_fault(&self.hosts, target)
     }
 
     /// Checks the invariants a stored document must satisfy.
