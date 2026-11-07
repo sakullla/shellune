@@ -6598,7 +6598,9 @@ async fn the_sidebar_counts_open_sessions_not_closed_ones(cx: &mut TestAppContex
 /// source keeps the two from drifting apart when a hint is added or reworded.
 #[test]
 fn every_ssh_next_step_is_translated() {
-    let source = include_str!("../../crates/ssh/src/error.rs");
+    // Git may check the file out with CRLF line endings (Windows), so they are
+    // normalised before the function's end is looked for.
+    let source = include_str!("../../crates/ssh/src/error.rs").replace("\r\n", "\n");
     let start = source
         .find("pub fn next_step(&self)")
         .expect("the SSH error type has next steps");
