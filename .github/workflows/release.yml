@@ -32,6 +32,10 @@ jobs:
 
   macos:
     runs-on: macos-latest
+    # `secrets` cannot be read in a step's `if:`, so whether signing is possible is
+    # decided here, where it can be, and the step reads the flag.
+    env:
+      HAS_SIGNING_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,7 +44,7 @@ jobs:
       - name: App bundle
         run: python3 packaging/macos/make-app-bundle.py --binary target/release/shellune
       - name: Sign and notarise
-        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        if: env.HAS_SIGNING_CERTIFICATE == 'true'
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
