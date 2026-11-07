@@ -62,6 +62,8 @@ use crate::app::{components, theme::radius};
 mod host_dialog;
 mod overlays;
 mod sessions;
+mod titlebar;
+pub use titlebar::{TRAFFIC_LIGHT_POSITION, custom_titlebar};
 
 /// Where a terminal comes from.
 ///
@@ -1398,19 +1400,16 @@ impl ShelluneView {
     ) -> bool {
         let strings = self.strings();
         if host.remembers_secret() {
-            match draft.typed_secret() {
-                Some(secret) => {
-                    let secret = shellune_core::SecretString::new(secret);
-                    if let Err(error) = self.secrets.save(host.id(), &secret) {
-                        self.hosts
-                            .set_message(format!("{}: {error}", strings.host_secret_failed), true);
-                        cx.notify();
-                        return false;
-                    }
+            // Nothing typed keeps what is saved: the draft only remembers when there is
+            // something to remember.
+            if let Some(secret) = draft.typed_secret() {
+                let secret = shellune_core::SecretString::new(secret);
+                if let Err(error) = self.secrets.save(host.id(), &secret) {
+                    self.hosts
+                        .set_message(format!("{}: {error}", strings.host_secret_failed), true);
+                    cx.notify();
+                    return false;
                 }
-                // Nothing typed keeps what is saved (the draft only remembers when
-                // there is something to remember).
-                None => {}
             }
         } else if saved.is_some_and(HostConfig::remembers_secret) {
             // Turning remembering off removes the secret; a store that cannot be reached
@@ -3662,32 +3661,48 @@ impl ShelluneView {
     /// The product mark: a gradient tile with a prompt, the name and how it is said.
     fn brand(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
+        // The macOS window buttons sit at the left of this row.
+        let left = if Platform::current() == Platform::MacOs {
+            titlebar::TRAFFIC_LIGHT_ROOM
+        } else {
+            spacing::BASE - 2.0
+        };
         div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(spacing::SNUG - 2.0))
             .h(metrics.header_height())
-            .pl(metrics.scale(spacing::BASE - 2.0))
             .pr(metrics.scale(spacing::TIGHT))
-            .child(brand_mark(metrics.scale(28.0), metrics))
             .child(
-                // The pronunciation is one hover away: the row keeps room for the
-                // sidebar button without cutting the name.
-                div()
-                    .id("brand.name")
+                self.drag_area("brand.drag")
+                    .flex()
                     .flex_1()
+                    .h_full()
+                    .items_center()
+                    .gap(metrics.scale(spacing::SNUG - 2.0))
                     .min_w(px(0.0))
-                    .truncate()
-                    .text_size(metrics.display_size())
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .tooltip(components::tooltip(SharedString::from(format!(
-                        "{} · {}",
-                        product::NAME,
-                        product::PRONUNCIATION
-                    ))))
-                    .child(product::NAME),
+                    .pl(metrics.scale(left))
+                    .when(Platform::current() != Platform::MacOs, |row| {
+                        row.child(brand_mark(metrics.scale(28.0), metrics))
+                    })
+                    .child(
+                        // The pronunciation is one hover away: the row keeps room for the
+                        // sidebar button without cutting the name.
+                        div()
+                            .id("brand.name")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(metrics.display_size())
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .tooltip(components::tooltip(SharedString::from(format!(
+                                "{} · {}",
+                                product::NAME,
+                                product::PRONUNCIATION
+                            ))))
+                            .child(product::NAME),
+                    ),
             )
             .child(self.rail_toggle(cx))
     }
@@ -4142,20 +4157,27 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_none()
-            .w(metrics.collapsed_rail_width())
+            .w(if Platform::current() == Platform::MacOs {
+                metrics.scale(titlebar::TRAFFIC_LIGHT_ROOM + 4.0)
+            } else {
+                metrics.collapsed_rail_width()
+            })
             .h_full()
             .bg(theme::swatch(palette::SURFACE))
             .border_r_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "rail".to_owned())
             .child(
-                div()
+                self.drag_area("brand.drag")
                     .flex()
                     .flex_none()
                     .items_center()
                     .justify_center()
                     .h(metrics.header_height())
-                    .child(brand_mark(metrics.scale(28.0), metrics)),
+                    // On macOS the window buttons take this place.
+                    .when(Platform::current() != Platform::MacOs, |row| {
+                        row.child(brand_mark(metrics.scale(28.0), metrics))
+                    }),
             )
             .child(
                 div()
@@ -4501,23 +4523,42 @@ impl ShelluneView {
             }
         }
 
+        // The blank part of the row is the window's caption: it drags the window. The
+        // tabs and buttons stay outside it, so a press on them is never a drag.
         let leading = if terminal_mode {
-            self.tab_row(cx)
-        } else {
             div()
+                .id("header.leading")
                 .flex()
-                .flex_col()
-                .gap(metrics.scale(1.0))
+                .flex_1()
+                .h_full()
+                .items_center()
                 .min_w(px(0.0))
-                .child(title_row)
+                .child(self.tab_row(cx).flex_initial())
+                .child(self.drag_area("header.drag").flex_1().h_full())
+        } else {
+            self.drag_area("header.drag")
+                .flex()
+                .flex_1()
+                .h_full()
+                .items_center()
+                .min_w(px(0.0))
                 .child(
                     div()
-                        .truncate()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .child(SharedString::from(subtitle)),
+                        .flex()
+                        .flex_col()
+                        .gap(metrics.scale(1.0))
+                        .min_w(px(0.0))
+                        .child(title_row)
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(SharedString::from(subtitle)),
+                        ),
                 )
         };
+        let controls = self.window_controls(window, cx);
 
         div()
             .flex()
@@ -4531,7 +4572,11 @@ impl ShelluneView {
             } else {
                 spacing::LOOSE
             }))
-            .pr(metrics.scale(spacing::SNUG))
+            .pr(if controls.is_some() {
+                px(0.0)
+            } else {
+                metrics.scale(spacing::SNUG)
+            })
             .bg(theme::swatch(if terminal_mode {
                 palette::SURFACE
             } else {
@@ -4541,6 +4586,7 @@ impl ShelluneView {
             .border_color(theme::swatch(palette::BORDER))
             .child(leading)
             .child(actions)
+            .children(controls)
     }
 
     /// The menu under the header's shell control: every shell, and a typed path.

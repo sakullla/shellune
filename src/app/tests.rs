@@ -7162,3 +7162,38 @@ async fn the_theme_control_switches_the_palette(cx: &mut TestAppContext) {
     // Leave the thread as the other tests expect it.
     theme::set_appearance(theme::Appearance::Dark);
 }
+
+// ---------------------------------------------------------------------------
+// The window's own title bar
+// ---------------------------------------------------------------------------
+
+#[test]
+fn windows_and_macos_draw_their_own_title_bar_and_linux_keeps_the_system_one() {
+    use crate::app::titlebar_for_test as custom_titlebar;
+    assert!(custom_titlebar(Platform::Windows));
+    assert!(custom_titlebar(Platform::MacOs));
+    assert!(!custom_titlebar(Platform::Linux));
+}
+
+#[gpui::test]
+async fn the_top_row_is_the_caption_and_keeps_its_buttons_inside_the_window(
+    cx: &mut TestAppContext,
+) {
+    let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("header.drag").is_some() && cx.debug_bounds("brand.drag").is_some(),
+        "the blank parts of the top row are drag areas"
+    );
+    if Platform::current() == Platform::Windows {
+        for button in ["window.minimize", "window.maximize", "window.close"] {
+            assert_fits_inside(bounds_of(cx, button), minimum_window(), button);
+        }
+        assert_fits_inside(
+            bounds_of(cx, "header.primary"),
+            minimum_window(),
+            "the main action beside the window buttons",
+        );
+    }
+}

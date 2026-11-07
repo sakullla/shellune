@@ -489,13 +489,6 @@ impl TextField {
         self.model.text()
     }
 
-    /// The editing state, for tests.
-    #[cfg(test)]
-    #[must_use]
-    pub fn model(&self) -> &LineModel {
-        &self.model
-    }
-
     /// The focus handle the caller focuses to type here.
     #[must_use]
     pub fn focus_handle(&self) -> &FocusHandle {
