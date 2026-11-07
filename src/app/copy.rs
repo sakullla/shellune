@@ -607,6 +607,26 @@ pub struct Strings {
     pub theme_dark: &'static str,
     /// Palette action: step the theme.
     pub palette_theme: &'static str,
+    /// Opens a connection that is not saved as a host first.
+    pub quick_connect: &'static str,
+    /// Explains that a quick connection does not write a host record.
+    pub quick_connect_hint: &'static str,
+    /// Title of the quick-connection form.
+    pub quick_connect_title: &'static str,
+    /// Saves a successful quick connection as a host.
+    pub quick_save_host: &'static str,
+    /// Shown after that host was written.
+    pub quick_saved: &'static str,
+    /// Shown while a quick connection has not been saved.
+    pub quick_unsaved_note: &'static str,
+    /// Heading above connection attempts that are not the one on screen.
+    pub attempt_others: &'static str,
+    /// Cancels one connection attempt.
+    pub attempt_cancel: &'static str,
+    /// Palette group: hosts that were really reached, newest first.
+    pub palette_group_recent: &'static str,
+    /// Label of the current session in the identity bar.
+    pub workspace_current: &'static str,
 }
 
 /// English copy.
@@ -874,6 +894,16 @@ pub static ENGLISH: Strings = Strings {
     theme_light: "Light",
     theme_dark: "Dark",
     palette_theme: "Change theme",
+    quick_connect: "Quick connect",
+    quick_connect_hint: "Connect now. The host is saved only if you ask.",
+    quick_connect_title: "Quick connect",
+    quick_save_host: "Save as host",
+    quick_saved: "Saved as a host",
+    quick_unsaved_note: "This connection is not a saved host yet",
+    attempt_others: "Other connections",
+    attempt_cancel: "Cancel",
+    palette_group_recent: "Recent connections",
+    workspace_current: "Current",
 };
 
 /// Chinese copy.
@@ -1141,6 +1171,16 @@ pub static CHINESE: Strings = Strings {
     theme_light: "浅色",
     theme_dark: "深色",
     palette_theme: "切换主题",
+    quick_connect: "快速连接",
+    quick_connect_hint: "先连接，只有你要求时才保存为主机。",
+    quick_connect_title: "快速连接",
+    quick_save_host: "保存为主机",
+    quick_saved: "已保存为主机",
+    quick_unsaved_note: "这次连接还没有保存为主机",
+    attempt_others: "其他连接",
+    attempt_cancel: "取消",
+    palette_group_recent: "最近连接",
+    workspace_current: "当前",
 };
 
 /// A count followed by its unit, in the grammar of the language.

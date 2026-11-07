@@ -29,6 +29,8 @@ pub enum Command {
     NewHost,
     /// Opens the SSH configuration import.
     ImportSshConfig,
+    /// Connects with an address that is not saved as a host first.
+    QuickConnect,
     /// Closes the session on screen.
     CloseTab(SessionId),
     /// Switches the interface language.
@@ -46,6 +48,8 @@ pub enum Command {
 pub enum Group {
     /// Open sessions.
     Sessions,
+    /// Hosts that were reached, newest first.
+    Recent,
     /// Shells that can be started.
     Shells,
     /// Saved hosts.

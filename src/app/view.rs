@@ -67,9 +67,9 @@ pub use titlebar::{TRAFFIC_LIGHT_POSITION, custom_titlebar};
 
 /// Where a terminal comes from.
 ///
-/// A session keeps its kind for its whole life, and the destinations use it to decide
-/// which of them can show the terminal: a server session under "Local shells" would
-/// mislabel what the user is looking at.
+/// A session keeps its kind for its whole life. Local and remote sessions share the
+/// workspace; the kind is written on the session bar and the tab, not by sending the
+/// user to a different page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaneKind {
     Local,
@@ -98,18 +98,27 @@ struct OpenPane {
     pane: Entity<TerminalPane>,
 }
 
-/// A connection attempt the open form is watching.
+/// One connection attempt.
 ///
-/// One attempt at a time: the form holds the credentials of one host, so a second
-/// attempt would need a second form. Live sessions are not limited by this — they keep
-/// running, and keep answering, while another host is being connected to.
+/// Several may be in flight together. Each owns its session, its transport and, when
+/// it is not the form on screen, its own panel. Cancelling one does not touch the
+/// others. `session` is `None` after the transport has ended but the form is still
+/// showing the reason.
 struct Attempt {
     /// The session record the attempt owns.
     id: SessionId,
-    /// The transport, until it becomes a terminal.
-    session: RemoteSession,
+    /// The session generation this transport belongs to.
+    generation: u32,
+    /// The transport, until it becomes a terminal or ends.
+    session: Option<RemoteSession>,
     /// Whether a poll loop is already watching it.
     watching: bool,
+    /// The form while another attempt is the one on screen.
+    ///
+    /// `None` means the form is [`ShelluneView::remote`] because this attempt is focused.
+    panel: Option<RemotePanel>,
+    /// The host was not written to the host file.
+    ephemeral: bool,
 }
 
 /// How often the shell looks for events from a connecting remote session.
@@ -181,12 +190,29 @@ pub struct ShelluneView {
     import: ImportPanel,
     /// The configuration path field, present only while that panel is open.
     import_path: Option<Entity<TextField>>,
-    /// The remote connection form, present while a host is being connected to.
+    /// The connection form on screen. Other attempts keep theirs on [`Attempt::panel`].
     remote: Option<RemotePanel>,
-    /// The attempt in flight, before it becomes a terminal.
-    attempt: Option<Attempt>,
-    /// The session the open form belongs to once it is live.
+    /// Every connection attempt that has not become a terminal, focused or not.
+    attempts: Vec<Attempt>,
+    /// The session the open form belongs to, once an attempt exists for it.
     form_session: Option<SessionId>,
+    /// The quick-connection form is open.
+    quick_open: bool,
+    /// Why the quick-connection form refused to start.
+    quick_error: Option<String>,
+    /// The quick connection signs in with the system agent instead of a password.
+    quick_agent: bool,
+    /// Address, port, user and password of a connection that is not saved first.
+    quick_address: Entity<TextField>,
+    quick_port: Entity<TextField>,
+    quick_user: Entity<TextField>,
+    quick_password: Entity<TextField>,
+    /// Host used by the next [`Self::connect_remote`] when it must not be saved yet.
+    pending_ephemeral: Option<HostConfig>,
+    /// Successful quick connections the user has not saved as hosts.
+    unsaved: Vec<(SessionId, HostConfig)>,
+    /// The connection form is what the workspace is showing, instead of a terminal.
+    showing_connection_form: bool,
     /// The ended session a new attempt restarts, when the form was opened by a
     /// reconnect instead of by a host row.
     reconnect: Option<SessionId>,
@@ -249,9 +275,9 @@ pub struct ShelluneView {
     focus_host_dialog: bool,
     /// The session row whose menu is open, and where it was opened.
     session_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
-    /// The attempt a test scripted, kept so its answers can be inspected.
+    /// Attempts a test scripted, kept so their answers can be inspected.
     #[cfg(test)]
-    scripted: Option<shellune_ssh::ScriptedSession>,
+    scripted: Vec<(SessionId, shellune_ssh::ScriptedSession)>,
 }
 
 /// The three credential fields of the remote form.
@@ -346,6 +372,19 @@ impl ShelluneView {
             field.set_revealable(true, cx);
             field
         });
+        let quick_address = cx.new(|cx| TextField::new(strings.host_field_address, cx));
+        let quick_port = cx.new(|cx| {
+            let mut field = TextField::new(strings.host_field_port, cx);
+            field.set_text("22", cx);
+            field
+        });
+        let quick_user = cx.new(|cx| TextField::new(strings.host_field_user, cx));
+        let quick_password = cx.new(|cx| {
+            let mut field = TextField::new(strings.auth_password, cx);
+            field.set_masked(true, cx);
+            field.set_revealable(true, cx);
+            field
+        });
 
         let mut view = Self {
             workspace,
@@ -365,8 +404,18 @@ impl ShelluneView {
             import: ImportPanel::new(),
             import_path: None,
             remote: None,
-            attempt: None,
+            attempts: Vec::new(),
             form_session: None,
+            quick_open: false,
+            quick_error: None,
+            quick_agent: false,
+            quick_address,
+            quick_port,
+            quick_user,
+            quick_password,
+            pending_ephemeral: None,
+            unsaved: Vec::new(),
+            showing_connection_form: false,
             reconnect: None,
             remote_fields: RemoteFields {
                 password,
@@ -396,7 +445,7 @@ impl ShelluneView {
             watching_appearance: false,
             session_terminal: false,
             #[cfg(test)]
-            scripted: None,
+            scripted: Vec::new(),
         };
         view.bind_cleanup(cx);
         view.bind_shell_path(cx);
@@ -553,19 +602,6 @@ impl ShelluneView {
         self.active.and_then(|id| self.pane_for(id))
     }
 
-    /// Which kind of terminal the selected session runs.
-    fn active_kind(&self) -> Option<PaneKind> {
-        let id = self.active?;
-        let session = self.workspace.session(id)?;
-        Some(PaneKind::of(session.kind()))
-    }
-
-    fn kind_of(&self, id: SessionId) -> Option<PaneKind> {
-        self.workspace
-            .session(id)
-            .map(|session| PaneKind::of(session.kind()))
-    }
-
     /// Takes the keyboard to the terminal of one session, when a window has one.
     fn focus_pane(&self, id: SessionId, cx: &mut Context<Self>) {
         let Some(pane) = self.pane_for(id) else {
@@ -579,14 +615,30 @@ impl ShelluneView {
 
     /// Adds a terminal for a session that just started and shows it.
     fn push_pane(&mut self, tag: EventTag, pane: Entity<TerminalPane>, cx: &mut Context<Self>) {
+        self.attach_pane(tag, pane, true, cx);
+    }
+
+    /// Adds a terminal. `focus` is false when a background attempt finished while the
+    /// user is looking at another session or form: the new terminal exists, but it
+    /// does not take the screen or the keyboard.
+    fn attach_pane(
+        &mut self,
+        tag: EventTag,
+        pane: Entity<TerminalPane>,
+        focus: bool,
+        cx: &mut Context<Self>,
+    ) {
         // The pane reports what its process does; the entry is observed so the session
         // list repeats the truth about that one session.
         cx.observe(&pane, |view, pane, cx| view.sync_pane(pane, cx))
             .detach();
         self.panes.push(OpenPane { tag, pane });
-        self.active = Some(tag.session);
-        self.session_terminal = true;
-        self.focus_pane(tag.session, cx);
+        if focus {
+            self.active = Some(tag.session);
+            self.session_terminal = true;
+            self.showing_connection_form = false;
+            self.focus_pane(tag.session, cx);
+        }
         cx.notify();
     }
 
@@ -619,26 +671,32 @@ impl ShelluneView {
         true
     }
 
-    /// Shows the terminal of one session, from wherever the user is (R7).
+    /// Shows the terminal of one session, from wherever the user is.
+    ///
+    /// Local and remote sessions share this workspace. Selecting one does not send
+    /// the user to a different page because of its kind. A tab that is still
+    /// connecting focuses that attempt's own form and leaves every other attempt
+    /// running.
     pub fn activate(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        // Only a session with a terminal can be shown: an attempt that is still
-        // connecting has nothing to draw, and a closed session is over. Selecting its
-        // tab therefore leaves the terminal on screen untouched.
         if self.pane_for(id).is_none() {
+            if self.attempt_index(id).is_some() {
+                self.focus_attempt(id, cx);
+            }
             return;
         }
-        let Some(kind) = self.kind_of(id) else {
-            return;
-        };
+        self.showing_connection_form = false;
         self.active = Some(id);
         self.session_terminal = true;
-        // A terminal is only visible in a destination that lists its kind, so selecting
-        // one takes the user to that destination rather than leaving them on a page that
-        // cannot show what they just chose.
-        self.workspace.select(match kind {
-            PaneKind::Local => Destination::LocalShells,
-            PaneKind::Remote => Destination::Sessions,
-        });
+        // Hosts and transfers are context panels. Coming back from one of them lands
+        // on the workspace, which shows whichever session was selected.
+        if !matches!(
+            self.workspace.destination(),
+            Destination::LocalShells | Destination::Sessions
+        ) {
+            self.workspace.select(Destination::LocalShells);
+            self.workspace
+                .set_context(shellune_core::PanelSection::None);
+        }
         self.focus_pane(id, cx);
         cx.notify();
     }
@@ -693,16 +751,19 @@ impl ShelluneView {
     /// the same way, so a tab can be closed while its connection is still being made,
     /// and the other sessions keep answering.
     pub fn close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if self
-            .attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.id == id)
-            && let Some(mut attempt) = self.attempt.take()
-        {
-            attempt.session.close();
-        }
+        self.discard_attempt(id);
+        self.unsaved.retain(|(session, _)| *session != id);
         self.drop_pane(id, cx);
         self.workspace.session_closed(id);
+        // A connecting attempt has no terminal, so closing it does not move the
+        // selection by itself. Point it at a session that is still open.
+        if self.active == Some(id) && self.pane_for(id).is_none() {
+            self.active = self
+                .panes
+                .last()
+                .map(|open| open.tag.session)
+                .or_else(|| self.attempts.first().map(|attempt| attempt.id));
+        }
         // A form that was showing this session can no longer be live: it goes away with
         // the session it belonged to, and takes the secrets it held with it.
         if self.form_session == Some(id) {
@@ -711,6 +772,7 @@ impl ShelluneView {
                 panel.clear_secrets();
             }
             self.remote = None;
+            self.showing_connection_form = false;
         }
         if self.reconnect == Some(id) {
             self.reconnect = None;
@@ -979,13 +1041,16 @@ impl ShelluneView {
         for id in ids {
             self.close_session(id, cx);
         }
-        if let Some(mut attempt) = self.attempt.take() {
-            attempt.session.close();
-            self.workspace.session_closed(attempt.id);
+        let pending: Vec<SessionId> = self.attempts.iter().map(|attempt| attempt.id).collect();
+        for id in pending {
+            self.discard_attempt(id);
+            self.workspace.session_closed(id);
         }
         self.remote = None;
         self.form_session = None;
         self.reconnect = None;
+        self.showing_connection_form = false;
+        self.unsaved.clear();
     }
 
     /// Starts another process for a session that ended (R7).
@@ -1038,9 +1103,12 @@ impl ShelluneView {
                 // until the form really starts a new attempt: a tab that said
                 // "connecting" over an empty form would claim a connection nobody made.
                 self.drop_pane(id, cx);
+                self.stash_focused_panel();
+                self.discard_attempt(id);
                 self.reconnect = Some(id);
                 self.form_session = Some(id);
                 self.remote = Some(RemotePanel::new(&host));
+                self.showing_connection_form = true;
                 self.sync_remote_fields(cx);
                 // A host that remembers how to sign in reconnects in one click too.
                 self.connect_when_ready(&host, cx);
@@ -1130,12 +1198,33 @@ impl ShelluneView {
     }
 
     /// Selects a destination, moving keyboard focus with it.
+    ///
+    /// Returning to the workspace gives the keyboard back to the session that was
+    /// on screen. A host list that is still loading does not get in the way: the
+    /// destination changes either way.
     fn select(&mut self, destination: Destination, window: &mut Window, cx: &mut Context<Self>) {
         if destination == Destination::Sessions {
             // The page itself was asked for: it lists the sessions.
             self.session_terminal = false;
+            self.showing_connection_form = false;
+        }
+        if destination == Destination::LocalShells {
+            self.showing_connection_form = false;
         }
         self.workspace.select(destination);
+        self.workspace.set_context(match destination {
+            Destination::Hosts => shellune_core::PanelSection::Hosts,
+            Destination::Transfers => shellune_core::PanelSection::Transfers,
+            _ => shellune_core::PanelSection::None,
+        });
+        if self.shows_terminal(destination)
+            && let Some(pane) = self.active_pane()
+        {
+            let handle = pane.read(cx).focus_handle().clone();
+            window.focus(&handle);
+            cx.notify();
+            return;
+        }
         let handle = self.destination_focus(destination).clone();
         window.focus(&handle);
         cx.notify();
@@ -1670,19 +1759,249 @@ impl ShelluneView {
         passphrase_field.update(cx, |field, cx| field.set_text(passphrase, cx));
     }
 
-    /// Opens the connection form for one saved host.
-    ///
-    /// One form, one attempt: opening the form for another host ends the attempt that
-    /// was still running, and records it as closed rather than leaving a tab that claims
-    /// a connection nobody is watching any more.
-    pub(crate) fn open_remote(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
-        if let Some(mut attempt) = self.attempt.take() {
-            attempt.session.close();
-            self.workspace.session_closed(attempt.id);
+    /// Index of one attempt.
+    fn attempt_index(&self, id: SessionId) -> Option<usize> {
+        self.attempts.iter().position(|attempt| attempt.id == id)
+    }
+
+    /// The form of one attempt: the screen's form when it is focused, otherwise the
+    /// copy kept on the attempt.
+    fn panel_for(&self, id: SessionId) -> Option<&RemotePanel> {
+        if self.form_session == Some(id) {
+            return self.remote.as_ref();
         }
+        self.attempts
+            .iter()
+            .find(|attempt| attempt.id == id)
+            .and_then(|attempt| attempt.panel.as_ref())
+    }
+
+    /// The form of one attempt, for an update that belongs to that attempt only.
+    fn panel_for_mut(&mut self, id: SessionId) -> Option<&mut RemotePanel> {
+        if self.form_session == Some(id) {
+            return self.remote.as_mut();
+        }
+        self.attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == id)
+            .and_then(|attempt| attempt.panel.as_mut())
+    }
+
+    /// The transport of one attempt.
+    fn transport_mut(&mut self, id: SessionId) -> Option<&mut RemoteSession> {
+        self.attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == id)
+            .and_then(|attempt| attempt.session.as_mut())
+    }
+
+    /// Takes the transport of one attempt and drops that attempt.
+    ///
+    /// The focused form stays in [`Self::remote`]. A parked form is dropped with the
+    /// attempt: the caller already copied anything it still needs, such as the host.
+    /// A failure uses [`Self::close_attempt_transport`] instead, so the parked form
+    /// can stay and show why that one attempt ended.
+    fn take_transport(&mut self, id: SessionId) -> Option<RemoteSession> {
+        let index = self.attempt_index(id)?;
+        let mut attempt = self.attempts.remove(index);
+        if self.form_session == Some(id) && self.remote.is_none() {
+            self.remote = attempt.panel.take();
+        }
+        attempt.session.take()
+    }
+
+    /// Closes one attempt's transport and forgets it. Other attempts stay.
+    fn discard_attempt(&mut self, id: SessionId) {
+        if let Some(mut session) = self.take_transport(id) {
+            session.close();
+        }
+        #[cfg(test)]
+        self.scripted.retain(|(session, _)| *session != id);
+    }
+
+    /// Closes one attempt's transport after it failed, and keeps its form.
+    ///
+    /// The focused form stays on screen. A background form stays on its attempt, so
+    /// the other-connections strip can still name it and the user can still cancel
+    /// it. Neither path touches any other attempt.
+    fn close_attempt_transport(&mut self, id: SessionId) {
+        if self.form_session == Some(id) {
+            if let Some(mut session) = self.take_transport(id) {
+                session.close();
+            }
+        } else if let Some(index) = self.attempt_index(id) {
+            if let Some(mut session) = self.attempts[index].session.take() {
+                session.close();
+            }
+            self.attempts[index].watching = false;
+        }
+        #[cfg(test)]
+        self.scripted.retain(|(session, _)| *session != id);
+    }
+
+    /// Puts the focused form back onto its attempt so another form can take the screen.
+    fn stash_focused_panel(&mut self) {
+        let Some(id) = self.form_session else {
+            return;
+        };
+        let Some(index) = self.attempt_index(id) else {
+            return;
+        };
+        if let Some(panel) = self.remote.take() {
+            self.attempts[index].panel = Some(panel);
+        }
+    }
+
+    /// Shows one attempt's own form without touching any other attempt.
+    fn focus_attempt(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.form_session != Some(id) {
+            self.stash_focused_panel();
+            let Some(index) = self.attempt_index(id) else {
+                cx.notify();
+                return;
+            };
+            self.remote = self.attempts[index].panel.take();
+            self.form_session = Some(id);
+        }
+        self.active = Some(id);
+        self.showing_connection_form = true;
+        self.session_terminal = true;
+        if !matches!(
+            self.workspace.destination(),
+            Destination::LocalShells | Destination::Sessions | Destination::Hosts
+        ) {
+            self.workspace.select(Destination::LocalShells);
+        }
+        self.sync_remote_fields(cx);
+        cx.notify();
+    }
+
+    /// Opens the quick-connection form on the workspace the user is already in.
+    fn open_quick_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick_open = true;
+        self.quick_error = None;
+        self.shell_menu_open = false;
+        if !matches!(
+            self.workspace.destination(),
+            Destination::LocalShells | Destination::Sessions
+        ) {
+            self.select(Destination::LocalShells, window, cx);
+        }
+        let handle = self.quick_address.read(cx).focus_handle().clone();
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    /// Builds an unsaved host from the quick-connection form and starts it.
+    fn start_quick_connect(&mut self, cx: &mut Context<Self>) {
+        if self.prepare_quick_connection(cx) {
+            self.quick_open = false;
+            self.connect_remote(cx);
+        }
+    }
+
+    /// Fills the connection form from the quick-connection fields.
+    ///
+    /// Nothing is written to the host file. Missing fields stay on the form with a
+    /// reason, and what was typed is kept.
+    pub(crate) fn prepare_quick_connection(&mut self, cx: &mut Context<Self>) -> bool {
+        let strings = self.strings();
+        let address = self.quick_address.read(cx).text().trim().to_owned();
+        let port_text = self.quick_port.read(cx).text().trim().to_owned();
+        let user = self.quick_user.read(cx).text().trim().to_owned();
+        let password = self.quick_password.read(cx).text().to_owned();
+        let port = match port_text.parse::<u16>() {
+            Ok(port) if port != 0 => port,
+            _ => {
+                self.quick_error = Some(strings.host_field_port.to_owned());
+                cx.notify();
+                return false;
+            }
+        };
+        if !self.quick_agent && password.is_empty() {
+            self.quick_error = Some(strings.auth_missing_password.to_owned());
+            cx.notify();
+            return false;
+        }
+        let name = if user.is_empty() {
+            address.clone()
+        } else {
+            format!("{user}@{address}")
+        };
+        let mut host = match HostConfig::new(name, address, port, user) {
+            Ok(host) => host,
+            Err(error) => {
+                self.quick_error = Some(error.to_string());
+                cx.notify();
+                return false;
+            }
+        };
+        if self.quick_agent {
+            host.set_auth(Some(shellune_core::AuthMethodKind::Agent));
+        } else {
+            host.set_auth(Some(shellune_core::AuthMethodKind::Password));
+        }
+        self.stash_focused_panel();
         self.reconnect = None;
         self.form_session = None;
+        let mut panel = RemotePanel::new(&host);
+        if self.quick_agent {
+            panel.select_method(MethodChoice::Agent);
+        } else {
+            panel.select_method(MethodChoice::Password);
+            panel.set_password(password);
+        }
+        self.pending_ephemeral = Some(host);
+        self.remote = Some(panel);
+        self.showing_connection_form = true;
+        self.quick_error = None;
+        self.sync_remote_fields(cx);
+        cx.notify();
+        true
+    }
+
+    /// Writes a quick connection's host, and only then.
+    ///
+    /// The password is not part of the host record. Cancelling this leaves the
+    /// session connected and the file unchanged.
+    fn save_quick_host(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(index) = self.unsaved.iter().position(|(session, _)| *session == id) else {
+            return;
+        };
+        let host = self.unsaved[index].1.clone();
+        let mut next = self.book.clone();
+        if let Err(error) = next.insert(host.clone()) {
+            self.hosts.set_message(error.to_string(), true);
+            cx.notify();
+            return;
+        }
+        match self.store.save(&next) {
+            Ok(()) => {
+                self.book = next;
+                let items = self.book.hosts().to_vec();
+                self.workspace.replace_hosts(SectionStatus::Ready, items);
+                self.unsaved.remove(index);
+                self.record_host_connection(host.id(), remote::now_unix(), cx);
+                self.hosts
+                    .set_message(self.strings().quick_saved.to_owned(), false);
+            }
+            Err(error) => self.hosts.set_message(error.to_string(), true),
+        }
+        cx.notify();
+    }
+
+    /// Opens the connection form for one saved host.
+    ///
+    /// An attempt that is already running is parked with its own form. It is not
+    /// cancelled, and its session stays. The new form asks only for what this host
+    /// still needs.
+    pub(crate) fn open_remote(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.stash_focused_panel();
+        self.reconnect = None;
+        self.form_session = None;
+        self.pending_ephemeral = None;
         self.remote = Some(RemotePanel::new(host));
+        self.showing_connection_form = true;
         self.sync_remote_fields(cx);
         self.connect_when_ready(host, cx);
         cx.notify();
@@ -1816,36 +2135,52 @@ impl ShelluneView {
         panel.set_status(RemoteStatus::Connecting);
         // The session the open form belongs to, whether it is still connecting or
         // already live: an answer to a trust question and a close both need it.
+        let ephemeral = self
+            .pending_ephemeral
+            .take()
+            .is_some_and(|pending| pending.id() == host.id());
+        let generation = self
+            .workspace
+            .session(id)
+            .map(Session::generation)
+            .unwrap_or(0);
         self.form_session = Some(id);
-        self.attempt = Some(Attempt {
+        self.active = Some(id);
+        self.attempts.retain(|attempt| attempt.id != id);
+        self.attempts.push(Attempt {
             id,
-            session: RemoteSession::connect(ConnectRequest::new(
+            generation,
+            session: Some(RemoteSession::connect(ConnectRequest::new(
                 host.address(),
                 host.port().get(),
                 host.user(),
                 auth,
                 size,
                 known,
-            )),
+            ))),
             watching: false,
+            panel: None,
+            ephemeral,
         });
-        self.watch_remote(cx);
+        self.watch_attempt(id, cx);
         cx.notify();
     }
 
-    /// Polls the attempt until it becomes a terminal or fails.
-    fn watch_remote(&mut self, cx: &mut Context<Self>) {
-        match self.attempt.as_ref() {
-            Some(attempt) if !attempt.watching => {}
-            _ => return,
+    /// Polls one attempt until it becomes a terminal or fails.
+    ///
+    /// Each attempt has its own loop. One that ends does not stop the others.
+    fn watch_attempt(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(attempt) = self.attempts.iter_mut().find(|attempt| attempt.id == id) else {
+            return;
+        };
+        if attempt.watching || attempt.session.is_none() {
+            return;
         }
-        if let Some(attempt) = self.attempt.as_mut() {
-            attempt.watching = true;
-        }
+        attempt.watching = true;
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(REMOTE_POLL_INTERVAL).await;
-                match this.update(cx, |view, cx| view.poll_remote(cx)) {
+                match this.update(cx, |view, cx| view.poll_attempt(id, cx)) {
                     Ok(true) => {}
                     _ => break,
                 }
@@ -1862,12 +2197,21 @@ impl ShelluneView {
     /// Everything drained after the notice is therefore kept and handed to the
     /// terminal once it exists, because the channel has already given those events up
     /// and there is nothing to read them from later.
-    fn poll_remote(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.attempt.as_ref().map(|attempt| attempt.id) else {
+    fn poll_attempt(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.attempt_index(id) else {
             return false;
         };
-        let events = match self.attempt.as_mut() {
-            Some(attempt) => attempt.session.drain(),
+        let generation = self.attempts[index].generation;
+        if !self
+            .workspace
+            .session(id)
+            .is_some_and(|session| session.accepts_event(generation))
+        {
+            self.discard_attempt(id);
+            return false;
+        }
+        let events = match self.attempts[index].session.as_mut() {
+            Some(session) => session.drain(),
             None => return false,
         };
         let mut pending: Vec<SourceEvent> = Vec::new();
@@ -1909,25 +2253,34 @@ impl ShelluneView {
         }
 
         if let Some(prompt) = prompt {
-            if let Some(panel) = self.remote.as_mut() {
+            if let Some(panel) = self.panel_for_mut(id) {
                 panel.set_status(RemoteStatus::VerifyingHost(prompt));
             }
             cx.notify();
         }
         if let Some(error) = failed {
-            if let Some(mut attempt) = self.attempt.take() {
-                attempt.session.close();
-            }
+            self.close_attempt_transport(id);
             self.on_remote_failed(id, &error, cx);
             return false;
         }
         if !connected {
             return true;
         }
-        let Some(attempt) = self.attempt.take() else {
+        let host = self.panel_for(id).map(|panel| panel.host().clone());
+        let ephemeral = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == id)
+            .is_some_and(|attempt| attempt.ephemeral);
+        let Some(session) = self.take_transport(id) else {
             return false;
         };
-        self.on_remote_connected(id, attempt.session, pending, cx);
+        let Some(host) = host else {
+            self.workspace.session_closed(id);
+            return false;
+        };
+        let show = self.form_session == Some(id);
+        self.on_remote_connected(id, session, pending, host, ephemeral, show, cx);
         false
     }
 
@@ -1937,15 +2290,11 @@ impl ShelluneView {
         id: SessionId,
         mut session: RemoteSession,
         pending: Vec<SourceEvent>,
+        host: HostConfig,
+        ephemeral: bool,
+        show: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) else {
-            // The form was closed while the attempt was still being made: there is
-            // nothing left that could show this terminal, so the session is not claimed
-            // as open.
-            self.workspace.session_closed(id);
-            return;
-        };
         let Some(tag) = self.workspace.session(id).map(|session| session.tag()) else {
             return;
         };
@@ -1969,12 +2318,20 @@ impl ShelluneView {
         pane.update(cx, |pane, cx| pane.adopt_events(tag, pending, cx));
         self.workspace.session_verified_and_authenticated(id);
         self.workspace.session_connected(id);
-        self.form_session = Some(id);
-        if let Some(panel) = self.remote.as_mut() {
-            panel.set_status(RemoteStatus::Live);
+        if show {
+            self.form_session = Some(id);
+            if let Some(panel) = self.remote.as_mut() {
+                panel.set_status(RemoteStatus::Live);
+            }
+            self.showing_connection_form = false;
         }
-        // The recent view only ever shows hosts that really answered.
-        self.record_host_connection(host.id(), remote::now_unix(), cx);
+        // A quick connection has no host record to mark as recent. Saving it is a
+        // separate, explicit step. A saved host is recorded only after it really answered.
+        if ephemeral {
+            self.unsaved.push((id, host.clone()));
+        } else if self.book.host(host.id()).is_some() {
+            self.record_host_connection(host.id(), remote::now_unix(), cx);
+        }
         if let Some(link) = file_link {
             self.files
                 .attach(id, host.name(), host.target(), Box::new(link));
@@ -1988,10 +2345,13 @@ impl ShelluneView {
             let line = format!("{command}\r");
             pane.update(cx, |pane, cx| pane.type_text(&line, cx));
         }
-        self.push_pane(tag, pane, cx);
-        // The new terminal is what the user connected for, so it is shown at once
-        // instead of leaving them on the hosts page with a tab to find.
-        self.activate(id, cx);
+        self.attach_pane(tag, pane, show, cx);
+        // The terminal the user was waiting for is shown at once. A connection that
+        // finished in the background only adds its tab, so it does not cover the
+        // form or session the user is looking at.
+        if show {
+            self.activate(id, cx);
+        }
     }
 
     /// Records an attempt that did not open, in both the form and the session list.
@@ -2002,7 +2362,7 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         let failure = RemoteFailure::from_error(error);
-        if let Some(panel) = self.remote.as_mut() {
+        if let Some(panel) = self.panel_for_mut(id) {
             panel.fail(failure);
         }
         self.workspace.session_failed(id, error.session_failure());
@@ -2032,10 +2392,10 @@ impl ShelluneView {
         let now = remote::now_unix();
 
         if !accept {
-            if let Some(attempt) = self.attempt.as_mut() {
-                attempt.session.answer_host_key(false);
+            if let Some(session) = self.transport_mut(id) {
+                session.answer_host_key(false);
             }
-            if let Some(panel) = self.remote.as_mut() {
+            if let Some(panel) = self.panel_for_mut(id) {
                 panel.fail(RemoteFailure::new(
                     strings.trust_rejected_note,
                     strings.remote_close,
@@ -2072,18 +2432,17 @@ impl ShelluneView {
         // closed, a server that hung up) cannot be told to accept anything, so the
         // record is taken back rather than left claiming a decision that nothing used.
         let delivered = self
-            .attempt
-            .as_mut()
-            .is_some_and(|attempt| attempt.session.answer_host_key(true));
+            .transport_mut(id)
+            .is_some_and(|session| session.answer_host_key(true));
         if !delivered {
             // The file gets the book that was there before this answer, so nothing
             // the retracted acceptance added survives a restart.
             self.trust_book = previous;
             let _ = self.trust.save(&self.trust_book);
-            if let Some(mut attempt) = self.attempt.take() {
-                attempt.session.close();
+            if let Some(mut session) = self.take_transport(id) {
+                session.close();
             }
-            if let Some(panel) = self.remote.as_mut() {
+            if let Some(panel) = self.panel_for_mut(id) {
                 panel.fail(RemoteFailure::new(
                     strings.trust_undelivered_note,
                     strings.remote_close,
@@ -2109,13 +2468,13 @@ impl ShelluneView {
 
     /// Ends an attempt because the identity could not be recorded.
     fn refuse_with(&mut self, id: SessionId, failure: RemoteFailure, cx: &mut Context<Self>) {
-        if let Some(attempt) = self.attempt.as_mut() {
-            attempt.session.answer_host_key(false);
+        if let Some(session) = self.transport_mut(id) {
+            session.answer_host_key(false);
         }
-        if let Some(mut attempt) = self.attempt.take() {
-            attempt.session.close();
+        if let Some(mut session) = self.take_transport(id) {
+            session.close();
         }
-        if let Some(panel) = self.remote.as_mut() {
+        if let Some(panel) = self.panel_for_mut(id) {
             panel.fail(failure);
         }
         self.workspace
@@ -2145,10 +2504,14 @@ impl ShelluneView {
             self.install_scripted_session(id, scripted, cx);
         }
         // The prompt reaches the form the same way a real one does.
-        self.poll_remote(cx);
+        if let Some(id) = self.form_session {
+            self.poll_attempt(id, cx);
+        }
     }
 
     /// Puts a session whose events a test supplies in place of a connecting attempt.
+    ///
+    /// Only the attempt with `id` is replaced. Any other attempt keeps its transport.
     #[cfg(test)]
     pub(crate) fn install_scripted_session(
         &mut self,
@@ -2156,12 +2519,35 @@ impl ShelluneView {
         mut scripted: shellune_ssh::ScriptedSession,
         cx: &mut Context<Self>,
     ) {
-        self.attempt = Some(Attempt {
+        let generation = self
+            .workspace
+            .session(id)
+            .map(Session::generation)
+            .unwrap_or(0);
+        let ephemeral = if self.pending_ephemeral.as_ref().is_some_and(|host| {
+            self.remote
+                .as_ref()
+                .is_some_and(|panel| panel.host().id() == host.id())
+        }) {
+            self.pending_ephemeral = None;
+            true
+        } else {
+            self.attempts
+                .iter()
+                .find(|attempt| attempt.id == id)
+                .is_some_and(|attempt| attempt.ephemeral)
+        };
+        self.attempts.retain(|attempt| attempt.id != id);
+        self.attempts.push(Attempt {
             id,
-            session: scripted.take_session(),
+            generation,
+            session: Some(scripted.take_session()),
             watching: false,
+            panel: None,
+            ephemeral,
         });
-        self.scripted = Some(scripted);
+        self.scripted.retain(|(session, _)| *session != id);
+        self.scripted.push((id, scripted));
         cx.notify();
     }
 
@@ -2189,6 +2575,8 @@ impl ShelluneView {
             None => self.workspace.register_remote_session(&host).id(),
         };
         self.form_session = Some(id);
+        self.active = Some(id);
+        self.showing_connection_form = true;
         let scripted = shellune_ssh::ScriptedSession::new();
         for event in events {
             scripted.push(event);
@@ -2205,27 +2593,49 @@ impl ShelluneView {
     /// stopped would: the question stays on screen, but nothing can answer it.
     #[cfg(test)]
     pub(crate) fn end_scripted_attempt(&mut self, cx: &mut Context<Self>) {
-        self.attempt = None;
-        self.scripted = None;
+        if let Some(id) = self.form_session {
+            let _ = self.take_transport(id);
+            self.scripted.retain(|(session, _)| *session != id);
+        }
         cx.notify();
     }
 
-    /// The answers the scripted attempt received, in the order they were given.
+    /// The answers the focused scripted attempt received, in the order they were given.
     #[cfg(test)]
     pub(crate) fn scripted_answers(&self) -> Vec<shellune_ssh::TrustAnswer> {
+        let focused = self.form_session;
         self.scripted
-            .as_ref()
-            .map(shellune_ssh::ScriptedSession::answers)
+            .iter()
+            .rev()
+            .find(|(id, _)| focused.is_none_or(|focused| *id == focused))
+            .map(|(_, scripted)| scripted.answers())
             .unwrap_or_default()
     }
 
-    /// Applies one round of remote events, the way the poll loop does.
+    /// How many connection attempts still have a transport.
+    #[cfg(test)]
+    pub(crate) fn pending_attempt_count(&self) -> usize {
+        self.attempts
+            .iter()
+            .filter(|attempt| attempt.session.is_some())
+            .count()
+    }
+
+    /// Applies one round of remote events for every attempt, the way each poll loop does.
     ///
     /// The loop itself waits on the window timer, which a test cannot advance, so a
-    /// test drives the same call directly.
+    /// test drives the same call directly. The result is whether any attempt is still
+    /// waiting.
     #[cfg(test)]
     pub(crate) fn pump_remote_once(&mut self, cx: &mut Context<Self>) -> bool {
-        self.poll_remote(cx)
+        let ids: Vec<SessionId> = self.attempts.iter().map(|attempt| attempt.id).collect();
+        let mut waiting = false;
+        for id in ids {
+            if self.poll_attempt(id, cx) {
+                waiting = true;
+            }
+        }
+        waiting
     }
 
     /// Runs a failed attempt through the same path the transport uses.
@@ -2258,22 +2668,23 @@ impl ShelluneView {
         self.connect_remote(cx);
     }
 
-    /// Closes the connection form and the session it opened.
+    /// Closes the connection form on screen and the attempt it belongs to.
+    ///
+    /// Other attempts keep running. A reconnect the user abandoned leaves its
+    /// session as it was: disconnected, with the reason it ended.
     fn close_remote(&mut self, cx: &mut Context<Self>) {
-        if let Some(mut attempt) = self.attempt.take() {
-            attempt.session.close();
-            self.workspace.session_closed(attempt.id);
-        }
-        if let Some(id) = self.form_session.take() {
+        if let Some(id) = self.form_session {
             self.close_session(id, cx);
+        } else {
+            if let Some(panel) = self.remote.as_mut() {
+                panel.clear_secrets();
+            }
+            self.remote = None;
+            self.showing_connection_form = false;
+            cx.notify();
         }
-        // A reconnect the user abandoned leaves its session as it was: disconnected,
-        // with the reason it ended, and nothing reopened behind their back.
         self.reconnect = None;
-        if let Some(panel) = self.remote.as_mut() {
-            panel.clear_secrets();
-        }
-        self.remote = None;
+        self.pending_ephemeral = None;
         cx.notify();
     }
 
@@ -2408,6 +2819,7 @@ impl ShelluneView {
         }
 
         self.workspace.session_connected(id);
+        self.workspace.clear_session_failure();
         // The size the pane actually uses is the one the next session starts with.
         self.workspace
             .set_local_font_size(pane.read(cx).font_size());
@@ -2449,6 +2861,7 @@ impl ShelluneView {
             return;
         }
         self.workspace.session_connected(id);
+        self.workspace.clear_session_failure();
         self.workspace
             .set_local_font_size(pane.read(cx).font_size());
         self.push_pane(tag, pane, cx);
@@ -2507,6 +2920,185 @@ impl ShelluneView {
     // -----------------------------------------------------------------------
     // Remote connections: the panel (R4, R6)
     // -----------------------------------------------------------------------
+
+    /// The quick-connection form. It never writes a host by itself.
+    fn quick_panel(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let mut card = components::card(metrics)
+            .w_full()
+            .max_w(metrics.scale(480.0))
+            .debug_selector(|| "quick.panel".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(metrics.title_size())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(strings.quick_connect_title),
+                    )
+                    .child(
+                        components::icon_only_button(Icon::Close, metrics)
+                            .id("quick.close")
+                            .debug_selector(|| "quick.close".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.quick_open = false;
+                                this.quick_error = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(strings.quick_connect_hint),
+            )
+            .child(self.remote_field(
+                SharedString::from("quick.address"),
+                strings.host_field_address,
+                self.quick_address.clone(),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .child(div().w(metrics.scale(120.0)).child(self.remote_field(
+                        SharedString::from("quick.port"),
+                        strings.host_field_port,
+                        self.quick_port.clone(),
+                    )))
+                    .child(div().flex_1().child(self.remote_field(
+                        SharedString::from("quick.user"),
+                        strings.host_field_user,
+                        self.quick_user.clone(),
+                    ))),
+            );
+        if !self.quick_agent {
+            card = card.child(self.remote_field(
+                SharedString::from("quick.password"),
+                strings.auth_password,
+                self.quick_password.clone(),
+            ));
+        }
+        card = card.child(
+            self.text_button(
+                SharedString::from("quick.agent"),
+                strings.auth_agent,
+                if self.quick_agent {
+                    Variant::Primary
+                } else {
+                    Variant::Secondary
+                },
+                cx,
+                |view, cx| {
+                    view.quick_agent = !view.quick_agent;
+                    cx.notify();
+                },
+            )
+            .debug_selector(|| "quick.agent".to_owned()),
+        );
+        if let Some(reason) = &self.quick_error {
+            card = card.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Danger.text())
+                    .debug_selector(|| "quick.error".to_owned())
+                    .child(SharedString::from(reason.clone())),
+            );
+        }
+        card.child(
+            div().flex().justify_end().child(
+                self.icon_text_button(
+                    SharedString::from("quick.connect"),
+                    Icon::Plug,
+                    strings.remote_connect,
+                    Variant::Primary,
+                    cx,
+                    |view, cx| view.start_quick_connect(cx),
+                )
+                .debug_selector(|| "quick.connect".to_owned()),
+            ),
+        )
+    }
+
+    /// Attempts that are not the form on screen, each with its own cancel.
+    fn other_attempts(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let others: Vec<(usize, SessionId)> = self
+            .attempts
+            .iter()
+            .enumerate()
+            .filter(|(_, attempt)| self.form_session != Some(attempt.id))
+            .filter(|(_, attempt)| {
+                attempt.session.is_some()
+                    || attempt
+                        .panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.status().failure().is_some())
+            })
+            .map(|(index, attempt)| (index, attempt.id))
+            .collect();
+        if others.is_empty() {
+            return div();
+        }
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "attempt.others".to_owned())
+            .child(components::section_label(strings.attempt_others, metrics));
+        for (index, id) in others {
+            let title = self
+                .panel_for(id)
+                .map(|panel| panel.host().name().to_owned())
+                .or_else(|| {
+                    self.workspace
+                        .session(id)
+                        .map(|session| session.title().to_owned())
+                })
+                .unwrap_or_default();
+            let status = self
+                .workspace
+                .session(id)
+                .map(|session| copy::session_state_label(session.state(), self.workspace.locale()))
+                .unwrap_or_default();
+            column = column.child(
+                components::row(metrics)
+                    .id(("attempt.row", index))
+                    .debug_selector({
+                        let selector = format!("attempt.row.{index}");
+                        move || selector
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.focus_attempt(id, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(components::stacked(title, status, metrics)),
+                    )
+                    .child({
+                        let selector = format!("attempt.cancel.{index}");
+                        components::compact_button(strings.attempt_cancel, Variant::Danger, metrics)
+                            .id(SharedString::from(selector.clone()))
+                            .debug_selector(move || selector)
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                // The row opens the attempt; this button only ends it.
+                                cx.stop_propagation();
+                                this.close_session(id, cx);
+                            }))
+                    }),
+            );
+        }
+        column
+    }
 
     /// The connection form, the trust question and the remote terminal.
     ///
@@ -2890,10 +3482,13 @@ impl ShelluneView {
             .w_full()
             .gap(metrics.scale(spacing::SNUG));
         // A connection in progress belongs at the top of the destination that
-        // started it, beside the host it is for.
+        // started it, beside the host it is for. Attempts that are not the form on
+        // screen stay listed after that form is closed, so each one can still be
+        // cancelled on its own.
         if self.remote.is_some() {
             column = column.child(self.remote_panel(cx));
         }
+        column = column.child(self.other_attempts(cx));
         // While the host dialog is open, its own refusals are shown inside it.
         if let Some(message) = self
             .hosts
@@ -4662,6 +5257,38 @@ impl ShelluneView {
                 .on_click(cx.listener(|this, _event, window, cx| {
                     this.toggle_custom_shell(window, cx);
                 })),
+            )
+            .child(
+                self.menu_item(
+                    strings.quick_connect.to_owned(),
+                    Some(strings.quick_connect_hint.to_owned()),
+                    false,
+                )
+                .id("menu.quick")
+                .debug_selector(|| "menu.quick".to_owned())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.open_quick_connect(window, cx);
+                })),
+            )
+            .child(
+                self.menu_item(strings.primary_hosts.to_owned(), None, false)
+                    .id("menu.new_host")
+                    .debug_selector(|| "menu.new_host".to_owned())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.shell_menu_open = false;
+                        this.select(Destination::Hosts, window, cx);
+                        this.open_create_host(cx);
+                    })),
+            )
+            .child(
+                self.menu_item(strings.import_open.to_owned(), None, false)
+                    .id("menu.import")
+                    .debug_selector(|| "menu.import".to_owned())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.shell_menu_open = false;
+                        this.select(Destination::Hosts, window, cx);
+                        this.open_import(cx);
+                    })),
             );
         if self.custom_shell_open {
             menu = menu.child(
@@ -4873,17 +5500,26 @@ impl ShelluneView {
 
     /// Whether a destination shows the selected terminal instead of a list.
     ///
-    /// "Local shells" lists local sessions and "Sessions" lists all of them, so a
-    /// server terminal belongs to the second and a local one to both. Showing a server
-    /// terminal under "Local shells" would mislabel what the user is looking at.
+    /// Local and remote sessions share the workspace. The kind is written on the
+    /// session itself, not by sending the user to a different page. Hosts and
+    /// transfers stay context panels and do not hide the fact that a session exists.
     fn shows_terminal(&self, destination: Destination) -> bool {
-        match self.active_kind() {
-            Some(PaneKind::Local) => {
-                destination == Destination::LocalShells
-                    || (destination == Destination::Sessions && self.session_terminal)
-            }
-            Some(PaneKind::Remote) => destination == Destination::Sessions && self.session_terminal,
-            None => false,
+        if self.showing_connection_form
+            && self.remote.is_some()
+            && destination != Destination::Hosts
+        {
+            return false;
+        }
+        let Some(id) = self.active else {
+            return false;
+        };
+        if self.pane_for(id).is_none() {
+            return false;
+        }
+        match destination {
+            Destination::LocalShells => true,
+            Destination::Sessions => self.session_terminal,
+            Destination::Hosts | Destination::Transfers => false,
         }
     }
 
@@ -4893,7 +5529,36 @@ impl ShelluneView {
         let state = self.workspace.state(destination);
 
         // A terminal fills the panel edge to edge; everything else is a reading
-        // column that scrolls.
+        // column that scrolls. A connection form opened from the workspace replaces
+        // the terminal until the user picks a session tab again; the attempts behind
+        // it keep running.
+        if destination != Destination::Hosts
+            && self.showing_connection_form
+            && self.remote.is_some()
+        {
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .id("content.scroll")
+                .debug_selector(|| "content".to_owned())
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .max_w(metrics.content_max_width())
+                        .mx_auto()
+                        .px(metrics.scale(spacing::LOOSE))
+                        .py(metrics.scale(spacing::LOOSE))
+                        .gap(metrics.panel_gap())
+                        .children(self.quick_open.then(|| self.quick_panel(cx)))
+                        .child(self.remote_panel(cx))
+                        .child(self.other_attempts(cx)),
+                );
+        }
         if self.shows_terminal(destination) {
             return div()
                 .flex()
@@ -4902,6 +5567,13 @@ impl ShelluneView {
                 .min_h(px(0.0))
                 .id("content.scroll")
                 .debug_selector(|| "content".to_owned())
+                .children(self.quick_open.then(|| {
+                    div()
+                        .flex_none()
+                        .px(metrics.scale(spacing::SNUG))
+                        .pt(metrics.scale(spacing::TIGHT))
+                        .child(self.quick_panel(cx))
+                }))
                 .child(self.terminal_panel(cx));
         }
 
@@ -5026,10 +5698,13 @@ impl ShelluneView {
                     }),
             );
 
-        let mut launcher = div()
-            .flex()
-            .flex_col()
-            .items_center()
+        let mut launcher = div().flex().flex_col().items_center();
+        // The form is the thing the user just asked for, so it leads. Leaving it under
+        // the tiles centres it out of a short window, where its button cannot be reached.
+        if self.quick_open {
+            launcher = launcher.child(self.quick_panel(cx));
+        }
+        launcher = launcher
             .w_full()
             .max_w(metrics.scale(720.0))
             .gap(metrics.scale(spacing::LOOSE - 4.0))
@@ -5083,24 +5758,50 @@ impl ShelluneView {
                     )),
             )
             .child(
-                components::icon_label_button(
-                    Icon::Server,
-                    strings.welcome_hosts,
-                    Variant::Ghost,
-                    metrics,
-                )
-                .id("welcome.hosts")
-                .debug_selector(|| "welcome.hosts".to_owned())
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.select(Destination::Hosts, window, cx);
-                })),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::icon_label_button(
+                            Icon::Plug,
+                            strings.quick_connect,
+                            Variant::Secondary,
+                            metrics,
+                        )
+                        .id("welcome.quick")
+                        .debug_selector(|| "welcome.quick".to_owned())
+                        .tooltip(components::tooltip(strings.quick_connect_hint))
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.open_quick_connect(window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        components::icon_label_button(
+                            Icon::Server,
+                            strings.welcome_hosts,
+                            Variant::Ghost,
+                            metrics,
+                        )
+                        .id("welcome.hosts")
+                        .debug_selector(|| "welcome.hosts".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                this.select(Destination::Hosts, window, cx);
+                            },
+                        )),
+                    ),
             );
 
         div()
             .flex()
             .flex_col()
             .items_center()
-            .justify_center()
+            .when(self.quick_open, |page| page.justify_start())
+            .when(!self.quick_open, |page| page.justify_center())
             .flex_1()
             .min_h_full()
             .px(metrics.scale(spacing::LOOSE))
@@ -6916,7 +7617,12 @@ impl ShelluneView {
                             .text_size(metrics.label_size())
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(session.title().to_owned())),
+                            .debug_selector(|| "session.identity".to_owned())
+                            .child(SharedString::from(format!(
+                                "{} · {}",
+                                strings.workspace_current,
+                                session.title()
+                            ))),
                     )
                     .children(target.map(|target| {
                         div()
@@ -6927,7 +7633,20 @@ impl ShelluneView {
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(SharedString::from(target))
                     }))
-                    .child(components::chip(state_label, tone, metrics)),
+                    .child(components::chip(state_label, tone, metrics))
+                    .children(
+                        self.unsaved
+                            .iter()
+                            .find(|(session, _)| *session == id)
+                            .map(|_| {
+                                div()
+                                    .flex_none()
+                                    .truncate()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(strings.quick_unsaved_note)
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -6946,6 +7665,19 @@ impl ShelluneView {
                             move |view, cx| view.reconnect_session(id, cx),
                         ))
                     })
+                    .when(
+                        self.unsaved.iter().any(|(session, _)| *session == id),
+                        |row| {
+                            row.child(self.icon_text_button(
+                                SharedString::from("session.save_host"),
+                                Icon::Server,
+                                strings.quick_save_host,
+                                Variant::Primary,
+                                cx,
+                                move |view, cx| view.save_quick_host(id, cx),
+                            ))
+                        },
+                    )
                     .child(self.icon_text_button(
                         SharedString::from("session.close"),
                         Icon::Close,
@@ -7312,6 +8044,11 @@ impl Render for ShelluneView {
                         (!self.tab_sessions().is_empty()
                             && !self.shows_terminal(self.workspace.destination()))
                         .then(|| self.tab_strip(cx)),
+                    )
+                    .children(
+                        (!self.shows_terminal(self.workspace.destination())
+                            && self.active.is_some())
+                        .then(|| self.session_bar(self.active, cx)),
                     )
                     .children(self.close_transfer_question(cx))
                     .child(self.destination_panel(cx)),

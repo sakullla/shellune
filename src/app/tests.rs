@@ -756,6 +756,16 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             theme_light,
             theme_dark,
             palette_theme,
+            quick_connect,
+            quick_connect_hint,
+            quick_connect_title,
+            quick_save_host,
+            quick_saved,
+            quick_unsaved_note,
+            attempt_others,
+            attempt_cancel,
+            palette_group_recent,
+            workspace_current,
             sidebar_collapse,
             sidebar_expand,
             host_auth_title,
@@ -1717,6 +1727,31 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
         cx.update(|_window, app| view.read(app).custom_shell_open()),
         "the field stays open because nothing started from it"
     );
+
+    // The failed launch is local. The shell that is already open, the navigation and
+    // the command palette keep working.
+    let open = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("the first shell is still the current session");
+    let sent = sent_after_typing(cx, &view, open, "after-failed-launch");
+    assert!(
+        sent.contains("after-failed-launch"),
+        "the open shell still takes input: {sent:?}"
+    );
+    // The open shell menu covers the window, so the first press only dismisses it.
+    click(cx, "nav.hosts");
+    click(cx, "nav.hosts");
+    assert_eq!(destination_of(&view, cx), Destination::Hosts);
+    click(cx, "nav.local");
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(open)
+    );
+    click(cx, "palette.open");
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
 }
 
 #[gpui::test]
@@ -4505,7 +4540,11 @@ async fn two_remote_hosts_stay_open_side_by_side(cx: &mut TestAppContext) {
         cx.update(|_window, app| view.read(app).active_session()),
         Some(first)
     );
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    assert_eq!(
+        destination_of(&view, cx),
+        Destination::LocalShells,
+        "both remote sessions stay in the workspace"
+    );
     assert_eq!(
         cx.update(|_window, app| view.read(app).open_sessions())
             .len(),
@@ -4949,9 +4988,10 @@ fn live_remote(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> Sessi
     id
 }
 
-/// Shows a remote session's terminal the way a user does: by clicking its tab, which
-/// selects the sessions page with that terminal on it. (The sessions page reached from
-/// the sidebar lists the sessions instead.)
+/// Shows a remote session's terminal the way a user does: by clicking its tab.
+///
+/// Coming from the hosts page lands on the workspace. The sessions page reached from
+/// the sidebar lists the sessions instead.
 fn show_remote_terminal(cx: &mut VisualTestContext, view: &Entity<ShelluneView>, id: SessionId) {
     let index = cx
         .update(|_window, app| view.read(app).open_tabs())
@@ -6967,8 +7007,370 @@ async fn the_startup_command_is_typed_once_the_connection_is_live(cx: &mut TestA
     assert_eq!(sent, b"cd /srv && tmux attach\r".to_vec());
     assert_eq!(
         destination_of(&view, cx),
-        Destination::Sessions,
-        "the terminal that was connected is shown at once"
+        Destination::LocalShells,
+        "the terminal that was connected is shown in the workspace"
+    );
+    assert!(
+        cx.debug_bounds("session.identity").is_some(),
+        "the connected session names itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One workspace for local and remote sessions (R1, R2, R3, R12)
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn local_and_remote_sessions_share_the_workspace(cx: &mut TestAppContext) {
+    let (view, cx, _dir) =
+        dialog_view(cx, vec![stored_host("web", "10.0.0.5", 22, "deploy", None)]);
+    click(cx, "nav.local");
+    let local = start_local_session(cx, &view);
+
+    click(cx, "nav.hosts");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().context()),
+        shellune_core::PanelSection::Hosts
+    );
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"remote ready\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+
+    let remote = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("the remote session is current");
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().context()),
+        shellune_core::PanelSection::None,
+        "the connected session comes back to the workspace"
+    );
+    assert!(cx.debug_bounds("session.bar").is_some());
+    assert!(cx.debug_bounds("session.identity").is_some());
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .session(remote)
+                .is_some_and(|session| session.kind().is_remote())
+        }),
+        "the session on screen is the remote one"
+    );
+
+    if let Some(local) = local {
+        click(cx, "session.tab.0");
+        assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+        assert_eq!(
+            cx.update(|_window, app| view.read(app).active_session()),
+            Some(local)
+        );
+        assert!(cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .session(local)
+                .is_some_and(|session| !session.kind().is_remote())
+        }));
+        click(cx, "session.tab.1");
+        assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+        assert_eq!(
+            cx.update(|_window, app| view.read(app).active_session()),
+            Some(remote)
+        );
+    }
+
+    click(cx, "nav.sessions");
+    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    assert!(
+        cx.debug_bounds("row.0").is_some(),
+        "the sessions page lists what the workspace is showing"
+    );
+    assert!(
+        cx.debug_bounds("session.identity").is_some(),
+        "leaving the terminal does not hide which session is current"
+    );
+}
+
+#[gpui::test]
+async fn a_quick_connection_does_not_write_a_host_until_asked(cx: &mut TestAppContext) {
+    let dir = TempDir::new("quick-unsaved");
+    seed(&dir.store(), Vec::new());
+    let file = dir.path().join(shellune_storage::FILE_NAME);
+    let before = std::fs::read(&file).expect("the empty host file");
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "welcome.quick");
+    assert!(cx.debug_bounds("quick.panel").is_some());
+    type_into(cx, "quick.address", "127.0.0.1");
+    clear_field(cx, "quick.port", 2);
+    type_into(cx, "quick.port", "1");
+    type_into(cx, "quick.user", "ada");
+    type_into(cx, "quick.password", "s3cret-quick");
+    click(cx, "quick.connect");
+
+    let (hosts, pending) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (view.book().hosts().len(), view.pending_attempt_count())
+    });
+    assert_eq!(hosts, 0, "connecting does not save a host");
+    assert_eq!(pending, 1, "the attempt started without a saved host");
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    let after = std::fs::read(&file).expect("the host file is still there");
+    assert_eq!(after, before, "the host file is untouched");
+    assert!(
+        !String::from_utf8_lossy(&after).contains("s3cret-quick"),
+        "the password is not written"
+    );
+
+    click(cx, "nav.sessions");
+    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    click(cx, "palette.open");
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+}
+
+#[gpui::test]
+async fn a_quick_connection_can_be_saved_as_a_host_afterwards(cx: &mut TestAppContext) {
+    let dir = TempDir::new("quick-save");
+    seed(&dir.store(), Vec::new());
+    let file = dir.path().join(shellune_storage::FILE_NAME);
+    let before = std::fs::read(&file).expect("the empty host file");
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "welcome.quick");
+    type_into(cx, "quick.address", "203.0.113.10");
+    type_into(cx, "quick.user", "ada");
+    type_into(cx, "quick.password", "s3cret-quick");
+    let prepared =
+        cx.update(|_window, app| view.update(app, |view, cx| view.prepare_quick_connection(cx)));
+    assert!(prepared, "the quick-connection fields are complete");
+    assert!(
+        cx.update(|_window, app| view.read(app).book().hosts().is_empty()),
+        "preparing the form does not save the host"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+
+    assert_eq!(
+        std::fs::read(&file).expect("the host file"),
+        before,
+        "a live quick connection is still unsaved"
+    );
+    assert!(cx.debug_bounds("session.save_host").is_some());
+    assert!(cx.debug_bounds("session.identity").is_some());
+    click(cx, "session.save_host");
+
+    let saved = cx.update(|_window, app| view.read(app).book().hosts().to_vec());
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].address(), "203.0.113.10");
+    assert_eq!(saved[0].user(), "ada");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().recent_hosts().len()),
+        1,
+        "saving records that the host was reached"
+    );
+    let written = std::fs::read_to_string(&file).expect("the host file was written");
+    assert!(written.contains("203.0.113.10"));
+    assert!(
+        !written.contains("s3cret-quick"),
+        "the password stays out of the host file"
+    );
+}
+
+#[gpui::test]
+async fn connection_attempts_wait_and_cancel_on_their_own(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(
+        cx,
+        vec![
+            stored_host("alpha", "10.0.0.5", 22, "deploy", None),
+            stored_host("beta", "10.0.0.6", 22, "deploy", None),
+        ],
+    );
+
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
+    });
+    click(cx, "hosts.connect.1");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        2
+    );
+    assert!(cx.debug_bounds("attempt.others").is_some());
+    assert!(cx.debug_bounds("session.tab.1").is_some());
+
+    click(cx, "session.tab.close.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        1,
+        "closing one attempt leaves the other waiting"
+    );
+    let waiting = cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    assert!(waiting, "the remaining attempt is still polled");
+
+    click(cx, "nav.local");
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    click(cx, "palette.open");
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    click(cx, "nav.hosts");
+    click(cx, "remote.close");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0
+    );
+}
+
+#[gpui::test]
+async fn one_attempt_failing_leaves_the_other_waiting(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(
+        cx,
+        vec![
+            stored_host("alpha", "10.0.0.5", 22, "deploy", None),
+            stored_host("beta", "10.0.0.6", 22, "deploy", None),
+        ],
+    );
+
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![shellune_ssh::RemoteEvent::Failed(
+                    shellune_ssh::ConnectError::AuthRejected,
+                )],
+                cx,
+            );
+        });
+    });
+    click(cx, "hosts.connect.1");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        1,
+        "only the attempt that failed has stopped"
+    );
+    let failed = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .sessions()
+            .items()
+            .iter()
+            .any(|session| matches!(session.state(), SessionState::Failed(_)))
+    });
+    assert!(failed, "the failed attempt is recorded on its own session");
+    assert!(cx.debug_bounds("attempt.others").is_some());
+    assert!(
+        cx.debug_bounds("remote.failure").is_none(),
+        "the form on screen is the attempt that is still connecting"
+    );
+
+    click(cx, "attempt.row.0");
+    assert!(cx.debug_bounds("remote.failure").is_some());
+    let waiting = cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    assert!(waiting);
+    click(cx, "attempt.cancel.1");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0
+    );
+    assert!(
+        cx.debug_bounds("remote.failure").is_some(),
+        "cancelling the other attempt leaves this failure on screen"
+    );
+    click(cx, "nav.sessions");
+    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    click(cx, "palette.open");
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+}
+
+#[gpui::test]
+async fn a_failed_host_file_does_not_block_the_rest_of_the_window(cx: &mut TestAppContext) {
+    let dir = TempDir::new("hosts-failed-nav");
+    let root = dir.path().join("data");
+    std::fs::write(&root, "not a directory").expect("the sentinel file is written");
+    let store = HostStore::at(&root);
+    let (view, cx) = cx
+        .add_window_view(move |_window, cx| ShelluneView::with_store(cx, Workspace::new(), store));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    let local = start_local_session(cx, &view);
+    if let Some(local) = local {
+        let sent = sent_after_typing(cx, &view, local, "while-hosts-failed");
+        assert!(sent.contains("while-hosts-failed"), "{sent:?}");
+    }
+
+    click(cx, "nav.hosts");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().state(Destination::Hosts)),
+        SectionState::Failed
+    );
+    assert!(cx.debug_bounds("state.card").is_some());
+
+    click(cx, "nav.local");
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    if let Some(local) = local {
+        assert_eq!(
+            session_state(cx, &view, local),
+            Some(SessionState::Connected)
+        );
+        let sent = sent_after_typing(cx, &view, local, "still-typing");
+        assert!(sent.contains("still-typing"), "{sent:?}");
+    }
+    click(cx, "palette.open");
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().state(Destination::Hosts)),
+        SectionState::Failed,
+        "opening the palette does not clear the host failure"
     );
 }
 

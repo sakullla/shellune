@@ -45,6 +45,7 @@ fn rows(results: &[Entry], searching: bool) -> Vec<Row> {
 fn group_label(group: Group, strings: &copy::Strings) -> &'static str {
     match group {
         Group::Sessions => strings.palette_group_sessions,
+        Group::Recent => strings.palette_group_recent,
         Group::Shells => strings.palette_group_shells,
         Group::Hosts => strings.palette_group_hosts,
         Group::Navigate => strings.palette_group_navigate,
@@ -167,7 +168,24 @@ impl ShelluneView {
             });
         }
 
+        let mut seen = Vec::new();
+        for recent in self.book.recent_hosts() {
+            let host = recent.host;
+            seen.push(host.id());
+            entries.push(Entry {
+                command: Command::Connect(host.id()),
+                group: Group::Recent,
+                title: host.name().to_owned(),
+                detail: host.target(),
+                shortcut: None,
+                icon: Icon::Plug,
+                current: false,
+            });
+        }
         for host in self.book.hosts() {
+            if seen.contains(&host.id()) {
+                continue;
+            }
             entries.push(Entry {
                 command: Command::Connect(host.id()),
                 group: Group::Hosts,
@@ -208,6 +226,15 @@ impl ShelluneView {
                 current: false,
             });
         }
+        entries.push(Entry {
+            command: Command::QuickConnect,
+            group: Group::Actions,
+            title: strings.quick_connect.to_owned(),
+            detail: strings.quick_connect_hint.to_owned(),
+            shortcut: None,
+            icon: Icon::Plug,
+            current: false,
+        });
         entries.push(Entry {
             command: Command::NewHost,
             group: Group::Actions,
@@ -325,7 +352,14 @@ impl ShelluneView {
             Command::Shell(index) => self.launch_choice(index, window, cx),
             Command::Connect(host) => {
                 if let Some(host) = self.book.host(host).cloned() {
-                    self.select(Destination::Hosts, window, cx);
+                    // The connection belongs to the workspace. The hosts page is the
+                    // one place that already shows the form beside the saved record.
+                    if !matches!(
+                        self.workspace.destination(),
+                        Destination::LocalShells | Destination::Sessions | Destination::Hosts
+                    ) {
+                        self.select(Destination::LocalShells, window, cx);
+                    }
                     self.open_remote(&host, cx);
                 }
             }
@@ -338,6 +372,7 @@ impl ShelluneView {
                 self.select(Destination::Hosts, window, cx);
                 self.open_import(cx);
             }
+            Command::QuickConnect => self.open_quick_connect(window, cx),
             Command::CloseTab(id) => self.request_close_session(id, cx),
             Command::ToggleLanguage => self.toggle_locale(cx),
             Command::ToggleSidebar => self.toggle_rail(cx),

@@ -13,7 +13,8 @@
 //! ever produced.
 
 use shellune_core::{
-    HostConfig, LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState, Transfer,
+    HostConfig, LocalShell, PanelSection, Session, SessionFailure, SessionId, SessionKind,
+    SessionState, Transfer,
 };
 
 use crate::app::copy::{Locale, Strings};
@@ -258,6 +259,8 @@ pub struct Workspace {
     shell_choice: usize,
     local_font_size: f32,
     notice: Option<Notice>,
+    /// Which context panel is beside the session workspace.
+    context: PanelSection,
 }
 
 impl Default for Workspace {
@@ -292,6 +295,7 @@ impl Workspace {
             shell_choice: 0,
             local_font_size: shellune_terminal::DEFAULT_FONT_SIZE,
             notice: None,
+            context: PanelSection::None,
         }
     }
 
@@ -321,6 +325,16 @@ impl Workspace {
             self.destination = destination;
             self.notice = None;
         }
+    }
+
+    /// The context panel selected beside the session workspace.
+    pub fn context(&self) -> PanelSection {
+        self.context
+    }
+
+    /// Records which context panel is open. This does not start a task.
+    pub fn set_context(&mut self, section: PanelSection) {
+        self.context = section;
     }
 
     /// Advances to the next destination.
@@ -431,14 +445,25 @@ impl Workspace {
     /// "no local session" and "no session at all" stay distinguishable.
     pub fn state(&self, destination: Destination) -> SectionState {
         match destination {
-            Destination::LocalShells => match self.sessions.status() {
-                SectionStatus::Ready if self.local_sessions().next().is_none() => {
-                    SectionState::Empty
+            // A failed launch is local. Other local sessions stay listed, and a remote
+            // session alone does not make the local page look populated.
+            Destination::LocalShells => {
+                let any_local = self.local_sessions().next().is_some();
+                match self.sessions.status() {
+                    SectionStatus::Loading if !any_local => SectionState::Loading,
+                    SectionStatus::Failed(_) if !any_local => SectionState::Failed,
+                    _ if !any_local => SectionState::Empty,
+                    _ => SectionState::Populated,
+                }
+            }
+            Destination::Hosts => self.hosts.state(),
+            // One bad launch must not replace the session list with a single failure card.
+            Destination::Sessions => match self.sessions.status() {
+                SectionStatus::Failed(_) if !self.sessions.items().is_empty() => {
+                    SectionState::Populated
                 }
                 _ => self.sessions.state(),
             },
-            Destination::Hosts => self.hosts.state(),
-            Destination::Sessions => self.sessions.state(),
             Destination::Transfers => self.transfers.state(),
         }
     }
@@ -611,6 +636,17 @@ impl Workspace {
         let sessions = self.sessions.items().to_vec();
         self.sessions
             .replace(SectionStatus::Failed(failure), sessions);
+    }
+
+    /// Drops a launch failure once a later start really produced a session.
+    ///
+    /// The failure belonged to the launch, not to the sessions that are open. Leaving
+    /// the section failed would keep a banner over terminals that started afterwards.
+    pub fn clear_session_failure(&mut self) {
+        if matches!(self.sessions.status(), SectionStatus::Failed(_)) {
+            let items = self.sessions.items().to_vec();
+            self.sessions.replace(SectionStatus::Ready, items);
+        }
     }
 
     /// Replaces the session list, for the model tests that pin one rule at a time.
