@@ -610,38 +610,55 @@ impl TerminalCore {
         let now = Instant::now();
         match event {
             IntegrationEvent::PromptStart => {
-                if self.blocks.in_input() {
-                    let scraped = self
-                        .blocks
-                        .input_anchor()
-                        .and_then(|anchor| self.text_between(anchor, self.anchor_now()));
-                    self.blocks.set_scraped_command(scraped);
-                }
-                if self.blocks.in_output() {
-                    self.refresh_running_output();
+                // The alternate grid is a different screen. Scraping it would store
+                // that screen as the command that was running on the primary grid.
+                if !self.on_alternate_screen() {
+                    if self.blocks.in_input() {
+                        let scraped = self
+                            .blocks
+                            .input_anchor()
+                            .and_then(|anchor| self.text_between(anchor, self.anchor_now()));
+                        self.blocks.set_scraped_command(scraped);
+                    }
+                    if self.blocks.in_output() {
+                        self.refresh_running_output();
+                    }
                 }
                 self.blocks.prompt_start();
             }
             IntegrationEvent::InputStart => self.blocks.input_start(self.anchor_now()),
             IntegrationEvent::CommandText(command) => self.blocks.set_explicit_command(command),
             IntegrationEvent::OutputStart => {
-                let scraped = self
-                    .blocks
-                    .input_anchor()
-                    .and_then(|anchor| self.text_between(anchor, self.anchor_now()));
+                let scraped = if self.on_alternate_screen() {
+                    None
+                } else {
+                    self.blocks
+                        .input_anchor()
+                        .and_then(|anchor| self.text_between(anchor, self.anchor_now()))
+                };
                 self.blocks.output_start(scraped, self.anchor_now(), now);
             }
             IntegrationEvent::CommandFinished { exit } => {
-                let output = self
-                    .blocks
-                    .output_anchor()
-                    .and_then(|anchor| self.text_between(anchor, self.anchor_now()));
+                let output = if self.on_alternate_screen() {
+                    None
+                } else {
+                    self.blocks
+                        .output_anchor()
+                        .and_then(|anchor| self.text_between(anchor, self.anchor_now()))
+                };
                 self.blocks.finish(output, exit, now);
             }
         }
     }
 
+    fn on_alternate_screen(&self) -> bool {
+        self.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     fn refresh_running_output(&mut self) {
+        if self.on_alternate_screen() {
+            return;
+        }
         let Some(anchor) = self.blocks.output_anchor() else {
             return;
         };
@@ -690,6 +707,11 @@ impl TerminalCore {
     }
 
     fn note_history(&mut self) {
+        // The alternate grid reports no scrollback. That zero is not the primary
+        // grid losing lines, so it must not move anchors that still point at it.
+        if self.on_alternate_screen() {
+            return;
+        }
         let history = self.term.grid().history_size();
         if history < self.last_history {
             self.lines_dropped += (self.last_history - history) as i64;
@@ -1232,5 +1254,73 @@ mod tests {
                 .iter()
                 .all(|block| !block.status.is_success() || block.id == id)
         );
+    }
+
+    #[test]
+    fn a_command_across_the_alternate_screen_does_not_copy_scrollback() {
+        let mut terminal = TerminalCore::new(40, 8, 100);
+        terminal.set_presentation(TerminalMode::Integrated);
+        for line in 0..30 {
+            terminal.feed(format!("older {line}\r\n").as_bytes());
+        }
+        assert_eq!(
+            terminal.history(),
+            23,
+            "thirty lines on an eight-row grid leave a real scrollback"
+        );
+
+        terminal.feed(&osc("133;A"));
+        terminal.feed(&osc("133;B"));
+        terminal.feed(b"vim file");
+        terminal.feed(&osc("133;C"));
+        terminal.feed(b"\r\n");
+        let primary = terminal.snapshot().text();
+
+        terminal.feed(b"\x1b[?1049h");
+        assert!(terminal.mode().contains(TermMode::ALT_SCREEN));
+        assert!(
+            terminal.shows_classic_grid(),
+            "the full-screen program is the classic grid"
+        );
+        terminal.feed(b"fullscreen-not-output");
+        let during = terminal.command_blocks();
+        assert_eq!(during.len(), 1);
+        assert_eq!(during[0].command, "vim file");
+        assert!(
+            !during[0].output.contains("older") && !during[0].output.contains("fullscreen"),
+            "the alternate screen is not this command's output: {}",
+            during[0].output
+        );
+
+        terminal.feed(b"\x1b[?1049l");
+        assert!(!terminal.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(
+            terminal.snapshot().text(),
+            primary,
+            "leaving the alternate screen restores the primary grid"
+        );
+        terminal.feed(&osc("133;D;0"));
+        let finished = terminal.command_blocks();
+        assert_eq!(finished[0].status, BlockStatus::Exited(0));
+        assert!(finished[0].status.is_success());
+        assert_eq!(finished[0].command, "vim file");
+        assert!(
+            !finished[0].output.contains("older") && !finished[0].output.contains("fullscreen"),
+            "scrollback must not be copied into the command: {}",
+            finished[0].output
+        );
+        let vim = finished[0].clone();
+
+        terminal.feed(&osc("133;A"));
+        terminal.feed(&osc("133;B"));
+        terminal.feed(b"echo after");
+        terminal.feed(&osc("133;C"));
+        terminal.feed(b"\r\nafter-out\r\n");
+        terminal.feed(&osc("133;D;0"));
+        let blocks = terminal.command_blocks();
+        assert_eq!(blocks[0], vim, "the earlier command stays as it was recorded");
+        assert_eq!(blocks[1].command, "echo after");
+        assert_eq!(blocks[1].output, "after-out");
+        assert!(blocks[1].status.is_success());
     }
 }

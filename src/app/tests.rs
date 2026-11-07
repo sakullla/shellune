@@ -1490,6 +1490,74 @@ async fn a_committed_line_is_written_without_a_paste_confirmation(cx: &mut TestA
 }
 
 #[gpui::test]
+async fn a_multiline_paste_on_the_alternate_screen_shows_its_target_before_it_is_sent(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.feed_for_test(b"\x1b[?1049h", cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| pane.read(app).alternate_for_test()),
+        "the pane is on the alternate screen"
+    );
+
+    let paste = "echo one\necho two\n";
+    let before = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_paste(paste, cx));
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        before,
+        "staging a paste on the alternate screen writes nothing"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_target().map(str::to_owned)),
+        Some("Test shell".to_owned())
+    );
+    assert!(
+        cx.debug_bounds("terminal.paste").is_some()
+            && cx.debug_bounds("terminal.paste.target").is_some()
+            && cx.debug_bounds("terminal.paste.preview").is_some(),
+        "the confirmation must be visible before anything is written"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.simulate_keystrokes("ctrl-l");
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        {
+            let mut bytes = before.clone();
+            bytes.extend_from_slice(&[0x1b, 0x0c, 0x03]);
+            bytes
+        },
+        "Escape, Ctrl+L and Ctrl+C stay program input and do not confirm the paste"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().map(str::to_owned)),
+        Some(paste.to_owned())
+    );
+
+    click(cx, "terminal.paste.cancel");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        {
+            let mut bytes = before;
+            bytes.extend_from_slice(&[0x1b, 0x0c, 0x03]);
+            bytes
+        },
+        "cancelling on the alternate screen writes nothing"
+    );
+    assert!(cx.update(|_window, app| pane.read(app).pending_paste_text().is_none()));
+}
+
+#[gpui::test]
 async fn cancelling_a_multiline_paste_writes_nothing_and_program_keys_still_arrive(
     cx: &mut TestAppContext,
 ) {

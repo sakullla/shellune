@@ -1893,7 +1893,7 @@ impl Render for TerminalPane {
 
         let show_blocks =
             !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks());
-        let show_paste = !self.alternate_screen() && self.pending_paste.is_some();
+        let show_paste = self.pending_paste.is_some();
         div()
             .flex()
             .flex_col()
