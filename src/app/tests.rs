@@ -751,6 +751,13 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             tab_menu_close,
             tab_menu_close_others,
             tab_menu_close_right,
+            session_menu_open,
+            session_menu_reopen,
+            session_menu_close,
+            session_menu_remove,
+            session_menu_remove_closed,
+            session_more,
+            session_closed_summary,
         ]
     )
 }
@@ -4728,7 +4735,7 @@ async fn a_reconnect_that_can_never_work_offers_close_instead(cx: &mut TestAppCo
         0,
         "the host is gone"
     );
-    click(cx, "nav.sessions");
+    show_remote_terminal(cx, &view, id);
 
     // Pressing reconnect now refuses, and the refusal is recorded as a reason no attempt
     // can resolve.
@@ -4904,9 +4911,27 @@ fn live_remote(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> Sessi
                 .map(|session| session.id())
         })
         .expect("the remote session is live");
-    // A remote terminal is only drawn on the sessions destination.
-    click(cx, "nav.sessions");
+    show_remote_terminal(cx, view, id);
     id
+}
+
+/// Shows a remote session's terminal the way a user does: by clicking its tab, which
+/// selects the sessions page with that terminal on it. (The sessions page reached from
+/// the sidebar lists the sessions instead.)
+fn show_remote_terminal(cx: &mut VisualTestContext, view: &Entity<ShelluneView>, id: SessionId) {
+    let index = cx
+        .update(|_window, app| view.read(app).open_tabs())
+        .iter()
+        .position(|tab| *tab == id)
+        .expect("the session has a tab");
+    // `click` takes a selector that lives for the whole test run.
+    let selector: &'static str = Box::leak(format!("session.tab.{index}").into_boxed_str());
+    click(cx, selector);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(id),
+        "the tab shows that session"
+    );
 }
 
 /// Connects the seeded host again and returns the session that is new.
@@ -4954,7 +4979,7 @@ fn live_remote_second(
                 .map(|session| session.id())
         })
         .expect("the second remote session is live");
-    click(cx, "nav.sessions");
+    show_remote_terminal(cx, view, id);
     id
 }
 
@@ -6532,4 +6557,175 @@ async fn the_sidebar_counts_open_sessions_not_closed_ones(cx: &mut TestAppContex
     click(cx, "session.tab.close.0");
     let open = cx.update(|_window, app| view.read(app).sidebar_count(Destination::Sessions));
     assert_eq!(open, 1, "the badge matches the tabs that are left");
+}
+
+/// Every next step the SSH layer can suggest has a Chinese sentence.
+///
+/// The hints live in the SSH crate, which does not know the interface language; the
+/// table in `copy` translates them by their English text. Reading the hints from the
+/// source keeps the two from drifting apart when a hint is added or reworded.
+#[test]
+fn every_ssh_next_step_is_translated() {
+    let source = include_str!("../../crates/ssh/src/error.rs");
+    let start = source
+        .find("pub fn next_step(&self)")
+        .expect("the SSH error type has next steps");
+    let body = &source[start..];
+    let body = &body[..body.find("\n    }\n").expect("the function ends")];
+    let mut hints = 0;
+    for part in body.split("=> ").skip(1) {
+        let Some(rest) = part
+            .trim_start()
+            .trim_start_matches('{')
+            .trim_start()
+            .strip_prefix('"')
+        else {
+            continue;
+        };
+        let hint = &rest[..rest.find('"').expect("a closed string")];
+        hints += 1;
+        let chinese = crate::app::copy::next_step_text(hint, Locale::Chinese);
+        assert_ne!(chinese, hint, "no Chinese for the SSH hint: {hint}");
+    }
+    assert!(
+        hints >= 18,
+        "only {hints} hints were found in the SSH error type"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Managing session records
+// ---------------------------------------------------------------------------
+
+/// The ids of the records that are closed, for the management tests.
+fn closed_records(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> Vec<SessionId> {
+    cx.update(|_window, app| view.read(app).workspace().closed_sessions())
+}
+
+#[gpui::test]
+async fn the_sessions_page_lists_every_session_while_tabs_are_open(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    // One tab closed leaves a record; one is still open and on screen.
+    click(cx, "session.tab.close.0");
+    assert_eq!(closed_records(cx, &view).len(), 1);
+
+    click(cx, "nav.sessions");
+    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    assert!(
+        cx.debug_bounds("row.0").is_some() && cx.debug_bounds("row.1").is_some(),
+        "the page reached from the sidebar lists the sessions, the closed one included"
+    );
+    assert!(
+        cx.debug_bounds("sessions.closed").is_some(),
+        "the list says how many records are closed and offers to clear them"
+    );
+}
+
+#[gpui::test]
+async fn a_closed_record_can_be_removed_and_all_closed_ones_cleared(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    click(cx, "session.tab.close.1");
+    click(cx, "session.tab.close.0");
+    assert_eq!(closed_records(cx, &view).len(), 2);
+
+    // Every tab is closed, so the local page lists the records.
+    click(cx, "nav.local");
+    click(cx, "row.remove.0");
+    let remaining = closed_records(cx, &view);
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only the record whose button was pressed went"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).workspace().session(tabs[0]).is_none()),
+        "the first record is the one removed"
+    );
+
+    click(cx, "sessions.remove_closed");
+    assert!(closed_records(cx, &view).is_empty());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().sessions().count()),
+        0,
+        "nothing but closed records was there, so nothing is left"
+    );
+}
+
+#[gpui::test]
+async fn removing_an_open_session_closes_it_first(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    cx.update(|_window, app| view.update(app, |view, cx| view.remove_session(tabs[0], cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![tabs[1]],
+        "the removed session's tab closed; the other one is untouched"
+    );
+    assert!(cx.update(|_window, app| view.read(app).workspace().session(tabs[0]).is_none()));
+}
+
+#[gpui::test]
+async fn a_session_row_menu_opens_on_right_click_and_reopens_a_closed_shell(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    click(cx, "session.tab.close.1");
+    click(cx, "session.tab.close.0");
+    click(cx, "nav.local");
+    let closed = closed_records(cx, &view);
+
+    let center = bounds_of(cx, "row.0").center();
+    cx.simulate_mouse_down(center, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(center, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).session_menu_open()));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).session_menu_open()),
+        "Escape closes the row menu"
+    );
+
+    cx.simulate_mouse_down(center, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(center, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    click(cx, "session.menu.reopen");
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    assert_eq!(tabs.len(), 1, "reopening started the shell again in a tab");
+    let after = closed_records(cx, &view);
+    assert_eq!(
+        after.len(),
+        closed.len() - 1,
+        "the reopened record does not stay behind as a closed copy"
+    );
+}
+
+#[test]
+fn only_a_closed_record_can_be_removed_from_the_model() {
+    let mut workspace = Workspace::new();
+    let live = connected_local_session("running");
+    let live_id = live.id();
+    let mut closed = connected_local_session("ended");
+    closed.close().expect("a live session closes");
+    let closed_id = closed.id();
+    workspace.set_sessions_for_test(vec![live, closed]);
+
+    assert_eq!(workspace.closed_sessions(), vec![closed_id]);
+    assert!(
+        !workspace.session_removed(live_id),
+        "a session with a tab stays"
+    );
+    assert!(workspace.session(live_id).is_some());
+    assert!(workspace.session_removed(closed_id));
+    assert!(workspace.session(closed_id).is_none());
 }

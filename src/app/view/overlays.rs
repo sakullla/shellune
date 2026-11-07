@@ -104,7 +104,7 @@ impl ShelluneView {
     }
 
     /// Focuses the terminal on screen, or the current page when there is none.
-    fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         let destination = self.workspace.destination();
         if self.shows_terminal(destination)
             && let Some(pane) = self.active_pane()
@@ -854,7 +854,7 @@ impl ShelluneView {
 
 /// Places a tab menu at the pointer, inside the window and below the tab bar, so it
 /// never covers the tab's own tooltip or the tab it belongs to.
-fn clamp_menu(
+pub(super) fn clamp_menu(
     position: Point<Pixels>,
     viewport: gpui::Size<Pixels>,
     width: Pixels,

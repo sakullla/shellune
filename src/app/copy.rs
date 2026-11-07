@@ -518,6 +518,20 @@ pub struct Strings {
     pub tab_menu_close_others: &'static str,
     /// Tab menu: close the tabs after this one.
     pub tab_menu_close_right: &'static str,
+    /// Session menu: show the terminal.
+    pub session_menu_open: &'static str,
+    /// Session menu: start a closed session again.
+    pub session_menu_reopen: &'static str,
+    /// Session menu: close the tab, keep the record.
+    pub session_menu_close: &'static str,
+    /// Session menu: close if needed and remove the record.
+    pub session_menu_remove: &'static str,
+    /// Session menu and list: remove every closed record.
+    pub session_menu_remove_closed: &'static str,
+    /// Tooltip of the row's more-actions button.
+    pub session_more: &'static str,
+    /// List toolbar: how many closed records there are, before the count.
+    pub session_closed_summary: &'static str,
 }
 
 /// English copy.
@@ -750,6 +764,13 @@ pub static ENGLISH: Strings = Strings {
     tab_menu_close: "Close tab",
     tab_menu_close_others: "Close other tabs",
     tab_menu_close_right: "Close tabs to the right",
+    session_menu_open: "Open",
+    session_menu_reopen: "Reopen",
+    session_menu_close: "Close",
+    session_menu_remove: "Remove",
+    session_menu_remove_closed: "Remove all closed",
+    session_more: "More actions",
+    session_closed_summary: "Closed sessions",
 };
 
 /// Chinese copy.
@@ -982,6 +1003,13 @@ pub static CHINESE: Strings = Strings {
     tab_menu_close: "关闭标签",
     tab_menu_close_others: "关闭其他标签",
     tab_menu_close_right: "关闭右侧标签",
+    session_menu_open: "打开",
+    session_menu_reopen: "重新打开",
+    session_menu_close: "关闭",
+    session_menu_remove: "删除",
+    session_menu_remove_closed: "清除所有已关闭",
+    session_more: "更多操作",
+    session_closed_summary: "已关闭的会话",
 };
 
 /// A count followed by its unit, in the grammar of the language.
@@ -1042,6 +1070,54 @@ pub fn transfer_state_label(state: &TransferState, locale: Locale) -> String {
         TransferState::Cancelled { .. } => match locale {
             Locale::English => "Cancelled".to_owned(),
             Locale::Chinese => "已取消".to_owned(),
+        },
+    }
+}
+
+/// The next step an SSH failure suggests, in the interface language.
+///
+/// The SSH layer words its advice in English and does not know the interface language;
+/// its sentence is the key here. A sentence this table does not know is shown as it
+/// came, so a new hint is never hidden, only untranslated until it is added (a test
+/// checks that every hint the SSH layer has today is here).
+#[must_use]
+pub fn next_step_text(english: &str, locale: Locale) -> &str {
+    match locale {
+        Locale::English => english,
+        Locale::Chinese => match english {
+            "Check the address and port, then connect again." => "检查地址和端口，然后重新连接。",
+            "Check the network and the address, then try again." => "检查网络和地址，然后重试。",
+            "Check the address, then try again." => "检查地址，然后重试。",
+            "The connection stops here; nothing was stored." => "连接到此为止，没有保存任何内容。",
+            "Connect again and accept or refuse the identity while it is shown." => {
+                "重新连接，并在身份信息显示时选择接受或拒绝。"
+            }
+            "Do not continue. Check the server identity before trusting it again." => {
+                "不要继续。重新信任之前，先核实服务器身份。"
+            }
+            "The server key cannot be compared; connect with a client that supports it." => {
+                "无法比对这台服务器的密钥；请改用支持它的客户端连接。"
+            }
+            "Check the credentials, or change the authentication method." => {
+                "检查凭据，或者换一种登录方式。"
+            }
+            "Choose a key file this account can read." => "选择一个本账号可以读取的私钥文件。",
+            "Enter the key passphrase to continue." => "输入私钥口令后继续。",
+            "Enter the correct passphrase for this key." => "输入这个私钥的正确口令。",
+            "Choose a key file Shellune can read." => "选择一个 Shellune 能识别的私钥文件。",
+            "Start the system SSH agent, then connect again." => {
+                "启动系统 SSH Agent，然后重新连接。"
+            }
+            "Load a key into the agent, then connect again." => {
+                "把私钥加载到 Agent 中，然后重新连接。"
+            }
+            "Use another identity, or a key file instead." => "换一个身份，或改用私钥文件。",
+            "Load an identity the server accepts." => "加载一个服务器接受的身份。",
+            "The server refused a terminal; use another account." => {
+                "服务器拒绝分配终端；请换一个账号。"
+            }
+            "Connect again to open a new session." => "重新连接以打开新的会话。",
+            other => other,
         },
     }
 }

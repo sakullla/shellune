@@ -59,6 +59,7 @@ use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Work
 use crate::app::{components, theme::radius};
 
 mod overlays;
+mod sessions;
 
 /// Where a terminal comes from.
 ///
@@ -225,6 +226,14 @@ pub struct ShelluneView {
     palette_scroll: gpui::ScrollHandle,
     /// The tab whose menu is open, and where the pointer opened it.
     tab_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
+    /// Whether the sessions page shows the selected terminal rather than the list.
+    ///
+    /// Selecting a tab shows its terminal; going to the page from the sidebar or its
+    /// shortcut shows every session instead, which is the only place closed records
+    /// and their actions are listed while tabs are open.
+    session_terminal: bool,
+    /// The session row whose menu is open, and where it was opened.
+    session_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// The attempt a test scripted, kept so its answers can be inspected.
     #[cfg(test)]
     scripted: Option<shellune_ssh::ScriptedSession>,
@@ -350,6 +359,8 @@ impl ShelluneView {
             palette_selected: 0,
             palette_scroll: gpui::ScrollHandle::new(),
             tab_menu: None,
+            session_menu: None,
+            session_terminal: false,
             #[cfg(test)]
             scripted: None,
         };
@@ -540,6 +551,7 @@ impl ShelluneView {
             .detach();
         self.panes.push(OpenPane { tag, pane });
         self.active = Some(tag.session);
+        self.session_terminal = true;
         self.focus_pane(tag.session, cx);
         cx.notify();
     }
@@ -585,6 +597,7 @@ impl ShelluneView {
             return;
         };
         self.active = Some(id);
+        self.session_terminal = true;
         // A terminal is only visible in a destination that lists its kind, so selecting
         // one takes the user to that destination rather than leaving them on a page that
         // cannot show what they just chose.
@@ -1058,6 +1071,10 @@ impl ShelluneView {
 
     /// Selects a destination, moving keyboard focus with it.
     fn select(&mut self, destination: Destination, window: &mut Window, cx: &mut Context<Self>) {
+        if destination == Destination::Sessions {
+            // The page itself was asked for: it lists the sessions.
+            self.session_terminal = false;
+        }
         self.workspace.select(destination);
         let handle = self.destination_focus(destination).clone();
         window.focus(&handle);
@@ -2404,7 +2421,8 @@ impl ShelluneView {
 
         if let Some(failure) = status.failure() {
             let reason = failure.reason().to_owned();
-            let next_step = failure.next_step().to_owned();
+            let next_step =
+                copy::next_step_text(failure.next_step(), self.workspace.locale()).to_owned();
             let retryable = failure.retryable();
             column = column.child(
                 components::banner(Tone::Danger, metrics)
@@ -4491,12 +4509,10 @@ impl ShelluneView {
     fn shows_terminal(&self, destination: Destination) -> bool {
         match self.active_kind() {
             Some(PaneKind::Local) => {
-                matches!(
-                    destination,
-                    Destination::LocalShells | Destination::Sessions
-                )
+                destination == Destination::LocalShells
+                    || (destination == Destination::Sessions && self.session_terminal)
             }
-            Some(PaneKind::Remote) => destination == Destination::Sessions,
+            Some(PaneKind::Remote) => destination == Destination::Sessions && self.session_terminal,
             None => false,
         }
     }
@@ -6587,6 +6603,9 @@ impl ShelluneView {
         sessions: &[&Session],
         cx: &mut Context<Self>,
     ) -> Div {
+        if let Some(bar) = self.closed_sessions_bar(sessions, cx) {
+            list = list.child(bar);
+        }
         for (index, session) in sessions.iter().enumerate() {
             let id = session.id();
             // A row whose session still has a terminal opens it; one that has none
@@ -6598,12 +6617,17 @@ impl ShelluneView {
                     .debug_selector(move || format!("row.{index}"))
                     .when(openable, |row| {
                         row.cursor_pointer().on_click(cx.listener(
-                            move |this, _event, _window, cx| {
-                                this.activate(id, cx);
+                            move |this, _event, window, cx| {
+                                this.activate_in(id, window, cx);
                             },
                         ))
                     })
-                    .child(self.session_row(session)),
+                    // Every row, open or closed, offers its actions on a right click.
+                    .on_mouse_down(
+                        sessions::MENU_BUTTON,
+                        self.session_row_menu_listener(id, cx),
+                    )
+                    .child(self.session_row(session, self.session_row_actions(id, index, cx))),
             );
         }
         list
@@ -6620,7 +6644,9 @@ impl ShelluneView {
         list
     }
 
-    fn session_row(&self, session: &Session) -> Div {
+    /// One session in a list: what it is on the left, its state and `actions` on the
+    /// right.
+    fn session_row(&self, session: &Session, actions: Div) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let locale = self.workspace.locale();
@@ -6669,11 +6695,19 @@ impl ShelluneView {
                         metrics,
                     )),
             )
-            .child(components::chip(
-                copy::session_state_label(session.state(), locale),
-                tone,
-                metrics,
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(components::chip(
+                        copy::session_state_label(session.state(), locale),
+                        tone,
+                        metrics,
+                    ))
+                    .child(actions),
+            )
     }
 
     fn transfer_row(&self, transfer: &Transfer) -> Div {
@@ -6790,6 +6824,10 @@ impl Render for ShelluneView {
                     this.close_tab_menu(window, cx);
                     return;
                 }
+                if this.session_menu.is_some() {
+                    this.close_session_menu(window, cx);
+                    return;
+                }
                 if this.shell_menu_open {
                     this.close_shell_menu(cx);
                     return;
@@ -6803,9 +6841,13 @@ impl Render for ShelluneView {
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.toggle_palette(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseActiveTab, _window, cx| {
+            .on_action(cx.listener(|this, _: &CloseActiveTab, window, cx| {
                 if let Some(id) = this.active {
                     this.request_close_session(id, cx);
+                    // The tab that takes over gets the keyboard through this window;
+                    // the pane's own focus call cannot reach it while the action runs,
+                    // and the next shortcut would otherwise go nowhere.
+                    this.restore_focus(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
@@ -6845,6 +6887,7 @@ impl Render for ShelluneView {
             }))
             .children(self.palette_overlay(window, cx))
             .children(self.tab_menu_overlay(window, cx))
+            .children(self.session_menu_overlay(window, cx))
             .child(self.rail(window, cx))
             .child(
                 div()
