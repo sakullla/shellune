@@ -3,7 +3,7 @@
 
 Usage:
     python3 packaging/linux/make-tarball.py --binary <path to shellune> \
-        [--version 0.1.0] [--out dist]
+        [--version 0.2.0] [--out dist]
 
 Result: dist/Shellune-<version>-linux-x86_64.tar.gz containing
 
@@ -46,7 +46,7 @@ are what the GPUI renderer needs.
 def main():
     parser = argparse.ArgumentParser(description="package Shellune for Linux")
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--version", default="0.1.0")
+    parser.add_argument("--version", default="0.2.0")
     parser.add_argument("--out", default=os.path.join(REPO, "dist"))
     args = parser.parse_args()
 
