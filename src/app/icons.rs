@@ -70,11 +70,17 @@ pub enum Icon {
     Lock,
     /// A triangle: a command run after connecting.
     Play,
+    /// An eye: show a hidden password.
+    Eye,
+    /// A struck eye: hide the password again.
+    EyeOff,
+    /// An open folder: choose a file.
+    FolderOpen,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 32] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -104,6 +110,9 @@ impl Icon {
         Self::Key,
         Self::Lock,
         Self::Play,
+        Self::Eye,
+        Self::EyeOff,
+        Self::FolderOpen,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -138,6 +147,9 @@ impl Icon {
             Self::Key => "icons/key.svg",
             Self::Lock => "icons/lock.svg",
             Self::Play => "icons/play.svg",
+            Self::Eye => "icons/eye.svg",
+            Self::EyeOff => "icons/eye-off.svg",
+            Self::FolderOpen => "icons/folder-open.svg",
         }
     }
 
@@ -207,6 +219,15 @@ impl Icon {
                 r#"<rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>"#
             }
             Self::Play => r#"<path d="M7 5l12 7-12 7z"/>"#,
+            Self::Eye => {
+                r#"<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/>"#
+            }
+            Self::EyeOff => {
+                r#"<path d="M3 3l18 18"/><path d="M10.6 5.6A9.6 9.6 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-3 3.8"/><path d="M6.6 6.6C4 8.3 2.5 12 2.5 12S6 18.5 12 18.5a9 9 0 0 0 4.4-1.1"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>"#
+            }
+            Self::FolderOpen => {
+                r#"<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V11"/><path d="M3 7v10a2 2 0 0 0 2 2h12.5a2 2 0 0 0 1.9-1.4L21.5 12H7.2a2 2 0 0 0-1.9 1.4L3 19"/>"#
+            }
         }
     }
 

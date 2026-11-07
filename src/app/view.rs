@@ -48,7 +48,7 @@ use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{self, MethodChoice, RemoteFailure, RemotePanel, RemoteStatus};
 use crate::app::terminal::{self, PaneState, SourceEvent, TerminalPane};
-use crate::app::text_field::TextField;
+use crate::app::text_field::{Browse, TextField};
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
 #[cfg(test)]
 use crate::app::transfers::TransferChannel;
@@ -300,7 +300,11 @@ impl ShelluneView {
         let placeholder = workspace.strings().shell_custom_placeholder;
         let search_placeholder = workspace.strings().hosts_search_placeholder;
         let strings = workspace.strings();
-        let shell_path = cx.new(|cx| TextField::new(placeholder, cx));
+        let shell_path = cx.new(|cx| {
+            let mut field = TextField::new(placeholder, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        });
         let hosts_search = cx.new(|cx| TextField::new(search_placeholder, cx));
 
         // The credentials fields are created once and reused: a field that is
@@ -309,12 +313,18 @@ impl ShelluneView {
         let password = cx.new(|cx| {
             let mut field = TextField::new(strings.auth_password, cx);
             field.set_masked(true, cx);
+            field.set_revealable(true, cx);
             field
         });
-        let key_path = cx.new(|cx| TextField::new(strings.auth_key, cx));
+        let key_path = cx.new(|cx| {
+            let mut field = TextField::new(strings.auth_key, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        });
         let passphrase = cx.new(|cx| {
             let mut field = TextField::new(strings.auth_key_passphrase, cx);
             field.set_masked(true, cx);
+            field.set_revealable(true, cx);
             field
         });
 
@@ -702,7 +712,11 @@ impl ShelluneView {
             return;
         };
         let placeholder = self.strings().transfers_upload_placeholder;
-        let field = cx.new(|cx| TextField::new(placeholder, cx));
+        let field = cx.new(|cx| {
+            let mut field = TextField::new(placeholder, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        });
         self.open_files_dialog(
             FilesDialog::Upload {
                 session: id,
@@ -731,7 +745,11 @@ impl ShelluneView {
         let remote = join_path(&directory, name);
         let placeholder = self.strings().transfers_download_placeholder;
         let suggested = default_download_directory();
-        let field = cx.new(|cx| TextField::with_text(placeholder, &suggested, cx));
+        let field = cx.new(|cx| {
+            let mut field = TextField::with_text(placeholder, &suggested, cx);
+            field.set_browse(Browse::Directory, cx);
+            field
+        });
         self.open_files_dialog(
             FilesDialog::Download {
                 session: id,
@@ -1242,11 +1260,13 @@ impl ShelluneView {
             TextField::with_text(strings.host_field_group, draft.text(HostField::Group), cx)
         });
         let identity = cx.new(|cx| {
-            TextField::with_text(
+            let mut field = TextField::with_text(
                 strings.host_field_identity,
                 draft.text(HostField::IdentityFile),
                 cx,
-            )
+            );
+            field.set_browse(Browse::File, cx);
+            field
         });
         self.host_fields = Some(HostFields {
             name,
@@ -1399,7 +1419,11 @@ impl ShelluneView {
         self.hosts.clear_message();
         let placeholder = self.strings().import_path_placeholder;
         let text = self.import.path().to_owned();
-        self.import_path = Some(cx.new(|cx| TextField::with_text(placeholder, text, cx)));
+        self.import_path = Some(cx.new(|cx| {
+            let mut field = TextField::with_text(placeholder, text, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        }));
         self.bind_import_path(cx);
         cx.notify();
     }
@@ -6772,6 +6796,9 @@ impl ShelluneView {
 
 impl Render for ShelluneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Small views that are not handed the workspace (a text field's menu) read the
+        // language from here.
+        self.workspace.locale().set_current();
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);
 

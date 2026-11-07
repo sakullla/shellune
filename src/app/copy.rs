@@ -42,6 +42,19 @@ impl Locale {
         }
     }
 
+    /// The language the window is drawn in right now.
+    ///
+    /// Set by the window each time it draws; small views that are not handed the
+    /// workspace, such as a text field's context menu, read it here.
+    pub fn current() -> Self {
+        CURRENT_LOCALE.with(std::cell::Cell::get)
+    }
+
+    /// Records the language the window is being drawn in; see [`Locale::current`].
+    pub fn set_current(self) {
+        CURRENT_LOCALE.with(|current| current.set(self));
+    }
+
     /// The other language.
     pub fn toggle(self) -> Self {
         let index = Self::ALL
@@ -50,6 +63,12 @@ impl Locale {
             .unwrap_or(0);
         Self::ALL[(index + 1) % Self::ALL.len()]
     }
+}
+
+thread_local! {
+    /// The language the window is drawn in; per thread, because a test runs its window
+    /// on its own thread and must not see another test's choice.
+    static CURRENT_LOCALE: std::cell::Cell<Locale> = const { std::cell::Cell::new(Locale::English) };
 }
 
 /// One column of UI copy.
@@ -532,6 +551,20 @@ pub struct Strings {
     pub session_more: &'static str,
     /// List toolbar: how many closed records there are, before the count.
     pub session_closed_summary: &'static str,
+    /// Text field menu: cut the selection.
+    pub field_cut: &'static str,
+    /// Text field menu: copy the selection.
+    pub field_copy: &'static str,
+    /// Text field menu: paste.
+    pub field_paste: &'static str,
+    /// Text field menu: select everything.
+    pub field_select_all: &'static str,
+    /// Tooltip: show a hidden password.
+    pub field_reveal: &'static str,
+    /// Tooltip: hide the password again.
+    pub field_conceal: &'static str,
+    /// Button beside a path field that opens the system file chooser.
+    pub field_browse: &'static str,
 }
 
 /// English copy.
@@ -771,6 +804,13 @@ pub static ENGLISH: Strings = Strings {
     session_menu_remove_closed: "Remove all closed",
     session_more: "More actions",
     session_closed_summary: "Closed sessions",
+    field_cut: "Cut",
+    field_copy: "Copy",
+    field_paste: "Paste",
+    field_select_all: "Select all",
+    field_reveal: "Show",
+    field_conceal: "Hide",
+    field_browse: "Browse…",
 };
 
 /// Chinese copy.
@@ -1010,6 +1050,13 @@ pub static CHINESE: Strings = Strings {
     session_menu_remove_closed: "清除所有已关闭",
     session_more: "更多操作",
     session_closed_summary: "已关闭的会话",
+    field_cut: "剪切",
+    field_copy: "复制",
+    field_paste: "粘贴",
+    field_select_all: "全选",
+    field_reveal: "显示",
+    field_conceal: "隐藏",
+    field_browse: "浏览…",
 };
 
 /// A count followed by its unit, in the grammar of the language.
