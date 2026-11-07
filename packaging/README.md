@@ -37,7 +37,22 @@ The path to the produced binary is `$CARGO_TARGET_DIR/release/shellune` (or
 
 ## What the scripts refuse to do
 
-They do not invent an icon, a company name, a version or a license, and they do not
+They do not invent a company name, a version or a license, and they do not
 copy test helpers into a release artifact: `shellune-flood` exists only for the
 interrupt tests, is hidden behind the `test-support` feature, and a `--release`
 build does not contain it.
+
+## Application icons
+
+`assets/icons/` contains the generated source, PNG, multi-resolution Windows ICO
+and macOS ICNS. The Windows build embeds icon resource 1, which GPUI uses for the
+window and taskbar. The macOS and Linux packaging scripts include their icons.
+
+`tool/generate_app_icons.py` adapts Rillight's configured-provider image workflow.
+Its `PROMPT` defines a moon-blue/lavender crescent with a terminal-chevron cutout.
+Generate with Python 3.11+ and Pillow, or rebuild offline from the saved source:
+
+```sh
+python tool/generate_app_icons.py --force
+python tool/generate_app_icons.py --reuse-source --force
+```

@@ -28,6 +28,7 @@ INFO = {
     "CFBundleDisplayName": "Shellune",
     "CFBundleIdentifier": "com.shellune.Shellune",
     "CFBundleExecutable": "shellune",
+    "CFBundleIconFile": "shellune.icns",
     "CFBundlePackageType": "APPL",
     "CFBundleShortVersionString": "{version}",
     "CFBundleVersion": "{version}",
@@ -54,6 +55,7 @@ def main():
     resources = os.path.join(app, "Contents", "Resources")
     os.makedirs(macos)
     os.makedirs(resources)
+    shutil.copy2(os.path.join(REPO, "assets", "icons", "shellune.icns"), resources)
 
     target = os.path.join(macos, "shellune")
     shutil.copy2(binary, target)

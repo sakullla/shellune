@@ -48,6 +48,9 @@ serde_json = { workspace = true }
 # only builds for tests.
 shellune-ssh = { path = "crates/ssh", features = ["test-support"] }
 
+[build-dependencies]
+embed-resource = "3.0.12"
+
 [workspace]
 members = ["crates/core", "crates/ssh", "crates/storage", "crates/terminal"]
 # The patched third-party crates are dependencies, not members of this workspace.

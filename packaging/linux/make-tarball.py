@@ -37,6 +37,7 @@ Install
 -------
     install -Dm755 shellune ~/.local/bin/shellune
     install -Dm644 shellune.desktop ~/.local/share/applications/shellune.desktop
+    install -Dm644 shellune.png ~/.local/share/icons/hicolor/1024x1024/apps/shellune.png
 
 Run it with the shellune command. A Vulkan 1.3 driver and an X11 or Wayland session
 are what the GPUI renderer needs.
@@ -61,6 +62,7 @@ def main():
     os.makedirs(stage)
 
     shutil.copy2(binary, os.path.join(stage, "shellune"))
+    shutil.copy2(os.path.join(REPO, "assets", "icons", "shellune.png"), stage)
     os.chmod(os.path.join(stage, "shellune"), 0o755)
     shutil.copy2(os.path.join(REPO, "LICENSE"), os.path.join(stage, "LICENSE"))
     shutil.copy2(os.path.join(REPO, "packaging", "linux", "shellune.desktop"),

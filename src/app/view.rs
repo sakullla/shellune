@@ -7456,8 +7456,8 @@ fn destination_icon(destination: Destination) -> Icon {
     }
 }
 
-/// The product mark: a prompt on the brand gradient.
-fn brand_mark(size: gpui::Pixels, metrics: Metrics) -> Div {
+/// The product mark, shared with the native application icons.
+fn brand_mark(size: gpui::Pixels, _metrics: Metrics) -> Div {
     div()
         .flex()
         .flex_none()
@@ -7465,19 +7465,7 @@ fn brand_mark(size: gpui::Pixels, metrics: Metrics) -> Div {
         .justify_center()
         .w(size)
         .h(size)
-        .rounded(px(radius::MEDIUM))
-        .bg(gpui::linear_gradient(
-            135.0,
-            gpui::linear_color_stop(theme::swatch(palette::ACCENT_HOVER), 0.0),
-            gpui::linear_color_stop(theme::swatch(palette::BRAND_END), 1.0),
-        ))
-        .shadow_md()
-        .child(icons::icon(
-            Icon::Terminal,
-            size * 0.58,
-            theme::swatch(palette::ON_ACCENT),
-        ))
-        .text_size(metrics.label_size())
+        .child(gpui::img(icons::APP_ICON).size(size))
 }
 
 /// A rounded square with the initials of a host, so a list is scanned by name shape.

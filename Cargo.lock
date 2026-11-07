@@ -6051,6 +6051,7 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 name = "shellune"
 version = "0.2.0"
 dependencies = [
+ "embed-resource",
  "gpui",
  "libc",
  "portable-pty",

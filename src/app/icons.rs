@@ -252,8 +252,15 @@ impl Icon {
 /// Serves the embedded icons to GPUI.
 pub struct Assets;
 
+pub const APP_ICON: &str = "icons/shellune.png";
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        if path == APP_ICON {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../../assets/icons/shellune.png"
+            ))));
+        }
         Ok(Icon::from_path(path).map(|icon| Cow::Owned(icon.svg_source().into_bytes())))
     }
 
@@ -261,6 +268,7 @@ impl AssetSource for Assets {
         Ok(Icon::ALL
             .into_iter()
             .map(Icon::path)
+            .chain(std::iter::once(APP_ICON))
             .filter(|candidate| candidate.starts_with(path))
             .map(SharedString::from)
             .collect())

@@ -16,6 +16,8 @@
 
 Unicode true
 !include "MUI2.nsh"
+!define MUI_ICON "..\..\assets\icons\shellune.ico"
+!define MUI_UNICON "..\..\assets\icons\shellune.ico"
 
 !ifndef VERSION
   !define VERSION "0.2.0"
