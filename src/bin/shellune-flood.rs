@@ -120,7 +120,7 @@ fn install_handler() {
     // SAFETY: SIGINT is process-wide state, set before any output starts, and the
     // handler does nothing a signal handler may not do.
     unsafe {
-        libc::signal(libc::SIGINT, record as libc::sighandler_t);
+        libc::signal(libc::SIGINT, record as *const () as libc::sighandler_t);
     }
 }
 
