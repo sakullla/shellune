@@ -478,6 +478,46 @@ pub struct Strings {
     pub transfers_close_cancel: &'static str,
     /// Answer that closes the session and cancels its transfers.
     pub transfers_close_confirm: &'static str,
+    /// Button and hint that open the command palette.
+    pub palette_open: &'static str,
+    /// Short name of the palette in the shortcut hints.
+    pub palette_hint_short: &'static str,
+    /// Placeholder of the palette's search field.
+    pub palette_placeholder: &'static str,
+    /// Shown when nothing in the palette matches.
+    pub palette_empty: &'static str,
+    /// Palette group: open sessions.
+    pub palette_group_sessions: &'static str,
+    /// Palette group: shells to start.
+    pub palette_group_shells: &'static str,
+    /// Palette group: saved hosts.
+    pub palette_group_hosts: &'static str,
+    /// Palette group: pages.
+    pub palette_group_navigate: &'static str,
+    /// Palette group: window actions.
+    pub palette_group_actions: &'static str,
+    /// Palette action: close the session on screen.
+    pub palette_close_tab: &'static str,
+    /// Palette action: switch the interface language.
+    pub palette_language: &'static str,
+    /// Palette action: step the text size.
+    pub palette_text_size: &'static str,
+    /// Marks the session already on screen.
+    pub palette_current: &'static str,
+    /// Footer hint: arrow keys.
+    pub palette_key_move: &'static str,
+    /// Footer hint: Enter.
+    pub palette_key_run: &'static str,
+    /// Footer hint: Escape.
+    pub palette_key_close: &'static str,
+    /// Tab menu: open another session like this one.
+    pub tab_menu_duplicate: &'static str,
+    /// Tab menu: close this tab.
+    pub tab_menu_close: &'static str,
+    /// Tab menu: close every other tab.
+    pub tab_menu_close_others: &'static str,
+    /// Tab menu: close the tabs after this one.
+    pub tab_menu_close_right: &'static str,
 }
 
 /// English copy.
@@ -535,7 +575,7 @@ pub static ENGLISH: Strings = Strings {
     shell_launch_title: "Start a shell",
     shell_menu_hint: "Choose which shell to open",
     shell_default: "Default",
-    shell_custom_hint: "Any program on this machine",
+    shell_custom_hint: "Any program, by path",
     welcome_hosts: "Connect to a server",
     nav_hint_short: "Switch sections",
     idle: "Idle",
@@ -690,6 +730,26 @@ pub static ENGLISH: Strings = Strings {
     transfers_close_question: "Closing this session cancels its transfers",
     transfers_close_cancel: "Keep the session open",
     transfers_close_confirm: "Close and cancel",
+    palette_open: "Search…",
+    palette_hint_short: "Command palette",
+    palette_placeholder: "Search sessions, shells, hosts and actions",
+    palette_empty: "Nothing matches",
+    palette_group_sessions: "Open sessions",
+    palette_group_shells: "New local shell",
+    palette_group_hosts: "Connect to host",
+    palette_group_navigate: "Go to",
+    palette_group_actions: "Actions",
+    palette_close_tab: "Close current session",
+    palette_language: "Switch interface language",
+    palette_text_size: "Change text size",
+    palette_current: "Current",
+    palette_key_move: "Select",
+    palette_key_run: "Open",
+    palette_key_close: "Close",
+    tab_menu_duplicate: "Duplicate tab",
+    tab_menu_close: "Close tab",
+    tab_menu_close_others: "Close other tabs",
+    tab_menu_close_right: "Close tabs to the right",
 };
 
 /// Chinese copy.
@@ -902,6 +962,26 @@ pub static CHINESE: Strings = Strings {
     transfers_close_question: "关闭这个会话会取消它的传输",
     transfers_close_cancel: "保持会话打开",
     transfers_close_confirm: "关闭并取消",
+    palette_open: "搜索…",
+    palette_hint_short: "命令面板",
+    palette_placeholder: "搜索会话、Shell、主机与操作",
+    palette_empty: "没有匹配的结果",
+    palette_group_sessions: "已打开的会话",
+    palette_group_shells: "新建本地终端",
+    palette_group_hosts: "连接到主机",
+    palette_group_navigate: "前往",
+    palette_group_actions: "操作",
+    palette_close_tab: "关闭当前会话",
+    palette_language: "切换界面语言",
+    palette_text_size: "调整文字大小",
+    palette_current: "当前",
+    palette_key_move: "选择",
+    palette_key_run: "打开",
+    palette_key_close: "关闭",
+    tab_menu_duplicate: "复制标签",
+    tab_menu_close: "关闭标签",
+    tab_menu_close_others: "关闭其他标签",
+    tab_menu_close_right: "关闭右侧标签",
 };
 
 /// A count followed by its unit, in the grammar of the language.

@@ -731,6 +731,26 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             files_kind_file,
             files_kind_link,
             files_kind_other,
+            palette_open,
+            palette_hint_short,
+            palette_placeholder,
+            palette_empty,
+            palette_group_sessions,
+            palette_group_shells,
+            palette_group_hosts,
+            palette_group_navigate,
+            palette_group_actions,
+            palette_close_tab,
+            palette_language,
+            palette_text_size,
+            palette_current,
+            palette_key_move,
+            palette_key_run,
+            palette_key_close,
+            tab_menu_duplicate,
+            tab_menu_close,
+            tab_menu_close_others,
+            tab_menu_close_right,
         ]
     )
 }
@@ -923,9 +943,53 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
     let bindings = key_bindings(Platform::current());
     assert_eq!(
         bindings.len(),
-        Destination::ALL.len() + 6,
-        "four destinations, next and previous, zoom, new shell, language and dismiss"
+        Destination::ALL.len() + 6 + 4 + crate::app::TAB_JUMP_COUNT,
+        "four destinations, next and previous, zoom, new shell, language and dismiss; \
+         the palette, close tab, next and previous tab; and one jump per tab digit"
     );
+}
+
+/// The tab and palette shortcuts have to work while a terminal has the keyboard, and
+/// none of them may take a key a shell program reads on its own.
+#[test]
+fn the_tab_and_palette_shortcuts_reach_past_a_terminal() {
+    for platform in [Platform::Windows, Platform::Linux, Platform::MacOs] {
+        let bindings = key_bindings(platform);
+        let (next, previous) = platform.tab_cycle_keystrokes();
+        for keystroke in [
+            platform.palette_keystroke(),
+            platform.close_tab_keystroke(),
+            next,
+            previous,
+        ] {
+            let wanted = gpui::Keystroke::parse(keystroke)
+                .expect("a valid keystroke")
+                .unparse();
+            let binding = bindings
+                .iter()
+                .find(|binding| {
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.unparse())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        == wanted
+                })
+                .unwrap_or_else(|| panic!("{keystroke} is not bound on {platform:?}"));
+            let predicate = format!("{:?}", binding.predicate());
+            assert!(
+                !predicate.contains("Not"),
+                "{keystroke} must reach past a terminal, got {predicate}"
+            );
+        }
+    }
+    // Ctrl+W and Ctrl+P are shell keys (delete word, previous command) on Windows and
+    // Linux; only the shifted forms may be taken there.
+    for platform in [Platform::Windows, Platform::Linux] {
+        assert_eq!(platform.close_tab_keystroke(), "ctrl-shift-w");
+        assert_eq!(platform.palette_keystroke(), "ctrl-shift-p");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6186,4 +6250,277 @@ async fn a_connection_that_cannot_take_a_transfer_says_so(cx: &mut TestAppContex
         0,
         "no task is left claiming to run"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Command palette and tab handling
+// ---------------------------------------------------------------------------
+
+/// Opens two real shells from the header, or returns `None` when the machine has none.
+fn two_shells(cx: &mut TestAppContext) -> Option<(Entity<ShelluneView>, &mut VisualTestContext)> {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return None;
+    }
+    click(cx, "header.primary");
+    click(cx, "header.primary");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs().len()),
+        2
+    );
+    Some((view, cx))
+}
+
+fn palette_keystroke() -> &'static str {
+    Platform::current().palette_keystroke()
+}
+
+#[gpui::test]
+async fn the_palette_opens_from_a_terminal_and_switches_sessions(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[1]),
+        "the newest shell is on screen and has the keyboard"
+    );
+
+    cx.simulate_keystrokes(palette_keystroke());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).palette_open()),
+        "the palette shortcut works while a terminal has the keyboard"
+    );
+    assert!(cx.debug_bounds("palette").is_some());
+
+    // Typing filters; the first match is highlighted and Enter runs it.
+    cx.simulate_input("1");
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert!(
+        titles.first().is_some_and(|title| title.ends_with(" 1")),
+        "the first tab is the best match for its number, got {titles:?}"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).palette_open()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[0]),
+        "Enter switched to the session that was picked"
+    );
+}
+
+#[gpui::test]
+async fn escape_closes_the_palette_without_running_anything(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    focus_root(&view, cx);
+
+    click(cx, "palette.open");
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    cx.simulate_input("hosts");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).palette_open()));
+    assert_eq!(
+        destination_of(&view, cx),
+        Destination::LocalShells,
+        "closing the palette does not run the highlighted entry"
+    );
+
+    // The arrow keys move the highlight; Enter runs what is highlighted.
+    cx.simulate_keystrokes(palette_keystroke());
+    cx.simulate_input("hosts");
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert_eq!(
+        titles.first().map(String::as_str),
+        Some(ENGLISH.nav_hosts),
+        "a page name is matched by its title first"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Hosts);
+}
+
+#[gpui::test]
+async fn a_search_without_a_match_says_so(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "palette.open");
+    cx.simulate_input("zzqqxx");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).palette_titles().is_empty()));
+    assert!(cx.debug_bounds("palette.empty").is_some());
+    // Enter over an empty list does nothing and keeps the palette open for a new search.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+}
+
+#[gpui::test]
+async fn tab_shortcuts_cycle_jump_and_close(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let platform = Platform::current();
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let active =
+        |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).active_session());
+
+    // Next wraps from the last tab to the first; a second press keeps working, which
+    // it only does when the keyboard followed the tab that was shown.
+    let (next, previous) = platform.tab_cycle_keystrokes();
+    cx.simulate_keystrokes(next);
+    cx.run_until_parked();
+    assert_eq!(active(cx), Some(tabs[0]));
+    cx.simulate_keystrokes(next);
+    cx.run_until_parked();
+    assert_eq!(active(cx), Some(tabs[1]));
+    cx.simulate_keystrokes(previous);
+    cx.run_until_parked();
+    assert_eq!(active(cx), Some(tabs[0]));
+
+    cx.simulate_keystrokes(&format!("{}-2", platform.tab_jump_modifier()));
+    cx.run_until_parked();
+    assert_eq!(active(cx), Some(tabs[1]), "the digit jumps to that tab");
+    cx.simulate_keystrokes(&format!("{}-9", platform.tab_jump_modifier()));
+    cx.run_until_parked();
+    assert_eq!(
+        active(cx),
+        Some(tabs[1]),
+        "the last digit means the last tab"
+    );
+
+    cx.simulate_keystrokes(platform.close_tab_keystroke());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![tabs[0]],
+        "only the tab on screen was closed"
+    );
+    assert_eq!(active(cx), Some(tabs[0]), "the remaining tab took over");
+}
+
+#[gpui::test]
+async fn the_tab_menu_closes_the_other_tabs_and_duplicates_one(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+
+    // Right-click the first tab.
+    let bounds = bounds_of(cx, "session.tab.0");
+    let center = bounds.center();
+    cx.simulate_mouse_down(
+        point(center.x, center.y),
+        MouseButton::Right,
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        point(center.x, center.y),
+        MouseButton::Right,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("tab.menu").is_some(),
+        "a right click opens the tab menu"
+    );
+
+    // Escape closes it, even though a terminal had the keyboard.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let menu_open = cx.update(|_window, app| view.read(app).tab_menu_open());
+    assert!(!menu_open, "Escape closes the tab menu");
+
+    cx.simulate_mouse_down(
+        point(center.x, center.y),
+        MouseButton::Right,
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        point(center.x, center.y),
+        MouseButton::Right,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    click(cx, "tab.menu.close_others");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![tabs[0]],
+        "every tab but the one the menu belongs to was closed"
+    );
+
+    cx.simulate_mouse_down(
+        point(center.x, center.y),
+        MouseButton::Right,
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        point(center.x, center.y),
+        MouseButton::Right,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    click(cx, "tab.menu.duplicate");
+    let after = cx.update(|_window, app| view.read(app).open_tabs());
+    assert_eq!(after.len(), 2, "duplicating opened another tab");
+    let kinds = cx.update(|_window, app| {
+        after
+            .iter()
+            .map(|id| {
+                view.read(app)
+                    .workspace()
+                    .session(*id)
+                    .map(|s| s.kind().clone())
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(kinds[0], kinds[1], "the copy runs the same shell");
+}
+
+#[gpui::test]
+async fn a_middle_click_closes_a_tab(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let bounds = bounds_of(cx, "session.tab.0");
+    let center = bounds.center();
+    cx.simulate_mouse_down(
+        point(center.x, center.y),
+        MouseButton::Middle,
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        point(center.x, center.y),
+        MouseButton::Middle,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![tabs[1]]
+    );
+}
+
+#[gpui::test]
+async fn the_sidebar_counts_open_sessions_not_closed_ones(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    click(cx, "session.tab.close.0");
+    let open = cx.update(|_window, app| view.read(app).sidebar_count(Destination::Sessions));
+    assert_eq!(open, 1, "the badge matches the tabs that are left");
 }

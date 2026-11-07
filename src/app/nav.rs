@@ -69,6 +69,70 @@ impl Platform {
         }
     }
 
+    /// Keystroke that opens the command palette.
+    ///
+    /// Shifted on every platform: Ctrl+P is the shell's "previous command".
+    pub fn palette_keystroke(self) -> &'static str {
+        match self {
+            Self::MacOs => "cmd-shift-p",
+            Self::Windows | Self::Linux => "ctrl-shift-p",
+        }
+    }
+
+    /// Label of [`Platform::palette_keystroke`].
+    pub fn palette_label(self) -> &'static str {
+        match self {
+            Self::MacOs => "\u{21e7}\u{2318}P",
+            Self::Windows | Self::Linux => "Ctrl+Shift+P",
+        }
+    }
+
+    /// Keystroke that closes the session on screen.
+    ///
+    /// Ctrl+W alone deletes a word in the shell, so the shifted form is used outside
+    /// macOS, as other terminals do.
+    pub fn close_tab_keystroke(self) -> &'static str {
+        match self {
+            Self::MacOs => "cmd-w",
+            Self::Windows | Self::Linux => "ctrl-shift-w",
+        }
+    }
+
+    /// Label of [`Platform::close_tab_keystroke`].
+    pub fn close_tab_label(self) -> &'static str {
+        match self {
+            Self::MacOs => "\u{2318}W",
+            Self::Windows | Self::Linux => "Ctrl+Shift+W",
+        }
+    }
+
+    /// Keystrokes that select the next and the previous tab.
+    pub fn tab_cycle_keystrokes(self) -> (&'static str, &'static str) {
+        match self {
+            Self::MacOs => ("cmd-shift-]", "cmd-shift-["),
+            Self::Windows | Self::Linux => ("ctrl-pagedown", "ctrl-pageup"),
+        }
+    }
+
+    /// Modifier of the shortcuts that jump straight to tab 1-9.
+    ///
+    /// The command key already selects a page on macOS, and Ctrl+digit does on
+    /// Windows and Linux, so tabs take the next free modifier.
+    pub fn tab_jump_modifier(self) -> &'static str {
+        match self {
+            Self::MacOs => "ctrl",
+            Self::Windows | Self::Linux => "alt",
+        }
+    }
+
+    /// Label of the tab jump shortcut for tab `number`.
+    pub fn tab_jump_label(self, number: usize) -> String {
+        match self {
+            Self::MacOs => format!("\u{2303}{number}"),
+            Self::Windows | Self::Linux => format!("Alt+{number}"),
+        }
+    }
+
     /// The whole navigation range, for example "Ctrl+1-4" or "⌘1-4".
     ///
     /// Derived from the same modifier and digits as `Destination::shortcut_label`

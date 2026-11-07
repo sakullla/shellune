@@ -19,6 +19,7 @@ pub mod files;
 pub mod hosts;
 pub mod icons;
 pub mod nav;
+pub mod palette;
 pub mod product;
 pub mod remote;
 pub mod terminal;
@@ -39,8 +40,10 @@ use gpui::{
 };
 
 use crate::app::actions::{
-    CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
-    NewLocalShell, NextDestination, PreviousDestination, ToggleLanguage,
+    CloseActiveTab, CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions,
+    GoToTransfers, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
+    PreviousTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage,
 };
 use crate::app::nav::{Destination, Platform};
 
@@ -61,7 +64,20 @@ pub mod actions {
             CycleTextSize,
             ToggleLanguage,
             DismissNotice,
-            NewLocalShell
+            NewLocalShell,
+            OpenPalette,
+            CloseActiveTab,
+            NextTab,
+            PreviousTab,
+            SelectTab1,
+            SelectTab2,
+            SelectTab3,
+            SelectTab4,
+            SelectTab5,
+            SelectTab6,
+            SelectTab7,
+            SelectTab8,
+            SelectTab9
         ]
     );
 }
@@ -141,6 +157,48 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
         // terminal has the keyboard: inside one they are keys the running program
         // needs (Escape leaves Vim's insert mode, Ctrl+L clears the screen).
         KeyBinding::new("escape", DismissNotice, Some(APP_KEY_CONTEXT)),
+        // The tab and palette shortcuts work from inside a terminal, like the new shell
+        // shortcut: each is a combination no shell program reads (shifted, or with
+        // Page Up/Down), so the running program loses nothing.
+        KeyBinding::new(platform.palette_keystroke(), OpenPalette, Some(KEY_CONTEXT)),
+        KeyBinding::new(
+            platform.close_tab_keystroke(),
+            CloseActiveTab,
+            Some(KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            platform.tab_cycle_keystrokes().0,
+            NextTab,
+            Some(KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            platform.tab_cycle_keystrokes().1,
+            PreviousTab,
+            Some(KEY_CONTEXT),
+        ),
+    ]
+    .into_iter()
+    .chain(tab_jump_bindings(platform))
+    .collect()
+}
+
+/// Number of tabs that have a jump shortcut.
+pub const TAB_JUMP_COUNT: usize = 9;
+
+/// Alt+1-9 (Ctrl+1-9 on macOS): straight to one tab.
+fn tab_jump_bindings(platform: Platform) -> Vec<KeyBinding> {
+    let modifier = platform.tab_jump_modifier();
+    let key = |number: usize| format!("{modifier}-{number}");
+    vec![
+        KeyBinding::new(&key(1), SelectTab1, Some(KEY_CONTEXT)),
+        KeyBinding::new(&key(2), SelectTab2, Some(KEY_CONTEXT)),
+        KeyBinding::new(&key(3), SelectTab3, Some(KEY_CONTEXT)),
+        KeyBinding::new(&key(4), SelectTab4, Some(KEY_CONTEXT)),
+        KeyBinding::new(&key(5), SelectTab5, Some(KEY_CONTEXT)),
+        KeyBinding::new(&key(6), SelectTab6, Some(KEY_CONTEXT)),
+        KeyBinding::new(&key(7), SelectTab7, Some(KEY_CONTEXT)),
+        KeyBinding::new(&key(8), SelectTab8, Some(KEY_CONTEXT)),
+        KeyBinding::new(&key(9), SelectTab9, Some(KEY_CONTEXT)),
     ]
 }
 

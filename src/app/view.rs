@@ -27,8 +27,10 @@ use shellune_storage::{
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{
-    CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
-    NewLocalShell, NextDestination, PreviousDestination, ToggleLanguage,
+    CloseActiveTab, CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions,
+    GoToTransfers, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
+    PreviousTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage,
 };
 use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
@@ -55,6 +57,8 @@ use crate::app::transfers::{
 };
 use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Workspace};
 use crate::app::{components, theme::radius};
+
+mod overlays;
 
 /// Where a terminal comes from.
 ///
@@ -211,6 +215,16 @@ pub struct ShelluneView {
     files_dialog: Option<FilesDialog>,
     /// The field of that question, present only while it has one.
     files_field: Option<Entity<TextField>>,
+    /// The command palette's search field, present only while the palette is open.
+    palette: Option<Entity<TextField>>,
+    /// What the palette's field held when the list was last ranked.
+    palette_query: String,
+    /// The highlighted palette entry.
+    palette_selected: usize,
+    /// Keeps the highlighted palette entry in view.
+    palette_scroll: gpui::ScrollHandle,
+    /// The tab whose menu is open, and where the pointer opened it.
+    tab_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// The attempt a test scripted, kept so its answers can be inspected.
     #[cfg(test)]
     scripted: Option<shellune_ssh::ScriptedSession>,
@@ -331,6 +345,11 @@ impl ShelluneView {
             files_polling: false,
             files_dialog: None,
             files_field: None,
+            palette: None,
+            palette_query: String::new(),
+            palette_selected: 0,
+            palette_scroll: gpui::ScrollHandle::new(),
+            tab_menu: None,
             #[cfg(test)]
             scripted: None,
         };
@@ -575,6 +594,50 @@ impl ShelluneView {
         });
         self.focus_pane(id, cx);
         cx.notify();
+    }
+
+    /// Shows a session's terminal and gives it the keyboard through `window`.
+    ///
+    /// [`Self::activate`] focuses through the application's active window, which is
+    /// already borrowed while a key action runs, so from a shortcut that focus would be
+    /// lost and the next shortcut would land on the terminal that was just hidden.
+    pub fn activate_in(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate(id, cx);
+        if self.active == Some(id)
+            && let Some(pane) = self.pane_for(id)
+        {
+            let handle = pane.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
+    }
+
+    /// Shows the tab at `index`, counting from the left; nothing happens past the end.
+    pub fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.tab_sessions().get(index).copied() {
+            self.activate_in(id, window, cx);
+        }
+    }
+
+    /// Shows the tab `delta` places from the current one, wrapping at both ends.
+    pub fn cycle_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = self.tab_sessions();
+        if tabs.is_empty() {
+            return;
+        }
+        let current = self
+            .active
+            .and_then(|id| tabs.iter().position(|tab| *tab == id))
+            .unwrap_or(0);
+        // A tab that is still connecting has no terminal to show, so it is stepped over
+        // instead of stopping the cycle on it.
+        let mut next = current;
+        for _ in 0..tabs.len() {
+            next = crate::app::palette::step(next, delta, tabs.len());
+            if self.pane_for(tabs[next]).is_some() {
+                self.activate_in(tabs[next], window, cx);
+                return;
+            }
+        }
     }
 
     /// Closes one session: its process, its terminal and its tab (R7).
@@ -2661,7 +2724,7 @@ impl ShelluneView {
     }
 
     /// Where the records are stored, said plainly.
-    fn hosts_storage_line(&self) -> Div {
+    fn hosts_storage_line(&self) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         div()
@@ -2671,6 +2734,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::HAIRLINE + 2.0))
             .min_w(px(0.0))
             .pt(metrics.scale(spacing::TIGHT))
+            .id("hosts.storage")
             .debug_selector(|| "hosts.storage".to_owned())
             .child(
                 div()
@@ -2684,8 +2748,13 @@ impl ShelluneView {
                     .font_family(terminal::monospace_family())
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(SharedString::from(self.store.path().display().to_string())),
+                    .child(SharedString::from(home_relative(
+                        &self.store.path().display().to_string(),
+                    ))),
             )
+            .tooltip(components::tooltip(SharedString::from(
+                self.store.path().display().to_string(),
+            )))
     }
 
     /// The search field and the three list views.
@@ -3537,7 +3606,7 @@ impl ShelluneView {
         };
 
         let index = destination.index();
-        let count = self.workspace.item_count(destination);
+        let count = self.badge_count(destination);
         let hover = theme::swatch(palette::SURFACE_HOVER);
         let hover_text = theme::swatch(palette::TEXT_PRIMARY);
         let group = SharedString::from(format!("nav-{index}"));
@@ -3623,6 +3692,26 @@ impl ShelluneView {
             })
     }
 
+    /// The number beside a destination in the sidebar.
+    ///
+    /// For the session pages it counts what is still open, so it matches the tabs: a
+    /// closed session stays in the list as a record, but it is no longer something the
+    /// user has running.
+    fn badge_count(&self, destination: Destination) -> usize {
+        let open = |session: &&Session| !matches!(session.state(), SessionState::Closed);
+        match destination {
+            Destination::LocalShells => self.workspace.local_sessions().filter(open).count(),
+            Destination::Sessions => self
+                .workspace
+                .sessions()
+                .items()
+                .iter()
+                .filter(open)
+                .count(),
+            Destination::Hosts | Destination::Transfers => self.workspace.item_count(destination),
+        }
+    }
+
     /// The tone a populated destination's dot is drawn in.
     ///
     /// A list of sessions is green only while one of them is live; a list where every
@@ -3685,6 +3774,7 @@ impl ShelluneView {
             .border_r_1()
             .border_color(theme::swatch(palette::BORDER))
             .child(self.brand())
+            .child(self.palette_trigger(cx))
             .child(nav)
             .child(
                 div()
@@ -3766,6 +3856,56 @@ impl ShelluneView {
             )
     }
 
+    /// The search box at the top of the sidebar, which opens the command palette.
+    ///
+    /// It looks like a field because that is what it leads to, and it names its
+    /// shortcut, so a user who clicks it once learns how not to next time.
+    fn palette_trigger(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let hover_border = theme::swatch(palette::BORDER_STRONG);
+        let hover_text = theme::swatch(palette::TEXT_SECONDARY);
+        div()
+            .id("palette.open")
+            .debug_selector(|| "palette.open".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .mx(metrics.scale(spacing::TIGHT + 2.0))
+            .mb(metrics.scale(spacing::HAIRLINE))
+            .h(metrics.scale(30.0))
+            .pl(metrics.scale(spacing::TIGHT + 1.0))
+            .pr(metrics.scale(spacing::HAIRLINE + 1.0))
+            .rounded(px(radius::MEDIUM))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .bg(theme::swatch(palette::CANVAS))
+            .text_size(metrics.label_size())
+            .text_color(theme::swatch(palette::TEXT_MUTED))
+            .cursor_pointer()
+            .hover(move |style| style.border_color(hover_border).text_color(hover_text))
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.toggle_palette(window, cx);
+            }))
+            .child(icons::icon(
+                Icon::Search,
+                metrics.small_icon_size(),
+                theme::swatch(palette::TEXT_MUTED),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .child(strings.palette_open),
+            )
+            .child(components::keycap(
+                Platform::current().palette_label(),
+                metrics,
+            ))
+    }
+
     /// One quiet setting at the foot of the sidebar: an icon, a name and its value.
     fn rail_control(&self, icon: Icon, label: &'static str, value: &'static str) -> Div {
         let metrics = self.metrics();
@@ -3812,7 +3952,10 @@ impl ShelluneView {
         let strings = self.strings();
         let locale: Locale = self.workspace.locale();
         let parts: Vec<String> = [
-            (self.workspace.sessions().count(), strings.count_sessions),
+            (
+                self.badge_count(Destination::Sessions),
+                strings.count_sessions,
+            ),
             (self.workspace.transfers().count(), strings.count_transfers),
         ]
         .into_iter()
@@ -4547,7 +4690,11 @@ impl ShelluneView {
                         new_shell_shortcut_label(platform).to_owned(),
                         strings.primary_local,
                     ))
-                    .child(hint(platform.shortcut_range(), strings.nav_hint_short)),
+                    .child(hint(platform.shortcut_range(), strings.nav_hint_short))
+                    .child(hint(
+                        platform.palette_label().to_owned(),
+                        strings.palette_hint_short,
+                    )),
             )
             .child(
                 components::icon_label_button(
@@ -4592,7 +4739,7 @@ impl ShelluneView {
             .flex()
             .items_center()
             .gap(metrics.scale(spacing::SNUG))
-            .w(metrics.scale(216.0))
+            .w(metrics.scale(224.0))
             .h(metrics.scale(64.0))
             .px(metrics.scale(spacing::SNUG + 2.0))
             .rounded(px(radius::LARGE + 2.0))
@@ -4632,8 +4779,8 @@ impl ShelluneView {
                             .gap(metrics.scale(spacing::HAIRLINE + 2.0))
                             .child(
                                 div()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
+                                    .min_w(px(0.0))
+                                    .truncate()
                                     .text_size(metrics.body_size() + px(1.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -4650,8 +4797,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .w_full()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
+                            .truncate()
                             .when(!custom, |line| {
                                 line.font_family(terminal::monospace_family())
                             })
@@ -6138,8 +6284,13 @@ impl ShelluneView {
             PaneKind::Local => strings.session_kind_local,
             PaneKind::Remote => strings.session_kind_remote,
         };
+        let jump = if index < crate::app::TAB_JUMP_COUNT {
+            format!(" ({})", Platform::current().tab_jump_label(index + 1))
+        } else {
+            String::new()
+        };
         let tooltip = format!(
-            "{} · {kind_label} · {} · {state_label}",
+            "{} · {kind_label} · {} · {state_label}{jump}",
             session.title(),
             session_target(&self.book, session)
         );
@@ -6165,9 +6316,25 @@ impl ShelluneView {
             .text_size(metrics.label_size())
             .cursor_pointer()
             .tooltip(components::tooltip(tooltip))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.activate(id, cx);
-            }));
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.activate_in(id, window, cx);
+            }))
+            // A middle click closes a tab and a right click offers the other tab
+            // actions, as in a browser or any other tabbed terminal.
+            .on_mouse_down(
+                gpui::MouseButton::Middle,
+                cx.listener(move |this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.request_close_session(id, cx);
+                }),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_tab_menu(id, event, window, cx);
+                }),
+            );
         tab = if selected {
             tab.bg(theme::swatch(palette::CANVAS))
                 .border_color(theme::swatch(palette::BORDER_STRONG))
@@ -6612,8 +6779,17 @@ impl Render for ShelluneView {
             .on_action(cx.listener(|this, _: &ToggleLanguage, _window, cx| {
                 this.toggle_locale(cx);
             }))
-            .on_action(cx.listener(|this, _: &DismissNotice, _window, cx| {
-                // Escape closes whatever floats first: an open menu, then the notice.
+            .on_action(cx.listener(|this, _: &DismissNotice, window, cx| {
+                // Escape closes whatever floats first: the palette, a menu, then the
+                // notice.
+                if this.palette.is_some() {
+                    this.close_palette(window, cx);
+                    return;
+                }
+                if this.tab_menu.is_some() {
+                    this.close_tab_menu(window, cx);
+                    return;
+                }
                 if this.shell_menu_open {
                     this.close_shell_menu(cx);
                     return;
@@ -6624,6 +6800,51 @@ impl Render for ShelluneView {
             .on_action(cx.listener(|this, _: &NewLocalShell, window, cx| {
                 this.new_local_shell(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+                this.toggle_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseActiveTab, _window, cx| {
+                if let Some(id) = this.active {
+                    this.request_close_session(id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                this.cycle_tab(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
+                this.cycle_tab(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab1, window, cx| {
+                this.select_tab(0, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab2, window, cx| {
+                this.select_tab(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab3, window, cx| {
+                this.select_tab(2, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab4, window, cx| {
+                this.select_tab(3, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab5, window, cx| {
+                this.select_tab(4, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab6, window, cx| {
+                this.select_tab(5, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab7, window, cx| {
+                this.select_tab(6, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab8, window, cx| {
+                this.select_tab(7, window, cx);
+            }))
+            // The last jump goes to the last tab, however many there are.
+            .on_action(cx.listener(|this, _: &SelectTab9, window, cx| {
+                let last = this.tab_sessions().len().saturating_sub(1);
+                this.select_tab(last, window, cx);
+            }))
+            .children(self.palette_overlay(window, cx))
+            .children(self.tab_menu_overlay(window, cx))
             .child(self.rail(window, cx))
             .child(
                 div()
@@ -6642,6 +6863,22 @@ impl Render for ShelluneView {
                     .children(self.close_transfer_question(cx))
                     .child(self.destination_panel(cx)),
             )
+    }
+}
+
+/// A path with the user's home folder written as `~`, which is how it is read.
+///
+/// The full path is still in the line's tooltip; this only keeps the visible line short
+/// enough to be read at a glance instead of being cut off.
+fn home_relative(path: &str) -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    match path.strip_prefix(home.as_str()) {
+        Some(rest) if !home.is_empty() && (rest.starts_with('/') || rest.starts_with('\\')) => {
+            format!("~{rest}")
+        }
+        _ => path.to_owned(),
     }
 }
 
