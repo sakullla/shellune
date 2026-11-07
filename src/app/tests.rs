@@ -21,7 +21,7 @@ use shellune_core::{
     EventTag, HostConfig, LocalShell, Session, SessionId, SessionKind, SessionState, Transfer,
     TransferDirection,
 };
-use shellune_storage::{HostBook, HostEdit, HostKey, HostStore, TrustStore};
+use shellune_storage::{ForwardStore, HostBook, HostEdit, HostKey, HostStore, TrustStore};
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage};
@@ -3083,8 +3083,17 @@ async fn an_import_preview_shows_its_limits_and_saves_only_the_hosts_it_offered(
         assert_eq!(web.target(), "deploy@web.example.org:2222");
         assert_eq!(web.identity_file(), Some("~/.ssh/id_ed25519"));
         let message = view.hosts_state().message().expect("the result is stated");
-        assert!(!message.failed());
+        assert!(
+            message.failed(),
+            "a blocked host keeps the result from reading as a complete import: {}",
+            message.text()
+        );
         assert!(message.text().contains('2'), "{}", message.text());
+        assert!(
+            message.text().contains("through-bastion"),
+            "the blocked host stays in the result: {}",
+            message.text()
+        );
         assert!(
             view.import_state().preview().is_none(),
             "applying closes the preview"
@@ -3270,6 +3279,147 @@ async fn an_import_whose_write_fails_keeps_the_preview_and_adds_nothing(cx: &mut
         cx.debug_bounds("hosts.import.row.0").is_some(),
         "the hosts that could not be written are still listed"
     );
+}
+
+#[gpui::test]
+async fn a_forward_write_failure_stays_on_the_same_preview_until_the_rules_land(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("import-forward-retry");
+    let config = dir.path().join("config");
+    std::fs::write(
+        &config,
+        "\
+Host web
+    HostName web.example.org
+    User deploy
+    LocalForward 8080 localhost:80
+    RemoteForward 9090 localhost:90
+    DynamicForward 1080
+",
+    )
+    .expect("the test writes the configuration");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+
+    // The host file can be written. The forwarding file cannot: it is a directory.
+    let forward_path = ForwardStore::at(dir.path()).path();
+    std::fs::create_dir(&forward_path).expect("the forwarding path blocks the write");
+
+    click(cx, "hosts.import.apply");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(
+            view.book().hosts().len(),
+            1,
+            "the host file was saved before the forwarding write failed"
+        );
+        assert!(
+            view.import_state().is_open() && view.import_state().keeps_preview(),
+            "the preview stays so the same rules can be written again"
+        );
+        let error = view
+            .import_state()
+            .error()
+            .expect("the forwarding failure is shown");
+        assert!(
+            error.contains("not written"),
+            "the message is the forwarding failure, not a completed import: {error}"
+        );
+        assert!(
+            view.hosts_state()
+                .message()
+                .is_none_or(|message| message.failed()),
+            "a partial write is not reported as success"
+        );
+    });
+    assert!(
+        ForwardStore::at(dir.path()).load().is_err(),
+        "the rules are not in the store while the path cannot be written"
+    );
+
+    std::fs::remove_dir(&forward_path).expect("the blocker is removed");
+    click(cx, "hosts.import.apply");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            view.import_state().preview().is_none(),
+            "the preview closes once the rules are stored"
+        );
+    });
+    let rules = ForwardStore::at(dir.path())
+        .load()
+        .expect("the forwarding file loads after the retry")
+        .rules()
+        .len();
+    assert_eq!(
+        rules, 3,
+        "the same preview writes the rules the first apply missed"
+    );
+}
+
+#[gpui::test]
+async fn a_finished_import_names_blocked_and_incomplete_hosts(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-withheld");
+    let config = dir.path().join("config");
+    std::fs::write(
+        &config,
+        "\
+Host web
+    HostName web.example.org
+    User deploy
+
+Host through-bastion
+    HostName internal.example.org
+    User root
+    ProxyJump bastion.example.org
+
+Host bare
+    HostName bare.example.org
+",
+    )
+    .expect("the test writes the configuration");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&config.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+    click(cx, "hosts.import.apply");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(view.book().hosts().len(), 1);
+        assert_eq!(view.book().hosts()[0].name(), "web");
+        let message = view.hosts_state().message().expect("the result is stated");
+        assert!(
+            message.failed(),
+            "left-out hosts keep this from being a complete success: {}",
+            message.text()
+        );
+        assert!(
+            message.text().contains("through-bastion"),
+            "the blocked host is named: {}",
+            message.text()
+        );
+        assert!(
+            message.text().contains("bare"),
+            "the host without a user is named: {}",
+            message.text()
+        );
+        assert!(
+            message.text().contains("ProxyJump") && message.text().contains("no User"),
+            "each left-out host keeps its reason: {}",
+            message.text()
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -7665,6 +7815,132 @@ async fn two_connection_forms_keep_their_own_secrets(cx: &mut TestAppContext) {
     });
     assert_eq!(second, "beta-secret");
     assert_ne!(first, second);
+}
+
+#[gpui::test]
+async fn a_form_refused_before_dial_keeps_its_secret_and_its_failure(cx: &mut TestAppContext) {
+    let bastion = stored_host("bastion", "10.0.0.1", 22, "jump", None);
+    let mut broken = stored_host("broken", "10.0.0.7", 22, "deploy", None);
+    broken.set_jumps([bastion.id()]);
+    broken.set_proxy_command(Some("nc %h %p"));
+    let (view, cx, _dir) = dialog_view(
+        cx,
+        vec![
+            bastion,
+            broken,
+            stored_host("other", "10.0.0.8", 22, "deploy", None),
+        ],
+    );
+
+    // Dialling is refused before an attempt exists. The form already has a session.
+    click(cx, "hosts.connect.1");
+    assert!(cx.debug_bounds("remote.failure").is_some());
+    type_into(cx, "remote.password", "chain-secret");
+    // The refused form fills the hosts page, so the next connect button sits under
+    // the scroll. Opening the host is the same call that button makes.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let host = view
+                .book()
+                .hosts()
+                .iter()
+                .find(|host| host.name() == "other")
+                .cloned()
+                .expect("other");
+            view.open_remote(&host, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("attempt.others").is_some(),
+        "the refused form is parked instead of replaced"
+    );
+    click(cx, "attempt.row.0");
+    let (password, reason) = cx.update(|_window, app| {
+        let panel = view
+            .read(app)
+            .remote_state()
+            .expect("the refused form is back");
+        (
+            panel.password().to_owned(),
+            panel
+                .status()
+                .failure()
+                .map(|failure| failure.reason().to_owned()),
+        )
+    });
+    assert_eq!(password, "chain-secret");
+    let reason = reason.expect("the refusal is still on the form");
+    assert!(
+        reason.contains("Nothing was connected"),
+        "the dial-before failure is the one that was parked: {reason}"
+    );
+}
+
+#[gpui::test]
+async fn a_form_whose_attempt_was_dropped_keeps_its_secret_and_its_failure(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, _dir) = dialog_view(
+        cx,
+        vec![
+            stored_host("alpha", "10.0.0.5", 22, "deploy", None),
+            stored_host("beta", "10.0.0.6", 22, "deploy", None),
+        ],
+    );
+
+    // The transport ends and takes the attempt with it. The focused form stays,
+    // bound to the session, with whatever was typed and the failure it showed.
+    click(cx, "hosts.connect.0");
+    type_into(cx, "remote.password", "kept-secret");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![shellune_ssh::RemoteEvent::Failed(
+                    shellune_ssh::ConnectError::AuthRejected,
+                )],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("remote.failure").is_some());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let host = view
+                .book()
+                .hosts()
+                .iter()
+                .find(|host| host.name() == "beta")
+                .cloned()
+                .expect("beta");
+            view.open_remote(&host, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("attempt.others").is_some());
+    click(cx, "attempt.row.0");
+    let (password, reason) = cx.update(|_window, app| {
+        let panel = view
+            .read(app)
+            .remote_state()
+            .expect("the ended form is back");
+        (
+            panel.password().to_owned(),
+            panel
+                .status()
+                .failure()
+                .map(|failure| failure.reason().to_owned()),
+        )
+    });
+    assert_eq!(password, "kept-secret");
+    let reason = reason.expect("the transport failure is still on the form");
+    assert!(
+        reason.contains("rejected"),
+        "the failure from the dropped attempt is unchanged: {reason}"
+    );
 }
 
 #[gpui::test]

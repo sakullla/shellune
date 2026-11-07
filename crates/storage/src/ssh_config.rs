@@ -758,7 +758,9 @@ impl ImportPreview {
     ///
     /// A host whose name is already saved is skipped with a reason rather than
     /// duplicated: two records with the same name would make the list ambiguous, and
-    /// the saved record is the one the user can already edit.
+    /// the saved record is the one the user can already edit. Forwarding rules for
+    /// that host are still planned, so a save that stored the host and missed the
+    /// rules can write the missing rules on the next apply.
     #[must_use]
     pub fn plan(&self, book: &HostBook) -> ImportPlan {
         let mut taken: HashSet<String> = book
@@ -782,6 +784,12 @@ impl ImportPreview {
                     alias: alias.to_owned(),
                     reason: format!("a saved host is already named {alias}"),
                 });
+                for forward in host.forwards() {
+                    forwards.push(PlannedForward {
+                        alias: alias.to_owned(),
+                        forward: forward.clone(),
+                    });
+                }
                 continue;
             }
             let Some(user) = host.user() else {
@@ -2942,6 +2950,27 @@ Host web
             "the reason says why: {}",
             plan.skipped()[0].reason()
         );
+    }
+
+    #[test]
+    fn a_skipped_namesake_still_plans_its_forwarding_rules() {
+        let preview = parse_preview(
+            "\
+Host web
+    HostName web.example.org
+    User deploy
+    LocalForward 8080 localhost:80
+    RemoteForward 9090 localhost:90
+    DynamicForward 1080
+",
+        );
+        let existing = HostConfig::new("web", "old.example.org", 22, "root").expect("valid host");
+        let book = HostBook::from_hosts(vec![existing]).expect("distinct hosts");
+        let plan = preview.plan(&book);
+        assert!(plan.is_empty(), "the saved name is not created again");
+        assert_eq!(plan.skipped().len(), 1);
+        assert_eq!(plan.forwards().len(), 3);
+        assert!(plan.forwards().iter().all(|rule| rule.alias() == "web"));
     }
 
     #[test]

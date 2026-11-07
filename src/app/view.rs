@@ -44,7 +44,7 @@ use crate::app::files::{
 };
 use crate::app::hosts::{
     HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
-    import_message,
+    import_message, unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
 use crate::app::nav::{Destination, Platform};
@@ -1738,6 +1738,9 @@ impl ShelluneView {
             })
             .count();
         let skipped = plan.skipped().len();
+        let withheld = unimported_hosts(&preview, &plan);
+        let (message, incomplete) =
+            import_message(self.strings(), imported, review, skipped, &withheld);
 
         let mut next = self.book.clone();
         if let Err(error) = plan.apply(&mut next) {
@@ -1761,10 +1764,10 @@ impl ShelluneView {
                     cx.notify();
                     return;
                 }
-                self.hosts.set_message(
-                    import_message(self.strings(), imported, review, skipped),
-                    false,
-                );
+                // A finished import still names every host and rule that did not land.
+                // The flag stays a failure while any of those remain, so the line is
+                // not the success text of a complete import.
+                self.hosts.set_message(message, incomplete);
                 self.import.close();
                 self.import_path = None;
             }
@@ -1786,6 +1789,7 @@ impl ShelluneView {
         }
         let store = ForwardStore::at(self.store.root());
         let mut book = store.load().map_err(|error| error.to_string())?;
+        let mut added = false;
         for planned in plan.forwards() {
             let host = self
                 .book
@@ -1797,9 +1801,21 @@ impl ShelluneView {
                 .forward()
                 .rule(host.id())
                 .map_err(|error| error.to_string())?;
+            let already = book.rules().iter().any(|saved| {
+                saved.host() == host.id()
+                    && saved.kind() == rule.kind()
+                    && saved.listen() == rule.listen()
+                    && saved.target() == rule.target()
+            });
+            if already {
+                continue;
+            }
             book.insert(rule).map_err(|error| error.to_string())?;
+            added = true;
         }
-        store.save(&book).map_err(|error| error.to_string())?;
+        if added {
+            store.save(&book).map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -1958,9 +1974,18 @@ impl ShelluneView {
     /// An idle form has no session until something else needs the screen. Registering
     /// one then keeps its typed secrets on its own attempt instead of dropping them
     /// when the next form opens.
+    ///
+    /// A form can already own a session and still have no attempt: dialling was refused
+    /// before a transport existed, or the attempt was removed when that transport
+    /// ended. That form is hung on the session it already has. A new session here would
+    /// leave the one on screen to be replaced.
     fn park_focused_form(&mut self) {
-        if self.form_session.is_some() {
-            self.stash_focused_panel();
+        if let Some(id) = self.form_session {
+            if self.attempt_index(id).is_some() {
+                self.stash_focused_panel();
+            } else {
+                self.park_session_form(id);
+            }
             return;
         }
         let Some(panel) = self.remote.take() else {
@@ -1975,6 +2000,43 @@ impl ShelluneView {
             .unwrap_or_else(|| panel.host().clone());
         let session = self.workspace.register_remote_session(&target);
         let id = session.id();
+        let generation = self
+            .workspace
+            .session(id)
+            .map(Session::generation)
+            .unwrap_or(0);
+        let ephemeral = self
+            .pending_ephemeral
+            .take()
+            .is_some_and(|host| host.id() == target.id());
+        self.attempts.push(Attempt {
+            id,
+            generation,
+            link: None,
+            watching: false,
+            panel: Some(panel),
+            chain: self.chain.take(),
+            pending_trust: None,
+            asking_hop: None,
+            target,
+            ephemeral,
+        });
+    }
+
+    /// Hangs the focused form on a session that does not have an attempt yet.
+    ///
+    /// The session id is the one the form already shows. Nothing new is registered.
+    fn park_session_form(&mut self, id: SessionId) {
+        let Some(panel) = self.remote.take() else {
+            self.chain = None;
+            return;
+        };
+        let target = self
+            .chain
+            .as_ref()
+            .and_then(ChainDraft::target_host)
+            .cloned()
+            .unwrap_or_else(|| panel.host().clone());
         let generation = self
             .workspace
             .session(id)

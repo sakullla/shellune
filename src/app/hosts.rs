@@ -14,7 +14,8 @@
 
 use shellune_core::{AuthMethodKind, HostConfig, HostId, Port};
 use shellune_storage::{
-    DEFAULT_CONFIG_TEXT, Group, HostBook, HostEdit, ImportPreview, RecentHost, host_matches,
+    DEFAULT_CONFIG_TEXT, Group, HostBook, HostEdit, ImportOutcome, ImportPlan, ImportPreview,
+    RecentHost, host_matches,
 };
 
 use crate::app::copy::Strings;
@@ -716,19 +717,78 @@ pub fn group_row_offsets(groups: &[Group<'_>]) -> Vec<usize> {
     offsets
 }
 
-/// The message an applied import leaves behind.
+/// Hosts the preview did not save, each with the reason the preview or the plan gave.
 ///
-/// It states what was written, how much of it needs a look and how many hosts were
-/// skipped, so an import never reads as a plain success when part of it was dropped.
+/// Blocked hosts and hosts missing a field never enter the plan. A name that is
+/// already saved, or a jump that could not be linked, is listed on the plan instead.
 #[must_use]
-pub fn import_message(strings: &Strings, imported: usize, review: usize, skipped: usize) -> String {
-    format!(
+pub fn unimported_hosts(preview: &ImportPreview, plan: &ImportPlan) -> Vec<(String, String)> {
+    let mut withheld = Vec::new();
+    for host in preview.hosts() {
+        if host.is_importable() {
+            continue;
+        }
+        let reason = host
+            .notes()
+            .iter()
+            .map(|note| note.reason())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let reason = if reason.is_empty() {
+            match host.outcome() {
+                ImportOutcome::Blocked => "Blocked".to_owned(),
+                _ => "missing fields".to_owned(),
+            }
+        } else {
+            reason
+        };
+        withheld.push((host.alias().to_owned(), reason));
+    }
+    for skipped in plan.skipped() {
+        if withheld
+            .iter()
+            .any(|(alias, _)| alias.eq_ignore_ascii_case(skipped.alias()))
+        {
+            continue;
+        }
+        withheld.push((skipped.alias().to_owned(), skipped.reason().to_owned()));
+    }
+    withheld
+}
+
+/// The message an applied import leaves behind, and whether it is a failure.
+///
+/// The counts say what was written, what needs a look and what was skipped. Every
+/// host that was not imported is named with its reason. That list makes the result
+/// a failure: a count line on its own would read as a complete import.
+#[must_use]
+pub fn import_message(
+    strings: &Strings,
+    imported: usize,
+    review: usize,
+    skipped: usize,
+    withheld: &[(String, String)],
+) -> (String, bool) {
+    let mut message = format!(
         "{} {imported} {} · {} {review} · {} {skipped}",
         strings.import_applied,
         strings.count_hosts,
         strings.import_review_count,
         strings.import_skipped
-    )
+    );
+    if withheld.is_empty() {
+        return (message, false);
+    }
+    message.push_str(" · ");
+    message.push_str(strings.import_not_offered);
+    for (alias, reason) in withheld {
+        message.push(' ');
+        message.push_str(alias);
+        message.push_str(": ");
+        message.push_str(reason);
+        message.push(';');
+    }
+    (message, true)
 }
 
 /// Formats a Unix timestamp as UTC, without pulling a date library into the shell.
@@ -978,15 +1038,27 @@ mod tests {
 
     #[test]
     fn an_import_message_states_what_was_written_and_what_was_not() {
-        let message = import_message(&ENGLISH, 2, 1, 3);
+        let (message, failed) = import_message(&ENGLISH, 2, 1, 3, &[]);
+        assert!(!failed);
         assert!(message.contains('2'), "{message}");
         assert!(message.contains("Imported"), "{message}");
         assert!(message.contains("need review"), "{message}");
         assert!(message.contains("skipped"), "{message}");
 
-        let chinese = import_message(&CHINESE, 2, 1, 3);
+        let (chinese, chinese_failed) = import_message(&CHINESE, 2, 1, 3, &[]);
+        assert!(!chinese_failed);
         assert!(chinese.contains("已导入"), "{chinese}");
         assert!(chinese.contains("需复核"), "{chinese}");
+
+        let withheld = vec![(
+            "through-bastion".to_owned(),
+            "ProxyJump was not applied".to_owned(),
+        )];
+        let (partial, partial_failed) = import_message(&ENGLISH, 2, 1, 0, &withheld);
+        assert!(partial_failed);
+        assert!(partial.contains("through-bastion"), "{partial}");
+        assert!(partial.contains("not imported"), "{partial}");
+        assert!(partial.contains("ProxyJump was not applied"), "{partial}");
     }
 
     #[test]
