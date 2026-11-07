@@ -13,9 +13,11 @@
 //! ever produced.
 
 use shellune_core::{
-    HostConfig, LocalShell, PanelSection, Session, SessionFailure, SessionId, SessionKind,
-    SessionState, Transfer,
+    HostConfig, HostId, LocalShell, PaneId, PaneTarget, PanelConfig, PanelSection, Session,
+    SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, Transfer, WorkspaceSnapshot,
 };
+
+use crate::app::layout::SessionLayout;
 
 use crate::app::copy::{Locale, Strings};
 use crate::app::nav::Destination;
@@ -261,6 +263,8 @@ pub struct Workspace {
     notice: Option<Notice>,
     /// Which context panel is beside the session workspace.
     context: PanelSection,
+    /// Tabs and the pane tree. Leaves name sessions; they do not own a second copy.
+    layout: SessionLayout,
 }
 
 impl Default for Workspace {
@@ -296,6 +300,7 @@ impl Workspace {
             local_font_size: shellune_terminal::DEFAULT_FONT_SIZE,
             notice: None,
             context: PanelSection::None,
+            layout: SessionLayout::new(),
         }
     }
 
@@ -335,6 +340,77 @@ impl Workspace {
     /// Records which context panel is open. This does not start a task.
     pub fn set_context(&mut self, section: PanelSection) {
         self.context = section;
+    }
+
+    /// Tabs and panes. Reading this does not start a connection.
+    #[must_use]
+    pub fn layout(&self) -> &SessionLayout {
+        &self.layout
+    }
+
+    /// The mutable layout, for a placement the view has already decided.
+    pub fn layout_mut(&mut self) -> &mut SessionLayout {
+        &mut self.layout
+    }
+
+    /// The session each open tab is known by, in tab order.
+    #[must_use]
+    pub fn tab_anchors(&self) -> Vec<SessionId> {
+        self.layout.tab_anchors()
+    }
+
+    /// Sessions that share a tab with `anchor`.
+    #[must_use]
+    pub fn sessions_in_tab(&self, anchor: SessionId) -> Vec<SessionId> {
+        self.layout.sessions_in_tab(anchor)
+    }
+
+    /// The next session splits the active pane instead of opening a tab.
+    pub fn arm_split(&mut self, axis: SplitAxis) -> bool {
+        self.layout.arm_split(axis)
+    }
+
+    /// The next session fills a pane that is already waiting.
+    pub fn arm_adopt(&mut self, pane: PaneId) {
+        self.layout.arm_adopt(pane);
+    }
+
+    /// Forgets a split or adopt that the start did not use.
+    pub fn clear_armed(&mut self) {
+        self.layout.clear_armed();
+    }
+
+    /// The layout as a snapshot. No password, socket or process is included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the tree could not be written.
+    pub fn capture_snapshot(&self) -> Result<WorkspaceSnapshot, String> {
+        let panel = PanelConfig::new(self.context != PanelSection::None, self.context);
+        self.layout
+            .capture(
+                |id| {
+                    self.session(id)
+                        .map(|session| session.title().to_owned())
+                        .unwrap_or_else(|| "Session".to_owned())
+                },
+                panel,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Replaces the layout with pending panes from a restore.
+    ///
+    /// The sessions that are already open are not started or stopped here. A
+    /// restored leaf has no session until the user connects it.
+    pub fn install_restored(&mut self, restored: shellune_core::RestoredWorkspace) {
+        self.context = restored.panel().section();
+        self.layout.install_restored(restored);
+    }
+
+    /// Marks only the remote panes whose host is no longer saved.
+    pub fn recheck_layout_hosts(&mut self, exists: impl FnMut(HostId) -> bool) {
+        self.layout.recheck_hosts(exists);
     }
 
     /// Advances to the next destination.
@@ -571,6 +647,11 @@ impl Workspace {
         let mut sessions = self.sessions.items().to_vec();
         sessions.push(session.clone());
         self.sessions.replace(SectionStatus::Ready, sessions);
+        self.layout.attach(
+            session.id(),
+            PaneTarget::local(Some(shell.program().to_owned())),
+            session.title(),
+        );
         session
     }
 
@@ -584,6 +665,11 @@ impl Workspace {
         let mut sessions = self.sessions.items().to_vec();
         sessions.push(session.clone());
         self.sessions.replace(SectionStatus::Ready, sessions);
+        self.layout.attach(
+            session.id(),
+            PaneTarget::remote(host.id()),
+            session.title(),
+        );
         session
     }
 
@@ -623,7 +709,11 @@ impl Workspace {
 
     /// Records that the user closed a session.
     pub fn session_closed(&mut self, id: SessionId) -> bool {
-        self.transition(id, |session| session.close().is_ok())
+        let closed = self.transition(id, |session| session.close().is_ok());
+        if closed {
+            self.layout.detach_session(id);
+        }
+        closed
     }
 
     /// Records a failure that stopped a shell from starting at all.
@@ -680,6 +770,7 @@ impl Workspace {
     /// terminal, so leaving a record behind would list something that never existed.
     /// Only an attempt that never became live may be forgotten this way.
     pub fn session_forgotten(&mut self, id: SessionId) {
+        self.layout.detach_session(id);
         let remaining: Vec<Session> = self
             .sessions
             .items()

@@ -720,9 +720,12 @@ impl ShelluneView {
         let Some(session) = self.workspace.session(id) else {
             return;
         };
-        match session.kind().clone() {
+        let kind = session.kind().clone();
+        let title = session.title().to_owned();
+        // A duplicate is a new tab, not a split of the pane that was armed.
+        self.workspace.clear_armed();
+        match kind {
             SessionKind::Local { shell } => {
-                let title = session.title().to_owned();
                 let known = self
                     .workspace
                     .shells()
@@ -778,10 +781,9 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let viewport = window.viewport_size();
-        let tabs = self.tab_sessions();
-        let index = tabs.iter().position(|tab| *tab == id)?;
-        let others: Vec<SessionId> = tabs.iter().copied().filter(|tab| *tab != id).collect();
-        let right: Vec<SessionId> = tabs[index + 1..].to_vec();
+        let tab_count = self.workspace.layout().tabs().len();
+        let index = (0..tab_count)
+            .find(|index| self.workspace.layout().anchor_of(*index) == Some(id))?;
         let platform = Platform::current();
 
         let item = |label: &'static str,
@@ -824,8 +826,8 @@ impl ShelluneView {
                 .bg(theme::swatch(colors::BORDER))
         };
 
-        let has_others = !others.is_empty();
-        let has_right = !right.is_empty();
+        let has_others = tab_count > 1;
+        let has_right = index + 1 < tab_count;
         let menu = div()
             .debug_selector(|| "tab.menu".to_owned())
             .flex()
@@ -848,6 +850,35 @@ impl ShelluneView {
             .child(divider())
             .child(
                 item(
+                    strings.tab_menu_move_left,
+                    "tab.menu.move_left",
+                    None,
+                    index > 0,
+                )
+                .when(index > 0, |item| {
+                    item.on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_tab_menu(window, cx);
+                        this.reorder_tab(id, -1, cx);
+                    }))
+                }),
+            )
+            .child(
+                item(
+                    strings.tab_menu_move_right,
+                    "tab.menu.move_right",
+                    None,
+                    index + 1 < tab_count,
+                )
+                .when(index + 1 < tab_count, |item| {
+                    item.on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_tab_menu(window, cx);
+                        this.reorder_tab(id, 1, cx);
+                    }))
+                }),
+            )
+            .child(divider())
+            .child(
+                item(
                     strings.tab_menu_close,
                     "tab.menu.close",
                     Some(platform.close_tab_label()),
@@ -855,7 +886,7 @@ impl ShelluneView {
                 )
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     this.close_tab_menu(window, cx);
-                    this.request_close_session(id, cx);
+                    this.request_close_tab_anchor(id, cx);
                 })),
             )
             .child(
@@ -868,7 +899,7 @@ impl ShelluneView {
                 .when(has_others, |item| {
                     item.on_click(cx.listener(move |this, _event, window, cx| {
                         this.close_tab_menu(window, cx);
-                        this.close_sessions(others.clone(), cx);
+                        this.close_other_tabs(id, cx);
                     }))
                 }),
             )
@@ -882,7 +913,7 @@ impl ShelluneView {
                 .when(has_right, |item| {
                     item.on_click(cx.listener(move |this, _event, window, cx| {
                         this.close_tab_menu(window, cx);
-                        this.close_sessions(right.clone(), cx);
+                        this.close_tabs_after(id, cx);
                     }))
                 }),
             );

@@ -695,6 +695,58 @@ pub struct Strings {
     pub import_forward_label: &'static str,
     /// Import: hosts were written and the forwarding file was not.
     pub import_forwards_failed: &'static str,
+    /// Pane: split the active pane to the right.
+    pub pane_split_right: &'static str,
+    /// Pane: split the active pane downward.
+    pub pane_split_down: &'static str,
+    /// Pane: the active pane fills its tab.
+    pub pane_zoom: &'static str,
+    /// Pane: leave zoom and show the other panes.
+    pub pane_unzoom: &'static str,
+    /// Marks the pane that receives the keyboard.
+    pub pane_active: &'static str,
+    /// A restored pane that has not been started.
+    pub pane_pending: &'static str,
+    /// Explains that a pending pane has no process and no old output.
+    pub pane_pending_body: &'static str,
+    /// Starts the pane the user is looking at. Nothing starts before this.
+    pub pane_connect: &'static str,
+    /// Removes one pane.
+    pub pane_remove: &'static str,
+    /// Closes one pane and leaves the others running.
+    pub pane_close: &'static str,
+    /// Shrinks the active pane along its split.
+    pub pane_resize_less: &'static str,
+    /// Grows the active pane along its split.
+    pub pane_resize_more: &'static str,
+    /// Moves the active pane left.
+    pub pane_move_left: &'static str,
+    /// Moves the active pane right.
+    pub pane_move_right: &'static str,
+    /// Moves the active pane up.
+    pub pane_move_up: &'static str,
+    /// Moves the active pane down.
+    pub pane_move_down: &'static str,
+    /// Tab menu: move this tab toward the start.
+    pub tab_menu_move_left: &'static str,
+    /// Tab menu: move this tab toward the end.
+    pub tab_menu_move_right: &'static str,
+    /// Shown when the last pane has been closed.
+    pub workspace_empty_title: &'static str,
+    /// The next step after the last pane is closed.
+    pub workspace_empty_body: &'static str,
+    /// A host id in a pane is not in the saved book.
+    pub pane_missing_host: &'static str,
+    /// What to do about a pane whose host is missing.
+    pub pane_missing_next: &'static str,
+    /// The saved active tab id is not in the workspace.
+    pub workspace_dangling_tab: &'static str,
+    /// The saved active pane id is not on its tab.
+    pub workspace_dangling_pane: &'static str,
+    /// Classic terminal mode, restored as a preference only.
+    pub pane_mode_classic: &'static str,
+    /// Command-block mode, restored as a preference. Output is not brought back.
+    pub pane_mode_integrated: &'static str,
 }
 
 /// English copy.
@@ -1006,6 +1058,32 @@ pub static ENGLISH: Strings = Strings {
     import_jump_label: "Jump",
     import_forward_label: "Forward",
     import_forwards_failed: "Hosts were saved, but the forwarding rules were not written.",
+    pane_split_right: "Split right",
+    pane_split_down: "Split down",
+    pane_zoom: "Zoom pane",
+    pane_unzoom: "Show all panes",
+    pane_active: "Active",
+    pane_pending: "Not connected",
+    pane_pending_body: "This pane is waiting. Nothing was started, and earlier output is not shown.",
+    pane_connect: "Connect",
+    pane_remove: "Remove pane",
+    pane_close: "Close pane",
+    pane_resize_less: "Shrink pane",
+    pane_resize_more: "Grow pane",
+    pane_move_left: "Move pane left",
+    pane_move_right: "Move pane right",
+    pane_move_up: "Move pane up",
+    pane_move_down: "Move pane down",
+    tab_menu_move_left: "Move tab left",
+    tab_menu_move_right: "Move tab right",
+    workspace_empty_title: "No pane is open",
+    workspace_empty_body: "Next step: open a local shell, or connect to a host. Other sessions were not closed with this one.",
+    pane_missing_host: "This host is not saved",
+    pane_missing_next: "Fix the host or remove the pane. Nothing was connected.",
+    workspace_dangling_tab: "The saved active tab is not in this workspace. Choose a tab. The others were kept.",
+    workspace_dangling_pane: "The saved active pane is not on its tab. Choose a pane. The layout was kept.",
+    pane_mode_classic: "Classic terminal",
+    pane_mode_integrated: "Command blocks, not restored",
 };
 
 /// Chinese copy.
@@ -1317,6 +1395,32 @@ pub static CHINESE: Strings = Strings {
     import_jump_label: "跳板",
     import_forward_label: "转发",
     import_forwards_failed: "主机已保存，但转发规则没有写入。",
+    pane_split_right: "向右拆分",
+    pane_split_down: "向下拆分",
+    pane_zoom: "放大窗格",
+    pane_unzoom: "显示全部分屏",
+    pane_active: "活动",
+    pane_pending: "待连接",
+    pane_pending_body: "这个窗格在等待。没有启动任何进程，之前的输出也不会显示。",
+    pane_connect: "连接",
+    pane_remove: "移除窗格",
+    pane_close: "关闭窗格",
+    pane_resize_less: "缩小窗格",
+    pane_resize_more: "放大尺寸",
+    pane_move_left: "左移窗格",
+    pane_move_right: "右移窗格",
+    pane_move_up: "上移窗格",
+    pane_move_down: "下移窗格",
+    tab_menu_move_left: "标签左移",
+    tab_menu_move_right: "标签右移",
+    workspace_empty_title: "没有打开的窗格",
+    workspace_empty_body: "下一步：打开本地终端，或连接一台主机。关闭这个窗格不会关掉其他会话。",
+    pane_missing_host: "这台主机没有保存",
+    pane_missing_next: "修复主机或移除这个窗格。没有建立连接。",
+    workspace_dangling_tab: "保存的活动标签不在这个工作区里。请另选一个标签，其余标签已保留。",
+    workspace_dangling_pane: "保存的活动窗格不在它的标签上。请另选一个窗格，布局已保留。",
+    pane_mode_classic: "经典终端",
+    pane_mode_integrated: "命令块模式，内容未恢复",
 };
 
 /// A count followed by its unit, in the grammar of the language.

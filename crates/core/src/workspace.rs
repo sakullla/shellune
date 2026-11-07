@@ -196,12 +196,17 @@ impl PaneNode {
     /// A leaf pane with a fresh id.
     #[must_use]
     pub fn leaf(target: PaneTarget, mode: TerminalMode) -> Self {
+        Self::leaf_with_id(PaneId::new(), target, mode)
+    }
+
+    /// A leaf that keeps an id the workspace already uses.
+    ///
+    /// Saving a snapshot must not mint a new id for a pane that already has one.
+    /// The id is only a name: this does not start a process or a connection.
+    #[must_use]
+    pub fn leaf_with_id(id: PaneId, target: PaneTarget, mode: TerminalMode) -> Self {
         Self::Leaf {
-            pane: PaneLeaf {
-                id: PaneId::new(),
-                mode,
-                target,
-            },
+            pane: PaneLeaf { id, mode, target },
         }
     }
 
@@ -304,12 +309,25 @@ impl WorkspaceTab {
     ///
     /// Returns [`WorkspaceBuildError::EmptyTitle`] when the title is blank.
     pub fn new(title: impl Into<String>, root: PaneNode) -> Result<Self, WorkspaceBuildError> {
+        Self::with_id(TabId::new(), title, root)
+    }
+
+    /// A tab that keeps an id the workspace already uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceBuildError::EmptyTitle`] when the title is blank.
+    pub fn with_id(
+        id: TabId,
+        title: impl Into<String>,
+        root: PaneNode,
+    ) -> Result<Self, WorkspaceBuildError> {
         let title = title.into().trim().to_owned();
         if title.is_empty() {
             return Err(WorkspaceBuildError::EmptyTitle);
         }
         Ok(Self {
-            id: TabId::new(),
+            id,
             title,
             root,
             active_pane: None,

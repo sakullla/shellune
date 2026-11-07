@@ -18,6 +18,7 @@ pub mod copy;
 pub mod files;
 pub mod hosts;
 pub mod icons;
+pub mod layout;
 pub mod nav;
 pub mod palette;
 pub mod product;
@@ -42,10 +43,13 @@ use gpui::{
 };
 
 use crate::app::actions::{
-    CloseActiveTab, CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions,
-    GoToTransfers, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
-    PreviousTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage, ToggleSidebar,
+    CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
+    FocusPaneUp, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers, MovePaneDown,
+    MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell,
+    NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab, ResizePaneDown,
+    ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
+    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight,
+    ToggleLanguage, ToggleSidebar, ZoomPane,
 };
 use crate::app::nav::{Destination, Platform};
 
@@ -80,7 +84,24 @@ pub mod actions {
             SelectTab7,
             SelectTab8,
             SelectTab9,
-            ToggleSidebar
+            ToggleSidebar,
+            SplitPaneRight,
+            SplitPaneDown,
+            ZoomPane,
+            FocusPaneLeft,
+            FocusPaneRight,
+            FocusPaneUp,
+            FocusPaneDown,
+            ResizePaneLeft,
+            ResizePaneRight,
+            ResizePaneUp,
+            ResizePaneDown,
+            MovePaneLeft,
+            MovePaneRight,
+            MovePaneUp,
+            MovePaneDown,
+            MoveTabLeft,
+            MoveTabRight
         ]
     );
 }
@@ -184,6 +205,26 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
             PreviousTab,
             Some(KEY_CONTEXT),
         ),
+        // Pane keys use Alt so Escape, Ctrl+C and Ctrl+L stay with the shell.
+        // Alt+arrows would otherwise be cursor sequences; taking them here is the
+        // focus move, and the program does not also receive them.
+        KeyBinding::new("alt-shift-=", SplitPaneRight, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-shift--", SplitPaneDown, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-shift-z", ZoomPane, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-left", FocusPaneLeft, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-right", FocusPaneRight, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-up", FocusPaneUp, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-down", FocusPaneDown, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-shift-left", ResizePaneLeft, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-shift-right", ResizePaneRight, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-shift-up", ResizePaneUp, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-shift-down", ResizePaneDown, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-left", MovePaneLeft, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-right", MovePaneRight, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-up", MovePaneUp, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-down", MovePaneDown, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-shift-,", MoveTabLeft, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-shift-.", MoveTabRight, Some(KEY_CONTEXT)),
     ]
     .into_iter()
     .chain(tab_jump_bindings(platform))

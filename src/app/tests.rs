@@ -18,10 +18,14 @@ use gpui::{
     ScrollWheelEvent, Size, TestAppContext, VisualTestContext, div, point, px, size,
 };
 use shellune_core::{
-    EventTag, HostConfig, LocalShell, Session, SessionId, SessionKind, SessionState, Transfer,
-    TransferDirection,
+    Endpoint, EventTag, ForwardBook, ForwardRule, HostConfig, LocalShell, PaneNode, PaneTarget,
+    PanelConfig, PanelSection, Session, SessionId, SessionKind, SessionState, SplitAxis,
+    TerminalMode, Transfer, TransferDirection, WorkspaceSnapshot, WorkspaceTab,
 };
-use shellune_storage::{ForwardStore, HostBook, HostEdit, HostKey, HostStore, TrustStore};
+use shellune_storage::{
+    ForwardStore, HostBook, HostEdit, HostKey, HostStore, TrustStore, WorkspaceStore,
+    WORKSPACE_FILE_NAME,
+};
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage};
@@ -34,6 +38,7 @@ use crate::app::terminal::{PaneState, SourceEvent, TerminalPane};
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Tone, Zoom, palette,
 };
+use crate::app::layout::Direction;
 use crate::app::workspace::{Failure, PrimaryOutcome, Recovery, Section, SectionState, Workspace};
 use crate::app::{DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ShelluneView, key_bindings};
 
@@ -816,6 +821,32 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             import_jump_label,
             import_forward_label,
             import_forwards_failed,
+            pane_split_right,
+            pane_split_down,
+            pane_zoom,
+            pane_unzoom,
+            pane_active,
+            pane_pending,
+            pane_pending_body,
+            pane_connect,
+            pane_remove,
+            pane_close,
+            pane_resize_less,
+            pane_resize_more,
+            pane_move_left,
+            pane_move_right,
+            pane_move_up,
+            pane_move_down,
+            tab_menu_move_left,
+            tab_menu_move_right,
+            workspace_empty_title,
+            workspace_empty_body,
+            pane_missing_host,
+            pane_missing_next,
+            workspace_dangling_tab,
+            workspace_dangling_pane,
+            pane_mode_classic,
+            pane_mode_integrated,
             field_cut,
             field_copy,
             field_paste,
@@ -1022,10 +1053,20 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
     let bindings = key_bindings(Platform::current());
     assert_eq!(
         bindings.len(),
-        Destination::ALL.len() + 6 + 5 + crate::app::TAB_JUMP_COUNT,
+        Destination::ALL.len()
+            + 6
+            + 5
+            + crate::app::TAB_JUMP_COUNT
+            + 2
+            + 1
+            + 4
+            + 4
+            + 4
+            + 2,
         "four destinations, next and previous, zoom, new shell, language and dismiss; \
-         the palette, the sidebar, close tab, next and previous tab; and one jump per \
-         tab digit"
+         the palette, the sidebar, close tab, next and previous tab; one jump per \
+         tab digit; split right and split down, zoom pane, focus, resize and move in \
+         four directions, and move tab left and right"
     );
 }
 
@@ -8333,4 +8374,353 @@ async fn the_top_row_is_the_caption_and_keeps_its_buttons_inside_the_window(
             "the main action beside the window buttons",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Nested panes and a safe layout restore (R4)
+// ---------------------------------------------------------------------------
+
+fn sent_text(cx: &mut VisualTestContext, view: &Entity<ShelluneView>, id: SessionId) -> String {
+    cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .map(|pane| String::from_utf8_lossy(pane.read(app).sent()).into_owned())
+            .unwrap_or_default()
+    })
+}
+
+#[gpui::test]
+async fn nested_splits_keep_input_and_resize_on_the_active_pane(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    click(cx, "header.primary");
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_active_for_test(SplitAxis::LeftRight, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_active_for_test(SplitAxis::TopBottom, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let leaves = cx.update(|_window, app| view.read(app).active_leaf_sessions_for_test());
+    assert_eq!(leaves.len(), 3, "one sideways split and one stacked split");
+    assert!(leaves.iter().all(|id| id.is_some()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs().len()),
+        1,
+        "the splits share one tab"
+    );
+    assert!(
+        cx.debug_bounds("pane.active").is_some(),
+        "the pane that receives input is marked"
+    );
+    let sessions: Vec<SessionId> = leaves.into_iter().flatten().collect();
+    let (left, middle, bottom) = (sessions[0], sessions[1], sessions[2]);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(bottom),
+        "the newest pane is the active one"
+    );
+
+    cx.simulate_input("only-bottom");
+    cx.run_until_parked();
+    assert!(
+        sent_text(cx, &view, bottom).contains("only-bottom"),
+        "input reached the active pane"
+    );
+    assert!(
+        sent_text(cx, &view, left).is_empty() && sent_text(cx, &view, middle).is_empty(),
+        "the other panes did not receive it"
+    );
+
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.focus_direction_for_test(Direction::Left, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(left)
+    );
+    cx.simulate_input("only-left");
+    cx.run_until_parked();
+    assert!(sent_text(cx, &view, left).contains("only-left"));
+    assert!(
+        !sent_text(cx, &view, middle).contains("only-left")
+            && !sent_text(cx, &view, bottom).contains("only-left"),
+        "moving focus left the other panes untouched"
+    );
+
+    let ratios = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    assert_eq!(ratios.len(), 2);
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.resize_direction_for_test(Direction::Right, window, cx);
+        });
+    });
+    let grown = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    assert_ne!(grown[0], ratios[0], "the sideways split around the active pane changed");
+    assert_eq!(grown[1], ratios[1], "the stacked split did not");
+
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.focus_direction_for_test(Direction::Right, window, cx);
+            view.focus_direction_for_test(Direction::Down, window, cx);
+            view.resize_direction_for_test(Direction::Down, window, cx);
+        });
+    });
+    let stacked = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    assert_eq!(stacked[0], grown[0], "the sideways split stayed");
+    assert_ne!(stacked[1], grown[1], "only the stacked split around the active pane changed");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.close_session(middle, cx));
+    });
+    cx.run_until_parked();
+    let remaining = cx.update(|_window, app| view.read(app).active_leaf_sessions_for_test());
+    assert_eq!(remaining, vec![Some(left), Some(bottom)]);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_sessions().len()),
+        2,
+        "closing one pane left the other sessions running"
+    );
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.focus_direction_for_test(Direction::Left, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_input("still-left");
+    cx.run_until_parked();
+    assert!(
+        sent_text(cx, &view, left).contains("still-left"),
+        "the remaining pane still accepts input"
+    );
+    assert!(!sent_text(cx, &view, bottom).contains("still-left"));
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.close_session(bottom, cx);
+            view.close_session(left, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("workspace.empty").is_some(),
+        "the last pane leaves an empty state"
+    );
+    assert!(
+        cx.debug_bounds("shell.picker").is_some()
+            || cx.debug_bounds("welcome.quick").is_some()
+            || cx.debug_bounds("session.tab.new").is_some(),
+        "the empty state names a next step"
+    );
+}
+
+fn layout_script(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let marker = dir.join("restore-ran.txt");
+    let script = if cfg!(windows) {
+        let script = dir.join("should-not-run.cmd");
+        std::fs::write(
+            &script,
+            format!("@echo off\r\necho leaked>\"{}\"\r\n", marker.display()),
+        )
+        .expect("script");
+        script
+    } else {
+        let script = dir.join("should-not-run.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho leaked > \"{}\"\n", marker.display()),
+        )
+        .expect("script");
+        script
+    };
+    (script, marker)
+}
+
+fn layout_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    port
+}
+
+#[gpui::test]
+async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("layout-restore");
+    let (script, marker) = layout_script(&dir.path());
+    let secret = "hunter2-layout-restore";
+    let port = layout_port();
+    let mut saved = stored_host("web", "10.0.0.5", 22, "deploy", None);
+    saved.set_proxy_command(Some(script.display().to_string()));
+    saved.set_startup_command(Some(secret));
+    seed(&dir.store(), vec![saved.clone()]);
+    let gone = shellune_core::HostId::new();
+    let root = PaneNode::split(
+        SplitAxis::LeftRight,
+        5000,
+        PaneNode::leaf(
+            PaneTarget::local(Some(script.display().to_string())),
+            TerminalMode::Classic,
+        ),
+        PaneNode::split(
+            SplitAxis::TopBottom,
+            4000,
+            PaneNode::leaf(PaneTarget::remote(saved.id()), TerminalMode::Integrated),
+            PaneNode::leaf(PaneTarget::remote(gone), TerminalMode::Classic),
+        )
+        .expect("inner"),
+    )
+    .expect("outer");
+    let mut tab = WorkspaceTab::new("Work", root).expect("title");
+    tab.set_active_pane(Some(shellune_core::PaneId::new()));
+    let mut snapshot =
+        WorkspaceSnapshot::new(vec![tab], PanelConfig::new(true, PanelSection::Files))
+            .expect("snapshot");
+    snapshot.set_active_tab(Some(shellune_core::TabId::new()));
+    WorkspaceStore::at(dir.path())
+        .save(&snapshot)
+        .expect("snapshot saves");
+    let mut rules = ForwardBook::new();
+    rules
+        .insert(ForwardRule::local(
+            saved.id(),
+            Endpoint::loopback(port).expect("listen"),
+            Endpoint::new("db.internal", 5432).expect("target"),
+        ))
+        .expect("rule");
+    ForwardStore::at(dir.path()).save(&rules).expect("rules");
+    let before = std::fs::read(dir.path().join(WORKSPACE_FILE_NAME)).expect("file");
+    assert!(!marker.exists(), "writing the snapshot must not run anything");
+
+    let workspace = Workspace::new();
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    assert_eq!(
+        std::fs::read(dir.path().join(WORKSPACE_FILE_NAME)).expect("file"),
+        before,
+        "loading the layout must not rewrite it"
+    );
+    assert!(!marker.exists(), "restore must not run the shell or ProxyCommand");
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("restore must not listen");
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions().is_empty()),
+        "no terminal process was started"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "no connection was started"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        3
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).missing_host_panes_for_test()),
+        vec![gone],
+        "only the missing host is marked"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).layout_notice_count_for_test()) >= 2,
+        "stale tab and pane ids stay as notices"
+    );
+    assert!(cx.debug_bounds("pane.pending").is_some());
+    assert!(cx.debug_bounds("pane.missing").is_some());
+    let saved_text = String::from_utf8_lossy(&before);
+    assert!(
+        !saved_text.contains(secret),
+        "the snapshot does not keep the startup command"
+    );
+    assert!(
+        !saved_text.to_lowercase().contains("password")
+            && !saved_text.to_lowercase().contains("passphrase")
+    );
+
+    assert!(
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| view.close_pending_for_test(cx))
+        }),
+        "one pending pane can be removed"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        2,
+        "the other panes stay"
+    );
+    assert!(!marker.exists());
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("removing a pane must not listen");
+    let rewritten = std::fs::read(dir.path().join(WORKSPACE_FILE_NAME)).expect("file");
+    assert_ne!(rewritten, before, "removing one pane is saved");
+    assert!(!String::from_utf8_lossy(&rewritten).contains(secret));
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.close_all_sessions(cx));
+    });
+    assert_eq!(
+        std::fs::read(dir.path().join(WORKSPACE_FILE_NAME)).expect("file"),
+        rewritten,
+        "closing the window does not replace the saved layout"
+    );
+}
+
+#[gpui::test]
+async fn an_empty_snapshot_does_not_replace_the_open_page(cx: &mut TestAppContext) {
+    let dir = TempDir::new("empty-layout");
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Hosts);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        0
+    );
+    assert!(cx.update(|_window, app| view.read(app).layout_error_for_test().is_none()));
+}
+
+#[gpui::test]
+async fn a_damaged_snapshot_is_left_unchanged(cx: &mut TestAppContext) {
+    let dir = TempDir::new("damaged-layout");
+    let path = dir.path().join(WORKSPACE_FILE_NAME);
+    std::fs::write(&path, b"{not-json").expect("write");
+    let before = std::fs::read(&path).expect("read");
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(&path).expect("read"), before);
+    assert!(cx.update(|_window, app| view.read(app).layout_error_for_test().is_some()));
+    assert!(cx.update(|_window, app| view.read(app).open_sessions().is_empty()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        0
+    );
 }

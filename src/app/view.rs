@@ -18,7 +18,7 @@ use gpui::{
 };
 use shellune_core::{
     BrowseState, EventTag, FileKind, HostConfig, HostId, HostValidationError, LocalShell, Session,
-    SessionFailure, SessionId, SessionKind, SessionState, Transfer, join_path,
+    SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, Transfer, join_path,
 };
 use shellune_ssh::PtySize;
 #[cfg(test)]
@@ -30,10 +30,13 @@ use shellune_storage::{
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{
-    CloseActiveTab, CycleTextSize, DismissNotice, GoToHosts, GoToLocalShells, GoToSessions,
-    GoToTransfers, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
-    PreviousTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, ToggleLanguage, ToggleSidebar,
+    CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
+    FocusPaneUp, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers, MovePaneDown,
+    MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell,
+    NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab, ResizePaneDown,
+    ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
+    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight,
+    ToggleLanguage, ToggleSidebar, ZoomPane,
 };
 use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
@@ -66,6 +69,7 @@ use crate::app::{components, theme::radius};
 
 mod host_dialog;
 mod overlays;
+mod panes;
 mod sessions;
 mod titlebar;
 pub use titlebar::{TRAFFIC_LIGHT_POSITION, custom_titlebar};
@@ -101,6 +105,15 @@ struct OpenPane {
     tag: EventTag,
     /// The terminal itself.
     pane: Entity<TerminalPane>,
+}
+
+/// A divider drag. The listener is registered again on every frame it lasts.
+#[derive(Clone, Copy)]
+struct SplitDrag {
+    split: u64,
+    axis: SplitAxis,
+    origin: gpui::Point<gpui::Pixels>,
+    origin_ratio: u16,
 }
 
 /// One connection attempt.
@@ -284,6 +297,12 @@ pub struct ShelluneView {
     palette_scroll: gpui::ScrollHandle,
     /// The tab whose menu is open, and where the pointer opened it.
     tab_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
+    /// Whether a user edit may be written. Window close turns this off first.
+    layout_persist: bool,
+    /// Why the saved layout could not be read. The file is left as it was.
+    layout_error: Option<String>,
+    /// The split whose divider is being dragged.
+    split_drag: Option<SplitDrag>,
     /// Whether the sessions page shows the selected terminal rather than the list.
     ///
     /// Selecting a tab shows its terminal; going to the page from the sidebar or its
@@ -493,6 +512,9 @@ impl ShelluneView {
             rail_collapsed: false,
             theme_choice: theme::ThemeChoice::default(),
             watching_appearance: false,
+            layout_persist: false,
+            layout_error: None,
+            split_drag: None,
             session_terminal: false,
             #[cfg(test)]
             scripted: Vec::new(),
@@ -503,6 +525,7 @@ impl ShelluneView {
         view.bind_remote_fields(cx);
         view.restore_hosts(cx);
         view.restore_trust();
+        view.restore_workspace_layout();
         view
     }
 
@@ -621,13 +644,7 @@ impl ShelluneView {
     /// terminal yet and still needs one, because the tab is the only place that reports
     /// what the attempt is doing. A closed session is over and has none.
     fn tab_sessions(&self) -> Vec<SessionId> {
-        self.workspace
-            .sessions()
-            .items()
-            .iter()
-            .filter(|session| !matches!(session.state(), SessionState::Closed))
-            .map(Session::id)
-            .collect()
+        self.workspace.tab_anchors()
     }
 
     /// The sessions the tab strip would draw, for the tests that check what is left
@@ -728,6 +745,7 @@ impl ShelluneView {
     /// connecting focuses that attempt's own form and leaves every other attempt
     /// running.
     pub fn activate(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.workspace.layout_mut().focus_session(id);
         if self.pane_for(id).is_none() {
             if self.attempt_index(id).is_some() {
                 self.focus_attempt(id, cx);
@@ -768,28 +786,39 @@ impl ShelluneView {
 
     /// Shows the tab at `index`, counting from the left; nothing happens past the end.
     pub fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.tab_sessions().get(index).copied() {
-            self.activate_in(id, window, cx);
+        if !self.workspace.layout_mut().select_index(index) {
+            return;
         }
+        self.show_layout_tab(window, cx);
     }
 
     /// Shows the tab `delta` places from the current one, wrapping at both ends.
     pub fn cycle_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let tabs = self.tab_sessions();
-        if tabs.is_empty() {
+        let count = self.workspace.layout().tabs().len();
+        if count == 0 {
             return;
         }
         let current = self
-            .active
-            .and_then(|id| tabs.iter().position(|tab| *tab == id))
+            .workspace
+            .layout()
+            .active_tab_id()
+            .and_then(|id| {
+                self.workspace
+                    .layout()
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id() == id)
+            })
             .unwrap_or(0);
         // A tab that is still connecting has no terminal to show, so it is stepped over
-        // instead of stopping the cycle on it.
+        // instead of stopping the cycle on it. A pane that is only waiting is a stop:
+        // it is on screen, and it has not been started.
         let mut next = current;
-        for _ in 0..tabs.len() {
-            next = crate::app::palette::step(next, delta, tabs.len());
-            if self.pane_for(tabs[next]).is_some() {
-                self.activate_in(tabs[next], window, cx);
+        for _ in 0..count {
+            next = crate::app::palette::step(next, delta, count);
+            if self.layout_tab_is_shown(next) {
+                self.workspace.layout_mut().select_index(next);
+                self.show_layout_tab(window, cx);
                 return;
             }
         }
@@ -828,6 +857,8 @@ impl ShelluneView {
         if self.reconnect == Some(id) {
             self.reconnect = None;
         }
+        self.sync_layout_focus(cx);
+        self.checkpoint_layout();
         cx.notify();
     }
 
@@ -1088,6 +1119,9 @@ impl ShelluneView {
     /// Each source is shut down through its own session, so the processes and the
     /// connection threads end with the window instead of outliving it.
     pub fn close_all_sessions(&mut self, cx: &mut Context<Self>) {
+        // Shutdown must not overwrite the saved tree with the empty one this close
+        // produces. The next launch restores that tree as pending panes.
+        self.layout_persist = false;
         let ids = self.open_sessions();
         for id in ids {
             self.close_session(id, cx);
@@ -1319,6 +1353,9 @@ impl ShelluneView {
     /// shortcut.
     fn new_local_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.shell_menu_open = false;
+        // A new shell is its own tab. A split that was armed and not used must not
+        // swallow it.
+        self.workspace.clear_armed();
         self.start_from_picker(window, cx);
     }
 
@@ -1391,6 +1428,7 @@ impl ShelluneView {
                 self.hosts.clear_message();
                 let items = self.book.hosts().to_vec();
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
+                self.recheck_open_hosts();
             }
             Err(error) => {
                 // A file that cannot be read is not an empty list: the section keeps
@@ -1400,9 +1438,19 @@ impl ShelluneView {
                 self.host_fields = None;
                 self.workspace
                     .fail_hosts(Failure::new(error.to_string(), Recovery::Retry));
+                self.recheck_open_hosts();
             }
         }
         cx.notify();
+    }
+
+    /// Marks only the remote panes whose host is no longer saved.
+    ///
+    /// Clearing a mark does not connect the pane.
+    fn recheck_open_hosts(&mut self) {
+        let ids: Vec<HostId> = self.book.hosts().iter().map(HostConfig::id).collect();
+        self.workspace
+            .recheck_layout_hosts(|id| ids.contains(&id));
     }
 
     /// Opens an empty form for a new host.
@@ -1582,6 +1630,7 @@ impl ShelluneView {
                 self.hosts.set_message(message.to_owned(), false);
                 let items = self.book.hosts().to_vec();
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
+                self.recheck_open_hosts();
             }
             // The records on disk did not change, so neither does the list: the
             // message carries the reason the write produced.
@@ -1754,6 +1803,7 @@ impl ShelluneView {
                 self.book = next;
                 let items = self.book.hosts().to_vec();
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
+                self.recheck_open_hosts();
                 if let Err(error) = self.write_import_forwards(&plan) {
                     // The host file changed. The preview stays, and the message does
                     // not describe that partial write as a complete import.
@@ -1980,6 +2030,9 @@ impl ShelluneView {
     /// ended. That form is hung on the session it already has. A new session here would
     /// leave the one on screen to be replaced.
     fn park_focused_form(&mut self) {
+        // A leftover split or adopt belongs to the action that armed it. Parking a
+        // form must not bind that form's session into the waiting pane.
+        self.workspace.clear_armed();
         if let Some(id) = self.form_session {
             if self.attempt_index(id).is_some() {
                 self.stash_focused_panel();
@@ -2021,6 +2074,7 @@ impl ShelluneView {
             target,
             ephemeral,
         });
+        self.checkpoint_layout();
     }
 
     /// Hangs the focused form on a session that does not have an attempt yet.
@@ -2229,6 +2283,15 @@ impl ShelluneView {
     /// still needs.
     pub(crate) fn open_remote(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
         self.park_focused_form();
+        self.open_remote_after_park(host, cx);
+    }
+
+    /// Opens a host form after any focused form has been parked.
+    ///
+    /// Does not clear an adopt aimed at a waiting pane. [`Self::open_remote`] clears
+    /// that aim by parking first; a pane's own Connect button arms the adopt after
+    /// the park, then calls this.
+    pub(super) fn open_remote_after_park(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
         self.reconnect = None;
         self.form_session = None;
         self.pending_ephemeral = None;
@@ -2533,6 +2596,7 @@ impl ShelluneView {
         }
         self.workspace
             .session_failed(id, SessionFailure::ConnectionFailed { reason });
+        self.checkpoint_layout();
         cx.notify();
     }
 
@@ -2603,7 +2667,9 @@ impl ShelluneView {
         {
             return Some(id);
         }
-        Some(self.workspace.register_remote_session(host).id())
+        let id = self.workspace.register_remote_session(host).id();
+        self.checkpoint_layout();
+        Some(id)
     }
 
     /// Polls one attempt until it becomes a terminal or fails.
@@ -3401,6 +3467,7 @@ impl ShelluneView {
             self.remote = None;
             self.chain = None;
             self.showing_connection_form = false;
+            self.workspace.clear_armed();
             cx.notify();
         }
         self.reconnect = None;
@@ -3549,6 +3616,7 @@ impl ShelluneView {
             window.focus(&handle);
         }
         self.push_pane(tag, pane, cx);
+        self.checkpoint_layout();
     }
 
     /// Starts the process of a session that is already recorded, and shows it.
@@ -6325,10 +6393,13 @@ impl ShelluneView {
         {
             return false;
         }
-        let Some(id) = self.active else {
-            return false;
-        };
-        if self.pane_for(id).is_none() {
+        let live = self
+            .active
+            .is_some_and(|id| self.pane_for(id).is_some());
+        // A waiting pane is drawn in the workspace. A session that is only
+        // connecting still has no terminal, so it does not take the page over.
+        let waiting = self.workspace.layout().has_pending();
+        if !live && !waiting {
             return false;
         }
         match destination {
@@ -6403,7 +6474,19 @@ impl ShelluneView {
                 .id("content.scroll")
                 .debug_selector(|| "content".to_owned())
                 .overflow_y_scroll()
-                .child(self.shell_launcher(cx));
+                .child(if self.workspace.layout().has_tabs() {
+                    self.shell_launcher(cx)
+                } else {
+                    // The selector must not add a box. The launcher fills this column
+                    // and centres itself, which is what keeps it inside 720×480.
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .debug_selector(|| "workspace.empty".to_owned())
+                        .child(self.shell_launcher(cx))
+                });
         }
 
         let body = if destination == Destination::Hosts {
@@ -6440,6 +6523,7 @@ impl ShelluneView {
                     // A session list is neither a terminal nor the empty welcome, and
                     // the form still has to appear on the page the user is already on.
                     .children(self.quick_open.then(|| self.quick_panel(cx)))
+                    .children(self.workspace_empty_banner())
                     .child(body),
             )
     }
@@ -6729,6 +6813,9 @@ impl ShelluneView {
     /// The terminal fills the panel edge to edge with the bar of its session on top,
     /// so the name, the state and the actions are read in the same place as the output.
     fn terminal_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.workspace.layout().active_tab().is_some() {
+            return self.layout_terminal(cx);
+        }
         let metrics = self.metrics();
         let strings = self.strings();
         let mut column = div()
@@ -8180,7 +8267,12 @@ impl ShelluneView {
         let Some(session) = self.workspace.session(id) else {
             return div().id(("session.tab", index));
         };
-        let selected = self.active == Some(id);
+        let selected = self
+            .workspace
+            .layout()
+            .tabs()
+            .get(index)
+            .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id());
         let kind = PaneKind::of(session.kind());
         let tone = session_tone(session.state());
         let state_label = copy::session_state_label(session.state(), self.workspace.locale());
@@ -8230,7 +8322,7 @@ impl ShelluneView {
                 gpui::MouseButton::Middle,
                 cx.listener(move |this, _event, _window, cx| {
                     cx.stop_propagation();
-                    this.request_close_session(id, cx);
+                    this.request_close_tab_anchor(id, cx);
                 }),
             )
             .on_mouse_down(
@@ -8283,18 +8375,19 @@ impl ShelluneView {
                     })
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         cx.stop_propagation();
-                        this.request_close_session(id, cx);
+                        this.request_close_tab_anchor(id, cx);
                     })),
             )
     }
 
     /// The label of one tab: the session's title, numbered when an earlier tab has
     /// the same one, so two shells of one program can be told apart at a glance.
-    fn tab_title(&self, id: SessionId, index: usize) -> String {
+    fn tab_title(&self, id: SessionId, _index: usize) -> String {
         let Some(title) = self.workspace.session(id).map(Session::title) else {
             return String::new();
         };
         let tabs = self.tab_sessions();
+        let index = tabs.iter().position(|tab| *tab == id).unwrap_or(0);
         let same = |other: &SessionId| {
             self.workspace
                 .session(*other)
@@ -8320,8 +8413,12 @@ impl ShelluneView {
             .overflow_hidden()
             .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "session.tabs".to_owned());
-        for (index, id) in self.tab_sessions().iter().enumerate() {
-            row = row.child(self.session_tab(*id, index, cx));
+        for index in 0..self.workspace.layout().tabs().len() {
+            if let Some(id) = self.workspace.layout().anchor_of(index) {
+                row = row.child(self.session_tab(id, index, cx));
+            } else {
+                row = row.child(self.pending_tab(index, cx));
+            }
         }
         row
     }
@@ -8875,8 +8972,59 @@ impl Render for ShelluneView {
                 this.select_tab(7, window, cx);
             }))
             // The last jump goes to the last tab, however many there are.
+            .on_action(cx.listener(|this, _: &SplitPaneRight, window, cx| {
+                this.split_active(SplitAxis::LeftRight, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitPaneDown, window, cx| {
+                this.split_active(SplitAxis::TopBottom, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomPane, _window, cx| {
+                this.toggle_active_zoom(cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneLeft, window, cx| {
+                this.focus_direction(crate::app::layout::Direction::Left, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneRight, window, cx| {
+                this.focus_direction(crate::app::layout::Direction::Right, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneUp, window, cx| {
+                this.focus_direction(crate::app::layout::Direction::Up, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneDown, window, cx| {
+                this.focus_direction(crate::app::layout::Direction::Down, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneLeft, window, cx| {
+                this.resize_direction(crate::app::layout::Direction::Left, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneRight, window, cx| {
+                this.resize_direction(crate::app::layout::Direction::Right, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneUp, window, cx| {
+                this.resize_direction(crate::app::layout::Direction::Up, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneDown, window, cx| {
+                this.resize_direction(crate::app::layout::Direction::Down, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MovePaneLeft, window, cx| {
+                this.move_direction(crate::app::layout::Direction::Left, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MovePaneRight, window, cx| {
+                this.move_direction(crate::app::layout::Direction::Right, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MovePaneUp, window, cx| {
+                this.move_direction(crate::app::layout::Direction::Up, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MovePaneDown, window, cx| {
+                this.move_direction(crate::app::layout::Direction::Down, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabLeft, _window, cx| {
+                this.reorder_active_tab(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabRight, _window, cx| {
+                this.reorder_active_tab(1, cx);
+            }))
             .on_action(cx.listener(|this, _: &SelectTab9, window, cx| {
-                let last = this.tab_sessions().len().saturating_sub(1);
+                let last = this.workspace.layout().tabs().len().saturating_sub(1);
                 this.select_tab(last, window, cx);
             }))
             .children(self.palette_overlay(window, cx))
@@ -8894,7 +9042,7 @@ impl Render for ShelluneView {
                     .child(self.header(window, cx))
                     .children(notice)
                     .children(
-                        (!self.tab_sessions().is_empty()
+                        (!self.workspace.layout().tabs().is_empty()
                             && !self.shows_terminal(self.workspace.destination()))
                         .then(|| self.tab_strip(cx)),
                     )

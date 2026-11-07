@@ -78,11 +78,17 @@ pub enum Icon {
     FolderOpen,
     /// A tick: a checked box.
     Check,
+    /// A vertical split: panes side by side.
+    SplitRight,
+    /// A horizontal split: panes one above the other.
+    SplitDown,
+    /// Four corners: zoom the active pane.
+    Zoom,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 36] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -116,6 +122,9 @@ impl Icon {
         Self::EyeOff,
         Self::FolderOpen,
         Self::Check,
+        Self::SplitRight,
+        Self::SplitDown,
+        Self::Zoom,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -154,6 +163,9 @@ impl Icon {
             Self::EyeOff => "icons/eye-off.svg",
             Self::FolderOpen => "icons/folder-open.svg",
             Self::Check => "icons/check.svg",
+            Self::SplitRight => "icons/split-right.svg",
+            Self::SplitDown => "icons/split-down.svg",
+            Self::Zoom => "icons/zoom.svg",
         }
     }
 
@@ -233,6 +245,15 @@ impl Icon {
                 r#"<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V11"/><path d="M3 7v10a2 2 0 0 0 2 2h12.5a2 2 0 0 0 1.9-1.4L21.5 12H7.2a2 2 0 0 0-1.9 1.4L3 19"/>"#
             }
             Self::Check => r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#,
+            Self::SplitRight => {
+                r#"<rect x="3.5" y="4" width="17" height="16" rx="2"/><path d="M12 4v16"/>"#
+            }
+            Self::SplitDown => {
+                r#"<rect x="4" y="3.5" width="16" height="17" rx="2"/><path d="M4 12h16"/>"#
+            }
+            Self::Zoom => {
+                r#"<path d="M9 4H5.5A1.5 1.5 0 0 0 4 5.5V9"/><path d="M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9"/><path d="M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15"/><path d="M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15"/>"#
+            }
         }
     }
 
