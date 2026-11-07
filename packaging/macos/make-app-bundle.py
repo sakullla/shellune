@@ -3,7 +3,7 @@
 
 Usage:
     python3 packaging/macos/make-app-bundle.py --binary <path to shellune> \
-        [--version 0.1.0] [--out dist]
+        [--version 0.2.0] [--out dist]
 
 The script only lays out the bundle; it does not sign it. Releases are signed in CI
 with a fixed self-signed certificate (see .github/workflows/release.yml and
@@ -39,7 +39,7 @@ INFO = {
 def main():
     parser = argparse.ArgumentParser(description="assemble Shellune.app")
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--version", default="0.1.0")
+    parser.add_argument("--version", default="0.2.0")
     parser.add_argument("--out", default=os.path.join(REPO, "dist"))
     args = parser.parse_args()
 
