@@ -13,8 +13,11 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use shellune_core::{LocalShell, SessionFailure};
@@ -29,6 +32,17 @@ pub const TERM_VALUE: &str = "xterm-256color";
 
 /// Size of one read from the PTY.
 const READ_BUFFER: usize = 8192;
+
+/// How long the output has to stay quiet after the process exits before the exit is
+/// reported, when the PTY does not end its output by itself.
+///
+/// On Linux and macOS the read ends as soon as the process is gone, so this is never
+/// waited for there. Windows ConPTY keeps its output open until the pseudo console is
+/// closed, so the last bytes are recognised by the pause after them instead.
+const EXIT_SETTLE_QUIET: Duration = Duration::from_millis(50);
+
+/// The longest the exit report waits for the last output, however busy the PTY is.
+const EXIT_SETTLE_LIMIT: Duration = Duration::from_secs(1);
 
 /// Why a shell could not be started.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,8 +264,9 @@ impl LocalSession {
             .map_err(|error| classify(error.as_ref(), program))?;
 
         let (sender, receiver) = channel();
-        spawn_reader(reader, sender.clone());
-        spawn_waiter(child, sender);
+        let progress = Arc::new(ReaderProgress::new());
+        spawn_reader(reader, sender.clone(), Arc::clone(&progress));
+        spawn_waiter(child, sender, progress);
 
         Ok(Self {
             master: pair.master,
@@ -348,7 +363,56 @@ fn pty_size(grid: GridSize) -> PtySize {
     }
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>, sender: Sender<PtyEvent>) {
+/// What the reader thread has done, as the waiter thread needs to know it.
+///
+/// The two threads send into the same channel, and the order of their messages is the
+/// order the window applies them in. A process that prints and exits at once can be
+/// reaped before its last output has been read; reported first, the exit would stop
+/// the pane before that output arrived, and the output would be lost.
+struct ReaderProgress {
+    started: Instant,
+    /// Milliseconds after `started` when bytes were last read.
+    last_read: AtomicU64,
+    /// Whether the reader has stopped: the output ended or failed.
+    done: AtomicBool,
+}
+
+impl ReaderProgress {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_read: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_read(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_read.store(elapsed, Ordering::Release);
+    }
+
+    fn quiet_for(&self) -> Duration {
+        let last = Duration::from_millis(self.last_read.load(Ordering::Acquire));
+        self.started.elapsed().saturating_sub(last)
+    }
+
+    /// Blocks until the output after an exit has been read, within the limits above.
+    fn settle(&self) {
+        let waited = Instant::now();
+        while !self.done.load(Ordering::Acquire)
+            && self.quiet_for() < EXIT_SETTLE_QUIET
+            && waited.elapsed() < EXIT_SETTLE_LIMIT
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn spawn_reader(
+    mut reader: Box<dyn Read + Send>,
+    sender: Sender<PtyEvent>,
+    progress: Arc<ReaderProgress>,
+) {
     thread::Builder::new()
         .name("shellune-pty-reader".to_owned())
         .spawn(move || {
@@ -357,6 +421,9 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, sender: Sender<PtyEvent>) {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(read) => {
+                        // Marked before it is sent: the waiter then sees fresh output and
+                        // keeps waiting, so these bytes cannot fall behind the exit.
+                        progress.mark_read();
                         if sender
                             .send(PtyEvent::Data(buffer[..read].to_vec()))
                             .is_err()
@@ -374,11 +441,16 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, sender: Sender<PtyEvent>) {
                     }
                 }
             }
+            progress.done.store(true, Ordering::Release);
         })
         .expect("the PTY reader thread can be created");
 }
 
-fn spawn_waiter(mut child: Box<dyn portable_pty::Child + Send + Sync>, sender: Sender<PtyEvent>) {
+fn spawn_waiter(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    sender: Sender<PtyEvent>,
+    progress: Arc<ReaderProgress>,
+) {
     thread::Builder::new()
         .name("shellune-pty-waiter".to_owned())
         .spawn(move || {
@@ -388,6 +460,9 @@ fn spawn_waiter(mut child: Box<dyn portable_pty::Child + Send + Sync>, sender: S
                     PtyEvent::ReadFailed(format!("the shell exit status is unknown: {error}"))
                 }
             };
+            // The exit is the last thing the window hears from this session, so the
+            // output the process wrote before it ended has to be in the channel first.
+            progress.settle();
             let _ = sender.send(event);
         })
         .expect("the PTY waiter thread can be created");
@@ -446,9 +521,18 @@ mod tests {
     }
 
     /// Collects events until the shell exits or the deadline passes.
-    fn collect_until_exit(session: &LocalSession) -> (Vec<u8>, Option<ExitReport>) {
+    /// Collects the output until the process exits, answering cursor position queries
+    /// the way a terminal does.
+    ///
+    /// Windows ConPTY asks for the cursor position (`ESC[6n`) when it starts and holds
+    /// the child's output until it gets an answer. The application's terminal core
+    /// answers it; a test that reads the PTY directly has to answer it too, or the
+    /// process never gets to run and the wait ends with no output and no exit.
+    fn collect_until_exit(session: &mut LocalSession) -> (Vec<u8>, Option<ExitReport>) {
+        const CURSOR_QUERY: &[u8] = b"\x1b[6n";
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut output = Vec::new();
+        let mut answered = 0;
         loop {
             for event in session.drain() {
                 match event {
@@ -456,6 +540,18 @@ mod tests {
                     PtyEvent::Exited(report) => return (output, Some(report)),
                     PtyEvent::ReadFailed(reason) => panic!("the PTY died: {reason}"),
                 }
+            }
+            // Counted over everything read so far, so a query split across two reads is
+            // still answered exactly once.
+            let asked = output
+                .windows(CURSOR_QUERY.len())
+                .filter(|window| *window == CURSOR_QUERY)
+                .count();
+            while answered < asked {
+                session
+                    .write(b"\x1b[1;1R")
+                    .expect("the PTY accepts the cursor position answer");
+                answered += 1;
             }
             if Instant::now() > deadline {
                 return (output, None);
@@ -571,7 +667,7 @@ mod tests {
         let mut session = LocalSession::spawn_command(command, GridSize::initial(), program)
             .expect("a system shell is available");
 
-        let (output, exit) = collect_until_exit(&session);
+        let (output, exit) = collect_until_exit(&mut session);
         let text = String::from_utf8_lossy(&output);
         assert!(
             text.contains("hello-from-pty"),
@@ -601,7 +697,7 @@ mod tests {
         let mut session = LocalSession::spawn_command(command, GridSize::initial(), program)
             .expect("a system shell is available");
 
-        let (_, exit) = collect_until_exit(&session);
+        let (_, exit) = collect_until_exit(&mut session);
         assert_eq!(exit, Some(ExitReport::Code { code: 7 }));
         session.close();
     }
@@ -627,7 +723,7 @@ mod tests {
             .write(b"typed-answer\r")
             .expect("writing to a live PTY succeeds");
 
-        let (output, exit) = collect_until_exit(&session);
+        let (output, exit) = collect_until_exit(&mut session);
         let text = String::from_utf8_lossy(&output);
         assert!(
             text.contains("got:typed-answer"),
