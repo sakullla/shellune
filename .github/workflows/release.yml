@@ -1,8 +1,10 @@
 # Builds the per-platform artifacts that packaging/ describes and, for a version tag,
 # publishes them as a GitHub release.
 #
-# Signing and notarisation run only when the repository provides the secrets below;
-# without them the artifacts stay unsigned, which the release notes state.
+# macOS builds are signed with a fixed self-signed certificate held in the secrets
+# APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD and
+# APPLE_SIGNING_IDENTITY; a release without them fails. They are not notarised.
+# Windows and Linux artifacts are unsigned.
 #
 # Release steps: set the version in Cargo.toml, write
 # docs/release/<version>-release-notes.md, merge, then push the tag v<version>. The
@@ -67,39 +69,90 @@ jobs:
   macos:
     needs: version
     runs-on: macos-latest
-    # `secrets` cannot be read in a step's `if:`, so whether signing is possible is
-    # decided here, where it can be, and the step reads the flag.
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      HAS_SIGNING_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
+      # Checked before the build, so a release without the certificate fails in seconds
+      # instead of after a full build, and never falls back to an ad-hoc signature.
+      - name: Require the stable signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::secret $name is not set; macOS releases are signed with a fixed certificate"
+              missing=1
+            fi
+          done
+          exit $missing
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
       - name: App bundle
         run: python3 packaging/macos/make-app-bundle.py --binary target/release/shellune --version "$VERSION"
-      - name: Sign and notarise
-        if: env.HAS_SIGNING_CERTIFICATE == 'true'
+      # A fixed self-signed identity, not Apple notarisation: every release carries the
+      # same signer, so macOS keeps the keychain and privacy permissions granted to an
+      # earlier version instead of asking again after each update.
+      - name: Sign with the stable certificate
         env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
-          security create-keychain -p actions build.keychain
-          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
-          codesign --force --options runtime --timestamp \
-            --sign "Developer ID Application" dist/Shellune.app
-          ditto -c -k --keepParent dist/Shellune.app notarise.zip
-          xcrun notarytool submit notarise.zip \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
-          xcrun stapler staple dist/Shellune.app
-      # Archived after signing, so a signed build ships the stapled bundle; an
-      # unsigned one ships the bundle as it is, as the release notes say.
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/shellune.keychain-db"
+          keychain_password="$(openssl rand -hex 16)"
+          certificate="$RUNNER_TEMP/shellune.p12"
+          cleanup() {
+            rm -f "$certificate"
+            security delete-keychain "$keychain" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -s "$keychain"
+          base64 --decode > "$certificate" <<< "$APPLE_CERTIFICATE"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+
+          app=dist/Shellune.app
+          # Inner Mach-O files first, deepest path first, then the bundle itself: a
+          # bundle signature covers what is inside it, so it has to come last.
+          find "$app" -type f -print0 | while IFS= read -r -d '' file; do
+            if file -b "$file" | grep -q 'Mach-O'; then
+              printf '%s\n' "$file"
+            fi
+          done | awk '{ print length($0) "\t" $0 }' | sort -nr | cut -f2- | while IFS= read -r file; do
+            codesign --force --options runtime --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$file"
+          done
+          codesign --force --options runtime --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+      - name: Verify the signature
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          app=dist/Shellune.app
+          signature=$(codesign --display --verbose=4 "$app" 2>&1)
+          echo "$signature"
+          if grep -q '^Signature=adhoc$' <<< "$signature"; then
+            echo "::error::the app is ad-hoc signed; expected $APPLE_SIGNING_IDENTITY"
+            exit 1
+          fi
+          grep -F -x -q "Authority=$APPLE_SIGNING_IDENTITY" <<< "$signature" \
+            || { echo "::error::the app is not signed by $APPLE_SIGNING_IDENTITY"; exit 1; }
+          grep -F -x -q "Identifier=com.shellune.Shellune" <<< "$signature" \
+            || { echo "::error::the signature does not carry the bundle identifier"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --requirements - "$app"
       - name: Archive
         run: ditto -c -k --keepParent dist/Shellune.app "dist/Shellune-$VERSION-macos-arm64.zip"
       - uses: actions/upload-artifact@v4

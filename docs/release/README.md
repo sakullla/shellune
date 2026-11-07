@@ -34,14 +34,15 @@ Everything lands in `dist/`, next to a `.sha256` file for the archive.
 
 ## 3. Sign
 
-No certificate exists in this project, so nothing is signed by default and the
-release notes say so. When a certificate is available:
-
-- Windows: pass `/DSIGNTOOL=<path to signtool.exe>` to `makensis`; the installer
-  is signed as the last step. Sign the portable `shellune.exe` before zipping it.
-- macOS: `codesign --force --options runtime --sign "Developer ID Application"`,
-  then `notarytool submit` and `stapler staple`. `.github/workflows/release.yml`
-  runs these steps only when the signing secrets are configured.
+- Windows: nothing is signed by default. When a certificate is available, pass
+  `/DSIGNTOOL=<path to signtool.exe>` to `makensis`; the installer is signed as the
+  last step. Sign the portable `shellune.exe` before zipping it.
+- macOS: `.github/workflows/release.yml` signs the bundle with the fixed self-signed
+  certificate from the repository secrets (`APPLE_CERTIFICATE`,
+  `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`), then verifies that the
+  signature is not ad-hoc and that its authority is that identity. A release without
+  the secrets fails. The bundle is not notarised. By hand:
+  `codesign --force --options runtime --sign "<identity>" Shellune.app`.
 
 ## 4. Publish
 
