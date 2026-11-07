@@ -1,8 +1,12 @@
-# Builds the per-platform artifacts that packaging/ describes.
+# Builds the per-platform artifacts that packaging/ describes and, for a version tag,
+# publishes them as a GitHub release.
 #
 # Signing and notarisation run only when the repository provides the secrets below;
-# without them the artifacts stay unsigned, which the release notes state. This
-# workflow has not been executed: there is no remote to run it on.
+# without them the artifacts stay unsigned, which the release notes state.
+#
+# Release steps: set the version in Cargo.toml, write
+# docs/release/<version>-release-notes.md, merge, then push the tag v<version>. The
+# version job refuses a tag that does not match Cargo.toml before anything is built.
 name: release
 
 on:
@@ -11,30 +15,62 @@ on:
   workflow_dispatch:
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        name: Read the version and check the tag
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version"
+            exit 1
+          fi
+          notes="docs/release/$version-release-notes.md"
+          if [ ! -f "$notes" ]; then
+            echo "::error::$notes is missing"
+            exit 1
+          fi
+
   windows:
+    needs: version
     runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
       - name: Portable bundle
-        run: python packaging/windows/make-portable.py --binary target/release/shellune.exe
+        run: python packaging/windows/make-portable.py --binary target/release/shellune.exe --version ${{ env.VERSION }}
+      # PowerShell, not bash: Git Bash rewrites an argument that starts with "/" into a
+      # path, which would turn /DVERSION=... into something makensis does not read.
       - name: Installer (NSIS)
-        shell: bash
+        shell: pwsh
         run: |
           choco install nsis -y --no-progress
-          "/c/Program Files (x86)/NSIS/makensis.exe" packaging/windows/shellune.nsi
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" "/DVERSION=$env:VERSION" packaging\windows\shellune.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
           name: shellune-windows-x86_64
-          path: dist/*
+          path: |
+            dist/Shellune-${{ env.VERSION }}-windows-x86_64-portable.zip
+            dist/Shellune-${{ env.VERSION }}-setup.exe
+          if-no-files-found: error
 
   macos:
+    needs: version
     runs-on: macos-latest
     # `secrets` cannot be read in a step's `if:`, so whether signing is possible is
     # decided here, where it can be, and the step reads the flag.
     env:
+      VERSION: ${{ needs.version.outputs.version }}
       HAS_SIGNING_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +78,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
       - name: App bundle
-        run: python3 packaging/macos/make-app-bundle.py --binary target/release/shellune
+        run: python3 packaging/macos/make-app-bundle.py --binary target/release/shellune --version "$VERSION"
       - name: Sign and notarise
         if: env.HAS_SIGNING_CERTIFICATE == 'true'
         env:
@@ -58,17 +94,25 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
           codesign --force --options runtime --timestamp \
             --sign "Developer ID Application" dist/Shellune.app
-          ditto -c -k --keepParent dist/Shellune.app dist/Shellune-macos-arm64.zip
-          xcrun notarytool submit dist/Shellune-macos-arm64.zip \
+          ditto -c -k --keepParent dist/Shellune.app notarise.zip
+          xcrun notarytool submit notarise.zip \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple dist/Shellune.app
+      # Archived after signing, so a signed build ships the stapled bundle; an
+      # unsigned one ships the bundle as it is, as the release notes say.
+      - name: Archive
+        run: ditto -c -k --keepParent dist/Shellune.app "dist/Shellune-$VERSION-macos-arm64.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: shellune-macos-arm64
-          path: dist/
+          path: dist/Shellune-${{ env.VERSION }}-macos-arm64.zip
+          if-no-files-found: error
 
   linux:
+    needs: version
     runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Install the graphics headers
@@ -81,8 +125,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
       - name: Tarball
-        run: python3 packaging/linux/make-tarball.py --binary target/release/shellune
+        run: python3 packaging/linux/make-tarball.py --binary target/release/shellune --version "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: shellune-linux-x86_64
-          path: dist/
+          path: dist/Shellune-${{ env.VERSION }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    # Only a version tag publishes; a manual run stops at the artifacts.
+    if: github.ref_type == 'tag'
+    needs: [version, windows, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          ls -l dist
+          cat dist/SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "Shellune $VERSION" \
+            --notes-file "docs/release/$VERSION-release-notes.md"
