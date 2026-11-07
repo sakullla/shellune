@@ -76,11 +76,13 @@ pub enum Icon {
     EyeOff,
     /// An open folder: choose a file.
     FolderOpen,
+    /// A tick: a checked box.
+    Check,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -113,6 +115,7 @@ impl Icon {
         Self::Eye,
         Self::EyeOff,
         Self::FolderOpen,
+        Self::Check,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -150,6 +153,7 @@ impl Icon {
             Self::Eye => "icons/eye.svg",
             Self::EyeOff => "icons/eye-off.svg",
             Self::FolderOpen => "icons/folder-open.svg",
+            Self::Check => "icons/check.svg",
         }
     }
 
@@ -228,6 +232,7 @@ impl Icon {
             Self::FolderOpen => {
                 r#"<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V11"/><path d="M3 7v10a2 2 0 0 0 2 2h12.5a2 2 0 0 0 1.9-1.4L21.5 12H7.2a2 2 0 0 0-1.9 1.4L3 19"/>"#
             }
+            Self::Check => r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#,
         }
     }
 

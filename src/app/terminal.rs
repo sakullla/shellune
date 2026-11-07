@@ -720,6 +720,11 @@ impl TerminalPane {
         }
     }
 
+    /// Sends text to the program as if it had been typed.
+    pub fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.write(text.as_bytes(), cx);
+    }
+
     /// Puts the selection on the clipboard.
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
         let Some(text) = self.core.selection_text().filter(|text| !text.is_empty()) else {

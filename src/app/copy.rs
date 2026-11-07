@@ -565,6 +565,34 @@ pub struct Strings {
     pub field_conceal: &'static str,
     /// Button beside a path field that opens the system file chooser.
     pub field_browse: &'static str,
+    /// Host dialog: heading of the sign-in choice.
+    pub host_auth_title: &'static str,
+    /// Host dialog: label of the key passphrase field.
+    pub host_secret_passphrase: &'static str,
+    /// Host dialog: checkbox that keeps the password.
+    pub host_remember_password: &'static str,
+    /// Host dialog: checkbox that keeps the passphrase.
+    pub host_remember_passphrase: &'static str,
+    /// Host dialog: where a remembered secret is kept.
+    pub host_remember_note: &'static str,
+    /// Host dialog: placeholder of the secret field when one is saved.
+    pub host_secret_saved_placeholder: &'static str,
+    /// Host dialog: the system store refused the secret; the reason follows.
+    pub host_secret_failed: &'static str,
+    /// Host dialog: label of the startup command.
+    pub host_startup_label: &'static str,
+    /// Host dialog: placeholder of the startup command.
+    pub host_startup_placeholder: &'static str,
+    /// Host dialog: what the startup command does.
+    pub host_startup_note: &'static str,
+    /// Host dialog: what the agent method needs.
+    pub host_agent_note: &'static str,
+    /// Host dialog: save and open a connection at once.
+    pub host_save_connect: &'static str,
+    /// Tooltip of the dialog's close button.
+    pub host_dialog_close: &'static str,
+    /// Connection form: a remembered secret could not be read; the reason follows.
+    pub remote_saved_secret_failed: &'static str,
 }
 
 /// English copy.
@@ -811,6 +839,20 @@ pub static ENGLISH: Strings = Strings {
     field_reveal: "Show",
     field_conceal: "Hide",
     field_browse: "Browse…",
+    host_auth_title: "Sign in with",
+    host_secret_passphrase: "Key passphrase",
+    host_remember_password: "Remember password",
+    host_remember_passphrase: "Remember passphrase",
+    host_remember_note: "Kept in the system credential store (Keychain or Credential Manager), never in the host file.",
+    host_secret_saved_placeholder: "Saved; leave empty to keep it",
+    host_secret_failed: "The password was not saved to the system credential store",
+    host_startup_label: "Run after connecting",
+    host_startup_placeholder: "For example cd /srv && tmux attach",
+    host_startup_note: "Typed into the remote shell once, each time the connection opens.",
+    host_agent_note: "Uses a key already loaded into the system SSH agent; nothing to fill in here.",
+    host_save_connect: "Save and connect",
+    host_dialog_close: "Close",
+    remote_saved_secret_failed: "The saved password could not be read",
 };
 
 /// Chinese copy.
@@ -1057,6 +1099,20 @@ pub static CHINESE: Strings = Strings {
     field_reveal: "显示",
     field_conceal: "隐藏",
     field_browse: "浏览…",
+    host_auth_title: "登录方式",
+    host_secret_passphrase: "私钥口令",
+    host_remember_password: "记住密码",
+    host_remember_passphrase: "记住口令",
+    host_remember_note: "保存在系统凭据库（钥匙串 / 凭据管理器），不会写入主机文件。",
+    host_secret_saved_placeholder: "已保存；留空则保持不变",
+    host_secret_failed: "密码没有保存到系统凭据库",
+    host_startup_label: "连接后运行",
+    host_startup_placeholder: "例如 cd /srv && tmux attach",
+    host_startup_note: "每次连接成功后，在远程 Shell 中自动执行一次。",
+    host_agent_note: "使用系统 SSH Agent 中已加载的密钥，这里无需填写。",
+    host_save_connect: "保存并连接",
+    host_dialog_close: "关闭",
+    remote_saved_secret_failed: "无法读取已保存的密码",
 };
 
 /// A count followed by its unit, in the grammar of the language.

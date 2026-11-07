@@ -24,6 +24,7 @@
 
 mod audit;
 mod book;
+mod credentials;
 mod error;
 mod ssh_config;
 mod store;
@@ -33,6 +34,7 @@ pub use audit::{CONFIG_KEYS, LOG_FIELDS, StoreEvent};
 pub use book::{
     FORMAT_VERSION, Group, HostBook, HostEdit, RecentConnection, RecentHost, host_matches,
 };
+pub use credentials::{MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
 pub use error::{BookError, StorageError};
 pub use ssh_config::{
     DEFAULT_CONFIG_TEXT, ImportError, ImportLimits, ImportNote, ImportOutcome, ImportPlan,

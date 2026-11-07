@@ -22,7 +22,8 @@ use shellune_core::{
 };
 use shellune_ssh::{ConnectRequest, PtySize, RemoteEvent, RemoteSession};
 use shellune_storage::{
-    HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview, ImportedHost, TrustStore,
+    HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview, ImportedHost, SecretStore,
+    TrustStore,
 };
 use shellune_terminal::GridSize;
 
@@ -58,6 +59,7 @@ use crate::app::transfers::{
 use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Workspace};
 use crate::app::{components, theme::radius};
 
+mod host_dialog;
 mod overlays;
 mod sessions;
 
@@ -216,6 +218,9 @@ pub struct ShelluneView {
     files_dialog: Option<FilesDialog>,
     /// The field of that question, present only while it has one.
     files_field: Option<Entity<TextField>>,
+    /// Where remembered passwords and passphrases are kept: the system credential store,
+    /// or memory in tests.
+    secrets: std::sync::Arc<dyn SecretStore>,
     /// The command palette's search field, present only while the palette is open.
     palette: Option<Entity<TextField>>,
     /// What the palette's field held when the list was last ranked.
@@ -232,6 +237,8 @@ pub struct ShelluneView {
     /// shortcut shows every session instead, which is the only place closed records
     /// and their actions are listed while tabs are open.
     session_terminal: bool,
+    /// Whether the host dialog's first field takes the keyboard on the next draw.
+    focus_host_dialog: bool,
     /// The session row whose menu is open, and where it was opened.
     session_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// The attempt a test scripted, kept so its answers can be inspected.
@@ -246,7 +253,7 @@ struct RemoteFields {
     passphrase: Entity<TextField>,
 }
 
-/// The six fields of the host editor, in form order.
+/// The fields of the host dialog, in form order.
 struct HostFields {
     name: Entity<TextField>,
     address: Entity<TextField>,
@@ -254,6 +261,8 @@ struct HostFields {
     user: Entity<TextField>,
     group: Entity<TextField>,
     identity: Entity<TextField>,
+    secret: Entity<TextField>,
+    startup: Entity<TextField>,
 }
 
 impl HostFields {
@@ -265,6 +274,8 @@ impl HostFields {
             HostField::User => &self.user,
             HostField::Group => &self.group,
             HostField::IdentityFile => &self.identity,
+            HostField::Secret => &self.secret,
+            HostField::StartupCommand => &self.startup,
         }
     }
 }
@@ -357,6 +368,7 @@ impl ShelluneView {
             trust,
             trust_book: HostTrust::new(),
             trust_error: None,
+            secrets: default_secrets(),
             files: FileViews::new(),
             transfers: TransferViews::new(),
             transfer_problem: None,
@@ -370,6 +382,7 @@ impl ShelluneView {
             palette_scroll: gpui::ScrollHandle::new(),
             tab_menu: None,
             session_menu: None,
+            focus_host_dialog: false,
             session_terminal: false,
             #[cfg(test)]
             scripted: None,
@@ -1018,9 +1031,27 @@ impl ShelluneView {
                 self.form_session = Some(id);
                 self.remote = Some(RemotePanel::new(&host));
                 self.sync_remote_fields(cx);
+                // A host that remembers how to sign in reconnects in one click too.
+                self.connect_when_ready(&host, cx);
                 cx.notify();
             }
         }
+    }
+
+    /// What the credential store holds for a host, for tests.
+    #[cfg(test)]
+    pub fn saved_secret_for_test(&self, id: HostId) -> Option<String> {
+        self.secrets
+            .load(id)
+            .ok()
+            .flatten()
+            .map(|secret| secret.expose().to_owned())
+    }
+
+    /// Whether the session bar offers the reconnect button for this session.
+    #[cfg(test)]
+    pub fn offers_reconnect(&self, id: SessionId) -> bool {
+        self.workspace.session(id).is_some_and(may_reconnect)
     }
 
     /// Records that a reconnect could not start, and why.
@@ -1180,7 +1211,7 @@ impl ShelluneView {
         entity.update(cx, |text_field, _cx| {
             text_field.on_submit(move |_text, _window, app| {
                 view.update(app, |view, cx| {
-                    view.save_host(cx);
+                    let _ = view.save_host(cx);
                     // The field keeps its text: when the save was refused, the reason
                     // points at what the user typed and must still be there.
                     false
@@ -1268,6 +1299,26 @@ impl ShelluneView {
             field.set_browse(Browse::File, cx);
             field
         });
+        let secret_placeholder = if draft.has_saved_secret() {
+            strings.host_secret_saved_placeholder
+        } else if draft.auth().needs_passphrase() {
+            strings.host_secret_passphrase
+        } else {
+            strings.auth_password
+        };
+        let secret = cx.new(|cx| {
+            let mut field = TextField::new(secret_placeholder, cx);
+            field.set_masked(true, cx);
+            field.set_revealable(true, cx);
+            field
+        });
+        let startup = cx.new(|cx| {
+            TextField::with_text(
+                strings.host_startup_placeholder,
+                draft.text(HostField::StartupCommand),
+                cx,
+            )
+        });
         self.host_fields = Some(HostFields {
             name,
             address,
@@ -1275,10 +1326,13 @@ impl ShelluneView {
             user,
             group,
             identity,
+            secret,
+            startup,
         });
         for field in HostField::ALL {
             self.bind_host_field(field, cx);
         }
+        self.focus_host_dialog = true;
         cx.notify();
     }
 
@@ -1290,10 +1344,11 @@ impl ShelluneView {
     }
 
     /// Validates the form and stores it when the domain accepts it.
-    fn save_host(&mut self, cx: &mut Context<Self>) {
-        let Some(draft) = self.hosts.draft().cloned() else {
-            return;
-        };
+    ///
+    /// Returns the id of the host that was saved, or `None` when the dialog stays open
+    /// with the reason it was refused.
+    fn save_host(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
+        let draft = self.hosts.draft().cloned()?;
         let saved = draft.editing().and_then(|id| self.book.host(id)).cloned();
         let edit = match draft.build(saved.as_ref()) {
             Ok(edit) => edit,
@@ -1302,7 +1357,7 @@ impl ShelluneView {
                 // the field the domain refused.
                 self.hosts.set_message(reason, true);
                 cx.notify();
-                return;
+                return None;
             }
         };
 
@@ -1310,9 +1365,53 @@ impl ShelluneView {
         if let Err(error) = next.apply(&edit) {
             self.hosts.set_message(error.to_string(), true);
             cx.notify();
-            return;
+            return None;
+        }
+        if !self.store_host_secret(&draft, edit.host(), saved.as_ref(), cx) {
+            return None;
         }
         self.commit_hosts(next, self.strings().hosts_saved, cx);
+        // The dialog closes only when the file was really written.
+        self.host_fields.is_none().then(|| edit.id())
+    }
+
+    /// Puts the secret typed in the form into the system store, or takes it out.
+    ///
+    /// Runs before the record is written: a host whose file says "remembered" must have
+    /// its secret in the store. Returns whether saving the record may go on; when the
+    /// store refuses, the dialog stays open with the reason.
+    fn store_host_secret(
+        &mut self,
+        draft: &HostDraft,
+        host: &HostConfig,
+        saved: Option<&HostConfig>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let strings = self.strings();
+        if host.remembers_secret() {
+            match draft.typed_secret() {
+                Some(secret) => {
+                    let secret = shellune_core::SecretString::new(secret);
+                    if let Err(error) = self.secrets.save(host.id(), &secret) {
+                        self.hosts
+                            .set_message(format!("{}: {error}", strings.host_secret_failed), true);
+                        cx.notify();
+                        return false;
+                    }
+                }
+                // Nothing typed keeps what is saved (the draft only remembers when
+                // there is something to remember).
+                None => {}
+            }
+        } else if saved.is_some_and(HostConfig::remembers_secret) {
+            // Turning remembering off removes the secret; a store that cannot be reached
+            // leaves an entry nobody reads, which is not a reason to keep the old flag.
+            let _ = self.secrets.forget(host.id());
+        }
+        if let Some(draft) = self.hosts.draft_mut() {
+            draft.clear_secret();
+        }
+        true
     }
 
     /// Saves the records, and only then adopts them as the current state.
@@ -1352,10 +1451,17 @@ impl ShelluneView {
             return;
         };
         let mut next = self.book.clone();
-        if let Err(error) = next.remove(id) {
-            self.hosts.set_message(error.to_string(), true);
-            cx.notify();
-            return;
+        let removed = match next.remove(id) {
+            Ok(removed) => removed,
+            Err(error) => {
+                self.hosts.set_message(error.to_string(), true);
+                cx.notify();
+                return;
+            }
+        };
+        // A deleted host's secret has nobody left to use it.
+        if removed.remembers_secret() {
+            let _ = self.secrets.forget(id);
         }
         self.commit_hosts(next, self.strings().hosts_deleted, cx);
     }
@@ -1570,7 +1676,59 @@ impl ShelluneView {
         self.form_session = None;
         self.remote = Some(RemotePanel::new(host));
         self.sync_remote_fields(cx);
+        self.connect_when_ready(host, cx);
         cx.notify();
+    }
+
+    /// Fills in what the host remembers and connects when nothing is left to ask.
+    ///
+    /// A host whose sign-in was chosen in its dialog connects in one click: the saved
+    /// password or passphrase comes from the system store, a key file or the agent needs
+    /// nothing typed. Anything missing - no choice yet, a secret not remembered, a store
+    /// that cannot be read - leaves the form open, saying why when there is a reason.
+    fn connect_when_ready(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        let Some(kind) = host.auth() else {
+            return;
+        };
+        let secret = if host.remembers_secret() {
+            match self.secrets.load(host.id()) {
+                Ok(secret) => secret,
+                Err(error) => {
+                    let reason = format!("{}: {error}", self.strings().remote_saved_secret_failed);
+                    if let Some(panel) = self.remote.as_mut() {
+                        panel.set_form_error(reason);
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let Some(panel) = self.remote.as_mut() else {
+            return;
+        };
+        let ready = match kind {
+            shellune_core::AuthMethodKind::Agent => true,
+            shellune_core::AuthMethodKind::KeyFile => !panel.key_path().trim().is_empty(),
+            shellune_core::AuthMethodKind::Password => match &secret {
+                Some(secret) => {
+                    panel.set_password(secret.expose());
+                    true
+                }
+                None => false,
+            },
+            shellune_core::AuthMethodKind::EncryptedKeyFile => match &secret {
+                Some(secret) if !panel.key_path().trim().is_empty() => {
+                    panel.set_passphrase(secret.expose());
+                    true
+                }
+                _ => false,
+            },
+        };
+        if ready {
+            self.sync_remote_fields(cx);
+            self.connect_remote(cx);
+        }
     }
 
     /// The open connection form, if there is one.
@@ -1816,7 +1974,16 @@ impl ShelluneView {
         if let Some(link) = transfer_link {
             self.transfers.attach(id, Box::new(link));
         }
+        // The command the host asks for is typed once the shell is there, as the user
+        // would type it; the remote side keeps it until its prompt reads it.
+        if let Some(command) = host.startup_command() {
+            let line = format!("{command}\r");
+            pane.update(cx, |pane, cx| pane.type_text(&line, cx));
+        }
         self.push_pane(tag, pane, cx);
+        // The new terminal is what the user connected for, so it is shown at once
+        // instead of leaving them on the hosts page with a tab to find.
+        self.activate(id, cx);
     }
 
     /// Records an attempt that did not open, in both the form and the session list.
@@ -2719,7 +2886,12 @@ impl ShelluneView {
         if self.remote.is_some() {
             column = column.child(self.remote_panel(cx));
         }
-        if let Some(message) = self.hosts.message() {
+        // While the host dialog is open, its own refusals are shown inside it.
+        if let Some(message) = self
+            .hosts
+            .message()
+            .filter(|message| !(message.failed() && self.host_fields.is_some()))
+        {
             column = column.child(
                 components::banner(
                     if message.failed() {
@@ -2753,9 +2925,6 @@ impl ShelluneView {
         column = column.child(self.hosts_toolbar(cx));
         if self.import.is_open() {
             column = column.child(self.import_panel(cx));
-        }
-        if let Some(fields) = &self.host_fields {
-            column = column.child(self.host_editor(fields, cx));
         }
         if let Some(id) = self.hosts.pending_delete() {
             column = column.child(self.host_delete_bar(id, cx));
@@ -2867,120 +3036,6 @@ impl ShelluneView {
                     .text_center()
                     .child(strings.import_read_only),
             )
-    }
-
-    /// The form that creates or changes one host.
-    fn host_editor(&self, fields: &HostFields, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let editing = self.hosts.draft().and_then(HostDraft::editing).is_some();
-
-        let mut card = components::card(metrics)
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .debug_selector(|| "hosts.editor".to_owned())
-            .child(components::card_title(
-                if editing {
-                    strings.host_editor_edit
-                } else {
-                    strings.host_editor_new
-                },
-                None,
-                metrics,
-            ));
-
-        // Two fields to a line, paired by what a person fills in together: the name
-        // and its group, the address and its port, the user and the key.
-        let cell = |field: HostField, grow: f32| {
-            div()
-                .flex()
-                .flex_col()
-                .flex_grow()
-                .flex_basis(gpui::relative(grow))
-                .min_w(px(0.0))
-                .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                .child(
-                    div()
-                        .text_size(metrics.caption_size())
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .child(field.label(strings)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .w_full()
-                        .min_w(px(0.0))
-                        .debug_selector(move || field.debug_selector().to_owned())
-                        .child(fields.get(field).clone()),
-                )
-        };
-        let line = |left: Div, right: Div| {
-            div()
-                .flex()
-                .w_full()
-                .gap(metrics.scale(spacing::SNUG))
-                .child(left)
-                .child(right)
-        };
-        card = card
-            .child(line(
-                cell(HostField::Name, 0.5),
-                cell(HostField::Group, 0.5),
-            ))
-            .child(line(
-                cell(HostField::Address, 0.75),
-                cell(HostField::Port, 0.25),
-            ))
-            .child(line(
-                cell(HostField::User, 0.5),
-                cell(HostField::IdentityFile, 0.5),
-            ));
-
-        // The key path is the only part of a key this application knows; saying so in
-        // the form is what keeps an imported IdentityFile editable without pretending
-        // the key itself is managed here.
-        card.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(metrics.scale(spacing::SNUG))
-                .mt(metrics.scale(spacing::HAIRLINE))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(caption_line(strings.host_identity_note.to_owned(), metrics)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            self.text_button(
-                                SharedString::from("hosts.cancel"),
-                                strings.host_cancel,
-                                Variant::Ghost,
-                                cx,
-                                |view, cx| view.close_host_editor(cx),
-                            )
-                            .h(metrics.control_height()),
-                        )
-                        .child(
-                            self.text_button(
-                                SharedString::from("hosts.save"),
-                                strings.host_save,
-                                Variant::Primary,
-                                cx,
-                                |view, cx| view.save_host(cx),
-                            )
-                            .h(metrics.control_height())
-                            .px(metrics.scale(spacing::BASE)),
-                        ),
-                ),
-        )
     }
 
     /// The import preview: the file it read, its limits and every host it describes.
@@ -6799,6 +6854,12 @@ impl Render for ShelluneView {
         // Small views that are not handed the workspace (a text field's menu) read the
         // language from here.
         self.workspace.locale().set_current();
+        if std::mem::take(&mut self.focus_host_dialog)
+            && let Some(fields) = &self.host_fields
+        {
+            let handle = fields.name.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);
 
@@ -6845,6 +6906,10 @@ impl Render for ShelluneView {
                 // notice.
                 if this.palette.is_some() {
                     this.close_palette(window, cx);
+                    return;
+                }
+                if this.host_fields.is_some() {
+                    this.close_host_editor(cx);
                     return;
                 }
                 if this.tab_menu.is_some() {
@@ -6915,6 +6980,7 @@ impl Render for ShelluneView {
             .children(self.palette_overlay(window, cx))
             .children(self.tab_menu_overlay(window, cx))
             .children(self.session_menu_overlay(window, cx))
+            .children(self.host_dialog_overlay(window, cx))
             .child(self.rail(window, cx))
             .child(
                 div()
@@ -7023,6 +7089,18 @@ fn default_store() -> HostStore {
 #[cfg(test)]
 fn default_store() -> HostStore {
     scratch_store()
+}
+
+/// The credential store the shell keeps remembered secrets in.
+#[cfg(not(test))]
+fn default_secrets() -> std::sync::Arc<dyn SecretStore> {
+    std::sync::Arc::new(shellune_storage::SystemSecrets)
+}
+
+/// Memory only, so a test never reads or writes the machine's credential store.
+#[cfg(test)]
+fn default_secrets() -> std::sync::Arc<dyn SecretStore> {
+    std::sync::Arc::new(shellune_storage::MemorySecrets::new())
 }
 
 /// The trust file the shell reads when the caller does not supply one.

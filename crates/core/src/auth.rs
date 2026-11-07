@@ -12,7 +12,8 @@ use crate::error::{AgentKind, SecretString};
 ///
 /// The kind is what the shell can show, log and remember as a preference; it holds
 /// no secret, which is why it is safe to put in a message or a test assertion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthMethodKind {
     /// A password typed for this attempt.
     Password,

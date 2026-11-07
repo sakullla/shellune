@@ -92,6 +92,28 @@ impl MethodChoice {
         matches!(self, Self::Password)
     }
 
+    /// The choice that stands for a domain method kind.
+    #[must_use]
+    pub fn from_kind(kind: shellune_core::AuthMethodKind) -> Self {
+        match kind {
+            shellune_core::AuthMethodKind::Password => Self::Password,
+            shellune_core::AuthMethodKind::KeyFile => Self::KeyFile,
+            shellune_core::AuthMethodKind::EncryptedKeyFile => Self::EncryptedKeyFile,
+            shellune_core::AuthMethodKind::Agent => Self::Agent,
+        }
+    }
+
+    /// The domain method kind this choice stands for.
+    #[must_use]
+    pub fn kind(self) -> shellune_core::AuthMethodKind {
+        match self {
+            Self::Password => shellune_core::AuthMethodKind::Password,
+            Self::KeyFile => shellune_core::AuthMethodKind::KeyFile,
+            Self::EncryptedKeyFile => shellune_core::AuthMethodKind::EncryptedKeyFile,
+            Self::Agent => shellune_core::AuthMethodKind::Agent,
+        }
+    }
+
     /// The method that matches a stored key path, used when a host carries one.
     #[must_use]
     pub fn for_stored_key() -> Self {
@@ -215,10 +237,12 @@ impl RemotePanel {
     #[must_use]
     pub fn new(host: &HostConfig) -> Self {
         let key_path = host.identity_file().unwrap_or_default().to_owned();
-        let method = if key_path.is_empty() {
-            MethodChoice::Password
-        } else {
-            MethodChoice::for_stored_key()
+        // The method chosen in the host form wins; a host saved before that choice
+        // existed is guessed from whether it carries a key path, as before.
+        let method = match host.auth() {
+            Some(kind) => MethodChoice::from_kind(kind),
+            None if key_path.is_empty() => MethodChoice::Password,
+            None => MethodChoice::for_stored_key(),
         };
         Self {
             host: host.clone(),

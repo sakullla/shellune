@@ -751,6 +751,20 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             tab_menu_close,
             tab_menu_close_others,
             tab_menu_close_right,
+            host_auth_title,
+            host_secret_passphrase,
+            host_remember_password,
+            host_remember_passphrase,
+            host_remember_note,
+            host_secret_saved_placeholder,
+            host_secret_failed,
+            host_startup_label,
+            host_startup_placeholder,
+            host_startup_note,
+            host_agent_note,
+            host_save_connect,
+            host_dialog_close,
+            remote_saved_secret_failed,
             field_cut,
             field_copy,
             field_paste,
@@ -4771,8 +4785,11 @@ async fn a_reconnect_that_can_never_work_offers_close_instead(cx: &mut TestAppCo
         cx.debug_bounds("session.close").is_some(),
         "closing the finished session is offered"
     );
+    // The button's absence is checked through the rule that draws it: the test window
+    // never forgets a selector once a frame drew it (GPUI clears every per-frame buffer
+    // but the debug bounds), and this button was drawn before the host was deleted.
     assert!(
-        cx.debug_bounds("session.reconnect").is_none(),
+        !cx.update(|_window, app| view.read(app).offers_reconnect(id)),
         "a session that can never be reconnected must not offer the button"
     );
 
@@ -6735,4 +6752,210 @@ fn only_a_closed_record_can_be_removed_from_the_model() {
     assert!(workspace.session(live_id).is_some());
     assert!(workspace.session_removed(closed_id));
     assert!(workspace.session(closed_id).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// The host dialog: sign-in, remembered secrets and the startup command
+// ---------------------------------------------------------------------------
+
+fn dialog_view(
+    cx: &mut TestAppContext,
+    hosts: Vec<HostConfig>,
+) -> (Entity<ShelluneView>, &mut VisualTestContext, TempDir) {
+    let dir = TempDir::new("host-dialog");
+    seed(&dir.store(), hosts);
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "nav.hosts");
+    (view, cx, dir)
+}
+
+/// Fills the dialog for a host on `127.0.0.1:1`, which refuses at once if dialled.
+fn fill_new_host(cx: &mut VisualTestContext) {
+    click(cx, "header.primary");
+    assert!(
+        cx.debug_bounds("hosts.editor").is_some(),
+        "the form opens as a dialog"
+    );
+    type_into(cx, "hosts.field.name", "box");
+    type_into(cx, "hosts.field.address", "127.0.0.1");
+    clear_field(cx, "hosts.field.port", 2);
+    type_into(cx, "hosts.field.port", "1");
+    type_into(cx, "hosts.field.user", "ada");
+}
+
+#[gpui::test]
+async fn a_remembered_password_goes_to_the_credential_store_not_the_file(cx: &mut TestAppContext) {
+    let (view, cx, dir) = dialog_view(cx, Vec::new());
+    fill_new_host(cx);
+    // Password is the default sign-in for a new host, and remembering is ticked.
+    type_into(cx, "hosts.field.secret", "s3cret-pass");
+    click(cx, "hosts.save");
+
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host was saved");
+    assert_eq!(host.auth(), Some(shellune_core::AuthMethodKind::Password));
+    assert!(host.remembers_secret());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(host.id())),
+        Some("s3cret-pass".to_owned())
+    );
+    let file = std::fs::read_to_string(dir.path().join(shellune_storage::FILE_NAME))
+        .expect("the host file was written");
+    assert!(
+        !file.contains("s3cret-pass"),
+        "the password never reaches the host file"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "a saved host closes the dialog"
+    );
+}
+
+#[gpui::test]
+async fn a_host_that_remembers_its_password_connects_in_one_click(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(cx, Vec::new());
+    fill_new_host(cx);
+    type_into(cx, "hosts.field.secret", "s3cret-pass");
+    click(cx, "hosts.save");
+
+    click(cx, "hosts.connect.0");
+    let (password, busy) = cx.update(|_window, app| {
+        let panel = view
+            .read(app)
+            .remote_state()
+            .expect("the connection form exists");
+        (panel.password().to_owned(), panel.status().is_busy())
+    });
+    assert!(
+        busy,
+        "nothing was left to ask, so the attempt started at once"
+    );
+    assert_eq!(
+        password, "s3cret-pass",
+        "the attempt signs in with the password from the credential store"
+    );
+}
+
+#[gpui::test]
+async fn saving_without_a_password_asks_for_it_when_connecting(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(cx, Vec::new());
+    fill_new_host(cx);
+    click(cx, "hosts.save");
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("a host without a password still saves");
+    assert!(
+        !host.remembers_secret(),
+        "nothing typed, nothing remembered"
+    );
+
+    click(cx, "hosts.connect.0");
+    let busy = cx.update(|_window, app| {
+        view.read(app)
+            .remote_state()
+            .is_some_and(|panel| panel.status().is_busy())
+    });
+    assert!(!busy, "the form waits for the password instead of dialling");
+}
+
+#[gpui::test]
+async fn unticking_remember_or_deleting_the_host_forgets_the_secret(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(cx, Vec::new());
+    fill_new_host(cx);
+    type_into(cx, "hosts.field.secret", "first");
+    click(cx, "hosts.save");
+    let id = cx
+        .update(|_window, app| view.read(app).book().hosts().first().map(HostConfig::id))
+        .expect("saved");
+
+    click(cx, "hosts.edit.0");
+    click(cx, "hosts.remember");
+    click(cx, "hosts.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(id)),
+        None,
+        "remembering was turned off, so the secret is gone"
+    );
+
+    click(cx, "hosts.edit.0");
+    click(cx, "hosts.remember");
+    type_into(cx, "hosts.field.secret", "second");
+    click(cx, "hosts.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(id)),
+        Some("second".to_owned())
+    );
+
+    click(cx, "hosts.delete.0");
+    click(cx, "hosts.confirm.delete");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).saved_secret_for_test(id)),
+        None,
+        "a deleted host leaves no secret behind"
+    );
+}
+
+#[gpui::test]
+async fn the_dialog_shows_the_fields_of_the_chosen_sign_in_and_closes_on_escape(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, _dir) = dialog_view(cx, Vec::new());
+    click(cx, "header.primary");
+    click(cx, "hosts.auth.remote.method.agent");
+    let auth = cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .draft()
+            .map(crate::app::hosts::HostDraft::auth)
+    });
+    assert_eq!(auth, Some(shellune_core::AuthMethodKind::Agent));
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "Escape closes the dialog without saving"
+    );
+    assert!(cx.update(|_window, app| view.read(app).book().hosts().is_empty()));
+}
+
+#[gpui::test]
+async fn the_startup_command_is_typed_once_the_connection_is_live(cx: &mut TestAppContext) {
+    let mut host = stored_host("web", "10.0.0.5", 22, "deploy", None);
+    host.set_startup_command(Some("cd /srv && tmux attach"));
+    let (view, cx, _dir) = dialog_view(cx, vec![host]);
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("the remote terminal is open");
+    let sent = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    assert_eq!(sent, b"cd /srv && tmux attach\r".to_vec());
+    assert_eq!(
+        destination_of(&view, cx),
+        Destination::Sessions,
+        "the terminal that was connected is shown at once"
+    );
 }
