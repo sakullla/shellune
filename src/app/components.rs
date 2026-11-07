@@ -10,6 +10,7 @@
 use gpui::prelude::*;
 use gpui::{AnyView, App, Div, SharedString, Window, div, px};
 
+use crate::app::icons::{self, Icon};
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
 
 /// The visual weight of a button.
@@ -35,7 +36,7 @@ pub fn status_dot(tone: Tone, metrics: Metrics) -> Div {
     div()
         .w(metrics.scale(7.0))
         .h(metrics.scale(7.0))
-        .rounded(metrics.scale(4.0))
+        .rounded_full()
         .bg(tone.text())
         .flex_none()
 }
@@ -48,10 +49,11 @@ pub fn chip(label: impl Into<SharedString>, tone: Tone, metrics: Metrics) -> Div
         .items_center()
         .gap(metrics.scale(5.0))
         .h(metrics.scale(20.0))
-        .px(metrics.scale(7.0))
-        .rounded(metrics.scale(10.0))
+        .px(metrics.scale(8.0))
+        .rounded_full()
         .bg(tone.chip_background())
         .text_size(metrics.caption_size())
+        .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(tone.text())
         .child(
             status_dot(tone, metrics)
@@ -61,16 +63,37 @@ pub fn chip(label: impl Into<SharedString>, tone: Tone, metrics: Metrics) -> Div
         .child(label.into())
 }
 
+/// A quiet label for a grouping such as a host's group: no dot, because it is not a
+/// state.
+pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(metrics.scale(20.0))
+        .px(metrics.scale(8.0))
+        .rounded_full()
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER_STRONG))
+        .text_size(metrics.caption_size())
+        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+        .child(label.into())
+}
+
 /// A keycap that names a shortcut.
 pub fn keycap(label: impl Into<SharedString>, metrics: Metrics) -> Div {
     div()
+        .flex()
         .flex_none()
+        .items_center()
+        .h(metrics.scale(18.0))
         .px(metrics.scale(5.0))
-        .py(metrics.scale(1.0))
-        .rounded(px(radius::SMALL))
+        .rounded(px(radius::SMALL - 1.0))
+        .bg(theme::swatch(palette::SURFACE_RAISED))
         .border_1()
-        .border_color(theme::swatch(palette::BORDER))
-        .text_size(metrics.caption_size())
+        .border_b_2()
+        .border_color(theme::swatch(palette::BORDER_STRONG))
+        .text_size(metrics.scale(10.5))
         .text_color(theme::swatch(palette::TEXT_MUTED))
         .child(label.into())
 }
@@ -86,10 +109,11 @@ pub fn badge(count: usize, tone: Tone, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .justify_center()
-        .min_w(metrics.scale(20.0))
+        .min_w(metrics.scale(18.0))
         .h(metrics.scale(18.0))
-        .px(metrics.scale(6.0))
-        .rounded(metrics.scale(9.0))
+        .px(metrics.scale(5.0))
+        .rounded_full()
+        .font_weight(gpui::FontWeight::MEDIUM)
         .bg(theme::swatch(background))
         .text_size(metrics.caption_size())
         .text_color(theme::swatch(text))
@@ -104,7 +128,10 @@ pub fn kind_badge(label: impl Into<SharedString>, remote: bool, metrics: Metrics
         (palette::SURFACE_SELECTED, palette::TEXT_SECONDARY)
     };
     div()
+        .flex()
         .flex_none()
+        .items_center()
+        .h(metrics.scale(16.0))
         .px(metrics.scale(5.0))
         .rounded(metrics.scale(4.0))
         .bg(theme::swatch(background))
@@ -123,7 +150,7 @@ pub fn button(label: impl Into<SharedString>, variant: Variant, metrics: Metrics
         .justify_center()
         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
         .h(metrics.control_height())
-        .px(metrics.scale(spacing::SNUG))
+        .px(metrics.scale(spacing::BASE - 2.0))
         .rounded(px(radius::MEDIUM))
         .border_1()
         .text_size(metrics.label_size())
@@ -131,6 +158,85 @@ pub fn button(label: impl Into<SharedString>, variant: Variant, metrics: Metrics
         .cursor_pointer()
         .child(label.into());
     style_variant(base, variant)
+}
+
+/// A button that leads with an icon.
+///
+/// The icon takes the button's text colour, so every variant and hover state works
+/// unchanged.
+pub fn icon_label_button(
+    icon: Icon,
+    label: impl Into<SharedString>,
+    variant: Variant,
+    metrics: Metrics,
+) -> Div {
+    let color = variant_text(variant);
+    let hover_text = theme::swatch(palette::TEXT_PRIMARY);
+    let drawing = icons::icon(icon, metrics.small_icon_size(), color);
+    let drawing = if variant == Variant::Ghost {
+        drawing.group_hover(ICON_GROUP, move |style| style.text_color(hover_text))
+    } else {
+        drawing
+    };
+    let base = div()
+        .group(ICON_GROUP)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+        .h(metrics.control_height())
+        .pl(metrics.scale(spacing::SNUG - 1.0))
+        .pr(metrics.scale(spacing::BASE - 2.0))
+        .rounded(px(radius::MEDIUM))
+        .border_1()
+        .text_size(metrics.label_size())
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .cursor_pointer()
+        .child(drawing)
+        .child(label.into());
+    style_variant(base, variant)
+}
+
+/// A square button holding one icon, quiet until pointed at.
+pub fn icon_only_button(icon: Icon, metrics: Metrics) -> Div {
+    let size = metrics.compact_control_height();
+    let hover = theme::swatch(palette::SURFACE_HOVER);
+    let hover_text = theme::swatch(palette::TEXT_PRIMARY);
+    div()
+        .group(ICON_GROUP)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(size)
+        .h(size)
+        .rounded(px(radius::SMALL))
+        .text_color(theme::swatch(palette::TEXT_MUTED))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover).text_color(hover_text))
+        .child(
+            icons::icon(
+                icon,
+                metrics.small_icon_size(),
+                theme::swatch(palette::TEXT_MUTED),
+            )
+            .group_hover(ICON_GROUP, move |style| style.text_color(hover_text)),
+        )
+}
+
+/// The hover group an icon button's drawing follows.
+pub const ICON_GROUP: &str = "icon-button";
+
+/// The text colour a variant draws its label in, for icons that sit beside it.
+fn variant_text(variant: Variant) -> gpui::Rgba {
+    match variant {
+        Variant::Primary => theme::swatch(palette::ON_ACCENT),
+        Variant::Soft => theme::swatch(palette::ACCENT_ON_TINT),
+        Variant::Secondary => theme::swatch(palette::TEXT_PRIMARY),
+        Variant::Ghost => theme::swatch(palette::TEXT_SECONDARY),
+        Variant::Danger => Tone::Danger.text(),
+    }
 }
 
 /// A compact button for toolbars, sized to sit inside a 36px bar.
@@ -167,16 +273,17 @@ fn style_variant(base: Div, variant: Variant) -> Div {
         Variant::Primary => {
             let hover = theme::swatch(palette::ACCENT_HOVER);
             base.bg(theme::swatch(palette::ACCENT))
-                .border_color(theme::swatch(palette::ACCENT))
+                .border_color(theme::swatch(palette::ACCENT_HOVER))
                 .text_color(theme::swatch(palette::ON_ACCENT))
-                .hover(move |style| style.bg(hover).border_color(hover))
+                .shadow_sm()
+                .hover(move |style| style.bg(hover))
         }
         Variant::Soft => {
             let hover = theme::swatch(palette::ACCENT);
             base.bg(theme::swatch(palette::ACCENT_TINT))
                 .border_color(theme::swatch(palette::ACCENT_TINT))
                 .text_color(theme::swatch(palette::ACCENT_ON_TINT))
-                .hover(move |style| style.border_color(hover))
+                .hover(move |style| style.border_color(theme::faded(hover, 0.6)))
         }
         Variant::Secondary => {
             let hover = theme::swatch(palette::SURFACE_HOVER);
@@ -203,18 +310,6 @@ fn style_variant(base: Div, variant: Variant) -> Div {
     }
 }
 
-/// The header's main button.
-///
-/// An unavailable action is drawn as a quiet outline with muted text instead of an
-/// accent fill, so the shell never looks as if it can do something it cannot.
-pub fn action_button(label: impl Into<SharedString>, available: bool, metrics: Metrics) -> Div {
-    if available {
-        button(label, Variant::Primary, metrics)
-    } else {
-        button(label, Variant::Secondary, metrics).text_color(theme::swatch(palette::TEXT_MUTED))
-    }
-}
-
 /// One option of a segmented choice: a shell, a view or a sign-in method.
 pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics) -> Div {
     let base = div()
@@ -231,6 +326,7 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
         base.bg(theme::swatch(palette::SURFACE_SELECTED))
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .font_weight(gpui::FontWeight::MEDIUM)
+            .shadow_sm()
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
     } else {
@@ -250,9 +346,9 @@ pub fn segmented(metrics: Metrics) -> Div {
         .flex_wrap()
         .items_center()
         .gap(metrics.scale(2.0))
-        .p(metrics.scale(2.0))
-        .rounded(px(radius::MEDIUM))
-        .bg(theme::swatch(palette::SURFACE))
+        .p(metrics.scale(3.0))
+        .rounded(px(radius::MEDIUM + 1.0))
+        .bg(theme::swatch(palette::CANVAS))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
 }
@@ -263,12 +359,13 @@ pub fn card(metrics: Metrics) -> Div {
         .flex()
         .flex_col()
         .w_full()
-        .gap(metrics.scale(spacing::SNUG))
-        .p(metrics.scale(spacing::BASE + 2.0))
+        .gap(metrics.scale(spacing::SNUG + 2.0))
+        .p(metrics.scale(spacing::LOOSE - 4.0))
         .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::SURFACE_RAISED))
+        .bg(theme::swatch(palette::SURFACE))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
+        .shadow_sm()
 }
 
 /// A card's title, with an optional line under it.
@@ -302,7 +399,7 @@ pub fn section_label(label: impl Into<SharedString>, metrics: Metrics) -> Div {
     div()
         .flex_none()
         .text_size(metrics.caption_size())
-        .font_weight(gpui::FontWeight::MEDIUM)
+        .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme::swatch(palette::TEXT_MUTED))
         .child(label.into())
 }
@@ -318,13 +415,14 @@ pub fn banner(tone: Tone, metrics: Metrics) -> Div {
         .flex_none()
         .w_full()
         .gap(metrics.scale(spacing::HAIRLINE))
-        .pl(metrics.scale(spacing::SNUG))
+        .pl(metrics.scale(spacing::SNUG + 2.0))
         .pr(metrics.scale(spacing::TIGHT))
-        .py(metrics.scale(spacing::TIGHT))
+        .py(metrics.scale(spacing::TIGHT + 2.0))
         .rounded(px(radius::MEDIUM))
         .bg(tone.chip_background())
+        .border_1()
         .border_l(metrics.scale(3.0))
-        .border_color(tone.text())
+        .border_color(theme::faded(tone.text(), 0.35))
         .text_size(metrics.label_size())
 }
 
@@ -338,7 +436,7 @@ pub fn field_row(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .child(
             div()
                 .flex_none()
-                .w(metrics.scale(96.0))
+                .w(metrics.scale(104.0))
                 .text_size(metrics.label_size())
                 .text_color(theme::swatch(palette::TEXT_MUTED))
                 .child(label.into()),
@@ -357,34 +455,63 @@ pub fn state_card(
     next_step: Option<SharedString>,
     metrics: Metrics,
 ) -> Div {
+    let emblem_icon = match tone {
+        Tone::Danger => None,
+        Tone::Warning => None,
+        _ => Some(Icon::Layers),
+    };
+    state_card_with_icon(tone, emblem_icon, title, body, next_step, metrics)
+}
+
+/// [`state_card`] with a chosen emblem: the destination's own icon reads better than
+/// a dot when a page is simply empty.
+pub fn state_card_with_icon(
+    tone: Tone,
+    emblem_icon: Option<Icon>,
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    next_step: Option<SharedString>,
+    metrics: Metrics,
+) -> Div {
+    let (emblem_bg, emblem_fg) = match tone {
+        Tone::Neutral | Tone::Planned => (
+            theme::swatch(palette::SURFACE_SELECTED),
+            theme::swatch(palette::TEXT_SECONDARY),
+        ),
+        tone => (tone.chip_background(), tone.text()),
+    };
     let emblem = div()
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
-        .w(metrics.scale(36.0))
-        .h(metrics.scale(36.0))
-        .rounded(px(radius::LARGE))
-        .bg(tone.chip_background())
+        .w(metrics.scale(48.0))
+        .h(metrics.scale(48.0))
+        .rounded(px(radius::XLARGE - 2.0))
+        .bg(emblem_bg)
         .border_1()
-        .border_color(theme::swatch(palette::BORDER))
-        .child(
-            status_dot(tone, metrics)
+        .border_color(theme::swatch(palette::BORDER_STRONG))
+        .child(match emblem_icon {
+            Some(icon) => icons::icon(icon, metrics.scale(22.0), emblem_fg).into_any_element(),
+            None => status_dot(tone, metrics)
                 .w(metrics.scale(10.0))
-                .h(metrics.scale(10.0)),
-        );
+                .h(metrics.scale(10.0))
+                .into_any_element(),
+        });
 
     let mut text = div()
         .flex()
         .flex_col()
-        .flex_1()
+        .items_center()
         .min_w(px(0.0))
+        .max_w(metrics.scale(480.0))
         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
         .child(
             div()
-                .text_size(metrics.title_size())
+                .text_size(metrics.title_size() + px(1.0))
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .font_weight(metrics.title_weight())
+                .text_center()
                 .child(title.into()),
         )
         .child(
@@ -392,6 +519,7 @@ pub fn state_card(
                 .text_size(metrics.body_size())
                 .text_color(theme::swatch(palette::TEXT_SECONDARY))
                 .font_weight(metrics.body_weight())
+                .text_center()
                 .child(body.into()),
         );
     if let Some(step) = next_step {
@@ -399,7 +527,11 @@ pub fn state_card(
             div()
                 .mt(metrics.scale(spacing::HAIRLINE))
                 .text_size(metrics.label_size())
-                .text_color(tone.text())
+                .text_color(match tone {
+                    Tone::Neutral | Tone::Planned => theme::swatch(palette::TEXT_MUTED),
+                    tone => tone.text(),
+                })
+                .text_center()
                 .child(step),
         );
     }
@@ -407,12 +539,14 @@ pub fn state_card(
     div()
         .debug_selector(|| "state.card".to_owned())
         .flex()
-        .items_start()
+        .flex_col()
+        .items_center()
         .gap(metrics.scale(spacing::BASE))
         .w_full()
-        .p(metrics.scale(spacing::LOOSE))
-        .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::SURFACE_RAISED))
+        .px(metrics.scale(spacing::LOOSE))
+        .py(metrics.scale(spacing::LOOSE + 16.0))
+        .rounded(px(radius::XLARGE))
+        .bg(theme::swatch(palette::SURFACE))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
         .child(emblem)
@@ -430,11 +564,11 @@ pub fn row(metrics: Metrics) -> Div {
         .justify_between()
         .gap(metrics.scale(spacing::SNUG))
         .w_full()
-        .min_h(metrics.list_row_height())
+        .min_h(metrics.list_row_height() + metrics.scale(4.0))
         .px(metrics.scale(spacing::BASE - 2.0))
-        .py(metrics.scale(spacing::TIGHT))
-        .rounded(px(radius::MEDIUM))
-        .bg(theme::swatch(palette::SURFACE_RAISED))
+        .py(metrics.scale(spacing::TIGHT + 2.0))
+        .rounded(px(radius::LARGE - 2.0))
+        .bg(theme::swatch(palette::SURFACE))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
         .hover(move |style| style.bg(hover).border_color(hover_border))
@@ -486,13 +620,13 @@ impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let metrics = Metrics::default();
         div()
-            .px(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::SMALL))
+            .px(metrics.scale(spacing::TIGHT + 1.0))
+            .py(metrics.scale(spacing::HAIRLINE + 1.0))
+            .rounded(px(radius::SMALL + 1.0))
             .bg(theme::swatch(palette::SURFACE_SELECTED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_md()
+            .shadow_lg()
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .child(self.text.clone())

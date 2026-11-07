@@ -25,7 +25,7 @@ use shellune_storage::{HostBook, HostEdit, HostKey, HostStore, TrustStore};
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage};
-use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
+use crate::app::copy::{CHINESE, ENGLISH, Locale, Strings};
 use crate::app::hosts::HostView;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
@@ -202,7 +202,8 @@ async fn the_minimum_window_still_shows_the_navigation_and_the_current_object(
         assert_fits_inside(bounds, viewport, destination.debug_selector());
     }
     assert_fits_inside(bounds_of(cx, "content"), viewport, "content panel");
-    assert_fits_inside(bounds_of(cx, "state.card"), viewport, "state card");
+    // The first page is the welcome: the shells it offers are the current object.
+    assert_fits_inside(bounds_of(cx, "shell.picker"), viewport, "shell picker");
 }
 
 #[gpui::test]
@@ -639,14 +640,17 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             primary_sessions,
             primary_transfers,
             unavailable_notice,
-            hint_nav_action,
+            nav_hint_short,
+            shell_default,
+            shell_custom_hint,
+            welcome_hosts,
             zoom_control,
             language_control,
             count_hosts,
             count_sessions,
             count_transfers,
             local_shell_fallback,
-            nothing_running,
+            idle,
             shell_custom_button,
             shell_custom_placeholder,
             shell_none_found,
@@ -809,9 +813,10 @@ fn shortcuts_follow_each_platform_convention() {
 #[test]
 fn the_navigation_hint_names_the_keys_the_keymap_binds() {
     for platform in [Platform::Windows, Platform::MacOs, Platform::Linux] {
-        let hint = copy::nav_hint(&ENGLISH, platform);
-        // The hint joins the labels the rail actually shows for the first and last
-        // entries, so it cannot name a key this platform does not bind.
+        let hint = format!("{} {}", platform.shortcut_range(), ENGLISH.nav_hint_short);
+        // The welcome page shows this range beside its label; it joins the shortcut
+        // labels of the first and last entries, so it cannot name a key this platform
+        // does not bind.
         let first = Destination::LocalShells.shortcut_label(platform);
         let last_digit = Destination::Transfers
             .shortcut_label(platform)
@@ -843,8 +848,16 @@ fn the_navigation_hint_names_the_keys_the_keymap_binds() {
 
     // The Chinese table carries the same platform-derived range, not a
     // Windows-only one.
-    let english = copy::nav_hint(&ENGLISH, Platform::MacOs);
-    let chinese = copy::nav_hint(&CHINESE, Platform::MacOs);
+    let english = format!(
+        "{} {}",
+        Platform::MacOs.shortcut_range(),
+        ENGLISH.nav_hint_short
+    );
+    let chinese = format!(
+        "{} {}",
+        Platform::MacOs.shortcut_range(),
+        CHINESE.nav_hint_short
+    );
     let range_of = |hint: &str| hint.split_once(' ').map(|(range, _)| range.to_owned());
     assert_eq!(
         range_of(&chinese),
@@ -942,6 +955,17 @@ fn body_text_reaches_the_contrast_floor_on_every_surface() {
                 "{text_name} on {surface_name} is {ratio:.2}:1, below {BODY_CONTRAST_FLOOR}"
             );
         }
+    }
+}
+
+#[test]
+fn host_avatar_initials_are_readable_on_their_tint() {
+    for (tint, text) in palette::AVATARS {
+        let ratio = theme::contrast::ratio(text, tint);
+        assert!(
+            ratio >= BODY_CONTRAST_FLOOR,
+            "avatar {text:#08x} on {tint:#08x} is {ratio:.2}:1"
+        );
     }
 }
 

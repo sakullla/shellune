@@ -23,50 +23,61 @@ use shellune_core::{SessionFailure, SessionKind, SessionState, TransferDirection
 /// session list readable.
 pub mod palette {
     /// Application background: the content area and the terminal itself.
-    pub const CANVAS: u32 = 0x0c0e13;
+    pub const CANVAS: u32 = 0x0b0c10;
     /// Chrome surface: the navigation rail, the tab strip and the status bar.
-    pub const SURFACE: u32 = 0x111419;
+    pub const SURFACE: u32 = 0x101116;
     /// Raised surface for cards, rows and inputs.
-    pub const SURFACE_RAISED: u32 = 0x171b22;
+    pub const SURFACE_RAISED: u32 = 0x16181e;
     /// Surface under the pointer, one step above [`SURFACE_RAISED`].
-    pub const SURFACE_HOVER: u32 = 0x1c212a;
+    pub const SURFACE_HOVER: u32 = 0x1c1f27;
     /// Surface used for the selected navigation entry, tab or choice.
-    pub const SURFACE_SELECTED: u32 = 0x212734;
+    pub const SURFACE_SELECTED: u32 = 0x23262f;
     /// Hairline border between regions.
-    pub const BORDER: u32 = 0x232934;
+    pub const BORDER: u32 = 0x1f222a;
     /// Border of controls and of an element under the pointer.
-    pub const BORDER_STRONG: u32 = 0x343c4b;
+    pub const BORDER_STRONG: u32 = 0x2e323d;
     /// Primary text: titles and the current object.
-    pub const TEXT_PRIMARY: u32 = 0xedf0f6;
+    pub const TEXT_PRIMARY: u32 = 0xeceef3;
     /// Secondary text: body copy and list metadata.
-    pub const TEXT_SECONDARY: u32 = 0xb6bece;
+    pub const TEXT_SECONDARY: u32 = 0xb3b8c6;
     /// Muted text: hints, counts and the status bar.
-    pub const TEXT_MUTED: u32 = 0x939db0;
+    pub const TEXT_MUTED: u32 = 0x8b92a3;
     /// Accent used for the selected destination and primary actions.
-    pub const ACCENT: u32 = 0x9db4ff;
+    pub const ACCENT: u32 = 0x8fa0ff;
     /// Accent under the pointer, for a solid primary button.
-    pub const ACCENT_HOVER: u32 = 0xb7c8ff;
+    pub const ACCENT_HOVER: u32 = 0xa9b6ff;
     /// Text drawn on a solid [`ACCENT`] fill.
-    pub const ON_ACCENT: u32 = 0x0b1022;
+    pub const ON_ACCENT: u32 = 0x0a0d22;
     /// Accent tint for filled accent surfaces.
-    pub const ACCENT_TINT: u32 = 0x222b45;
+    pub const ACCENT_TINT: u32 = 0x1e2340;
     /// Text and icons drawn on [`ACCENT_TINT`].
-    pub const ACCENT_ON_TINT: u32 = 0xc8d5ff;
+    pub const ACCENT_ON_TINT: u32 = 0xc9d0ff;
     /// Dark tint behind a positive chip or banner.
-    pub const POSITIVE_TINT: u32 = 0x14271f;
+    pub const POSITIVE_TINT: u32 = 0x12241d;
     /// Dark tint behind a warning chip or banner.
-    pub const WARNING_TINT: u32 = 0x2a2315;
+    pub const WARNING_TINT: u32 = 0x282114;
     /// Dark tint behind a danger chip, banner or destructive button.
-    pub const DANGER_TINT: u32 = 0x2d1a1f;
+    pub const DANGER_TINT: u32 = 0x2b181d;
     /// Live and completed status.
-    pub const POSITIVE: u32 = 0x64d8a8;
+    pub const POSITIVE: u32 = 0x5fd4a0;
     /// Waiting, verifying or in-progress status.
-    pub const WARNING: u32 = 0xf3c66c;
+    pub const WARNING: u32 = 0xf0c36d;
     /// Failed, rejected or unavailable status.
-    pub const DANGER: u32 = 0xff8d99;
+    pub const DANGER: u32 = 0xff8c97;
     /// Planned-but-not-shipped status; deliberately desaturated so it never
     /// reads as an error or as success.
-    pub const PLANNED: u32 = 0x9aa6bd;
+    pub const PLANNED: u32 = 0xa2a9ba;
+    /// Host avatar pairs (tint, text): iris, violet, teal, amber, rose, sky.
+    pub const AVATARS: [(u32, u32); 6] = [
+        (0x1e2340, 0xc9d0ff),
+        (0x2a1f40, 0xd9c6ff),
+        (0x13292a, 0x8fe3d6),
+        (0x2b2416, 0xf2d08f),
+        (0x2e1a26, 0xffb8d2),
+        (0x162536, 0x9fd3ff),
+    ];
+    /// Second stop of the brand gradient, a violet beside the accent.
+    pub const BRAND_END: u32 = 0xb48cff;
 }
 
 /// Spacing scale in logical pixels before zoom is applied.
@@ -91,6 +102,8 @@ pub mod radius {
     pub const MEDIUM: f32 = 8.0;
     /// Cards, menus and the terminal frame.
     pub const LARGE: f32 = 12.0;
+    /// Hero tiles and the welcome emblem.
+    pub const XLARGE: f32 = 16.0;
 }
 
 /// Type scale in logical pixels.
@@ -104,14 +117,21 @@ pub mod type_scale {
     /// Panel title.
     pub const TITLE: f32 = 15.0;
     /// Destination title in the header.
-    pub const HEADING: f32 = 18.0;
+    pub const HEADING: f32 = 17.0;
     /// Product name mark.
     pub const DISPLAY: f32 = 15.0;
+    /// The welcome title on an empty page.
+    pub const HERO: f32 = 24.0;
 }
 
 /// Colour helper so views do not call `rgb` with literals.
 pub fn swatch(hex: u32) -> Rgba {
     rgb(hex)
+}
+
+/// A colour at a reduced opacity, for borders and hairlines that should recede.
+pub fn faded(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: alpha, ..color }
 }
 
 /// A fully transparent colour, for a border or fill that only appears in some states.
@@ -293,12 +313,12 @@ impl Metrics {
 
     /// Width of the navigation rail.
     pub fn rail_width(self) -> Pixels {
-        self.scale(212.0)
+        self.scale(208.0)
     }
 
     /// Height of the header that names the current object.
     pub fn header_height(self) -> Pixels {
-        self.scale(56.0)
+        self.scale(52.0)
     }
 
     /// Height of one navigation entry.
@@ -311,14 +331,24 @@ impl Metrics {
         self.scale(52.0)
     }
 
-    /// Height of the status bar.
-    pub fn status_bar_height(self) -> Pixels {
-        self.scale(28.0)
+    /// Height of the session bar above a terminal.
+    pub fn session_bar_height(self) -> Pixels {
+        self.scale(36.0)
+    }
+
+    /// Edge length of a navigation or inline icon.
+    pub fn icon_size(self) -> Pixels {
+        self.scale(16.0)
+    }
+
+    /// Edge length of a small icon inside a compact control.
+    pub fn small_icon_size(self) -> Pixels {
+        self.scale(14.0)
     }
 
     /// Height of a standard button, input or segmented control.
     pub fn control_height(self) -> Pixels {
-        self.scale(30.0)
+        self.scale(32.0)
     }
 
     /// Height of a compact control inside a toolbar.
@@ -328,7 +358,7 @@ impl Metrics {
 
     /// Height of one session tab.
     pub fn tab_height(self) -> Pixels {
-        self.scale(30.0)
+        self.scale(32.0)
     }
 
     /// Widest a reading column of cards and rows grows to.
@@ -336,7 +366,7 @@ impl Metrics {
     /// Lists and forms stop widening here so a maximised window does not stretch a
     /// host row across a whole monitor; the terminal ignores it and fills the panel.
     pub fn content_max_width(self) -> Pixels {
-        self.scale(960.0)
+        self.scale(880.0)
     }
 
     /// Gap between panels.
@@ -367,6 +397,11 @@ impl Metrics {
     /// Destination heading size.
     pub fn heading_size(self) -> Pixels {
         self.scale(type_scale::HEADING)
+    }
+
+    /// Welcome title size.
+    pub fn hero_size(self) -> Pixels {
+        self.scale(type_scale::HERO)
     }
 
     /// Product name size.

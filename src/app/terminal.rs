@@ -38,7 +38,8 @@ use shellune_terminal::{
 
 use crate::app::components;
 use crate::app::copy::Locale;
-use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, spacing};
+use crate::app::icons::Icon;
+use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, spacing};
 
 /// How often the pane looks for output from the shell.
 ///
@@ -48,13 +49,13 @@ use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, s
 pub const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(12);
 
 /// Height of the status line under the grid.
-pub const SHELL_BAR_HEIGHT: f32 = 30.0;
+pub const SHELL_BAR_HEIGHT: f32 = 28.0;
 
 /// Width of the caret in logical pixels.
 const CARET_WIDTH: f32 = 2.0;
 
 /// Background of a selected cell.
-const SELECTION_BACKGROUND: u32 = 0x2a33_50ff;
+const SELECTION_BACKGROUND: u32 = 0x2c33_5cff;
 
 /// Font family the grid is laid out in.
 ///
@@ -896,6 +897,7 @@ impl TerminalPane {
                 None => Tone::Neutral,
             }
         };
+        let muted = theme::swatch(shell_palette::TEXT_MUTED);
         div()
             .id("terminal.bar")
             .debug_selector(|| "terminal.bar".to_owned())
@@ -905,11 +907,13 @@ impl TerminalPane {
             .gap(metrics.scale(spacing::TIGHT))
             .h(px(SHELL_BAR_HEIGHT))
             .flex_none()
-            .px(metrics.scale(spacing::SNUG))
+            .pl(metrics.scale(spacing::BASE - 2.0))
+            .pr(metrics.scale(spacing::HAIRLINE))
             .bg(theme::swatch(shell_palette::SURFACE))
             .border_t_1()
             .border_color(theme::swatch(shell_palette::BORDER))
-            .rounded_b(px(radius::LARGE))
+            .text_size(metrics.caption_size())
+            .text_color(muted)
             .child(
                 div()
                     .flex()
@@ -920,21 +924,22 @@ impl TerminalPane {
                         div()
                             .flex_none()
                             .font_family(monospace_family())
-                            .text_size(metrics.caption_size())
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme::swatch(shell_palette::ACCENT))
-                            .child(">_"),
+                            .debug_selector(|| "terminal.grid.size".to_owned())
+                            .child(SharedString::from(format!(
+                                "{}\u{00D7}{}",
+                                self.grid.cols, self.grid.rows
+                            ))),
                     )
-                    .child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
-                            .truncate()
-                            .debug_selector(|| "terminal.shell".to_owned())
-                            .child(SharedString::from(self.origin.label().to_owned())),
-                    )
+                    // The program is named on the session bar and the tab; down here it
+                    // is only repeated once it stopped, beside how it stopped.
                     .when(!live, |row| {
-                        row.child(components::chip(
+                        row.child(
+                            div()
+                                .truncate()
+                                .debug_selector(|| "terminal.shell".to_owned())
+                                .child(SharedString::from(self.origin.label().to_owned())),
+                        )
+                        .child(components::chip(
                             self.state.label(self.locale),
                             tone,
                             metrics,
@@ -946,36 +951,17 @@ impl TerminalPane {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(metrics.scale(2.0))
+                    .gap(metrics.scale(1.0))
                     .child(
-                        components::icon_button("A\u{2212}", metrics)
+                        components::icon_only_button(Icon::Copy, metrics)
                             .h(metrics.scale(22.0))
-                            .min_w(metrics.scale(26.0))
-                            .id("terminal.font.decrease")
-                            .debug_selector(|| "terminal.font.decrease".to_owned())
-                            .tooltip(components::tooltip(strings.terminal_smaller))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.step_font_size(false, cx);
-                            })),
-                    )
-                    .child(
-                        components::icon_button("A+", metrics)
-                            .h(metrics.scale(22.0))
-                            .min_w(metrics.scale(26.0))
-                            .id("terminal.font.increase")
-                            .debug_selector(|| "terminal.font.increase".to_owned())
-                            .tooltip(components::tooltip(strings.terminal_larger))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.step_font_size(true, cx);
-                            })),
-                    )
-                    .child(
-                        components::icon_button(strings.terminal_copy, metrics)
-                            .h(metrics.scale(22.0))
-                            .px(metrics.scale(spacing::TIGHT))
+                            .w(metrics.scale(24.0))
                             .id("terminal.copy")
                             .debug_selector(|| "terminal.copy".to_owned())
-                            .tooltip(components::tooltip("Ctrl+Shift+C"))
+                            .tooltip(components::tooltip(SharedString::from(format!(
+                                "{} (Ctrl+Shift+C)",
+                                strings.terminal_copy
+                            ))))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.copy_selection(cx);
                             })),
@@ -986,15 +972,33 @@ impl TerminalPane {
                             .mx(metrics.scale(spacing::HAIRLINE)),
                     )
                     .child(
+                        components::icon_button("A\u{2212}", metrics)
+                            .h(metrics.scale(22.0))
+                            .min_w(metrics.scale(24.0))
+                            .id("terminal.font.decrease")
+                            .debug_selector(|| "terminal.font.decrease".to_owned())
+                            .tooltip(components::tooltip(strings.terminal_smaller))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.step_font_size(false, cx);
+                            })),
+                    )
+                    .child(
                         div()
+                            .min_w(metrics.scale(34.0))
+                            .text_center()
                             .font_family(monospace_family())
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(shell_palette::TEXT_MUTED))
-                            .debug_selector(|| "terminal.grid.size".to_owned())
-                            .child(SharedString::from(format!(
-                                "{}\u{00D7}{} \u{00B7} {}px",
-                                self.grid.cols, self.grid.rows, self.font_size
-                            ))),
+                            .child(SharedString::from(format!("{}px", self.font_size))),
+                    )
+                    .child(
+                        components::icon_button("A+", metrics)
+                            .h(metrics.scale(22.0))
+                            .min_w(metrics.scale(24.0))
+                            .id("terminal.font.increase")
+                            .debug_selector(|| "terminal.font.increase".to_owned())
+                            .tooltip(components::tooltip(strings.terminal_larger))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.step_font_size(true, cx);
+                            })),
                     ),
             )
     }

@@ -12,8 +12,6 @@
 
 use shellune_core::{SessionState, TransferState};
 
-use crate::app::nav::Platform;
-
 /// UI language.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Locale {
@@ -131,11 +129,6 @@ pub struct Strings {
     pub primary_transfers: &'static str,
     /// Feedback after an unavailable action was requested.
     pub unavailable_notice: &'static str,
-    /// What the section shortcuts do, shown after the platform's key range.
-    ///
-    /// The key range itself is not stored here: it depends on the platform and is
-    /// built by [`nav_hint`] from [`crate::app::nav::Platform`].
-    pub hint_nav_action: &'static str,
     /// Label of the zoom control.
     pub zoom_control: &'static str,
     /// Label of the language toggle.
@@ -148,8 +141,6 @@ pub struct Strings {
     pub count_transfers: &'static str,
     /// Fallback name for a local session without a chosen shell.
     pub local_shell_fallback: &'static str,
-    /// Hint shown when nothing is running at all.
-    pub nothing_running: &'static str,
     /// Button that reveals the free-text shell path field.
     pub shell_custom_button: &'static str,
     /// Placeholder in the free-text shell path field.
@@ -174,6 +165,16 @@ pub struct Strings {
     pub shell_launch_title: &'static str,
     /// Tooltip of the control that opens the shell menu.
     pub shell_menu_hint: &'static str,
+    /// The mark on the launcher tile the main button opens.
+    pub shell_default: &'static str,
+    /// The second line of the custom-path launcher tile.
+    pub shell_custom_hint: &'static str,
+    /// The welcome page's link to the hosts destination.
+    pub welcome_hosts: &'static str,
+    /// The short label beside the section-switching shortcut.
+    pub nav_hint_short: &'static str,
+    /// The sidebar's activity line when nothing is open.
+    pub idle: &'static str,
     /// Primary action on the transfers page when no connection can browse files yet.
     pub primary_transfers_connect: &'static str,
     /// Placeholder in the host search field.
@@ -515,14 +516,12 @@ pub static ENGLISH: Strings = Strings {
     primary_sessions: "New local shell",
     primary_transfers: "Browse files",
     unavailable_notice: "This action is not available in this build, so nothing was started.",
-    hint_nav_action: "switches sections",
     zoom_control: "Text size",
     language_control: "Language",
     count_hosts: "host",
     count_sessions: "session",
     count_transfers: "transfer",
     local_shell_fallback: "System shell",
-    nothing_running: "Nothing is running yet.",
     shell_custom_button: "Custom path",
     shell_custom_placeholder: "Program name or full path, then Enter",
     shell_none_found: "No shell was found on this machine. Enter a program path to start one.",
@@ -535,6 +534,11 @@ pub static ENGLISH: Strings = Strings {
     terminal_larger: "Larger text",
     shell_launch_title: "Start a shell",
     shell_menu_hint: "Choose which shell to open",
+    shell_default: "Default",
+    shell_custom_hint: "Any program on this machine",
+    welcome_hosts: "Connect to a server",
+    nav_hint_short: "Switch sections",
+    idle: "Idle",
     primary_transfers_connect: "Connect to a host",
     hosts_search_placeholder: "Search name, address, user or group",
     hosts_view_all: "All hosts",
@@ -724,14 +728,12 @@ pub static CHINESE: Strings = Strings {
     primary_sessions: "新建本地终端",
     primary_transfers: "浏览远程文件",
     unavailable_notice: "当前版本没有实现这个操作，因此没有启动任何任务。",
-    hint_nav_action: "切换分区",
     zoom_control: "文字大小",
     language_control: "语言",
     count_hosts: "台主机",
     count_sessions: "个会话",
     count_transfers: "个传输",
     local_shell_fallback: "系统 Shell",
-    nothing_running: "暂无正在运行的任务。",
     shell_custom_button: "自定义路径",
     shell_custom_placeholder: "输入程序名或完整路径后按回车",
     shell_none_found: "本机没有找到可用的 Shell。请输入程序路径来启动一个。",
@@ -744,6 +746,11 @@ pub static CHINESE: Strings = Strings {
     terminal_larger: "放大字号",
     shell_launch_title: "启动一个 Shell",
     shell_menu_hint: "选择要打开的 Shell",
+    shell_default: "默认",
+    shell_custom_hint: "本机上的任意程序",
+    welcome_hosts: "连接到服务器",
+    nav_hint_short: "切换分区",
+    idle: "空闲",
     primary_transfers_connect: "连接主机",
     hosts_search_placeholder: "搜索名称、地址、用户名或分组",
     hosts_view_all: "全部主机",
@@ -896,15 +903,6 @@ pub static CHINESE: Strings = Strings {
     transfers_close_cancel: "保持会话打开",
     transfers_close_confirm: "关闭并取消",
 };
-
-/// Hint for the section shortcuts, built for one platform.
-///
-/// The key range comes from [`Platform::shortcut_range`], which derives it from the
-/// same modifier and digits the keymap binds, so a macOS build reads "⌘1-4"
-/// instead of a hard-coded "Ctrl+1-4".
-pub fn nav_hint(strings: &Strings, platform: Platform) -> String {
-    format!("{} {}", platform.shortcut_range(), strings.hint_nav_action)
-}
 
 /// A count followed by its unit, in the grammar of the language.
 ///
