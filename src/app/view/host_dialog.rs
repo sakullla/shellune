@@ -8,7 +8,7 @@
 
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, Point, SharedString, Stateful, Window, div, px};
-use shellune_core::AuthMethodKind;
+use shellune_core::{AuthMethodKind, HostId};
 
 use super::{HostFields, ShelluneView};
 use crate::app::components::{self, Variant};
@@ -77,6 +77,145 @@ impl ShelluneView {
             draft.set_remember(remember);
             cx.notify();
         }
+    }
+
+    fn add_host_jump(&mut self, id: HostId, cx: &mut Context<Self>) {
+        if let Some(draft) = self.hosts.draft_mut() {
+            draft.add_jump(id);
+        }
+        cx.notify();
+    }
+
+    fn remove_host_jump(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(draft) = self.hosts.draft_mut() {
+            draft.remove_jump(index);
+        }
+        cx.notify();
+    }
+
+    fn move_host_jump(&mut self, index: usize, up: bool, cx: &mut Context<Self>) {
+        if let Some(draft) = self.hosts.draft_mut() {
+            draft.move_jump(index, up);
+        }
+        cx.notify();
+    }
+
+    /// The ordered jump list and the ProxyCommand. Neither is executed from here.
+    fn jump_section(&self, fields: &HostFields, draft: &HostDraft, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let mut heading = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.host_jump_title),
+            );
+        if draft.jumps().is_empty() {
+            heading = heading.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.host_jump_empty),
+            );
+        }
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "hosts.jump".to_owned())
+            .child(heading);
+        for (index, id) in draft.jumps().iter().copied().enumerate() {
+            let name = self
+                .book
+                .host(id)
+                .map(|host| host.name().to_owned())
+                .unwrap_or_else(|| id.to_string());
+            column = column.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .debug_selector({
+                        let selector = format!("hosts.jump.{index}");
+                        move || selector
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(name)),
+                    )
+                    .child(self.text_button(
+                        SharedString::from(format!("hosts.jump.up.{index}")),
+                        strings.host_jump_up,
+                        Variant::Ghost,
+                        cx,
+                        move |view, cx| view.move_host_jump(index, true, cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("hosts.jump.down.{index}")),
+                        strings.host_jump_down,
+                        Variant::Ghost,
+                        cx,
+                        move |view, cx| view.move_host_jump(index, false, cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("hosts.jump.remove.{index}")),
+                        strings.host_jump_remove,
+                        Variant::Danger,
+                        cx,
+                        move |view, cx| view.remove_host_jump(index, cx),
+                    )),
+            );
+        }
+        let editing = draft.editing();
+        let present = draft.jumps().to_vec();
+        let additions: Vec<(HostId, String)> = self
+            .book
+            .hosts()
+            .iter()
+            .filter(|host| editing != Some(host.id()) && !present.contains(&host.id()))
+            .map(|host| (host.id(), host.name().to_owned()))
+            .collect();
+        for (index, (id, name)) in additions.into_iter().enumerate() {
+            column = column.child(self.text_button(
+                SharedString::from(format!("hosts.jump.add.{index}")),
+                format!("{} {name}", strings.host_jump_add),
+                Variant::Secondary,
+                cx,
+                move |view, cx| view.add_host_jump(id, cx),
+            ));
+        }
+        column = column
+            .child(self.dialog_field(fields, HostField::ProxyCommand, None, 1.0))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.host_proxy_note),
+            );
+        if draft.proxy_conflicts() {
+            column = column.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Warning.text())
+                    .debug_selector(|| "hosts.proxy.conflict".to_owned())
+                    .child(strings.host_proxy_conflict),
+            );
+        }
+        column
     }
 
     /// Saves the host and, when it was saved, connects to it at once.
@@ -266,6 +405,8 @@ impl ShelluneView {
             .child(self.dialog_field(fields, HostField::User, None, 1.0))
             .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
             .child(self.sign_in_fields(fields, &draft, cx))
+            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
+            .child(self.jump_section(fields, &draft, cx))
             .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
             .child(section(strings.host_startup_label))
             .child(

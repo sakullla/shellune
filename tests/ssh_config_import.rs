@@ -402,3 +402,116 @@ fn importing_the_same_file_twice_does_not_duplicate_the_saved_hosts() {
     plan.apply(&mut unchanged).expect("an empty plan applies");
     assert_eq!(unchanged.hosts().len(), 2);
 }
+
+#[test]
+fn a_complete_jump_proxy_command_and_forwards_are_saved_without_touching_the_source() {
+    let dir = TempDir::new("chain-forward");
+    let config = dir.write_config(
+        "\
+Host bastion
+    HostName bastion.example.org
+    User jump
+
+Host web
+    HostName web.example.org
+    User deploy
+    ProxyJump bastion
+
+Host files
+    HostName files.example.org
+    User deploy
+    ProxyCommand ssh -W %h:%p bastion
+    LocalForward 8080 localhost:80
+    RemoteForward 9090 db.internal:5432
+    DynamicForward 1080
+",
+    );
+    let before = std::fs::read(&config).expect("the configuration is readable");
+    let preview = ImportPreview::from_file(&config).expect("the configuration parses");
+    let web = preview
+        .hosts()
+        .iter()
+        .find(|host| host.alias() == "web")
+        .expect("web is in the preview");
+    assert!(web.is_importable(), "a complete ProxyJump is offered");
+    assert_eq!(web.jumps()[0].alias(), Some("bastion"));
+    let files = preview
+        .hosts()
+        .iter()
+        .find(|host| host.alias() == "files")
+        .expect("files is in the preview");
+    assert_eq!(files.proxy_command(), Some("ssh -W %h:%p bastion"));
+    assert_eq!(
+        files.forwards().len(),
+        3,
+        "three complete forwards stay visible"
+    );
+
+    let store = dir.store();
+    let mut book = store.load().expect("a first run is not a failure");
+    let plan = preview.plan(&book);
+    assert_eq!(plan.forwards().len(), 3);
+    plan.apply(&mut book).expect("the hosts are added");
+    store.save(&book).expect("the book saves");
+
+    let bastion = book
+        .hosts()
+        .iter()
+        .find(|host| host.name() == "bastion")
+        .expect("the jump host is saved");
+    let web = book
+        .hosts()
+        .iter()
+        .find(|host| host.name() == "web")
+        .expect("the jumped host is saved");
+    assert_eq!(web.jumps(), &[bastion.id()]);
+    assert!(web.proxy_command().is_none());
+    let files_host = book
+        .hosts()
+        .iter()
+        .find(|host| host.name() == "files")
+        .expect("the proxied host is saved");
+    assert_eq!(files_host.proxy_command(), Some("ssh -W %h:%p bastion"));
+
+    let forward_store = shellune_storage::ForwardStore::at(store.root());
+    let mut forwards = forward_store
+        .load()
+        .expect("a missing forward file is empty");
+    for planned in plan.forwards() {
+        let host = book
+            .hosts()
+            .iter()
+            .find(|host| host.name().eq_ignore_ascii_case(planned.alias()))
+            .expect("the forward names a saved host");
+        forwards
+            .insert(planned.forward().rule(host.id()).expect("a complete rule"))
+            .expect("the rule is stored");
+    }
+    forward_store
+        .save(&forwards)
+        .expect("the forwarding file is written");
+    let loaded = shellune_storage::ForwardStore::at(store.root())
+        .load()
+        .expect("the forwarding file loads");
+    assert_eq!(loaded.rules().len(), 3);
+    assert!(loaded.rules().iter().any(|rule| {
+        rule.kind() == shellune_core::ForwardKind::Local && rule.host() == files_host.id()
+    }));
+    assert!(
+        loaded
+            .rules()
+            .iter()
+            .any(|rule| rule.kind() == shellune_core::ForwardKind::Remote)
+    );
+    assert!(
+        loaded
+            .rules()
+            .iter()
+            .any(|rule| rule.kind() == shellune_core::ForwardKind::Dynamic)
+    );
+    assert_eq!(
+        std::fs::read(&config).expect("the configuration is still readable"),
+        before,
+        "planning and saving do not run or rewrite the source"
+    );
+}

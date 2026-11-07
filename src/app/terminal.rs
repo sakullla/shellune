@@ -29,7 +29,7 @@ use gpui::{
 use std::ops::Range;
 
 use shellune_core::{EventTag, LocalShell, SessionFailure};
-use shellune_ssh::{RemoteEvent, RemoteSession};
+use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession};
 use shellune_terminal::{
     CellSize, CursorShape, ExitReport, GridSize, Key, KeyModifiers, LocalSession, PtyEvent, Rgb,
     SelectionType, Snapshot, TerminalCore, TerminalEffects, encode_key, encode_paste, encode_text,
@@ -136,6 +136,8 @@ pub enum PaneSource {
     Local(LocalSession),
     /// A shell on a server, reached over SSH.
     Remote(RemoteSession),
+    /// A shell on the target of a jump chain.
+    Chain(ChainSession),
 }
 
 /// Something a source produced, in the terms the pane thinks in.
@@ -177,16 +179,15 @@ impl PaneSource {
         match self {
             Self::Local(session) => session.write(bytes).map_err(|error| error.to_string()),
             Self::Remote(session) => session.write(bytes),
+            Self::Chain(session) => session.write(bytes),
         }
     }
 
     fn resize(&mut self, grid: GridSize) -> Result<(), String> {
         match self {
             Self::Local(session) => session.resize(grid),
-            Self::Remote(session) => session.resize(shellune_ssh::PtySize::new(
-                u32::try_from(grid.cols).unwrap_or(u32::MAX),
-                u32::try_from(grid.rows).unwrap_or(u32::MAX),
-            )),
+            Self::Remote(session) => session.resize(pty_size(grid)),
+            Self::Chain(session) => session.resize(pty_size(grid)),
         }
     }
 
@@ -201,27 +202,32 @@ impl PaneSource {
                     PtyEvent::ReadFailed(reason) => SourceEvent::Lost(reason),
                 })
                 .collect(),
-            Self::Remote(session) => {
-                let drained = session.drain();
-                drained
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        RemoteEvent::Data(bytes) => Some(SourceEvent::Data(bytes)),
-                        RemoteEvent::Exited { code } => Some(SourceEvent::Exited(match code {
-                            None | Some(0) => ExitReport::Clean,
-                            Some(code) => ExitReport::Code {
-                                code: i32::try_from(code).unwrap_or(i32::MAX),
-                            },
-                        })),
-                        // A prompt or a connection notice belongs to the shell, which
-                        // owns the session until the shell is live; reaching this point
-                        // with one would mean two owners, so it is ignored rather than
-                        // drawn as output.
-                        RemoteEvent::HostKeyPrompt(_) | RemoteEvent::Connected => None,
-                        RemoteEvent::Failed(error) => Some(SourceEvent::Lost(error.to_string())),
-                    })
-                    .collect()
-            }
+            Self::Remote(session) => session
+                .drain()
+                .into_iter()
+                .filter_map(SourceEvent::from_remote)
+                .collect(),
+            Self::Chain(session) => session
+                .drain()
+                .into_iter()
+                .filter_map(|event| match event {
+                    ChainEvent::Data(bytes) => Some(SourceEvent::Data(bytes)),
+                    ChainEvent::Exited { code } => Some(SourceEvent::Exited(match code {
+                        None | Some(0) => ExitReport::Clean,
+                        Some(code) => ExitReport::Code {
+                            code: i32::try_from(code).unwrap_or(i32::MAX),
+                        },
+                    })),
+                    // The chain's own text names the hop. Mapping through
+                    // session_failure would turn a disconnect into "the server".
+                    ChainEvent::Failed(failure) => Some(SourceEvent::Lost(failure.to_string())),
+                    ChainEvent::HopStarted(_)
+                    | ChainEvent::HostKeyPrompt { .. }
+                    | ChainEvent::ProxyConfirmation { .. }
+                    | ChainEvent::HopReady(_)
+                    | ChainEvent::Connected { .. } => None,
+                })
+                .collect(),
         }
     }
 
@@ -229,8 +235,16 @@ impl PaneSource {
         match self {
             Self::Local(session) => session.close(),
             Self::Remote(session) => session.close(),
+            Self::Chain(session) => session.close(),
         }
     }
+}
+
+fn pty_size(grid: GridSize) -> shellune_ssh::PtySize {
+    shellune_ssh::PtySize::new(
+        u32::try_from(grid.cols).unwrap_or(u32::MAX),
+        u32::try_from(grid.rows).unwrap_or(u32::MAX),
+    )
 }
 
 /// What a pane is running, for labels and for the reason a failure names.
@@ -379,6 +393,47 @@ impl TerminalPane {
             tag,
             core,
             source: Some(PaneSource::Remote(session)),
+            origin: PaneOrigin::Remote { target },
+            state: PaneState::Live,
+            #[cfg(test)]
+            sent: Vec::new(),
+            font_size,
+            cell: CellSize::for_font_size(font_size),
+            grid,
+            viewport: None,
+            focus: cx.focus_handle(),
+            dragging: false,
+            press: None,
+            marked: None,
+            last_copy: None,
+            locale,
+            polling: false,
+        };
+        pane.start_polling(cx);
+        pane
+    }
+
+    /// Wraps a live jump chain in a pane.
+    ///
+    /// The target shell is already running. Later output and a later failure use the
+    /// same grid as a direct session; a chain failure keeps the hop in its own text.
+    pub fn start_chain(
+        session: ChainSession,
+        tag: EventTag,
+        target: impl Into<String>,
+        grid: GridSize,
+        font_size: f32,
+        locale: Locale,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let font_size = sanitize_font_size(font_size);
+        let grid = grid.clamped();
+        let target = target.into();
+        let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
+        let mut pane = Self {
+            tag,
+            core,
+            source: Some(PaneSource::Chain(session)),
             origin: PaneOrigin::Remote { target },
             state: PaneState::Live,
             #[cfg(test)]

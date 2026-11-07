@@ -44,8 +44,8 @@ pub use error::{BookError, PersistError, StorageError};
 pub use forwarding::{FILE_NAME as FORWARD_FILE_NAME, ForwardStore};
 pub use ssh_config::{
     DEFAULT_CONFIG_TEXT, ImportError, ImportLimits, ImportNote, ImportOutcome, ImportPlan,
-    ImportPreview, ImportedHost, NoteKind, SkippedHost, default_config_path, home_directory,
-    resolve_path,
+    ImportPreview, ImportedForward, ImportedHost, JumpSpec, NoteKind, PlannedForward, SkippedHost,
+    default_config_path, home_directory, resolve_path,
 };
 pub use store::{FILE_NAME, HostStore};
 pub use trust::{

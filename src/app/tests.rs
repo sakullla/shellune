@@ -798,6 +798,24 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             host_save_connect,
             host_dialog_close,
             remote_saved_secret_failed,
+            host_jump_title,
+            host_jump_empty,
+            host_jump_add,
+            host_jump_up,
+            host_jump_down,
+            host_jump_remove,
+            host_proxy_label,
+            host_proxy_placeholder,
+            host_proxy_note,
+            host_proxy_conflict,
+            remote_asking_hop,
+            remote_proxy_title,
+            remote_proxy_confirm,
+            remote_proxy_refuse,
+            import_proxy_label,
+            import_jump_label,
+            import_forward_label,
+            import_forwards_failed,
             field_cut,
             field_copy,
             field_paste,
@@ -7582,6 +7600,71 @@ async fn saving_a_quick_host_shows_a_write_failure_on_the_session_bar(cx: &mut T
         std::fs::read(&blocked).expect("the blocked path is unchanged"),
         b"not-a-directory"
     );
+}
+
+#[gpui::test]
+async fn the_host_dialog_keeps_a_jump_and_a_proxy_command_on_the_form(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(
+        cx,
+        vec![
+            stored_host("bastion", "10.0.0.1", 22, "jump", None),
+            stored_host("web", "10.0.0.2", 22, "deploy", None),
+        ],
+    );
+    click(cx, "hosts.edit.1");
+    assert!(cx.debug_bounds("hosts.field.proxy").is_some());
+    assert!(cx.debug_bounds("hosts.jump").is_some());
+    click(cx, "hosts.jump.add.0");
+    type_into(cx, "hosts.field.proxy", "nc %h %p");
+    assert!(cx.debug_bounds("hosts.proxy.conflict").is_some());
+    click(cx, "hosts.save");
+    cx.update(|_window, app| {
+        let host = view
+            .read(app)
+            .book()
+            .hosts()
+            .iter()
+            .find(|host| host.name() == "web")
+            .expect("web is saved")
+            .clone();
+        assert_eq!(host.jumps().len(), 1);
+        assert_eq!(host.proxy_command(), Some("nc %h %p"));
+    });
+}
+
+#[gpui::test]
+async fn two_connection_forms_keep_their_own_secrets(cx: &mut TestAppContext) {
+    let (view, cx, _dir) = dialog_view(
+        cx,
+        vec![
+            stored_host("alpha", "10.0.0.5", 22, "deploy", None),
+            stored_host("beta", "10.0.0.6", 22, "deploy", None),
+        ],
+    );
+    click(cx, "hosts.connect.0");
+    type_into(cx, "remote.password", "alpha-secret");
+    click(cx, "hosts.connect.1");
+    type_into(cx, "remote.password", "beta-secret");
+    assert!(cx.debug_bounds("attempt.others").is_some());
+    click(cx, "attempt.row.0");
+    let first = cx.update(|_window, app| {
+        view.read(app)
+            .remote_state()
+            .expect("the first form is back")
+            .password()
+            .to_owned()
+    });
+    assert_eq!(first, "alpha-secret");
+    click(cx, "attempt.row.1");
+    let second = cx.update(|_window, app| {
+        view.read(app)
+            .remote_state()
+            .expect("the second form is back")
+            .password()
+            .to_owned()
+    });
+    assert_eq!(second, "beta-secret");
+    assert_ne!(first, second);
 }
 
 #[gpui::test]

@@ -9,7 +9,7 @@ use gpui::{
     Context, Div, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
     SharedString, Window, div, px,
 };
-use shellune_core::{LocalShell, SessionId, SessionKind};
+use shellune_core::{HostConfig, LocalShell, SessionId, SessionKind};
 
 use super::{PaneKind, ShelluneView, destination_icon, program_label, session_target};
 use crate::app::components;
@@ -19,6 +19,18 @@ use crate::app::nav::{Destination, Platform};
 use crate::app::palette::{self, Command, Entry, Group};
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Tone, palette as colors, radius, spacing};
+
+/// How a host is described in the palette: its target, then a jump or ProxyCommand.
+fn host_palette_detail(host: &HostConfig) -> String {
+    let mut detail = host.target();
+    if !host.jumps().is_empty() {
+        detail.push_str(&format!(" · {} jump", host.jumps().len()));
+    }
+    if host.proxy_command().is_some() {
+        detail.push_str(" · ProxyCommand");
+    }
+    detail
+}
 
 /// One line of the palette list: a group heading or an entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,7 +188,7 @@ impl ShelluneView {
                 command: Command::Connect(host.id()),
                 group: Group::Recent,
                 title: host.name().to_owned(),
-                detail: host.target(),
+                detail: host_palette_detail(host),
                 shortcut: None,
                 icon: Icon::Plug,
                 current: false,
@@ -190,7 +202,7 @@ impl ShelluneView {
                 command: Command::Connect(host.id()),
                 group: Group::Hosts,
                 title: host.name().to_owned(),
-                detail: host.target(),
+                detail: host_palette_detail(host),
                 shortcut: None,
                 icon: Icon::Plug,
                 current: false,

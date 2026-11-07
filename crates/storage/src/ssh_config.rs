@@ -21,18 +21,20 @@
 //! this file never defines, so the result is partial rather than complete.
 //!
 //! Everything the subset cannot decide is reported instead of guessed: a Match
-//! block, an Include, an OpenSSH token inside a value, a directive this build does
-//! not apply, and every directive that could change the target or the path to it
-//! (ProxyJump, ProxyCommand and the three forwarding directives). A host that a
-//! proxy or a forwarding could apply to is Blocked and is never offered for import,
-//! so the application cannot open a direct connection that the file would have
-//! routed somewhere else. Nothing here adds a jump host, a proxy or a forwarding
-//! feature: the only thing the importer does with them is refuse to pretend.
+//! block, an Include, an OpenSSH token this build cannot expand, and a directive
+//! this build does not apply. ProxyJump, ProxyCommand, LocalForward, RemoteForward
+//! and DynamicForward are read into the preview. A rule that can be stored as a
+//! jump, a command or a forwarding rule is offered with the host. A rule that is
+//! incomplete, conditional, or uses a token the connection layer does not expand
+//! stays visible and is not applied, so a direct connection is never substituted
+//! for a path the file did not describe.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use shellune_core::{DEFAULT_SSH_PORT, HostConfig};
+use shellune_core::{
+    DEFAULT_SSH_PORT, Endpoint, ForwardBuildError, ForwardKind, ForwardRule, HostConfig, HostId,
+};
 
 use crate::book::{HostBook, HostEdit};
 use crate::error::BookError;
@@ -103,8 +105,10 @@ pub enum ImportOutcome {
     Ready,
     /// The host can be imported, but part of the file could not be applied to it.
     NeedsReview,
-    /// A proxy, a proxy command or a forwarding could apply, so the host is not
-    /// imported: connecting directly could take a path the file never intended.
+    /// The file describes a path or a forward this build cannot store completely.
+    ///
+    /// The host is not imported. Saving it as a direct connection would drop a jump,
+    /// a command or a rule the preview could not express.
     Blocked,
 }
 
@@ -140,11 +144,14 @@ pub enum NoteKind {
 }
 
 impl NoteKind {
-    /// Whether the note describes something that stops the host from being
-    /// imported as a direct connection.
+    /// Whether this kind of note, by itself, used to mean the host could not be saved.
+    ///
+    /// A proxy or a forward that was fully read does not block the host. Only an
+    /// incomplete or conditional one does, and that decision is the host's outcome,
+    /// not the mere presence of the keyword.
     #[must_use]
     pub fn blocks_import(self) -> bool {
-        matches!(self, Self::Proxy | Self::Forwarding)
+        false
     }
 }
 
@@ -198,6 +205,147 @@ impl ImportNote {
     }
 }
 
+/// One hop a ProxyJump line named.
+///
+/// `alias` is set when the hop names a Host block in the same file. Otherwise the
+/// hop is a literal `user@address` and the plan creates a host for it. Reading this
+/// value does not open a connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JumpSpec {
+    alias: Option<String>,
+    user: Option<String>,
+    address: String,
+    port: Option<u16>,
+}
+
+impl JumpSpec {
+    /// The Host alias this hop uses, when the file named one.
+    #[must_use]
+    pub fn alias(&self) -> Option<&str> {
+        self.alias.as_deref()
+    }
+
+    /// The login user, when the line or the alias decided one.
+    #[must_use]
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
+    /// The address or alias text the line named.
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// The port, when the line named one. Absent means the hop's own port.
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// How the preview names the hop.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match (&self.user, self.port) {
+            (Some(user), Some(port)) => format!("{user}@{}:{port}", self.address),
+            (Some(user), None) => format!("{user}@{}", self.address),
+            (None, Some(port)) => format!("{}:{port}", self.address),
+            (None, None) => self.address.clone(),
+        }
+    }
+}
+
+/// One forwarding rule the file described completely enough to store.
+///
+/// It is configuration only. Building it does not bind a port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedForward {
+    kind: ForwardKind,
+    listen_host: String,
+    listen_port: u16,
+    target_host: Option<String>,
+    target_port: Option<u16>,
+    line: usize,
+}
+
+impl ImportedForward {
+    /// Which tunnel the line asked for.
+    #[must_use]
+    pub fn kind(&self) -> ForwardKind {
+        self.kind
+    }
+
+    /// Address the listener would bind. A bare port in the file becomes the loopback.
+    #[must_use]
+    pub fn listen_host(&self) -> &str {
+        &self.listen_host
+    }
+
+    /// Port the listener would bind.
+    #[must_use]
+    pub fn listen_port(&self) -> u16 {
+        self.listen_port
+    }
+
+    /// Where traffic would go, absent for a dynamic rule.
+    #[must_use]
+    pub fn target_host(&self) -> Option<&str> {
+        self.target_host.as_deref()
+    }
+
+    /// Target port, absent for a dynamic rule.
+    #[must_use]
+    pub fn target_port(&self) -> Option<u16> {
+        self.target_port
+    }
+
+    /// One-based line of the directive.
+    #[must_use]
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    /// One line for the preview.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self.kind {
+            ForwardKind::Dynamic => {
+                format!("dynamic {}:{}", self.listen_host, self.listen_port)
+            }
+            ForwardKind::Local | ForwardKind::Remote => format!(
+                "{} {}:{} → {}:{}",
+                self.kind.label(),
+                self.listen_host,
+                self.listen_port,
+                self.target_host.as_deref().unwrap_or("?"),
+                self.target_port.unwrap_or(0)
+            ),
+        }
+    }
+
+    /// The saved rule this line becomes, bound to `host`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the endpoint error when an address or port would not survive a save.
+    pub fn rule(&self, host: HostId) -> Result<ForwardRule, ForwardBuildError> {
+        let listen = Endpoint::new(&self.listen_host, self.listen_port)?;
+        match self.kind {
+            ForwardKind::Dynamic => Ok(ForwardRule::dynamic(host, listen)),
+            ForwardKind::Local | ForwardKind::Remote => {
+                let target_host = self.target_host.as_deref().unwrap_or("");
+                let target_port = self.target_port.unwrap_or(0);
+                let target = Endpoint::new(target_host, target_port)?;
+                if self.kind == ForwardKind::Local {
+                    Ok(ForwardRule::local(host, listen, target))
+                } else {
+                    Ok(ForwardRule::remote(host, listen, target))
+                }
+            }
+        }
+    }
+}
+
 /// One host the file describes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedHost {
@@ -206,6 +354,20 @@ pub struct ImportedHost {
     port: Option<u16>,
     user: Option<String>,
     identity_file: Option<String>,
+    /// ProxyJump hops the file named. Present even when the host is not imported,
+    /// so the preview can show the path it refused to guess.
+    jumps: Vec<JumpSpec>,
+    /// True once a ProxyJump line, including `none`, has been taken.
+    jump_set: bool,
+    /// Line of the ProxyJump that was kept, for a later note.
+    jump_line: usize,
+    /// ProxyCommand text. Present even when it is not safe to store.
+    proxy_command: Option<String>,
+    /// True once a ProxyCommand line, including `none`, has been taken.
+    proxy_set: bool,
+    forwards: Vec<ImportedForward>,
+    /// The network fields must be shown and must not be written.
+    withhold: bool,
     outcome: ImportOutcome,
     notes: Vec<ImportNote>,
 }
@@ -241,6 +403,27 @@ impl ImportedHost {
         self.identity_file.as_deref()
     }
 
+    /// ProxyJump hops, in order. Empty when the file sets none, or sets `none`.
+    #[must_use]
+    pub fn jumps(&self) -> &[JumpSpec] {
+        &self.jumps
+    }
+
+    /// ProxyCommand text, when the file sets one other than `none`.
+    ///
+    /// The text is what a later confirmed connection would run. Importing it does
+    /// not run it.
+    #[must_use]
+    pub fn proxy_command(&self) -> Option<&str> {
+        self.proxy_command.as_deref()
+    }
+
+    /// Forwarding rules the file described completely.
+    #[must_use]
+    pub fn forwards(&self) -> &[ImportedForward] {
+        &self.forwards
+    }
+
     /// How this host would be imported.
     #[must_use]
     pub fn outcome(&self) -> ImportOutcome {
@@ -261,7 +444,7 @@ impl ImportedHost {
     /// about who the user logs in as.
     #[must_use]
     pub fn is_importable(&self) -> bool {
-        self.outcome.is_offered() && self.user.is_some() && self.address.is_some()
+        self.outcome.is_offered() && !self.withhold && self.user.is_some() && self.address.is_some()
     }
 
     /// The target as a confirmation prompt would name it.
@@ -281,6 +464,19 @@ impl ImportedHost {
         if let Some(key) = &self.identity_file {
             summary.push_str(" · ");
             summary.push_str(key);
+        }
+        if !self.jumps.is_empty() {
+            let hops: Vec<String> = self.jumps.iter().map(JumpSpec::label).collect();
+            summary.push_str(" · jump ");
+            summary.push_str(&hops.join(", "));
+        }
+        if let Some(command) = &self.proxy_command {
+            summary.push_str(" · ");
+            summary.push_str(command);
+        }
+        if !self.forwards.is_empty() {
+            summary.push_str(" · ");
+            summary.push_str(&format!("{} forward", self.forwards.len()));
         }
         summary
     }
@@ -344,6 +540,28 @@ impl ImportLimits {
 pub struct ImportPlan {
     edits: Vec<HostEdit>,
     skipped: Vec<SkippedHost>,
+    forwards: Vec<PlannedForward>,
+}
+
+/// One forwarding rule to create for a host the plan also creates or already saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedForward {
+    alias: String,
+    forward: ImportedForward,
+}
+
+impl PlannedForward {
+    /// The host alias the rule belongs to.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// The rule, not yet bound to a host id.
+    #[must_use]
+    pub fn forward(&self) -> &ImportedForward {
+        &self.forward
+    }
 }
 
 impl ImportPlan {
@@ -357,6 +575,12 @@ impl ImportPlan {
     #[must_use]
     pub fn skipped(&self) -> &[SkippedHost] {
         &self.skipped
+    }
+
+    /// Forwarding rules that belong to hosts this plan can save.
+    #[must_use]
+    pub fn forwards(&self) -> &[PlannedForward] {
+        &self.forwards
     }
 
     /// Whether the plan would change nothing.
@@ -461,10 +685,11 @@ impl ImportPreview {
         let blocks = parse_blocks(&source, text)?;
         let aliases = concrete_aliases(&blocks);
         let limits = file_limits(&blocks, &aliases);
-        let hosts = aliases
+        let mut hosts: Vec<ImportedHost> = aliases
             .into_iter()
             .map(|(alias, line)| resolve_host(&blocks, &alias, line))
             .collect();
+        finalize_jumps(&mut hosts);
         Ok(Self {
             source,
             hosts,
@@ -543,6 +768,8 @@ impl ImportPreview {
             .collect();
         let mut edits = Vec::new();
         let mut skipped = Vec::new();
+        let mut created: HashMap<String, HostId> = HashMap::new();
+        let mut forwards = Vec::new();
 
         for host in &self.hosts {
             if !host.is_importable() {
@@ -574,12 +801,134 @@ impl ImportPreview {
                 }
             };
             record.set_identity_file(host.identity_file());
+            record.set_proxy_command(host.proxy_command());
+            created.insert(name.clone(), record.id());
             taken.insert(name);
             edits.push(HostEdit::create(record));
+            for forward in host.forwards() {
+                forwards.push(PlannedForward {
+                    alias: alias.to_owned(),
+                    forward: forward.clone(),
+                });
+            }
         }
 
-        ImportPlan { edits, skipped }
+        // Literal jump targets that are not Host blocks of their own.
+        for host in &self.hosts {
+            if !host.is_importable() {
+                continue;
+            }
+            for jump in host.jumps() {
+                if jump.alias().is_some() {
+                    continue;
+                }
+                let Some(user) = jump.user() else {
+                    continue;
+                };
+                let label = jump.label();
+                let name = label.to_lowercase();
+                if taken.contains(&name) || created.contains_key(&name) {
+                    continue;
+                }
+                let port = jump.port().unwrap_or(DEFAULT_SSH_PORT);
+                let Ok(record) = HostConfig::new(&label, jump.address(), port, user) else {
+                    continue;
+                };
+                created.insert(name.clone(), record.id());
+                taken.insert(name);
+                edits.push(HostEdit::create(record));
+            }
+        }
+
+        let mut drop_aliases = Vec::new();
+        let mut jump_updates: Vec<(String, Vec<HostId>)> = Vec::new();
+        for edit in &edits {
+            let Some(imported) = self
+                .hosts
+                .iter()
+                .find(|host| host.alias().eq_ignore_ascii_case(edit.host().name()))
+            else {
+                continue;
+            };
+            if imported.jumps().is_empty() {
+                continue;
+            }
+            let mut hop_ids = Vec::new();
+            let mut unresolved = false;
+            for jump in imported.jumps() {
+                let Some(id) = jump_id(jump, book, &created) else {
+                    unresolved = true;
+                    break;
+                };
+                hop_ids.push(id);
+            }
+            if unresolved {
+                skipped.push(SkippedHost {
+                    alias: imported.alias().to_owned(),
+                    reason: format!(
+                        "the jump chain for {} names a host this import cannot save",
+                        imported.alias()
+                    ),
+                });
+                drop_aliases.push(imported.alias().to_owned());
+                continue;
+            }
+            jump_updates.push((imported.alias().to_owned(), hop_ids));
+        }
+        if !drop_aliases.is_empty() {
+            edits.retain(|edit| {
+                !drop_aliases
+                    .iter()
+                    .any(|alias| edit.host().name().eq_ignore_ascii_case(alias))
+            });
+            forwards.retain(|forward| {
+                !drop_aliases
+                    .iter()
+                    .any(|alias| forward.alias().eq_ignore_ascii_case(alias))
+            });
+        }
+        for edit in &mut edits {
+            let Some((_, hop_ids)) = jump_updates
+                .iter()
+                .find(|(alias, _)| edit.host().name().eq_ignore_ascii_case(alias))
+            else {
+                continue;
+            };
+            let mut host = edit.host().clone();
+            host.set_jumps(hop_ids.iter().copied());
+            *edit = HostEdit::create(host);
+        }
+
+        ImportPlan {
+            edits,
+            skipped,
+            forwards,
+        }
     }
+}
+
+/// The saved id a jump hop refers to: an alias just created, a literal just created,
+/// or a host the book already has under that name.
+fn jump_id(jump: &JumpSpec, book: &HostBook, created: &HashMap<String, HostId>) -> Option<HostId> {
+    let key = match jump.alias() {
+        Some(alias) => alias.to_lowercase(),
+        None => jump.label().to_lowercase(),
+    };
+    if let Some(id) = created.get(&key) {
+        return Some(*id);
+    }
+    let name = jump.alias().unwrap_or("");
+    let literal = jump.label();
+    book.hosts()
+        .iter()
+        .find(|host| {
+            if jump.alias().is_some() {
+                host.name().eq_ignore_ascii_case(name)
+            } else {
+                host.name().eq_ignore_ascii_case(&literal)
+            }
+        })
+        .map(HostConfig::id)
 }
 
 // ---------------------------------------------------------------------------
@@ -942,9 +1291,8 @@ enum Directive {
 
 /// Classifies one directive by keyword.
 ///
-/// The three blocks are not interchangeable: a proxy or a forwarding is the reason
-/// a host is not imported, an Include means files were not read, and everything else
-/// is a directive this build simply does not apply.
+/// A proxy or a forwarding is read into the preview. Include means files were not
+/// read. Everything else is a directive this build simply does not apply.
 fn classify(keyword: &str) -> Directive {
     match keyword {
         "hostname" => Directive::HostName,
@@ -987,6 +1335,13 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
         port: None,
         user: None,
         identity_file: None,
+        jumps: Vec::new(),
+        jump_set: false,
+        jump_line: 0,
+        proxy_command: None,
+        proxy_set: false,
+        forwards: Vec::new(),
+        withhold: false,
         outcome: ImportOutcome::Ready,
         notes: Vec::new(),
     };
@@ -1004,33 +1359,24 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
             let mut unknown: Vec<&str> = Vec::new();
             for setting in &block.settings {
                 match classify(&setting.lower) {
-                    Directive::Proxy => {
+                    Directive::Proxy | Directive::Forwarding => {
                         blocked = true;
+                        host.withhold = true;
+                        let kind = if matches!(classify(&setting.lower), Directive::Proxy) {
+                            NoteKind::Proxy
+                        } else {
+                            NoteKind::Forwarding
+                        };
+                        remember_network(&mut host, setting, true);
                         push_once(
                             &mut host.notes,
                             &mut reported,
                             ImportNote::new(
                                 setting.line,
                                 &setting.keyword,
-                                NoteKind::Proxy,
+                                kind,
                                 format!(
-                                    "line {}: {} sits inside a Match block that Shellune does not evaluate, so this host may not be a direct connection and was not imported",
-                                    setting.line, setting.keyword
-                                ),
-                            ),
-                        );
-                    }
-                    Directive::Forwarding => {
-                        blocked = true;
-                        push_once(
-                            &mut host.notes,
-                            &mut reported,
-                            ImportNote::new(
-                                setting.line,
-                                &setting.keyword,
-                                NoteKind::Forwarding,
-                                format!(
-                                    "line {}: {} sits inside a Match block that Shellune does not evaluate, so this host may use a forwarded port and was not imported",
+                                    "line {}: {} sits inside a Match block that Shellune does not evaluate, so it was not applied and this host was not imported",
                                     setting.line, setting.keyword
                                 ),
                             ),
@@ -1096,36 +1442,10 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
                     apply_port(&mut host, setting, &mut review, &mut reported);
                 }
                 Directive::Proxy => {
-                    blocked = true;
-                    push_once(
-                        &mut host.notes,
-                        &mut reported,
-                        ImportNote::new(
-                            setting.line,
-                            &setting.keyword,
-                            NoteKind::Proxy,
-                            format!(
-                                "line {}: {} sends this connection through another machine, which this build does not do; the host was not imported so a direct connection cannot be opened by mistake",
-                                setting.line, setting.keyword
-                            ),
-                        ),
-                    );
+                    apply_proxy(&mut host, setting, &mut review, &mut reported);
                 }
                 Directive::Forwarding => {
-                    blocked = true;
-                    push_once(
-                        &mut host.notes,
-                        &mut reported,
-                        ImportNote::new(
-                            setting.line,
-                            &setting.keyword,
-                            NoteKind::Forwarding,
-                            format!(
-                                "line {}: {} opens a forwarded port, which this build does not manage; the host was not imported so its port is not used without a review",
-                                setting.line, setting.keyword
-                            ),
-                        ),
-                    );
+                    apply_forward(&mut host, setting, &mut review, &mut reported);
                 }
                 Directive::Include => {
                     review = true;
@@ -1191,8 +1511,20 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
                 .to_owned(),
         ));
     }
+    if host.jump_set && !host.jumps.is_empty() && host.proxy_command.is_some() {
+        blocked = true;
+        host.withhold = true;
+        host.notes.push(ImportNote::new(
+            alias_line,
+            "ProxyJump",
+            NoteKind::Proxy,
+            format!(
+                "{alias} has both a jump chain and a ProxyCommand. Keep one way to reach it; neither was applied, and the host was not imported"
+            ),
+        ));
+    }
 
-    host.outcome = if blocked {
+    host.outcome = if blocked || host.withhold {
         ImportOutcome::Blocked
     } else if review {
         ImportOutcome::NeedsReview
@@ -1330,6 +1662,438 @@ fn apply_port(
                     ),
                 ),
             );
+        }
+    }
+}
+
+/// Applies one ProxyJump or ProxyCommand, keeping the first obtained value.
+fn apply_proxy(
+    host: &mut ImportedHost,
+    setting: &Setting,
+    review: &mut bool,
+    reported: &mut HashSet<(NoteKind, String)>,
+) {
+    let is_jump = setting.lower == "proxyjump";
+    let already = if is_jump {
+        host.jump_set
+    } else {
+        host.proxy_set
+    };
+    if already {
+        push_once(
+            &mut host.notes,
+            reported,
+            ImportNote::new(
+                setting.line,
+                &setting.keyword,
+                NoteKind::Superseded,
+                format!(
+                    "line {}: {} {} was ignored because an earlier line already set it",
+                    setting.line, setting.keyword, setting.value
+                ),
+            ),
+        );
+        return;
+    }
+    if is_jump {
+        host.jump_set = true;
+        host.jump_line = setting.line;
+    } else {
+        host.proxy_set = true;
+    }
+    if setting.value.eq_ignore_ascii_case("none") {
+        return;
+    }
+    if let Some(token) = proxy_token(&setting.value) {
+        host.withhold = true;
+        *review = true;
+        push_once(
+            &mut host.notes,
+            reported,
+            ImportNote::new(
+                setting.line,
+                &setting.keyword,
+                NoteKind::Token,
+                format!(
+                    "line {}: {} uses the OpenSSH token {token}, which Shellune does not expand for this directive, so the host was not imported",
+                    setting.line, setting.keyword
+                ),
+            ),
+        );
+        remember_network(host, setting, true);
+        return;
+    }
+    if is_jump {
+        match parse_jump_list(&setting.value) {
+            Ok(jumps) => host.jumps = jumps,
+            Err(reason) => {
+                host.withhold = true;
+                *review = true;
+                host.notes.push(ImportNote::new(
+                    setting.line,
+                    &setting.keyword,
+                    NoteKind::InvalidValue,
+                    format!(
+                        "line {}: ProxyJump {} cannot be stored ({reason}), so the host was not imported as a direct connection",
+                        setting.line, setting.value
+                    ),
+                ));
+            }
+        }
+    } else if setting.value.is_empty() {
+        host.withhold = true;
+        *review = true;
+        host.notes.push(ImportNote::new(
+            setting.line,
+            &setting.keyword,
+            NoteKind::InvalidValue,
+            format!(
+                "line {}: ProxyCommand has no command, so the host was not imported",
+                setting.line
+            ),
+        ));
+    } else {
+        host.proxy_command = Some(setting.value.clone());
+    }
+}
+
+/// Applies one forwarding directive. Every complete line is kept; OpenSSH accumulates them.
+fn apply_forward(
+    host: &mut ImportedHost,
+    setting: &Setting,
+    review: &mut bool,
+    _reported: &mut HashSet<(NoteKind, String)>,
+) {
+    let kind = match setting.lower.as_str() {
+        "localforward" => ForwardKind::Local,
+        "remoteforward" => ForwardKind::Remote,
+        _ => ForwardKind::Dynamic,
+    };
+    if let Some(token) = proxy_token(&setting.value) {
+        *review = true;
+        host.notes.push(ImportNote::new(
+            setting.line,
+            &setting.keyword,
+            NoteKind::Token,
+            format!(
+                "line {}: {} uses the OpenSSH token {token}, which Shellune does not expand, so this forward was not created",
+                setting.line, setting.keyword
+            ),
+        ));
+        return;
+    }
+    match parse_forward(kind, &setting.value, setting.line) {
+        Ok(forward) => host.forwards.push(forward),
+        Err(reason) => {
+            *review = true;
+            host.notes.push(ImportNote::new(
+                setting.line,
+                &setting.keyword,
+                NoteKind::InvalidValue,
+                format!(
+                    "line {}: {} {} is incomplete ({reason}) and was not created",
+                    setting.line, setting.keyword, setting.value
+                ),
+            ));
+        }
+    }
+}
+
+/// Keeps the text of a proxy that will not be saved, so the preview can still show it.
+fn remember_network(host: &mut ImportedHost, setting: &Setting, withheld: bool) {
+    if !withheld {
+        return;
+    }
+    if setting.lower == "proxycommand" && !setting.value.eq_ignore_ascii_case("none") {
+        host.proxy_command = Some(setting.value.clone());
+    }
+    if setting.lower == "proxyjump" && host.jumps.is_empty() {
+        if let Ok(jumps) = parse_jump_list(&setting.value) {
+            host.jumps = jumps;
+        }
+    }
+}
+
+/// Tokens the connection layer expands in a ProxyCommand: `%h`, `%n`, `%p`, `%r`, `%%`.
+///
+/// Any other percent token is reported. HostName and User still reject every token,
+/// because those values are stored literally and a token there would be dialled as text.
+fn proxy_token(value: &str) -> Option<String> {
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            continue;
+        }
+        match characters.next() {
+            Some('%') => continue,
+            Some('h' | 'n' | 'p' | 'r') => continue,
+            Some(next) => return Some(format!("%{next}")),
+            None => return Some("%".to_owned()),
+        }
+    }
+    None
+}
+
+fn parse_jump_list(value: &str) -> Result<Vec<JumpSpec>, String> {
+    let mut hops = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("a hop is missing".to_owned());
+        }
+        if part.chars().any(char::is_whitespace) {
+            return Err("a hop contains whitespace".to_owned());
+        }
+        hops.push(parse_jump_hop(part)?);
+    }
+    if hops.is_empty() {
+        return Err("no hop was named".to_owned());
+    }
+    Ok(hops)
+}
+
+fn parse_jump_hop(token: &str) -> Result<JumpSpec, String> {
+    let (user, rest) = if let Some((user, rest)) = token.split_once('@') {
+        if user.is_empty() || rest.is_empty() {
+            return Err("the user or the host is missing".to_owned());
+        }
+        (Some(user.to_owned()), rest)
+    } else {
+        (None, token)
+    };
+    let (address, port) = if let Some(rest) = rest.strip_prefix('[') {
+        let Some((address, after)) = rest.split_once(']') else {
+            return Err("the IPv6 address is not closed".to_owned());
+        };
+        if address.is_empty() {
+            return Err("the address is empty".to_owned());
+        }
+        let port = if after.is_empty() {
+            None
+        } else if let Some(port) = after.strip_prefix(':') {
+            Some(parse_port_token(port)?)
+        } else {
+            return Err("trailing text after the address".to_owned());
+        };
+        (address.to_owned(), port)
+    } else if let Some((address, port)) = rest.rsplit_once(':') {
+        if !port.is_empty() && port.chars().all(|character| character.is_ascii_digit()) {
+            (address.to_owned(), Some(parse_port_token(port)?))
+        } else {
+            (rest.to_owned(), None)
+        }
+    } else {
+        (rest.to_owned(), None)
+    };
+    if address.is_empty() {
+        return Err("the address is empty".to_owned());
+    }
+    Ok(JumpSpec {
+        alias: None,
+        user,
+        address,
+        port,
+    })
+}
+
+fn parse_port_token(text: &str) -> Result<u16, String> {
+    match text.parse::<u16>() {
+        Ok(port) if port > 0 => Ok(port),
+        _ => Err(format!("port {text} is outside 1-65535")),
+    }
+}
+
+fn parse_forward(kind: ForwardKind, value: &str, line: usize) -> Result<ImportedForward, String> {
+    if value.chars().any(|character| character == '/') {
+        return Err("a Unix socket path is not a TCP forward".to_owned());
+    }
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    match kind {
+        ForwardKind::Dynamic => {
+            if parts.len() != 1 {
+                return Err("DynamicForward needs one listen port".to_owned());
+            }
+            let (listen_host, listen_port) = parse_listen(parts[0])?;
+            Ok(ImportedForward {
+                kind,
+                listen_host,
+                listen_port,
+                target_host: None,
+                target_port: None,
+                line,
+            })
+        }
+        ForwardKind::Local | ForwardKind::Remote => {
+            if parts.len() != 2 {
+                return Err("the line needs a listen port and a target".to_owned());
+            }
+            let (listen_host, listen_port) = parse_listen(parts[0])?;
+            let (target_host, target_port) = parse_target(parts[1])?;
+            Ok(ImportedForward {
+                kind,
+                listen_host,
+                listen_port,
+                target_host: Some(target_host),
+                target_port: Some(target_port),
+                line,
+            })
+        }
+    }
+}
+
+fn parse_listen(token: &str) -> Result<(String, u16), String> {
+    if token.contains('[') || token.contains(']') {
+        let (address, port) = parse_bracket_host(token)?;
+        let port = port.ok_or_else(|| "the listen port is missing".to_owned())?;
+        return Ok((address, port));
+    }
+    if let Some((host, port)) = token.rsplit_once(':') {
+        if !port.is_empty()
+            && port.chars().all(|character| character.is_ascii_digit())
+            && !host.is_empty()
+        {
+            return Ok((host.to_owned(), parse_port_token(port)?));
+        }
+    }
+    Ok(("127.0.0.1".to_owned(), parse_port_token(token)?))
+}
+
+fn parse_target(token: &str) -> Result<(String, u16), String> {
+    if token.contains('[') {
+        let (address, port) = parse_bracket_host(token)?;
+        let port = port.ok_or_else(|| "the target port is missing".to_owned())?;
+        return Ok((address, port));
+    }
+    let Some((host, port)) = token.rsplit_once(':') else {
+        return Err("the target needs a host and a port".to_owned());
+    };
+    if host.is_empty() {
+        return Err("the target host is empty".to_owned());
+    }
+    Ok((host.to_owned(), parse_port_token(port)?))
+}
+
+fn parse_bracket_host(token: &str) -> Result<(String, Option<u16>), String> {
+    let Some(rest) = token.strip_prefix('[') else {
+        return Err("the address is not bracketed".to_owned());
+    };
+    let Some((address, after)) = rest.split_once(']') else {
+        return Err("the IPv6 address is not closed".to_owned());
+    };
+    if address.is_empty() {
+        return Err("the address is empty".to_owned());
+    }
+    if after.is_empty() {
+        return Ok((address.to_owned(), None));
+    }
+    let Some(port) = after.strip_prefix(':') else {
+        return Err("trailing text after the address".to_owned());
+    };
+    Ok((address.to_owned(), Some(parse_port_token(port)?)))
+}
+
+/// Binds ProxyJump hops to aliases in this file, and withholds a host whose hop
+/// cannot be stored without inventing a user or a direct connection.
+fn finalize_jumps(hosts: &mut [ImportedHost]) {
+    let snapshots: Vec<(String, Option<String>, u16, Option<String>)> = hosts
+        .iter()
+        .map(|host| {
+            (
+                host.alias.clone(),
+                host.user.clone(),
+                host.port(),
+                host.address.clone(),
+            )
+        })
+        .collect();
+    for index in 0..hosts.len() {
+        if hosts[index].jumps.is_empty() || hosts[index].withhold {
+            continue;
+        }
+        let mut resolved = Vec::new();
+        let mut failure: Option<String> = None;
+        for jump in hosts[index].jumps.clone() {
+            if let Some((alias, user, port, address)) = snapshots
+                .iter()
+                .find(|(alias, _, _, _)| alias.eq_ignore_ascii_case(&jump.address))
+            {
+                let user_ok = match &jump.user {
+                    Some(asked) => user.as_ref() == Some(asked),
+                    None => true,
+                };
+                let port_ok = match jump.port {
+                    Some(asked) => asked == *port,
+                    None => true,
+                };
+                if user.is_none() || !user_ok || !port_ok {
+                    failure = Some(format!(
+                        "ProxyJump {} does not match the saved user and port of {alias}, so it was not applied",
+                        jump.label()
+                    ));
+                    break;
+                }
+                resolved.push(JumpSpec {
+                    alias: Some(alias.clone()),
+                    user: user.clone(),
+                    address: address.clone().unwrap_or_else(|| alias.clone()),
+                    port: Some(*port),
+                });
+            } else if jump.user.is_some() {
+                resolved.push(jump);
+            } else {
+                failure = Some(format!(
+                    "ProxyJump {} names a host with no user in this file, so it was not applied and this host was not imported as a direct connection",
+                    jump.label()
+                ));
+                break;
+            }
+        }
+        if let Some(reason) = failure {
+            let line = hosts[index].jump_line.max(1);
+            hosts[index].withhold = true;
+            hosts[index].outcome = ImportOutcome::Blocked;
+            hosts[index]
+                .notes
+                .push(ImportNote::new(line, "ProxyJump", NoteKind::Proxy, reason));
+        } else {
+            hosts[index].jumps = resolved;
+        }
+    }
+    // A hop that points at a host this preview will not save cannot be linked.
+    loop {
+        let saved: Vec<String> = hosts
+            .iter()
+            .filter(|host| host.is_importable())
+            .map(|host| host.alias.to_lowercase())
+            .collect();
+        let mut changed = false;
+        for host in hosts.iter_mut() {
+            if !host.is_importable() {
+                continue;
+            }
+            let missing = host.jumps.iter().any(|jump| {
+                jump.alias().is_some_and(|alias| {
+                    !saved.iter().any(|saved| saved.eq_ignore_ascii_case(alias))
+                })
+            });
+            if missing {
+                let line = host.jump_line.max(1);
+                host.withhold = true;
+                host.outcome = ImportOutcome::Blocked;
+                host.notes.push(ImportNote::new(
+                    line,
+                    "ProxyJump",
+                    NoteKind::Proxy,
+                    format!(
+                        "the jump chain for {} depends on a host that is not imported, so {} was not imported as a direct connection",
+                        host.alias, host.alias
+                    ),
+                ));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 }
@@ -1652,39 +2416,184 @@ Host web
     }
 
     #[test]
-    fn proxy_and_forwarding_directives_block_the_host() {
-        for (directive, kind) in [
-            ("ProxyJump bastion", NoteKind::Proxy),
-            ("ProxyCommand ssh -W %h:%p bastion", NoteKind::Proxy),
-            ("LocalForward 8080 localhost:80", NoteKind::Forwarding),
-            ("RemoteForward 9090 localhost:90", NoteKind::Forwarding),
-            ("DynamicForward 1080", NoteKind::Forwarding),
-        ] {
-            let text = format!(
-                "Host web\n    HostName web.example.org\n    User deploy\n    {directive}\n"
-            );
-            let preview = parse_preview(&text);
-            let web = host(&preview, "web");
-            assert_eq!(
-                web.outcome(),
-                ImportOutcome::Blocked,
-                "{directive} must block the host"
-            );
-            assert!(!web.is_importable(), "{directive} must not be imported");
-            assert_eq!(preview.blocked_count(), 1);
-            let note = web
-                .notes()
-                .iter()
-                .find(|note| note.kind() == kind)
-                .unwrap_or_else(|| panic!("{directive} is recorded as {kind:?}"));
-            assert_eq!(note.line(), 4, "the note points at the directive");
-            let keyword = directive.split(' ').next().unwrap_or_default();
-            assert!(note.keyword().eq_ignore_ascii_case(keyword));
+    fn an_incomplete_proxy_jump_is_shown_and_not_imported_as_a_direct_connection() {
+        let preview = parse_preview(
+            "\
+Host web
+    HostName web.example.org
+    User deploy
+    ProxyJump bastion
+",
+        );
+        let web = host(&preview, "web");
+        assert_eq!(web.outcome(), ImportOutcome::Blocked);
+        assert!(!web.is_importable());
+        assert_eq!(web.jumps().len(), 1, "the hop is still in the preview");
+        assert_eq!(web.jumps()[0].address(), "bastion");
+        let note = web
+            .notes()
+            .iter()
+            .find(|note| note.kind() == NoteKind::Proxy)
+            .expect("the missing jump host is explained");
+        assert_eq!(note.line(), 4);
+        assert!(note.keyword().eq_ignore_ascii_case("ProxyJump"));
+        assert!(note.reason().contains("not imported"), "{}", note.reason());
+        assert!(preview.plan(&HostBook::new()).is_empty());
+    }
 
-            // The plan never offers a blocked host, so no direct connection exists.
-            let plan = preview.plan(&HostBook::new());
-            assert!(plan.is_empty(), "{directive} must not reach the book");
-        }
+    #[test]
+    fn proxy_jump_proxy_command_and_forwards_enter_the_preview() {
+        let preview = parse_preview(
+            "\
+Host bastion
+    HostName bastion.example.org
+    User jump
+
+Host web
+    HostName web.example.org
+    User deploy
+    ProxyJump bastion
+    ProxyCommand nc %h %p
+
+Host files
+    HostName files.example.org
+    User deploy
+    LocalForward 8080 localhost:80
+    RemoteForward 9090 db.internal:5432
+    DynamicForward 1080
+
+Host tunnel
+    HostName tunnel.example.org
+    User deploy
+    ProxyCommand ssh -W %h:%p bastion
+",
+        );
+        let web = host(&preview, "web");
+        assert_eq!(
+            web.outcome(),
+            ImportOutcome::Blocked,
+            "a host cannot keep both a jump and a command"
+        );
+        assert!(web.proxy_command().is_some());
+        assert_eq!(web.jumps().len(), 1);
+        assert!(!web.is_importable());
+
+        let files = host(&preview, "files");
+        assert_eq!(files.outcome(), ImportOutcome::Ready);
+        assert!(files.is_importable());
+        assert_eq!(files.forwards().len(), 3);
+        assert_eq!(
+            files.forwards()[0].kind(),
+            shellune_core::ForwardKind::Local
+        );
+        assert_eq!(files.forwards()[0].listen_port(), 8080);
+        assert_eq!(files.forwards()[0].listen_host(), "127.0.0.1");
+        assert_eq!(files.forwards()[0].target_host(), Some("localhost"));
+        assert_eq!(
+            files.forwards()[1].kind(),
+            shellune_core::ForwardKind::Remote
+        );
+        assert_eq!(
+            files.forwards()[2].kind(),
+            shellune_core::ForwardKind::Dynamic
+        );
+        assert!(files.forwards()[2].target_host().is_none());
+        assert!(
+            files.summary().contains("forward"),
+            "the row names the forwards: {}",
+            files.summary()
+        );
+
+        let tunnel = host(&preview, "tunnel");
+        assert_eq!(tunnel.outcome(), ImportOutcome::Ready);
+        assert_eq!(
+            tunnel.proxy_command(),
+            Some("ssh -W %h:%p bastion"),
+            "tokens the chain expands are kept as the command"
+        );
+        assert!(tunnel.is_importable());
+
+        let bastion = host(&preview, "bastion");
+        assert!(bastion.is_importable());
+        let plan = preview.plan(&HostBook::new());
+        assert!(
+            plan.edits()
+                .iter()
+                .any(|edit| edit.host().name() == "files"),
+            "the forwarded host is saved"
+        );
+        assert!(
+            plan.edits().iter().all(|edit| edit.host().name() != "web"),
+            "the conflicting host is not saved as a direct connection"
+        );
+        let saved_tunnel = plan
+            .edits()
+            .iter()
+            .find(|edit| edit.host().name() == "tunnel")
+            .expect("the proxy command host is saved");
+        assert_eq!(
+            saved_tunnel.host().proxy_command(),
+            Some("ssh -W %h:%p bastion")
+        );
+        let saved_web_missing = plan.edits().iter().find(|edit| edit.host().name() == "web");
+        assert!(saved_web_missing.is_none());
+        let saved_files = plan
+            .edits()
+            .iter()
+            .find(|edit| edit.host().name() == "files")
+            .expect("files");
+        let web_was_blocked = host(&preview, "web");
+        assert!(web_was_blocked.summary().contains("bastion"));
+        assert_eq!(plan.forwards().len(), 3);
+        assert_eq!(plan.forwards()[0].alias(), "files");
+        let rule = plan.forwards()[0]
+            .forward()
+            .rule(saved_files.host().id())
+            .expect("the local rule can be stored");
+        assert_eq!(rule.kind(), shellune_core::ForwardKind::Local);
+        assert_eq!(rule.listen().port().get(), 8080);
+        assert_eq!(
+            rule.target().expect("local has a target").host(),
+            "localhost"
+        );
+
+        let linked = preview.plan(&HostBook::new());
+        let saved_bastion = linked
+            .edits()
+            .iter()
+            .find(|edit| edit.host().name() == "bastion")
+            .expect("bastion");
+        // web is blocked, so nothing points at bastion from that host.
+        assert!(saved_bastion.host().jumps().is_empty());
+
+        let only_jump = parse_preview(
+            "\
+Host bastion
+    HostName bastion.example.org
+    User jump
+
+Host web
+    HostName web.example.org
+    User deploy
+    ProxyJump bastion
+",
+        );
+        let web = host(&only_jump, "web");
+        assert_eq!(web.outcome(), ImportOutcome::Ready, "{:?}", web.notes());
+        assert_eq!(web.jumps()[0].alias(), Some("bastion"));
+        let plan = only_jump.plan(&HostBook::new());
+        let web = plan
+            .edits()
+            .iter()
+            .find(|edit| edit.host().name() == "web")
+            .expect("web");
+        let bastion = plan
+            .edits()
+            .iter()
+            .find(|edit| edit.host().name() == "bastion")
+            .expect("bastion");
+        assert_eq!(web.host().jumps(), &[bastion.host().id()]);
+        assert!(web.host().proxy_command().is_none());
     }
 
     #[test]

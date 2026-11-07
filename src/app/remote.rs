@@ -13,8 +13,15 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use shellune_core::{AgentKind, AuthMethod, HostConfig, SecretString};
-use shellune_ssh::{ConnectError, HostKeyPrompt, KnownHostKey};
+use std::collections::HashMap;
+
+use shellune_core::{
+    AgentKind, AuthMethod, AuthMethodKind, HostConfig, HostId, SecretString, connection_jump_fault,
+};
+use shellune_ssh::{
+    ChainEvent, ChainFailure, ChainRequest, ChainSession, ConnectError, FileLink, HopAuth,
+    HostKeyPrompt, KnownHostKey, PtySize, RemoteEvent, RemoteSession, TransferLink,
+};
 use shellune_storage::{HostKey, HostTrust, TrustEntry, TrustError};
 
 use crate::app::copy::Strings;
@@ -140,6 +147,36 @@ impl RemoteFailure {
         }
     }
 
+    /// A jump-chain failure. The reason is the chain's own text, which names the hop.
+    ///
+    /// [`ChainFailure::session_failure`] drops that hop: an authentication failure
+    /// becomes [`shellune_core::SessionFailure::AuthenticationFailed`], and a disconnect
+    /// becomes a remote I/O failure whose host is "the server". The panel keeps the
+    /// chain text instead.
+    #[must_use]
+    pub fn from_chain(failure: &ChainFailure) -> Self {
+        let (next_step, retryable) = match failure {
+            ChainFailure::Hop { error, .. } => (error.next_step().to_owned(), error.is_retryable()),
+            ChainFailure::NotDialed { .. } => (
+                "Fix the jump chain or the ProxyCommand, then connect again.".to_owned(),
+                true,
+            ),
+            ChainFailure::Cancelled { .. } => {
+                ("Connect again to start a new attempt.".to_owned(), true)
+            }
+            ChainFailure::ProxyNotConfirmed { .. } => (
+                "Confirm the command to run it, or remove the ProxyCommand from the host."
+                    .to_owned(),
+                true,
+            ),
+        };
+        Self {
+            reason: failure.to_string(),
+            next_step,
+            retryable,
+        }
+    }
+
     /// A failure the shell itself produced, such as a trust record that could not be
     /// written.
     #[must_use]
@@ -179,6 +216,15 @@ pub enum RemoteStatus {
     Connecting,
     /// The server identity is unknown and the user has to decide.
     VerifyingHost(HostKeyPrompt),
+    /// A ProxyCommand is expanded and will not run until the user confirms it.
+    ConfirmingProxy {
+        /// The hop the command would reach.
+        host_id: HostId,
+        /// How that hop is named in the form.
+        label: String,
+        /// The expanded command. Nothing has been started.
+        command: String,
+    },
     /// The remote shell is live.
     Live,
     /// The attempt ended, with the reason.
@@ -189,13 +235,13 @@ impl RemoteStatus {
     /// Whether an attempt is in flight.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        matches!(self, Self::Connecting)
+        matches!(self, Self::Connecting | Self::ConfirmingProxy { .. })
     }
 
-    /// Whether the user is being asked about the server identity.
+    /// Whether the user is being asked about the server identity or a ProxyCommand.
     #[must_use]
     pub fn is_asking(&self) -> bool {
-        matches!(self, Self::VerifyingHost(_))
+        matches!(self, Self::VerifyingHost(_) | Self::ConfirmingProxy { .. })
     }
 
     /// The prompt, when there is one.
@@ -203,6 +249,19 @@ impl RemoteStatus {
     pub fn prompt(&self) -> Option<&HostKeyPrompt> {
         match self {
             Self::VerifyingHost(prompt) => Some(prompt),
+            _ => None,
+        }
+    }
+
+    /// The ProxyCommand waiting for a yes or a no.
+    #[must_use]
+    pub fn proxy_question(&self) -> Option<(HostId, &str, &str)> {
+        match self {
+            Self::ConfirmingProxy {
+                host_id,
+                label,
+                command,
+            } => Some((*host_id, label.as_str(), command.as_str())),
             _ => None,
         }
     }
@@ -227,6 +286,8 @@ pub struct RemotePanel {
     passphrase: String,
     status: RemoteStatus,
     form_error: Option<String>,
+    /// Names the hop this form is collecting credentials for, when it is not obvious.
+    hop_label: Option<String>,
 }
 
 impl RemotePanel {
@@ -252,7 +313,20 @@ impl RemotePanel {
             passphrase: String::new(),
             status: RemoteStatus::Idle,
             form_error: None,
+            hop_label: None,
         }
+    }
+
+    /// The hop this form is asking about, when the chain has more than one node.
+    #[must_use]
+    pub fn hop_label(&self) -> Option<&str> {
+        self.hop_label.as_deref()
+    }
+
+    /// Sets the hop label drawn above the fields.
+    pub fn set_hop_label(&mut self, label: impl Into<String>) {
+        let label = label.into();
+        self.hop_label = (!label.is_empty()).then_some(label);
     }
 
     /// The host this form connects to.
@@ -439,6 +513,344 @@ pub fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
+}
+
+/// Credentials a saved host can supply without asking, when they are already complete.
+///
+/// Agent and a key path need nothing typed. A password or passphrase is complete only
+/// when `secret` holds it. Anything missing returns `None` so the form can ask for
+/// that hop alone.
+#[must_use]
+pub fn stored_auth(host: &HostConfig, secret: Option<&SecretString>) -> Option<AuthMethod> {
+    match host.auth()? {
+        AuthMethodKind::Agent => Some(AuthMethod::agent(default_agent())),
+        AuthMethodKind::KeyFile => {
+            let path = host.identity_file()?.trim();
+            (!path.is_empty()).then(|| AuthMethod::key_file(path.to_owned(), None))
+        }
+        AuthMethodKind::Password => {
+            let text = secret?.expose();
+            (!text.is_empty()).then(|| AuthMethod::password(text.to_owned()))
+        }
+        AuthMethodKind::EncryptedKeyFile => {
+            let path = host.identity_file()?.trim();
+            let text = secret?.expose();
+            if path.is_empty() || text.is_empty() {
+                None
+            } else {
+                Some(AuthMethod::key_file(
+                    path.to_owned(),
+                    Some(SecretString::new(text.to_owned())),
+                ))
+            }
+        }
+    }
+}
+
+/// The ordered hops of one connection, plus the credentials collected so far.
+///
+/// Building this does not dial and does not start a ProxyCommand. A cycle, a missing
+/// hop, or a host that has both a jump list and a ProxyCommand is a [`Self::fault`]
+/// and leaves `order` empty.
+pub struct ChainDraft {
+    hosts: Vec<HostConfig>,
+    target: HostId,
+    order: Vec<HostId>,
+    auths: Vec<HopAuth>,
+    fault: Option<String>,
+}
+
+impl ChainDraft {
+    /// The chain from `target` through `saved`.
+    ///
+    /// `target` is added when it is not already in `saved`, which is how a quick
+    /// connection dials a host that has not been written.
+    #[must_use]
+    pub fn prepare(saved: &[HostConfig], target: &HostConfig) -> Self {
+        let mut hosts = saved.to_vec();
+        if !hosts.iter().any(|host| host.id() == target.id()) {
+            hosts.push(target.clone());
+        }
+        let fault = connection_jump_fault(&hosts, target.id())
+            .map(|fault| fault.message().to_owned())
+            .or_else(|| chain_shape_fault(&hosts, target.id()));
+        let order = if fault.is_some() {
+            Vec::new()
+        } else {
+            expand_order(&hosts, target.id()).unwrap_or_default()
+        };
+        Self {
+            hosts,
+            target: target.id(),
+            order,
+            auths: Vec::new(),
+            fault,
+        }
+    }
+
+    /// A chain of one host that is not in the saved book.
+    #[must_use]
+    pub fn single(host: HostConfig) -> Self {
+        Self::prepare(std::slice::from_ref(&host), &host)
+    }
+
+    /// Why this chain must not be dialled.
+    #[must_use]
+    pub fn fault(&self) -> Option<&str> {
+        self.fault.as_deref()
+    }
+
+    /// Hops in dial order. Empty when [`Self::fault`] is set.
+    #[must_use]
+    pub fn order(&self) -> &[HostId] {
+        &self.order
+    }
+
+    /// The host the session is for.
+    #[must_use]
+    pub fn target_host(&self) -> Option<&HostConfig> {
+        self.hosts.iter().find(|host| host.id() == self.target)
+    }
+
+    /// One hop's saved record.
+    #[must_use]
+    pub fn host(&self, id: HostId) -> Option<&HostConfig> {
+        self.hosts.iter().find(|host| host.id() == id)
+    }
+
+    /// Whether this hop already has the credentials the chain will use.
+    #[must_use]
+    pub fn has_auth(&self, id: HostId) -> bool {
+        self.auths.iter().any(|auth| auth.host_id == id)
+    }
+
+    /// The first hop that still needs credentials.
+    #[must_use]
+    pub fn next_needed(&self) -> Option<HostId> {
+        self.order.iter().copied().find(|id| !self.has_auth(*id))
+    }
+
+    /// Records one hop's credentials. A second set for the same hop is ignored.
+    pub fn push_auth(&mut self, auth: HopAuth) {
+        if !self.has_auth(auth.host_id) {
+            self.auths.push(auth);
+        }
+    }
+
+    /// The pieces [`ChainRequest::new`] needs. The draft is consumed.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<HostConfig>, HostId, Vec<HopAuth>) {
+        (self.hosts, self.target, self.auths)
+    }
+
+    /// A request for this chain, when every hop has credentials and nothing is wrong.
+    #[must_use]
+    pub fn into_request(self, size: PtySize) -> Option<ChainRequest> {
+        if self.fault.is_some() || self.next_needed().is_some() {
+            return None;
+        }
+        let (hosts, target, auth) = self.into_parts();
+        Some(ChainRequest::new(hosts, target, auth, size))
+    }
+}
+
+fn expand_order(hosts: &[HostConfig], target: HostId) -> Result<Vec<HostId>, String> {
+    let by_id: HashMap<HostId, &HostConfig> = hosts.iter().map(|host| (host.id(), host)).collect();
+    let mut order = Vec::new();
+    let mut stack = Vec::new();
+    expand_hops(target, &by_id, &mut order, &mut stack)?;
+    Ok(order)
+}
+
+fn chain_shape_fault(hosts: &[HostConfig], target: HostId) -> Option<String> {
+    let order = match expand_order(hosts, target) {
+        Ok(order) => order,
+        Err(message) => return Some(message),
+    };
+    let by_id: HashMap<HostId, &HostConfig> = hosts.iter().map(|host| (host.id(), host)).collect();
+    for id in order {
+        if let Some(host) = by_id.get(&id)
+            && !host.jumps().is_empty()
+            && host.proxy_command().is_some()
+        {
+            return Some(format!(
+                "\"{}\" has both a jump chain and a ProxyCommand. Keep one way to reach it and remove the other before connecting. Nothing was connected and no command was run.",
+                host.name()
+            ));
+        }
+    }
+    None
+}
+
+fn expand_hops(
+    id: HostId,
+    by_id: &HashMap<HostId, &HostConfig>,
+    out: &mut Vec<HostId>,
+    stack: &mut Vec<HostId>,
+) -> Result<(), String> {
+    if out.contains(&id) {
+        return Ok(());
+    }
+    if stack.contains(&id) {
+        return Err(
+            "the jump chain loops. Remove the hop that returns to an earlier host before connecting. Nothing was connected and no command was run."
+                .to_owned(),
+        );
+    }
+    let Some(host) = by_id.get(&id) else {
+        return Err(format!(
+            "host {id} is not saved, so it cannot be connected. Nothing was connected and no command was run."
+        ));
+    };
+    stack.push(id);
+    for hop in host.jumps() {
+        expand_hops(*hop, by_id, out, stack)?;
+    }
+    stack.pop();
+    if !out.contains(&id) {
+        out.push(id);
+    }
+    Ok(())
+}
+
+/// What one attempt's transport reported, whether it is a direct session or a chain.
+pub enum LinkEvent {
+    /// An unknown identity on one hop.
+    HostKey {
+        /// The hop, when the event names one.
+        host_id: Option<HostId>,
+        /// The question.
+        prompt: HostKeyPrompt,
+    },
+    /// A ProxyCommand waiting for confirmation.
+    Proxy {
+        /// The hop the command would reach.
+        host_id: HostId,
+        /// How that hop is named.
+        label: String,
+        /// The expanded command.
+        command: String,
+    },
+    /// The hop accepted its credentials.
+    HopReady(HostId),
+    /// The target shell is running.
+    Connected,
+    /// Bytes from the target shell.
+    Data(Vec<u8>),
+    /// The target shell ended.
+    Exited {
+        /// Exit status, when one was reported.
+        code: Option<u32>,
+    },
+    /// A direct session failed.
+    FailedRemote(ConnectError),
+    /// A chain failed. The display text names the hop.
+    FailedChain(ChainFailure),
+}
+
+/// The transport behind one attempt.
+pub enum AttemptLink {
+    /// A scripted session. Real dials use [`Self::Chain`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    Remote(RemoteSession),
+    /// A jump chain, including a chain of one host.
+    Chain(ChainSession),
+}
+
+impl AttemptLink {
+    /// Whether this transport is a jump chain.
+    #[must_use]
+    pub fn is_chain(&self) -> bool {
+        matches!(self, Self::Chain(_))
+    }
+
+    /// Stops the attempt.
+    pub fn close(&mut self) {
+        match self {
+            Self::Remote(session) => session.close(),
+            Self::Chain(session) => session.close(),
+        }
+    }
+
+    /// Events waiting since the last drain.
+    pub fn drain(&mut self) -> Vec<LinkEvent> {
+        match self {
+            Self::Remote(session) => session
+                .drain()
+                .into_iter()
+                .map(|event| match event {
+                    RemoteEvent::HostKeyPrompt(prompt) => LinkEvent::HostKey {
+                        host_id: None,
+                        prompt,
+                    },
+                    RemoteEvent::Connected => LinkEvent::Connected,
+                    RemoteEvent::Data(bytes) => LinkEvent::Data(bytes),
+                    RemoteEvent::Exited { code } => LinkEvent::Exited { code },
+                    RemoteEvent::Failed(error) => LinkEvent::FailedRemote(error),
+                })
+                .collect(),
+            Self::Chain(session) => session
+                .drain()
+                .into_iter()
+                .filter_map(|event| match event {
+                    ChainEvent::HopStarted(_) => None,
+                    ChainEvent::HostKeyPrompt { hop, prompt } => Some(LinkEvent::HostKey {
+                        host_id: Some(hop.host_id),
+                        prompt,
+                    }),
+                    ChainEvent::ProxyConfirmation { hop, command } => Some(LinkEvent::Proxy {
+                        host_id: hop.host_id,
+                        label: hop.to_string(),
+                        command,
+                    }),
+                    ChainEvent::HopReady(hop) => Some(LinkEvent::HopReady(hop.host_id)),
+                    ChainEvent::Connected { .. } => Some(LinkEvent::Connected),
+                    ChainEvent::Data(bytes) => Some(LinkEvent::Data(bytes)),
+                    ChainEvent::Exited { code } => Some(LinkEvent::Exited { code }),
+                    ChainEvent::Failed(failure) => Some(LinkEvent::FailedChain(failure)),
+                })
+                .collect(),
+        }
+    }
+
+    /// Answers a trust question.
+    ///
+    /// A chain needs the hop id. `true` means the answer was queued, not that the hop
+    /// finished using it.
+    #[must_use]
+    pub fn answer_host_key(&mut self, host_id: Option<HostId>, accept: bool) -> bool {
+        match self {
+            Self::Remote(session) => session.answer_host_key(accept),
+            Self::Chain(session) => {
+                host_id.is_some_and(|host_id| session.answer_host_key(host_id, accept))
+            }
+        }
+    }
+
+    /// Confirms or refuses one hop's ProxyCommand. A direct session is not waiting.
+    #[must_use]
+    pub fn confirm_proxy(&mut self, host_id: HostId, allow: bool) -> bool {
+        match self {
+            Self::Remote(_) => false,
+            Self::Chain(session) => session.confirm_proxy(host_id, allow),
+        }
+    }
+
+    /// The browsable side, once.
+    pub fn take_file_link(&mut self) -> Option<FileLink> {
+        match self {
+            Self::Remote(session) => session.take_file_link(),
+            Self::Chain(session) => session.take_file_link(),
+        }
+    }
+
+    /// The transfer side, once.
+    pub fn take_transfer_link(&mut self) -> Option<TransferLink> {
+        match self {
+            Self::Remote(session) => session.take_transfer_link(),
+            Self::Chain(session) => session.take_transfer_link(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -628,5 +1040,58 @@ mod tests {
     #[test]
     fn the_clock_a_record_uses_is_a_real_instant() {
         assert!(now_unix() > 1_700_000_000, "the clock has moved on");
+    }
+
+    #[test]
+    fn a_chain_authentication_failure_names_the_hop_the_session_failure_drops() {
+        let bastion = HostConfig::new("bastion", "10.0.0.1", 22, "jump").expect("a hop");
+        let failure = ChainFailure::Hop {
+            hop: Box::new(shellune_ssh::HopLocation {
+                host_id: bastion.id(),
+                index: 0,
+                name: bastion.name().to_owned(),
+                address: bastion.address().to_owned(),
+                port: bastion.port().get(),
+                user: bastion.user().to_owned(),
+            }),
+            error: Box::new(ConnectError::AuthRejected),
+        };
+        let shown = RemoteFailure::from_chain(&failure);
+        assert!(
+            shown.reason().contains("bastion"),
+            "the panel names the hop: {}",
+            shown.reason()
+        );
+        assert!(
+            shown.reason().contains("hop"),
+            "the panel says which hop failed: {}",
+            shown.reason()
+        );
+        let recorded = failure.session_failure();
+        assert!(
+            matches!(
+                recorded,
+                shellune_core::SessionFailure::AuthenticationFailed
+            ),
+            "the session record drops the hop, got {recorded:?}"
+        );
+        assert!(
+            !recorded.to_string().contains("bastion"),
+            "session_failure does not name the hop: {recorded}"
+        );
+    }
+
+    #[test]
+    fn a_host_with_both_a_jump_and_a_proxy_command_is_refused_before_dial() {
+        let bastion = HostConfig::new("bastion", "10.0.0.1", 22, "jump").expect("a hop");
+        let mut web = HostConfig::new("web", "10.0.0.2", 22, "deploy").expect("a target");
+        web.set_jumps([bastion.id()]);
+        web.set_proxy_command(Some("nc %h %p"));
+        let draft = ChainDraft::prepare(&[bastion, web.clone()], &web);
+        let fault = draft.fault().expect("both routes are refused");
+        assert!(fault.contains("Nothing was connected"), "{fault}");
+        assert!(fault.contains("no command was run"), "{fault}");
+        assert!(draft.order().is_empty());
+        assert!(draft.into_request(PtySize::new(80, 24)).is_none());
     }
 }

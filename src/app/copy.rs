@@ -659,6 +659,42 @@ pub struct Strings {
     pub quick_save_inconsistent: &'static str,
     /// What to do when the saved hosts disagree.
     pub quick_save_inconsistent_next: &'static str,
+    /// Host dialog: heading of the ordered jump list.
+    pub host_jump_title: &'static str,
+    /// Host dialog: shown when the jump list is empty.
+    pub host_jump_empty: &'static str,
+    /// Host dialog: adds a saved host to the jump list.
+    pub host_jump_add: &'static str,
+    /// Host dialog: moves a jump earlier.
+    pub host_jump_up: &'static str,
+    /// Host dialog: moves a jump later.
+    pub host_jump_down: &'static str,
+    /// Host dialog: removes a jump.
+    pub host_jump_remove: &'static str,
+    /// Host dialog: label of the ProxyCommand field.
+    pub host_proxy_label: &'static str,
+    /// Host dialog: placeholder of the ProxyCommand field.
+    pub host_proxy_placeholder: &'static str,
+    /// Host dialog: the command is stored and not run from the form.
+    pub host_proxy_note: &'static str,
+    /// Host dialog: both a jump list and a ProxyCommand are set.
+    pub host_proxy_conflict: &'static str,
+    /// Connection form: the node the missing credentials belong to.
+    pub remote_asking_hop: &'static str,
+    /// Connection form: title of the ProxyCommand confirmation.
+    pub remote_proxy_title: &'static str,
+    /// Connection form: run the expanded ProxyCommand.
+    pub remote_proxy_confirm: &'static str,
+    /// Connection form: do not run the ProxyCommand.
+    pub remote_proxy_refuse: &'static str,
+    /// Import preview: label in front of a ProxyCommand.
+    pub import_proxy_label: &'static str,
+    /// Import preview: label in front of a jump hop.
+    pub import_jump_label: &'static str,
+    /// Import preview: label in front of a forwarding rule.
+    pub import_forward_label: &'static str,
+    /// Import: hosts were written and the forwarding file was not.
+    pub import_forwards_failed: &'static str,
 }
 
 /// English copy.
@@ -952,6 +988,24 @@ pub static ENGLISH: Strings = Strings {
     quick_save_unknown_next: "Save it as a new host, or check the host file. This session stays connected.",
     quick_save_inconsistent: "The saved hosts disagree with each other, so this one was not written.",
     quick_save_inconsistent_next: "Repair the host file, then save again. This session stays connected.",
+    host_jump_title: "Jump hosts",
+    host_jump_empty: "Direct connection. Add a saved host to reach this one through it.",
+    host_jump_add: "Add",
+    host_jump_up: "Move up",
+    host_jump_down: "Move down",
+    host_jump_remove: "Remove",
+    host_proxy_label: "Proxy command",
+    host_proxy_placeholder: "For example nc -X connect -x proxy:1080 %h %p",
+    host_proxy_note: "Stored as text. It runs only after you confirm the expanded command.",
+    host_proxy_conflict: "This host has both a jump chain and a ProxyCommand. Keep one before connecting.",
+    remote_asking_hop: "Sign in to",
+    remote_proxy_title: "Confirm ProxyCommand",
+    remote_proxy_confirm: "Run command",
+    remote_proxy_refuse: "Do not run",
+    import_proxy_label: "Proxy command",
+    import_jump_label: "Jump",
+    import_forward_label: "Forward",
+    import_forwards_failed: "Hosts were saved, but the forwarding rules were not written.",
 };
 
 /// Chinese copy.
@@ -1245,6 +1299,24 @@ pub static CHINESE: Strings = Strings {
     quick_save_unknown_next: "可以把它另存为一台新主机，或先检查主机文件。当前会话保持连接。",
     quick_save_inconsistent: "已保存的主机记录互相不一致，所以这一台没有写入。",
     quick_save_inconsistent_next: "先修好主机文件，再保存一次。当前会话保持连接。",
+    host_jump_title: "跳板主机",
+    host_jump_empty: "直接连接。添加已保存的主机，即可经它到达这一台。",
+    host_jump_add: "添加",
+    host_jump_up: "上移",
+    host_jump_down: "下移",
+    host_jump_remove: "移除",
+    host_proxy_label: "代理命令",
+    host_proxy_placeholder: "例如 nc -X connect -x proxy:1080 %h %p",
+    host_proxy_note: "只保存命令文本。展开后的命令需要你确认才会执行。",
+    host_proxy_conflict: "这台主机同时有跳板链和 ProxyCommand。连接前只保留一种。",
+    remote_asking_hop: "登录到",
+    remote_proxy_title: "确认代理命令",
+    remote_proxy_confirm: "运行命令",
+    remote_proxy_refuse: "不运行",
+    import_proxy_label: "代理命令",
+    import_jump_label: "跳板",
+    import_forward_label: "转发",
+    import_forwards_failed: "主机已保存，但转发规则没有写入。",
 };
 
 /// A count followed by its unit, in the grammar of the language.
@@ -1352,6 +1424,13 @@ pub fn next_step_text(english: &str, locale: Locale) -> &str {
                 "服务器拒绝分配终端；请换一个账号。"
             }
             "Connect again to open a new session." => "重新连接以打开新的会话。",
+            "Fix the jump chain or the ProxyCommand, then connect again." => {
+                "修正跳板链或 ProxyCommand，然后重新连接。"
+            }
+            "Connect again to start a new attempt." => "重新连接以开始一次新的尝试。",
+            "Confirm the command to run it, or remove the ProxyCommand from the host." => {
+                "确认后才会运行这条命令，或者从主机上去掉 ProxyCommand。"
+            }
             other => other,
         },
     }

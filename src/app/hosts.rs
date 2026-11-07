@@ -79,11 +79,13 @@ pub enum HostField {
     Secret,
     /// The command typed into the remote shell after connecting.
     StartupCommand,
+    /// The ProxyCommand template. Blank means none, and nothing is run from the form.
+    ProxyCommand,
 }
 
 impl HostField {
     /// Every field, in form order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Name,
         Self::Address,
         Self::Port,
@@ -92,6 +94,7 @@ impl HostField {
         Self::IdentityFile,
         Self::Secret,
         Self::StartupCommand,
+        Self::ProxyCommand,
     ];
 
     /// Label shown in front of the field.
@@ -105,6 +108,7 @@ impl HostField {
             Self::IdentityFile => strings.host_field_identity,
             Self::Secret => strings.auth_password,
             Self::StartupCommand => strings.host_startup_label,
+            Self::ProxyCommand => strings.host_proxy_label,
         }
     }
 
@@ -119,6 +123,7 @@ impl HostField {
             Self::IdentityFile => "hosts.field.identity",
             Self::Secret => "hosts.field.secret",
             Self::StartupCommand => "hosts.field.startup",
+            Self::ProxyCommand => "hosts.field.proxy",
         }
     }
 }
@@ -146,6 +151,10 @@ pub struct HostDraft {
     /// The secret typed in this form; empty means "keep what is saved".
     secret: String,
     startup: String,
+    /// Saved hosts to dial before this one, in order.
+    jumps: Vec<HostId>,
+    /// ProxyCommand template. Blank clears it and nothing is executed.
+    proxy: String,
 }
 
 impl HostDraft {
@@ -165,6 +174,8 @@ impl HostDraft {
             has_saved_secret: false,
             secret: String::new(),
             startup: String::new(),
+            jumps: Vec::new(),
+            proxy: String::new(),
         }
     }
 
@@ -190,6 +201,8 @@ impl HostDraft {
             has_saved_secret: host.remembers_secret(),
             secret: String::new(),
             startup: host.startup_command().unwrap_or_default().to_owned(),
+            jumps: host.jumps().to_vec(),
+            proxy: host.proxy_command().unwrap_or_default().to_owned(),
         }
     }
 
@@ -267,6 +280,7 @@ impl HostDraft {
             HostField::IdentityFile => &self.identity,
             HostField::Secret => &self.secret,
             HostField::StartupCommand => &self.startup,
+            HostField::ProxyCommand => &self.proxy,
         }
     }
 
@@ -281,6 +295,7 @@ impl HostDraft {
             HostField::IdentityFile => &mut self.identity,
             HostField::Secret => &mut self.secret,
             HostField::StartupCommand => &mut self.startup,
+            HostField::ProxyCommand => &mut self.proxy,
         };
         let text = text.into();
         if *slot == text {
@@ -315,6 +330,7 @@ impl HostDraft {
                 // the value is only ever the path to the key.
                 host.set_identity_file(self.identity_for_method());
                 self.apply_sign_in(&mut host);
+                self.apply_route(&mut host);
                 Ok(HostEdit::replace(host))
             }
             None => {
@@ -328,9 +344,60 @@ impl HostDraft {
                 host.set_group(Some(self.group.clone()));
                 host.set_identity_file(self.identity_for_method());
                 self.apply_sign_in(&mut host);
+                self.apply_route(&mut host);
                 Ok(HostEdit::create(host))
             }
         }
+    }
+
+    /// The jump hosts, in dial order.
+    #[must_use]
+    pub fn jumps(&self) -> &[HostId] {
+        &self.jumps
+    }
+
+    /// Adds a saved host to the end of the jump chain.
+    ///
+    /// The host being edited is not added, and a hop already in the list is not repeated.
+    pub fn add_jump(&mut self, id: HostId) -> bool {
+        if self.editing == Some(id) || self.jumps.contains(&id) {
+            return false;
+        }
+        self.jumps.push(id);
+        true
+    }
+
+    /// Removes the hop at `index`.
+    pub fn remove_jump(&mut self, index: usize) {
+        if index < self.jumps.len() {
+            self.jumps.remove(index);
+        }
+    }
+
+    /// Moves the hop at `index` one place up or down.
+    pub fn move_jump(&mut self, index: usize, up: bool) {
+        let Some(next) = (if up {
+            index.checked_sub(1)
+        } else {
+            index.checked_add(1)
+        }) else {
+            return;
+        };
+        if next < self.jumps.len() {
+            self.jumps.swap(index, next);
+        }
+    }
+
+    /// Whether the form currently asks for both a jump chain and a ProxyCommand.
+    #[must_use]
+    pub fn proxy_conflicts(&self) -> bool {
+        !self.jumps.is_empty() && !self.proxy.trim().is_empty()
+    }
+
+    /// Writes the jump chain and the ProxyCommand. A blank command clears it.
+    fn apply_route(&self, host: &mut HostConfig) {
+        host.set_jumps(self.jumps.iter().copied());
+        host.set_proxy_command(Some(self.proxy.clone()));
     }
 
     /// The key path to store: kept only for a method that reads a key file.
@@ -935,5 +1002,38 @@ mod tests {
             "each group starts where the previous one ended, so no two rows share an index"
         );
         assert!(group_row_offsets(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_draft_keeps_an_ordered_jump_chain_and_clears_a_blank_proxy_command() {
+        let bastion = host("bastion", "10.0.0.1", 22, "jump", None);
+        let second = host("edge", "10.0.0.3", 22, "jump", None);
+        let web = host("web", "10.0.0.2", 22, "deploy", None);
+        let mut draft = HostDraft::edit(&web);
+        assert!(draft.jumps().is_empty());
+        assert_eq!(draft.text(HostField::ProxyCommand), "");
+        assert!(draft.add_jump(bastion.id()));
+        assert!(draft.add_jump(second.id()));
+        assert!(!draft.add_jump(web.id()), "a host is not a jump to itself");
+        assert!(!draft.add_jump(bastion.id()), "a hop is listed once");
+        draft.move_jump(1, true);
+        assert_eq!(draft.jumps(), &[second.id(), bastion.id()]);
+        draft.set_text(HostField::ProxyCommand, "  nc %h %p  ");
+        assert!(draft.proxy_conflicts());
+        let edit = draft.build(Some(&web)).expect("the host is valid");
+        let saved = edit.host();
+        assert_eq!(saved.jumps(), &[second.id(), bastion.id()]);
+        assert_eq!(saved.proxy_command(), Some("nc %h %p"));
+
+        let mut again = HostDraft::edit(saved);
+        assert_eq!(again.jumps(), &[second.id(), bastion.id()]);
+        again.remove_jump(0);
+        again.set_text(HostField::ProxyCommand, "   ");
+        let cleared = again
+            .build(Some(saved))
+            .expect("clearing the command is valid");
+        assert_eq!(cleared.host().jumps(), &[bastion.id()]);
+        assert_eq!(cleared.host().proxy_command(), None);
+        assert!(!HostDraft::edit(cleared.host()).proxy_conflicts());
     }
 }
