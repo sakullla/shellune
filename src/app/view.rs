@@ -17,13 +17,13 @@ use gpui::{
     Window, div, px,
 };
 use shellune_core::{
-    BrowseState, EventTag, FileKind, HostConfig, HostId, LocalShell, Session, SessionFailure,
-    SessionId, SessionKind, SessionState, Transfer, join_path,
+    BrowseState, EventTag, FileKind, HostConfig, HostId, HostValidationError, LocalShell, Session,
+    SessionFailure, SessionId, SessionKind, SessionState, Transfer, join_path,
 };
 use shellune_ssh::{ConnectRequest, PtySize, RemoteEvent, RemoteSession};
 use shellune_storage::{
-    HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview, ImportedHost, SecretStore,
-    TrustStore,
+    BookError, HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview, ImportedHost,
+    SecretStore, StorageError, TrustStore,
 };
 use shellune_terminal::GridSize;
 
@@ -200,17 +200,21 @@ pub struct ShelluneView {
     quick_open: bool,
     /// Why the quick-connection form refused to start.
     quick_error: Option<String>,
-    /// The quick connection signs in with the system agent instead of a password.
-    quick_agent: bool,
-    /// Address, port, user and password of a connection that is not saved first.
+    /// The sign-in method the quick-connection form is set to.
+    quick_method: MethodChoice,
+    /// Address, port, user and the secret the chosen method still needs.
     quick_address: Entity<TextField>,
     quick_port: Entity<TextField>,
     quick_user: Entity<TextField>,
     quick_password: Entity<TextField>,
+    quick_key: Entity<TextField>,
+    quick_passphrase: Entity<TextField>,
     /// Host used by the next [`Self::connect_remote`] when it must not be saved yet.
     pending_ephemeral: Option<HostConfig>,
     /// Successful quick connections the user has not saved as hosts.
     unsaved: Vec<(SessionId, HostConfig)>,
+    /// The last explicit save of a quick connection, shown on the session bar.
+    quick_save_notice: Option<QuickSaveNotice>,
     /// The connection form is what the workspace is showing, instead of a terminal.
     showing_connection_form: bool,
     /// The ended session a new attempt restarts, when the form was opened by a
@@ -278,6 +282,14 @@ pub struct ShelluneView {
     /// Attempts a test scripted, kept so their answers can be inspected.
     #[cfg(test)]
     scripted: Vec<(SessionId, shellune_ssh::ScriptedSession)>,
+}
+
+/// The last explicit save of a quick connection, drawn on the session bar.
+#[derive(Clone)]
+struct QuickSaveNotice {
+    failed: bool,
+    reason: String,
+    next: String,
 }
 
 /// The three credential fields of the remote form.
@@ -385,6 +397,17 @@ impl ShelluneView {
             field.set_revealable(true, cx);
             field
         });
+        let quick_key = cx.new(|cx| {
+            let mut field = TextField::new(strings.auth_key, cx);
+            field.set_browse(Browse::File, cx);
+            field
+        });
+        let quick_passphrase = cx.new(|cx| {
+            let mut field = TextField::new(strings.auth_key_passphrase, cx);
+            field.set_masked(true, cx);
+            field.set_revealable(true, cx);
+            field
+        });
 
         let mut view = Self {
             workspace,
@@ -408,13 +431,16 @@ impl ShelluneView {
             form_session: None,
             quick_open: false,
             quick_error: None,
-            quick_agent: false,
+            quick_method: MethodChoice::Password,
             quick_address,
             quick_port,
             quick_user,
             quick_password,
+            quick_key,
+            quick_passphrase,
             pending_ephemeral: None,
             unsaved: Vec::new(),
+            quick_save_notice: None,
             showing_connection_form: false,
             reconnect: None,
             remote_fields: RemoteFields {
@@ -1903,26 +1929,23 @@ impl ShelluneView {
     /// Fills the connection form from the quick-connection fields.
     ///
     /// Nothing is written to the host file. Missing fields stay on the form with a
-    /// reason, and what was typed is kept.
+    /// reason, and what was typed is kept. The chosen method is the only one whose
+    /// secret is collected.
     pub(crate) fn prepare_quick_connection(&mut self, cx: &mut Context<Self>) -> bool {
         let strings = self.strings();
         let address = self.quick_address.read(cx).text().trim().to_owned();
         let port_text = self.quick_port.read(cx).text().trim().to_owned();
         let user = self.quick_user.read(cx).text().trim().to_owned();
         let password = self.quick_password.read(cx).text().to_owned();
+        let key_path = self.quick_key.read(cx).text().trim().to_owned();
+        let passphrase = self.quick_passphrase.read(cx).text().to_owned();
         let port = match port_text.parse::<u16>() {
             Ok(port) if port != 0 => port,
             _ => {
-                self.quick_error = Some(strings.host_field_port.to_owned());
-                cx.notify();
+                self.refuse_quick(quick_port_reason(&port_text, strings), cx);
                 return false;
             }
         };
-        if !self.quick_agent && password.is_empty() {
-            self.quick_error = Some(strings.auth_missing_password.to_owned());
-            cx.notify();
-            return false;
-        }
         let name = if user.is_empty() {
             address.clone()
         } else {
@@ -1931,25 +1954,28 @@ impl ShelluneView {
         let mut host = match HostConfig::new(name, address, port, user) {
             Ok(host) => host,
             Err(error) => {
-                self.quick_error = Some(error.to_string());
-                cx.notify();
+                self.refuse_quick(quick_host_reason(&error, strings), cx);
                 return false;
             }
         };
-        if self.quick_agent {
-            host.set_auth(Some(shellune_core::AuthMethodKind::Agent));
-        } else {
-            host.set_auth(Some(shellune_core::AuthMethodKind::Password));
+        let method = self.quick_method;
+        if let Some(reason) = quick_auth_gap(method, &password, &key_path, &passphrase, strings) {
+            self.refuse_quick(reason, cx);
+            return false;
         }
+        apply_quick_auth(&mut host, method, &key_path);
         self.stash_focused_panel();
         self.reconnect = None;
         self.form_session = None;
         let mut panel = RemotePanel::new(&host);
-        if self.quick_agent {
-            panel.select_method(MethodChoice::Agent);
-        } else {
-            panel.select_method(MethodChoice::Password);
-            panel.set_password(password);
+        match method {
+            MethodChoice::Password => panel.set_password(password),
+            MethodChoice::KeyFile => panel.set_key_path(key_path),
+            MethodChoice::EncryptedKeyFile => {
+                panel.set_key_path(key_path);
+                panel.set_passphrase(passphrase);
+            }
+            MethodChoice::Agent => {}
         }
         self.pending_ephemeral = Some(host);
         self.remote = Some(panel);
@@ -1958,6 +1984,12 @@ impl ShelluneView {
         self.sync_remote_fields(cx);
         cx.notify();
         true
+    }
+
+    /// Keeps a refusal on the quick-connection form.
+    fn refuse_quick(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.quick_error = Some(reason);
+        cx.notify();
     }
 
     /// Writes a quick connection's host, and only then.
@@ -1969,9 +2001,15 @@ impl ShelluneView {
             return;
         };
         let host = self.unsaved[index].1.clone();
+        let strings = self.strings();
         let mut next = self.book.clone();
         if let Err(error) = next.insert(host.clone()) {
-            self.hosts.set_message(error.to_string(), true);
+            let (reason, next_step) = quick_book_failure(&error, strings);
+            self.quick_save_notice = Some(QuickSaveNotice {
+                failed: true,
+                reason,
+                next: next_step,
+            });
             cx.notify();
             return;
         }
@@ -1982,10 +2020,20 @@ impl ShelluneView {
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
                 self.unsaved.remove(index);
                 self.record_host_connection(host.id(), remote::now_unix(), cx);
-                self.hosts
-                    .set_message(self.strings().quick_saved.to_owned(), false);
+                self.quick_save_notice = Some(QuickSaveNotice {
+                    failed: false,
+                    reason: strings.quick_saved.to_owned(),
+                    next: strings.quick_saved_next.to_owned(),
+                });
             }
-            Err(error) => self.hosts.set_message(error.to_string(), true),
+            Err(error) => {
+                let (reason, next_step) = quick_storage_failure(&error, strings);
+                self.quick_save_notice = Some(QuickSaveNotice {
+                    failed: true,
+                    reason,
+                    next: next_step,
+                });
+            }
         }
         cx.notify();
     }
@@ -2612,6 +2660,38 @@ impl ShelluneView {
             .unwrap_or_default()
     }
 
+    /// Whether the quick-connection form is open.
+    #[cfg(test)]
+    pub(crate) fn quick_form_open(&self) -> bool {
+        self.quick_open
+    }
+
+    /// Why the quick-connection form refused to dial, when it did.
+    #[cfg(test)]
+    pub(crate) fn quick_refusal(&self) -> Option<&str> {
+        self.quick_error.as_deref()
+    }
+
+    /// The address still in the quick-connection form.
+    #[cfg(test)]
+    pub(crate) fn quick_address_text(&self, cx: &gpui::App) -> String {
+        self.quick_address.read(cx).text().to_owned()
+    }
+
+    /// The user still in the quick-connection form.
+    #[cfg(test)]
+    pub(crate) fn quick_user_text(&self, cx: &gpui::App) -> String {
+        self.quick_user.read(cx).text().to_owned()
+    }
+
+    /// The last save-as-host result: failed, reason, next step.
+    #[cfg(test)]
+    pub(crate) fn quick_save_report(&self) -> Option<(bool, String, String)> {
+        self.quick_save_notice
+            .as_ref()
+            .map(|notice| (notice.failed, notice.reason.clone(), notice.next.clone()))
+    }
+
     /// How many connection attempts still have a transport.
     #[cfg(test)]
     pub(crate) fn pending_attempt_count(&self) -> usize {
@@ -2977,30 +3057,46 @@ impl ShelluneView {
                         self.quick_user.clone(),
                     ))),
             );
-        if !self.quick_agent {
+        let method = self.quick_method;
+        let mut methods = components::segmented(metrics);
+        for choice in MethodChoice::ALL {
+            let selected = choice == method;
+            let selector = quick_method_selector(choice);
+            methods = methods.child(
+                components::segment(choice.label(strings), selected, metrics)
+                    .id(("quick.method", choice as usize))
+                    .debug_selector(move || selector.to_owned())
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.quick_method = choice;
+                        this.quick_error = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        card = card
+            .child(div().flex().child(methods))
+            .child(caption_line(method.hint(strings).to_owned(), metrics));
+        if method.needs_password() {
             card = card.child(self.remote_field(
                 SharedString::from("quick.password"),
                 strings.auth_password,
                 self.quick_password.clone(),
             ));
         }
-        card = card.child(
-            self.text_button(
-                SharedString::from("quick.agent"),
-                strings.auth_agent,
-                if self.quick_agent {
-                    Variant::Primary
-                } else {
-                    Variant::Secondary
-                },
-                cx,
-                |view, cx| {
-                    view.quick_agent = !view.quick_agent;
-                    cx.notify();
-                },
-            )
-            .debug_selector(|| "quick.agent".to_owned()),
-        );
+        if method.needs_key_path() {
+            card = card.child(self.remote_field(
+                SharedString::from("quick.key"),
+                strings.auth_key,
+                self.quick_key.clone(),
+            ));
+        }
+        if method.needs_passphrase() {
+            card = card.child(self.remote_field(
+                SharedString::from("quick.passphrase"),
+                strings.auth_key_passphrase,
+                self.quick_passphrase.clone(),
+            ));
+        }
         if let Some(reason) = &self.quick_error {
             card = card.child(
                 div()
@@ -5622,6 +5718,9 @@ impl ShelluneView {
                     .px(metrics.scale(spacing::LOOSE))
                     .py(metrics.scale(spacing::LOOSE))
                     .gap(metrics.panel_gap())
+                    // A session list is neither a terminal nor the empty welcome, and
+                    // the form still has to appear on the page the user is already on.
+                    .children(self.quick_open.then(|| self.quick_panel(cx)))
                     .child(body),
             )
     }
@@ -7585,107 +7684,142 @@ impl ShelluneView {
             )
         });
 
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_none()
-            .gap(metrics.scale(spacing::TIGHT))
-            .h(metrics.session_bar_height())
-            .pl(metrics.scale(spacing::BASE - 2.0))
-            .pr(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(palette::CANVAS))
-            .border_b_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .debug_selector(|| "session.bar".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .min_w(px(0.0))
-                    .child(components::kind_badge(
-                        kind_label,
-                        kind == PaneKind::Remote,
-                        metrics,
-                    ))
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(metrics.scale(240.0))
-                            .truncate()
-                            .text_size(metrics.label_size())
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .debug_selector(|| "session.identity".to_owned())
-                            .child(SharedString::from(format!(
-                                "{} · {}",
-                                strings.workspace_current,
-                                session.title()
-                            ))),
-                    )
-                    .children(target.map(|target| {
-                        div()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .font_family(terminal::monospace_family())
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(target))
-                    }))
-                    .child(components::chip(state_label, tone, metrics))
-                    .children(
-                        self.unsaved
-                            .iter()
-                            .find(|(session, _)| *session == id)
-                            .map(|_| {
+        let row =
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .flex_none()
+                .gap(metrics.scale(spacing::TIGHT))
+                .h(metrics.session_bar_height())
+                .pl(metrics.scale(spacing::BASE - 2.0))
+                .pr(metrics.scale(spacing::TIGHT))
+                .bg(theme::swatch(palette::CANVAS))
+                .border_b_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .debug_selector(|| "session.bar".to_owned())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .min_w(px(0.0))
+                        .child(components::kind_badge(
+                            kind_label,
+                            kind == PaneKind::Remote,
+                            metrics,
+                        ))
+                        .child(
+                            div()
+                                .flex_none()
+                                .max_w(metrics.scale(240.0))
+                                .truncate()
+                                .text_size(metrics.label_size())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .debug_selector(|| "session.identity".to_owned())
+                                .child(SharedString::from(format!(
+                                    "{} · {}",
+                                    strings.workspace_current,
+                                    session.title()
+                                ))),
+                        )
+                        .children(target.map(|target| {
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .font_family(terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(SharedString::from(target))
+                        }))
+                        .child(components::chip(state_label, tone, metrics))
+                        .children(self.unsaved.iter().find(|(session, _)| *session == id).map(
+                            |_| {
                                 div()
                                     .flex_none()
                                     .truncate()
                                     .text_size(metrics.caption_size())
                                     .text_color(theme::swatch(palette::TEXT_MUTED))
                                     .child(strings.quick_unsaved_note)
-                            }),
-                    ),
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .when_some(files_button, |row, button| row.child(button))
+                        .when(can_reconnect, |row| {
+                            row.child(self.icon_text_button(
+                                SharedString::from("session.reconnect"),
+                                Icon::Refresh,
+                                strings.session_reconnect,
+                                Variant::Primary,
+                                cx,
+                                move |view, cx| view.reconnect_session(id, cx),
+                            ))
+                        })
+                        .when(
+                            self.unsaved.iter().any(|(session, _)| *session == id),
+                            |row| {
+                                row.child(self.icon_text_button(
+                                    SharedString::from("session.save_host"),
+                                    Icon::Server,
+                                    strings.quick_save_host,
+                                    Variant::Primary,
+                                    cx,
+                                    move |view, cx| view.save_quick_host(id, cx),
+                                ))
+                            },
+                        )
+                        .child(self.icon_text_button(
+                            SharedString::from("session.close"),
+                            Icon::Close,
+                            strings.session_close,
+                            Variant::Ghost,
+                            cx,
+                            move |view, cx| view.request_close_session(id, cx),
+                        )),
+                );
+        let notice = self.quick_save_notice.clone();
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .child(row)
+            .children(notice.map(|notice| self.quick_save_banner(&notice)))
+    }
+
+    /// The save result, on the session bar that holds the save button.
+    fn quick_save_banner(&self, notice: &QuickSaveNotice) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let tone = if notice.failed {
+            Tone::Danger
+        } else {
+            Tone::Positive
+        };
+        components::banner(tone, metrics)
+            .debug_selector(|| "session.save.notice".to_owned())
+            .child(
+                div()
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "session.save.reason".to_owned())
+                    .child(SharedString::from(notice.reason.clone())),
             )
             .child(
                 div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .when_some(files_button, |row, button| row.child(button))
-                    .when(can_reconnect, |row| {
-                        row.child(self.icon_text_button(
-                            SharedString::from("session.reconnect"),
-                            Icon::Refresh,
-                            strings.session_reconnect,
-                            Variant::Primary,
-                            cx,
-                            move |view, cx| view.reconnect_session(id, cx),
-                        ))
-                    })
-                    .when(
-                        self.unsaved.iter().any(|(session, _)| *session == id),
-                        |row| {
-                            row.child(self.icon_text_button(
-                                SharedString::from("session.save_host"),
-                                Icon::Server,
-                                strings.quick_save_host,
-                                Variant::Primary,
-                                cx,
-                                move |view, cx| view.save_quick_host(id, cx),
-                            ))
-                        },
-                    )
-                    .child(self.icon_text_button(
-                        SharedString::from("session.close"),
-                        Icon::Close,
-                        strings.session_close,
-                        Variant::Ghost,
-                        cx,
-                        move |view, cx| view.request_close_session(id, cx),
-                    )),
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "session.save.next".to_owned())
+                    .child(SharedString::from(format!(
+                        "{}: {}",
+                        strings.next_step, notice.next
+                    ))),
             )
     }
 
@@ -8053,6 +8187,107 @@ impl Render for ShelluneView {
                     .children(self.close_transfer_question(cx))
                     .child(self.destination_panel(cx)),
             )
+    }
+}
+
+/// Why a port the quick form cannot dial, naming the field to change.
+fn quick_port_reason(entered: &str, strings: &Strings) -> String {
+    let shown = if entered.is_empty() {
+        strings.quick_port_blank
+    } else {
+        entered
+    };
+    format!(
+        "{} ({}). {}",
+        strings.quick_port_invalid, shown, strings.quick_fix_port
+    )
+}
+
+/// Why [`HostConfig::new`] refused the quick form, in the current language.
+///
+/// The domain error's English text is not shown: each variant names the field.
+fn quick_host_reason(error: &HostValidationError, strings: &Strings) -> String {
+    match error {
+        HostValidationError::EmptyName => strings.quick_invalid_name.to_owned(),
+        HostValidationError::EmptyAddress => strings.quick_invalid_address.to_owned(),
+        HostValidationError::AddressContainsWhitespace => {
+            strings.quick_invalid_address_space.to_owned()
+        }
+        HostValidationError::EmptyUser => strings.quick_invalid_user.to_owned(),
+        HostValidationError::PortOutOfRange { value } => {
+            format!(
+                "{} ({}). {}",
+                strings.quick_port_invalid, value, strings.quick_fix_port
+            )
+        }
+    }
+}
+
+/// The secret the chosen method still lacks, or nothing when it can dial.
+fn quick_auth_gap(
+    method: MethodChoice,
+    password: &str,
+    key_path: &str,
+    passphrase: &str,
+    strings: &Strings,
+) -> Option<String> {
+    match method {
+        MethodChoice::Password if password.is_empty() => {
+            Some(strings.auth_missing_password.to_owned())
+        }
+        MethodChoice::KeyFile | MethodChoice::EncryptedKeyFile if key_path.is_empty() => {
+            Some(strings.auth_missing_key.to_owned())
+        }
+        MethodChoice::EncryptedKeyFile if passphrase.is_empty() => {
+            Some(strings.auth_missing_passphrase.to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Records the method on the unsaved host. A key path is not a secret; a password
+/// or passphrase is never written here.
+fn apply_quick_auth(host: &mut HostConfig, method: MethodChoice, key_path: &str) {
+    host.set_auth(Some(method.kind()));
+    if method.needs_key_path() {
+        host.set_identity_file(Some(key_path));
+    }
+}
+
+/// Localized reason and next step when the host book refuses the save.
+fn quick_book_failure(error: &BookError, strings: &Strings) -> (String, String) {
+    match error {
+        BookError::DuplicateHost { .. } => (
+            strings.quick_save_duplicate.to_owned(),
+            strings.quick_save_duplicate_next.to_owned(),
+        ),
+        BookError::UnknownHost { .. } => (
+            strings.quick_save_unknown.to_owned(),
+            strings.quick_save_unknown_next.to_owned(),
+        ),
+        BookError::Inconsistent { .. } => (
+            strings.quick_save_inconsistent.to_owned(),
+            strings.quick_save_inconsistent_next.to_owned(),
+        ),
+    }
+}
+
+/// Localized reason and next step when the host file cannot be written.
+fn quick_storage_failure(error: &StorageError, strings: &Strings) -> (String, String) {
+    let reason = match error.path() {
+        Some(path) => format!("{} ({})", strings.quick_save_write_failed, path.display()),
+        None => strings.quick_save_write_failed.to_owned(),
+    };
+    (reason, strings.quick_save_write_next.to_owned())
+}
+
+/// Debug selector of one quick-connection method, distinct from the remote form.
+fn quick_method_selector(choice: MethodChoice) -> &'static str {
+    match choice {
+        MethodChoice::Password => "quick.method.password",
+        MethodChoice::KeyFile => "quick.method.key",
+        MethodChoice::EncryptedKeyFile => "quick.method.key-passphrase",
+        MethodChoice::Agent => "quick.method.agent",
     }
 }
 

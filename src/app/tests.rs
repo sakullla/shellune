@@ -766,6 +766,22 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             attempt_cancel,
             palette_group_recent,
             workspace_current,
+            quick_port_invalid,
+            quick_port_blank,
+            quick_fix_port,
+            quick_invalid_name,
+            quick_invalid_address,
+            quick_invalid_address_space,
+            quick_invalid_user,
+            quick_saved_next,
+            quick_save_write_failed,
+            quick_save_write_next,
+            quick_save_duplicate,
+            quick_save_duplicate_next,
+            quick_save_unknown,
+            quick_save_unknown_next,
+            quick_save_inconsistent,
+            quick_save_inconsistent_next,
             sidebar_collapse,
             sidebar_expand,
             host_auth_title,
@@ -7195,6 +7211,22 @@ async fn a_quick_connection_can_be_saved_as_a_host_afterwards(cx: &mut TestAppCo
     assert!(cx.debug_bounds("session.identity").is_some());
     click(cx, "session.save_host");
 
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    assert!(
+        cx.debug_bounds("session.save.reason").is_some(),
+        "saving states the result on the session bar"
+    );
+    assert!(
+        cx.debug_bounds("session.save.next").is_some(),
+        "saving states the next step on the session bar"
+    );
+    let (failed, reason, next) = cx
+        .update(|_window, app| view.read(app).quick_save_report())
+        .expect("the session bar keeps the save result");
+    assert!(!failed);
+    assert_eq!(reason, ENGLISH.quick_saved);
+    assert_eq!(next, ENGLISH.quick_saved_next);
+
     let saved = cx.update(|_window, app| view.read(app).book().hosts().to_vec());
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].address(), "203.0.113.10");
@@ -7209,6 +7241,346 @@ async fn a_quick_connection_can_be_saved_as_a_host_afterwards(cx: &mut TestAppCo
     assert!(
         !written.contains("s3cret-quick"),
         "the password stays out of the host file"
+    );
+}
+
+#[gpui::test]
+async fn quick_connect_opens_on_the_sessions_list(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "nav.sessions");
+    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    assert!(
+        cx.debug_bounds("quick.panel").is_none(),
+        "the sessions list does not show the form until it is asked for"
+    );
+
+    click(cx, "shell.menu");
+    click(cx, "menu.quick");
+    assert_eq!(
+        destination_of(&view, cx),
+        Destination::Sessions,
+        "opening quick connect stays on the sessions list"
+    );
+    assert!(cx.debug_bounds("quick.panel").is_some());
+    assert!(cx.debug_bounds("quick.address").is_some());
+    assert!(cx.update(|_window, app| view.read(app).quick_form_open()));
+
+    click(cx, "quick.close");
+    assert!(!cx.update(|_window, app| view.read(app).quick_form_open()));
+
+    click(cx, "palette.open");
+    cx.simulate_input("Quick connect");
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert_eq!(
+        titles.first().map(String::as_str),
+        Some(ENGLISH.quick_connect),
+        "the palette offers quick connect, got {titles:?}"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    assert!(cx.update(|_window, app| view.read(app).quick_form_open()));
+    assert!(
+        cx.debug_bounds("quick.panel").is_some(),
+        "the command palette mounts the form on the sessions list"
+    );
+    assert!(cx.debug_bounds("quick.address").is_some());
+}
+
+#[gpui::test]
+async fn quick_connect_names_the_field_when_input_is_rejected(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "welcome.quick");
+    type_into(cx, "quick.address", "example.com");
+    type_into(cx, "quick.user", "ada");
+    type_into(cx, "quick.password", "secret");
+    clear_field(cx, "quick.port", 2);
+    type_into(cx, "quick.port", "0");
+    click(cx, "quick.connect");
+
+    let reason = cx
+        .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
+        .expect("a bad port is refused before dialling");
+    assert_eq!(
+        reason,
+        format!(
+            "{} (0). {}",
+            ENGLISH.quick_port_invalid, ENGLISH.quick_fix_port
+        )
+    );
+    assert_ne!(reason, ENGLISH.host_field_port);
+    assert!(!reason.contains("outside the valid range"), "{reason}");
+    assert!(cx.debug_bounds("quick.error").is_some());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.update(app, |view, cx| view.quick_address_text(cx))),
+        "example.com",
+        "the address that was typed stays in the form"
+    );
+
+    clear_field(cx, "quick.port", 1);
+    type_into(cx, "quick.port", "abc");
+    click(cx, "quick.connect");
+    let reason = cx
+        .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
+        .expect("an unparseable port is refused");
+    assert_eq!(
+        reason,
+        format!(
+            "{} (abc). {}",
+            ENGLISH.quick_port_invalid, ENGLISH.quick_fix_port
+        )
+    );
+
+    click(cx, "status.language");
+    click(cx, "quick.connect");
+    let reason = cx
+        .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
+        .expect("the Chinese form explains the port");
+    assert_eq!(
+        reason,
+        format!(
+            "{} (abc). {}",
+            CHINESE.quick_port_invalid, CHINESE.quick_fix_port
+        )
+    );
+    assert_ne!(reason, CHINESE.host_field_port);
+    assert!(
+        reason
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    );
+    assert!(!reason.contains("outside the valid range"), "{reason}");
+
+    clear_field(cx, "quick.port", 3);
+    type_into(cx, "quick.port", "22");
+    clear_field(cx, "quick.user", 3);
+    click(cx, "quick.connect");
+    let reason = cx
+        .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
+        .expect("an empty user is refused");
+    assert_eq!(reason, CHINESE.quick_invalid_user);
+    assert!(!reason.contains("user name cannot be empty"), "{reason}");
+    assert_eq!(
+        cx.update(|_window, app| view.update(app, |view, cx| view.quick_user_text(cx))),
+        ""
+    );
+
+    click(cx, "status.language");
+    click(cx, "quick.connect");
+    let reason = cx
+        .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
+        .expect("the English form explains the user field");
+    assert_eq!(reason, ENGLISH.quick_invalid_user);
+    assert!(!reason.contains("user name cannot be empty"), "{reason}");
+
+    type_into(cx, "quick.user", "ada");
+    clear_field(cx, "quick.address", "example.com".len());
+    type_into(cx, "quick.address", "bad host");
+    click(cx, "quick.connect");
+    let reason = cx
+        .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
+        .expect("a spaced address is refused");
+    assert_eq!(reason, ENGLISH.quick_invalid_address_space);
+    assert!(
+        !reason.contains("host address cannot contain whitespace"),
+        "{reason}"
+    );
+
+    click(cx, "status.language");
+    click(cx, "quick.connect");
+    let reason = cx
+        .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
+        .expect("the Chinese form explains the address");
+    assert_eq!(reason, CHINESE.quick_invalid_address_space);
+    assert!(
+        !reason.contains("host address cannot contain whitespace"),
+        "{reason}"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.update(app, |view, cx| view.quick_address_text(cx))),
+        "bad host"
+    );
+}
+
+#[gpui::test]
+async fn quick_connect_dials_with_a_key_before_saving(cx: &mut TestAppContext) {
+    let dir = TempDir::new("quick-key");
+    seed(&dir.store(), Vec::new());
+    let file = dir.path().join(shellune_storage::FILE_NAME);
+    let before = std::fs::read(&file).expect("the empty host file");
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "welcome.quick");
+    assert!(cx.debug_bounds("quick.method.password").is_some());
+    assert!(cx.debug_bounds("quick.method.key").is_some());
+    assert!(cx.debug_bounds("quick.method.key-passphrase").is_some());
+    assert!(cx.debug_bounds("quick.method.agent").is_some());
+    assert!(
+        cx.debug_bounds("quick.key").is_none(),
+        "a password method does not ask for a key path"
+    );
+    assert!(cx.debug_bounds("quick.passphrase").is_none());
+
+    click(cx, "quick.method.key");
+    assert!(cx.debug_bounds("quick.key").is_some());
+    click(cx, "quick.method.key-passphrase");
+    assert!(
+        cx.debug_bounds("quick.passphrase").is_some(),
+        "an encrypted key asks for its passphrase"
+    );
+
+    let key_path = "C:/keys/quick-only";
+    type_into(cx, "quick.address", "127.0.0.1");
+    clear_field(cx, "quick.port", 2);
+    type_into(cx, "quick.port", "1");
+    type_into(cx, "quick.user", "ada");
+    type_into(cx, "quick.key", key_path);
+    click(cx, "quick.connect");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).quick_refusal().map(str::to_owned)),
+        Some(ENGLISH.auth_missing_passphrase.to_owned())
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0
+    );
+
+    click(cx, "quick.method.key");
+    clear_field(cx, "quick.key", key_path.len());
+    click(cx, "quick.connect");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).quick_refusal().map(str::to_owned)),
+        Some(ENGLISH.auth_missing_key.to_owned())
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "a missing key path does not dial"
+    );
+
+    type_into(cx, "quick.key", key_path);
+    click(cx, "quick.connect");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        1,
+        "a key file dials without a password, an agent or a saved host"
+    );
+    assert!(cx.update(|_window, app| view.read(app).quick_refusal().is_none()));
+    assert!(cx.update(|_window, app| view.read(app).book().hosts().is_empty()));
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    let after = std::fs::read(&file).expect("the host file is still there");
+    assert_eq!(
+        after, before,
+        "connecting with a key does not save the host"
+    );
+    assert!(!String::from_utf8_lossy(&after).contains(key_path));
+    cx.update(|_window, app| {
+        let panel = view
+            .read(app)
+            .remote_state()
+            .expect("the attempt keeps its form");
+        assert_eq!(panel.method(), MethodChoice::KeyFile);
+        assert_eq!(
+            panel.host().auth(),
+            Some(shellune_core::AuthMethodKind::KeyFile)
+        );
+        assert_eq!(panel.host().identity_file(), Some(key_path));
+        assert!(!panel.host().remembers_secret());
+    });
+}
+
+#[gpui::test]
+async fn saving_a_quick_host_shows_a_write_failure_on_the_session_bar(cx: &mut TestAppContext) {
+    let dir = TempDir::new("quick-save-fail");
+    let blocked = dir.path().join("store-blocked");
+    std::fs::write(&blocked, b"not-a-directory").expect("the blocked store path");
+    let store = HostStore::at(&blocked);
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "welcome.quick");
+    type_into(cx, "quick.address", "203.0.113.20");
+    type_into(cx, "quick.user", "ada");
+    type_into(cx, "quick.password", "s3cret-fail");
+    let prepared =
+        cx.update(|_window, app| view.update(app, |view, cx| view.prepare_quick_connection(cx)));
+    assert!(prepared, "the quick-connection fields are complete");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("session.save_host").is_some());
+    click(cx, "status.language");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese
+    );
+    click(cx, "session.save_host");
+
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    assert!(
+        cx.debug_bounds("session.save.reason").is_some(),
+        "a failed save states the reason on the session bar"
+    );
+    assert!(
+        cx.debug_bounds("session.save.next").is_some(),
+        "a failed save states the next step on the session bar"
+    );
+    assert!(
+        cx.debug_bounds("session.save_host").is_some(),
+        "the save button stays when the file was not written"
+    );
+    let (failed, reason, next) = cx
+        .update(|_window, app| view.read(app).quick_save_report())
+        .expect("the session bar keeps the failure");
+    assert!(failed);
+    assert!(
+        reason.starts_with(CHINESE.quick_save_write_failed),
+        "{reason}"
+    );
+    assert!(
+        reason
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+    );
+    assert!(!reason.contains("could not"), "{reason}");
+    assert_eq!(next, CHINESE.quick_save_write_next);
+    assert!(cx.update(|_window, app| view.read(app).book().hosts().is_empty()));
+    assert_eq!(
+        std::fs::read(&blocked).expect("the blocked path is unchanged"),
+        b"not-a-directory"
     );
 }
 

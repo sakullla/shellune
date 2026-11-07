@@ -627,6 +627,38 @@ pub struct Strings {
     pub palette_group_recent: &'static str,
     /// Label of the current session in the identity bar.
     pub workspace_current: &'static str,
+    /// Quick connect: the port is not a number from 1 to 65535.
+    pub quick_port_invalid: &'static str,
+    /// Quick connect: what to show when the port field is blank.
+    pub quick_port_blank: &'static str,
+    /// Quick connect: the port field is the one to change.
+    pub quick_fix_port: &'static str,
+    /// Quick connect: a blank address left the connection with no name.
+    pub quick_invalid_name: &'static str,
+    /// Quick connect: the address field is empty.
+    pub quick_invalid_address: &'static str,
+    /// Quick connect: the address field contains whitespace.
+    pub quick_invalid_address_space: &'static str,
+    /// Quick connect: the user field is empty.
+    pub quick_invalid_user: &'static str,
+    /// Shown after a quick connection was saved, as the next step.
+    pub quick_saved_next: &'static str,
+    /// The host file could not be written while saving a quick connection.
+    pub quick_save_write_failed: &'static str,
+    /// What to do after that write failed.
+    pub quick_save_write_next: &'static str,
+    /// A quick connection's identifier is already a saved host.
+    pub quick_save_duplicate: &'static str,
+    /// What to do when that identifier is already saved.
+    pub quick_save_duplicate_next: &'static str,
+    /// The host to update is not in the file.
+    pub quick_save_unknown: &'static str,
+    /// What to do when the host is not in the file.
+    pub quick_save_unknown_next: &'static str,
+    /// The saved hosts disagree, so this one was not written.
+    pub quick_save_inconsistent: &'static str,
+    /// What to do when the saved hosts disagree.
+    pub quick_save_inconsistent_next: &'static str,
 }
 
 /// English copy.
@@ -904,6 +936,22 @@ pub static ENGLISH: Strings = Strings {
     attempt_cancel: "Cancel",
     palette_group_recent: "Recent connections",
     workspace_current: "Current",
+    quick_port_invalid: "The port is not a whole number from 1 to 65535",
+    quick_port_blank: "empty",
+    quick_fix_port: "Change the Port field.",
+    quick_invalid_name: "The address is empty, so this connection has no name. Change the Address field.",
+    quick_invalid_address: "The address is empty. Change the Address field.",
+    quick_invalid_address_space: "The address contains a space. Change the Address field so it has none.",
+    quick_invalid_user: "The user name is empty. Change the User field.",
+    quick_saved_next: "Open it later from the host list. This session stays connected.",
+    quick_save_write_failed: "The host file could not be written, so this connection was not saved.",
+    quick_save_write_next: "This session stays connected. Make the host file writable, then save again.",
+    quick_save_duplicate: "A host with this identifier is already saved, so nothing was written.",
+    quick_save_duplicate_next: "Open that saved host to change it, or leave this connection unsaved.",
+    quick_save_unknown: "That host is not in the saved file, so it could not be updated.",
+    quick_save_unknown_next: "Save it as a new host, or check the host file. This session stays connected.",
+    quick_save_inconsistent: "The saved hosts disagree with each other, so this one was not written.",
+    quick_save_inconsistent_next: "Repair the host file, then save again. This session stays connected.",
 };
 
 /// Chinese copy.
@@ -1181,6 +1229,22 @@ pub static CHINESE: Strings = Strings {
     attempt_cancel: "取消",
     palette_group_recent: "最近连接",
     workspace_current: "当前",
+    quick_port_invalid: "端口必须是 1 到 65535 的整数",
+    quick_port_blank: "空的",
+    quick_fix_port: "请修改端口这一栏。",
+    quick_invalid_name: "地址是空的，这次连接没有名称。请修改地址这一栏。",
+    quick_invalid_address: "地址是空的。请修改地址这一栏。",
+    quick_invalid_address_space: "地址里含有空格。请修改地址这一栏，去掉其中的空格。",
+    quick_invalid_user: "用户名是空的。请修改用户这一栏。",
+    quick_saved_next: "之后可以从主机列表再次打开。当前会话保持连接。",
+    quick_save_write_failed: "主机文件没有写入，所以这次连接没有保存成主机。",
+    quick_save_write_next: "当前会话保持连接。让主机文件可以写入后，再保存一次。",
+    quick_save_duplicate: "已经有一台主机使用了这个标识，所以没有再写入。",
+    quick_save_duplicate_next: "打开已保存的那台主机再修改，或者让这次连接保持未保存。",
+    quick_save_unknown: "主机文件里没有这一台，所以无法更新它。",
+    quick_save_unknown_next: "可以把它另存为一台新主机，或先检查主机文件。当前会话保持连接。",
+    quick_save_inconsistent: "已保存的主机记录互相不一致，所以这一台没有写入。",
+    quick_save_inconsistent_next: "先修好主机文件，再保存一次。当前会话保持连接。",
 };
 
 /// A count followed by its unit, in the grammar of the language.
