@@ -1449,8 +1449,7 @@ impl ShelluneView {
     /// Clearing a mark does not connect the pane.
     fn recheck_open_hosts(&mut self) {
         let ids: Vec<HostId> = self.book.hosts().iter().map(HostConfig::id).collect();
-        self.workspace
-            .recheck_layout_hosts(|id| ids.contains(&id));
+        self.workspace.recheck_layout_hosts(|id| ids.contains(&id));
     }
 
     /// Opens an empty form for a new host.
@@ -2926,13 +2925,18 @@ impl ShelluneView {
         let grid = GridSize::initial();
         let font_size = self.workspace.local_font_size();
         let locale = self.workspace.locale();
-        let pane = cx.new(|pane_cx| match link {
-            AttemptLink::Remote(session) => {
-                TerminalPane::start_remote(session, tag, target, grid, font_size, locale, pane_cx)
-            }
-            AttemptLink::Chain(session) => {
-                TerminalPane::start_chain(session, tag, target, grid, font_size, locale, pane_cx)
-            }
+        let mode = self.workspace.layout().session_mode(id);
+        let pane = cx.new(move |pane_cx| {
+            let mut pane = match link {
+                AttemptLink::Remote(session) => TerminalPane::start_remote(
+                    session, tag, target, grid, font_size, locale, pane_cx,
+                ),
+                AttemptLink::Chain(session) => TerminalPane::start_chain(
+                    session, tag, target, grid, font_size, locale, pane_cx,
+                ),
+            };
+            pane.apply_presentation(mode);
+            pane
         });
         // The batch the window drained before the pane existed belongs to this process,
         // and reaches the grid only because the tag matches.
@@ -3589,8 +3593,12 @@ impl ShelluneView {
         let session = self.workspace.register_local_session(&shell);
         let id = session.id();
         let tag = session.tag();
-        let pane =
-            cx.new(|pane_cx| TerminalPane::start(shell, tag, grid, font_size, locale, pane_cx));
+        let mode = self.workspace.layout().session_mode(id);
+        let pane = cx.new(|pane_cx| {
+            let mut pane = TerminalPane::start(shell, tag, grid, font_size, locale, pane_cx);
+            pane.apply_presentation(mode);
+            pane
+        });
         let state = pane.read(cx).state().clone();
         if !state.accepts_input() {
             let reason = state
@@ -3635,8 +3643,12 @@ impl ShelluneView {
         let Some(tag) = self.workspace.session(id).map(|session| session.tag()) else {
             return;
         };
-        let pane =
-            cx.new(|pane_cx| TerminalPane::start(shell, tag, grid, font_size, locale, pane_cx));
+        let mode = self.workspace.layout().session_mode(id);
+        let pane = cx.new(|pane_cx| {
+            let mut pane = TerminalPane::start(shell, tag, grid, font_size, locale, pane_cx);
+            pane.apply_presentation(mode);
+            pane
+        });
         let state = pane.read(cx).state().clone();
         if !state.accepts_input() {
             let reason = state
@@ -3681,6 +3693,14 @@ impl ShelluneView {
             return;
         }
         let state = pane.read(cx).state().clone();
+        let presentation = pane.read(cx).presentation();
+        if self
+            .workspace
+            .layout_mut()
+            .set_session_mode(id, presentation)
+        {
+            self.checkpoint_layout();
+        }
         match state {
             PaneState::Live => {
                 self.workspace.session_connected(id);
@@ -6397,9 +6417,7 @@ impl ShelluneView {
         {
             return false;
         }
-        let live = self
-            .active
-            .is_some_and(|id| self.pane_for(id).is_some());
+        let live = self.active.is_some_and(|id| self.pane_for(id).is_some());
         // A waiting pane is drawn in the workspace. A session that is only
         // connecting still has no terminal, so it does not take the page over.
         let waiting = self.workspace.layout().has_pending();

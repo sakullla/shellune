@@ -11,10 +11,10 @@
 
 use std::time::{Duration, Instant};
 
-use shellune_core::LocalShell;
+use shellune_core::{LocalShell, TerminalMode};
 use shellune_terminal::{
-    ExitReport, GridSize, LocalSession, PtyEvent, Snapshot, TermMode, TerminalCore, encode_text,
-    palette, platform_default, program_exists,
+    BlockStatus, ExitReport, GridSize, LocalSession, PtyEvent, Snapshot, TermMode, TerminalCore,
+    encode_text, palette, platform_default, program_exists,
 };
 
 #[cfg(feature = "test-support")]
@@ -468,6 +468,230 @@ fn a_program_that_exits_immediately_after_output_is_still_read() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(session.exited, Some(ExitReport::Clean));
+}
+
+#[test]
+fn a_real_shell_reports_command_blocks_without_using_its_process_exit() {
+    let Some(mut session) = integration_session() else {
+        eprintln!("no shell that can print integration markers, skipping");
+        return;
+    };
+    session.core.set_presentation(TerminalMode::Integrated);
+
+    let start = shell_print(
+        &session,
+        &format!(
+            "{}{}echo hello{}{}hello-block{}",
+            osc("133;A"),
+            osc("133;B"),
+            osc("133;C"),
+            "\r\n",
+            "\r\n"
+        ),
+    );
+    session.run(&start);
+    session.poll_until("the running command block", |session, _, _| {
+        session.core.command_blocks().iter().any(|block| {
+            block.command.contains("echo hello")
+                && block.output.contains("hello-block")
+                && !block.status.is_success()
+        })
+    });
+    std::thread::sleep(Duration::from_millis(30));
+    session.run(&shell_print(&session, &osc("133;D;0")));
+    session.poll_until("the finished command block", |session, _, _| {
+        session.core.command_blocks().iter().any(|block| {
+            block.command.contains("echo hello")
+                && block.status.is_success()
+                && block.duration.is_some()
+        })
+    });
+    let finished = session
+        .core
+        .command_blocks()
+        .into_iter()
+        .find(|block| block.command.contains("echo hello"))
+        .expect("the finished block");
+    assert_eq!(finished.status, BlockStatus::Exited(0));
+    assert!(finished.output.contains("hello-block"));
+    let duration = finished.duration.expect("the markers measured a duration");
+    assert!(
+        duration.as_millis() >= 1,
+        "duration comes from the marker timestamps, got {duration:?}"
+    );
+
+    session.run(&shell_print(
+        &session,
+        &format!(
+            "{}{}false-cmd{}{}nope{}{}",
+            osc("133;A"),
+            osc("133;B"),
+            osc("133;C"),
+            "\r\n",
+            "\r\n",
+            osc("133;D")
+        ),
+    ));
+    session.poll_until("the unknown command block", |session, _, _| {
+        session
+            .core
+            .command_blocks()
+            .iter()
+            .any(|block| block.command.contains("false-cmd"))
+    });
+    let unknown = session
+        .core
+        .command_blocks()
+        .into_iter()
+        .find(|block| block.command.contains("false-cmd"))
+        .expect("the block with no exit code");
+    assert_eq!(unknown.status, BlockStatus::Unknown);
+    assert!(
+        !unknown.status.is_success(),
+        "a marker with no exit code is not success"
+    );
+    assert!(unknown.output.contains("nope"));
+
+    let before_alt = session.core.search_history("hello-block");
+    assert!(!before_alt.is_empty(), "the output is in the real grid");
+    session.run(&shell_print(&session, "\u{1b}[?1049h"));
+    session.wait_for("the alternate screen", |snapshot, _| {
+        snapshot.mode.contains(TermMode::ALT_SCREEN)
+    });
+    assert!(
+        session.core.shows_classic_grid(),
+        "a full-screen program uses the classic grid"
+    );
+    session.run(&shell_print(&session, "\u{1b}[?1049l"));
+    session.wait_for("the primary screen", |snapshot, _| {
+        !snapshot.mode.contains(TermMode::ALT_SCREEN)
+    });
+    assert!(
+        !session.core.search_history("hello-block").is_empty(),
+        "leaving the alternate screen keeps the earlier output"
+    );
+    assert!(session.core.shows_command_blocks());
+
+    session.run("exit 9");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while session.exited.is_none() {
+        session.pump();
+        if Instant::now() > deadline {
+            panic!("the shell exit was never reported");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(session.exited, Some(ExitReport::Code { code: 9 }));
+    let after = session.core.command_blocks();
+    let hello = after
+        .iter()
+        .find(|block| block.command.contains("echo hello"))
+        .expect("the first block survives the process exit");
+    let failed = after
+        .iter()
+        .find(|block| block.command.contains("false-cmd"))
+        .expect("the unknown block survives the process exit");
+    assert_eq!(hello.status, BlockStatus::Exited(0));
+    assert!(hello.status.is_success());
+    assert_eq!(failed.status, BlockStatus::Unknown);
+    assert!(
+        !failed.status.is_success(),
+        "the process exit code is not the command's exit code"
+    );
+    assert!(
+        after
+            .iter()
+            .all(|block| block.status != BlockStatus::Exited(9)),
+        "no command block was rewritten from the process status: {after:?}"
+    );
+}
+
+fn integration_session() -> Option<Session> {
+    if cfg!(windows)
+        && let Some(bash) = git_install_path("bash")
+    {
+        let shell = LocalShell::new("Git Bash", bash);
+        let grid = GridSize::new(100, 30);
+        let pty = LocalSession::spawn(&shell, grid, None).ok()?;
+        return Some(Session {
+            shell,
+            pty,
+            core: TerminalCore::new(grid.cols, grid.rows, 2000),
+            exited: None,
+            bytes_read: 0,
+        });
+    }
+    Session::start()
+}
+
+fn osc(payload: &str) -> String {
+    format!("\u{1b}]{payload}\u{7}")
+}
+
+fn shell_print(session: &Session, text: &str) -> String {
+    let program = session.shell.program().to_ascii_lowercase();
+    if program.contains("powershell") || program.contains("pwsh") {
+        powershell_print(text)
+    } else if program.ends_with("cmd.exe") || program.ends_with("\\cmd") || program == "cmd" {
+        format!(
+            "powershell -NoProfile -Command \"{}\"",
+            powershell_print(text)
+        )
+    } else {
+        posix_printf(text)
+    }
+}
+
+fn powershell_print(text: &str) -> String {
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let flush = |literal: &mut String, parts: &mut Vec<String>| {
+        if literal.is_empty() {
+            return;
+        }
+        let escaped = literal.replace('\'', "''");
+        parts.push(format!("'{escaped}'"));
+        literal.clear();
+    };
+    for character in text.chars() {
+        match character {
+            '\u{1b}' => {
+                flush(&mut literal, &mut parts);
+                parts.push("[char]27".to_owned());
+            }
+            '\u{7}' => {
+                flush(&mut literal, &mut parts);
+                parts.push("[char]7".to_owned());
+            }
+            '\r' => {
+                flush(&mut literal, &mut parts);
+                parts.push("[char]13".to_owned());
+            }
+            '\n' => {
+                flush(&mut literal, &mut parts);
+                parts.push("[char]10".to_owned());
+            }
+            _ => literal.push(character),
+        }
+    }
+    flush(&mut literal, &mut parts);
+    if parts.is_empty() {
+        parts.push("''".to_owned());
+    }
+    format!("Write-Host -NoNewline ({})", parts.join("+"))
+}
+
+fn posix_printf(text: &str) -> String {
+    let mut body = String::from("printf '");
+    for byte in text.bytes() {
+        match byte {
+            b'\'' => body.push_str("'\\''"),
+            0x20..=0x7e => body.push(byte as char),
+            _ => body.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    body.push('\'');
+    body
 }
 
 /// The interrupt tests (R8), and the program they interrupt.

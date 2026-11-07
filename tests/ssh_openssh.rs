@@ -20,12 +20,13 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use shellune_core::{AuthMethod, SecretString};
+use shellune_core::{AuthMethod, SecretString, TerminalMode};
 use shellune_ssh::testserver::{Harness, KEY_PASSPHRASE};
 use shellune_ssh::{
     ConnectError, ConnectRequest, KnownHostKey, PtySize, RemoteEvent, RemoteSession,
 };
 use shellune_storage::{HostKey, HostTrust, TrustStore, TrustVerdict};
+use shellune_terminal::{BlockStatus, TermMode, TerminalCore};
 
 /// How long any single wait may take.
 const PATIENCE: Duration = Duration::from_secs(45);
@@ -589,5 +590,183 @@ fn an_address_that_refuses_the_connection_shows_no_session() {
             );
         }
         other => panic!("an unreachable port must not connect, got {other:?}"),
+    }
+}
+
+#[test]
+fn remote_shell_integration_markers_are_command_blocks_and_not_the_process_exit() {
+    if skip("remote command blocks") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let fingerprint = server.host_key_fingerprint();
+    let mut session = connect(server, password(server), trusted(&fingerprint));
+    assert!(
+        matches!(wait_for_outcome(&mut session), RemoteEvent::Connected),
+        "the remote shell must be running before it can report markers"
+    );
+
+    let mut core = TerminalCore::new(100, 30, 2000);
+    core.set_presentation(TerminalMode::Integrated);
+    // The banner is ordinary output. It is not a command block.
+    let _ = pump_remote(&mut session, &mut core);
+
+    session
+        .write(
+            b"printf '\\033]133;A\\a\\033]133;B\\aecho hello\\033]133;C\\a\\r\\nhello-block\\r\\n'\n",
+        )
+        .expect("the marker command is sent");
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the running remote block",
+        |core| {
+            core.command_blocks().iter().any(|block| {
+                block.command.contains("echo hello")
+                    && block.output.contains("hello-block")
+                    && !block.status.is_success()
+            })
+        },
+    );
+    std::thread::sleep(Duration::from_millis(30));
+    session
+        .write(b"printf '\\033]133;D;0\\a'\n")
+        .expect("the end marker is sent");
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the finished remote block",
+        |core| {
+            core.command_blocks().iter().any(|block| {
+                block.command.contains("echo hello")
+                    && block.status.is_success()
+                    && block.duration.is_some()
+            })
+        },
+    );
+    let finished = core
+        .command_blocks()
+        .into_iter()
+        .find(|block| block.command.contains("echo hello"))
+        .expect("the remote block");
+    assert_eq!(finished.status, BlockStatus::Exited(0));
+    assert!(finished.output.contains("hello-block"));
+    let duration = finished.duration.expect("the markers measured a duration");
+    assert!(duration.as_millis() >= 1, "{duration:?}");
+
+    session
+        .write(
+            b"printf '\\033]133;A\\a\\033]133;B\\afalse-cmd\\033]133;C\\a\\r\\nnope\\r\\n\\033]133;D\\a'\n",
+        )
+        .expect("the unknown-exit command is sent");
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the unknown remote block",
+        |core| {
+            core.command_blocks()
+                .iter()
+                .any(|block| block.command.contains("false-cmd") && !block.status.is_success())
+        },
+    );
+
+    session
+        .write(b"printf '\\033[?1049h'\n")
+        .expect("the alternate screen is requested");
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the remote alternate screen",
+        |core| core.mode().contains(TermMode::ALT_SCREEN) && core.shows_classic_grid(),
+    );
+    session
+        .write(b"printf '\\033[?1049l'\n")
+        .expect("the primary screen is requested");
+    wait_remote(
+        &mut session,
+        &mut core,
+        "the remote primary screen",
+        |core| {
+            !core.mode().contains(TermMode::ALT_SCREEN)
+                && !core.search_history("hello-block").is_empty()
+        },
+    );
+
+    session
+        .write(b"exit 7\n")
+        .expect("the remote shell can exit");
+    let deadline = Instant::now() + PATIENCE;
+    let mut process_code = None;
+    while process_code.is_none() {
+        for event in session.drain() {
+            match event {
+                RemoteEvent::Data(bytes) => {
+                    core.feed(&bytes);
+                }
+                RemoteEvent::Exited { code } => process_code = Some(code),
+                RemoteEvent::Failed(error) => panic!("the remote shell failed: {error}"),
+                _ => {}
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("the remote shell never exited");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The server may report the shell status or only that the channel closed.
+    // Either way that status is not a command-block exit code.
+    assert!(process_code.is_some(), "the remote shell exited");
+    let after = core.command_blocks();
+    let hello = after
+        .iter()
+        .find(|block| block.command.contains("echo hello"))
+        .expect("the finished block is still the one the markers reported");
+    let failed = after
+        .iter()
+        .find(|block| block.command.contains("false-cmd"))
+        .expect("the unknown block is still the one the markers reported");
+    assert_eq!(hello.status, BlockStatus::Exited(0));
+    assert_eq!(failed.status, BlockStatus::Unknown);
+    assert!(!failed.status.is_success());
+    assert!(
+        after
+            .iter()
+            .all(|block| block.status != BlockStatus::Exited(7)),
+        "the process exit is not applied to a command block: {after:?}"
+    );
+}
+
+fn pump_remote(session: &mut RemoteSession, core: &mut TerminalCore) -> bool {
+    let mut exited = false;
+    for event in session.drain() {
+        match event {
+            RemoteEvent::Data(bytes) => {
+                core.feed(&bytes);
+            }
+            RemoteEvent::Exited { .. } => exited = true,
+            RemoteEvent::Failed(error) => panic!("the remote shell failed: {error}"),
+            _ => {}
+        }
+    }
+    exited
+}
+
+fn wait_remote(
+    session: &mut RemoteSession,
+    core: &mut TerminalCore,
+    what: &str,
+    mut ready: impl FnMut(&TerminalCore) -> bool,
+) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        pump_remote(session, core);
+        if ready(core) {
+            return;
+        }
+        if Instant::now() > deadline {
+            let screen = core.snapshot().text().join("\n");
+            panic!("timed out waiting for {what}; the screen held:\n{screen}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

@@ -18,15 +18,20 @@
 //!   characters occupy two columns, and a selection is reported per cell.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode, point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb, StdSyncHandler};
+use shellune_core::TerminalMode;
 
+use crate::blocks::{
+    BlockBook, BlockFilter, GridAnchor, IntegrationEvent, IntegrationSplitter, Segment,
+};
 use crate::metrics::GridSize;
 use crate::palette;
 
@@ -144,6 +149,20 @@ pub struct RenderedCursor {
     pub shape: CursorShape,
 }
 
+/// One line of real scrollback that contains a search query.
+///
+/// The line index is the grid's own index, including negative history lines, and
+/// `text` is that line with its trailing line break removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryMatch {
+    /// Grid line. Negative values are above the live screen.
+    pub line: i32,
+    /// Byte index of the query inside [`HistoryMatch::text`].
+    pub column: usize,
+    /// The line as the grid stores it.
+    pub text: String,
+}
+
 /// A complete picture of what the terminal shows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
@@ -189,6 +208,16 @@ pub struct TerminalCore {
     sink: EffectSink,
     grid: GridSize,
     title: Option<String>,
+    /// OSC 133 / 633 markers, held when a chunk splits one.
+    splitter: IntegrationSplitter,
+    /// Command blocks built from those markers. Not from prompt text.
+    blocks: BlockBook,
+    /// Classic, or command blocks when the shell actually reports them.
+    presentation: TerminalMode,
+    /// Lines dropped from the front of history, so anchors survive a full scrollback.
+    lines_dropped: i64,
+    /// History size after the previous chunk, to see how many lines were dropped.
+    last_history: usize,
 }
 
 impl TerminalCore {
@@ -208,15 +237,43 @@ impl TerminalCore {
             sink,
             grid,
             title: None,
+            splitter: IntegrationSplitter::new(),
+            blocks: BlockBook::new(),
+            presentation: TerminalMode::Classic,
+            lines_dropped: 0,
+            last_history: 0,
         }
     }
 
     /// Parses a chunk of output and returns what the application must do about it.
+    ///
+    /// OSC 133 and OSC 633 command markers are taken out of the stream and turned
+    /// into command blocks. Every other byte, including other OSC sequences, is
+    /// parsed into the grid as before. The grid is never cleared because a marker
+    /// was missing or the presentation changed.
     pub fn feed(&mut self, bytes: &[u8]) -> TerminalEffects {
-        self.parser.advance(&mut self.term, bytes);
-        let effects = self.sink.take_effects();
-        if let Some(title) = &effects.title {
-            self.title = Some(title.clone());
+        let segments = self.splitter.push(bytes);
+        let mut effects = TerminalEffects::default();
+        for segment in segments {
+            match segment {
+                Segment::Bytes(chunk) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    self.parser.advance(&mut self.term, &chunk);
+                    let next = self.sink.take_effects();
+                    if let Some(title) = &next.title {
+                        self.title = Some(title.clone());
+                    }
+                    merge_effects(&mut effects, next);
+                    self.note_history();
+                    self.refresh_running_output();
+                }
+                Segment::Event(event) => {
+                    self.note_history();
+                    self.apply_integration(event);
+                }
+            }
         }
         effects
     }
@@ -229,6 +286,7 @@ impl TerminalCore {
         }
         self.term.resize(grid);
         self.grid = grid;
+        self.note_history();
     }
 
     /// Current grid size.
@@ -414,16 +472,247 @@ impl TerminalCore {
         }
     }
 
+    /// Chooses classic or command-block presentation.
+    ///
+    /// Switching does not clear the grid, the scrollback, or blocks already
+    /// recorded. Choosing command blocks again clears an integration-failure flag
+    /// so a later real marker can be shown; it does not replay or rewrite output.
+    pub fn set_presentation(&mut self, mode: TerminalMode) {
+        self.presentation = mode;
+        if mode == TerminalMode::Integrated {
+            self.blocks.clear_failure();
+        }
+    }
+
+    /// The presentation the user asked for, not the one on screen.
+    ///
+    /// The screen falls back to the classic grid while the alternate screen is
+    /// active, while no shell integration has been seen, or after integration fails.
+    #[must_use]
+    pub fn presentation(&self) -> TerminalMode {
+        self.presentation
+    }
+
+    /// Whether command blocks may be drawn over this terminal.
+    ///
+    /// False on the alternate screen, in classic mode, when the shell has not
+    /// reported a block, and after integration has failed. The grid is unaffected.
+    #[must_use]
+    pub fn shows_command_blocks(&self) -> bool {
+        self.presentation == TerminalMode::Integrated
+            && !self.mode().contains(TermMode::ALT_SCREEN)
+            && !self.blocks.failed()
+            && self.blocks.has_blocks()
+    }
+
+    /// Whether the screen is the classic grid rather than command blocks.
+    #[must_use]
+    pub fn shows_classic_grid(&self) -> bool {
+        !self.shows_command_blocks()
+    }
+
+    /// Whether shell integration was seen and then stopped being trustworthy.
+    ///
+    /// A missing exit code is not a failure of the integration: the block stays
+    /// unknown. An unreadable exit field, or [`TerminalCore::invalidate_integration`],
+    /// is.
+    #[must_use]
+    pub fn integration_failed(&self) -> bool {
+        self.blocks.failed()
+    }
+
+    /// Drops back to the classic grid because integration can no longer be trusted.
+    ///
+    /// The grid and the recorded blocks stay. A running command becomes unknown,
+    /// never success.
+    pub fn invalidate_integration(&mut self) {
+        self.blocks.fail();
+    }
+
+    /// Finished commands, plus the one still running once input or output started.
+    ///
+    /// A prompt marker alone is not a block. The order is the order the shell
+    /// started them.
+    #[must_use]
+    pub fn command_blocks(&self) -> Vec<crate::blocks::CommandBlock> {
+        self.blocks.blocks()
+    }
+
+    /// Blocks whose command or output contains `query`, limited by `filter`.
+    ///
+    /// An empty query matches every block the filter allows. The match is the
+    /// block's own text, which was taken from the grid or from an `E` marker.
+    #[must_use]
+    pub fn search_blocks(
+        &self,
+        query: &str,
+        filter: BlockFilter,
+    ) -> Vec<crate::blocks::CommandBlock> {
+        self.blocks.search(query, filter)
+    }
+
+    /// Command and output of one block, for the clipboard.
+    #[must_use]
+    pub fn copy_block_text(&self, id: crate::blocks::CommandBlockId) -> Option<String> {
+        self.blocks.get(id).map(|block| block.copy_text())
+    }
+
+    /// The command text to send for a rerun.
+    ///
+    /// Reading it does not change the block. The caller writes it as a new
+    /// execution; the shell's next markers, if any, become a new block.
+    #[must_use]
+    pub fn rerun_command(&self, id: crate::blocks::CommandBlockId) -> Option<String> {
+        self.blocks.get(id).and_then(|block| {
+            if block.command.is_empty() {
+                None
+            } else {
+                Some(block.command)
+            }
+        })
+    }
+
+    /// Lines of the real grid, including scrollback, that contain `query`.
+    ///
+    /// The search does not consult a side log. An empty query matches nothing.
+    #[must_use]
+    pub fn search_history(&self, query: &str) -> Vec<HistoryMatch> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let top = self.term.grid().topmost_line().0;
+        let bottom = self.term.grid().bottommost_line().0;
+        let mut matches = Vec::new();
+        for line in top..=bottom {
+            let text = self.line_text(Line(line));
+            if let Some(column) = text.find(query) {
+                matches.push(HistoryMatch { line, column, text });
+            }
+        }
+        matches
+    }
+
+    /// Scrolls so `line` is the top of the viewport, without moving the cursor.
+    pub fn reveal_history(&mut self, line: i32) {
+        let offset = usize::try_from(-line).unwrap_or(0).min(self.history());
+        let current = i32::try_from(self.display_offset()).unwrap_or(i32::MAX);
+        let target = i32::try_from(offset).unwrap_or(i32::MAX);
+        self.scroll(target.saturating_sub(current));
+    }
+
     fn grid_point(&self, row: usize, column: usize) -> Point {
         let column = column.min(self.grid.cols.saturating_sub(1));
         let row = row.min(self.grid.rows.saturating_sub(1));
         viewport_to_point(self.display_offset(), Point::new(row, Column(column)))
     }
+
+    fn apply_integration(&mut self, event: IntegrationEvent) {
+        let now = Instant::now();
+        match event {
+            IntegrationEvent::PromptStart => {
+                if self.blocks.in_input() {
+                    let scraped = self
+                        .blocks
+                        .input_anchor()
+                        .and_then(|anchor| self.text_between(anchor, self.anchor_now()));
+                    self.blocks.set_scraped_command(scraped);
+                }
+                if self.blocks.in_output() {
+                    self.refresh_running_output();
+                }
+                self.blocks.prompt_start();
+            }
+            IntegrationEvent::InputStart => self.blocks.input_start(self.anchor_now()),
+            IntegrationEvent::CommandText(command) => self.blocks.set_explicit_command(command),
+            IntegrationEvent::OutputStart => {
+                let scraped = self
+                    .blocks
+                    .input_anchor()
+                    .and_then(|anchor| self.text_between(anchor, self.anchor_now()));
+                self.blocks.output_start(scraped, self.anchor_now(), now);
+            }
+            IntegrationEvent::CommandFinished { exit } => {
+                let output = self
+                    .blocks
+                    .output_anchor()
+                    .and_then(|anchor| self.text_between(anchor, self.anchor_now()));
+                self.blocks.finish(output, exit, now);
+            }
+        }
+    }
+
+    fn refresh_running_output(&mut self) {
+        let Some(anchor) = self.blocks.output_anchor() else {
+            return;
+        };
+        let text = self.text_between(anchor, self.anchor_now());
+        self.blocks.set_running_output(text);
+    }
+
+    fn anchor_now(&self) -> GridAnchor {
+        let point = self.term.grid().cursor.point;
+        let history = self.term.grid().history_size() as i64;
+        GridAnchor {
+            stable: history + i64::from(point.line.0) + self.lines_dropped,
+            column: point.column.0,
+        }
+    }
+
+    fn point_of(&self, anchor: GridAnchor) -> Option<Point> {
+        let history = self.term.grid().history_size() as i64;
+        let line = anchor.stable - self.lines_dropped - history;
+        let top = -history;
+        let bottom = self.term.grid().screen_lines() as i64 - 1;
+        if line < top || line > bottom {
+            return None;
+        }
+        let line = i32::try_from(line).ok()?;
+        let column = anchor.column.min(self.grid.cols.saturating_sub(1));
+        Some(Point::new(Line(line), Column(column)))
+    }
+
+    fn text_between(&self, from: GridAnchor, to: GridAnchor) -> Option<String> {
+        let start = self.point_of(from)?;
+        let end = self.point_of(to)?;
+        if (end.line, end.column) < (start.line, start.column) {
+            return Some(String::new());
+        }
+        Some(self.term.bounds_to_string(start, end))
+    }
+
+    fn line_text(&self, line: Line) -> String {
+        let start = Point::new(line, Column(0));
+        let end = Point::new(line, self.term.grid().last_column());
+        self.term
+            .bounds_to_string(start, end)
+            .trim_end_matches(['\n', '\r'])
+            .to_owned()
+    }
+
+    fn note_history(&mut self) {
+        let history = self.term.grid().history_size();
+        if history < self.last_history {
+            self.lines_dropped += (self.last_history - history) as i64;
+        }
+        self.last_history = history;
+    }
+}
+
+fn merge_effects(into: &mut TerminalEffects, next: TerminalEffects) {
+    into.writes.extend(next.writes);
+    if next.title.is_some() {
+        into.title = next.title;
+    }
+    if next.clipboard.is_some() {
+        into.clipboard = next.clipboard;
+    }
+    into.bell |= next.bell;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocks::{BlockStatus, CommandBlockId};
 
     fn core() -> TerminalCore {
         TerminalCore::new(40, 10, 100)
@@ -698,6 +987,250 @@ mod tests {
             terminal.display_offset(),
             3,
             "scrolling stops at the oldest line"
+        );
+    }
+
+    fn osc(payload: &str) -> Vec<u8> {
+        let mut bytes = b"\x1b]".to_vec();
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes.push(0x07);
+        bytes
+    }
+
+    fn feed_block(terminal: &mut TerminalCore, command: &str, output: &str, end: &str) {
+        terminal.feed(&osc("133;A"));
+        terminal.feed(b"$ ");
+        terminal.feed(&osc("133;B"));
+        terminal.feed(command.as_bytes());
+        terminal.feed(&osc("133;C"));
+        terminal.feed(b"\r\n");
+        terminal.feed(output.as_bytes());
+        terminal.feed(b"\r\n");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        terminal.feed(&osc(end));
+    }
+
+    #[test]
+    fn shell_integration_markers_record_command_output_exit_and_duration() {
+        let mut terminal = core();
+        terminal.set_presentation(TerminalMode::Integrated);
+        let before = terminal.snapshot().text();
+        feed_block(&mut terminal, "echo hello", "hello", "133;D;0");
+
+        let blocks = terminal.command_blocks();
+        assert_eq!(blocks.len(), 1, "one command, one block");
+        let block = blocks[0].clone();
+        assert_eq!(block.command, "echo hello");
+        assert_eq!(block.output, "hello");
+        assert_eq!(block.status, BlockStatus::Exited(0));
+        assert!(block.status.is_success());
+        let duration = block.duration.expect("the command has a measured duration");
+        assert!(
+            duration.as_millis() >= 1,
+            "duration comes from the markers' timestamps, got {duration:?}"
+        );
+        assert!(terminal.shows_command_blocks());
+        assert_ne!(
+            terminal.snapshot().text(),
+            before,
+            "the grid keeps the real output"
+        );
+
+        let copied = terminal
+            .copy_block_text(block.id)
+            .expect("the block can be copied");
+        assert_eq!(copied, "echo hello\nhello");
+        let found = terminal.search_blocks("hello", BlockFilter::ExitedZero);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, block.id);
+        let history = terminal.search_history("hello");
+        assert!(
+            history.iter().any(|hit| hit.text.contains("hello")),
+            "history search reads the grid, got {history:?}"
+        );
+        assert!(
+            history.iter().any(|hit| hit.text == block.output),
+            "the block output is the grid line, got {history:?}"
+        );
+
+        let rerun = terminal
+            .rerun_command(block.id)
+            .expect("the command can be rerun");
+        assert_eq!(rerun, "echo hello");
+        assert_eq!(
+            terminal.command_blocks()[0],
+            block,
+            "a rerun reads the command and does not change the recorded result"
+        );
+    }
+
+    #[test]
+    fn a_missing_exit_code_is_not_success_and_a_rerun_is_a_new_block() {
+        let mut terminal = core();
+        terminal.set_presentation(TerminalMode::Integrated);
+        feed_block(&mut terminal, "false", "nope", "133;D");
+        let first = terminal.command_blocks()[0].clone();
+        assert_eq!(first.status, BlockStatus::Unknown);
+        assert!(
+            !first.status.is_success(),
+            "an ended command with no exit code is not success"
+        );
+        assert!(
+            first.duration.is_some(),
+            "the end marker still has a duration"
+        );
+        assert!(
+            terminal
+                .search_blocks("false", BlockFilter::ExitedZero)
+                .is_empty(),
+            "the success filter does not keep an unknown exit"
+        );
+        assert_eq!(terminal.search_blocks("", BlockFilter::Unknown).len(), 1);
+
+        let command = terminal.rerun_command(first.id).expect("rerun text");
+        assert_eq!(command, "false");
+        feed_block(&mut terminal, "false", "again", "133;D;2");
+        let blocks = terminal.command_blocks();
+        assert_eq!(blocks.len(), 2, "the rerun is a second execution");
+        assert_eq!(blocks[0], first, "the original result is unchanged");
+        assert_eq!(blocks[1].status, BlockStatus::Exited(2));
+        assert!(!blocks[1].status.is_success());
+        assert_eq!(blocks[1].output, "again");
+    }
+
+    #[test]
+    fn an_explicit_command_marker_is_the_command_text() {
+        let mut terminal = core();
+        terminal.feed(&osc("133;A"));
+        terminal.feed(&osc("133;E;make test"));
+        terminal.feed(&osc("133;C"));
+        terminal.feed(b"\r\nok\r\n");
+        terminal.feed(&osc("133;D;0"));
+        let block = &terminal.command_blocks()[0];
+        assert_eq!(block.command, "make test");
+        assert_eq!(block.output, "ok");
+        assert!(block.status.is_success());
+    }
+
+    #[test]
+    fn a_running_command_is_not_success_and_scrollback_search_reveals_it() {
+        let mut terminal = TerminalCore::new(20, 4, 100);
+        terminal.set_presentation(TerminalMode::Integrated);
+        terminal.feed(&osc("133;B"));
+        terminal.feed(b"sleep 5");
+        terminal.feed(&osc("133;C"));
+        terminal.feed(b"\r\nstill going\r\n");
+        let block = &terminal.command_blocks()[0];
+        assert_eq!(block.status, BlockStatus::Running);
+        assert!(!block.status.is_success());
+        assert!(
+            block.duration.is_none(),
+            "a running command has no final duration"
+        );
+        assert_eq!(block.command, "sleep 5");
+        assert_eq!(block.output, "still going");
+
+        for line in 0..10 {
+            terminal.feed(format!("older {line}\r\n").as_bytes());
+        }
+        let hits = terminal.search_history("older 0");
+        assert!(!hits.is_empty(), "the scrolled line is still in history");
+        terminal.reveal_history(hits[0].line);
+        let shown = terminal.snapshot().text().join("\n");
+        assert!(
+            shown.contains("older 0"),
+            "revealing a history match scrolls the real grid, got {shown}"
+        );
+    }
+
+    #[test]
+    fn alternate_screen_is_the_classic_grid_and_the_primary_screen_returns() {
+        let mut terminal = core();
+        terminal.set_presentation(TerminalMode::Integrated);
+        feed_block(&mut terminal, "echo before", "before", "133;D;0");
+        let primary = terminal.snapshot().text();
+        let block = terminal.command_blocks()[0].clone();
+        assert!(terminal.shows_command_blocks());
+
+        terminal.feed(b"\x1b[?1049h\x1b[H");
+        assert!(terminal.mode().contains(TermMode::ALT_SCREEN));
+        assert!(
+            terminal.shows_classic_grid(),
+            "a full-screen program is the classic grid"
+        );
+        terminal.feed(b"inside");
+        assert_eq!(terminal.snapshot().row_text(0).as_deref(), Some("inside"));
+
+        terminal.feed(b"\x1b[?1049l");
+        assert!(!terminal.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(
+            terminal.snapshot().text(),
+            primary,
+            "leaving the alternate screen restores the previous grid"
+        );
+        assert_eq!(
+            terminal.command_blocks()[0],
+            block,
+            "the full-screen program does not rewrite the recorded command"
+        );
+        assert!(terminal.shows_command_blocks());
+    }
+
+    #[test]
+    fn classic_mode_an_unsupported_shell_and_a_failed_integration_keep_the_grid() {
+        let mut terminal = core();
+        terminal.feed(b"plain prompt\r\n");
+        terminal.set_presentation(TerminalMode::Integrated);
+        let text = terminal.snapshot().text();
+        assert!(
+            terminal.shows_classic_grid(),
+            "no integration markers means the classic grid"
+        );
+        assert!(terminal.command_blocks().is_empty());
+        assert_eq!(terminal.snapshot().text(), text);
+
+        feed_block(&mut terminal, "echo kept", "kept", "133;D;0");
+        let with_block = terminal.snapshot().text();
+        terminal.set_presentation(TerminalMode::Classic);
+        assert!(terminal.shows_classic_grid());
+        assert_eq!(
+            terminal.snapshot().text(),
+            with_block,
+            "turning command blocks off does not rewrite the grid"
+        );
+        assert_eq!(terminal.command_blocks()[0].command, "echo kept");
+
+        terminal.set_presentation(TerminalMode::Integrated);
+        let id: CommandBlockId = terminal.command_blocks()[0].id;
+        terminal.feed(&osc("133;B"));
+        terminal.feed(b"broken");
+        terminal.feed(&osc("133;C"));
+        terminal.feed(b"\r\nbad\r\n");
+        terminal.feed(&osc("133;D;not-a-code"));
+        assert!(terminal.integration_failed());
+        assert!(
+            terminal.shows_classic_grid(),
+            "an unreadable exit field falls back to the classic grid"
+        );
+        let broken = terminal
+            .command_blocks()
+            .into_iter()
+            .find(|block| block.id != id)
+            .expect("the unreadable end is its own block");
+        assert_eq!(broken.status, BlockStatus::Unknown);
+        assert!(!broken.status.is_success());
+        let again = terminal.snapshot().text();
+        terminal.invalidate_integration();
+        assert_eq!(
+            terminal.snapshot().text(),
+            again,
+            "falling back does not rewrite the grid"
+        );
+        assert!(
+            terminal
+                .command_blocks()
+                .iter()
+                .all(|block| !block.status.is_success() || block.id == id)
         );
     }
 }

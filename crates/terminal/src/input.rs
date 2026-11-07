@@ -242,6 +242,44 @@ pub fn encode_text(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// Whether a paste must be confirmed before any byte is written.
+///
+/// More than one line, a trailing line break, or a control character other than
+/// tab can execute or inject input the user did not mean as a single keystroke.
+/// A single line of ordinary text does not need a confirmation.
+#[must_use]
+pub fn paste_needs_confirmation(text: &str) -> bool {
+    if text.contains(['\n', '\r', '\u{2028}', '\u{2029}']) {
+        return true;
+    }
+    text.chars().any(|character| {
+        let code = u32::from(character);
+        (code < 0x20 && character != '\t') || code == 0x7f || (0x80..0xa0).contains(&code)
+    })
+}
+
+/// A short view of a paste: the first lines, and how many lines there are.
+///
+/// The count treats a final empty piece from a trailing break as its own line,
+/// because that break is what would submit the paste.
+#[must_use]
+pub fn paste_preview(text: &str, max_lines: usize) -> (usize, String) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let count = lines.len();
+    let mut shown = lines
+        .iter()
+        .take(max_lines.max(1))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if count > max_lines {
+        shown.push('\n');
+        shown.push('…');
+    }
+    (count, shown)
+}
+
 /// Pasted text, wrapped when the running program asked for bracketed paste.
 ///
 /// Bracketed paste is what stops an editor from treating a paste as typing: without
@@ -535,6 +573,14 @@ mod tests {
     #[test]
     fn paste_is_wrapped_only_when_the_program_asked_for_it() {
         assert_eq!(encode_paste("ls\n", TermMode::empty()), b"ls\r");
+        assert!(paste_needs_confirmation("ls\n"));
+        assert!(paste_needs_confirmation("two\r\nlines"));
+        assert!(paste_needs_confirmation("has\u{001b}esc"));
+        assert!(!paste_needs_confirmation("echo hello"));
+        assert!(!paste_needs_confirmation("a\tb"));
+        let (count, preview) = paste_preview("one\r\ntwo\r\nthree", 2);
+        assert_eq!(count, 3);
+        assert!(preview.starts_with("one\ntwo"));
         assert_eq!(
             encode_paste("ls\n", TermMode::BRACKETED_PASTE),
             b"\x1b[200~ls\r\x1b[201~"

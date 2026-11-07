@@ -28,12 +28,13 @@ use gpui::{
 };
 use std::ops::Range;
 
-use shellune_core::{EventTag, LocalShell, SessionFailure};
+use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession};
 use shellune_terminal::{
-    CellSize, CursorShape, ExitReport, GridSize, Key, KeyModifiers, LocalSession, PtyEvent, Rgb,
-    SelectionType, Snapshot, TerminalCore, TerminalEffects, encode_key, encode_paste, encode_text,
-    grid_for, palette, sanitize_font_size, step_font_size,
+    BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
+    GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, PtyEvent, Rgb, SelectionType,
+    Snapshot, TermMode, TerminalCore, TerminalEffects, encode_key, encode_paste, encode_text,
+    grid_for, palette, paste_needs_confirmation, paste_preview, sanitize_font_size, step_font_size,
 };
 
 use crate::app::components;
@@ -324,6 +325,27 @@ pub struct TerminalPane {
     last_copy: Option<String>,
     locale: Locale,
     polling: bool,
+    /// A multi-line or high-risk paste that has not been confirmed.
+    ///
+    /// It is not encoded and not written until [`TerminalPane::confirm_paste`].
+    /// Cancel drops it. Program keys are not answers to this prompt.
+    pending_paste: Option<PendingPaste>,
+    search_open: bool,
+    /// When set, typed text edits the search query instead of the shell.
+    ///
+    /// Escape, Ctrl+L and Ctrl+C are never taken by the search.
+    search_focused: bool,
+    search_query: String,
+    search_hits: Vec<HistoryMatch>,
+    search_at: usize,
+    block_filter: BlockFilter,
+}
+
+/// A paste held until the user confirms the session it names.
+struct PendingPaste {
+    text: String,
+    /// The session label captured when the paste was offered.
+    target: String,
 }
 
 impl TerminalPane {
@@ -366,6 +388,13 @@ impl TerminalPane {
             last_copy: None,
             locale,
             polling: false,
+            pending_paste: None,
+            search_open: false,
+            search_focused: false,
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_at: 0,
+            block_filter: BlockFilter::All,
         };
         pane.start_polling(cx);
         pane
@@ -408,6 +437,13 @@ impl TerminalPane {
             last_copy: None,
             locale,
             polling: false,
+            pending_paste: None,
+            search_open: false,
+            search_focused: false,
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_at: 0,
+            block_filter: BlockFilter::All,
         };
         pane.start_polling(cx);
         pane
@@ -449,6 +485,13 @@ impl TerminalPane {
             last_copy: None,
             locale,
             polling: false,
+            pending_paste: None,
+            search_open: false,
+            search_focused: false,
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_at: 0,
+            block_filter: BlockFilter::All,
         };
         pane.start_polling(cx);
         pane
@@ -506,6 +549,13 @@ impl TerminalPane {
             last_copy: None,
             locale,
             polling: false,
+            pending_paste: None,
+            search_open: false,
+            search_focused: false,
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_at: 0,
+            block_filter: BlockFilter::All,
         }
     }
 
@@ -741,8 +791,43 @@ impl TerminalPane {
                     cx.stop_propagation();
                     return;
                 }
+                // These confirm or cancel a paste, or drive search. They are not
+                // Escape, Ctrl+L or Ctrl+C, which stay program input below.
+                "enter" if self.pending_paste.is_some() => {
+                    self.confirm_paste(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "backspace" if self.pending_paste.is_some() => {
+                    self.cancel_paste(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "f" if !self.alternate_screen() => {
+                    self.toggle_search(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "g" if self.search_open && !self.alternate_screen() => {
+                    self.next_search_hit(cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 _ => {}
             }
+        }
+        if self.search_focused
+            && !self.alternate_screen()
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && keystroke.key == "backspace"
+        {
+            self.search_query.pop();
+            self.refresh_search();
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
         if modifiers.platform {
             return;
@@ -793,13 +878,179 @@ impl TerminalPane {
         cx.notify();
     }
 
-    /// Sends pasted text, wrapped when the running program asked for bracketed paste.
+    /// Sends pasted text, or holds it when it is multi-line or high-risk.
+    ///
+    /// Holding it writes nothing. Confirmation encodes with the mode the program
+    /// has set at confirm time, and only into this pane.
     fn paste(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        let bytes = encode_paste(&text, self.core.mode());
+        self.stage_paste(&text, cx);
+    }
+
+    /// The presentation the user chose.
+    #[must_use]
+    pub fn presentation(&self) -> TerminalMode {
+        self.core.presentation()
+    }
+
+    /// Applies a saved presentation without notifying. Used while the pane is built.
+    pub fn apply_presentation(&mut self, mode: TerminalMode) {
+        self.core.set_presentation(mode);
+    }
+
+    /// Switches classic and command-block presentation.
+    ///
+    /// The grid is not cleared. Command blocks appear only when the shell has
+    /// reported them and the alternate screen is not up.
+    pub fn set_presentation(&mut self, mode: TerminalMode, cx: &mut Context<Self>) {
+        self.core.set_presentation(mode);
+        cx.notify();
+    }
+
+    /// Offers `text` to this pane. A risky paste waits; a plain line is written.
+    pub fn stage_paste(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        if paste_needs_confirmation(text) {
+            self.pending_paste = Some(PendingPaste {
+                text: text.to_owned(),
+                target: self.origin.label().to_owned(),
+            });
+            cx.notify();
+            return;
+        }
+        self.pending_paste = None;
+        self.write_paste(text, cx);
+        cx.notify();
+    }
+
+    /// Writes the held paste into this pane only.
+    ///
+    /// Returns whether a paste was waiting. The bytes go through this pane's
+    /// source, so another session cannot receive them.
+    pub fn confirm_paste(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pending) = self.pending_paste.take() else {
+            return false;
+        };
+        self.write_paste(&pending.text, cx);
+        cx.notify();
+        true
+    }
+
+    /// Drops a held paste. Nothing is written.
+    pub fn cancel_paste(&mut self, cx: &mut Context<Self>) {
+        if self.pending_paste.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The session a held paste would be sent to, when one is waiting.
+    #[cfg(test)]
+    #[must_use]
+    pub fn pending_paste_target(&self) -> Option<&str> {
+        self.pending_paste
+            .as_ref()
+            .map(|paste| paste.target.as_str())
+    }
+
+    /// The text a held paste would send.
+    #[cfg(test)]
+    #[must_use]
+    pub fn pending_paste_text(&self) -> Option<&str> {
+        self.pending_paste.as_ref().map(|paste| paste.text.as_str())
+    }
+
+    /// Command blocks recorded from shell integration, including a running one.
+    #[cfg(test)]
+    #[must_use]
+    pub fn command_blocks(&self) -> Vec<CommandBlock> {
+        self.core.command_blocks()
+    }
+
+    /// Sends one block's command as a new execution.
+    ///
+    /// The recorded block is not edited. A later integration marker, if the shell
+    /// emits one, becomes a separate block.
+    pub fn rerun_block(&mut self, id: CommandBlockId, cx: &mut Context<Self>) {
+        let Some(command) = self.core.rerun_command(id) else {
+            return;
+        };
+        let before = self.core.command_blocks();
+        let mut bytes = encode_text(&command);
+        if !bytes.ends_with(b"\r") {
+            bytes.push(b'\r');
+        }
         self.write(&bytes, cx);
+        debug_assert_eq!(self.core.command_blocks(), before);
+        cx.notify();
+    }
+
+    fn write_paste(&mut self, text: &str, cx: &mut Context<Self>) {
+        let bytes = encode_paste(text, self.core.mode());
+        self.write(&bytes, cx);
+    }
+
+    fn alternate_screen(&self) -> bool {
+        self.core.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether the alternate screen is up. Tests use this; the view reads the same flag.
+    #[cfg(test)]
+    #[must_use]
+    pub fn alternate_for_test(&self) -> bool {
+        self.alternate_screen()
+    }
+
+    /// Whether the block list is on screen. The alternate screen and classic mode hide it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn shows_blocks_for_test(&self) -> bool {
+        !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks())
+    }
+
+    fn toggle_search(&mut self, cx: &mut Context<Self>) {
+        self.search_open = !self.search_open;
+        self.search_focused = self.search_open;
+        if self.search_open {
+            self.refresh_search();
+        }
+        cx.notify();
+    }
+
+    fn refresh_search(&mut self) {
+        self.search_hits = self.core.search_history(&self.search_query);
+        if self.search_hits.is_empty() {
+            self.search_at = 0;
+            return;
+        }
+        self.search_at = self.search_at.min(self.search_hits.len() - 1);
+        let line = self.search_hits[self.search_at].line;
+        self.core.reveal_history(line);
+    }
+
+    fn next_search_hit(&mut self, cx: &mut Context<Self>) {
+        if self.search_hits.is_empty() {
+            return;
+        }
+        self.search_at = (self.search_at + 1) % self.search_hits.len();
+        let line = self.search_hits[self.search_at].line;
+        self.core.reveal_history(line);
+        cx.notify();
+    }
+
+    fn copy_block(&mut self, id: CommandBlockId, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .core
+            .copy_block_text(id)
+            .filter(|text| !text.is_empty())
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        self.last_copy = Some(text);
         cx.notify();
     }
 
@@ -877,6 +1128,7 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus);
+        self.search_focused = false;
         let Some((row, column)) = self.cell_at(event.position) else {
             return;
         };
@@ -1007,6 +1259,14 @@ impl TerminalPane {
                             tone,
                             metrics,
                         ))
+                    })
+                    .when_some(self.integration_note(), |row, note| {
+                        row.child(
+                            div()
+                                .truncate()
+                                .debug_selector(|| "terminal.integration".to_owned())
+                                .child(note),
+                        )
                     }),
             )
             .child(
@@ -1015,6 +1275,8 @@ impl TerminalPane {
                     .flex_none()
                     .items_center()
                     .gap(metrics.scale(1.0))
+                    .child(self.mode_button(metrics, strings, cx))
+                    .child(self.search_button(metrics, strings, cx))
                     .child(
                         components::icon_only_button(Icon::Copy, metrics)
                             .h(metrics.scale(22.0))
@@ -1160,6 +1422,344 @@ impl TerminalPane {
         )
     }
 
+    fn mode_button(
+        &self,
+        metrics: Metrics,
+        strings: &crate::app::copy::Strings,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let integrated = self.core.presentation() == TerminalMode::Integrated;
+        let label = if integrated {
+            strings.terminal_mode_blocks
+        } else {
+            strings.terminal_mode_classic
+        };
+        components::compact_button(label, components::Variant::Ghost, metrics)
+            .id("terminal.mode")
+            .debug_selector(|| "terminal.mode".to_owned())
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                let next = if integrated {
+                    TerminalMode::Classic
+                } else {
+                    TerminalMode::Integrated
+                };
+                this.set_presentation(next, cx);
+            }))
+    }
+
+    fn search_button(
+        &self,
+        metrics: Metrics,
+        strings: &crate::app::copy::Strings,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        components::icon_only_button(Icon::Search, metrics)
+            .h(metrics.scale(22.0))
+            .w(metrics.scale(24.0))
+            .id("terminal.search")
+            .debug_selector(|| "terminal.search".to_owned())
+            .tooltip(components::tooltip(strings.terminal_search))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_search(cx);
+            }))
+    }
+
+    fn integration_note(&self) -> Option<&'static str> {
+        if self.alternate_screen() || self.core.presentation() != TerminalMode::Integrated {
+            return None;
+        }
+        let strings = self.locale.strings();
+        if self.core.integration_failed() {
+            Some(strings.terminal_blocks_failed)
+        } else if !self.core.shows_command_blocks() {
+            Some(strings.terminal_no_blocks)
+        } else {
+            None
+        }
+    }
+
+    fn paste_overlay(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
+        let strings = self.locale.strings();
+        let Some(pending) = &self.pending_paste else {
+            return div();
+        };
+        let (count, preview) = paste_preview(&pending.text, 4);
+        let target = pending.target.clone();
+        div()
+            .absolute()
+            .top(px(8.0))
+            .left(px(8.0))
+            .right(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .p(metrics.scale(spacing::TIGHT))
+            .bg(theme::swatch(shell_palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(shell_palette::BORDER_STRONG))
+            .rounded(px(theme::radius::MEDIUM))
+            .debug_selector(|| "terminal.paste".to_owned())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                    .child(strings.terminal_paste_title),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "terminal.paste.target".to_owned())
+                    .text_size(metrics.caption_size())
+                    .child(SharedString::from(format!(
+                        "{}: {target}",
+                        strings.terminal_paste_target
+                    ))),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                    .child(SharedString::from(format!(
+                        "{count} {}",
+                        strings.terminal_paste_lines
+                    ))),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "terminal.paste.preview".to_owned())
+                    .font_family(monospace_family())
+                    .text_size(metrics.caption_size())
+                    .child(SharedString::from(preview)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::compact_button(
+                            strings.terminal_paste_confirm,
+                            components::Variant::Primary,
+                            metrics,
+                        )
+                        .id("terminal.paste.confirm")
+                        .debug_selector(|| "terminal.paste.confirm".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.confirm_paste(cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        components::compact_button(
+                            strings.terminal_paste_cancel,
+                            components::Variant::Secondary,
+                            metrics,
+                        )
+                        .id("terminal.paste.cancel")
+                        .debug_selector(|| "terminal.paste.cancel".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.cancel_paste(cx);
+                            },
+                        )),
+                    ),
+            )
+    }
+
+    fn block_overlay(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let strings = self.locale.strings();
+        let blocks = self
+            .core
+            .search_blocks(&self.search_query, self.block_filter);
+        let filter_label = match self.block_filter {
+            BlockFilter::All => strings.terminal_filter_all,
+            BlockFilter::Running => strings.terminal_filter_running,
+            BlockFilter::Unknown => strings.terminal_filter_unknown,
+            BlockFilter::Failed => strings.terminal_filter_failed,
+            BlockFilter::ExitedZero => strings.terminal_filter_zero,
+        };
+        let query = if self.search_query.is_empty() {
+            strings.terminal_search.to_owned()
+        } else {
+            self.search_query.clone()
+        };
+        let hits = self.search_hits.len();
+        let mut panel = div()
+            .absolute()
+            .bottom(px(SHELL_BAR_HEIGHT))
+            .left(px(0.0))
+            .right(px(0.0))
+            .max_h(px(180.0))
+            .flex()
+            .flex_col()
+            .id("terminal.blocks")
+            .overflow_y_scroll()
+            .p(metrics.scale(spacing::TIGHT))
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .bg(theme::swatch(shell_palette::SURFACE))
+            .border_t_1()
+            .border_color(theme::swatch(shell_palette::BORDER))
+            .debug_selector(|| "terminal.blocks".to_owned())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .debug_selector(|| "terminal.search.query".to_owned())
+                            .font_family(monospace_family())
+                            .text_size(metrics.caption_size())
+                            .child(SharedString::from(query)),
+                    )
+                    .when(self.search_open, |row| {
+                        row.child(
+                            div()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                                .child(SharedString::from(if hits == 0 {
+                                    strings.terminal_search_empty.to_owned()
+                                } else {
+                                    format!("{hits}")
+                                })),
+                        )
+                        .child(
+                            components::compact_button(
+                                strings.terminal_search_next,
+                                components::Variant::Ghost,
+                                metrics,
+                            )
+                            .id("terminal.search.next")
+                            .debug_selector(|| "terminal.search.next".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.next_search_hit(cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            components::compact_button(
+                                strings.terminal_search_close,
+                                components::Variant::Ghost,
+                                metrics,
+                            )
+                            .id("terminal.search.close")
+                            .debug_selector(|| "terminal.search.close".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.search_open = false;
+                                    this.search_focused = false;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    })
+                    .when(self.core.shows_command_blocks(), |row| {
+                        row.child(
+                            components::compact_button(
+                                filter_label,
+                                components::Variant::Ghost,
+                                metrics,
+                            )
+                            .id("terminal.blocks.filter")
+                            .debug_selector(|| "terminal.blocks.filter".to_owned())
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.block_filter = this.block_filter.cycle();
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    }),
+            );
+        for block in blocks {
+            panel = panel.child(self.block_row(&block, metrics, strings, cx));
+        }
+        panel
+    }
+
+    fn block_row(
+        &self,
+        block: &CommandBlock,
+        metrics: Metrics,
+        strings: &crate::app::copy::Strings,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let id = block.id;
+        let status = block_status_label(block.status, strings);
+        let tone = block_tone(block.status);
+        let duration = duration_label(block.duration);
+        let command = if block.command.is_empty() {
+            status.clone()
+        } else {
+            block.command.clone()
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(move || format!("terminal.block.{}", id.get()))
+            .child(components::chip(status, tone, metrics))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .font_family(monospace_family())
+                    .text_size(metrics.caption_size())
+                    .child(SharedString::from(command)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                    .child(SharedString::from(duration)),
+            )
+            .child(
+                components::compact_button(
+                    strings.terminal_block_copy,
+                    components::Variant::Ghost,
+                    metrics,
+                )
+                .id(SharedString::from(format!(
+                    "terminal.block.copy.{}",
+                    id.get()
+                )))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.copy_block(id, cx);
+                })),
+            )
+            .child(
+                components::compact_button(
+                    strings.terminal_block_rerun,
+                    components::Variant::Secondary,
+                    metrics,
+                )
+                .id(SharedString::from(format!(
+                    "terminal.block.rerun.{}",
+                    id.get()
+                )))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.rerun_block(id, cx);
+                })),
+            )
+    }
+
     fn viewport(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let snapshot = self.core.snapshot();
         let weak = cx.entity().downgrade();
@@ -1291,11 +1891,15 @@ impl Render for TerminalPane {
         // the grid matches what is drawn even when the platform substitutes a face.
         let _ = self.measure_cell(window);
 
+        let show_blocks =
+            !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks());
+        let show_paste = !self.alternate_screen() && self.pending_paste.is_some();
         div()
             .flex()
             .flex_col()
             .size_full()
             .min_h(px(0.0))
+            .relative()
             .child(
                 // A margin inside the frame keeps the first column off the border; the
                 // grid itself is measured inside it, so no cell is lost to the margin.
@@ -1311,6 +1915,41 @@ impl Render for TerminalPane {
                     .child(self.viewport(window, cx)),
             )
             .child(self.bar(metrics, cx))
+            .when(show_paste, |column| {
+                column.child(self.paste_overlay(metrics, cx))
+            })
+            .when(show_blocks, |column| {
+                column.child(self.block_overlay(metrics, cx))
+            })
+    }
+}
+
+fn block_status_label(status: BlockStatus, strings: &crate::app::copy::Strings) -> String {
+    match status {
+        BlockStatus::Running => strings.terminal_block_running.to_owned(),
+        BlockStatus::Unknown => strings.terminal_block_unknown.to_owned(),
+        BlockStatus::Exited(code) => format!("{} {code}", strings.terminal_block_exit),
+    }
+}
+
+fn block_tone(status: BlockStatus) -> Tone {
+    match status {
+        BlockStatus::Exited(0) => Tone::Positive,
+        BlockStatus::Exited(_) => Tone::Danger,
+        BlockStatus::Unknown => Tone::Warning,
+        BlockStatus::Running => Tone::Neutral,
+    }
+}
+
+fn duration_label(duration: Option<std::time::Duration>) -> String {
+    let Some(duration) = duration else {
+        return "\u{2014}".to_owned();
+    };
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis} ms")
+    } else {
+        format!("{:.1} s", millis as f64 / 1000.0)
     }
 }
 
@@ -1373,6 +2012,14 @@ impl EntityInputHandler for TerminalPane {
         // A commit replaces any composition with its final text, so the pending
         // marker is dropped before the text is sent.
         self.marked = None;
+        if self.search_focused && !self.alternate_screen() {
+            self.search_query.push_str(text);
+            self.refresh_search();
+            cx.notify();
+            return;
+        }
+        // A commit is program input, including one command that ends in a newline.
+        // Multi-line and high-risk confirmation belongs to clipboard paste.
         let bytes = encode_text(text);
         self.write(&bytes, cx);
         cx.notify();

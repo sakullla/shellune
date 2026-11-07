@@ -23,14 +23,15 @@ use shellune_core::{
     TerminalMode, Transfer, TransferDirection, WorkspaceSnapshot, WorkspaceTab,
 };
 use shellune_storage::{
-    ForwardStore, HostBook, HostEdit, HostKey, HostStore, TrustStore, WorkspaceStore,
-    WORKSPACE_FILE_NAME,
+    ForwardStore, HostBook, HostEdit, HostKey, HostStore, TrustStore, WORKSPACE_FILE_NAME,
+    WorkspaceStore,
 };
-use shellune_terminal::GridSize;
+use shellune_terminal::{BlockStatus, GridSize, TermMode, encode_paste};
 
 use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage};
 use crate::app::copy::{CHINESE, ENGLISH, Locale, Strings};
 use crate::app::hosts::HostView;
+use crate::app::layout::Direction;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
@@ -38,7 +39,6 @@ use crate::app::terminal::{PaneState, SourceEvent, TerminalPane};
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Tone, Zoom, palette,
 };
-use crate::app::layout::Direction;
 use crate::app::workspace::{Failure, PrimaryOutcome, Recovery, Section, SectionState, Workspace};
 use crate::app::{DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ShelluneView, key_bindings};
 
@@ -847,6 +847,29 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             workspace_dangling_pane,
             pane_mode_classic,
             pane_mode_integrated,
+            terminal_mode_classic,
+            terminal_mode_blocks,
+            terminal_block_running,
+            terminal_block_unknown,
+            terminal_block_exit,
+            terminal_block_copy,
+            terminal_block_rerun,
+            terminal_search,
+            terminal_search_empty,
+            terminal_search_next,
+            terminal_search_close,
+            terminal_paste_title,
+            terminal_paste_target,
+            terminal_paste_confirm,
+            terminal_paste_cancel,
+            terminal_paste_lines,
+            terminal_no_blocks,
+            terminal_blocks_failed,
+            terminal_filter_all,
+            terminal_filter_running,
+            terminal_filter_unknown,
+            terminal_filter_failed,
+            terminal_filter_zero,
             field_cut,
             field_copy,
             field_paste,
@@ -1053,16 +1076,7 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
     let bindings = key_bindings(Platform::current());
     assert_eq!(
         bindings.len(),
-        Destination::ALL.len()
-            + 6
-            + 5
-            + crate::app::TAB_JUMP_COUNT
-            + 2
-            + 1
-            + 4
-            + 4
-            + 4
-            + 2,
+        Destination::ALL.len() + 6 + 5 + crate::app::TAB_JUMP_COUNT + 2 + 1 + 4 + 4 + 4 + 2,
         "four destinations, next and previous, zoom, new shell, language and dismiss; \
          the palette, the sidebar, close tab, next and previous tab; one jump per \
          tab digit; split right and split down, zoom pane, focus, resize and move in \
@@ -1288,6 +1302,11 @@ struct PaneHarness {
     pane: Entity<TerminalPane>,
 }
 
+struct TwoPaneHarness {
+    first: Entity<TerminalPane>,
+    second: Entity<TerminalPane>,
+}
+
 impl Render for PaneHarness {
     fn render(
         &mut self,
@@ -1295,6 +1314,32 @@ impl Render for PaneHarness {
         _cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
         div().size_full().child(self.pane.clone())
+    }
+}
+
+impl Render for TwoPaneHarness {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .child(self.first.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .child(self.second.clone()),
+            )
     }
 }
 
@@ -1384,6 +1429,287 @@ async fn typing_reaches_the_shell_through_the_input_path(cx: &mut TestAppContext
         b"echo hi\r\x03\x1b[A".to_vec(),
         "an arrow key must send the cursor sequence"
     );
+}
+
+fn bare_pane(name: &str, cx: &mut gpui::Context<TerminalPane>) -> TerminalPane {
+    TerminalPane::without_process(
+        LocalShell::new(name, "test-shell"),
+        shellune_core::EventTag::new(shellune_core::SessionId::new(), 0),
+        GridSize::new(40, 10),
+        shellune_terminal::DEFAULT_FONT_SIZE,
+        Locale::English,
+        cx,
+    )
+}
+
+fn two_panes(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<TerminalPane>,
+    Entity<TerminalPane>,
+    &mut VisualTestContext,
+) {
+    let first = cx.new(|pane_cx| bare_pane("Left shell", pane_cx));
+    let second = cx.new(|pane_cx| bare_pane("Right shell", pane_cx));
+    let first_pane = first.clone();
+    let second_pane = second.clone();
+    let (_harness, cx) = cx.add_window_view(move |_window, _cx| TwoPaneHarness {
+        first: first_pane,
+        second: second_pane,
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    (first, second, cx)
+}
+
+fn osc_bytes(payload: &str) -> Vec<u8> {
+    let mut bytes = b"\x1b]".to_vec();
+    bytes.extend_from_slice(payload.as_bytes());
+    bytes.push(0x07);
+    bytes
+}
+
+#[gpui::test]
+async fn a_committed_line_is_written_without_a_paste_confirmation(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|window, app| {
+        use gpui::EntityInputHandler;
+        pane.update(app, |pane, cx| {
+            pane.replace_text_in_range(None, "echo hi\n", window, cx);
+        });
+    });
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"echo hi\r".to_vec(),
+        "an input-method commit that ends a line must reach the program"
+    );
+    assert!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().is_none()),
+        "committing a line must not wait for a paste confirmation"
+    );
+}
+
+#[gpui::test]
+async fn cancelling_a_multiline_paste_writes_nothing_and_program_keys_still_arrive(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("", cx);
+    let paste = "echo one\necho two\n";
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_paste(paste, cx));
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        Vec::<u8>::new(),
+        "a multi-line paste must not be written before it is confirmed"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_target().map(str::to_owned)),
+        Some("Test shell".to_owned()),
+        "the confirmation names the session that would receive the paste"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().map(str::to_owned)),
+        Some(paste.to_owned())
+    );
+    assert!(cx.debug_bounds("terminal.paste").is_some());
+    assert!(cx.debug_bounds("terminal.paste.target").is_some());
+
+    cx.simulate_keystrokes("escape");
+    cx.simulate_keystrokes("ctrl-l");
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        vec![0x1b, 0x0c, 0x03],
+        "Escape, Ctrl+L and Ctrl+C stay program input while a paste is waiting"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().map(str::to_owned)),
+        Some(paste.to_owned()),
+        "those keys must not confirm or cancel the paste"
+    );
+
+    let before_cancel = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    click(cx, "terminal.paste.cancel");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        before_cancel,
+        "cancelling a paste writes nothing"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().map(str::to_owned)),
+        None
+    );
+}
+
+#[gpui::test]
+async fn confirming_a_multiline_paste_writes_only_the_active_pane(cx: &mut TestAppContext) {
+    let (left, right, cx) = two_panes(cx);
+    let paste = "echo left\necho more\n";
+    cx.update(|_window, app| {
+        left.update(app, |pane, cx| pane.stage_paste(paste, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| left.read(app).pending_paste_target().map(str::to_owned)),
+        Some("Left shell".to_owned())
+    );
+    assert_eq!(
+        cx.update(|_window, app| right.read(app).sent().to_vec()),
+        Vec::<u8>::new()
+    );
+    assert!(cx.update(|_window, app| right.read(app).pending_paste_target().is_none()));
+
+    click(cx, "terminal.paste.confirm");
+    let expected = encode_paste(paste, TermMode::empty());
+    assert_eq!(
+        cx.update(|_window, app| left.read(app).sent().to_vec()),
+        expected,
+        "confirming writes the paste into the pane that asked"
+    );
+    assert_eq!(
+        cx.update(|_window, app| right.read(app).sent().to_vec()),
+        Vec::<u8>::new(),
+        "the other session receives nothing"
+    );
+    assert!(cx.update(|_window, app| left.read(app).pending_paste_text().is_none()));
+
+    let other = "echo right\necho rest\n";
+    cx.update(|_window, app| {
+        right.update(app, |pane, cx| pane.stage_paste(other, cx));
+    });
+    cx.run_until_parked();
+    let left_sent = cx.update(|_window, app| left.read(app).sent().to_vec());
+    click(cx, "terminal.paste.confirm");
+    assert_eq!(
+        cx.update(|_window, app| right.read(app).sent().to_vec()),
+        encode_paste(other, TermMode::empty())
+    );
+    assert_eq!(
+        cx.update(|_window, app| left.read(app).sent().to_vec()),
+        left_sent,
+        "confirming the other pane does not write into the first session"
+    );
+}
+
+#[gpui::test]
+async fn integration_markers_become_blocks_and_the_alternate_screen_stays_classic(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.set_presentation(TerminalMode::Integrated, cx);
+            let mut bytes = Vec::new();
+            bytes.extend(osc_bytes("133;A"));
+            bytes.extend(b"$ ");
+            bytes.extend(osc_bytes("133;B"));
+            bytes.extend(b"echo hello");
+            bytes.extend(osc_bytes("133;C"));
+            bytes.extend(b"\r\nhello\r\n");
+            pane.feed_for_test(&bytes, cx);
+        });
+    });
+    cx.run_until_parked();
+    let running = cx.update(|_window, app| pane.read(app).command_blocks());
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].command, "echo hello");
+    assert_eq!(running[0].output, "hello");
+    assert_eq!(running[0].status, BlockStatus::Running);
+    assert!(!running[0].status.is_success());
+    assert!(running[0].duration.is_none());
+    assert!(cx.debug_bounds("terminal.blocks").is_some());
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(&osc_bytes("133;D;0"), cx)
+        });
+    });
+    cx.run_until_parked();
+    let finished = cx.update(|_window, app| pane.read(app).command_blocks());
+    assert_eq!(finished[0].status, BlockStatus::Exited(0));
+    assert!(finished[0].status.is_success());
+    assert_eq!(finished[0].output, "hello");
+    let duration = finished[0]
+        .duration
+        .expect("a finished command has a duration");
+    assert!(duration.as_millis() >= 1, "{duration:?}");
+
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            let mut bytes = Vec::new();
+            bytes.extend(osc_bytes("133;B"));
+            bytes.extend(b"false");
+            bytes.extend(osc_bytes("133;C"));
+            bytes.extend(b"\r\nnope\r\n");
+            bytes.extend(osc_bytes("133;D"));
+            pane.feed_for_test(&bytes, cx);
+        });
+    });
+    let blocks = cx.update(|_window, app| pane.read(app).command_blocks());
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].status, BlockStatus::Exited(0));
+    assert_eq!(blocks[1].command, "false");
+    assert_eq!(blocks[1].status, BlockStatus::Unknown);
+    assert!(
+        !blocks[1].status.is_success(),
+        "a command-end marker with no exit code is not success"
+    );
+
+    let primary = cx.update(|_window, app| pane.read(app).visible_text());
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"\x1b[?1049h\x1b[Hinside", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| pane.read(app).alternate_for_test()),
+        "the full-screen program switched to the alternate screen"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text()[0].clone()),
+        "inside",
+        "the alternate screen is the classic grid"
+    );
+    assert!(
+        !cx.update(|_window, app| pane.read(app).shows_blocks_for_test()),
+        "command blocks stay hidden on the alternate screen"
+    );
+
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.feed_for_test(b"\x1b[?1049l", cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text()),
+        primary,
+        "leaving the alternate screen restores the previous grid"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).command_blocks()),
+        blocks,
+        "the full-screen program does not rewrite recorded commands"
+    );
+    assert!(cx.update(|_window, app| pane.read(app).shows_blocks_for_test()));
+
+    let kept = cx.update(|_window, app| pane.read(app).visible_text());
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.set_presentation(TerminalMode::Classic, cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text()),
+        kept,
+        "turning command blocks off does not rewrite the grid"
+    );
+    assert!(!cx.update(|_window, app| pane.read(app).shows_blocks_for_test()));
 }
 
 #[gpui::test]
@@ -6856,7 +7182,10 @@ async fn closing_a_mixed_tab_from_the_menu_drops_its_pending_pane(cx: &mut TestA
             )
         })
     });
-    assert!(pending.is_some(), "the split adds a pane that has no session");
+    assert!(
+        pending.is_some(),
+        "the split adds a pane that has no session"
+    );
     assert_eq!(
         cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
         1
@@ -6871,7 +7200,11 @@ async fn closing_a_mixed_tab_from_the_menu_drops_its_pending_pane(cx: &mut TestA
             0,
             "the waiting pane is removed with its tab"
         );
-        assert_eq!(view.layout_tab_count_for_test(), 1, "the tab itself is gone");
+        assert_eq!(
+            view.layout_tab_count_for_test(),
+            1,
+            "the tab itself is gone"
+        );
         assert_eq!(view.open_tabs(), vec![kept]);
         assert!(
             view.workspace()
@@ -6972,7 +7305,11 @@ async fn a_failed_local_adopt_keeps_the_pending_pane(cx: &mut TestAppContext) {
         })
     });
     let before = cx.update(|_window, app| view.read(app).leaf_ids_for_test());
-    assert_eq!(before.len(), 2, "the split has the live pane and the waiting one");
+    assert_eq!(
+        before.len(),
+        2,
+        "the split has the live pane and the waiting one"
+    );
 
     cx.update(|_window, app| {
         view.update(app, |view, cx| view.connect_leaf_for_test(pending, cx));
@@ -8672,7 +9009,10 @@ async fn nested_splits_keep_input_and_resize_on_the_active_pane(cx: &mut TestApp
         });
     });
     let grown = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
-    assert_ne!(grown[0], ratios[0], "the sideways split around the active pane changed");
+    assert_ne!(
+        grown[0], ratios[0],
+        "the sideways split around the active pane changed"
+    );
     assert_eq!(grown[1], ratios[1], "the stacked split did not");
 
     cx.update(|window, app| {
@@ -8684,7 +9024,10 @@ async fn nested_splits_keep_input_and_resize_on_the_active_pane(cx: &mut TestApp
     });
     let stacked = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
     assert_eq!(stacked[0], grown[0], "the sideways split stayed");
-    assert_ne!(stacked[1], grown[1], "only the stacked split around the active pane changed");
+    assert_ne!(
+        stacked[1], grown[1],
+        "only the stacked split around the active pane changed"
+    );
 
     cx.update(|_window, app| {
         view.update(app, |view, cx| view.close_session(middle, cx));
@@ -8760,9 +9103,7 @@ fn layout_port() -> u16 {
 }
 
 #[gpui::test]
-async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(
-    cx: &mut TestAppContext,
-) {
+async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(cx: &mut TestAppContext) {
     let dir = TempDir::new("layout-restore");
     let (script, marker) = layout_script(&dir.path());
     let secret = "hunter2-layout-restore";
@@ -8807,7 +9148,10 @@ async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(
         .expect("rule");
     ForwardStore::at(dir.path()).save(&rules).expect("rules");
     let before = std::fs::read(dir.path().join(WORKSPACE_FILE_NAME)).expect("file");
-    assert!(!marker.exists(), "writing the snapshot must not run anything");
+    assert!(
+        !marker.exists(),
+        "writing the snapshot must not run anything"
+    );
 
     let workspace = Workspace::new();
     let store = HostStore::at(dir.path());
@@ -8823,7 +9167,10 @@ async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(
         before,
         "loading the layout must not rewrite it"
     );
-    assert!(!marker.exists(), "restore must not run the shell or ProxyCommand");
+    assert!(
+        !marker.exists(),
+        "restore must not run the shell or ProxyCommand"
+    );
     std::net::TcpListener::bind(("127.0.0.1", port)).expect("restore must not listen");
     assert!(
         cx.update(|_window, app| view.read(app).open_sessions().is_empty()),
@@ -8860,9 +9207,7 @@ async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(
     );
 
     assert!(
-        cx.update(|_window, app| {
-            view.update(app, |view, cx| view.close_pending_for_test(cx))
-        }),
+        cx.update(|_window, app| { view.update(app, |view, cx| view.close_pending_for_test(cx)) }),
         "one pending pane can be removed"
     );
     assert_eq!(

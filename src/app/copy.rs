@@ -747,6 +747,52 @@ pub struct Strings {
     pub pane_mode_classic: &'static str,
     /// Command-block mode, restored as a preference. Output is not brought back.
     pub pane_mode_integrated: &'static str,
+    /// Toolbar: show the classic grid.
+    pub terminal_mode_classic: &'static str,
+    /// Toolbar: show command blocks when the shell reports them.
+    pub terminal_mode_blocks: &'static str,
+    /// Command block that has not ended.
+    pub terminal_block_running: &'static str,
+    /// Command block whose exit code was not reported.
+    pub terminal_block_unknown: &'static str,
+    /// Label before a reported exit code.
+    pub terminal_block_exit: &'static str,
+    /// Copies one command block.
+    pub terminal_block_copy: &'static str,
+    /// Runs the block's command again, as a new execution.
+    pub terminal_block_rerun: &'static str,
+    /// Opens search of this terminal's history and command blocks.
+    pub terminal_search: &'static str,
+    /// Shown when a search matches nothing in this terminal.
+    pub terminal_search_empty: &'static str,
+    /// Moves to the next history match.
+    pub terminal_search_next: &'static str,
+    /// Closes the history search.
+    pub terminal_search_close: &'static str,
+    /// Title of the paste confirmation.
+    pub terminal_paste_title: &'static str,
+    /// Label for the session a paste would be sent to.
+    pub terminal_paste_target: &'static str,
+    /// Confirms a paste into the session named above it.
+    pub terminal_paste_confirm: &'static str,
+    /// Drops a paste without sending it.
+    pub terminal_paste_cancel: &'static str,
+    /// Unit after the number of lines in a paste.
+    pub terminal_paste_lines: &'static str,
+    /// Enhanced mode, but the shell has not emitted integration markers.
+    pub terminal_no_blocks: &'static str,
+    /// Integration was seen and then stopped being trustworthy.
+    pub terminal_blocks_failed: &'static str,
+    /// Filter: every command block.
+    pub terminal_filter_all: &'static str,
+    /// Filter: commands that have not ended.
+    pub terminal_filter_running: &'static str,
+    /// Filter: commands with no exit code.
+    pub terminal_filter_unknown: &'static str,
+    /// Filter: commands that exited non-zero.
+    pub terminal_filter_failed: &'static str,
+    /// Filter: commands that exited zero. Not a generic success.
+    pub terminal_filter_zero: &'static str,
 }
 
 /// English copy.
@@ -1084,6 +1130,29 @@ pub static ENGLISH: Strings = Strings {
     workspace_dangling_pane: "The saved active pane is not on its tab. Choose a pane. The layout was kept.",
     pane_mode_classic: "Classic terminal",
     pane_mode_integrated: "Command blocks, not restored",
+    terminal_mode_classic: "Classic grid",
+    terminal_mode_blocks: "Command blocks",
+    terminal_block_running: "Running",
+    terminal_block_unknown: "Unknown",
+    terminal_block_exit: "Exit",
+    terminal_block_copy: "Copy block",
+    terminal_block_rerun: "Run again",
+    terminal_search: "Search this terminal",
+    terminal_search_empty: "No matches in this terminal",
+    terminal_search_next: "Next match",
+    terminal_search_close: "Close search",
+    terminal_paste_title: "Confirm paste",
+    terminal_paste_target: "Target session",
+    terminal_paste_confirm: "Paste into this session",
+    terminal_paste_cancel: "Do not paste",
+    terminal_paste_lines: "lines",
+    terminal_no_blocks: "This shell has not reported command blocks. The grid is unchanged.",
+    terminal_blocks_failed: "Shell integration failed. The classic grid was kept.",
+    terminal_filter_all: "All commands",
+    terminal_filter_running: "Running only",
+    terminal_filter_unknown: "Unknown exit",
+    terminal_filter_failed: "Non-zero exit",
+    terminal_filter_zero: "Exit 0 only",
 };
 
 /// Chinese copy.
@@ -1421,6 +1490,29 @@ pub static CHINESE: Strings = Strings {
     workspace_dangling_pane: "保存的活动窗格不在它的标签上。请另选一个窗格，布局已保留。",
     pane_mode_classic: "经典终端",
     pane_mode_integrated: "命令块模式，内容未恢复",
+    terminal_mode_classic: "经典网格",
+    terminal_mode_blocks: "命令块",
+    terminal_block_running: "进行中",
+    terminal_block_unknown: "未知",
+    terminal_block_exit: "退出码",
+    terminal_block_copy: "复制此块",
+    terminal_block_rerun: "重新运行",
+    terminal_search: "搜索这个终端",
+    terminal_search_empty: "这个终端里没有匹配",
+    terminal_search_next: "下一个匹配",
+    terminal_search_close: "关闭搜索",
+    terminal_paste_title: "确认粘贴",
+    terminal_paste_target: "目标会话",
+    terminal_paste_confirm: "粘贴到这个会话",
+    terminal_paste_cancel: "不粘贴",
+    terminal_paste_lines: "行",
+    terminal_no_blocks: "这个 Shell 没有报告命令块。网格保持原样。",
+    terminal_blocks_failed: "Shell 集成已失效。经典网格已保留。",
+    terminal_filter_all: "全部命令",
+    terminal_filter_running: "仅进行中",
+    terminal_filter_unknown: "未知退出",
+    terminal_filter_failed: "非零退出",
+    terminal_filter_zero: "仅退出码 0",
 };
 
 /// A count followed by its unit, in the grammar of the language.

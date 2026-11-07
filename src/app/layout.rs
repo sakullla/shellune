@@ -315,6 +315,28 @@ impl SessionLayout {
         tab.active.filter(|id| contains(&tab.root, *id))
     }
 
+    /// The presentation stored for the leaf that shows `session`.
+    #[must_use]
+    pub fn session_mode(&self, session: SessionId) -> TerminalMode {
+        self.leaves()
+            .into_iter()
+            .find(|leaf| leaf.session() == Some(session))
+            .map(|leaf| leaf.mode())
+            .unwrap_or(TerminalMode::Classic)
+    }
+
+    /// Records the presentation of the leaf that shows `session`.
+    ///
+    /// Returns whether the stored mode changed. The pane's grid is not touched.
+    pub fn set_session_mode(&mut self, session: SessionId, mode: TerminalMode) -> bool {
+        for tab in &mut self.tabs {
+            if set_leaf_mode(&mut tab.root, session, mode) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Every leaf, in tree order.
     #[must_use]
     pub fn leaves(&self) -> Vec<&Leaf> {
@@ -563,11 +585,7 @@ impl SessionLayout {
 
     /// Removes one pane. The rest of its tab, and every other tab, stay.
     pub fn close_pane(&mut self, pane: PaneId) -> bool {
-        let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| contains(&tab.root, pane))
-        else {
+        let Some(index) = self.tabs.iter().position(|tab| contains(&tab.root, pane)) else {
             return false;
         };
         let tab_id = self.tabs[index].id;
@@ -601,8 +619,7 @@ impl SessionLayout {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
         };
-        let Some(root) = drop_pending(std::mem::replace(&mut self.tabs[index].root, hole()))
-        else {
+        let Some(root) = drop_pending(std::mem::replace(&mut self.tabs[index].root, hole())) else {
             self.tabs.remove(index);
             if self.active == Some(id) {
                 self.active = self
@@ -695,8 +712,10 @@ impl SessionLayout {
                     self.notices.push(LayoutNotice::DanglingTab { tab: *tab });
                 }
                 WorkspaceIssue::DanglingActivePane { tab, pane, .. } => {
-                    self.notices
-                        .push(LayoutNotice::DanglingPane { tab: *tab, pane: *pane });
+                    self.notices.push(LayoutNotice::DanglingPane {
+                        tab: *tab,
+                        pane: *pane,
+                    });
                 }
                 WorkspaceIssue::MissingHost { .. } => {}
             }
@@ -819,6 +838,22 @@ fn contains(node: &Node, id: PaneId) -> bool {
     }
 }
 
+fn set_leaf_mode(node: &mut Node, session: SessionId, mode: TerminalMode) -> bool {
+    match node {
+        Node::Leaf(leaf) if leaf.session == Some(session) => {
+            if leaf.mode == mode {
+                return false;
+            }
+            leaf.mode = mode;
+            true
+        }
+        Node::Leaf(_) => false,
+        Node::Split { first, second, .. } => {
+            set_leaf_mode(first, session, mode) || set_leaf_mode(second, session, mode)
+        }
+    }
+}
+
 fn leaf<'a>(node: &'a Node, id: PaneId) -> Option<&'a Leaf> {
     match node {
         Node::Leaf(leaf) if leaf.id == id => Some(leaf),
@@ -929,7 +964,10 @@ fn locate(node: &Node, id: PaneId, direction: Direction) -> Locate {
             }
         }
         Node::Split {
-            axis, first, second, ..
+            axis,
+            first,
+            second,
+            ..
         } => match locate(first, id, direction) {
             Locate::Found(pane) => Locate::Found(pane),
             Locate::Inside => {
@@ -959,7 +997,10 @@ fn entry_edge(node: &Node, direction: Direction) -> PaneId {
     match node {
         Node::Leaf(leaf) => leaf.id,
         Node::Split {
-            axis, first, second, ..
+            axis,
+            first,
+            second,
+            ..
         } => {
             if axis_matches(*axis, direction) {
                 if points_second(direction) {
@@ -1103,13 +1144,7 @@ fn remove_pane(node: Node, pane: PaneId) -> Option<Node> {
     }
 }
 
-fn insert_at(
-    node: Node,
-    pane: PaneId,
-    axis: SplitAxis,
-    split: u64,
-    leaf: Leaf,
-) -> (Node, bool) {
+fn insert_at(node: Node, pane: PaneId, axis: SplitAxis, split: u64, leaf: Leaf) -> (Node, bool) {
     match node {
         Node::Leaf(existing) if existing.id == pane => (
             Node::Split {
@@ -1348,11 +1383,7 @@ mod tests {
 
     fn session_leaf(layout: &mut SessionLayout, title: &str) -> (SessionId, PaneId) {
         let session = SessionId::new();
-        layout.attach(
-            session,
-            PaneTarget::local(Some("pwsh".to_owned())),
-            title,
-        );
+        layout.attach(session, PaneTarget::local(Some("pwsh".to_owned())), title);
         let pane = layout.active_pane().expect("the new tab has a pane");
         (session, pane)
     }
@@ -1412,13 +1443,17 @@ mod tests {
         assert_eq!(layout.tabs().len(), 1);
         assert_eq!(layout.active_ratios().len(), 2, "the tree shape stays");
         let sessions = sessions_of(&layout.active_tab().expect("tab").root);
-        assert!(sessions.contains(&first) && sessions.contains(&second) && sessions.contains(&third));
+        assert!(
+            sessions.contains(&first) && sessions.contains(&second) && sessions.contains(&third)
+        );
 
-        assert!(layout.close_pane(
-            layout
-                .active_pane()
-                .expect("a pane is still active after the move")
-        ));
+        assert!(
+            layout.close_pane(
+                layout
+                    .active_pane()
+                    .expect("a pane is still active after the move")
+            )
+        );
         let left = sessions_of(&layout.active_tab().expect("tab").root);
         assert_eq!(left.len(), 2, "one pane closed");
         assert!(left.contains(&first), "the pane that was not closed stays");
@@ -1440,7 +1475,10 @@ mod tests {
         let root = PaneNode::split(
             SplitAxis::LeftRight,
             5000,
-            PaneNode::leaf(PaneTarget::local(Some("pwsh".to_owned())), TerminalMode::Classic),
+            PaneNode::leaf(
+                PaneTarget::local(Some("pwsh".to_owned())),
+                TerminalMode::Classic,
+            ),
             PaneNode::split(
                 SplitAxis::TopBottom,
                 2500,
@@ -1453,9 +1491,11 @@ mod tests {
         let mut tab = WorkspaceTab::new("Work", root).expect("title");
         let stale = PaneId::new();
         tab.set_active_pane(Some(stale));
-        let mut snapshot =
-            WorkspaceSnapshot::new(vec![tab], PanelConfig::new(true, shellune_core::PanelSection::Files))
-                .expect("snapshot");
+        let mut snapshot = WorkspaceSnapshot::new(
+            vec![tab],
+            PanelConfig::new(true, shellune_core::PanelSection::Files),
+        )
+        .expect("snapshot");
         let stale_tab = TabId::new();
         snapshot.set_active_tab(Some(stale_tab));
 
@@ -1467,10 +1507,7 @@ mod tests {
         assert_eq!(leaves.len(), 3);
         assert!(leaves.iter().all(|leaf| leaf.session().is_none()));
         assert!(leaves.iter().all(|leaf| leaf.is_pending()));
-        let marked: Vec<_> = leaves
-            .iter()
-            .filter(|leaf| leaf.mark().is_some())
-            .collect();
+        let marked: Vec<_> = leaves.iter().filter(|leaf| leaf.mark().is_some()).collect();
         assert_eq!(marked.len(), 1, "only the missing host is marked");
         assert!(matches!(
             marked[0].mark(),
