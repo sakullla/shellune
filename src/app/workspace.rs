@@ -359,12 +359,6 @@ impl Workspace {
         self.layout.tab_anchors()
     }
 
-    /// Sessions that share a tab with `anchor`.
-    #[must_use]
-    pub fn sessions_in_tab(&self, anchor: SessionId) -> Vec<SessionId> {
-        self.layout.sessions_in_tab(anchor)
-    }
-
     /// The next session splits the active pane instead of opening a tab.
     pub fn arm_split(&mut self, axis: SplitAxis) -> bool {
         self.layout.arm_split(axis)
@@ -771,6 +765,27 @@ impl Workspace {
     /// Only an attempt that never became live may be forgotten this way.
     pub fn session_forgotten(&mut self, id: SessionId) {
         self.layout.detach_session(id);
+        self.forget_session_record(id);
+    }
+
+    /// Undoes an adopt whose process never started.
+    ///
+    /// The leaf goes back to waiting, with the target it had. A launch that opened
+    /// a new tab is not this case: [`Self::session_forgotten`] still removes it.
+    pub fn revert_failed_adopt(&mut self, id: SessionId) -> bool {
+        if !self.layout.revert_adopted(id) {
+            return false;
+        }
+        self.forget_session_record(id);
+        true
+    }
+
+    /// A started shell owns the leaf, so a later failure must not restore the old one.
+    pub fn clear_adopted_launch(&mut self) {
+        self.layout.clear_adopted();
+    }
+
+    fn forget_session_record(&mut self, id: SessionId) {
         let remaining: Vec<Session> = self
             .sessions
             .items()

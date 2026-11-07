@@ -293,14 +293,13 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// Closes every session that shares `id`'s tab. One session is the whole tab.
+    /// Closes the whole tab that holds `id`, including panes that have no session yet.
     pub(super) fn request_close_tab_anchor(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let ids = self.workspace.sessions_in_tab(id);
-        if ids.is_empty() {
+        let Some(index) = self.tab_index_of(id) else {
             self.request_close_session(id, cx);
             return;
-        }
-        self.close_sessions(ids, cx);
+        };
+        self.close_tab_indexes(cx, |candidate| candidate == index);
     }
 
     /// Closes every tab except the one that holds `id`.
@@ -334,16 +333,18 @@ impl ShelluneView {
             .map(|(_, tab)| (tab.id(), sessions_in_node(tab.root())))
             .collect();
         let mut sessions = Vec::new();
-        let mut pending = Vec::new();
         for (tab, in_tab) in tabs {
-            if in_tab.is_empty() {
-                pending.push(tab);
-            } else {
+            // A transfer still has to be confirmed, so that session's tab stays until
+            // the user answers. Waiting panes on the named tab do not stay with it.
+            let busy = in_tab
+                .iter()
+                .any(|id| self.transfers.active_count(*id) > 0);
+            if busy {
+                self.workspace.layout_mut().drop_pending_on_tab(tab);
                 sessions.extend(in_tab);
+            } else {
+                sessions.extend(self.workspace.layout_mut().take_tab(tab));
             }
-        }
-        for tab in pending {
-            let _ = self.workspace.layout_mut().take_tab(tab);
         }
         if sessions.is_empty() {
             self.sync_layout_focus(cx);
@@ -351,6 +352,8 @@ impl ShelluneView {
             cx.notify();
             return;
         }
+        self.sync_layout_focus(cx);
+        self.checkpoint_layout();
         self.close_sessions(sessions, cx);
     }
 
@@ -1000,23 +1003,7 @@ impl ShelluneView {
     }
 
     fn close_pending_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(id) = self
-            .workspace
-            .layout()
-            .tabs()
-            .get(index)
-            .map(|tab| tab.id())
-        else {
-            return;
-        };
-        let sessions = self.workspace.layout_mut().take_tab(id);
-        if sessions.is_empty() {
-            self.sync_layout_focus(cx);
-            self.checkpoint_layout();
-            cx.notify();
-            return;
-        }
-        self.close_sessions(sessions, cx);
+        self.close_tab_indexes(cx, |candidate| candidate == index);
     }
 
     fn focus_leaf(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
@@ -1234,6 +1221,49 @@ impl ShelluneView {
 
     pub fn layout_error_for_test(&self) -> Option<&str> {
         self.layout_error.as_deref()
+    }
+
+    pub fn layout_tab_count_for_test(&self) -> usize {
+        self.workspace.layout().tabs().len()
+    }
+
+    pub fn leaf_ids_for_test(&self) -> Vec<PaneId> {
+        self.workspace
+            .layout()
+            .leaves()
+            .iter()
+            .map(|leaf| leaf.id())
+            .collect()
+    }
+
+    pub fn leaf_snapshot_for_test(&self, pane: PaneId) -> Option<(bool, PaneTarget, Option<SessionId>)> {
+        self.workspace
+            .layout()
+            .leaves()
+            .iter()
+            .find(|leaf| leaf.id() == pane)
+            .map(|leaf| (leaf.is_pending(), leaf.target().clone(), leaf.session()))
+    }
+
+    pub fn split_pending_for_test(
+        &mut self,
+        axis: SplitAxis,
+        target: PaneTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneId> {
+        let id = self.workspace.layout_mut().split_pending(axis, target)?;
+        self.present_active_pane(window, cx);
+        self.checkpoint_layout();
+        Some(id)
+    }
+
+    pub fn connect_leaf_for_test(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        self.connect_leaf(pane, None, cx);
+    }
+
+    pub fn local_error_for_test(&self) -> Option<String> {
+        self.local_error.clone()
     }
 
     pub fn close_pending_for_test(&mut self, cx: &mut Context<Self>) -> bool {

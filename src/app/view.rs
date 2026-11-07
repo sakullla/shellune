@@ -3596,9 +3596,12 @@ impl ShelluneView {
             let reason = state
                 .failure()
                 .map_or_else(|| state.label(locale), |failure| failure.to_string());
-            // A process that never ran is not a session: the record is dropped and the
-            // reason is reported where the picked shell is.
-            self.workspace.session_forgotten(id);
+            // A process that never ran is not a session. A new tab is removed. An
+            // adopt puts the existing leaf back to waiting so its target can be tried
+            // again; the reason stays on the workspace that still shows that leaf.
+            if !self.workspace.revert_failed_adopt(id) {
+                self.workspace.session_forgotten(id);
+            }
             self.local_error = Some(reason.clone());
             self.workspace
                 .fail_local_start(Failure::new(reason, Recovery::ChooseShell));
@@ -3606,6 +3609,7 @@ impl ShelluneView {
             return;
         }
 
+        self.workspace.clear_adopted_launch();
         self.workspace.session_connected(id);
         self.workspace.clear_session_failure();
         // The size the pane actually uses is the one the next session starts with.

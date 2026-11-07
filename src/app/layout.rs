@@ -190,12 +190,24 @@ impl Tab {
     }
 }
 
+/// The leaf an adopt overwrote, so a failed start can put that leaf back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldLeaf {
+    pane: PaneId,
+    session: Option<SessionId>,
+    target: PaneTarget,
+    mode: TerminalMode,
+    mark: Option<LeafMark>,
+}
+
 /// Tabs, the active one, and a one-shot placement for the next session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionLayout {
     tabs: Vec<Tab>,
     active: Option<TabId>,
     armed: Option<Armed>,
+    /// Set only when the latest attach bound a session onto a leaf that was already there.
+    adopted: Option<HeldLeaf>,
     notices: Vec<LayoutNotice>,
     next_split: u64,
 }
@@ -206,6 +218,7 @@ impl Default for SessionLayout {
             tabs: Vec::new(),
             active: None,
             armed: None,
+            adopted: None,
             notices: Vec::new(),
             next_split: 1,
         }
@@ -302,16 +315,6 @@ impl SessionLayout {
         tab.active.filter(|id| contains(&tab.root, *id))
     }
 
-    /// Sessions that share the tab `anchor` is on.
-    #[must_use]
-    pub fn sessions_in_tab(&self, anchor: SessionId) -> Vec<SessionId> {
-        self.tabs
-            .iter()
-            .find(|tab| tab_contains_session(tab, anchor))
-            .map(|tab| sessions_of(&tab.root))
-            .unwrap_or_default()
-    }
-
     /// Every leaf, in tree order.
     #[must_use]
     pub fn leaves(&self) -> Vec<&Leaf> {
@@ -359,12 +362,29 @@ impl SessionLayout {
     /// An armed split or adopt is consumed. Otherwise the session is a new tab,
     /// which is how a new shell stays a tab of its own.
     pub fn attach(&mut self, session: SessionId, target: PaneTarget, title: &str) {
+        self.adopted = None;
         match self.armed.take() {
             Some(Armed::Adopt { pane }) if self.bind(pane, session, target.clone()) => {}
             Some(Armed::Split { pane, axis })
                 if self.insert_split(pane, axis, Leaf::live(session, target.clone())) => {}
             _ => self.open_tab(Some(session), target, title, TerminalMode::Classic),
         }
+    }
+
+    /// Puts an adopted leaf back and reports whether `session` was the one just bound.
+    ///
+    /// A start that never produced a process must not delete the pane the user
+    /// already had. The leaf keeps its id, its place and the target it had.
+    pub fn revert_adopted(&mut self, session: SessionId) -> bool {
+        let Some(held) = self.adopted.take() else {
+            return false;
+        };
+        restore_held(&mut self.tabs, &held, session)
+    }
+
+    /// The launch is real, so the adopted leaf is no longer waiting to be restored.
+    pub fn clear_adopted(&mut self) {
+        self.adopted = None;
     }
 
     /// Splits the active pane with a leaf that has not been started.
@@ -574,6 +594,36 @@ impl SessionLayout {
         true
     }
 
+    /// Removes waiting leaves from one tab. A tab that was only waiting is removed.
+    ///
+    /// Sessions on that tab stay, and every other tab stays.
+    pub fn drop_pending_on_tab(&mut self, id: TabId) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        let Some(root) = drop_pending(std::mem::replace(&mut self.tabs[index].root, hole()))
+        else {
+            self.tabs.remove(index);
+            if self.active == Some(id) {
+                self.active = self
+                    .tabs
+                    .get(index)
+                    .or_else(|| self.tabs.last())
+                    .map(|tab| tab.id);
+            }
+            return true;
+        };
+        let tab = &mut self.tabs[index];
+        tab.root = root;
+        if tab.active.is_some_and(|pane| !contains(&tab.root, pane)) {
+            tab.active = first_pane(&tab.root);
+        }
+        if tab.zoomed.is_some_and(|pane| !contains(&tab.root, pane)) {
+            tab.zoomed = None;
+        }
+        true
+    }
+
     /// Removes one tab and reports the sessions it held, so the caller can stop
     /// those processes and no others.
     pub fn take_tab(&mut self, id: TabId) -> Vec<SessionId> {
@@ -624,6 +674,7 @@ impl SessionLayout {
     /// Every leaf has no session. The caller must not start one from this.
     pub fn install_restored(&mut self, restored: RestoredWorkspace) {
         self.armed = None;
+        self.adopted = None;
         self.notices.clear();
         let mut tabs = Vec::new();
         let mut seed = self.next_split;
@@ -669,9 +720,10 @@ impl SessionLayout {
 
     fn bind(&mut self, pane: PaneId, session: SessionId, target: PaneTarget) -> bool {
         for tab in &mut self.tabs {
-            if bind_leaf(&mut tab.root, pane, session, target.clone()) {
+            if let Some(held) = bind_leaf(&mut tab.root, pane, session, target.clone()) {
                 tab.active = Some(pane);
                 self.active = Some(tab.id);
+                self.adopted = Some(held);
                 return true;
             }
         }
@@ -751,10 +803,6 @@ fn anchor_session(tab: &Tab) -> Option<SessionId> {
         .and_then(|id| leaf(&tab.root, id))
         .and_then(|leaf| leaf.session);
     preferred.or_else(|| first_session(&tab.root))
-}
-
-fn tab_contains_session(tab: &Tab, session: SessionId) -> bool {
-    find_session(&tab.root, session).is_some()
 }
 
 fn has_pending(node: &Node) -> bool {
@@ -1121,18 +1169,84 @@ fn insert_at(
     }
 }
 
-fn bind_leaf(node: &mut Node, pane: PaneId, session: SessionId, target: PaneTarget) -> bool {
+fn bind_leaf(
+    node: &mut Node,
+    pane: PaneId,
+    session: SessionId,
+    target: PaneTarget,
+) -> Option<HeldLeaf> {
     match node {
         Node::Leaf(leaf) if leaf.id == pane => {
+            let held = HeldLeaf {
+                pane,
+                session: leaf.session,
+                target: leaf.target.clone(),
+                mode: leaf.mode,
+                mark: leaf.mark.clone(),
+            };
             leaf.session = Some(session);
             leaf.target = target;
             leaf.mark = None;
+            Some(held)
+        }
+        Node::Leaf(_) => None,
+        Node::Split { first, second, .. } => bind_leaf(first, pane, session, target.clone())
+            .or_else(|| bind_leaf(second, pane, session, target)),
+    }
+}
+
+fn restore_held(tabs: &mut [Tab], held: &HeldLeaf, session: SessionId) -> bool {
+    for tab in tabs {
+        if restore_held_node(&mut tab.root, held, session) {
+            if tab.active.is_some_and(|pane| !contains(&tab.root, pane)) {
+                tab.active = Some(held.pane);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn restore_held_node(node: &mut Node, held: &HeldLeaf, session: SessionId) -> bool {
+    match node {
+        Node::Leaf(leaf) if leaf.id == held.pane && leaf.session == Some(session) => {
+            leaf.session = held.session;
+            leaf.target = held.target.clone();
+            leaf.mode = held.mode;
+            leaf.mark = held.mark.clone();
             true
         }
         Node::Leaf(_) => false,
         Node::Split { first, second, .. } => {
-            bind_leaf(first, pane, session, target.clone())
-                || bind_leaf(second, pane, session, target)
+            restore_held_node(first, held, session) || restore_held_node(second, held, session)
+        }
+    }
+}
+
+fn drop_pending(node: Node) -> Option<Node> {
+    match node {
+        Node::Leaf(leaf) if leaf.session.is_none() => None,
+        Node::Leaf(leaf) => Some(Node::Leaf(leaf)),
+        Node::Split {
+            id,
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let first = drop_pending(*first);
+            let second = drop_pending(*second);
+            match (first, second) {
+                (None, None) => None,
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (Some(first), Some(second)) => Some(Node::Split {
+                    id,
+                    axis,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+            }
         }
     }
 }

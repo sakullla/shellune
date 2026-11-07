@@ -2372,6 +2372,22 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     cx.run_until_parked();
 }
 
+fn right_click(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = bounds_of(cx, selector);
+    let center = bounds.center();
+    cx.simulate_mouse_down(
+        point(center.x, center.y),
+        MouseButton::Right,
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        point(center.x, center.y),
+        MouseButton::Right,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+}
+
 /// Clicks a form field and types into it, the way a user does.
 fn type_into(cx: &mut VisualTestContext, selector: &'static str, text: &str) {
     click(cx, selector);
@@ -6821,6 +6837,192 @@ async fn the_tab_menu_closes_the_other_tabs_and_duplicates_one(cx: &mut TestAppC
             .collect::<Vec<_>>()
     });
     assert_eq!(kinds[0], kinds[1], "the copy runs the same shell");
+}
+
+#[gpui::test]
+async fn closing_a_mixed_tab_from_the_menu_drops_its_pending_pane(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let (kept, closing) = (tabs[0], tabs[1]);
+    let pending = cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_pending_for_test(
+                SplitAxis::LeftRight,
+                PaneTarget::local(Some("shellune-pending-leaf".to_owned())),
+                window,
+                cx,
+            )
+        })
+    });
+    assert!(pending.is_some(), "the split adds a pane that has no session");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        1
+    );
+
+    right_click(cx, "session.tab.1");
+    click(cx, "tab.menu.close");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(
+            view.pending_pane_count_for_test(),
+            0,
+            "the waiting pane is removed with its tab"
+        );
+        assert_eq!(view.layout_tab_count_for_test(), 1, "the tab itself is gone");
+        assert_eq!(view.open_tabs(), vec![kept]);
+        assert!(
+            view.workspace()
+                .session(kept)
+                .is_some_and(|session| matches!(session.state(), SessionState::Connected)),
+            "the other tab's session is still running"
+        );
+        assert!(
+            view.workspace().session(closing).is_none()
+                || view
+                    .workspace()
+                    .session(closing)
+                    .is_some_and(|session| !matches!(session.state(), SessionState::Connected)),
+            "the closed session is no longer a live pane"
+        );
+    });
+
+    // Close others and close right share the same removal. A waiting pane on a
+    // tab that is not the one under the pointer must go with that tab.
+    click(cx, "header.primary");
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_pending_for_test(
+                SplitAxis::TopBottom,
+                PaneTarget::remote(shellune_core::HostId::new()),
+                window,
+                cx,
+            );
+        });
+    });
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        1
+    );
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.close_others");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(view.pending_pane_count_for_test(), 0);
+        assert_eq!(view.layout_tab_count_for_test(), 1);
+        assert_eq!(view.open_tabs(), vec![kept]);
+    });
+
+    click(cx, "header.primary");
+    click(cx, "header.primary");
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_pending_for_test(
+                SplitAxis::LeftRight,
+                PaneTarget::local(Some("shellune-pending-right".to_owned())),
+                window,
+                cx,
+            );
+        });
+    });
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).layout_tab_count_for_test()),
+        3
+    );
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.close_right");
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(
+            view.pending_pane_count_for_test(),
+            0,
+            "a waiting pane on a tab to the right is removed"
+        );
+        assert_eq!(view.layout_tab_count_for_test(), 1);
+        assert_eq!(view.open_tabs(), vec![kept]);
+    });
+}
+
+#[gpui::test]
+async fn a_failed_local_adopt_keeps_the_pending_pane(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    click(cx, "header.primary");
+    let neighbor = cx.update(|_window, app| {
+        view.read(app)
+            .active_session()
+            .expect("the real shell is the neighbour")
+    });
+    let program = "shellune-no-such-shell-zz9";
+    let pending = cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_pending_for_test(
+                SplitAxis::LeftRight,
+                PaneTarget::local(Some(program.to_owned())),
+                window,
+                cx,
+            )
+            .expect("the waiting pane is inserted beside the shell")
+        })
+    });
+    let before = cx.update(|_window, app| view.read(app).leaf_ids_for_test());
+    assert_eq!(before.len(), 2, "the split has the live pane and the waiting one");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.connect_leaf_for_test(pending, cx));
+    });
+    cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(
+            view.leaf_ids_for_test(),
+            before,
+            "the failed start leaves both panes where they were"
+        );
+        let (pending_leaf, target, session) = view
+            .leaf_snapshot_for_test(pending)
+            .expect("the waiting pane is still in the split");
+        assert!(pending_leaf, "the pane is waiting again");
+        assert_eq!(session, None, "no session is left on the pane");
+        assert_eq!(target, PaneTarget::local(Some(program.to_owned())));
+        assert!(
+            view.workspace()
+                .session(neighbor)
+                .is_some_and(|session| matches!(session.state(), SessionState::Connected)),
+            "the pane beside it was not closed"
+        );
+        assert!(
+            view.workspace().sessions().items().iter().all(|session| {
+                !matches!(
+                    session.kind(),
+                    SessionKind::Local { shell: Some(shell) } if shell.as_str() == program
+                )
+            }),
+            "the process that never started is not a session"
+        );
+        let reason = view
+            .local_error_for_test()
+            .expect("the failure stays visible");
+        assert!(
+            reason.contains(program),
+            "the reason names the program that did not start: {reason}"
+        );
+    });
+    assert!(
+        cx.debug_bounds("pane.pending").is_some(),
+        "the pane can be tried again"
+    );
+    assert!(
+        cx.debug_bounds("terminal.viewport").is_some(),
+        "the neighbour still has its terminal"
+    );
 }
 
 #[gpui::test]
