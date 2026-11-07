@@ -14,22 +14,22 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 /// Default text colour, matching the shell's primary text token.
 pub const FOREGROUND: Rgb = Rgb {
-    r: 0xee,
-    g: 0xf1,
-    b: 0xf7,
+    r: 0xe6,
+    g: 0xe9,
+    b: 0xf0,
 };
 
 /// Default terminal background, matching the shell canvas token.
 pub const BACKGROUND: Rgb = Rgb {
-    r: 0x0c,
-    g: 0x0e,
-    b: 0x13,
+    r: 0x0b,
+    g: 0x0c,
+    b: 0x10,
 };
 
 /// Default cursor colour, matching the accent token.
 pub const CURSOR: Rgb = Rgb {
-    r: 0x9d,
-    g: 0xb4,
+    r: 0x8f,
+    g: 0xa0,
     b: 0xff,
 };
 

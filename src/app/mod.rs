@@ -17,6 +17,7 @@ pub mod components;
 pub mod copy;
 pub mod files;
 pub mod hosts;
+pub mod icons;
 pub mod nav;
 pub mod product;
 pub mod remote;
@@ -151,13 +152,15 @@ pub const DEFAULT_WINDOW_SIZE: (f32, f32) = (1120.0, 720.0);
 
 /// Starts the Shellune application and opens the main window.
 pub fn run() {
-    Application::new().run(|cx: &mut App| {
-        cx.bind_keys(key_bindings(Platform::current()));
-        if let Err(error) = open_main_window(cx) {
-            eprintln!("shellune: failed to open the main window: {error}");
-        }
-        cx.activate(true);
-    });
+    Application::new()
+        .with_assets(icons::Assets)
+        .run(|cx: &mut App| {
+            cx.bind_keys(key_bindings(Platform::current()));
+            if let Err(error) = open_main_window(cx) {
+                eprintln!("shellune: failed to open the main window: {error}");
+            }
+            cx.activate(true);
+        });
 }
 
 fn open_main_window(cx: &mut App) -> Result<(), String> {
