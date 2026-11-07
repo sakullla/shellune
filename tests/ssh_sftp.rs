@@ -813,3 +813,34 @@ fn a_change_to_a_path_that_does_not_exist_is_reported_as_missing() {
     ));
     session.close();
 }
+
+#[test]
+fn an_empty_directory_is_empty_and_the_shell_stays_authenticated() {
+    if skip("listing an empty directory") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let home = server.home();
+    let empty = format!("{home}/empty-shellune");
+    server
+        .as_user(&format!("rm -rf '{empty}' && mkdir -p '{empty}'"))
+        .expect("the empty directory exists");
+    let before = accepted_authentications(server);
+    let mut session = live(server);
+    let mut link = session
+        .take_file_link()
+        .expect("a live session is browsable");
+    let entries = list(&mut link, 1, &empty).expect("the empty directory is listed");
+    assert!(
+        entries.is_empty(),
+        "an empty directory has no entries: {:?}",
+        named(&entries)
+    );
+    assert_eq!(
+        accepted_authentications(server),
+        before + 1,
+        "one authentication for the terminal, none for the empty directory"
+    );
+    shell_echo(&mut session, "shellune-empty-dir");
+    session.close();
+}

@@ -732,6 +732,25 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             files_unknown_path,
             files_failed,
             files_terminal_note,
+            files_source_local,
+            files_source_remote,
+            files_show_local,
+            files_show_remote,
+            files_to_remote,
+            files_to_local,
+            files_delete_recursive_local,
+            files_delete_file_local,
+            files_change_pending_local,
+            files_change_done_local,
+            files_change_failed_local,
+            files_local_not_found,
+            files_local_denied,
+            files_local_not_directory,
+            files_local_lost,
+            files_local_refused,
+            files_local_exists,
+            files_local_unavailable,
+            files_local_root,
             files_kind_directory,
             files_kind_file,
             files_kind_link,
@@ -5978,6 +5997,45 @@ fn open_files(
     answers
 }
 
+/// Opens both sources on scripted listings, so the local column is not this computer's home.
+fn open_both_sources(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+    local_path: &str,
+    local_entries: &[(&str, shellune_core::FileKind)],
+) -> (FileAnswers, FileAnswers) {
+    let remote = FileAnswers::accepting();
+    let local = FileAnswers::accepting();
+    let remote_channel = remote.clone();
+    let local_channel = local.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(
+                id,
+                "web",
+                "deploy@10.0.0.5:22",
+                Box::new(remote_channel),
+                cx,
+            );
+            view.attach_local_files_for_test(id, Box::new(local_channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+    remote.reply(
+        1,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    local.reply(1, local_path, local_entries);
+    pump_files(cx, view);
+    (remote, local)
+}
+
 /// The names the view shows, in the order it lists them.
 fn listed_names(
     cx: &mut VisualTestContext,
@@ -6435,6 +6493,386 @@ async fn a_deep_path_is_readable_instead_of_being_cut_off(cx: &mut TestAppContex
         long.size.height > short.size.height,
         "a deep path takes more lines instead of losing its end: {short:?} vs {long:?}"
     );
+}
+
+#[gpui::test]
+async fn both_columns_name_their_own_source_and_a_narrow_window_switches(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_remote, _local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[
+            ("空目录", shellune_core::FileKind::Directory),
+            ("报告.txt", shellune_core::FileKind::File),
+        ],
+    );
+
+    assert!(cx.debug_bounds("files.panel").is_some(), "the remote column is drawn");
+    assert!(
+        cx.debug_bounds("files.local.panel").is_some(),
+        "the local column is drawn beside it"
+    );
+    assert!(cx.debug_bounds("files.source").is_some());
+    assert!(cx.debug_bounds("files.local.source").is_some());
+    assert!(cx.debug_bounds("files.host").is_some());
+    assert!(cx.debug_bounds("files.local.host").is_some());
+    assert!(cx.debug_bounds("files.path").is_some());
+    assert!(cx.debug_bounds("files.local.path").is_some());
+    assert!(
+        cx.debug_bounds("files.show.local").is_none(),
+        "a wide window shows both sources instead of a switch"
+    );
+    let (remote_host, local_host, remote_path, local_path) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let remote = view.files_browser(id).expect("remote");
+        let local = view.files_local_browser(id).expect("local");
+        (
+            remote.host().to_owned(),
+            local.host().to_owned(),
+            remote.path().unwrap().to_owned(),
+            local.path().unwrap().to_owned(),
+        )
+    });
+    assert_eq!(remote_host, "web");
+    assert_ne!(local_host, remote_host, "the local machine is not the remote host");
+    assert_eq!(remote_path, "/home/deploy");
+    assert_eq!(local_path, "/C:/work");
+    assert_ne!(remote_path, local_path);
+}
+
+#[gpui::test]
+async fn a_narrow_window_switches_source_without_merging_them(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    cx.simulate_resize(size(px(1000.0), px(720.0)));
+    cx.run_until_parked();
+    let (remote, local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[("报告.txt", shellune_core::FileKind::File)],
+    );
+    assert!(
+        cx.debug_bounds("files.panel").is_some(),
+        "the narrow window starts on the remote source"
+    );
+    assert!(
+        cx.debug_bounds("files.local.panel").is_none(),
+        "the local source is not merged into the remote column"
+    );
+    assert!(cx.debug_bounds("files.show.local").is_some());
+    assert!(cx.debug_bounds("files.show.remote").is_some());
+    assert_eq!(remote.requests().len(), 1);
+    assert_eq!(local.requests().len(), 1, "the hidden source was still opened");
+    click(cx, "files.show.local");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_shown(id)),
+        Some(crate::app::files::FileSource::Local)
+    );
+    assert!(cx.debug_bounds("files.local.panel").is_some());
+    assert!(cx.debug_bounds("files.local.host").is_some());
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_browser(id)
+                .and_then(|browser| browser.path().map(str::to_owned))
+        }),
+        Some("/home/deploy".to_owned()),
+        "switching source does not retarget the hidden one"
+    );
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_local_browser(id)
+                .and_then(|browser| browser.path().map(str::to_owned))
+        }),
+        Some("/C:/work".to_owned())
+    );
+    click(cx, "files.show.remote");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_shown(id)),
+        Some(crate::app::files::FileSource::Remote)
+    );
+    assert_eq!(remote.requests().len(), 1);
+    assert_eq!(local.requests().len(), 1);
+}
+
+#[gpui::test]
+async fn file_actions_have_a_button_path_and_a_drop_uses_that_same_request(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (remote, local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[
+            ("空目录", shellune_core::FileKind::Directory),
+            ("报告.txt", shellune_core::FileKind::File),
+        ],
+    );
+    let transfers = TransferAnswers::accepting();
+    let channel = transfers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_transfers_for_test(id, Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Keyboard rename needs a selected row. Refresh is separate, and a modified key is not a file action.
+    let before = local.requests().len();
+    let handled = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let ignored = view.files_key_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                "c",
+                true,
+                cx,
+            );
+            view.files_key_for_test(id, crate::app::files::FileSource::Local, "down", false, cx);
+            let rename = view.files_key_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                "f2",
+                false,
+                cx,
+            );
+            (!ignored, rename)
+        })
+    });
+    assert_eq!(handled, (true, true));
+    assert!(
+        cx.update(|_window, app| view.read(app).files_question_open()),
+        "f2 asks to rename the selected entry"
+    );
+    assert_eq!(local.requests().len(), before, "the rename question sends nothing");
+    click(cx, "files.question.cancel");
+    assert!(!cx.update(|_window, app| view.read(app).files_question_open()));
+    let refreshed = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_key_for_test(id, crate::app::files::FileSource::Local, "f5", false, cx)
+        })
+    });
+    assert!(refreshed, "f5 refreshes the focused source");
+    assert_eq!(local.requests().len(), before + 1, "f5 is the only request");
+    assert!(matches!(
+        local.requests().last(),
+        Some(shellune_core::BrowseRequest::List { .. })
+    ));
+    assert_eq!(remote.requests().len(), 1, "the remote source was not refreshed");
+
+    local.reply(2, "/C:/work", &[
+        ("空目录", shellune_core::FileKind::Directory),
+        ("报告.txt", shellune_core::FileKind::File),
+    ]);
+    pump_files(cx, &view);
+
+    // A new folder is not drawn until this computer lists the directory again.
+    let before = local.requests().len();
+    click(cx, "files.local.new");
+    type_into(cx, "files.question.input", "日志");
+    click(cx, "files.question.confirm");
+    assert!(matches!(
+        local.requests().last(),
+        Some(shellune_core::BrowseRequest::CreateDirectory { name, .. }) if name == "日志"
+    ));
+    assert_eq!(remote.requests().len(), 1);
+    assert!(
+        !cx.update(|_window, app| {
+            view.read(app)
+                .files_local_browser(id)
+                .and_then(|browser| browser.state().listing())
+                .is_some_and(|listing| listing.entries().iter().any(|entry| entry.name() == "日志"))
+        }),
+        "the new folder is not shown before the directory is read again"
+    );
+    local.changed(
+        before as u64 + 1,
+        shellune_core::MutationOutcome::new(
+            shellune_core::MutationAction::CreateDirectory {
+                path: "/C:/work/日志".to_owned(),
+            },
+            vec![shellune_core::MutationStep::done(
+                "/C:/work/日志",
+                Some(shellune_core::FileKind::Directory),
+            )],
+        ),
+    );
+    pump_files(cx, &view);
+    local.reply(
+        before as u64 + 2,
+        "/C:/work",
+        &[
+            ("日志", shellune_core::FileKind::Directory),
+            ("空目录", shellune_core::FileKind::Directory),
+            ("报告.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .files_local_browser(id)
+            .and_then(|browser| browser.state().listing())
+            .is_some_and(|listing| listing.entries().iter().any(|entry| entry.name() == "日志"))
+    }));
+
+    // Cancelling a delete sends nothing. Confirming does, and the list waits for the refresh.
+    let before = local.requests().len();
+    click(cx, "files.local.delete.2");
+    assert!(cx.debug_bounds("files.question.target").is_some());
+    assert!(cx.debug_bounds("files.question.kind").is_some());
+    assert!(cx.debug_bounds("files.question.note").is_some());
+    click(cx, "files.question.cancel");
+    assert_eq!(local.requests().len(), before, "cancelling a delete sends nothing");
+    click(cx, "files.local.rename.2");
+    clear_field(cx, "files.question.input", "报告.txt".chars().count());
+    type_into(cx, "files.question.input", "说明.txt");
+    click(cx, "files.question.confirm");
+    assert!(matches!(
+        local.requests().last(),
+        Some(shellune_core::BrowseRequest::Rename { to, .. }) if to.ends_with("说明.txt")
+    ));
+
+    // Upload and download buttons, and a drop, start the same kind of transfer.
+    click(cx, "files.local.to_remote.2");
+    click(cx, "files.to_local.1");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_drop_for_test(
+                id,
+                crate::app::files::FileSource::Remote,
+                crate::app::files::FileSource::Local,
+                "/C:/work",
+                "报告.txt",
+                cx,
+            );
+            view.files_drop_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                crate::app::files::FileSource::Remote,
+                "/home/deploy",
+                "notes.txt",
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 4, "two buttons and two drops: {starts:?}");
+    let folder = crate::app::files::local_protocol_to_os("/C:/work").expect("a local folder");
+    let uploaded = folder.join("报告.txt").to_string_lossy().into_owned();
+    let downloaded = crate::app::transfers::local_path(&folder, "notes.txt")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(starts[0].direction, TransferDirection::Upload);
+    assert_eq!(starts[0].source, uploaded);
+    assert_eq!(starts[0].destination, "/home/deploy/报告.txt");
+    assert_eq!(starts[2].direction, TransferDirection::Upload);
+    assert_eq!(starts[2].source, starts[0].source);
+    assert_eq!(starts[2].destination, starts[0].destination);
+    assert_eq!(starts[1].direction, TransferDirection::Download);
+    assert_eq!(starts[1].source, "/home/deploy/notes.txt");
+    assert_eq!(starts[1].destination, downloaded);
+    assert_eq!(starts[3].source, starts[1].source);
+    assert_eq!(starts[3].destination, starts[1].destination);
+}
+
+#[gpui::test]
+async fn an_empty_or_failed_source_leaves_the_other_source_and_the_terminal(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (remote, local) = open_both_sources(cx, &view, id, "/C:/work/empty", &[]);
+
+    assert!(
+        cx.debug_bounds("files.local.empty").is_some(),
+        "an empty directory says it is empty"
+    );
+    assert!(cx.debug_bounds("files.entry.0").is_some(), "the remote listing stays");
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_local_browser(id)
+                .and_then(|browser| browser.state().listing())
+                .is_some_and(|listing| listing.is_empty())
+        })
+    );
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connected));
+
+    click(cx, "files.local.refresh");
+    local.fail(
+        2,
+        shellune_core::BrowseFailure::PermissionDenied {
+            path: "/C:/work/empty".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+    assert!(cx.debug_bounds("files.local.failure").is_some());
+    assert!(cx.debug_bounds("files.local.failure.reason").is_some());
+    assert!(cx.debug_bounds("files.local.failure.refresh").is_some());
+    assert!(
+        cx.debug_bounds("files.failure.reconnect").is_none(),
+        "a local permission failure is not a lost SSH connection"
+    );
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_browser(id)
+                .and_then(|browser| browser.state().listing())
+                .is_some()
+        }),
+        "the remote listing is untouched"
+    );
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connected));
+    assert!(cx.debug_bounds("terminal.failure").is_none());
+
+    click(cx, "files.local.failure.refresh");
+    local.fail(
+        3,
+        shellune_core::BrowseFailure::NotFound {
+            path: "/C:/work/missing".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .files_local_browser(id)
+            .and_then(|browser| browser.state().failure())
+            .is_some_and(|failure| matches!(failure, shellune_core::BrowseFailure::NotFound { .. }))
+    }));
+
+    click(cx, "files.refresh");
+    remote.fail(
+        2,
+        shellune_core::BrowseFailure::ConnectionLost {
+            reason: "the SSH connection is no longer open".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+    assert!(cx.debug_bounds("files.failure").is_some());
+    assert!(cx.debug_bounds("files.failure.reconnect").is_some());
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_local_browser(id)
+                .and_then(|browser| browser.state().failure())
+                .is_some_and(|failure| matches!(failure, shellune_core::BrowseFailure::NotFound { .. }))
+        }),
+        "the remote disconnect does not replace the local failure"
+    );
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connected));
+    assert!(cx.debug_bounds("terminal.failure").is_none());
 }
 
 // ---------------------------------------------------------------------------

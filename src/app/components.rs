@@ -239,6 +239,26 @@ fn variant_text(variant: Variant) -> gpui::Rgba {
     }
 }
 
+/// One column of a dual file view.
+///
+/// The width is fixed so a wide window can put two sources beside the terminal, and
+/// a narrow window can show one of them, without either column borrowing the other's
+/// identity. The caller supplies the source heading and the listing.
+pub fn file_column(width: f32, metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w(metrics.scale(width))
+        .min_w(px(0.0))
+        .min_h(px(0.0))
+        .gap(metrics.scale(spacing::TIGHT + 2.0))
+        .p(metrics.scale(spacing::BASE - 2.0))
+        .bg(theme::swatch(palette::SURFACE))
+        .border_l_1()
+        .border_color(theme::swatch(palette::BORDER))
+}
+
 /// A compact button for toolbars, sized to sit inside a 36px bar.
 pub fn compact_button(label: impl Into<SharedString>, variant: Variant, metrics: Metrics) -> Div {
     button(label, variant, metrics)

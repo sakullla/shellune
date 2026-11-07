@@ -13,12 +13,13 @@
 
 use gpui::prelude::*;
 use gpui::{
-    Context, Div, Entity, FocusHandle, FontWeight, IntoElement, Render, SharedString, Stateful,
-    Window, div, px,
+    Context, Div, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Render, SharedString,
+    Stateful, Window, div, px,
 };
 use shellune_core::{
-    BrowseState, EventTag, FileKind, HostConfig, HostId, HostValidationError, LocalShell, Session,
-    SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, Transfer, join_path,
+    BrowseFailure, BrowseState, EventTag, FileKind, HostConfig, HostId, HostValidationError,
+    LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, Transfer,
+    TransferDirection, join_path,
 };
 use shellune_ssh::PtySize;
 #[cfg(test)]
@@ -43,7 +44,8 @@ use crate::app::copy::{self, Locale, Strings};
 #[cfg(test)]
 use crate::app::files::BrowseChannel;
 use crate::app::files::{
-    FileViews, FilesDialog, kind_label, path_problem_text, problem_text, transfer_problem_text,
+    FileSource, FileViews, FilesDialog, browse_failure_text, display_path, kind_label,
+    local_protocol_to_os, path_crumbs, path_problem_text, problem_text, transfer_problem_text,
 };
 use crate::app::hosts::{
     HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
@@ -105,6 +107,46 @@ struct OpenPane {
     tag: EventTag,
     /// The terminal itself.
     pane: Entity<TerminalPane>,
+}
+
+/// A file dragged from one column onto the other.
+///
+/// The directory is the one the file was listed in, so the drop asks to transfer
+/// that file and not whatever now occupies the same row.
+#[derive(Clone)]
+struct FileDrag {
+    session: SessionId,
+    source: FileSource,
+    name: String,
+    directory: String,
+}
+
+/// The small label GPUI shows while a file is dragged.
+struct FileDragLabel {
+    name: SharedString,
+}
+
+impl Render for FileDragLabel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(radius::SMALL))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .text_size(px(12.0))
+            .child(self.name.clone())
+    }
+}
+
+/// A debug id for one file source. The remote column keeps the ids the file view
+/// already used; the local column is a different object and does not reuse them.
+fn files_element_id(source: FileSource, suffix: &str) -> SharedString {
+    match source {
+        FileSource::Remote => SharedString::from(format!("files.{suffix}")),
+        FileSource::Local => SharedString::from(format!("files.local.{suffix}")),
+    }
 }
 
 /// A divider drag. The listener is registered again on every frame it lasts.
@@ -284,6 +326,14 @@ pub struct ShelluneView {
     files_dialog: Option<FilesDialog>,
     /// The field of that question, present only while it has one.
     files_field: Option<Entity<TextField>>,
+    /// Focus of the local column, so its keys are not the terminal's keys.
+    files_local_focus: FocusHandle,
+    /// Focus of the remote column.
+    files_remote_focus: FocusHandle,
+    /// Last viewport width, which chooses two columns or one.
+    viewport_width: gpui::Pixels,
+    /// Forces the file layout in a test. `None` follows the viewport.
+    files_layout_override: Option<bool>,
     /// Where remembered passwords and passphrases are kept: the system credential store,
     /// or memory in tests.
     secrets: std::sync::Arc<dyn SecretStore>,
@@ -502,6 +552,10 @@ impl ShelluneView {
             files_polling: false,
             files_dialog: None,
             files_field: None,
+            files_local_focus: cx.focus_handle(),
+            files_remote_focus: cx.focus_handle(),
+            viewport_width: px(crate::app::DEFAULT_WINDOW_SIZE.0),
+            files_layout_override: None,
             palette: None,
             palette_query: String::new(),
             palette_selected: 0,
@@ -888,6 +942,7 @@ impl ShelluneView {
         self.open_files_dialog(
             FilesDialog::Upload {
                 session: id,
+                source: FileSource::Remote,
                 directory,
                 text: String::new(),
                 problem: None,
@@ -921,6 +976,7 @@ impl ShelluneView {
         self.open_files_dialog(
             FilesDialog::Download {
                 session: id,
+                source: FileSource::Remote,
                 remote,
                 text: suggested,
                 problem: None,
@@ -6930,6 +6986,83 @@ impl ShelluneView {
         let Some(id) = id.filter(|id| self.files.is_open(*id)) else {
             return column;
         };
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let wide = self.files_side_by_side();
+        let shown = self.files.shown(id).unwrap_or(FileSource::Remote);
+        let mut columns = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .overflow_hidden();
+        if wide || shown == FileSource::Local {
+            columns = columns.child(self.files_panel(id, FileSource::Local, cx));
+        }
+        if wide || shown == FileSource::Remote {
+            columns = columns.child(self.files_panel(id, FileSource::Remote, cx));
+        }
+        let switch = (!wide).then(|| {
+            div()
+                .flex()
+                .flex_none()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .child(self.text_button(
+                    SharedString::from("files.show.local"),
+                    strings.files_show_local,
+                    if shown == FileSource::Local {
+                        Variant::Secondary
+                    } else {
+                        Variant::Ghost
+                    },
+                    cx,
+                    move |view, cx| view.files_show(id, FileSource::Local, cx),
+                ))
+                .child(self.text_button(
+                    SharedString::from("files.show.remote"),
+                    strings.files_show_remote,
+                    if shown == FileSource::Remote {
+                        Variant::Secondary
+                    } else {
+                        Variant::Ghost
+                    },
+                    cx,
+                    move |view, cx| view.files_show(id, FileSource::Remote, cx),
+                ))
+        });
+        let files = div()
+            .id("files.panes")
+            .debug_selector(|| "files.panes".to_owned())
+            .flex()
+            .flex_col()
+            .flex_none()
+            .h_full()
+            .overflow_hidden()
+            .min_h(px(0.0))
+            .bg(theme::swatch(palette::SURFACE))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .px(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(spacing::HAIRLINE))
+                    .border_b_1()
+                    .border_l_1()
+                    .border_color(theme::swatch(palette::BORDER))
+                    .children(switch)
+                    .child(self.text_button(
+                        SharedString::from("files.close"),
+                        strings.files_close,
+                        Variant::Ghost,
+                        cx,
+                        move |view, cx| view.toggle_files(id, cx),
+                    )),
+            )
+            .child(columns);
         div()
             .flex()
             .flex_1()
@@ -6943,7 +7076,18 @@ impl ShelluneView {
                     .min_h(px(0.0))
                     .child(column),
             )
-            .child(self.files_panel(id, cx))
+            .child(files)
+    }
+
+    /// Whether the window is wide enough for both file sources at once.
+    fn files_side_by_side(&self) -> bool {
+        self.files_layout_override
+            .unwrap_or(self.viewport_width >= px(1080.0))
+    }
+
+    fn files_show(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
+        self.files.show(id, source);
+        cx.notify();
     }
 
     /// Opens or closes the file view of one session (R9).
@@ -6960,23 +7104,43 @@ impl ShelluneView {
         cx.notify();
     }
 
-    fn files_up(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    fn files_up(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
         // Leaving the directory ends any question about an entry in it: the question
-        // names a target in the directory on screen, and a later answer would apply to
-        // wherever the user went next.
-        self.close_files_question(id);
-        self.files.up(id);
+        // names a target in that source, and a later answer would apply wherever the
+        // user went next. The other source keeps its own question.
+        self.close_files_question_for(id, source);
+        self.files.select(id, source, None);
+        if source == FileSource::Remote {
+            self.files.up(id);
+        } else {
+            self.files.up_in(id, source);
+        }
         cx.notify();
     }
 
-    fn files_refresh(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        self.files.refresh(id);
+    fn files_refresh(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
+        if source == FileSource::Remote {
+            self.files.refresh(id);
+        } else {
+            self.files.refresh_in(id, source);
+        }
         cx.notify();
     }
 
-    fn files_enter(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
-        self.close_files_question(id);
-        self.files.enter(id, name);
+    fn files_enter(&mut self, id: SessionId, source: FileSource, name: &str, cx: &mut Context<Self>) {
+        self.close_files_question_for(id, source);
+        self.files.select(id, source, Some(name.to_owned()));
+        if source == FileSource::Remote {
+            self.files.enter(id, name);
+        } else {
+            self.files.enter_in(id, source, name);
+        }
+        cx.notify();
+    }
+
+    fn files_go(&mut self, id: SessionId, source: FileSource, path: &str, cx: &mut Context<Self>) {
+        self.close_files_question_for(id, source);
+        self.files.list_at(id, source, path);
         cx.notify();
     }
 
@@ -6986,6 +7150,18 @@ impl ShelluneView {
             .files_dialog
             .as_ref()
             .is_some_and(|dialog| dialog.session() == id)
+        {
+            self.files_dialog = None;
+            self.files_field = None;
+        }
+    }
+
+    /// Drops the question of one source only.
+    fn close_files_question_for(&mut self, id: SessionId, source: FileSource) {
+        if self
+            .files_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.session() == id && dialog.source() == source)
         {
             self.files_dialog = None;
             self.files_field = None;
@@ -7013,8 +7189,8 @@ impl ShelluneView {
     // -----------------------------------------------------------------------
 
     /// Asks for the name of a new directory, without sending anything yet.
-    fn files_new(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if !self.files.is_open(id) {
+    fn files_new(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
+        if self.files.browser_in(id, source).is_none() {
             return;
         }
         let placeholder = self.strings().files_new_placeholder;
@@ -7022,6 +7198,7 @@ impl ShelluneView {
         self.open_files_dialog(
             FilesDialog::NewDirectory {
                 session: id,
+                source,
                 text: String::new(),
                 problem: None,
             },
@@ -7031,8 +7208,14 @@ impl ShelluneView {
     }
 
     /// Asks what one entry should be called, with its current name already in the field.
-    fn files_ask_rename(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
-        if !self.files.is_open(id) {
+    fn files_ask_rename(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.files.browser_in(id, source).is_none() {
             return;
         }
         let placeholder = self.strings().files_rename_placeholder;
@@ -7040,6 +7223,7 @@ impl ShelluneView {
         self.open_files_dialog(
             FilesDialog::Rename {
                 session: id,
+                source,
                 from: name.to_owned(),
                 text: name.to_owned(),
                 problem: None,
@@ -7057,15 +7241,17 @@ impl ShelluneView {
     fn files_ask_delete(
         &mut self,
         id: SessionId,
+        source: FileSource,
         name: &str,
         kind: FileKind,
         cx: &mut Context<Self>,
     ) {
-        if !self.files.is_open(id) {
+        if self.files.browser_in(id, source).is_none() {
             return;
         }
         self.files_dialog = Some(FilesDialog::Delete {
             session: id,
+            source,
             name: name.to_owned(),
             kind,
             problem: None,
@@ -7110,6 +7296,45 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Uploads one local file into the remote directory on screen.
+    ///
+    /// The button and a drop onto the remote column both call this, so the transfer
+    /// request is the one the upload field already starts.
+    fn transfer_to_remote(
+        &mut self,
+        id: SessionId,
+        directory: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(folder) = local_protocol_to_os(directory) else {
+            self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
+            cx.notify();
+            return;
+        };
+        let path = folder.join(name);
+        self.start_upload(id, &path.to_string_lossy(), cx);
+    }
+
+    /// Downloads one remote file into the local directory on screen.
+    ///
+    /// The button and a drop onto the local column both call this.
+    fn transfer_to_local(
+        &mut self,
+        id: SessionId,
+        directory: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let remote = join_path(directory, name);
+        let Some(folder) = self.files.local_os_directory(id) else {
+            self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
+            cx.notify();
+            return;
+        };
+        self.start_download(id, &remote, &folder.to_string_lossy(), cx);
+    }
+
     /// Closes the question without sending anything at all (R11).
     ///
     /// Cancelling is not a request the server has to refuse: the target never left
@@ -7151,16 +7376,43 @@ impl ShelluneView {
             | FilesDialog::Delete { .. } => {}
         }
         let sent = match &dialog {
-            FilesDialog::NewDirectory { session, text, .. } => {
-                self.files.create_directory(*session, text)
+            FilesDialog::NewDirectory {
+                session,
+                source,
+                text,
+                ..
+            } => {
+                if *source == FileSource::Remote {
+                    self.files.create_directory(*session, text)
+                } else {
+                    self.files.create_directory_in(*session, *source, text)
+                }
             }
             FilesDialog::Rename {
                 session,
+                source,
                 from,
                 text,
                 ..
-            } => self.files.rename(*session, from, text),
-            FilesDialog::Delete { session, name, .. } => self.files.delete(*session, name),
+            } => {
+                if *source == FileSource::Remote {
+                    self.files.rename(*session, from, text)
+                } else {
+                    self.files.rename_in(*session, *source, from, text)
+                }
+            }
+            FilesDialog::Delete {
+                session,
+                source,
+                name,
+                ..
+            } => {
+                if *source == FileSource::Remote {
+                    self.files.delete(*session, name)
+                } else {
+                    self.files.delete_in(*session, *source, name)
+                }
+            }
             FilesDialog::Upload { .. } | FilesDialog::Download { .. } => Ok(()),
         };
         match sent {
@@ -7205,8 +7457,36 @@ impl ShelluneView {
     /// a server whose files cannot be read is never reported as a terminal that
     /// ended.
     fn pump_files(&mut self, cx: &mut Context<Self>) -> bool {
+        let done_before: Vec<shellune_core::TransferId> = self
+            .transfers
+            .transfers()
+            .iter()
+            .filter(|task| task.state().is_success())
+            .map(|task| task.id())
+            .collect();
         let listed = self.files.pump();
         let transferred = self.transfers.pump();
+        if transferred {
+            for task in self.transfers.transfers() {
+                if !task.state().is_success() || done_before.contains(&task.id()) {
+                    continue;
+                }
+                if !self.files.is_open(task.session()) {
+                    continue;
+                }
+                // The worker reported the bytes as written. The directory is read
+                // again so the list cannot show a file the refresh does not return.
+                match task.direction() {
+                    TransferDirection::Upload => {
+                        self.files.refresh(task.session());
+                    }
+                    TransferDirection::Download => {
+                        self.files
+                            .refresh_in(task.session(), FileSource::Local);
+                    }
+                }
+            }
+        }
         if transferred {
             // The transfers page reads one list, so it is refreshed in the same tick in
             // which the task that changed it was applied.
@@ -7224,35 +7504,322 @@ impl ShelluneView {
         open
     }
 
-    /// The file view: the host it belongs to, the path it shows and its entries.
-    fn files_panel(&self, id: SessionId, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// Moves a file between the two columns of one session.
+    ///
+    /// The button on a row and a drop onto the other column both arrive here, so a
+    /// drag cannot start a transfer the button would not.
+    fn files_accept_drop(
+        &mut self,
+        id: SessionId,
+        onto: FileSource,
+        drag: &FileDrag,
+        cx: &mut Context<Self>,
+    ) {
+        if drag.session != id || drag.source == onto {
+            return;
+        }
+        match onto {
+            FileSource::Remote => self.transfer_to_remote(id, &drag.directory, &drag.name, cx),
+            FileSource::Local => self.transfer_to_local(id, &drag.directory, &drag.name, cx),
+        }
+    }
+
+    /// Uploads or downloads the named entry of the directory on screen.
+    ///
+    /// The directory is read from that source's current listing, which is the same
+    /// directory a drag from the row would carry.
+    fn files_transfer_named(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(directory) = self
+            .files
+            .browser_in(id, source)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned)
+        else {
+            self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
+            cx.notify();
+            return;
+        };
+        self.files_accept_drop(
+            id,
+            match source {
+                FileSource::Local => FileSource::Remote,
+                FileSource::Remote => FileSource::Local,
+            },
+            &FileDrag {
+                session: id,
+                source,
+                name: name.to_owned(),
+                directory,
+            },
+            cx,
+        );
+    }
+
+    /// A key pressed while one file column has the keyboard.
+    ///
+    /// Modified keys are left alone: Escape, Ctrl+L and Ctrl+C belong to the
+    /// terminal when it is focused, and a file column must not take them either.
+    /// Returns whether the key was a file action.
+    fn files_key(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.keystroke.modifiers.modified() {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "f5" => {
+                self.files_refresh(id, source, cx);
+                true
+            }
+            "f2" => {
+                if let Some(name) = self.files.selected(id, source).map(str::to_owned) {
+                    self.files_ask_rename(id, source, &name, cx);
+                }
+                true
+            }
+            "delete" => {
+                let name = self.files.selected(id, source).map(str::to_owned);
+                let kind = name.as_deref().and_then(|name| {
+                    self.files
+                        .browser_in(id, source)
+                        .and_then(|browser| browser.entry(name))
+                        .map(|entry| entry.kind())
+                });
+                if let (Some(name), Some(kind)) = (name, kind) {
+                    self.files_ask_delete(id, source, &name, kind, cx);
+                }
+                true
+            }
+            "enter" | "right" => {
+                let name = self.files.selected(id, source).map(str::to_owned);
+                let open = name.as_deref().is_some_and(|name| {
+                    self.files
+                        .browser_in(id, source)
+                        .and_then(|browser| browser.entry(name))
+                        .is_some_and(|entry| entry.is_directory())
+                });
+                if open && let Some(name) = name {
+                    self.files_enter(id, source, &name, cx);
+                }
+                true
+            }
+            "left" | "backspace" => {
+                self.files_up(id, source, cx);
+                true
+            }
+            "up" => {
+                self.files_move_selection(id, source, -1, cx);
+                true
+            }
+            "down" => {
+                self.files_move_selection(id, source, 1, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The names in one listing, in the order the column draws them.
+    fn files_entry_names(&self, id: SessionId, source: FileSource) -> Vec<String> {
+        self.files
+            .browser_in(id, source)
+            .and_then(|browser| browser.state().listing())
+            .map(|listing| {
+                listing
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Moves the keyboard selection by one row, staying inside the listing.
+    fn files_move_selection(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        delta: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let names = self.files_entry_names(id, source);
+        if names.is_empty() {
+            return;
+        }
+        let current = self
+            .files
+            .selected(id, source)
+            .and_then(|name| names.iter().position(|item| item == name));
+        let next = match current {
+            Some(index) => {
+                let moved = index as isize + delta;
+                moved.clamp(0, names.len() as isize - 1) as usize
+            }
+            None => {
+                if delta < 0 {
+                    names.len() - 1
+                } else {
+                    0
+                }
+            }
+        };
+        self.files
+            .select(id, source, Some(names[next].clone()));
+        cx.notify();
+    }
+
+    /// Why one source could not be read, and the action that source can still take.
+    ///
+    /// Refresh and going up stay on this source. Reconnect is only offered when the
+    /// remote connection itself is gone: a local disk has no SSH session to restart,
+    /// and neither failure closes the terminal.
+    fn files_failure(
+        &self,
+        id: SessionId,
+        source: FileSource,
+        failure: &BrowseFailure,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let Some(browser) = self.files.browser(id) else {
-            return div().id("files.panel");
+        let reason = browse_failure_text(failure, source, strings);
+        let failure_id = files_element_id(source, "failure");
+        let reason_id = files_element_id(source, "failure.reason");
+        let note_id = files_element_id(source, "failure.note");
+        let refresh_id = files_element_id(source, "failure.refresh");
+        let up_id = files_element_id(source, "failure.up");
+        let reconnect_id = files_element_id(source, "failure.reconnect");
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .child(self.text_button(
+                refresh_id,
+                strings.files_refresh,
+                Variant::Secondary,
+                cx,
+                move |view, cx| view.files_refresh(id, source, cx),
+            ))
+            .child(self.text_button(
+                up_id,
+                strings.files_up,
+                Variant::Ghost,
+                cx,
+                move |view, cx| view.files_up(id, source, cx),
+            ));
+        if failure.is_connection_lost() && source == FileSource::Remote {
+            actions = actions.child(self.text_button(
+                reconnect_id,
+                strings.session_reconnect,
+                Variant::Secondary,
+                cx,
+                move |view, cx| view.reconnect_session(id, cx),
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::SMALL))
+            .p(metrics.scale(spacing::TIGHT))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(move || failure_id.to_string())
+            .child(
+                div()
+                    .text_size(metrics.label_size())
+                    .text_color(Tone::Danger.text())
+                    .child(SharedString::from(strings.files_failed)),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(move || reason_id.to_string())
+                    .child(SharedString::from(reason)),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(move || note_id.to_string())
+                    .child(SharedString::from(strings.files_terminal_note)),
+            )
+            .child(actions)
+    }
+
+    /// One file column: the source it is, the path it shows and the entries of that source.
+    fn files_panel(
+        &self,
+        id: SessionId,
+        source: FileSource,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let Some(browser) = self.files.browser_in(id, source) else {
+            return div().id(files_element_id(source, "panel"));
         };
         let host = browser.host().to_owned();
         let target = browser.target().to_owned();
         let path = browser.path().map(str::to_owned);
-        // Whether a change is with the server decides what the panel says while the
-        // answer is missing; the question itself reads its target from the browser.
         let changing = browser.is_changing();
         let state = browser.state().clone();
+        let source_label = match source {
+            FileSource::Local => strings.files_source_local,
+            FileSource::Remote => strings.files_source_remote,
+        };
+        let host_text = match source {
+            FileSource::Remote => format!("{host} · {target}"),
+            FileSource::Local => host,
+        };
+        let shown_path = path
+            .as_deref()
+            .map(|path| display_path(source, path))
+            .unwrap_or_else(|| strings.files_unknown_path.to_owned());
 
+        let source_id = files_element_id(source, "source");
+        let host_id = files_element_id(source, "host");
+        let header_id = files_element_id(source, "header");
+        let path_id = files_element_id(source, "path");
         let header = div()
             .flex()
             .flex_col()
             .flex_none()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "files.header".to_owned())
+            .debug_selector({
+                let header_id = header_id.clone();
+                move || header_id.to_string()
+            })
             .child(
                 div()
                     .flex()
                     .items_center()
+                    .flex_wrap()
                     .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::kind_badge(source_label, source == FileSource::Remote, metrics)
+                            .debug_selector({
+                                let source_id = source_id.clone();
+                                move || source_id.to_string()
+                            }),
+                    )
                     .child(components::kind_badge(
                         strings.files_host_label,
-                        true,
+                        source == FileSource::Remote,
                         metrics,
                     ))
                     .child(
@@ -7262,8 +7829,11 @@ impl ShelluneView {
                             .text_size(metrics.body_size())
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .debug_selector(|| "files.host".to_owned())
-                            .child(SharedString::from(format!("{host} · {target}"))),
+                            .debug_selector({
+                                let host_id = host_id.clone();
+                                move || host_id.to_string()
+                            })
+                            .child(SharedString::from(host_text)),
                     ),
             )
             .child(
@@ -7277,161 +7847,175 @@ impl ShelluneView {
                         metrics,
                     ))
                     .child(
-                        // The path wraps instead of being cut off: a deep path is the
-                        // one thing the user needs to be able to read here, and an
-                        // ellipsis in the middle of it names no directory at all.
                         div()
                             .flex_1()
                             .min_w(px(0.0))
                             .font_family(terminal::monospace_family())
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .debug_selector(|| "files.path".to_owned())
-                            .child(SharedString::from(
-                                path.clone()
-                                    .unwrap_or_else(|| strings.files_unknown_path.to_owned()),
-                            )),
+                            .debug_selector({
+                                let path_id = path_id.clone();
+                                move || path_id.to_string()
+                            })
+                            .child(SharedString::from(shown_path)),
                     ),
             );
 
-        let toolbar = div()
+        let crumbs = path.as_deref().map(path_crumbs).unwrap_or_default();
+        let mut crumb_row = div()
+            .flex()
+            .flex_wrap()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE));
+        for (index, crumb) in crumbs.iter().enumerate() {
+            let crumb_path = crumb.path.clone();
+            let label = if index == 0 && source == FileSource::Local {
+                strings.files_local_root.to_owned()
+            } else {
+                crumb.label.clone()
+            };
+            let crumb_id = files_element_id(source, &format!("crumb.{index}"));
+            crumb_row = crumb_row.child(self.text_button(
+                crumb_id,
+                SharedString::from(label),
+                Variant::Ghost,
+                cx,
+                move |view, cx| view.files_go(id, source, &crumb_path, cx),
+            ));
+        }
+
+        let mut toolbar = div()
             .flex()
             .items_center()
             .flex_wrap()
             .flex_none()
             .gap(metrics.scale(spacing::HAIRLINE))
             .child(self.text_button(
-                SharedString::from("files.up"),
+                files_element_id(source, "up"),
                 strings.files_up,
                 Variant::Ghost,
                 cx,
-                move |view, cx| view.files_up(id, cx),
+                move |view, cx| view.files_up(id, source, cx),
             ))
             .child(self.text_button(
-                SharedString::from("files.refresh"),
+                files_element_id(source, "refresh"),
                 strings.files_refresh,
                 Variant::Ghost,
                 cx,
-                move |view, cx| view.files_refresh(id, cx),
+                move |view, cx| view.files_refresh(id, source, cx),
             ))
             .child(self.text_button(
-                SharedString::from("files.new"),
+                files_element_id(source, "new"),
                 strings.files_new,
                 Variant::Ghost,
                 cx,
-                move |view, cx| view.files_new(id, cx),
-            ))
-            // The upload asks where the file is, the download is asked for from the row
-            // of the file it would copy: each question names its own object.
-            .child(self.text_button(
+                move |view, cx| view.files_new(id, source, cx),
+            ));
+        if source == FileSource::Remote {
+            toolbar = toolbar.child(self.text_button(
                 SharedString::from("files.upload"),
                 strings.transfers_upload,
                 Variant::Soft,
                 cx,
                 move |view, cx| view.files_ask_upload(id, cx),
-            ))
-            .child(self.text_button(
-                SharedString::from("files.close"),
-                strings.files_close,
-                Variant::Ghost,
-                cx,
-                move |view, cx| view.toggle_files(id, cx),
             ));
+        }
 
-        let body: gpui::AnyElement = match state {
-            BrowseState::Loading => div()
-                .flex_none()
-                .rounded(px(radius::SMALL))
-                .p(metrics.scale(spacing::TIGHT))
-                .bg(theme::swatch(palette::SURFACE))
-                .text_size(metrics.caption_size())
-                .text_color(Tone::Warning.text())
-                .debug_selector(|| "files.loading".to_owned())
-                .child(SharedString::from(strings.files_loading))
-                .into_any_element(),
-            BrowseState::Failed(failure) => div()
-                .flex()
-                .flex_col()
-                .flex_none()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .rounded(px(radius::SMALL))
-                .p(metrics.scale(spacing::TIGHT))
-                .bg(theme::swatch(palette::SURFACE))
-                .border_1()
-                .border_color(theme::swatch(palette::BORDER))
-                .debug_selector(|| "files.failure".to_owned())
-                .child(
-                    div()
-                        .text_size(metrics.label_size())
-                        .text_color(Tone::Danger.text())
-                        .child(SharedString::from(strings.files_failed)),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .debug_selector(|| "files.failure.reason".to_owned())
-                        .child(SharedString::from(failure.to_string())),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .debug_selector(|| "files.failure.note".to_owned())
-                        .child(SharedString::from(strings.files_terminal_note)),
-                )
+        let body: gpui::AnyElement = match &state {
+            BrowseState::Loading => {
+                let loading_id = files_element_id(source, "loading");
+                div()
+                    .flex_none()
+                    .rounded(px(radius::SMALL))
+                    .p(metrics.scale(spacing::TIGHT))
+                    .bg(theme::swatch(palette::SURFACE))
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Warning.text())
+                    .debug_selector(move || loading_id.to_string())
+                    .child(SharedString::from(strings.files_loading))
+                    .into_any_element()
+            }
+            BrowseState::Failed(failure) => self
+                .files_failure(id, source, failure, cx)
                 .into_any_element(),
             BrowseState::Ready(listing) => {
+                let list_id = files_element_id(source, "list");
                 let mut list = div()
-                    .id("files.list")
+                    .id(list_id.clone())
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
                     .gap(metrics.scale(1.0))
                     .overflow_y_scroll()
-                    .debug_selector(|| "files.list".to_owned());
+                    .debug_selector({
+                        let list_id = list_id.clone();
+                        move || list_id.to_string()
+                    });
                 if path.as_deref().is_some_and(|path| path != "/") {
-                    list = list.child(self.files_parent_row(id, cx));
+                    list = list.child(self.files_parent_row(id, source, cx));
                 }
                 if listing.is_empty() {
+                    let empty_id = files_element_id(source, "empty");
                     list = list.child(
                         div()
                             .flex_none()
                             .p(metrics.scale(spacing::HAIRLINE))
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .debug_selector(|| "files.empty".to_owned())
+                            .debug_selector(move || empty_id.to_string())
                             .child(SharedString::from(strings.files_empty)),
                     );
                 }
                 for (index, entry) in listing.entries().iter().enumerate() {
-                    list = list.child(self.files_row(id, index, entry, cx));
+                    list = list.child(self.files_row(id, source, index, entry, cx));
                 }
                 list.into_any_element()
             }
         };
 
-        let mut panel = div()
-            .id("files.panel")
-            .debug_selector(|| "files.panel".to_owned())
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(metrics.scale(FILES_PANEL_WIDTH))
-            .min_h(px(0.0))
-            .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .p(metrics.scale(spacing::BASE - 2.0))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_l_1()
-            .border_color(theme::swatch(palette::BORDER))
+        let panel_id = files_element_id(source, "panel");
+        let focus = match source {
+            FileSource::Local => &self.files_local_focus,
+            FileSource::Remote => &self.files_remote_focus,
+        };
+        let mut panel = components::file_column(FILES_PANEL_WIDTH, metrics)
+            .id(panel_id.clone())
+            .debug_selector({
+                let panel_id = panel_id.clone();
+                move || panel_id.to_string()
+            })
+            .h_full()
+            .overflow_hidden()
+            .track_focus(focus)
+            .on_key_down(cx.listener(
+                move |view, event: &KeyDownEvent, _window, cx| {
+                    if view.files_key(id, source, event, cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .can_drop(move |value, _window, _app| {
+                value
+                    .downcast_ref::<FileDrag>()
+                    .is_some_and(|drag| drag.session == id && drag.source != source)
+            })
+            .on_drop(cx.listener(
+                move |view, drag: &FileDrag, _window, cx| {
+                    view.files_accept_drop(id, source, drag, cx);
+                },
+            ))
             .child(header)
+            .child(crumb_row)
             .child(toolbar);
-        // The question while one is open, otherwise the fact that a change is with the
-        // server. Both sit above the list: they are about the entries, not a part of them.
-        if let Some(question) = self.files_question(id, cx) {
+        if let Some(question) = self.files_question(id, source, cx) {
             panel = panel.child(question);
         } else if changing {
+            let pending_id = files_element_id(source, "pending");
+            let pending = match source {
+                FileSource::Local => strings.files_change_pending_local,
+                FileSource::Remote => strings.files_change_pending,
+            };
             panel = panel.child(
                 div()
                     .flex_none()
@@ -7440,18 +8024,17 @@ impl ShelluneView {
                     .bg(theme::swatch(palette::SURFACE))
                     .text_size(metrics.caption_size())
                     .text_color(Tone::Warning.text())
-                    .debug_selector(|| "files.pending".to_owned())
-                    .child(SharedString::from(strings.files_change_pending)),
+                    .debug_selector(move || pending_id.to_string())
+                    .child(SharedString::from(pending)),
             );
         }
         panel = panel.child(body);
-        // What the last change really did, item by item, stays under the list.
-        if let Some(report) = self.files_report(id) {
+        if let Some(report) = self.files_report(id, source) {
             panel = panel.child(report);
         }
-        // What is moving, how far it is and what it became, for this session only: a
-        // transfer of another session belongs to that session's own list.
-        panel = panel.child(self.transfers_panel(id, cx));
+        if source == FileSource::Remote {
+            panel = panel.child(self.transfers_panel(id, cx));
+        }
         panel
     }
 
@@ -7722,16 +8305,20 @@ impl ShelluneView {
     /// Every variant names the exact object: the full path, and for a deletion also the
     /// kind and whether its contents go with it. Nothing on it sends anything until the
     /// confirming button is pressed.
-    fn files_question(&self, id: SessionId, cx: &mut Context<Self>) -> Option<Div> {
-        let dialog = self
-            .files_dialog
-            .as_ref()
-            .filter(|dialog| dialog.session() == id)?;
+    fn files_question(
+        &self,
+        id: SessionId,
+        source: FileSource,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let dialog = self.files_dialog.as_ref().filter(|dialog| {
+            dialog.session() == id && dialog.source() == source
+        })?;
         let metrics = self.metrics();
         let strings = self.strings();
         let directory = self
             .files
-            .browser(id)
+            .browser_in(id, source)
             .and_then(|browser| browser.current_directory())
             .map(str::to_owned);
         let danger = matches!(dialog, FilesDialog::Delete { .. });
@@ -7786,7 +8373,7 @@ impl ShelluneView {
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_SECONDARY))
                         .debug_selector(|| "files.question.target".to_owned())
-                        .child(SharedString::from(target)),
+                        .child(SharedString::from(display_path(dialog.source(), &target))),
                 );
                 if let Some(field) = &self.files_field {
                     card = card.child(
@@ -7853,8 +8440,9 @@ impl ShelluneView {
                         .text_color(theme::swatch(palette::TEXT_PRIMARY))
                         .debug_selector(|| "files.question.target".to_owned())
                         .child(SharedString::from(format!(
-                            "{}: {target}",
-                            strings.files_target_label
+                            "{}: {}",
+                            strings.files_target_label,
+                            display_path(dialog.source(), &target)
                         ))),
                 );
                 card = card.child(
@@ -7873,10 +8461,11 @@ impl ShelluneView {
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_MUTED))
                         .debug_selector(|| "files.question.note".to_owned())
-                        .child(SharedString::from(if kind.is_directory() {
-                            strings.files_delete_recursive
-                        } else {
-                            strings.files_delete_file
+                        .child(SharedString::from(match (dialog.source(), kind.is_directory()) {
+                            (FileSource::Local, true) => strings.files_delete_recursive_local,
+                            (FileSource::Local, false) => strings.files_delete_file_local,
+                            (FileSource::Remote, true) => strings.files_delete_recursive,
+                            (FileSource::Remote, false) => strings.files_delete_file,
                         })),
                 );
                 // A deletion the browser refuses says so here. Without it, confirming a
@@ -7922,15 +8511,26 @@ impl ShelluneView {
     ///
     /// A change that failed in part is not a success with a footnote: the heading says
     /// so, and every path the server refused is listed with the reason it gave.
-    fn files_report(&self, id: SessionId) -> Option<Div> {
-        let outcome = self.files.outcome(id)?;
+    fn files_report(&self, id: SessionId, source: FileSource) -> Option<Div> {
+        let outcome = match source {
+            FileSource::Remote => self.files.outcome(id)?,
+            FileSource::Local => self.files.outcome_in(id, source)?,
+        };
         let metrics = self.metrics();
         let strings = self.strings();
         let done = outcome.succeeded();
+        let heading = match (source, done) {
+            (FileSource::Local, true) => strings.files_change_done_local,
+            (FileSource::Local, false) => strings.files_change_failed_local,
+            (FileSource::Remote, true) => strings.files_change_done,
+            (FileSource::Remote, false) => strings.files_change_failed,
+        };
+        let report = files_element_id(source, "report");
+        let report_heading = files_element_id(source, "report.heading");
         let mut card =
             components::banner(if done { Tone::Positive } else { Tone::Danger }, metrics)
                 .gap(metrics.scale(1.0))
-                .debug_selector(|| "files.report".to_owned())
+                .debug_selector(move || report.to_string())
                 .child(
                     div()
                         .text_size(metrics.label_size())
@@ -7939,27 +8539,24 @@ impl ShelluneView {
                         } else {
                             Tone::Danger.text()
                         })
-                        .debug_selector(|| "files.report.heading".to_owned())
-                        .child(SharedString::from(if done {
-                            strings.files_change_done
-                        } else {
-                            strings.files_change_failed
-                        })),
+                        .debug_selector(move || report_heading.to_string())
+                        .child(SharedString::from(heading)),
                 )
-                .child(
+                .child({
+                    let count_id = files_element_id(source, "report.count");
                     div()
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .debug_selector(|| "files.report.count".to_owned())
+                        .debug_selector(move || count_id.to_string())
                         .child(SharedString::from(format!(
                             "{} {}/{}",
                             strings.files_change_changed,
                             outcome.changed(),
                             outcome.steps().len()
-                        ))),
-                );
+                        )))
+                });
         for (index, step) in outcome.steps().iter().take(FILES_REPORT_STEPS).enumerate() {
-            let selector = format!("files.report.step.{index}");
+            let selector = files_element_id(source, &format!("report.step.{index}"));
             let line = match step.failure() {
                 Some(failure) => format!("{} · {failure}", step.path()),
                 None => format!(
@@ -7980,7 +8577,7 @@ impl ShelluneView {
                     } else {
                         theme::swatch(palette::TEXT_SECONDARY)
                     })
-                    .debug_selector(move || selector.clone())
+                    .debug_selector(move || selector.to_string())
                     .child(SharedString::from(line)),
             );
         }
@@ -7988,11 +8585,17 @@ impl ShelluneView {
     }
 
     /// The row that leads to the parent directory.
-    fn files_parent_row(&self, id: SessionId, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn files_parent_row(
+        &self,
+        id: SessionId,
+        source: FileSource,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let metrics = self.metrics();
+        let parent_id = files_element_id(source, "parent");
         div()
-            .id("files.parent")
-            .debug_selector(|| "files.parent".to_owned())
+            .id(parent_id.clone())
+            .debug_selector(move || parent_id.to_string())
             .flex()
             .items_center()
             .flex_none()
@@ -8004,7 +8607,7 @@ impl ShelluneView {
             .text_color(theme::swatch(palette::TEXT_SECONDARY))
             .cursor_pointer()
             .on_click(cx.listener(move |view, _event, _window, cx| {
-                view.files_up(id, cx);
+                view.files_up(id, source, cx);
             }))
             .child(SharedString::from(format!(
                 "..  {}",
@@ -8021,6 +8624,7 @@ impl ShelluneView {
     fn files_row(
         &self,
         id: SessionId,
+        source: FileSource,
         index: usize,
         entry: &shellune_core::DirEntry,
         cx: &mut Context<Self>,
@@ -8032,14 +8636,20 @@ impl ShelluneView {
         let size = entry.size();
         let kind = entry.kind();
         let openable = entry.is_directory();
-        let owned = name.to_owned();
+        let select_name = name.to_owned();
         let rename = name.to_owned();
         let delete = name.to_owned();
         let download = name.to_owned();
-        let name_selector = format!("files.name.{index}");
+        let transfer_name = name.to_owned();
+        let prefix = match source {
+            FileSource::Remote => "files",
+            FileSource::Local => "files.local",
+        };
+        let name_selector = format!("{prefix}.name.{index}");
+        let entry_selector = format!("{prefix}.entry.{index}");
         let mut entry_row = div()
-            .id(("files.entry", index))
-            .debug_selector(move || format!("files.entry.{index}"))
+            .id(SharedString::from(entry_selector.clone()))
+            .debug_selector(move || entry_selector.clone())
             .flex()
             .items_center()
             .justify_between()
@@ -8072,23 +8682,54 @@ impl ShelluneView {
                     })),
             );
         if openable {
+            let open_name = name.to_owned();
             entry_row = entry_row.cursor_pointer().on_click(cx.listener(
                 move |view, _event, _window, cx| {
-                    view.files_enter(id, &owned, cx);
+                    view.files_enter(id, source, &open_name, cx);
                 },
             ));
+        } else if let Some(directory) = self
+            .files
+            .browser_in(id, source)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned)
+        {
+            let drag_name = name.to_owned();
+            entry_row = entry_row.on_drag(
+                FileDrag {
+                    session: id,
+                    source,
+                    name: drag_name.clone(),
+                    directory,
+                },
+                move |drag, _offset, _window, cx| {
+                    cx.new(|_| FileDragLabel {
+                        name: SharedString::from(drag.name.clone()),
+                    })
+                },
+            );
         }
         let hover = theme::swatch(palette::SURFACE_HOVER);
+        let row_selector = format!("{prefix}.row.{index}");
+        let selected = self.files.selected(id, source) == Some(name);
         div()
-            .id(("files.row", index))
-            .debug_selector(move || format!("files.row.{index}"))
+            .id(SharedString::from(row_selector.clone()))
+            .debug_selector(move || row_selector.clone())
             .flex()
             .flex_col()
             .flex_none()
             .py(metrics.scale(2.0))
             .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(if selected {
+                palette::ACCENT_TINT
+            } else {
+                palette::SURFACE_RAISED
+            }))
             .hover(move |style| style.bg(hover))
+            .on_click(cx.listener(move |view, _event, _window, cx| {
+                view.files.select(id, source, Some(select_name.clone()));
+                cx.notify();
+            }))
             .child(entry_row)
             .child({
                 let mut actions = div()
@@ -8099,29 +8740,50 @@ impl ShelluneView {
                     .px(metrics.scale(spacing::HAIRLINE))
                     .pb(metrics.scale(1.0))
                     .child(self.text_button(
-                        SharedString::from(format!("files.rename.{index}")),
+                        SharedString::from(format!("{prefix}.rename.{index}")),
                         strings.files_rename,
                         Variant::Ghost,
                         cx,
-                        move |view, cx| view.files_ask_rename(id, &rename, cx),
+                        move |view, cx| view.files_ask_rename(id, source, &rename, cx),
                     ));
-                // Only a file has content to copy, so only a file offers a download: a
-                // directory that showed the button would promise a transfer it cannot do.
+                // Only a file has content to copy. A directory button would promise a
+                // transfer the connection cannot do. Dragging a file calls this too.
                 if !openable {
-                    actions = actions.child(self.text_button(
-                        SharedString::from(format!("files.download.{index}")),
-                        strings.transfers_download,
-                        Variant::Ghost,
-                        cx,
-                        move |view, cx| view.files_ask_download(id, &download, cx),
-                    ));
+                    if source == FileSource::Remote {
+                        actions = actions.child(self.text_button(
+                            SharedString::from(format!("files.download.{index}")),
+                            strings.transfers_download,
+                            Variant::Ghost,
+                            cx,
+                            move |view, cx| view.files_ask_download(id, &download, cx),
+                        ));
+                        actions = actions.child(self.text_button(
+                            SharedString::from(format!("files.to_local.{index}")),
+                            strings.files_to_local,
+                            Variant::Ghost,
+                            cx,
+                            move |view, cx| {
+                                view.files_transfer_named(id, FileSource::Remote, &transfer_name, cx)
+                            },
+                        ));
+                    } else {
+                        actions = actions.child(self.text_button(
+                            SharedString::from(format!("files.local.to_remote.{index}")),
+                            strings.files_to_remote,
+                            Variant::Ghost,
+                            cx,
+                            move |view, cx| {
+                                view.files_transfer_named(id, FileSource::Local, &transfer_name, cx)
+                            },
+                        ));
+                    }
                 }
                 actions.child(self.text_button(
-                    SharedString::from(format!("files.delete.{index}")),
+                    SharedString::from(format!("{prefix}.delete.{index}")),
                     strings.files_delete,
                     Variant::Ghost,
                     cx,
-                    move |view, cx| view.files_ask_delete(id, &delete, kind, cx),
+                    move |view, cx| view.files_ask_delete(id, source, &delete, kind, cx),
                 ))
             })
     }
@@ -8199,6 +8861,82 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn files_browser(&self, id: SessionId) -> Option<&shellune_core::FileBrowser> {
         self.files.browser(id)
+    }
+
+    /// The local file view of one session, as the window holds it.
+    #[cfg(test)]
+    pub fn files_local_browser(&self, id: SessionId) -> Option<&shellune_core::FileBrowser> {
+        self.files.browser_in(id, FileSource::Local)
+    }
+
+    /// Which source a narrow window is showing.
+    #[cfg(test)]
+    pub fn files_shown(&self, id: SessionId) -> Option<FileSource> {
+        self.files.shown(id)
+    }
+
+    /// Replaces the local channel, for a test that scripts this computer.
+    #[cfg(test)]
+    pub(crate) fn attach_local_files_for_test(
+        &mut self,
+        id: SessionId,
+        channel: Box<dyn BrowseChannel>,
+        cx: &mut Context<Self>,
+    ) {
+        self.files.attach_local_for_test(id, channel);
+        cx.notify();
+    }
+
+    /// Presses one unmodified key on a file column, or a modified key when `modified` is set.
+    ///
+    /// The column's own handler is what runs, so the test does not add a window binding.
+    #[cfg(test)]
+    pub fn files_key_for_test(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        key: &str,
+        modified: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut keystroke = gpui::Keystroke::default();
+        keystroke.key = key.to_owned();
+        if modified {
+            keystroke.modifiers.control = true;
+        }
+        self.files_key(
+            id,
+            source,
+            &KeyDownEvent {
+                keystroke,
+                is_held: false,
+            },
+            cx,
+        )
+    }
+
+    /// Drops a file onto one column, using the same request as the row button.
+    #[cfg(test)]
+    pub fn files_drop_for_test(
+        &mut self,
+        id: SessionId,
+        onto: FileSource,
+        from: FileSource,
+        directory: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.files_accept_drop(
+            id,
+            onto,
+            &FileDrag {
+                session: id,
+                source: from,
+                name: name.to_owned(),
+                directory: directory.to_owned(),
+            },
+            cx,
+        );
     }
 
     /// Whether the file view of a session is open.
@@ -8849,6 +9587,7 @@ impl Render for ShelluneView {
         // Small views that are not handed the workspace (a text field's menu) read the
         // language from here.
         self.workspace.locale().set_current();
+        self.viewport_width = window.viewport_size().width;
         // The palette is decided before anything is drawn: the user's choice, or the
         // system's when the choice is to follow it, which the window reports when it
         // changes.

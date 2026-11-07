@@ -1,31 +1,28 @@
-//! The file view of a remote session: what is open, where it is and what arrived
-//! (R9), and the changes it asks for (R11).
+//! The file view of one remote session: a local directory and that session's SFTP
+//! directory, each with its own path, request number and listing (R8).
 //!
 //! The state machine that decides what a directory listing may say lives in
 //! shellune-core, because it has to be testable without a window. What lives here is
-//! the wiring: one open view per session, the connection it asks, and the rule that a
-//! failure of the file view never becomes a failure of the terminal.
+//! the wiring. A session keeps two browsers and nothing is shared with another session:
 //!
-//! Three things are kept per session and nothing is shared between sessions:
-//!
-//! * the link to that session's own connection, so browsing never re-authenticates;
-//! * the browser with its path, its request number and its listing;
-//! * the host label, so the view can always say which machine a path belongs to.
+//! * the link to that session's own connection, so the remote side never re-authenticates;
+//! * a local filesystem channel that answers the same requests, so there is no second protocol;
+//! * each browser's path, request number and listing, plus the host the remote path belongs to.
 //!
 //! The view asks for entries only after a real answer: pump() applies what came back
 //! and reports whether anything changed, and a request that could not even be
-//! delivered is turned into a connection failure for that one view.
+//! delivered is turned into a connection failure for that one source. A failure of one
+//! source does not clear the other, and neither becomes a failure of the terminal.
 //!
-//! A change is asked for the same way, but it is answered differently: the answer is a
-//! report of every path the server reached, and the directory is listed again after it.
-//! The report says what happened; only the next listing says what the directory holds
-//! now, which is why the two are never mixed into one statement.
+//! A change is answered by a report, then the same source is listed again. The report
+//! says what happened; only the next listing says what the directory holds now.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use shellune_core::{
-    BrowseFailure, BrowseRequest, BrowseResponse, FileBrowser, FileKind, MutationOutcome,
-    NameProblem, SessionId,
+    BrowseFailure, BrowseRequest, BrowseResponse, FileBrowser, FileKind, MutationAction,
+    MutationOutcome, MutationStep, NameProblem, SessionId, join_path, normalize_path,
 };
 use shellune_ssh::FileLink;
 
@@ -53,13 +50,31 @@ impl BrowseChannel for FileLink {
     }
 }
 
-/// One browsable session: its connection, its view and the name of the host.
+/// Which directory a file view is asking about.
+///
+/// Local and remote stay separate values: a narrow window may show only one of them,
+/// but it never folds the two into a single identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileSource {
+    /// A directory on this computer.
+    Local,
+    /// A directory on the session's own SSH connection.
+    Remote,
+}
+
+/// One browsable session: the remote connection, the local disk, and both views.
 struct SessionFiles {
-    channel: Box<dyn BrowseChannel>,
+    remote: Box<dyn BrowseChannel>,
+    local: Box<dyn BrowseChannel>,
     /// None until the user opens the file view for this session.
-    browser: Option<FileBrowser>,
+    remote_browser: Option<FileBrowser>,
+    local_browser: Option<FileBrowser>,
     host: String,
     target: String,
+    /// Which source a narrow window shows. A wide window shows both.
+    shown: FileSource,
+    local_selected: Option<String>,
+    remote_selected: Option<String>,
 }
 
 /// Every browsable session and which of them show a file view.
@@ -78,7 +93,8 @@ impl FileViews {
     /// Records that a session's connection can browse directories.
     ///
     /// The host and address are kept with the link so a view can never show a path
-    /// without naming the machine it is on.
+    /// without naming the machine it is on. The local side is this computer; it does
+    /// not use the session's credentials.
     pub fn attach(
         &mut self,
         session: SessionId,
@@ -89,12 +105,28 @@ impl FileViews {
         self.sessions.insert(
             session,
             SessionFiles {
-                channel,
-                browser: None,
+                remote: channel,
+                local: Box::new(LocalFs::new()),
+                remote_browser: None,
+                local_browser: None,
                 host: host.into(),
                 target: target.into(),
+                shown: FileSource::Remote,
+                local_selected: None,
+                remote_selected: None,
             },
         );
+    }
+
+    /// Replaces the local channel, for a test that scripts this computer.
+    ///
+    /// The remote channel is left as it was: a script for one source must not become
+    /// the other source's answers.
+    #[cfg(test)]
+    pub fn attach_local_for_test(&mut self, session: SessionId, channel: Box<dyn BrowseChannel>) {
+        if let Some(files) = self.sessions.get_mut(&session) {
+            files.local = channel;
+        }
     }
 
     /// Whether this session has a connection that can browse directories.
@@ -108,189 +140,721 @@ impl FileViews {
     pub fn is_open(&self, session: SessionId) -> bool {
         self.sessions
             .get(&session)
-            .is_some_and(|files| files.browser.is_some())
+            .is_some_and(|files| files.remote_browser.is_some())
     }
 
     /// Whether any file view is open, which is when polling is worth its timer.
     #[must_use]
     pub fn any_open(&self) -> bool {
-        self.sessions.values().any(|files| files.browser.is_some())
+        self.sessions
+            .values()
+            .any(|files| files.remote_browser.is_some())
     }
 
-    /// The view of one session, when it is open.
+    /// The remote view of one session, when it is open.
     #[must_use]
     pub fn browser(&self, session: SessionId) -> Option<&FileBrowser> {
-        self.sessions.get(&session)?.browser.as_ref()
+        self.browser_in(session, FileSource::Remote)
     }
 
-    /// What the last change in this view really did, when one was attempted.
+    /// The view of one source, when the file view is open.
+    #[must_use]
+    pub fn browser_in(&self, session: SessionId, source: FileSource) -> Option<&FileBrowser> {
+        let files = self.sessions.get(&session)?;
+        match source {
+            FileSource::Local => files.local_browser.as_ref(),
+            FileSource::Remote => files.remote_browser.as_ref(),
+        }
+    }
+
+    /// What the last remote change really did, when one was attempted.
     #[must_use]
     pub fn outcome(&self, session: SessionId) -> Option<&MutationOutcome> {
-        self.browser(session)?.last_outcome()
+        self.outcome_in(session, FileSource::Remote)
     }
 
-    /// Opens the file view of a session at the login directory.
+    /// What the last change of one source really did.
+    #[must_use]
+    pub fn outcome_in(&self, session: SessionId, source: FileSource) -> Option<&MutationOutcome> {
+        self.browser_in(session, source)?.last_outcome()
+    }
+
+    /// Which source a narrow window is showing.
+    #[must_use]
+    pub fn shown(&self, session: SessionId) -> Option<FileSource> {
+        let files = self.sessions.get(&session)?;
+        files.remote_browser.is_some().then_some(files.shown)
+    }
+
+    /// Shows one source in a narrow window, without changing the other source's path.
+    pub fn show(&mut self, session: SessionId, source: FileSource) -> bool {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        if files.remote_browser.is_none() {
+            return false;
+        }
+        files.shown = source;
+        true
+    }
+
+    /// The entry the keyboard is acting on, when one is chosen.
+    #[must_use]
+    pub fn selected(&self, session: SessionId, source: FileSource) -> Option<&str> {
+        let files = self.sessions.get(&session)?;
+        match source {
+            FileSource::Local => files.local_selected.as_deref(),
+            FileSource::Remote => files.remote_selected.as_deref(),
+        }
+    }
+
+    /// Remembers which entry the keyboard acts on. `None` clears the choice.
+    pub fn select(&mut self, session: SessionId, source: FileSource, name: Option<String>) {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        match source {
+            FileSource::Local => files.local_selected = name,
+            FileSource::Remote => files.remote_selected = name,
+        }
+    }
+
+    /// The local directory on screen, as a path of this computer.
     ///
-    /// Opening is the only place that starts a browser, so a session that was never
-    /// opened has no path and no listing to show for itself.
+    /// `None` when that directory has not been listed, or when the path is the
+    /// Windows drive list, which is not a folder a file can be written into.
+    #[must_use]
+    pub fn local_os_directory(&self, session: SessionId) -> Option<PathBuf> {
+        let path = self
+            .browser_in(session, FileSource::Local)?
+            .current_directory()?;
+        local_protocol_to_os(path)
+    }
+
+    /// Opens both sources of a session.
+    ///
+    /// The remote side asks the connection that is already authenticated for its
+    /// login directory. The local side asks this computer. Neither request invents
+    /// a listing, and opening does not ask for credentials again.
     pub fn open(&mut self, session: SessionId) -> bool {
         let Some(files) = self.sessions.get_mut(&session) else {
             return false;
         };
-        if files.browser.is_none() {
-            let mut browser = FileBrowser::new(session, files.host.clone(), files.target.clone());
-            let request = browser.begin_home();
-            files.browser = Some(browser);
-            let _ = Self::ask(files, request);
+        if files.remote_browser.is_none() {
+            let mut remote = FileBrowser::new(session, files.host.clone(), files.target.clone());
+            let request = remote.begin_home();
+            files.remote_browser = Some(remote);
+            let _ = deliver(files, FileSource::Remote, request);
+            let mut local = FileBrowser::new(session, machine_name(), "local");
+            let request = local.begin_home();
+            files.local_browser = Some(local);
+            let _ = deliver(files, FileSource::Local, request);
+            files.shown = FileSource::Remote;
         }
         self.is_open(session)
     }
 
-    /// Closes the file view of a session, keeping the connection for a later open.
+    /// Closes both sources, keeping the connection for a later open.
     pub fn close(&mut self, session: SessionId) {
         if let Some(files) = self.sessions.get_mut(&session) {
-            files.browser = None;
+            files.remote_browser = None;
+            files.local_browser = None;
+            files.local_selected = None;
+            files.remote_selected = None;
         }
     }
 
     /// Forgets a session entirely, which is what a closed connection does.
     ///
-    /// The connection ends with the session, so the view of it ends too: a listing
-    /// that nothing backs would keep showing files the user cannot reach, and it would
-    /// keep the poll timer alive for a server that is no longer there.
+    /// The connection ends with the session, so both listings end with it: a path
+    /// that nothing backs would keep showing files the user cannot reach.
     pub fn detach(&mut self, session: SessionId) -> bool {
         let had_view = self.is_open(session);
         self.sessions.remove(&session);
         had_view
     }
 
-    /// Asks for the parent of the directory shown.
+    /// Asks for the parent of the remote directory shown.
     pub fn up(&mut self, session: SessionId) -> bool {
-        self.ask_from(session, |browser| browser.up())
+        self.up_in(session, FileSource::Remote)
     }
 
-    /// Asks again for the directory shown.
+    /// Asks for the parent of one source.
+    pub fn up_in(&mut self, session: SessionId, source: FileSource) -> bool {
+        self.ask_in(session, source, |browser| browser.up())
+    }
+
+    /// Asks again for the remote directory shown.
     pub fn refresh(&mut self, session: SessionId) -> bool {
-        self.ask_from(session, |browser| Some(browser.refresh()))
+        self.refresh_in(session, FileSource::Remote)
     }
 
-    /// Opens one entry of the listing on screen.
+    /// Asks again for one source. The next listing, not the previous one, is truth.
+    pub fn refresh_in(&mut self, session: SessionId, source: FileSource) -> bool {
+        self.ask_in(session, source, |browser| Some(browser.refresh()))
+    }
+
+    /// Opens one remote entry.
     pub fn enter(&mut self, session: SessionId, name: &str) -> bool {
-        self.ask_from(session, |browser| browser.open(name))
+        self.enter_in(session, FileSource::Remote, name)
     }
 
-    /// Asks for a new directory called name inside the directory on screen.
+    /// Opens one entry of one source.
+    pub fn enter_in(&mut self, session: SessionId, source: FileSource, name: &str) -> bool {
+        self.ask_in(session, source, |browser| browser.open(name))
+    }
+
+    /// Asks one source to list an absolute path it already speaks.
     ///
-    /// A name the browser refuses produces the reason and sends nothing: an invalid
-    /// name or a collision is a fact about the listing on screen, so it is answered
-    /// before the server is involved.
+    /// Remote paths are POSIX. Local paths are the protocol form [`local_protocol_to_os`]
+    /// reverses, so a breadcrumb cannot point the remote browser at a local disk.
+    pub fn list_at(&mut self, session: SessionId, source: FileSource, path: &str) -> bool {
+        self.ask_in(session, source, |browser| Some(browser.begin_list(path)))
+    }
+
+    /// Asks for a new remote directory called name.
     pub fn create_directory(&mut self, session: SessionId, name: &str) -> Result<(), NameProblem> {
-        self.mutate(session, |browser| browser.create_directory(name))
+        self.create_directory_in(session, FileSource::Remote, name)
     }
 
-    /// Asks to rename one entry of the directory on screen.
-    pub fn rename(&mut self, session: SessionId, from: &str, to: &str) -> Result<(), NameProblem> {
-        self.mutate(session, |browser| browser.rename(from, to))
-    }
-
-    /// Asks to delete one entry of the directory on screen.
-    pub fn delete(&mut self, session: SessionId, name: &str) -> Result<(), NameProblem> {
-        self.mutate(session, |browser| browser.delete(name))
-    }
-
-    /// Runs one change of the browser and delivers it.
-    fn mutate(
+    /// Asks one source for a new directory. A refused name sends nothing.
+    pub fn create_directory_in(
         &mut self,
         session: SessionId,
+        source: FileSource,
+        name: &str,
+    ) -> Result<(), NameProblem> {
+        self.mutate_in(session, source, |browser| browser.create_directory(name))
+    }
+
+    /// Asks to rename one remote entry.
+    pub fn rename(&mut self, session: SessionId, from: &str, to: &str) -> Result<(), NameProblem> {
+        self.rename_in(session, FileSource::Remote, from, to)
+    }
+
+    /// Asks one source to rename one entry.
+    pub fn rename_in(
+        &mut self,
+        session: SessionId,
+        source: FileSource,
+        from: &str,
+        to: &str,
+    ) -> Result<(), NameProblem> {
+        self.mutate_in(session, source, |browser| browser.rename(from, to))
+    }
+
+    /// Asks to delete one remote entry.
+    pub fn delete(&mut self, session: SessionId, name: &str) -> Result<(), NameProblem> {
+        self.delete_in(session, FileSource::Remote, name)
+    }
+
+    /// Asks one source to delete one entry.
+    pub fn delete_in(
+        &mut self,
+        session: SessionId,
+        source: FileSource,
+        name: &str,
+    ) -> Result<(), NameProblem> {
+        self.mutate_in(session, source, |browser| browser.delete(name))
+    }
+
+    /// Runs one change and delivers it to that source only.
+    fn mutate_in(
+        &mut self,
+        session: SessionId,
+        source: FileSource,
         ask: impl FnOnce(&mut FileBrowser) -> Result<BrowseRequest, NameProblem>,
     ) -> Result<(), NameProblem> {
         let Some(files) = self.sessions.get_mut(&session) else {
             return Err(NameProblem::NoDirectory);
         };
-        let Some(browser) = files.browser.as_mut() else {
-            return Err(NameProblem::NoDirectory);
+        let request = {
+            let Some(browser) = side_mut(files, source) else {
+                return Err(NameProblem::NoDirectory);
+            };
+            ask(browser)?
         };
-        let request = ask(browser)?;
-        Self::ask(files, request);
+        deliver(files, source, request);
         Ok(())
     }
 
     /// Applies every answer that arrived, returning whether anything changed.
     ///
-    /// A change is answered only by the server's own next listing: once the report is
-    /// in, the directory is listed again, so what stays on screen is what the server
-    /// really holds now and not what the change hoped for.
+    /// Each source is applied on its own. A change is followed by a fresh listing of
+    /// that same source, so a remote failure cannot replace the local directory and a
+    /// local change is not treated as something the server confirmed.
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
         for files in self.sessions.values_mut() {
-            let responses = files.channel.drain();
-            if files.browser.is_none() {
-                continue;
-            }
-            for response in responses {
-                let is_change = response.outcome().is_some();
-                let applied = {
-                    let Some(browser) = files.browser.as_mut() else {
-                        break;
-                    };
-                    // An answer that does not belong to the request this browser is
-                    // waiting for is dropped by the browser itself.
-                    browser.apply(response)
-                };
-                if !applied {
-                    continue;
-                }
+            if pump_side(files, FileSource::Remote) {
                 changed = true;
-                if is_change {
-                    let refreshed = {
-                        let Some(browser) = files.browser.as_mut() else {
-                            break;
-                        };
-                        browser.refresh()
-                    };
-                    Self::ask(files, refreshed);
-                }
+            }
+            if pump_side(files, FileSource::Local) {
+                changed = true;
             }
         }
         changed
     }
 
-    /// Runs one request of the browser and delivers it.
-    fn ask_from(
+    /// Runs one request of one browser and delivers it to that source.
+    fn ask_in(
         &mut self,
         session: SessionId,
+        source: FileSource,
         ask: impl FnOnce(&mut FileBrowser) -> Option<BrowseRequest>,
     ) -> bool {
         let Some(files) = self.sessions.get_mut(&session) else {
             return false;
         };
-        if files.browser.is_none() {
-            return false;
-        }
-        let request = files.browser.as_mut().and_then(ask);
+        let request = {
+            let Some(browser) = side_mut(files, source) else {
+                return false;
+            };
+            ask(browser)
+        };
         let Some(request) = request else {
             return false;
         };
-        Self::ask(files, request)
+        deliver(files, source, request)
+    }
+}
+
+/// The browser of one source.
+fn side_mut(files: &mut SessionFiles, source: FileSource) -> Option<&mut FileBrowser> {
+    match source {
+        FileSource::Local => files.local_browser.as_mut(),
+        FileSource::Remote => files.remote_browser.as_mut(),
+    }
+}
+
+/// Applies one source's answers and, after a change, asks that source to list again.
+fn pump_side(files: &mut SessionFiles, source: FileSource) -> bool {
+    let responses = match source {
+        FileSource::Local => files.local.drain(),
+        FileSource::Remote => files.remote.drain(),
+    };
+    let mut changed = false;
+    for response in responses {
+        let is_change = response.outcome().is_some();
+        let applied = side_mut(files, source).is_some_and(|browser| browser.apply(response));
+        if !applied {
+            continue;
+        }
+        changed = true;
+        forget_missing_selection(files, source);
+        if is_change {
+            let Some(browser) = side_mut(files, source) else {
+                continue;
+            };
+            let refreshed = browser.refresh();
+            deliver(files, source, refreshed);
+        }
+    }
+    changed
+}
+
+/// Drops a selection the latest listing no longer contains.
+fn forget_missing_selection(files: &mut SessionFiles, source: FileSource) {
+    let selected = match source {
+        FileSource::Local => files.local_selected.clone(),
+        FileSource::Remote => files.remote_selected.clone(),
+    };
+    let still = selected.as_deref().is_some_and(|name| {
+        side_mut(files, source).is_some_and(|browser| browser.entry(name).is_some())
+    });
+    if !still {
+        match source {
+            FileSource::Local => files.local_selected = None,
+            FileSource::Remote => files.remote_selected = None,
+        }
+    }
+}
+
+/// Delivers one request to one source.
+///
+/// A request that never left the process is a failure of that source only. The
+/// remote wording stays the one the connection already uses, so a lost SSH session
+/// is not described as a problem with this computer.
+fn deliver(files: &mut SessionFiles, source: FileSource, request: BrowseRequest) -> bool {
+    let sent = match source {
+        FileSource::Local => files.local.send(request.clone()),
+        FileSource::Remote => files.remote.send(request.clone()),
+    };
+    if sent {
+        return true;
+    }
+    if let Some(browser) = side_mut(files, source) {
+        let reason = match source {
+            FileSource::Remote => "the SSH connection is no longer open".to_owned(),
+            FileSource::Local => "this computer could not accept the request".to_owned(),
+        };
+        browser.apply(BrowseResponse::Failed {
+            request: request.request(),
+            failure: BrowseFailure::ConnectionLost { reason },
+        });
+    }
+    false
+}
+
+/// The name of this computer, so the local column can be told from the remote host.
+fn machine_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "localhost".to_owned())
+}
+
+/// A path this computer can open, or `None` for the Windows list of drives.
+///
+/// FileBrowser stores POSIX-shaped paths. On Windows a drive root is `/C:/Users`,
+/// which is not a path `std::fs` can open until the drive letter is put back.
+#[must_use]
+pub fn local_protocol_to_os(path: &str) -> Option<PathBuf> {
+    let path = normalize_path(path);
+    if cfg!(windows) {
+        if path == "/" {
+            return None;
+        }
+        let rest = path.trim_start_matches('/');
+        if let Some((drive, tail)) = rest.split_once(':')
+            && drive.len() == 1
+            && drive
+                .chars()
+                .next()
+                .is_some_and(|letter| letter.is_ascii_alphabetic())
+        {
+            let mut os = format!("{}:\\", drive.to_ascii_uppercase());
+            let tail = tail.trim_start_matches('/');
+            if !tail.is_empty() {
+                os.push_str(&tail.replace('/', "\\"));
+            }
+            return Some(PathBuf::from(os));
+        }
+        return Some(PathBuf::from(rest.replace('/', "\\")));
+    }
+    Some(PathBuf::from(path))
+}
+
+/// The protocol path of a real local path, so both browsers share one path language.
+#[must_use]
+pub fn local_os_to_protocol(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = text
+        .strip_prefix(r"\\?\")
+        .or_else(|| text.strip_prefix("//?/"))
+        .unwrap_or(text.as_ref());
+    let slash = text.replace('\\', "/");
+    if slash.starts_with('/') {
+        normalize_path(&slash)
+    } else {
+        normalize_path(&format!("/{slash}"))
+    }
+}
+
+/// What the local column prints for a path. The Windows drive list has no folder.
+#[must_use]
+pub fn display_path(source: FileSource, path: &str) -> String {
+    if source == FileSource::Local {
+        return local_protocol_to_os(path)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| path.to_owned());
+    }
+    path.to_owned()
+}
+
+/// One step of a path, from the root out to the directory on screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathCrumb {
+    /// The single name the user clicks.
+    pub label: String,
+    /// The absolute path that click lists.
+    pub path: String,
+}
+
+/// The breadcrumbs of one protocol path, root first.
+#[must_use]
+pub fn path_crumbs(path: &str) -> Vec<PathCrumb> {
+    let path = normalize_path(path);
+    let mut crumbs = vec![PathCrumb {
+        label: "/".to_owned(),
+        path: "/".to_owned(),
+    }];
+    if path == "/" {
+        return crumbs;
+    }
+    let mut built = String::new();
+    for part in path.trim_start_matches('/').split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        built.push('/');
+        built.push_str(part);
+        crumbs.push(PathCrumb {
+            label: part.to_owned(),
+            path: built.clone(),
+        });
+    }
+    crumbs
+}
+
+/// Answers browse requests against this computer.
+///
+/// The requests and the answers are the ones the remote connection already speaks,
+/// so a button, a key and a drag cannot grow a second set of file operations.
+#[derive(Default)]
+struct LocalFs {
+    pending: Vec<BrowseResponse>,
+}
+
+impl LocalFs {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl BrowseChannel for LocalFs {
+    fn send(&mut self, request: BrowseRequest) -> bool {
+        self.pending.push(local_answer(&request));
+        true
     }
 
-    /// Delivers one request, reporting a connection that cannot take it.
-    ///
-    /// A request that never left the process is answered here, as the failure it is:
-    /// the view must not sit in "loading" for a connection that is already gone.
-    fn ask(files: &mut SessionFiles, request: BrowseRequest) -> bool {
-        if files.channel.send(request.clone()) {
-            return true;
-        }
-        if let Some(browser) = files.browser.as_mut() {
-            browser.apply(BrowseResponse::Failed {
-                request: request.request(),
-                failure: BrowseFailure::ConnectionLost {
-                    reason: "the SSH connection is no longer open".to_owned(),
+    fn drain(&mut self) -> Vec<BrowseResponse> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn local_answer(request: &BrowseRequest) -> BrowseResponse {
+    let number = request.request();
+    match request {
+        BrowseRequest::Home { .. } => match local_home() {
+            Ok(path) => match list_directory(&path) {
+                Ok(entries) => BrowseResponse::Listed {
+                    request: number,
+                    path: local_os_to_protocol(&path),
+                    entries,
                 },
-            });
+                Err(failure) => BrowseResponse::Failed {
+                    request: number,
+                    failure,
+                },
+            },
+            Err(failure) => BrowseResponse::Failed {
+                request: number,
+                failure,
+            },
+        },
+        BrowseRequest::List { path, .. } => match list_protocol(path) {
+            Ok(entries) => BrowseResponse::Listed {
+                request: number,
+                path: normalize_path(path),
+                entries,
+            },
+            Err(failure) => BrowseResponse::Failed {
+                request: number,
+                failure,
+            },
+        },
+        BrowseRequest::CreateDirectory {
+            directory, name, ..
+        } => {
+            let target = join_path(directory, name);
+            let action = MutationAction::CreateDirectory { path: target.clone() };
+            let outcome = match create_local_directory(directory, name) {
+                Ok(()) => MutationOutcome::new(
+                    action,
+                    vec![MutationStep::done(target, Some(FileKind::Directory))],
+                ),
+                Err(failure) => MutationOutcome::refused(action, failure),
+            };
+            BrowseResponse::Changed {
+                request: number,
+                outcome,
+            }
         }
-        false
+        BrowseRequest::Rename { from, to, .. } => {
+            let action = MutationAction::Rename {
+                from: from.clone(),
+                to: to.clone(),
+            };
+            let outcome = match rename_local(from, to) {
+                Ok(()) => MutationOutcome::new(action, vec![MutationStep::done(to.clone(), None)]),
+                Err(failure) => MutationOutcome::refused(action, failure),
+            };
+            BrowseResponse::Changed {
+                request: number,
+                outcome,
+            }
+        }
+        BrowseRequest::Delete { path, kind, .. } => {
+            let action = MutationAction::Delete {
+                path: path.clone(),
+                kind: *kind,
+            };
+            let outcome = match delete_local(path, *kind) {
+                Ok(()) => {
+                    MutationOutcome::new(action, vec![MutationStep::done(path.clone(), Some(*kind))])
+                }
+                Err(failure) => MutationOutcome::refused(action, failure),
+            };
+            BrowseResponse::Changed {
+                request: number,
+                outcome,
+            }
+        }
+    }
+}
+
+fn local_home() -> Result<PathBuf, BrowseFailure> {
+    let raw = if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    };
+    if let Some(raw) = raw {
+        let path = PathBuf::from(raw);
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+    std::env::current_dir().map_err(|error| io_failure(error, "."))
+}
+
+fn list_protocol(path: &str) -> Result<Vec<shellune_core::DirEntry>, BrowseFailure> {
+    let protocol = normalize_path(path);
+    #[cfg(windows)]
+    if protocol == "/" {
+        return Ok(windows_drives());
+    }
+    let Some(os_path) = local_protocol_to_os(&protocol) else {
+        return Err(BrowseFailure::NotFound { path: protocol });
+    };
+    list_directory(&os_path)
+}
+
+fn list_directory(path: &Path) -> Result<Vec<shellune_core::DirEntry>, BrowseFailure> {
+    let protocol = local_os_to_protocol(path);
+    let meta = std::fs::metadata(path).map_err(|error| io_failure(error, &protocol))?;
+    if !meta.is_dir() {
+        return Err(BrowseFailure::NotADirectory { path: protocol });
+    }
+    let read = std::fs::read_dir(path).map_err(|error| io_failure(error, &protocol))?;
+    let mut entries = Vec::new();
+    for item in read {
+        let Ok(item) = item else {
+            continue;
+        };
+        let name = item.file_name();
+        let name = name.to_string_lossy();
+        let kind = entry_kind(item.path().as_path());
+        let size = (kind == FileKind::File)
+            .then(|| item.metadata().ok().map(|meta| meta.len()))
+            .flatten();
+        if let Some(entry) = shellune_core::DirEntry::new(name.as_ref(), kind, size) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn entry_kind(path: &Path) -> FileKind {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return FileKind::Other;
+    };
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        FileKind::Symlink
+    } else if file_type.is_dir() {
+        FileKind::Directory
+    } else if file_type.is_file() {
+        FileKind::File
+    } else {
+        FileKind::Other
+    }
+}
+
+fn create_local_directory(directory: &str, name: &str) -> Result<(), BrowseFailure> {
+    let Some(parent) = local_protocol_to_os(directory) else {
+        return Err(BrowseFailure::Refused {
+            reason: "a drive list is not a folder".to_owned(),
+        });
+    };
+    let path = parent.join(name);
+    std::fs::create_dir(&path).map_err(|error| io_failure(error, &local_os_to_protocol(&path)))
+}
+
+fn rename_local(from: &str, to: &str) -> Result<(), BrowseFailure> {
+    let Some(from_path) = local_protocol_to_os(from) else {
+        return Err(BrowseFailure::NotFound {
+            path: from.to_owned(),
+        });
+    };
+    let Some(to_path) = local_protocol_to_os(to) else {
+        return Err(BrowseFailure::Refused {
+            reason: "the new name is not on this computer".to_owned(),
+        });
+    };
+    std::fs::rename(&from_path, &to_path).map_err(|error| io_failure(error, from))
+}
+
+fn delete_local(path: &str, kind: FileKind) -> Result<(), BrowseFailure> {
+    let Some(os_path) = local_protocol_to_os(path) else {
+        return Err(BrowseFailure::NotFound {
+            path: path.to_owned(),
+        });
+    };
+    let removed = match kind {
+        FileKind::Directory => std::fs::remove_dir_all(&os_path),
+        FileKind::File | FileKind::Symlink | FileKind::Other => std::fs::remove_file(&os_path),
+    };
+    removed.map_err(|error| io_failure(error, path))
+}
+
+#[cfg(windows)]
+fn windows_drives() -> Vec<shellune_core::DirEntry> {
+    (b'A'..=b'Z')
+        .filter_map(|letter| {
+            let root = format!("{}:\\", letter as char);
+            if std::path::Path::new(&root).is_dir() {
+                shellune_core::DirEntry::new(
+                    format!("{}:", letter as char),
+                    FileKind::Directory,
+                    None,
+                )
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn io_failure(error: std::io::Error, path: &str) -> BrowseFailure {
+    let path = path.to_owned();
+    match error.kind() {
+        std::io::ErrorKind::NotFound => BrowseFailure::NotFound { path },
+        std::io::ErrorKind::PermissionDenied => BrowseFailure::PermissionDenied { path },
+        std::io::ErrorKind::AlreadyExists => BrowseFailure::AlreadyExists { path },
+        std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::UnexpectedEof => BrowseFailure::ConnectionLost {
+            reason: error.to_string(),
+        },
+        _ => {
+            let raw = error.raw_os_error();
+            // ENOTDIR on Unix, ERROR_DIRECTORY on Windows.
+            if raw == Some(20) || raw == Some(267) {
+                return BrowseFailure::NotADirectory { path };
+            }
+            let text = error.to_string();
+            if text.to_lowercase().contains("not a directory") {
+                BrowseFailure::NotADirectory { path }
+            } else {
+                BrowseFailure::Refused { reason: text }
+            }
+        }
     }
 }
 /// The question the file view is asking before anything is sent (R11, R10).
@@ -309,6 +873,8 @@ pub enum FilesDialog {
     NewDirectory {
         /// The session whose directory it would go into.
         session: SessionId,
+        /// Which source the directory belongs to.
+        source: FileSource,
         /// What the user typed.
         text: String,
         /// Why the last attempt to send it was refused, when it was.
@@ -318,6 +884,8 @@ pub enum FilesDialog {
     Rename {
         /// The session whose directory holds the entry.
         session: SessionId,
+        /// Which source holds the entry.
+        source: FileSource,
         /// The entry as the listing named it.
         from: String,
         /// The name the user typed.
@@ -329,6 +897,8 @@ pub enum FilesDialog {
     Delete {
         /// The session whose directory holds the entry.
         session: SessionId,
+        /// Which source holds the entry.
+        source: FileSource,
         /// The entry as the listing named it.
         name: String,
         /// What the entry is, as the listing reported it.
@@ -344,6 +914,8 @@ pub enum FilesDialog {
     Upload {
         /// The session whose directory would receive the file.
         session: SessionId,
+        /// The source that would receive the file. An upload is always remote.
+        source: FileSource,
         /// The directory on screen, which is where the file would land.
         directory: String,
         /// The local path the user typed.
@@ -355,6 +927,8 @@ pub enum FilesDialog {
     Download {
         /// The session the entry belongs to.
         session: SessionId,
+        /// The source the entry is copied from. A download is always remote.
+        source: FileSource,
         /// The remote path of the entry.
         remote: String,
         /// The local directory the user typed.
@@ -374,6 +948,18 @@ impl FilesDialog {
             | Self::Delete { session, .. }
             | Self::Upload { session, .. }
             | Self::Download { session, .. } => *session,
+        }
+    }
+
+    /// The source this question would change.
+    #[must_use]
+    pub fn source(&self) -> FileSource {
+        match self {
+            Self::NewDirectory { source, .. }
+            | Self::Rename { source, .. }
+            | Self::Delete { source, .. }
+            | Self::Upload { source, .. }
+            | Self::Download { source, .. } => *source,
         }
     }
 
@@ -488,6 +1074,40 @@ pub fn problem_text(problem: &NameProblem, strings: &Strings) -> &'static str {
     }
 }
 
+/// What one source says about a directory it could not read.
+///
+/// The remote wording is the failure's own, which already names the server. The
+/// local wording must not say "server": a folder on this computer is a different
+/// object, and the two reasons have to stay distinguishable.
+#[must_use]
+pub fn browse_failure_text(
+    failure: &BrowseFailure,
+    source: FileSource,
+    strings: &Strings,
+) -> String {
+    if source == FileSource::Remote {
+        return failure.to_string();
+    }
+    let path = failure.path().unwrap_or("");
+    match failure {
+        BrowseFailure::Unavailable { reason } => {
+            format!("{} {reason}", strings.files_local_unavailable)
+        }
+        BrowseFailure::NotFound { .. } => format!("{} {path}", strings.files_local_not_found),
+        BrowseFailure::NotADirectory { .. } => {
+            format!("{} {path}", strings.files_local_not_directory)
+        }
+        BrowseFailure::PermissionDenied { .. } => {
+            format!("{} {path}", strings.files_local_denied)
+        }
+        BrowseFailure::AlreadyExists { .. } => format!("{} {path}", strings.files_local_exists),
+        BrowseFailure::ConnectionLost { reason } => {
+            format!("{} {reason}", strings.files_local_lost)
+        }
+        BrowseFailure::Refused { reason } => format!("{} {reason}", strings.files_local_refused),
+    }
+}
+
 /// What the view prints for one kind of entry, in the current language.
 #[must_use]
 pub fn kind_label(kind: FileKind, strings: &Strings) -> &'static str {
@@ -501,6 +1121,8 @@ pub fn kind_label(kind: FileKind, strings: &Strings) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
     use shellune_core::DirEntry;
 
@@ -909,5 +1531,341 @@ mod tests {
             Err(NameProblem::NoDirectory),
             "a forgotten session cannot be changed"
         );
+    }
+
+    /// A directory of this process, removed when the test returns.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "shellune-files-{}-{}",
+                std::process::id(),
+                SessionId::new()
+            ));
+            std::fs::create_dir_all(&path).expect("a temporary directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn opening_lists_both_sources_and_a_remote_failure_leaves_the_local_one() {
+        let session = SessionId::new();
+        let remote = FakeChannel::accepting();
+        remote.reply(1, "/home/deploy", &[("notes.txt", FileKind::File)]);
+        let local = FakeChannel::accepting();
+        local.reply(1, "/tmp/work", &[("local.txt", FileKind::File)]);
+        let mut views = FileViews::new();
+        views.attach(
+            session,
+            "web",
+            "deploy@10.0.0.7:22",
+            Box::new(remote.clone()),
+        );
+        views.attach_local_for_test(session, Box::new(local.clone()));
+        assert!(views.open(session), "the authenticated session opens files");
+        assert_eq!(
+            remote.requests(),
+            vec![BrowseRequest::Home { request: 1 }],
+            "opening asks the existing connection for its home directory and nothing else"
+        );
+        views.pump();
+        assert_eq!(
+            views.browser(session).and_then(FileBrowser::path),
+            Some("/home/deploy")
+        );
+        assert_eq!(
+            views
+                .browser_in(session, FileSource::Local)
+                .map(FileBrowser::owner),
+            views.browser(session).map(FileBrowser::owner),
+            "both columns belong to the session that was already authenticated"
+        );
+        assert_ne!(
+            views
+                .browser_in(session, FileSource::Local)
+                .map(FileBrowser::host),
+            views.browser(session).map(FileBrowser::host),
+            "the local machine is not labelled as the remote host"
+        );
+        assert_ne!(
+            views
+                .browser_in(session, FileSource::Local)
+                .and_then(FileBrowser::path),
+            views.browser(session).and_then(FileBrowser::path),
+            "the local path is not the remote path"
+        );
+        assert_eq!(views.shown(session), Some(FileSource::Remote));
+        assert!(views.show(session, FileSource::Local));
+        assert_eq!(
+            views.browser(session).and_then(FileBrowser::path),
+            Some("/home/deploy"),
+            "showing the local column does not retarget the remote one"
+        );
+
+        local.0.lock().expect("a free lock").answers.push(BrowseResponse::Failed {
+            request: 2,
+            failure: BrowseFailure::PermissionDenied {
+                path: "/tmp/secret".to_owned(),
+            },
+        });
+        assert!(views.list_at(session, FileSource::Local, "/tmp/secret"));
+        views.pump();
+        assert!(
+            views
+                .browser_in(session, FileSource::Local)
+                .and_then(|browser| browser.state().failure())
+                .is_some_and(|failure| matches!(failure, BrowseFailure::PermissionDenied { .. })),
+            "the local source reports the refusal"
+        );
+        assert_eq!(
+            views.browser(session).and_then(FileBrowser::path),
+            Some("/home/deploy"),
+            "a local refusal does not replace the remote listing"
+        );
+        assert!(views.browser(session).unwrap().state().listing().is_some());
+    }
+
+    #[test]
+    fn a_lost_remote_connection_does_not_clear_the_local_directory() {
+        let session = SessionId::new();
+        let remote = FakeChannel::closed();
+        let local = FakeChannel::accepting();
+        local.reply(1, "/tmp/work", &[("keep.txt", FileKind::File)]);
+        let mut views = FileViews::new();
+        views.attach(session, "web", "deploy@10.0.0.7:22", Box::new(remote));
+        views.attach_local_for_test(session, Box::new(local));
+        views.open(session);
+        views.pump();
+        assert!(
+            views
+                .browser(session)
+                .and_then(|browser| browser.state().failure())
+                .is_some_and(BrowseFailure::is_connection_lost),
+            "the remote source says the connection is gone"
+        );
+        assert_eq!(
+            views
+                .browser_in(session, FileSource::Local)
+                .and_then(FileBrowser::path),
+            Some("/tmp/work"),
+            "the local directory is still the one this computer listed"
+        );
+    }
+
+    #[test]
+    fn a_local_change_is_visible_only_after_the_directory_is_read_again() {
+        let session = SessionId::new();
+        let root = TempDir::new();
+        std::fs::write(root.path().join("notes.txt"), b"note").unwrap();
+        let protocol = local_os_to_protocol(root.path());
+        let remote = FakeChannel::accepting();
+        remote.reply(1, "/home/deploy", &[("server.txt", FileKind::File)]);
+        let mut views = FileViews::new();
+        views.attach(
+            session,
+            "web",
+            "deploy@10.0.0.7:22",
+            Box::new(remote.clone()),
+        );
+        views.open(session);
+        assert!(views.list_at(session, FileSource::Local, &protocol));
+        views.pump();
+        let names = |views: &FileViews| {
+            views
+                .browser_in(session, FileSource::Local)
+                .and_then(|browser| browser.state().listing())
+                .map(|listing| {
+                    listing
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.name().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(names(&views), vec!["notes.txt".to_owned()]);
+        assert!(
+            views
+                .browser(session)
+                .and_then(|browser| browser.state().listing())
+                .is_some_and(|listing| listing.entries()[0].name() == "server.txt"),
+            "the remote listing arrived on its own"
+        );
+
+        assert_eq!(
+            views.create_directory_in(session, FileSource::Local, "日志"),
+            Ok(())
+        );
+        assert_eq!(
+            names(&views),
+            vec!["notes.txt".to_owned()],
+            "the new folder is not shown before this computer lists the directory again"
+        );
+        // The change report and the following listing are two answers.
+        views.pump();
+        views.pump();
+        assert!(
+            names(&views).contains(&"日志".to_owned()),
+            "the refreshed listing is what the disk holds: {:?}",
+            names(&views)
+        );
+        assert!(root.path().join("日志").is_dir());
+
+        assert_eq!(
+            views.rename_in(session, FileSource::Local, "notes.txt", "说明.txt"),
+            Ok(())
+        );
+        views.pump();
+        views.pump();
+        assert!(names(&views).contains(&"说明.txt".to_owned()));
+        assert!(!root.path().join("notes.txt").exists());
+
+        assert_eq!(views.delete_in(session, FileSource::Local, "日志"), Ok(()));
+        views.pump();
+        views.pump();
+        assert!(
+            !names(&views).contains(&"日志".to_owned()),
+            "a deleted folder leaves the listing only after the refresh"
+        );
+        assert!(!root.path().join("日志").exists());
+        assert_eq!(
+            remote.requests().iter().filter(|request| !request.is_listing()).count(),
+            0,
+            "a local change is not sent to the server"
+        );
+    }
+
+    #[test]
+    fn an_empty_missing_or_non_directory_local_path_names_itself() {
+        let session = SessionId::new();
+        let root = TempDir::new();
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let file = root.path().join("plain.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let remote = FakeChannel::accepting();
+        remote.reply(1, "/home/deploy", &[("server.txt", FileKind::File)]);
+        let mut views = FileViews::new();
+        views.attach(session, "web", "deploy@10.0.0.7:22", Box::new(remote));
+        views.open(session);
+
+        assert!(views.list_at(
+            session,
+            FileSource::Local,
+            &local_os_to_protocol(&empty)
+        ));
+        views.pump();
+        assert!(
+            views
+                .browser_in(session, FileSource::Local)
+                .and_then(|browser| browser.state().listing())
+                .is_some_and(|listing| listing.is_empty()),
+            "an empty directory is empty, not a failure"
+        );
+
+        let missing = local_os_to_protocol(&root.path().join("no-such"));
+        assert!(views.list_at(session, FileSource::Local, &missing));
+        views.pump();
+        assert!(
+            matches!(
+                views
+                    .browser_in(session, FileSource::Local)
+                    .and_then(|browser| browser.state().failure()),
+                Some(BrowseFailure::NotFound { .. })
+            ),
+            "a path that is not there says so"
+        );
+        assert!(
+            views.browser(session).unwrap().state().listing().is_some(),
+            "the remote listing survives a missing local path"
+        );
+
+        assert!(views.list_at(
+            session,
+            FileSource::Local,
+            &local_os_to_protocol(&file)
+        ));
+        views.pump();
+        assert!(
+            matches!(
+                views
+                    .browser_in(session, FileSource::Local)
+                    .and_then(|browser| browser.state().failure()),
+                Some(BrowseFailure::NotADirectory { .. })
+            ),
+            "a file is not listed as a directory"
+        );
+    }
+
+    #[test]
+    fn a_permission_error_is_not_reported_as_a_missing_path() {
+        let failure = io_failure(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            "/secret",
+        );
+        assert!(
+            matches!(failure, BrowseFailure::PermissionDenied { .. }),
+            "permission and absence are different reasons: {failure:?}"
+        );
+        assert!(!failure.is_connection_lost());
+    }
+
+    #[test]
+    fn cancelling_is_a_property_of_the_question_not_of_a_request() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        listed_view(&channel);
+        let mut views = views(session, channel.clone());
+        views.open(session);
+        views.pump();
+        let sent = channel.requests().len();
+        // The dialog is what the window cancels. Building it and dropping it must
+        // not be representable as a request, which is why delete is not called here.
+        let dialog = FilesDialog::Delete {
+            session,
+            source: FileSource::Remote,
+            name: "docs".to_owned(),
+            kind: FileKind::Directory,
+            problem: None,
+        };
+        assert_eq!(dialog.source(), FileSource::Remote);
+        drop(dialog);
+        assert_eq!(channel.requests().len(), sent);
+    }
+
+    #[test]
+    fn windows_drive_paths_round_trip_without_becoming_posix_roots() {
+        use std::path::{Path, PathBuf};
+
+        if !cfg!(windows) {
+            let protocol = local_os_to_protocol(Path::new("/tmp/work"));
+            assert_eq!(protocol, "/tmp/work");
+            assert_eq!(
+                local_protocol_to_os("/tmp/work").unwrap(),
+                PathBuf::from("/tmp/work")
+            );
+            return;
+        }
+        let protocol = local_os_to_protocol(Path::new(r"C:\work\文档"));
+        assert_eq!(protocol, "/C:/work/文档");
+        assert_eq!(
+            local_protocol_to_os(&protocol).unwrap(),
+            PathBuf::from(r"C:\work\文档")
+        );
+        assert!(local_protocol_to_os("/").is_none());
+        let crumbs = path_crumbs("/C:/work");
+        assert_eq!(crumbs[0].path, "/");
+        assert_eq!(crumbs.last().unwrap().path, "/C:/work");
     }
 }

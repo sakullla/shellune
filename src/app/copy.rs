@@ -453,6 +453,44 @@ pub struct Strings {
     pub files_problem_missing: &'static str,
     /// Reason: the new name is the old one.
     pub files_problem_unchanged: &'static str,
+    /// Kind label of the local file column.
+    pub files_source_local: &'static str,
+    /// Kind label of the remote file column.
+    pub files_source_remote: &'static str,
+    /// Narrow-window button that shows the local column.
+    pub files_show_local: &'static str,
+    /// Narrow-window button that shows the remote column.
+    pub files_show_remote: &'static str,
+    /// Button that uploads one local file into the remote directory on screen.
+    pub files_to_remote: &'static str,
+    /// Button that downloads one remote file into the local directory on screen.
+    pub files_to_local: &'static str,
+    /// Said about a directory deleted on this computer, including its contents.
+    pub files_delete_recursive_local: &'static str,
+    /// Said about a file deleted on this computer.
+    pub files_delete_file_local: &'static str,
+    /// Said while a local change has not been listed again.
+    pub files_change_pending_local: &'static str,
+    /// Heading when this computer applied a change.
+    pub files_change_done_local: &'static str,
+    /// Heading when this computer did not apply every part of a change.
+    pub files_change_failed_local: &'static str,
+    /// Local failure: the path is not there. The path is appended.
+    pub files_local_not_found: &'static str,
+    /// Local failure: this account may not read the path. The path is appended.
+    pub files_local_denied: &'static str,
+    /// Local failure: the path is not a directory. The path is appended.
+    pub files_local_not_directory: &'static str,
+    /// Local failure: the disk or volume went away. The reason is appended.
+    pub files_local_lost: &'static str,
+    /// Local failure: the computer refused the request. The reason is appended.
+    pub files_local_refused: &'static str,
+    /// Local failure: the name is already taken. The path is appended.
+    pub files_local_exists: &'static str,
+    /// Local failure: the folder cannot be listed at all. The reason is appended.
+    pub files_local_unavailable: &'static str,
+    /// Label of the root breadcrumb on this computer.
+    pub files_local_root: &'static str,
     /// Heading of the transfer list of a session.
     pub transfers_heading: &'static str,
     /// Said when a session has no transfer yet.
@@ -954,7 +992,7 @@ pub static ENGLISH: Strings = Strings {
     files_empty: "This directory is empty.",
     files_unknown_path: "Waiting for the server",
     files_failed: "The directory could not be read",
-    files_terminal_note: "The terminal keeps running; only this file view is affected.",
+    files_terminal_note: "The terminal keeps running. Only this source is affected.",
     files_kind_directory: "Directory",
     files_kind_file: "File",
     files_kind_link: "Link",
@@ -983,6 +1021,25 @@ pub static ENGLISH: Strings = Strings {
     files_problem_taken: "An entry with that name already exists here.",
     files_problem_missing: "That entry is no longer in this directory.",
     files_problem_unchanged: "The name did not change.",
+    files_source_local: "Local",
+    files_source_remote: "Remote",
+    files_show_local: "Show local",
+    files_show_remote: "Show remote",
+    files_to_remote: "Upload to remote",
+    files_to_local: "Download to local",
+    files_delete_recursive_local: "This directory and everything inside it are deleted on this computer. This cannot be undone.",
+    files_delete_file_local: "This file is deleted on this computer. This cannot be undone.",
+    files_change_pending_local: "Waiting for this computer\u{2026}",
+    files_change_done_local: "This computer applied this change",
+    files_change_failed_local: "This computer did not apply every part of this change",
+    files_local_not_found: "This computer has no such path:",
+    files_local_denied: "This computer refused access to",
+    files_local_not_directory: "This path is not a directory:",
+    files_local_lost: "This computer could not be read:",
+    files_local_refused: "This computer refused the request:",
+    files_local_exists: "That name is already on this computer:",
+    files_local_unavailable: "This folder cannot be listed:",
+    files_local_root: "This computer",
     transfers_heading: "Transfers",
     transfers_empty: "Nothing is being moved for this session.",
     transfers_upload: "Upload",
@@ -1314,7 +1371,7 @@ pub static CHINESE: Strings = Strings {
     files_empty: "这个目录是空的。",
     files_unknown_path: "等待服务器返回",
     files_failed: "无法读取这个目录",
-    files_terminal_note: "终端仍在运行，只有这个文件视图受影响。",
+    files_terminal_note: "终端仍在运行，只有这个来源受影响。",
     files_kind_directory: "目录",
     files_kind_file: "文件",
     files_kind_link: "链接",
@@ -1343,6 +1400,25 @@ pub static CHINESE: Strings = Strings {
     files_problem_taken: "这里已经有同名条目。",
     files_problem_missing: "这个条目已不在当前目录中。",
     files_problem_unchanged: "名称没有变化。",
+    files_source_local: "本地",
+    files_source_remote: "远程",
+    files_show_local: "显示本地",
+    files_show_remote: "显示远程",
+    files_to_remote: "上传到远程",
+    files_to_local: "下载到本地",
+    files_delete_recursive_local: "这个目录及其中的全部内容都会从这台电脑删除，且无法撤销。",
+    files_delete_file_local: "这个文件会从这台电脑删除，且无法撤销。",
+    files_change_pending_local: "正在等待这台电脑\u{2026}",
+    files_change_done_local: "这台电脑已应用这次修改",
+    files_change_failed_local: "这台电脑没有完成这次修改的全部内容",
+    files_local_not_found: "这台电脑上没有这个路径：",
+    files_local_denied: "这台电脑拒绝访问",
+    files_local_not_directory: "这个路径不是目录：",
+    files_local_lost: "无法读取这台电脑：",
+    files_local_refused: "这台电脑拒绝了请求：",
+    files_local_exists: "这台电脑上已经有这个名称：",
+    files_local_unavailable: "无法列出这个文件夹：",
+    files_local_root: "这台电脑",
     transfers_heading: "传输",
     transfers_empty: "这个会话当前没有传输。",
     transfers_upload: "上传",
