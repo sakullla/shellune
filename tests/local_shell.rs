@@ -197,25 +197,32 @@ fn changing_directory_shows_the_new_path() {
     let Some(mut session) = Session::start() else {
         return;
     };
-    // Not canonicalised: on Windows that yields an extended-length path
-    // (\?C:...) that the shell never prints.
-    let expected = std::env::temp_dir()
-        .to_string_lossy()
-        .trim_end_matches(['/', '\\'])
-        .to_owned();
+    // A directory whose name the test chooses, so the check does not depend on how
+    // the shell spells the temporary folder: on the Windows CI runner the path Rust
+    // reports and the one PowerShell prints differ (short 8.3 name against long name),
+    // and canonicalising yields an extended-length path (\\?\C:...) no shell prints.
+    let name = format!("shellune-cd-{}", std::process::id());
+    let target = std::env::temp_dir().join(&name);
+    std::fs::create_dir_all(&target).expect("the test directory can be created");
+    let path = target.to_string_lossy().into_owned();
 
     if cfg!(windows) {
-        session.run("Set-Location $env:TEMP; (Get-Location).Path");
+        session.run(&format!("Set-Location '{path}'; (Get-Location).Path"));
     } else {
-        session.run("cd \"$TMPDIR\" 2>/dev/null || cd /tmp; pwd");
+        session.run(&format!("cd '{path}' && pwd"));
     }
+    // The command line names the directory once; the shell's answer is a second
+    // occurrence, so two mean the change really happened and was reported.
     let screen = session.wait_for("the new directory", |_snapshot, text| {
-        text.contains(expected.as_str()) || text.contains(&expected.replace('\\', "/"))
+        text.matches(name.as_str()).count() >= 2
     });
     assert!(
-        screen.contains(&expected) || screen.contains(&expected.replace('\\', "/")),
-        "the new directory was not reported: expected {expected} in\n{screen}"
+        screen.matches(name.as_str()).count() >= 2,
+        "the new directory was not reported: expected {name} in\n{screen}"
     );
+    // The shell may still be inside it (Windows refuses to remove it then); a left-over
+    // empty folder in the temporary directory is harmless.
+    let _ = std::fs::remove_dir(&target);
 }
 
 #[test]
