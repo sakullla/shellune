@@ -5,13 +5,11 @@ Usage:
     python3 packaging/macos/make-app-bundle.py --binary <path to shellune> \
         [--version 0.1.0] [--out dist]
 
-The script only lays out the bundle; it does not sign or notarise it. Signing needs
-an Apple Developer ID certificate and is done in CI (see
-.github/workflows/release.yml) or by hand:
+The script only lays out the bundle; it does not sign it. Releases are signed in CI
+with a fixed self-signed certificate (see .github/workflows/release.yml and
+packaging/README.md), or by hand:
 
-    codesign --force --options runtime --sign "Developer ID Application: ..." Shellune.app
-    xcrun notarytool submit Shellune-<version>-macos-arm64.zip --wait ...
-    xcrun stapler staple Shellune.app
+    codesign --force --options runtime --sign "<identity>" Shellune.app
 
 This file has never been executed: the verification machine is Windows, so the
 macOS bundle is scaffolding and the release notes say it is unverified.
@@ -67,7 +65,7 @@ def main():
         plistlib.dump(info, f)
 
     print("bundle: " + app)
-    print("note:   unsigned and unnotarised")
+    print("note:   unsigned; release builds are signed in CI")
 
 
 if __name__ == "__main__":

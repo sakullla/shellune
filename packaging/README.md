@@ -21,17 +21,18 @@ The path to the produced binary is `$CARGO_TARGET_DIR/release/shellune` (or
 
 ## Signing and notarisation state
 
-**Nothing in this repository is signed.** No code-signing certificate, no Apple
-Developer ID and no notarisation credentials are available to this project, so the
-artifacts are unsigned unless the person packaging them supplies a certificate:
-
 - Windows: the portable zip contains an unsigned `shellune.exe`; SmartScreen shows
   the usual "unknown publisher" prompt. The NSIS script accepts
   `/DSIGNTOOL=...` and code-signs the installer only when `signtool` is provided.
-- macOS: the bundle is unsigned and unnotarised. Gatekeeper blocks it until the user
-  allows it, or until a Developer ID certificate is used (`codesign` +
-  `notarytool`, wired in `.github/workflows/release.yml` but skipped unless the
-  signing secrets exist).
+- macOS: the release workflow signs `Shellune.app` with a **fixed self-signed
+  certificate**, so every release carries the same signer and macOS keeps the
+  keychain and privacy permissions granted to an earlier version. The certificate
+  lives in the repository secrets `APPLE_CERTIFICATE` (base64 `.p12`),
+  `APPLE_CERTIFICATE_PASSWORD` and `APPLE_SIGNING_IDENTITY` (the certificate's
+  common name); a release without them fails instead of shipping an ad-hoc
+  signature. The bundle is **not notarised**: on first launch Gatekeeper asks the
+  user to allow it (right-click → Open, or System Settings → Privacy & Security).
+  Replacing the certificate changes the signer, and users are asked again once.
 - Linux: no signature at all; a tarball has no signing step.
 
 ## What the scripts refuse to do
