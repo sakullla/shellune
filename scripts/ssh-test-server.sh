@@ -52,6 +52,12 @@ AllowUsers $TEST_USER
 StrictModes no
 PrintMotd no
 PrintLastLog no
+# Jump tests open direct-tcpip through this server. Forwarding is explicit so a
+# distro default cannot turn a two-hop connection into a refusal.
+AllowTcpForwarding yes
+PermitOpen any
+MaxSessions 50
+MaxStartups 50:30:200
 # A test deliberately tries a wrong password and then the right key on the same
 # host. OpenSSH's per-source penalty would otherwise reject the second attempt for
 # a few seconds, which would look like a broken retry instead of rate limiting.
@@ -104,9 +110,26 @@ start() {
     return 1
 }
 
+# The listener and every session it forked. Killing only the pid file leaves
+# those sessions running, so a jump test would not see the hop drop.
+kill_descendants() {
+    local pid="$1"
+    local child
+    local children
+    children="$(ps -o pid= --ppid "$pid" 2>/dev/null || true)"
+    for child in $children; do
+        kill_descendants "$child"
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
 stop() {
     if [ -f "$WORK/sshd.pid" ]; then
-        kill "$(cat "$WORK/sshd.pid")" 2>/dev/null || true
+        local pid
+        pid="$(cat "$WORK/sshd.pid" 2>/dev/null || true)"
+        if [ -n "${pid:-}" ]; then
+            kill_descendants "$pid"
+        fi
         rm -f "$WORK/sshd.pid"
     fi
 }

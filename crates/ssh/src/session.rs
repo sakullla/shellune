@@ -100,7 +100,7 @@ pub enum TrustAnswer {
 /// deadline only applies during the first: everything after it is the user's work or
 /// the consequence of the user's decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HandshakeStage {
+pub(crate) enum HandshakeStage {
     /// TCP and the key exchange, before anything is asked of the user.
     Machine = 0,
     /// The identity question is on its way to the user; no deadline applies.
@@ -114,12 +114,12 @@ enum HandshakeStage {
 /// The handler runs inside the connect future the deadline wraps, so it can only
 /// report progress through a value like this one.
 #[derive(Debug, Default)]
-struct HandshakeProgress {
+pub(crate) struct HandshakeProgress {
     stage: AtomicU8,
 }
 
 impl HandshakeProgress {
-    fn stage(&self) -> HandshakeStage {
+    pub(crate) fn stage(&self) -> HandshakeStage {
         match self.stage.load(Ordering::SeqCst) {
             1 => HandshakeStage::WaitingForUser,
             2 => HandshakeStage::UserDecided,
@@ -127,7 +127,7 @@ impl HandshakeProgress {
         }
     }
 
-    fn set(&self, stage: HandshakeStage) {
+    pub(crate) fn set(&self, stage: HandshakeStage) {
         self.stage.store(stage as u8, Ordering::SeqCst);
     }
 }
@@ -604,8 +604,8 @@ async fn connect_and_shell(
 /// That is a statement about the server's configuration and not about the shell, so
 /// it is reported as its own kind of failure: the terminal keeps running, and the
 /// file view says the server has no SFTP instead of claiming the session ended.
-async fn open_sftp_channel(
-    handle: &client::Handle<ClientHandler>,
+pub(crate) async fn open_sftp_channel<H: client::Handler>(
+    handle: &client::Handle<H>,
 ) -> Result<Channel<client::Msg>, ChannelFailure> {
     let channel = handle
         .channel_open_session()
@@ -628,7 +628,7 @@ async fn open_sftp_channel(
 }
 
 /// Why a dial stopped before it produced a connected handle.
-enum DialFailure {
+pub(crate) enum DialFailure {
     /// The machine part of the handshake did not finish before the deadline.
     Timeout,
     /// The attempt ended with an error, which the handler may describe better.
@@ -649,7 +649,24 @@ async fn dial<A: tokio::net::ToSocketAddrs>(
     progress: &HandshakeProgress,
     timeout: Duration,
 ) -> Result<client::Handle<ClientHandler>, DialFailure> {
-    let mut connecting = Box::pin(client::connect(config, addrs, handler));
+    finish_dial(client::connect(config, addrs, handler), progress, timeout).await
+}
+
+/// Runs a handshake future with the same deadline rules as a direct TCP dial.
+///
+/// The chain uses this for a stream that is already open — a jump channel or a
+/// confirmed ProxyCommand — so the deadline still stops when the user is asked
+/// about an identity and still does not apply to that decision.
+pub(crate) async fn finish_dial<H, F>(
+    connecting: F,
+    progress: &HandshakeProgress,
+    timeout: Duration,
+) -> Result<client::Handle<H>, DialFailure>
+where
+    H: client::Handler,
+    F: std::future::Future<Output = Result<client::Handle<H>, ConnectError>>,
+{
+    let mut connecting = Box::pin(connecting);
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
@@ -677,7 +694,7 @@ async fn dial<A: tokio::net::ToSocketAddrs>(
 }
 
 /// The credentials of one attempt, resolved before the handshake starts.
-enum Material {
+pub(crate) enum Material {
     Password(shellune_core::SecretString),
     Key(Arc<russh::keys::PrivateKey>),
     Agent {
@@ -687,7 +704,7 @@ enum Material {
 }
 
 impl Material {
-    async fn resolve(auth: AuthMethod) -> Result<Self, ConnectError> {
+    pub(crate) async fn resolve(auth: AuthMethod) -> Result<Self, ConnectError> {
         match auth {
             AuthMethod::Password { password } => Ok(Self::Password(password)),
             AuthMethod::KeyFile { path, passphrase } => {
@@ -703,8 +720,8 @@ impl Material {
 }
 
 /// Tries the one authentication method the attempt chose.
-async fn authenticate(
-    handle: &mut client::Handle<ClientHandler>,
+pub(crate) async fn authenticate<H: client::Handler>(
+    handle: &mut client::Handle<H>,
     user: &str,
     material: Material,
 ) -> Result<(), ConnectError> {
@@ -764,8 +781,8 @@ async fn authenticate(
 }
 
 /// The RSA hash algorithm the server supports, which is None for other key types.
-async fn rsa_hash_alg(
-    handle: &client::Handle<ClientHandler>,
+async fn rsa_hash_alg<H: client::Handler>(
+    handle: &client::Handle<H>,
     key: &russh::keys::PrivateKey,
 ) -> Option<HashAlg> {
     if !matches!(key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {

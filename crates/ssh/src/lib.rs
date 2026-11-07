@@ -10,18 +10,24 @@
 //!   user compares;
 //! * [auth] reads a private key file, decrypting it when a passphrase was given;
 //! * [agent] reaches SSH_AUTH_SOCK, the Windows OpenSSH pipe or Pageant;
-//! * [session] runs the attempt and the remote shell;
+//! * [session] runs one direct attempt and the remote shell;
+//! * [chain] runs an ordered jump chain, one trust decision and one confirmed
+//!   ProxyCommand per hop, and cleans up from the far end when a hop fails;
+//! * [transport] is the byte pipe a direct socket, a jump channel and a
+//!   ProxyCommand all become after the chain has decided to open them;
 //! * [sftp] browses directories over the connection the shell already authenticated;
 //! * [transfer] moves file contents over that same connection, under a temporary name;
 //! * [error] keeps every failure free of credentials.
 
 pub mod agent;
 pub mod auth;
+mod chain;
 pub mod error;
 pub mod hostkey;
 pub mod session;
 pub mod sftp;
 pub mod transfer;
+mod transport;
 
 /// A disposable OpenSSH server, for the tests that need a real one.
 #[cfg(any(test, feature = "test-support"))]
@@ -31,7 +37,8 @@ pub mod testserver;
 #[cfg(feature = "test-support")]
 pub use session::ScriptedSession;
 
-pub use error::ConnectError;
+pub use chain::{ChainEvent, ChainRequest, ChainSession, HopAuth};
+pub use error::{ChainFailure, ConnectError, HopLocation};
 pub use hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 pub use session::{
     CONNECT_TIMEOUT, ConnectRequest, PtySize, RemoteEvent, RemoteSession, TERM_VALUE, TrustAnswer,

@@ -9,6 +9,10 @@
 //! How the server is provided differs by host, and the difference is printed rather
 //! than hidden: on Windows the harness starts OpenSSH inside WSL, and anywhere else
 //! it reports that it cannot run instead of pretending the tests passed.
+//!
+//! The disposable server allows TCP forwarding, so a jump test can open a
+//! direct-tcpip channel through it. Starting, stopping or rotating the server
+//! never runs a ProxyCommand.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -228,6 +232,10 @@ runuser -u '{user}' -- bash '{file}'",
              StrictModes no\n\
              PrintMotd no\n\
              PrintLastLog no\n\
+             AllowTcpForwarding yes\n\
+             PermitOpen any\n\
+             MaxSessions 50\n\
+             MaxStartups 50:30:200\n\
              PerSourcePenalties no\n\
              LogLevel VERBOSE\n",
             self.user

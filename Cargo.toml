@@ -78,7 +78,7 @@ sha2 = "0.10.9"
 thiserror = "2.0.12"
 # "fs" is for the transfer tasks: they read and write local files in fixed chunks
 # beside the socket work instead of blocking the SSH runtime on a file system call.
-tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
 zeroize = "1.8.1"
 

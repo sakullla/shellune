@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use shellune_core::{AgentKind, SecurityError, SessionFailure};
+use shellune_core::{AgentKind, HostId, SecurityError, SessionFailure};
 
 use crate::hostkey::PresentedKey;
 
@@ -368,6 +368,154 @@ impl fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
+/// Which hop of a jump chain an event or a failure belongs to.
+///
+/// The id is the saved host, and the address and port are the ones the trust
+/// record must use. A later hop never borrows the target's identity: the prompt
+/// and the failure name this hop even when the user asked to reach something
+/// beyond it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HopLocation {
+    /// Saved host this hop is.
+    pub host_id: HostId,
+    /// Zero-based position in the resolved chain. The target is last.
+    pub index: usize,
+    /// Display name of the host.
+    pub name: String,
+    /// Address that was dialled, not the display name.
+    pub address: String,
+    /// TCP port that was dialled.
+    pub port: u16,
+    /// Login user for this hop.
+    pub user: String,
+}
+
+impl HopLocation {
+    /// `user@address:port`, the form the single-hop errors already use.
+    #[must_use]
+    pub fn target(&self) -> String {
+        format!("{}@{}:{}", self.user, self.address, self.port)
+    }
+
+    /// One-based hop number, for a message a person reads.
+    #[must_use]
+    pub fn number(&self) -> usize {
+        self.index + 1
+    }
+}
+
+impl fmt::Display for HopLocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "hop {} \"{}\" ({})",
+            self.number(),
+            self.name,
+            self.target()
+        )
+    }
+}
+
+/// Why a jump chain stopped.
+///
+/// A refusal that happens before dialling has no hop socket and no child process.
+/// A hop failure names that hop and carries the same credential-free error a direct
+/// connection would. Cancelling and refusing a ProxyCommand are their own cases so
+/// they cannot be read as a server that rejected a password.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainFailure {
+    /// The chain was refused before any socket or process existed.
+    NotDialed {
+        /// The host the attempt was aimed at.
+        host_id: HostId,
+        /// What to change. Never includes a secret.
+        message: String,
+    },
+    /// One hop failed. Later hops are not left running.
+    ///
+    /// The hop and the transport error are boxed so a `Result` can carry this
+    /// failure without moving a large enum through every dial step.
+    Hop {
+        /// The hop that failed.
+        hop: Box<HopLocation>,
+        /// What failed, without credentials.
+        error: Box<ConnectError>,
+    },
+    /// The attempt was cancelled. Child processes are stopped.
+    Cancelled {
+        /// The hop that was in progress, when one was.
+        hop: Option<Box<HopLocation>>,
+    },
+    /// A ProxyCommand was shown and not confirmed, so it was not started.
+    ProxyNotConfirmed {
+        /// The hop whose command was refused.
+        hop: Box<HopLocation>,
+        /// The expanded command that was not run.
+        command: String,
+    },
+}
+
+impl ChainFailure {
+    /// The hop a person should look at, when the failure has one.
+    #[must_use]
+    pub fn hop(&self) -> Option<&HopLocation> {
+        match self {
+            Self::Hop { hop, .. } | Self::ProxyNotConfirmed { hop, .. } => Some(hop.as_ref()),
+            Self::Cancelled { hop } => hop.as_deref(),
+            Self::NotDialed { .. } => None,
+        }
+    }
+
+    /// The transport error, when this failure is one hop's connection error.
+    #[must_use]
+    pub fn connect_error(&self) -> Option<&ConnectError> {
+        match self {
+            Self::Hop { error, .. } => Some(error.as_ref()),
+            Self::NotDialed { .. } | Self::Cancelled { .. } | Self::ProxyNotConfirmed { .. } => {
+                None
+            }
+        }
+    }
+
+    /// The session failure that records this problem.
+    #[must_use]
+    pub fn session_failure(&self) -> SessionFailure {
+        match self {
+            Self::Hop { error, .. } => error.session_failure(),
+            Self::NotDialed { message, .. } => SessionFailure::ConnectionFailed {
+                reason: message.clone(),
+            },
+            Self::Cancelled { .. } | Self::ProxyNotConfirmed { .. } => {
+                SessionFailure::ConnectionFailed {
+                    reason: self.to_string(),
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for ChainFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDialed { message, .. } => formatter.write_str(message),
+            Self::Hop { hop, error } => write!(formatter, "{hop} failed: {error}"),
+            Self::Cancelled { hop: Some(hop) } => write!(
+                formatter,
+                "the attempt was cancelled while connecting to {hop}"
+            ),
+            Self::Cancelled { hop: None } => {
+                formatter.write_str("the attempt was cancelled before a connection was opened")
+            }
+            Self::ProxyNotConfirmed { hop, command } => write!(
+                formatter,
+                "the ProxyCommand for {hop} was not confirmed, so it was not run: {command}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChainFailure {}
+
 /// The transport error type the SSH client needs for its handler.
 ///
 /// The library requires From<russh::Error>, and every transport error that reaches
@@ -467,6 +615,38 @@ mod tests {
             Some(SecurityError::PassphraseRequired { .. })
         ));
         assert!(error.next_step().contains("passphrase"));
+    }
+
+    #[test]
+    fn a_chain_failure_names_its_hop_and_not_a_secret() {
+        let hop = HopLocation {
+            host_id: shellune_core::HostId::new(),
+            index: 1,
+            name: "web".to_owned(),
+            address: "10.0.0.8".to_owned(),
+            port: 22,
+            user: "deploy".to_owned(),
+        };
+        let failure = ChainFailure::Hop {
+            hop: Box::new(hop.clone()),
+            error: Box::new(ConnectError::AuthRejected),
+        };
+        let text = format!("{failure} {failure:?}");
+        assert!(text.contains("hop 2"));
+        assert!(text.contains("web"));
+        assert!(text.contains("deploy@10.0.0.8:22"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert_eq!(
+            failure.session_failure(),
+            SessionFailure::AuthenticationFailed
+        );
+
+        let refused = ChainFailure::ProxyNotConfirmed {
+            hop: Box::new(hop),
+            command: "nc 10.0.0.8 22".to_owned(),
+        };
+        assert!(refused.to_string().contains("was not run"));
+        assert!(refused.connect_error().is_none());
     }
 
     #[test]
