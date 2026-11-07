@@ -732,6 +732,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             files_unknown_path,
             files_failed,
             files_terminal_note,
+            files_refresh_source,
             files_source_local,
             files_source_remote,
             files_show_local,
@@ -6861,7 +6862,19 @@ async fn an_empty_or_failed_source_leaves_the_other_source_and_the_terminal(
     );
     pump_files(cx, &view);
     assert!(cx.debug_bounds("files.failure").is_some());
-    assert!(cx.debug_bounds("files.failure.reconnect").is_some());
+    assert!(
+        cx.debug_bounds("files.failure.reconnect").is_none(),
+        "a connected session does not offer a reconnect that cannot start"
+    );
+    assert!(
+        cx.debug_bounds("files.failure.refresh").is_some(),
+        "refresh stays available for this source"
+    );
+    assert!(cx.debug_bounds("files.failure.up").is_some());
+    assert!(
+        cx.debug_bounds("files.failure.refresh.hint").is_some(),
+        "the card says to refresh this source instead of reconnecting the session"
+    );
     assert!(
         cx.update(|_window, app| {
             view.read(app)
@@ -6871,8 +6884,28 @@ async fn an_empty_or_failed_source_leaves_the_other_source_and_the_terminal(
         }),
         "the remote disconnect does not replace the local failure"
     );
+    let before = remote.requests().len();
+    click(cx, "files.failure.refresh");
+    assert!(
+        matches!(
+            remote.requests().last(),
+            Some(shellune_core::BrowseRequest::List { .. })
+        ),
+        "refresh asks this source to list again: {:?}",
+        remote.requests()
+    );
+    assert_eq!(remote.requests().len(), before + 1);
     assert_eq!(session_state(cx, &view, id), Some(SessionState::Connected));
     assert!(cx.debug_bounds("terminal.failure").is_none());
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_local_browser(id)
+                .and_then(|browser| browser.state().failure())
+                .is_some_and(|failure| matches!(failure, shellune_core::BrowseFailure::NotFound { .. }))
+        }),
+        "refreshing the remote source leaves the local failure as it was"
+    );
 }
 
 // ---------------------------------------------------------------------------

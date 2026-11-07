@@ -397,6 +397,10 @@ pub struct Strings {
     pub files_failed: &'static str,
     /// Said beside a file view failure, so the terminal is not read as failed too.
     pub files_terminal_note: &'static str,
+    /// Said when this file source failed and the terminal is still connected.
+    ///
+    /// Refresh is the recovery: the session is not ended, so reconnect would do nothing.
+    pub files_refresh_source: &'static str,
     /// Kind label of a directory entry.
     pub files_kind_directory: &'static str,
     /// Kind label of a file entry.
@@ -993,6 +997,7 @@ pub static ENGLISH: Strings = Strings {
     files_unknown_path: "Waiting for the server",
     files_failed: "The directory could not be read",
     files_terminal_note: "The terminal keeps running. Only this source is affected.",
+    files_refresh_source: "Refresh reads this source again. The terminal stays connected.",
     files_kind_directory: "Directory",
     files_kind_file: "File",
     files_kind_link: "Link",
@@ -1372,6 +1377,7 @@ pub static CHINESE: Strings = Strings {
     files_unknown_path: "等待服务器返回",
     files_failed: "无法读取这个目录",
     files_terminal_note: "终端仍在运行，只有这个来源受影响。",
+    files_refresh_source: "刷新会重新读取这个来源，终端保持连接。",
     files_kind_directory: "目录",
     files_kind_file: "文件",
     files_kind_link: "链接",

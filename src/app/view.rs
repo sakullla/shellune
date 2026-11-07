@@ -7680,9 +7680,10 @@ impl ShelluneView {
 
     /// Why one source could not be read, and the action that source can still take.
     ///
-    /// Refresh and going up stay on this source. Reconnect is only offered when the
-    /// remote connection itself is gone: a local disk has no SSH session to restart,
-    /// and neither failure closes the terminal.
+    /// Refresh and going up stay on this source. A session reconnect is drawn only
+    /// when that session can actually start again. A file channel that failed while
+    /// the terminal is still connected is retried with Refresh, and neither failure
+    /// closes the terminal.
     fn files_failure(
         &self,
         id: SessionId,
@@ -7718,7 +7719,10 @@ impl ShelluneView {
                 cx,
                 move |view, cx| view.files_up(id, source, cx),
             ));
-        if failure.is_connection_lost() && source == FileSource::Remote {
+        let session_can_restart = failure.is_connection_lost()
+            && source == FileSource::Remote
+            && self.workspace.session(id).is_some_and(may_reconnect);
+        if session_can_restart {
             actions = actions.child(self.text_button(
                 reconnect_id,
                 strings.session_reconnect,
@@ -7727,7 +7731,7 @@ impl ShelluneView {
                 move |view, cx| view.reconnect_session(id, cx),
             ));
         }
-        div()
+        let mut card = div()
             .flex()
             .flex_col()
             .flex_none()
@@ -7758,7 +7762,23 @@ impl ShelluneView {
                     .debug_selector(move || note_id.to_string())
                     .child(SharedString::from(strings.files_terminal_note)),
             )
-            .child(actions)
+            .child(actions);
+        // The terminal still owns the connection, so Refresh is the action that
+        // reads this source again. A session reconnect button would return immediately.
+        if failure.is_connection_lost()
+            && source == FileSource::Remote
+            && !self.workspace.session(id).is_some_and(may_reconnect)
+        {
+            let hint_id = files_element_id(source, "failure.refresh.hint");
+            card = card.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(move || hint_id.to_string())
+                    .child(SharedString::from(strings.files_refresh_source)),
+            );
+        }
+        card
     }
 
     /// One file column: the source it is, the path it shows and the entries of that source.

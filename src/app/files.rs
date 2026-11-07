@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use shellune_core::{
     BrowseFailure, BrowseRequest, BrowseResponse, FileBrowser, FileKind, MutationAction,
-    MutationOutcome, MutationStep, NameProblem, SessionId, join_path, normalize_path,
+    MutationOutcome, MutationStep, NameProblem, SessionId, join_path, normalize_path, parent_path,
 };
 use shellune_ssh::FileLink;
 
@@ -775,27 +775,92 @@ fn entry_kind(path: &Path) -> FileKind {
 }
 
 fn create_local_directory(directory: &str, name: &str) -> Result<(), BrowseFailure> {
+    // The name is judged before the parent is joined. On Windows `Path::join`
+    // treats `..\outside`, `D:\abs` and `\Windows\...` as paths outside the parent,
+    // and a later create_dir would write there.
+    if !is_single_local_name(name) {
+        return Err(name_leaves_directory());
+    }
     let Some(parent) = local_protocol_to_os(directory) else {
         return Err(BrowseFailure::Refused {
             reason: "a drive list is not a folder".to_owned(),
         });
     };
-    let path = parent.join(name);
+    let path = local_child_path(&parent, name)?;
     std::fs::create_dir(&path).map_err(|error| io_failure(error, &local_os_to_protocol(&path)))
 }
 
 fn rename_local(from: &str, to: &str) -> Result<(), BrowseFailure> {
+    let leaf = confined_leaf(to)?;
+    if parent_path(from) != parent_path(to) {
+        return Err(name_leaves_directory());
+    }
     let Some(from_path) = local_protocol_to_os(from) else {
         return Err(BrowseFailure::NotFound {
             path: from.to_owned(),
         });
     };
-    let Some(to_path) = local_protocol_to_os(to) else {
-        return Err(BrowseFailure::Refused {
-            reason: "the new name is not on this computer".to_owned(),
-        });
+    let Some(parent) = from_path.parent() else {
+        return Err(name_leaves_directory());
     };
+    let to_path = local_child_path(parent, leaf)?;
     std::fs::rename(&from_path, &to_path).map_err(|error| io_failure(error, from))
+}
+
+/// A local entry name that stays one component of the directory it was typed in.
+///
+/// Slashes, backslashes and drive prefixes are rejected here, not in the shared
+/// POSIX name check: a remote file may contain a backslash, and `Path::join` only
+/// escapes on this computer.
+fn is_single_local_name(name: &str) -> bool {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    let mut bytes = name.chars();
+    if bytes
+        .next()
+        .is_some_and(|letter| letter.is_ascii_alphabetic())
+        && bytes.next() == Some(':')
+    {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    match components.next() {
+        Some(std::path::Component::Normal(part)) => {
+            components.next().is_none() && part == std::ffi::OsStr::new(name)
+        }
+        _ => false,
+    }
+}
+
+/// The last segment of a protocol path, when that segment cannot leave its directory.
+fn confined_leaf(path: &str) -> Result<&str, BrowseFailure> {
+    let trimmed = path.trim_end_matches('/');
+    let leaf = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if is_single_local_name(leaf) {
+        Ok(leaf)
+    } else {
+        Err(name_leaves_directory())
+    }
+}
+
+/// `parent` plus one confined name. The name is checked again so a join cannot run first.
+fn local_child_path(parent: &Path, name: &str) -> Result<PathBuf, BrowseFailure> {
+    if !is_single_local_name(name) {
+        return Err(name_leaves_directory());
+    }
+    let mut path = parent.to_path_buf();
+    path.push(name);
+    if path.parent() != Some(parent) || path.file_name() != Some(std::ffi::OsStr::new(name)) {
+        return Err(name_leaves_directory());
+    }
+    Ok(path)
+}
+
+fn name_leaves_directory() -> BrowseFailure {
+    BrowseFailure::Refused {
+        reason: "the name leaves this directory".to_owned(),
+    }
 }
 
 fn delete_local(path: &str, kind: FileKind) -> Result<(), BrowseFailure> {
@@ -1842,6 +1907,57 @@ mod tests {
         assert_eq!(dialog.source(), FileSource::Remote);
         drop(dialog);
         assert_eq!(channel.requests().len(), sent);
+    }
+
+    #[test]
+    fn a_local_name_that_would_escape_is_refused_before_the_filesystem_is_touched() {
+        let root = TempDir::new();
+        let work = root.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(work.join("inside")).unwrap();
+        let directory = local_os_to_protocol(&work);
+        let from = join_path(&directory, "inside");
+        // The shared POSIX check still allows a backslash: a remote name may contain one.
+        assert!(shellune_core::check_name(r"..\outside").is_ok());
+        let escapes = [r"..\outside", r"D:\abs", r"\Windows\shellune-escape"];
+        for name in escapes {
+            let created = create_local_directory(&directory, name);
+            assert!(
+                matches!(
+                    &created,
+                    Err(BrowseFailure::Refused { reason })
+                        if reason == "the name leaves this directory"
+                ),
+                "{name} must be refused before create_dir, got {created:?}"
+            );
+            let renamed = rename_local(&from, &join_path(&directory, name));
+            assert!(
+                matches!(
+                    &renamed,
+                    Err(BrowseFailure::Refused { reason })
+                        if reason == "the name leaves this directory"
+                ),
+                "{name} must be refused before rename, got {renamed:?}"
+            );
+        }
+        assert!(
+            work.join("inside").is_dir(),
+            "the entry that would have been renamed is still in this directory"
+        );
+        assert!(
+            !root.path().join("outside").exists(),
+            "a parent-relative name must not be created beside the open directory"
+        );
+        let children: Vec<_> = std::fs::read_dir(&work)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(children, vec!["inside".to_owned()]);
+        assert!(create_local_directory(&directory, "日志").is_ok());
+        assert!(work.join("日志").is_dir());
+        assert!(rename_local(&join_path(&directory, "日志"), &join_path(&directory, "说明")).is_ok());
+        assert!(work.join("说明").is_dir());
+        assert!(!work.join("日志").exists());
     }
 
     #[test]
