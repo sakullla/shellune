@@ -239,6 +239,10 @@ pub struct ShelluneView {
     session_terminal: bool,
     /// Whether the sidebar is collapsed to its icons.
     rail_collapsed: bool,
+    /// What the user chose for the palette.
+    theme_choice: theme::ThemeChoice,
+    /// Whether the window already tells this view when the system palette changes.
+    watching_appearance: bool,
     /// Whether the host dialog's first field takes the keyboard on the next draw.
     focus_host_dialog: bool,
     /// The session row whose menu is open, and where it was opened.
@@ -386,6 +390,8 @@ impl ShelluneView {
             session_menu: None,
             focus_host_dialog: false,
             rail_collapsed: false,
+            theme_choice: theme::ThemeChoice::default(),
+            watching_appearance: false,
             session_terminal: false,
             #[cfg(test)]
             scripted: None,
@@ -3915,6 +3921,20 @@ impl ShelluneView {
                             .h(px(1.0))
                             .bg(theme::swatch(palette::BORDER)),
                     )
+                    .child(
+                        self.rail_control(
+                            self.theme_icon(),
+                            strings.theme_control,
+                            self.theme_label(),
+                        )
+                        .id("theme.control")
+                        .debug_selector(|| "theme.control".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.cycle_theme(cx);
+                            },
+                        )),
+                    )
                     // The language control is clickable because the shortcut it
                     // duplicates cannot be: inside a terminal Ctrl+L is the shell's key.
                     .child(
@@ -4030,6 +4050,47 @@ impl ShelluneView {
             ))
     }
 
+    /// Steps the theme: system, light, dark.
+    pub fn cycle_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme_choice = self.theme_choice.next();
+        self.repaint_terminals(cx);
+        cx.notify();
+    }
+
+    /// The theme the user chose.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn theme_choice(&self) -> theme::ThemeChoice {
+        self.theme_choice
+    }
+
+    /// Asks every terminal to draw again, so a new palette reaches the ones that are
+    /// not on screen too.
+    fn repaint_terminals(&self, cx: &mut Context<Self>) {
+        for open in &self.panes {
+            open.pane.update(cx, |_pane, cx| cx.notify());
+        }
+    }
+
+    /// The name of the current theme choice.
+    fn theme_label(&self) -> &'static str {
+        let strings = self.strings();
+        match self.theme_choice {
+            theme::ThemeChoice::System => strings.theme_system,
+            theme::ThemeChoice::Light => strings.theme_light,
+            theme::ThemeChoice::Dark => strings.theme_dark,
+        }
+    }
+
+    /// The icon of the current theme choice.
+    fn theme_icon(&self) -> Icon {
+        match self.theme_choice {
+            theme::ThemeChoice::System => Icon::Monitor,
+            theme::ThemeChoice::Light => Icon::Sun,
+            theme::ThemeChoice::Dark => Icon::Moon,
+        }
+    }
+
     /// Collapses the sidebar to its icons, or expands it again.
     pub fn toggle_rail(&mut self, cx: &mut Context<Self>) {
         self.rail_collapsed = !self.rail_collapsed;
@@ -4129,6 +4190,18 @@ impl ShelluneView {
                     .gap(metrics.scale(2.0))
                     .pb(metrics.scale(spacing::SNUG))
                     .mt_auto()
+                    .child(
+                        square(
+                            self.theme_icon(),
+                            "theme.control",
+                            format!("{} · {}", strings.theme_control, self.theme_label()),
+                        )
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.cycle_theme(cx);
+                            },
+                        )),
+                    )
                     .child(
                         square(
                             Icon::Globe,
@@ -7026,6 +7099,29 @@ impl Render for ShelluneView {
         // Small views that are not handed the workspace (a text field's menu) read the
         // language from here.
         self.workspace.locale().set_current();
+        // The palette is decided before anything is drawn: the user's choice, or the
+        // system's when the choice is to follow it, which the window reports when it
+        // changes.
+        if !self.watching_appearance {
+            self.watching_appearance = true;
+            cx.observe_window_appearance(window, |this, _window, cx| {
+                this.repaint_terminals(cx);
+                cx.notify();
+            })
+            .detach();
+        }
+        let system_dark = matches!(
+            window.appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
+        theme::set_appearance(self.theme_choice.appearance(system_dark));
+        // A panel that closed while one of its fields had the keyboard leaves nothing
+        // focused, and every shortcut would then go nowhere; the page takes it back.
+        if window.focused(cx).is_none() {
+            let destination = self.workspace.destination();
+            let handle = self.destination_focus(destination).clone();
+            window.focus(&handle);
+        }
         if std::mem::take(&mut self.focus_host_dialog)
             && let Some(fields) = &self.host_fields
         {

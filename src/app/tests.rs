@@ -751,6 +751,11 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             tab_menu_close,
             tab_menu_close_others,
             tab_menu_close_right,
+            theme_control,
+            theme_system,
+            theme_light,
+            theme_dark,
+            palette_theme,
             sidebar_collapse,
             sidebar_expand,
             host_auth_title,
@@ -7002,4 +7007,158 @@ async fn the_sidebar_collapses_to_its_icons_and_navigation_keeps_working(cx: &mu
     cx.simulate_keystrokes(Platform::current().sidebar_keystroke());
     cx.run_until_parked();
     assert!(!cx.update(|_window, app| view.read(app).rail_collapsed()));
+}
+
+// ---------------------------------------------------------------------------
+// The light palette
+// ---------------------------------------------------------------------------
+
+/// The light value of a dark token.
+fn light(token: u32) -> u32 {
+    theme::light_value(token)
+}
+
+#[test]
+fn every_token_has_a_light_value() {
+    let tokens = [
+        palette::CANVAS,
+        palette::SURFACE,
+        palette::SURFACE_RAISED,
+        palette::SURFACE_HOVER,
+        palette::SURFACE_SELECTED,
+        palette::BORDER,
+        palette::BORDER_STRONG,
+        palette::TEXT_PRIMARY,
+        palette::TEXT_SECONDARY,
+        palette::TEXT_MUTED,
+        palette::ACCENT,
+        palette::ACCENT_HOVER,
+        palette::ON_ACCENT,
+        palette::ACCENT_TINT,
+        palette::ACCENT_ON_TINT,
+        palette::POSITIVE_TINT,
+        palette::WARNING_TINT,
+        palette::DANGER_TINT,
+        palette::POSITIVE,
+        palette::WARNING,
+        palette::DANGER,
+        palette::PLANNED,
+        palette::BRAND_END,
+    ];
+    for token in tokens.into_iter().chain(
+        palette::AVATARS
+            .iter()
+            .flat_map(|(tint, text)| [*tint, *text]),
+    ) {
+        assert_ne!(light(token), token, "{token:06x} has no light value");
+    }
+}
+
+#[test]
+fn light_body_text_reaches_the_contrast_floor_on_every_surface() {
+    let surfaces = [
+        ("canvas", palette::CANVAS),
+        ("surface", palette::SURFACE),
+        ("raised", palette::SURFACE_RAISED),
+        ("selected", palette::SURFACE_SELECTED),
+    ];
+    let text = [
+        ("primary", palette::TEXT_PRIMARY),
+        ("secondary", palette::TEXT_SECONDARY),
+        ("muted", palette::TEXT_MUTED),
+        ("accent", palette::ACCENT),
+    ];
+    for (surface_name, surface) in surfaces {
+        for (text_name, token) in text {
+            let ratio = theme::contrast::ratio(light(token), light(surface));
+            assert!(
+                ratio >= BODY_CONTRAST_FLOOR,
+                "light {text_name} on {surface_name} is {ratio:.2}:1"
+            );
+        }
+    }
+}
+
+#[test]
+fn light_status_and_accent_pairs_are_readable() {
+    let pairs = [
+        ("positive", palette::POSITIVE, palette::POSITIVE_TINT),
+        ("warning", palette::WARNING, palette::WARNING_TINT),
+        ("danger", palette::DANGER, palette::DANGER_TINT),
+        ("on accent", palette::ON_ACCENT, palette::ACCENT),
+        (
+            "accent on tint",
+            palette::ACCENT_ON_TINT,
+            palette::ACCENT_TINT,
+        ),
+    ];
+    for (name, text, background) in pairs {
+        let ratio = theme::contrast::ratio(light(text), light(background));
+        assert!(ratio >= BODY_CONTRAST_FLOOR, "light {name} is {ratio:.2}:1");
+    }
+    for (tint, text) in palette::AVATARS {
+        let ratio = theme::contrast::ratio(light(text), light(tint));
+        assert!(
+            ratio >= BODY_CONTRAST_FLOOR,
+            "light avatar {text:06x} is {ratio:.2}:1"
+        );
+    }
+}
+
+#[test]
+fn the_light_terminal_keeps_its_colours_readable() {
+    let background = 0xfcfcfd;
+    let lookup = |dark: u32| {
+        theme::light::TERMINAL
+            .iter()
+            .find(|(from, _)| *from == dark)
+            .map(|(_, to)| *to)
+            .expect("a terminal colour has a light value")
+    };
+    assert_eq!(lookup(0x0b0c10), background);
+    let foreground = lookup(0xe6e9f0);
+    assert!(theme::contrast::ratio(foreground, background) >= BODY_CONTRAST_FLOOR);
+    // Red, green, yellow, blue, magenta and cyan are text colours in every shell.
+    for (index, color) in shellune_terminal::palette::ANSI[1..7].iter().enumerate() {
+        let dark = u32::from(color.r) << 16 | u32::from(color.g) << 8 | u32::from(color.b);
+        let ratio = theme::contrast::ratio(lookup(dark), background);
+        assert!(
+            ratio >= BODY_CONTRAST_FLOOR,
+            "ANSI {} in the light terminal is {ratio:.2}:1",
+            index + 1
+        );
+    }
+}
+
+#[test]
+fn the_theme_choice_follows_the_system_until_one_is_picked() {
+    use crate::app::theme::{Appearance, ThemeChoice};
+    assert_eq!(ThemeChoice::System.appearance(true), Appearance::Dark);
+    assert_eq!(ThemeChoice::System.appearance(false), Appearance::Light);
+    assert_eq!(ThemeChoice::Light.appearance(true), Appearance::Light);
+    assert_eq!(ThemeChoice::Dark.appearance(false), Appearance::Dark);
+    assert_eq!(ThemeChoice::System.next(), ThemeChoice::Light);
+    assert_eq!(ThemeChoice::Dark.next(), ThemeChoice::System);
+}
+
+#[gpui::test]
+async fn the_theme_control_switches_the_palette(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "theme.control");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).theme_choice()),
+        theme::ThemeChoice::Light
+    );
+    assert_eq!(theme::appearance(), theme::Appearance::Light, "drawn light");
+    assert_eq!(
+        theme::swatch(palette::CANVAS),
+        gpui::rgb(light(palette::CANVAS)),
+        "a token resolves to its light value"
+    );
+    click(cx, "theme.control");
+    assert_eq!(theme::appearance(), theme::Appearance::Dark, "drawn dark");
+    // Leave the thread as the other tests expect it.
+    theme::set_appearance(theme::Appearance::Dark);
 }

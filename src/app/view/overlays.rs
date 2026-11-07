@@ -236,6 +236,15 @@ impl ShelluneView {
             current: false,
         });
         entries.push(Entry {
+            command: Command::CycleTheme,
+            group: Group::Actions,
+            title: strings.palette_theme.to_owned(),
+            detail: self.theme_label().to_owned(),
+            shortcut: None,
+            icon: self.theme_icon(),
+            current: false,
+        });
+        entries.push(Entry {
             command: Command::ToggleSidebar,
             group: Group::Actions,
             title: if self.rail_collapsed {
@@ -332,6 +341,7 @@ impl ShelluneView {
             Command::CloseTab(id) => self.request_close_session(id, cx),
             Command::ToggleLanguage => self.toggle_locale(cx),
             Command::ToggleSidebar => self.toggle_rail(cx),
+            Command::CycleTheme => self.cycle_theme(cx),
             Command::CycleTextSize => {
                 self.workspace.cycle_text_size();
                 cx.notify();

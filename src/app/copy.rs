@@ -597,6 +597,16 @@ pub struct Strings {
     pub sidebar_collapse: &'static str,
     /// Sidebar button and palette action: expand the sidebar.
     pub sidebar_expand: &'static str,
+    /// Sidebar control: the palette the window is drawn in.
+    pub theme_control: &'static str,
+    /// Theme value: follow the operating system.
+    pub theme_system: &'static str,
+    /// Theme value: light.
+    pub theme_light: &'static str,
+    /// Theme value: dark.
+    pub theme_dark: &'static str,
+    /// Palette action: step the theme.
+    pub palette_theme: &'static str,
 }
 
 /// English copy.
@@ -859,6 +869,11 @@ pub static ENGLISH: Strings = Strings {
     remote_saved_secret_failed: "The saved password could not be read",
     sidebar_collapse: "Collapse sidebar",
     sidebar_expand: "Expand sidebar",
+    theme_control: "Theme",
+    theme_system: "System",
+    theme_light: "Light",
+    theme_dark: "Dark",
+    palette_theme: "Change theme",
 };
 
 /// Chinese copy.
@@ -1121,6 +1136,11 @@ pub static CHINESE: Strings = Strings {
     remote_saved_secret_failed: "无法读取已保存的密码",
     sidebar_collapse: "收起侧边栏",
     sidebar_expand: "展开侧边栏",
+    theme_control: "主题",
+    theme_system: "跟随系统",
+    theme_light: "浅色",
+    theme_dark: "深色",
+    palette_theme: "切换主题",
 };
 
 /// A count followed by its unit, in the grammar of the language.
