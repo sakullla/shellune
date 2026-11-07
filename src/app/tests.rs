@@ -3877,8 +3877,10 @@ async fn a_real_ssh_session_opens_a_terminal_that_uses_the_shared_interactions(
         assert_eq!(recent.connections(), 1, "one successful connection");
     });
 
-    // Closing the panel ends the session and leaves no terminal behind.
-    click(cx, "remote.close");
+    // A successful connection now opens its session tab. Close that active tab,
+    // rather than clicking the connection panel which is no longer on screen.
+    cx.dispatch_action(crate::app::actions::CloseActiveTab);
+    cx.run_until_parked();
     cx.update(|_window, app| {
         let view = view.read(app);
         assert!(
