@@ -1815,10 +1815,11 @@ fn remember_network(host: &mut ImportedHost, setting: &Setting, withheld: bool) 
     if setting.lower == "proxycommand" && !setting.value.eq_ignore_ascii_case("none") {
         host.proxy_command = Some(setting.value.clone());
     }
-    if setting.lower == "proxyjump" && host.jumps.is_empty() {
-        if let Ok(jumps) = parse_jump_list(&setting.value) {
-            host.jumps = jumps;
-        }
+    if setting.lower == "proxyjump"
+        && host.jumps.is_empty()
+        && let Ok(jumps) = parse_jump_list(&setting.value)
+    {
+        host.jumps = jumps;
     }
 }
 
@@ -1955,13 +1956,12 @@ fn parse_listen(token: &str) -> Result<(String, u16), String> {
         let port = port.ok_or_else(|| "the listen port is missing".to_owned())?;
         return Ok((address, port));
     }
-    if let Some((host, port)) = token.rsplit_once(':') {
-        if !port.is_empty()
-            && port.chars().all(|character| character.is_ascii_digit())
-            && !host.is_empty()
-        {
-            return Ok((host.to_owned(), parse_port_token(port)?));
-        }
+    if let Some((host, port)) = token.rsplit_once(':')
+        && !port.is_empty()
+        && port.chars().all(|character| character.is_ascii_digit())
+        && !host.is_empty()
+    {
+        return Ok((host.to_owned(), parse_port_token(port)?));
     }
     Ok(("127.0.0.1".to_owned(), parse_port_token(token)?))
 }
@@ -2014,13 +2014,13 @@ fn finalize_jumps(hosts: &mut [ImportedHost]) {
             )
         })
         .collect();
-    for index in 0..hosts.len() {
-        if hosts[index].jumps.is_empty() || hosts[index].withhold {
+    for host in hosts.iter_mut() {
+        if host.jumps.is_empty() || host.withhold {
             continue;
         }
         let mut resolved = Vec::new();
         let mut failure: Option<String> = None;
-        for jump in hosts[index].jumps.clone() {
+        for jump in host.jumps.clone() {
             if let Some((alias, user, port, address)) = snapshots
                 .iter()
                 .find(|(alias, _, _, _)| alias.eq_ignore_ascii_case(&jump.address))
@@ -2057,14 +2057,13 @@ fn finalize_jumps(hosts: &mut [ImportedHost]) {
             }
         }
         if let Some(reason) = failure {
-            let line = hosts[index].jump_line.max(1);
-            hosts[index].withhold = true;
-            hosts[index].outcome = ImportOutcome::Blocked;
-            hosts[index]
-                .notes
+            let line = host.jump_line.max(1);
+            host.withhold = true;
+            host.outcome = ImportOutcome::Blocked;
+            host.notes
                 .push(ImportNote::new(line, "ProxyJump", NoteKind::Proxy, reason));
         } else {
-            hosts[index].jumps = resolved;
+            host.jumps = resolved;
         }
     }
     // A hop that points at a host this preview will not save cannot be linked.
