@@ -29,7 +29,8 @@ use shellune_storage::{
 use shellune_terminal::{BlockStatus, GridSize, TermMode, encode_paste};
 
 use crate::app::actions::{
-    CycleTextSize, GoToForwards, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage,
+    CycleTextSize, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
+    ToggleLanguage,
 };
 use crate::app::copy::{CHINESE, ENGLISH, Locale, Strings};
 use crate::app::hosts::HostView;
@@ -39,7 +40,7 @@ use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
 use crate::app::terminal::{PaneState, SourceEvent, TerminalPane};
 use crate::app::theme::{
-    self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Tone, Zoom, palette,
+    self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
 };
 use crate::app::workspace::{Failure, PrimaryOutcome, Recovery, Section, SectionState, Workspace};
 use crate::app::{DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ShelluneView, key_bindings};
@@ -50,6 +51,21 @@ fn design_window() -> Size<Pixels> {
 
 fn minimum_window() -> Size<Pixels> {
     size(px(MIN_WINDOW_SIZE.0), px(MIN_WINDOW_SIZE.1))
+}
+
+fn assert_within_width(bounds: gpui::Bounds<Pixels>, viewport: Size<Pixels>, what: &str) {
+    assert!(
+        bounds.size.width > px(0.0),
+        "{what} was measured with an empty box: {bounds:?}"
+    );
+    assert!(
+        bounds.origin.x >= px(-0.5),
+        "{what} starts left of the window: {bounds:?}"
+    );
+    assert!(
+        bounds.origin.x + bounds.size.width <= viewport.width + px(0.5),
+        "{what} extends past the right edge ({bounds:?} in {viewport:?})"
+    );
 }
 
 fn assert_fits_inside(bounds: gpui::Bounds<Pixels>, viewport: Size<Pixels>, what: &str) {
@@ -214,7 +230,7 @@ async fn the_minimum_window_still_shows_the_navigation_and_the_current_object(
 }
 
 #[gpui::test]
-async fn the_largest_text_size_keeps_every_entry_inside_the_minimum_window(
+async fn one_step_of_text_size_is_115_percent_and_stays_inside_the_minimum_window(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -226,7 +242,7 @@ async fn the_largest_text_size_keeps_every_entry_inside_the_minimum_window(
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Comfortable,
-        "one step from the default must reach the largest text size"
+        "one step from the default is 115%"
     );
     let viewport = cx.update(|window, _app| window.viewport_size());
     for destination in Destination::ALL {
@@ -234,6 +250,129 @@ async fn the_largest_text_size_keeps_every_entry_inside_the_minimum_window(
         assert_fits_inside(bounds, viewport, destination.debug_selector());
     }
     assert_fits_inside(bounds_of(cx, "content"), viewport, "content panel");
+}
+
+#[gpui::test]
+async fn two_hundred_percent_chinese_keeps_primary_actions_in_the_minimum_window(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    cx.dispatch_action(ToggleLanguage);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese
+    );
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let rail = bounds_of(cx, "rail").size.width;
+    assert!(
+        rail < px(160.0),
+        "200% text in the minimum window keeps the icon rail so the page still fits, got {rail:?}"
+    );
+
+    let pages = [
+        (Destination::LocalShells, "local"),
+        (Destination::Hosts, "hosts"),
+        (Destination::Sessions, "sessions"),
+        (Destination::Transfers, "transfers"),
+        (Destination::Forwards, "forwards"),
+    ];
+    for (destination, name) in pages {
+        match destination {
+            Destination::LocalShells => cx.dispatch_action(GoToLocalShells),
+            Destination::Hosts => cx.dispatch_action(GoToHosts),
+            Destination::Sessions => cx.dispatch_action(GoToSessions),
+            Destination::Transfers => cx.dispatch_action(GoToTransfers),
+            Destination::Forwards => cx.dispatch_action(GoToForwards),
+        }
+        cx.run_until_parked();
+        assert_eq!(destination_of(&view, cx), destination, "{name}");
+        assert_fits_inside(bounds_of(cx, "header.title"), viewport, name);
+        assert_fits_inside(bounds_of(cx, "header.primary"), viewport, name);
+        assert_within_width(bounds_of(cx, "content"), viewport, name);
+    }
+}
+
+#[gpui::test]
+async fn reduced_motion_drops_the_loading_fade_and_keeps_the_state(cx: &mut TestAppContext) {
+    let mut workspace = Workspace::with_sections(
+        Section::<Session>::ready(Vec::new()),
+        Section::<HostConfig>::ready(Vec::new()),
+        Section::<Transfer>::loading(),
+    );
+    workspace.select(Destination::Transfers);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("state.motion.pulse").is_some(),
+        "full motion fades the loading mark in"
+    );
+    assert!(cx.debug_bounds("state.motion.still").is_none());
+    assert!(cx.debug_bounds("state.card").is_some());
+
+    click(cx, "motion.control");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().motion()),
+        Motion::Reduced
+    );
+    // GPUI keeps a debug selector's last bounds until a later frame overwrites that
+    // same selector, so a removed pulse can still be reported. The still mark is new
+    // in this frame and is only built when the fade is skipped.
+    assert!(
+        cx.debug_bounds("state.motion.still").is_some(),
+        "reduced motion draws the loading mark without the fade"
+    );
+    assert!(
+        cx.debug_bounds("state.card").is_some(),
+        "the loading state stays readable without the fade"
+    );
+    assert!(
+        !theme::motion_allowed(),
+        "the draw must be using the reduced-motion preference"
+    );
+    theme::set_motion(Motion::Full);
+}
+
+#[gpui::test]
+async fn closing_the_palette_returns_focus_to_the_field_that_opened_it(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    focus_root(&view, cx);
+    cx.run_until_parked();
+
+    click(cx, "shell.custom");
+    assert!(
+        cx.update(|window, app| view.read(app).shell_path_focused(window, app)),
+        "the custom shell field takes the keyboard when it opens"
+    );
+
+    click(cx, "palette.open");
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    assert!(
+        !cx.update(|window, app| view.read(app).shell_path_focused(window, app)),
+        "the palette takes the keyboard while it is open"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).palette_open()));
+    assert!(
+        cx.update(|window, app| view.read(app).shell_path_focused(window, app)),
+        "closing the palette returns the keyboard to the field that opened it"
+    );
 }
 
 #[gpui::test]
@@ -586,17 +725,19 @@ fn selecting_another_destination_clears_a_stale_notice() {
 }
 
 #[test]
-fn text_size_steps_through_the_three_levels_and_wraps() {
+fn text_size_steps_through_every_level_and_wraps() {
     assert_eq!(Zoom::default(), Zoom::Regular);
     assert_eq!(Zoom::Compact.next(), Zoom::Regular);
     assert_eq!(Zoom::Regular.next(), Zoom::Comfortable);
-    assert_eq!(Zoom::Comfortable.next(), Zoom::Compact);
-    assert!(Zoom::Compact.factor() < Zoom::Regular.factor());
-    assert!(Zoom::Regular.factor() < Zoom::Comfortable.factor());
+    assert_eq!(Zoom::Comfortable.next(), Zoom::Largest);
+    assert_eq!(Zoom::Largest.next(), Zoom::Compact);
+    assert_eq!(Zoom::Largest.factor(), 2.0);
+    assert_eq!(Zoom::Largest.label(), "200%");
+    assert!(Zoom::Comfortable.factor() < Zoom::Largest.factor());
 
-    let metrics = Metrics::new(Zoom::Comfortable);
-    assert!(metrics.body_size() > Metrics::new(Zoom::Compact).body_size());
-    assert!(metrics.rail_width() > Metrics::new(Zoom::Compact).rail_width());
+    let metrics = Metrics::new(Zoom::Largest);
+    assert!(metrics.body_size() > Metrics::new(Zoom::Comfortable).body_size());
+    assert!(metrics.rail_width() > Metrics::new(Zoom::Comfortable).rail_width());
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +935,10 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             theme_light,
             theme_dark,
             palette_theme,
+            motion_control,
+            motion_full,
+            motion_reduced,
+            palette_motion,
             quick_connect,
             quick_connect_hint,
             quick_connect_title,
@@ -10448,18 +10593,10 @@ async fn closing_a_tab_or_removing_a_session_with_an_active_forward_asks_first(
     let id_b = rule_b.id();
     let (mut observed_a, mut observed_b) = cx.update(|_window, app| {
         view.update(app, |view, _cx| {
-            let observed_a = view.install_listening_forward_for_test(
-                tabs[0],
-                rule_a,
-                "127.0.0.1",
-                45111,
-            );
-            let observed_b = view.install_listening_forward_for_test(
-                tabs[1],
-                rule_b,
-                "127.0.0.1",
-                45112,
-            );
+            let observed_a =
+                view.install_listening_forward_for_test(tabs[0], rule_a, "127.0.0.1", 45111);
+            let observed_b =
+                view.install_listening_forward_for_test(tabs[1], rule_b, "127.0.0.1", 45112);
             (observed_a, observed_b)
         })
     });

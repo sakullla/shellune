@@ -671,6 +671,14 @@ pub struct Strings {
     pub theme_dark: &'static str,
     /// Palette action: step the theme.
     pub palette_theme: &'static str,
+    /// Sidebar control: short interface motion.
+    pub motion_control: &'static str,
+    /// Motion value: animations play.
+    pub motion_full: &'static str,
+    /// Motion value: animations are skipped.
+    pub motion_reduced: &'static str,
+    /// Palette action: switch reduced motion.
+    pub palette_motion: &'static str,
     /// Opens a connection that is not saved as a host first.
     pub quick_connect: &'static str,
     /// Explains that a quick connection does not write a host record.
@@ -1223,6 +1231,10 @@ pub static ENGLISH: Strings = Strings {
     theme_light: "Light",
     theme_dark: "Dark",
     palette_theme: "Change theme",
+    motion_control: "Motion",
+    motion_full: "Full",
+    motion_reduced: "Reduced",
+    palette_motion: "Reduce motion",
     quick_connect: "Quick connect",
     quick_connect_hint: "Connect now. The host is saved only if you ask.",
     quick_connect_title: "Quick connect",
@@ -1648,6 +1660,10 @@ pub static CHINESE: Strings = Strings {
     theme_light: "浅色",
     theme_dark: "深色",
     palette_theme: "切换主题",
+    motion_control: "动态效果",
+    motion_full: "完整",
+    motion_reduced: "减少",
+    palette_motion: "减少动态效果",
     quick_connect: "快速连接",
     quick_connect_hint: "先连接，只有你要求时才保存为主机。",
     quick_connect_title: "快速连接",

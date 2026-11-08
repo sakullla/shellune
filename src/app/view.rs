@@ -34,22 +34,22 @@ use shellune_terminal::GridSize;
 
 use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers, MovePaneDown,
-    MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell,
-    NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab, ResizePaneDown,
-    ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
-    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight,
-    ToggleLanguage, ToggleSidebar, ZoomPane,
+    FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
+    MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight,
+    NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab,
+    ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2,
+    SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
+    SplitPaneDown, SplitPaneRight, ToggleLanguage, ToggleSidebar, ZoomPane,
 };
 use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(test)]
 use crate::app::files::BrowseChannel;
-use crate::app::forwarding::ForwardCenter;
 use crate::app::files::{
     FileSource, FileViews, FilesDialog, browse_failure_text, display_path, kind_label,
     local_protocol_to_os, path_crumbs, path_problem_text, problem_text, transfer_problem_text,
 };
+use crate::app::forwarding::ForwardCenter;
 use crate::app::hosts::{
     HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
     import_message, unimported_hosts,
@@ -397,6 +397,10 @@ pub struct ShelluneView {
     watching_appearance: bool,
     /// Whether the host dialog's first field takes the keyboard on the next draw.
     focus_host_dialog: bool,
+    /// Focus to return to when an overlay closes. Weak, so a removed field is not kept.
+    focus_return: Option<gpui::WeakFocusHandle>,
+    /// The next draw gives the keyboard back to [`Self::focus_return`].
+    restore_focus_pending: bool,
     /// The session row whose menu is open, and where it was opened.
     session_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// Attempts a test scripted, kept so their answers can be inspected.
@@ -610,6 +614,8 @@ impl ShelluneView {
             tab_menu: None,
             session_menu: None,
             focus_host_dialog: false,
+            focus_return: None,
+            restore_focus_pending: false,
             rail_collapsed: false,
             theme_choice: theme::ThemeChoice::default(),
             watching_appearance: false,
@@ -683,7 +689,10 @@ impl ShelluneView {
     /// How many forwarding rules are saved, and whether any is listening.
     #[cfg(test)]
     pub fn forward_restore_state(&self) -> (usize, bool) {
-        (self.forwards.book().rules().len(), self.forwards.any_active())
+        (
+            self.forwards.book().rules().len(),
+            self.forwards.any_active(),
+        )
     }
 
     /// The saved records this shell last read or wrote.
@@ -1244,7 +1253,8 @@ impl ShelluneView {
                         .child(strings.forward_close_rules),
                 );
             }
-            question = self.interrupted_forward_lines(question, "session.close.forward", &rules, metrics);
+            question =
+                self.interrupted_forward_lines(question, "session.close.forward", &rules, metrics);
         }
         Some(
             question.child(
@@ -1882,6 +1892,7 @@ impl ShelluneView {
     fn close_host_editor(&mut self, cx: &mut Context<Self>) {
         self.hosts.close_editor();
         self.host_fields = None;
+        self.restore_focus_pending = true;
         cx.notify();
     }
 
@@ -1960,6 +1971,7 @@ impl ShelluneView {
                 self.book = next;
                 self.hosts.close_editor();
                 self.host_fields = None;
+                self.restore_focus_pending = true;
                 self.hosts.set_message(message.to_owned(), false);
                 let items = self.book.hosts().to_vec();
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
@@ -5438,7 +5450,10 @@ impl ShelluneView {
                     Variant::Ghost,
                     cx,
                     move |view, cx| {
-                        view.show_forwards_scope(crate::app::forwarding::ForwardScope::Host(id), cx);
+                        view.show_forwards_scope(
+                            crate::app::forwarding::ForwardScope::Host(id),
+                            cx,
+                        );
                     },
                 ))
                 .child(self.text_button(
@@ -5686,7 +5701,7 @@ impl ShelluneView {
             destination.shortcut_label(Platform::current())
         );
 
-        let collapsed = self.rail_collapsed;
+        let collapsed = self.rail_is_collapsed();
         let mut entry = div()
             .id(("nav", index))
             .group(group.clone())
@@ -5703,9 +5718,9 @@ impl ShelluneView {
             })
             .rounded(px(radius::MEDIUM))
             .border_1()
-            // The ring marks keyboard focus that has moved off the current page; on
-            // the selected entry the fill already says where focus is.
-            .border_color(if focused && !selected {
+            // The ring is the keyboard focus, including on the selected entry: its fill
+            // says which page is open, and the ring says which control has the keys.
+            .border_color(if focused {
                 theme::swatch(palette::ACCENT)
             } else {
                 theme::clear()
@@ -5864,7 +5879,7 @@ impl ShelluneView {
             nav = nav.child(self.nav_entry(destination, window, cx));
         }
 
-        if self.rail_collapsed {
+        if self.rail_is_collapsed() {
             return self.collapsed_rail(nav, cx);
         }
         div()
@@ -5878,16 +5893,26 @@ impl ShelluneView {
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "rail".to_owned())
             .child(self.brand(cx))
-            .child(self.palette_trigger(cx))
-            .child(nav)
+            .child(
+                div()
+                    .id("rail.scroll")
+                    .debug_selector(|| "rail.scroll".to_owned())
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(self.palette_trigger(cx))
+                    .child(nav),
+            )
             .child(
                 div()
                     .flex()
                     .flex_col()
+                    .flex_none()
                     .gap(metrics.scale(2.0))
                     .px(metrics.scale(spacing::TIGHT + 2.0))
                     .pb(metrics.scale(spacing::SNUG))
-                    .mt_auto()
                     .child(
                         div()
                             .mx(metrics.scale(spacing::HAIRLINE))
@@ -5939,6 +5964,14 @@ impl ShelluneView {
                                 cx.notify();
                             },
                         )),
+                    )
+                    .child(
+                        self.rail_control(Icon::Play, strings.motion_control, self.motion_label())
+                            .id("motion.control")
+                            .debug_selector(|| "motion.control".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.cycle_motion(cx);
+                            })),
                     )
                     .child(
                         div()
@@ -6031,11 +6064,75 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Switches short motion off or on. Does not read a system reduced-motion flag.
+    pub fn cycle_motion(&mut self, cx: &mut Context<Self>) {
+        self.workspace.cycle_motion();
+        cx.notify();
+    }
+
+    /// The name of the current motion setting.
+    fn motion_label(&self) -> &'static str {
+        let strings = self.strings();
+        if self.workspace.motion().allows_animation() {
+            strings.motion_full
+        } else {
+            strings.motion_reduced
+        }
+    }
+
+    /// Icon rail when the user collapsed it, or when the labels would crowd the page out.
+    fn rail_is_collapsed(&self) -> bool {
+        self.rail_collapsed || self.viewport_forces_icon_rail()
+    }
+
+    /// True when the labelled rail plus the page's main action would not fit.
+    ///
+    /// Window caption buttons stay a fixed 46px each; they are not part of the text scale.
+    fn viewport_forces_icon_rail(&self) -> bool {
+        let metrics = self.metrics();
+        let caption = if Platform::current() == Platform::Windows {
+            46.0 * 3.0
+        } else {
+            0.0
+        };
+        self.viewport_width < metrics.rail_width() + metrics.scale(280.0) + px(caption)
+    }
+
     /// The theme the user chose.
     #[allow(dead_code)]
     #[must_use]
     pub fn theme_choice(&self) -> theme::ThemeChoice {
         self.theme_choice
+    }
+
+    /// Whether `handle` is the window or a page, rather than a field or a terminal.
+    fn is_page_focus(&self, handle: &FocusHandle) -> bool {
+        handle == &self.root_focus || self.destination_focus.iter().any(|item| item == handle)
+    }
+
+    /// Remembers a field or terminal while one has the keyboard.
+    ///
+    /// Page focus does not replace it: a click that opens an overlay often blurs the
+    /// field first, and the page focus that fills the gap is not where the user was.
+    fn note_content_focus(&mut self, window: &Window, cx: &gpui::App) {
+        if self.palette.is_some()
+            || self.host_fields.is_some()
+            || self.tab_menu.is_some()
+            || self.session_menu.is_some()
+        {
+            return;
+        }
+        if let Some(handle) = window.focused(cx) {
+            if !self.is_page_focus(&handle) {
+                self.focus_return = Some(handle.downgrade());
+            }
+        }
+    }
+
+    /// Whether the custom shell path field has the keyboard.
+    #[cfg(test)]
+    pub fn shell_path_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.shell_path.read(cx).focus_handle().is_focused(window)
     }
 
     /// Asks every terminal to draw again, so a new palette reaches the ones that are
@@ -6066,7 +6163,13 @@ impl ShelluneView {
     }
 
     /// Collapses the sidebar to its icons, or expands it again.
+    ///
+    /// A window that is already forcing the icon rail does not store that as the
+    /// user's choice, so widening it brings the labels back.
     pub fn toggle_rail(&mut self, cx: &mut Context<Self>) {
+        if self.viewport_forces_icon_rail() {
+            return;
+        }
         self.rail_collapsed = !self.rail_collapsed;
         cx.notify();
     }
@@ -6140,92 +6243,102 @@ impl ShelluneView {
             )
             .child(
                 div()
+                    .id("rail.scroll")
+                    .debug_selector(|| "rail.scroll".to_owned())
                     .flex()
                     .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
                     .items_center()
-                    .gap(metrics.scale(2.0))
-                    .child(self.rail_toggle(cx).size(metrics.scale(36.0)))
                     .child(
-                        square(
-                            Icon::Search,
-                            "palette.open",
-                            format!(
-                                "{} ({})",
-                                strings.palette_hint_short,
-                                platform.palette_label()
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(metrics.scale(2.0))
+                            .child(self.rail_toggle(cx).size(metrics.scale(36.0)))
+                            .child(
+                                square(
+                                    Icon::Search,
+                                    "palette.open",
+                                    format!(
+                                        "{} ({})",
+                                        strings.palette_hint_short,
+                                        platform.palette_label()
+                                    ),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _event, window, cx| {
+                                        this.toggle_palette(window, cx);
+                                    },
+                                )),
                             ),
-                        )
-                        .on_click(cx.listener(
-                            |this, _event, window, cx| {
-                                this.toggle_palette(window, cx);
-                            },
-                        )),
+                    )
+                    .child(nav)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(metrics.scale(2.0))
+                            .pb(metrics.scale(spacing::SNUG))
+                            .child(
+                                square(
+                                    self.theme_icon(),
+                                    "theme.control",
+                                    format!("{} · {}", strings.theme_control, self.theme_label()),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.cycle_theme(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                square(
+                                    Icon::Globe,
+                                    "status.language",
+                                    format!(
+                                        "{} · {}",
+                                        strings.language_control,
+                                        self.workspace.locale().endonym()
+                                    ),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.toggle_locale(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                square(
+                                    Icon::TextSize,
+                                    "zoom.control",
+                                    format!(
+                                        "{} · {}",
+                                        strings.zoom_control,
+                                        self.workspace.zoom().label()
+                                    ),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.workspace.cycle_text_size();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(div().pt(metrics.scale(spacing::HAIRLINE)).child(
+                                components::status_dot(
+                                    if self.any_live() {
+                                        Tone::Positive
+                                    } else {
+                                        Tone::Neutral
+                                    },
+                                    metrics,
+                                ),
+                            )),
                     ),
-            )
-            .child(nav)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(metrics.scale(2.0))
-                    .pb(metrics.scale(spacing::SNUG))
-                    .mt_auto()
-                    .child(
-                        square(
-                            self.theme_icon(),
-                            "theme.control",
-                            format!("{} · {}", strings.theme_control, self.theme_label()),
-                        )
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.cycle_theme(cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        square(
-                            Icon::Globe,
-                            "status.language",
-                            format!(
-                                "{} · {}",
-                                strings.language_control,
-                                self.workspace.locale().endonym()
-                            ),
-                        )
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.toggle_locale(cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        square(
-                            Icon::TextSize,
-                            "zoom.control",
-                            format!(
-                                "{} · {}",
-                                strings.zoom_control,
-                                self.workspace.zoom().label()
-                            ),
-                        )
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.workspace.cycle_text_size();
-                                cx.notify();
-                            },
-                        )),
-                    )
-                    .child(div().pt(metrics.scale(spacing::HAIRLINE)).child(
-                        components::status_dot(
-                            if self.any_live() {
-                                Tone::Positive
-                            } else {
-                                Tone::Neutral
-                            },
-                            metrics,
-                        ),
-                    )),
             )
     }
 
@@ -10246,18 +10359,29 @@ impl Render for ShelluneView {
             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
         );
         theme::set_appearance(self.theme_choice.appearance(system_dark));
-        // A panel that closed while one of its fields had the keyboard leaves nothing
-        // focused, and every shortcut would then go nowhere; the page takes it back.
-        if window.focused(cx).is_none() {
+        theme::set_motion(self.workspace.motion());
+        // A field's focus is noted before a click can blur it. Opening an overlay then
+        // still knows which field to restore, even when the click already moved focus.
+        self.note_content_focus(window, cx);
+        // A closed overlay asked to put the keyboard back where it was opened from.
+        // Otherwise a panel that closed while one of its fields had the keyboard leaves
+        // nothing focused, and every shortcut would go nowhere; the page takes it back.
+        if std::mem::take(&mut self.restore_focus_pending) {
+            self.restore_overlay_focus(window, cx);
+        } else if window.focused(cx).is_none() {
             let destination = self.workspace.destination();
             let handle = self.destination_focus(destination).clone();
             window.focus(&handle);
         }
-        if std::mem::take(&mut self.focus_host_dialog)
-            && let Some(fields) = &self.host_fields
-        {
-            let handle = fields.name.read(cx).focus_handle().clone();
-            window.focus(&handle);
+        if std::mem::take(&mut self.focus_host_dialog) {
+            let handle = self
+                .host_fields
+                .as_ref()
+                .map(|fields| fields.name.read(cx).focus_handle().clone());
+            if let Some(handle) = handle {
+                self.remember_focus(window, cx);
+                window.focus(&handle);
+            }
         }
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);

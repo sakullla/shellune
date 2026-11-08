@@ -95,6 +95,7 @@ impl ShelluneView {
     ) {
         self.shell_menu_open = false;
         self.tab_menu = None;
+        self.remember_focus(window, cx);
         self.session_menu = Some((id, position));
         window.focus(&self.root_focus.clone());
         cx.notify();
@@ -109,7 +110,7 @@ impl ShelluneView {
 
     pub(super) fn close_session_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.session_menu.take().is_some() {
-            self.restore_focus(window, cx);
+            self.restore_overlay_focus(window, cx);
             cx.notify();
         }
     }

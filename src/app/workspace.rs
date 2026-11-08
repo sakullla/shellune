@@ -22,7 +22,7 @@ use crate::app::layout::SessionLayout;
 
 use crate::app::copy::{Locale, Strings};
 use crate::app::nav::Destination;
-use crate::app::theme::{Metrics, Tone, Zoom};
+use crate::app::theme::{Metrics, Motion, Tone, Zoom};
 
 /// What the user can do about a failure.
 ///
@@ -255,6 +255,7 @@ pub struct Workspace {
     destination: Destination,
     locale: Locale,
     zoom: Zoom,
+    motion: Motion,
     sessions: Section<Session>,
     hosts: Section<HostConfig>,
     transfers: Section<Transfer>,
@@ -287,6 +288,7 @@ impl Workspace {
             destination: Destination::LocalShells,
             locale: Locale::default(),
             zoom: Zoom::default(),
+            motion: Motion::default(),
             // The local terminal is implemented, so its section starts as a real,
             // empty result instead of unread work. Which shell can be started is
             // decided by probing this machine, not by the build.
@@ -445,12 +447,22 @@ impl Workspace {
         Metrics::new(self.zoom)
     }
 
-    /// Cycles the text size through the three levels.
+    /// Cycles the text size through 90%, 100%, 115% and 200%.
     ///
-    /// One control with three steps is easier to explain than a pair of buttons in
-    /// a shell that only needs a larger or smaller label.
+    /// One control is easier to explain than a pair of buttons in a shell that only
+    /// needs a larger or smaller label. 200% is the ceiling the layout keeps usable.
     pub fn cycle_text_size(&mut self) {
         self.zoom = self.zoom.next();
+    }
+
+    /// Whether short interface motion is played. This is not read from the OS.
+    pub fn motion(&self) -> Motion {
+        self.motion
+    }
+
+    /// Switches between full motion and reduced motion.
+    pub fn cycle_motion(&mut self) {
+        self.motion = self.motion.next();
     }
 
     /// The notice currently shown, if any.
@@ -670,11 +682,8 @@ impl Workspace {
         let mut sessions = self.sessions.items().to_vec();
         sessions.push(session.clone());
         self.sessions.replace(SectionStatus::Ready, sessions);
-        self.layout.attach(
-            session.id(),
-            PaneTarget::remote(host.id()),
-            session.title(),
-        );
+        self.layout
+            .attach(session.id(), PaneTarget::remote(host.id()), session.title());
         session
     }
 

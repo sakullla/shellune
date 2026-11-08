@@ -99,6 +99,7 @@ impl ShelluneView {
             }
         })
         .detach();
+        self.remember_focus(window, cx);
         window.focus(field.read(cx).focus_handle());
         self.palette = Some(field);
         self.palette_query.clear();
@@ -112,8 +113,42 @@ impl ShelluneView {
             return;
         }
         self.palette_query.clear();
-        self.restore_focus(window, cx);
+        self.restore_overlay_focus(window, cx);
         cx.notify();
+    }
+
+    /// Remembers the focused element so an overlay can give it back.
+    ///
+    /// A page-level focus does not replace a field noted on the previous frame. The
+    /// click that opens the overlay may already have blurred that field.
+    pub(super) fn remember_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = window.focused(cx);
+        if let Some(handle) = current.as_ref() {
+            if !self.is_page_focus(handle) {
+                self.focus_return = Some(handle.downgrade());
+                return;
+            }
+        }
+        let kept = self
+            .focus_return
+            .as_ref()
+            .and_then(|handle| handle.upgrade());
+        if kept
+            .as_ref()
+            .is_some_and(|handle| !self.is_page_focus(handle))
+        {
+            return;
+        }
+        self.focus_return = current.map(|handle| handle.downgrade());
+    }
+
+    /// Returns the keyboard to the element that opened the overlay, or to the page.
+    pub(super) fn restore_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = self.focus_return.take().and_then(|handle| handle.upgrade()) {
+            window.focus(&handle);
+            return;
+        }
+        self.restore_focus(window, cx);
     }
 
     /// Focuses the terminal on screen, or the current page when there is none.
@@ -298,6 +333,15 @@ impl ShelluneView {
             current: false,
         });
         entries.push(Entry {
+            command: Command::CycleMotion,
+            group: Group::Actions,
+            title: strings.palette_motion.to_owned(),
+            detail: self.motion_label().to_owned(),
+            shortcut: None,
+            icon: Icon::Play,
+            current: false,
+        });
+        entries.push(Entry {
             command: Command::CycleTextSize,
             group: Group::Actions,
             title: strings.palette_text_size.to_owned(),
@@ -395,6 +439,7 @@ impl ShelluneView {
             Command::ToggleLanguage => self.toggle_locale(cx),
             Command::ToggleSidebar => self.toggle_rail(cx),
             Command::CycleTheme => self.cycle_theme(cx),
+            Command::CycleMotion => self.cycle_motion(cx),
             Command::CycleTextSize => {
                 self.workspace.cycle_text_size();
                 cx.notify();
@@ -689,6 +734,7 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         self.shell_menu_open = false;
+        self.remember_focus(window, cx);
         self.tab_menu = Some((id, event.position));
         window.focus(&self.root_focus.clone());
         cx.notify();
@@ -711,7 +757,7 @@ impl ShelluneView {
     /// Closes the tab menu and gives the keyboard back to what was on screen.
     pub(super) fn close_tab_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_menu.take().is_some() {
-            self.restore_focus(window, cx);
+            self.restore_overlay_focus(window, cx);
             cx.notify();
         }
     }
@@ -788,8 +834,8 @@ impl ShelluneView {
         let strings = self.strings();
         let viewport = window.viewport_size();
         let tab_count = self.workspace.layout().tabs().len();
-        let index = (0..tab_count)
-            .find(|index| self.workspace.layout().anchor_of(*index) == Some(id))?;
+        let index =
+            (0..tab_count).find(|index| self.workspace.layout().anchor_of(*index) == Some(id))?;
         let platform = Platform::current();
 
         let item = |label: &'static str,

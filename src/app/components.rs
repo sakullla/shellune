@@ -7,8 +7,10 @@
 //! Every clickable piece here carries its own hover state, so a control looks the
 //! same wherever it is used and the pointer always gets feedback before a click.
 
+use std::time::Duration;
+
 use gpui::prelude::*;
-use gpui::{AnyView, App, Div, SharedString, Window, div, px};
+use gpui::{Animation, AnimationExt, AnyElement, AnyView, App, Div, SharedString, Window, div, px};
 
 use crate::app::icons::{self, Icon};
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
@@ -513,21 +515,21 @@ pub fn state_card_with_icon(
         .border_color(theme::swatch(palette::BORDER_STRONG))
         .child(match emblem_icon {
             Some(icon) => icons::icon(icon, metrics.scale(22.0), emblem_fg).into_any_element(),
-            None => status_dot(tone, metrics)
-                .w(metrics.scale(10.0))
-                .h(metrics.scale(10.0))
-                .into_any_element(),
+            None => attention_dot(tone, metrics),
         });
 
     let mut text = div()
         .flex()
         .flex_col()
         .items_center()
+        .w_full()
         .min_w(px(0.0))
         .max_w(metrics.scale(480.0))
         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
         .child(
             div()
+                .w_full()
+                .whitespace_normal()
                 .text_size(metrics.title_size() + px(1.0))
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .font_weight(metrics.title_weight())
@@ -536,6 +538,8 @@ pub fn state_card_with_icon(
         )
         .child(
             div()
+                .w_full()
+                .whitespace_normal()
                 .text_size(metrics.body_size())
                 .text_color(theme::swatch(palette::TEXT_SECONDARY))
                 .font_weight(metrics.body_weight())
@@ -571,6 +575,31 @@ pub fn state_card_with_icon(
         .border_color(theme::swatch(palette::BORDER))
         .child(emblem)
         .child(text)
+}
+
+/// The dot on a waiting card.
+///
+/// Full motion fades it in once. Reduced motion draws it at full strength immediately,
+/// and the card's words stay either way. The fade is not a loop: a load that takes
+/// time is still told by the warning copy, not by something that keeps moving.
+fn attention_dot(tone: Tone, metrics: Metrics) -> AnyElement {
+    let dot = status_dot(tone, metrics)
+        .w(metrics.scale(10.0))
+        .h(metrics.scale(10.0));
+    if tone == Tone::Warning && theme::motion_allowed() {
+        dot.debug_selector(|| "state.motion.pulse".to_owned())
+            .with_animation(
+                "state.motion",
+                Animation::new(Duration::from_millis(180)),
+                |dot, delta| dot.opacity(0.35 + 0.65 * delta),
+            )
+            .into_any_element()
+    } else if tone == Tone::Warning {
+        dot.debug_selector(|| "state.motion.still".to_owned())
+            .into_any_element()
+    } else {
+        dot.into_any_element()
+    }
 }
 
 /// A list row frame shared by hosts, sessions and transfers.

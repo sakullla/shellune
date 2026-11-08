@@ -4,7 +4,7 @@
 //! sidebar to switch a session, start another shell or connect to a saved host breaks
 //! that. The palette gathers those destinations behind one shortcut, the way other
 //! terminals offer a profile or connection selector: open sessions, local shells,
-//! saved hosts, the four pages and the window settings, filtered as the user types.
+//! saved hosts, the five pages and the window settings, filtered as the user types.
 //!
 //! This module is render-independent: it holds the entries and the ranking, so the
 //! matching rules can be tested without a window.
@@ -41,6 +41,8 @@ pub enum Command {
     ToggleSidebar,
     /// Steps the theme.
     CycleTheme,
+    /// Switches short interface motion off or on.
+    CycleMotion,
 }
 
 /// The section an entry is listed under when nothing is typed.

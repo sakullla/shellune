@@ -151,6 +151,37 @@ pub enum ThemeChoice {
     Dark,
 }
 
+/// Whether short interface motion is played.
+///
+/// This is an application setting. GPUI 0.2.2's window appearance is observed for
+/// light and dark, but this crate has no evidence of a system reduced-motion
+/// query, so the shell does not claim to follow one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Motion {
+    /// Play short, skippable feedback such as a loading dot fading in.
+    #[default]
+    Full,
+    /// Skip that motion. Status text, colour and available actions stay.
+    Reduced,
+}
+
+impl Motion {
+    /// Whether a short animation may run.
+    #[must_use]
+    pub fn allows_animation(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// The other setting.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Full => Self::Reduced,
+            Self::Reduced => Self::Full,
+        }
+    }
+}
+
 impl ThemeChoice {
     /// The order the theme control steps through.
     pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
@@ -180,6 +211,8 @@ thread_local! {
     /// The palette the window is being drawn in; per thread, so tests that each run a
     /// window on their own thread never see another test's choice.
     static APPEARANCE: std::cell::Cell<Appearance> = const { std::cell::Cell::new(Appearance::Dark) };
+    /// The motion preference of the window being drawn. Not read from the OS.
+    static MOTION: std::cell::Cell<Motion> = const { std::cell::Cell::new(Motion::Full) };
 }
 
 /// The palette the window is drawn in now.
@@ -191,6 +224,17 @@ pub fn appearance() -> Appearance {
 /// Sets the palette the next draws use; the window calls it before drawing.
 pub fn set_appearance(appearance: Appearance) {
     APPEARANCE.with(|current| current.set(appearance));
+}
+
+/// Whether the window being drawn may play short motion.
+#[must_use]
+pub fn motion_allowed() -> bool {
+    MOTION.with(|current| current.get().allows_animation())
+}
+
+/// Sets the motion preference the next draws use. This does not consult the OS.
+pub fn set_motion(motion: Motion) {
+    MOTION.with(|current| current.set(motion));
 }
 
 /// The value a token has in the current palette.
@@ -426,11 +470,18 @@ pub enum Zoom {
     Regular,
     /// 115% — larger text for high-density displays.
     Comfortable,
+    /// 200% — text and the metrics that keep it readable, the resize-text ceiling.
+    Largest,
 }
 
 impl Zoom {
     /// Every zoom level in display order.
-    pub const ALL: [Self; 3] = [Self::Compact, Self::Regular, Self::Comfortable];
+    pub const ALL: [Self; 4] = [
+        Self::Compact,
+        Self::Regular,
+        Self::Comfortable,
+        Self::Largest,
+    ];
 
     /// Multiplier applied to every logical length.
     pub fn factor(self) -> f32 {
@@ -438,6 +489,7 @@ impl Zoom {
             Self::Compact => 0.9,
             Self::Regular => 1.0,
             Self::Comfortable => 1.15,
+            Self::Largest => 2.0,
         }
     }
 
@@ -447,6 +499,7 @@ impl Zoom {
             Self::Compact => "90%",
             Self::Regular => "100%",
             Self::Comfortable => "115%",
+            Self::Largest => "200%",
         }
     }
 

@@ -1,7 +1,7 @@
 //! Destination model for the navigation rail (R12).
 //!
-//! Navigation is a fixed list of four destinations — local shells, hosts,
-//! sessions and transfers — because those are the objects the product organises
+//! Navigation is a fixed list of five destinations — local shells, hosts,
+//! sessions, transfers and forwards — because those are the objects the product organises
 //! work around. The list is a model, not a layout: a future layout can render it
 //! as a rail, a tab strip or a palette without touching the destinations.
 //!
