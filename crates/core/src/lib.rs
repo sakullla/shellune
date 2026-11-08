@@ -46,8 +46,9 @@ pub use session::{
 };
 pub use shell::LocalShell;
 pub use task::{
-    OverwriteChoice, PARTIAL_PREFIX, Transfer, TransferDirection, TransferEvent, TransferFailure,
-    TransferQueue, TransferState, TransferUpdate, TransferUpdateError, partial_path,
+    OverwriteChoice, PARTIAL_PREFIX, PartialRecord, ResumeHint, ResumeRefusal, Transfer,
+    TransferDirection, TransferEvent, TransferFailure, TransferQueue, TransferState,
+    TransferUpdate, TransferUpdateError, partial_path,
 };
 pub use workspace::{
     PaneNode, PaneTarget, PanelConfig, PanelSection, PendingConnection, PendingPane, RestoredNode,

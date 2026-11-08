@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use shellune_core::{
-    AuthMethod, OverwriteChoice, PARTIAL_PREFIX, TransferDirection, TransferEvent, TransferFailure,
-    TransferId, TransferUpdate,
+    AuthMethod, OverwriteChoice, PARTIAL_PREFIX, ResumeHint, TransferDirection, TransferEvent,
+    TransferFailure, TransferId, TransferUpdate,
 };
 use shellune_ssh::testserver::Harness;
 use shellune_ssh::{
@@ -219,6 +219,43 @@ impl Recorder {
         }
     }
 
+    /// Waits until one task reported a checkpoint that is still short of `total`.
+    fn until_partial_checkpoint(
+        &mut self,
+        link: &mut TransferLink,
+        id: TransferId,
+        total: u64,
+    ) -> ResumeHint {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            self.collect(link);
+            let found = self
+                .updates(id)
+                .into_iter()
+                .rev()
+                .find_map(|update| match update {
+                    TransferUpdate::Checkpoint(hint) if hint.offset > 0 && hint.offset < total => {
+                        Some(hint.clone())
+                    }
+                    _ => None,
+                });
+            if let Some(hint) = found {
+                return hint;
+            }
+            assert!(
+                !self.finished(id),
+                "the transfer finished before a partial checkpoint: {:?}",
+                self.updates(id)
+            );
+            assert!(
+                Instant::now() < deadline,
+                "no partial checkpoint arrived: {:?}",
+                self.updates(id)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Waits until one task reported progress.
     fn until_progress(&mut self, link: &mut TransferLink, id: TransferId) {
         let deadline = Instant::now() + PATIENCE;
@@ -248,6 +285,17 @@ fn start(
     source: &str,
     destination: &str,
 ) -> TransferId {
+    start_from(link, direction, source, destination, None)
+}
+
+/// Starts one transfer, optionally from a checkpoint the worker must re-check.
+fn start_from(
+    link: &mut TransferLink,
+    direction: TransferDirection,
+    source: &str,
+    destination: &str,
+    resume: Option<ResumeHint>,
+) -> TransferId {
     let id = TransferId::new();
     assert!(
         link.send(TransferCommand::Start(TransferRequest {
@@ -255,6 +303,7 @@ fn start(
             direction,
             source: source.to_owned(),
             destination: destination.to_owned(),
+            resume,
         })),
         "the transfer reaches the connection"
     );
@@ -362,6 +411,89 @@ fn shell_echo(session: &mut RemoteSession, text: &str) -> String {
 /// Whether a listing holds a temporary file of the transfer worker.
 fn has_partial(listing: &[String]) -> bool {
     listing.iter().any(|name| name.contains(".shellune-part-"))
+}
+
+/// An upload cancelled after a confirmed prefix, with the target still absent.
+struct HeldUpload {
+    directory: String,
+    remote: String,
+    local: PathBuf,
+    scratch: PathBuf,
+    bytes: Vec<u8>,
+    hint: ResumeHint,
+    partial: String,
+}
+
+/// Uploads until a checkpoint exists, then cancels. The target must not exist.
+fn hold_upload(
+    server: &Harness,
+    link: &mut TransferLink,
+    name: &str,
+    len: usize,
+) -> (Recorder, HeldUpload) {
+    let directory = own_directory(server, name);
+    let remote = format!("{directory}/{name}.bin");
+    let bytes = sample(len);
+    let scratch = scratch_directory(name);
+    let local = local_file(&scratch, &format!("{name}.bin"), &bytes);
+    let mut recorder = Recorder::default();
+    let id = start(
+        link,
+        TransferDirection::Upload,
+        local.to_string_lossy().as_ref(),
+        &remote,
+    );
+    recorder.until_partial_checkpoint(link, id, bytes.len() as u64);
+    cancel(link, id);
+    let held = match recorder.until_finished(link, id) {
+        TransferUpdate::Cancelled { residue, resume } => {
+            let hint = resume.expect("a confirmed prefix is kept with its checkpoint");
+            let partial = residue.expect("the partial file is named");
+            assert!(hint.offset > 0, "the checkpoint names real bytes");
+            assert!(
+                hint.offset < bytes.len() as u64,
+                "the cancel landed before the whole file was confirmed"
+            );
+            assert!(
+                server_size(server, &remote).is_none(),
+                "cancelling does not create the target"
+            );
+            let partial_size = server_size(server, &partial);
+            assert!(
+                partial_size.is_some_and(|size| size >= hint.offset && size < bytes.len() as u64),
+                "the partial file holds the confirmed prefix and not the finished target: {partial_size:?}"
+            );
+            assert!(
+                !recorder
+                    .updates(id)
+                    .iter()
+                    .any(|update| matches!(update, TransferUpdate::Completed { .. })),
+                "a cancelled upload is not completed"
+            );
+            HeldUpload {
+                directory,
+                remote,
+                local,
+                scratch,
+                bytes,
+                hint,
+                partial,
+            }
+        }
+        other => panic!("a cancelled upload must end cancelled: {other:?}"),
+    };
+    (recorder, held)
+}
+
+/// The first progress a task reported, which is the offset a resume must start from.
+fn first_progress(recorder: &Recorder, id: TransferId) -> Option<u64> {
+    recorder
+        .updates(id)
+        .into_iter()
+        .find_map(|update| match update {
+            TransferUpdate::Progress { transferred, .. } => Some(*transferred),
+            _ => None,
+        })
 }
 
 #[test]
@@ -549,7 +681,7 @@ fn an_existing_target_is_untouched_until_the_answer_says_to_replace_it() {
     // Keeping it ends the transfer without writing anything.
     decide(&mut link, id, OverwriteChoice::KeepExisting);
     match recorder.until_finished(&mut link, id) {
-        TransferUpdate::Cancelled { residue } => assert_eq!(
+        TransferUpdate::Cancelled { residue, .. } => assert_eq!(
             residue, None,
             "keeping the existing file leaves no partial file of its own"
         ),
@@ -597,45 +729,88 @@ fn an_existing_target_is_untouched_until_the_answer_says_to_replace_it() {
 }
 
 #[test]
-fn a_cancelled_upload_leaves_no_partial_file_and_no_target() {
+fn a_cancelled_upload_keeps_a_confirmed_prefix_and_does_not_create_the_target() {
     if skip("cancelling a transfer") {
         return;
     }
     let server = shared().as_ref().expect("a server");
-    let directory = own_directory(server, "cancel");
-    let remote = format!("{directory}/cancelled.bin");
-    // Large enough that the transfer is still running when the cancel arrives.
-    let bytes = sample(24 * 1024 * 1024);
-    let scratch = scratch_directory("cancel");
-    let local = local_file(&scratch, "big.bin", &bytes);
-
     let (mut session, mut link) = live_with_link(server);
-    let mut recorder = Recorder::default();
-    let id = start(
-        &mut link,
-        TransferDirection::Upload,
-        local.to_string_lossy().as_ref(),
-        &remote,
-    );
-    recorder.until_progress(&mut link, id);
-    cancel(&mut link, id);
-    match recorder.until_finished(&mut link, id) {
-        TransferUpdate::Cancelled { residue } => assert_eq!(
-            residue, None,
-            "a cancelled transfer cleans its temporary file up"
-        ),
-        other => panic!("a cancelled upload must end cancelled: {other:?}"),
-    }
-    let listing = server_listing(server, &directory);
+    let (_recorder, held) = hold_upload(server, &mut link, "cancel", 16 * 1024 * 1024);
+    let listing = server_listing(server, &held.directory);
     assert!(
-        !listing.iter().any(|name| name == "cancelled.bin"),
+        !listing.iter().any(|name| name == "cancel.bin"),
         "the target of a cancelled transfer does not exist: {listing:?}"
     );
     assert!(
-        !has_partial(&listing),
-        "no partial file is left: {listing:?}"
+        has_partial(&listing),
+        "the confirmed prefix stays so it can be checked again: {listing:?}"
     );
     shell_echo(&mut session, "shellune-after-cancel");
+    session.close();
+    let _ = std::fs::remove_file(&held.hint.record);
+    let _ = shell(server, &format!("rm -rf '{}'", held.directory));
+    let _ = std::fs::remove_dir_all(&held.scratch);
+}
+
+#[test]
+fn cancelling_the_overwrite_question_writes_nothing() {
+    if skip("cancelling an overwrite question") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let directory = own_directory(server, "cancel-ask");
+    let remote = format!("{directory}/existing.txt");
+    let original = b"the original content that must survive a cancelled question".to_vec();
+    let replacement = b"replacement bytes that must not be written".to_vec();
+    let scratch = scratch_directory("cancel-ask");
+    let first = local_file(&scratch, "first.txt", &original);
+    let second = local_file(&scratch, "second.txt", &replacement);
+
+    let (mut session, mut link) = live_with_link(server);
+    let mut recorder = Recorder::default();
+    let seed = start(
+        &mut link,
+        TransferDirection::Upload,
+        first.to_string_lossy().as_ref(),
+        &remote,
+    );
+    assert!(matches!(
+        recorder.until_finished(&mut link, seed),
+        TransferUpdate::Completed { .. }
+    ));
+
+    let id = start(
+        &mut link,
+        TransferDirection::Upload,
+        second.to_string_lossy().as_ref(),
+        &remote,
+    );
+    recorder.until_asked(&mut link, id);
+    cancel(&mut link, id);
+    match recorder.until_finished(&mut link, id) {
+        TransferUpdate::Cancelled { residue, resume } => {
+            assert_eq!(residue, None);
+            assert!(
+                resume.is_none(),
+                "a question that wrote nothing has no prefix"
+            );
+        }
+        other => panic!("cancelling the question must end cancelled: {other:?}"),
+    }
+    let kept = shell(server, &format!("cat '{remote}'")).expect("the server reads the file");
+    assert_eq!(kept.as_bytes(), original.as_slice());
+    assert!(
+        !has_partial(&server_listing(server, &directory)),
+        "cancelling the question leaves no temporary file"
+    );
+    assert!(
+        !recorder.updates(id).iter().any(|update| matches!(
+            update,
+            TransferUpdate::Completed { .. } | TransferUpdate::Progress { .. }
+        )),
+        "the cancelled question never started writing: {:?}",
+        recorder.updates(id)
+    );
     session.close();
     let _ = std::fs::remove_dir_all(&scratch);
 }
@@ -713,7 +888,9 @@ fn a_target_that_cannot_be_replaced_is_reported_without_claiming_success() {
     recorder.until_asked(&mut link, id);
     decide(&mut link, id, OverwriteChoice::Replace);
     match recorder.until_finished(&mut link, id) {
-        TransferUpdate::Failed { failure, residue } => {
+        TransferUpdate::Failed {
+            failure, residue, ..
+        } => {
             assert_eq!(
                 failure,
                 TransferFailure::FinalizeFailed,
@@ -796,7 +973,9 @@ chown {user}: '{mount_point}'",
         "a full disk cannot produce a complete target"
     );
     match finish {
-        TransferUpdate::Failed { failure, residue } => {
+        TransferUpdate::Failed {
+            failure, residue, ..
+        } => {
             assert_eq!(
                 failure,
                 TransferFailure::NoSpace,
@@ -1017,5 +1196,410 @@ fn a_transfer_of_one_connection_is_never_reported_on_another() {
         "a transfer of one connection is never reported on another"
     );
     first_session.close();
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Reads a remote file back through a download and returns the bytes.
+fn read_back(
+    link: &mut TransferLink,
+    recorder: &mut Recorder,
+    remote: &str,
+    name: &str,
+) -> Vec<u8> {
+    let directory = scratch_directory(name);
+    let back = directory.join("back.bin");
+    let id = start(
+        link,
+        TransferDirection::Download,
+        remote,
+        back.to_string_lossy().as_ref(),
+    );
+    match recorder.until_finished(link, id) {
+        TransferUpdate::Completed { .. } => {}
+        other => panic!("the read-back download did not complete: {other:?}"),
+    }
+    let bytes = std::fs::read(&back).expect("the downloaded file exists");
+    let _ = std::fs::remove_dir_all(&directory);
+    bytes
+}
+
+fn assert_refused(update: &TransferUpdate, reason: shellune_core::ResumeRefusal) {
+    match update {
+        TransferUpdate::Failed {
+            failure: TransferFailure::ResumeRefused { reason: got },
+            ..
+        } => assert_eq!(*got, reason),
+        other => panic!("the resume must be refused, not finished: {other:?}"),
+    }
+}
+
+fn assert_no_fake_progress(recorder: &Recorder, id: TransferId) {
+    assert!(
+        recorder.updates(id).iter().all(|update| !matches!(
+            update,
+            TransferUpdate::Progress { .. }
+                | TransferUpdate::Completed { .. }
+                | TransferUpdate::Started
+        )),
+        "a refused resume writes nothing and reports no progress: {:?}",
+        recorder.updates(id)
+    );
+}
+
+#[test]
+fn a_verified_prefix_resumes_from_its_offset_and_the_finished_file_matches() {
+    if skip("resuming an upload") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let (mut session, mut link) = live_with_link(server);
+    let (mut recorder, held) = hold_upload(server, &mut link, "resume", 16 * 1024 * 1024);
+    let offset = held.hint.offset;
+
+    let id = start_from(
+        &mut link,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+        Some(held.hint.clone()),
+    );
+    match recorder.until_finished(&mut link, id) {
+        TransferUpdate::Completed { bytes } => {
+            assert_eq!(bytes, held.bytes.len() as u64);
+        }
+        other => panic!("the resumed upload did not complete: {other:?}"),
+    }
+    assert_eq!(
+        first_progress(&recorder, id),
+        Some(offset),
+        "the first progress is the confirmed offset, not zero and not a guess"
+    );
+    assert!(
+        recorder.updates(id).iter().all(|update| match update {
+            TransferUpdate::Progress { transferred, .. } => *transferred >= offset,
+            TransferUpdate::Completed { bytes } => *bytes == held.bytes.len() as u64,
+            _ => true,
+        }),
+        "progress never goes backwards and completion is the whole file: {:?}",
+        recorder.updates(id)
+    );
+    assert_eq!(
+        server_size(server, &held.remote),
+        Some(held.bytes.len() as u64)
+    );
+    assert!(
+        !has_partial(&server_listing(server, &held.directory)),
+        "the temporary file was renamed onto the target"
+    );
+    assert_eq!(
+        read_back(&mut link, &mut recorder, &held.remote, "resume-back"),
+        held.bytes,
+        "the target holds the bytes that were uploaded"
+    );
+    assert!(
+        !Path::new(&held.hint.record).exists(),
+        "a finished resume removes its checkpoint"
+    );
+    session.close();
+    let _ = shell(server, &format!("rm -rf '{}'", held.directory));
+    let _ = std::fs::remove_dir_all(&held.scratch);
+}
+
+#[test]
+fn a_changed_source_is_not_resumed_and_a_new_transfer_starts_over() {
+    if skip("a changed source") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let (mut session, mut link) = live_with_link(server);
+    let (mut recorder, held) = hold_upload(server, &mut link, "changed", 16 * 1024 * 1024);
+    let mut changed = held.bytes.clone();
+    changed.extend_from_slice(b"-changed");
+    std::fs::write(&held.local, &changed).expect("the source can be replaced");
+
+    let refused = start_from(
+        &mut link,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+        Some(held.hint.clone()),
+    );
+    let update = recorder.until_finished(&mut link, refused);
+    assert_refused(&update, shellune_core::ResumeRefusal::SourceChanged);
+    assert_no_fake_progress(&recorder, refused);
+    assert!(server_size(server, &held.remote).is_none());
+    assert!(
+        server_size(server, &held.partial).is_none(),
+        "a prefix that no longer matches the source is not kept as a resume"
+    );
+
+    let fresh = start(
+        &mut link,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+    );
+    match recorder.until_finished(&mut link, fresh) {
+        TransferUpdate::Completed { bytes } => assert_eq!(bytes, changed.len() as u64),
+        other => panic!("the new transfer did not complete: {other:?}"),
+    }
+    assert!(
+        matches!(
+            recorder.updates(fresh).first().copied(),
+            Some(TransferUpdate::Started)
+        ),
+        "a transfer that cannot resume starts from the beginning: {:?}",
+        recorder.updates(fresh)
+    );
+    assert_ne!(fresh, refused);
+    assert_eq!(
+        read_back(&mut link, &mut recorder, &held.remote, "changed-back"),
+        changed
+    );
+    session.close();
+    let _ = std::fs::remove_file(&held.hint.record);
+    let _ = shell(server, &format!("rm -rf '{}'", held.directory));
+    let _ = std::fs::remove_dir_all(&held.scratch);
+}
+
+#[test]
+fn an_unverifiable_or_damaged_partial_is_transferred_again_from_the_start() {
+    if skip("an unverifiable partial") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let (mut session, mut link) = live_with_link(server);
+    let (mut recorder, held) = hold_upload(server, &mut link, "unverifiable", 8 * 1024 * 1024);
+    std::fs::remove_file(&held.hint.record).expect("the checkpoint file can be removed");
+
+    let missing = start_from(
+        &mut link,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+        Some(held.hint.clone()),
+    );
+    let update = recorder.until_finished(&mut link, missing);
+    assert_refused(&update, shellune_core::ResumeRefusal::Unverifiable);
+    assert_no_fake_progress(&recorder, missing);
+    assert!(server_size(server, &held.remote).is_none());
+    assert!(
+        server_size(server, &held.partial).is_some(),
+        "a checkpoint that cannot be read leaves the partial file in place"
+    );
+    let _ = shell(server, &format!("rm -rf '{}'", held.directory));
+    let _ = std::fs::remove_dir_all(&held.scratch);
+
+    // A damaged prefix is a different refusal, and it is not resumed either.
+    let (mut recorder, held) = hold_upload(server, &mut link, "damaged", 8 * 1024 * 1024);
+    // The sample's first byte is already zero, so the change has to be a different byte.
+    shell(
+        server,
+        &format!(
+            "printf '\\377' | dd of='{}' bs=1 count=1 conv=notrunc status=none",
+            held.partial
+        ),
+    )
+    .expect("the partial file can be altered");
+    let damaged = start_from(
+        &mut link,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+        Some(held.hint.clone()),
+    );
+    let update = recorder.until_finished(&mut link, damaged);
+    assert_refused(&update, shellune_core::ResumeRefusal::PartialDamaged);
+    assert_no_fake_progress(&recorder, damaged);
+    assert!(server_size(server, &held.remote).is_none());
+
+    let fresh = start(
+        &mut link,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+    );
+    match recorder.until_finished(&mut link, fresh) {
+        TransferUpdate::Completed { bytes } => assert_eq!(bytes, held.bytes.len() as u64),
+        other => panic!("the replacement transfer did not complete: {other:?}"),
+    }
+    assert!(
+        matches!(
+            recorder.updates(fresh).first().copied(),
+            Some(TransferUpdate::Started)
+        ),
+        "the replacement transfer starts from the first byte: {:?}",
+        recorder.updates(fresh)
+    );
+    assert_eq!(
+        read_back(&mut link, &mut recorder, &held.remote, "damaged-back"),
+        held.bytes
+    );
+    assert_ne!(fresh, damaged);
+    session.close();
+    let _ = shell(server, &format!("rm -rf '{}'", held.directory));
+    let _ = std::fs::remove_dir_all(&held.scratch);
+}
+
+#[test]
+fn a_verified_download_resumes_from_its_offset_and_matches_the_server() {
+    if skip("resuming a download") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let directory = own_directory(server, "down-resume");
+    let bytes = sample(8 * 1024 * 1024);
+    let scratch = scratch_directory("down-resume-src");
+    let local = local_file(&scratch, "source.bin", &bytes);
+    let remote = format!("{directory}/source.bin");
+
+    let (mut session, mut link) = live_with_link(server);
+    let mut recorder = Recorder::default();
+    let seed = start(
+        &mut link,
+        TransferDirection::Upload,
+        local.to_string_lossy().as_ref(),
+        &remote,
+    );
+    assert!(matches!(
+        recorder.until_finished(&mut link, seed),
+        TransferUpdate::Completed { .. }
+    ));
+
+    let target_dir = scratch_directory("down-resume");
+    let target = target_dir.join("source.bin");
+    let id = start(
+        &mut link,
+        TransferDirection::Download,
+        &remote,
+        target.to_string_lossy().as_ref(),
+    );
+    recorder.until_partial_checkpoint(&mut link, id, bytes.len() as u64);
+    cancel(&mut link, id);
+    let hint = match recorder.until_finished(&mut link, id) {
+        TransferUpdate::Cancelled { residue, resume } => {
+            assert!(
+                !target.exists(),
+                "a cancelled download does not create the target"
+            );
+            let hint = resume.expect("the confirmed prefix is kept");
+            let partial = residue.expect("the local partial file is named");
+            let size = std::fs::metadata(&partial)
+                .expect("the partial file exists")
+                .len();
+            assert!(size >= hint.offset && size < bytes.len() as u64);
+            assert!(hint.offset > 0);
+            hint
+        }
+        other => panic!("the cancelled download must end cancelled: {other:?}"),
+    };
+
+    let resumed = start_from(
+        &mut link,
+        TransferDirection::Download,
+        &remote,
+        target.to_string_lossy().as_ref(),
+        Some(hint.clone()),
+    );
+    match recorder.until_finished(&mut link, resumed) {
+        TransferUpdate::Completed { bytes: moved } => assert_eq!(moved, bytes.len() as u64),
+        other => panic!("the resumed download did not complete: {other:?}"),
+    }
+    assert_eq!(first_progress(&recorder, resumed), Some(hint.offset));
+    assert_eq!(std::fs::read(&target).expect("the file was written"), bytes);
+    let left: Vec<String> = target_dir
+        .read_dir()
+        .expect("the folder is readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !left.iter().any(|name| name.contains(".shellune-part-")),
+        "the temporary file was renamed onto the target: {left:?}"
+    );
+
+    session.close();
+    let _ = shell(server, &format!("rm -rf '{directory}'"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&target_dir);
+}
+
+#[test]
+fn closing_one_connection_does_not_stop_the_other_transfers() {
+    if skip("two connections") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let first_dir = own_directory(server, "close-one");
+    let second_dir = own_directory(server, "close-two");
+    let bytes = sample(16 * 1024 * 1024);
+    let scratch = scratch_directory("close-two-sessions");
+    let local = local_file(&scratch, "shared.bin", &bytes);
+    let first_remote = format!("{first_dir}/one.bin");
+    let second_remote = format!("{second_dir}/two.bin");
+
+    let (mut first_session, mut first_link) = live_with_link(server);
+    let (mut second_session, mut second_link) = live_with_link(server);
+    let mut first_recorder = Recorder::default();
+    let mut second_recorder = Recorder::default();
+    let first_id = start(
+        &mut first_link,
+        TransferDirection::Upload,
+        local.to_string_lossy().as_ref(),
+        &first_remote,
+    );
+    let second_id = start(
+        &mut second_link,
+        TransferDirection::Upload,
+        local.to_string_lossy().as_ref(),
+        &second_remote,
+    );
+    first_recorder.until_progress(&mut first_link, first_id);
+    second_recorder.until_progress(&mut second_link, second_id);
+
+    first_session.close();
+    let wait_until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < wait_until {
+        first_recorder.collect(&mut first_link);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !first_recorder
+            .updates(first_id)
+            .iter()
+            .any(|update| matches!(update, TransferUpdate::Completed { .. })),
+        "closing the first connection does not complete its transfer: {:?}",
+        first_recorder.updates(first_id)
+    );
+    if let Some(size) = server_size(server, &first_remote) {
+        assert_ne!(size, bytes.len() as u64);
+    }
+
+    match second_recorder.until_finished(&mut second_link, second_id) {
+        TransferUpdate::Completed { bytes: moved } => assert_eq!(moved, bytes.len() as u64),
+        other => panic!("the second connection's transfer must finish: {other:?}"),
+    }
+    assert!(
+        second_recorder
+            .events
+            .iter()
+            .all(|event| event.transfer == second_id),
+        "the second connection only reports its own task"
+    );
+    assert_eq!(
+        server_size(server, &second_remote),
+        Some(bytes.len() as u64)
+    );
+    assert_eq!(
+        read_back(
+            &mut second_link,
+            &mut second_recorder,
+            &second_remote,
+            "close-two-back"
+        ),
+        bytes
+    );
+    second_session.close();
+    let _ = shell(server, &format!("rm -rf '{first_dir}' '{second_dir}'"));
     let _ = std::fs::remove_dir_all(&scratch);
 }

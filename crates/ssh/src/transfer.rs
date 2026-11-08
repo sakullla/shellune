@@ -12,27 +12,32 @@
 //!   target. Only after that file is closed and its size checked is it renamed onto the
 //!   target, which is why [`TransferUpdate::Completed`] means "the target holds the
 //!   content" and never "the temporary file was written";
-//! * a cancellation or failure removes the temporary file and says so when it could
-//!   not, because a partial file nobody mentions is worse than one that is named. The
-//!   one case that does not remove it is a replacement that failed after the old target
-//!   was already gone: there the completed copy is the only one left, so it is kept and
-//!   named instead;
+//! * a cancellation or failure removes the temporary file when the bytes already
+//!   written cannot be checked again. A prefix that was flushed and recorded is kept,
+//!   with its checkpoint, so a later attempt can resume it. A partial file nobody
+//!   mentions is still worse than one that is named. The other case that keeps a file
+//!   is a replacement that failed after the old target was already gone: there the
+//!   completed copy is the only one left, so it is kept and named;
 //! * every event carries the task's [`TransferId`], so a message from an attempt that
-//!   already ended cannot make a newer task look finished. Retrying starts a new task
-//!   from zero bytes: nothing here resumes a previous attempt.
+//!   already ended cannot make a newer task look finished. A new attempt resumes only
+//!   when its request carries a checkpoint and the source and partial file still match
+//!   it. Otherwise it reports that refusal and writes nothing, and a restart with no
+//!   checkpoint begins at the first byte.
 
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::{Config, SftpSession};
-use russh_sftp::protocol::StatusCode;
+use russh_sftp::protocol::{OpenFlags, StatusCode};
+use sha2::{Digest, Sha256};
 use shellune_core::{
-    OverwriteChoice, Transfer, TransferDirection, TransferEvent, TransferFailure, TransferId,
-    TransferUpdate, parent_path,
+    OverwriteChoice, PartialRecord, ResumeHint, ResumeRefusal, Transfer, TransferDirection,
+    TransferEvent, TransferFailure, TransferId, TransferUpdate, parent_path,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
@@ -71,6 +76,8 @@ pub struct TransferRequest {
     pub source: String,
     /// Remote path for an upload, local file for a download.
     pub destination: String,
+    /// A checkpoint to re-check before continuing. `None` starts at the first byte.
+    pub resume: Option<ResumeHint>,
 }
 
 impl TransferRequest {
@@ -82,6 +89,7 @@ impl TransferRequest {
             direction: transfer.direction(),
             source: transfer.source().to_owned(),
             destination: transfer.destination().to_owned(),
+            resume: transfer.resume_hint().cloned(),
         }
     }
 }
@@ -215,10 +223,11 @@ pub(crate) async fn serve(wiring: Wiring, commands: UnboundedSender<Command>) {
 enum End {
     /// The target holds the transferred content.
     Completed(u64),
-    /// The transfer stopped; the optional path is a partial file that stayed behind.
-    Failed(TransferFailure, Option<String>),
-    /// The user stopped it; the optional path is a partial file that stayed behind.
-    Cancelled(Option<String>),
+    /// The transfer stopped. The path is a partial file that stayed, and the hint is
+    /// present only when that file was kept because its prefix can be checked again.
+    Failed(TransferFailure, Option<String>, Option<ResumeHint>),
+    /// The user stopped it. The hint is present only for a prefix that was kept.
+    Cancelled(Option<String>, Option<ResumeHint>),
 }
 
 /// The user's answer about an existing target.
@@ -253,6 +262,10 @@ impl Job {
 
     fn progress(&self, transferred: u64, total: Option<u64>) {
         self.report(TransferUpdate::Progress { transferred, total });
+    }
+
+    fn checkpoint(&self, hint: ResumeHint) {
+        self.report(TransferUpdate::Checkpoint(hint));
     }
 
     /// Waits for the answer about an existing target.
@@ -307,6 +320,7 @@ async fn run(
             job.report(TransferUpdate::Failed {
                 failure,
                 residue: None,
+                resume: None,
             });
             return;
         }
@@ -317,8 +331,16 @@ async fn run(
     };
     match end {
         End::Completed(bytes) => job.report(TransferUpdate::Completed { bytes }),
-        End::Failed(failure, residue) => job.report(TransferUpdate::Failed { failure, residue }),
-        End::Cancelled(residue) => job.report(TransferUpdate::Cancelled { residue }),
+        End::Failed(failure, residue, resume) => {
+            job.report(TransferUpdate::Failed {
+                failure,
+                residue,
+                resume,
+            });
+        }
+        End::Cancelled(residue, resume) => {
+            job.report(TransferUpdate::Cancelled { residue, resume });
+        }
     }
     let _ = session.close().await;
 }
@@ -352,51 +374,183 @@ async fn open(commands: &UnboundedSender<Command>) -> Result<SftpSession, Transf
         })
 }
 
+/// Source identity captured before this attempt writes.
+struct SourceIdentity {
+    size: u64,
+    modified_unix: Option<u64>,
+    /// SHA-256 of the whole source, only when no mtime could be recorded.
+    content_sha256: Option<String>,
+}
+
+/// Bytes confirmed for one partial file, and the checkpoint that names them.
+struct Ledger {
+    original: TransferId,
+    direction: TransferDirection,
+    source: String,
+    destination: String,
+    identity: SourceIdentity,
+    generation: u64,
+    offset: u64,
+    hasher: Sha256,
+    partial: String,
+    record_path: PathBuf,
+}
+
+impl Ledger {
+    fn fresh(
+        id: TransferId,
+        request: &TransferRequest,
+        identity: SourceIdentity,
+        partial: String,
+    ) -> Self {
+        Self {
+            original: id,
+            direction: request.direction,
+            source: request.source.clone(),
+            destination: request.destination.clone(),
+            identity,
+            generation: 1,
+            offset: 0,
+            hasher: Sha256::new(),
+            partial,
+            record_path: resume_record_path(id),
+        }
+    }
+
+    fn note(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        self.offset += bytes.len() as u64;
+    }
+
+    fn prefix_hash(&self) -> String {
+        hex_encode(&self.hasher.clone().finalize())
+    }
+
+    fn record(&self) -> PartialRecord {
+        PartialRecord {
+            transfer: self.original,
+            direction: self.direction,
+            source: self.source.clone(),
+            destination: self.destination.clone(),
+            source_size: self.identity.size,
+            source_modified_unix: self.identity.modified_unix,
+            content_sha256: self.identity.content_sha256.clone(),
+            prefix_sha256: self.prefix_hash(),
+            confirmed_offset: self.offset,
+            generation: self.generation,
+        }
+    }
+
+    fn hint(&self) -> ResumeHint {
+        ResumeHint {
+            partial: self.partial.clone(),
+            record: self.record_path.display().to_string(),
+            offset: self.offset,
+            generation: self.generation,
+        }
+    }
+
+    async fn persist(&self) -> bool {
+        if self.offset == 0 {
+            return false;
+        }
+        write_record(&self.record_path, &self.record()).await
+    }
+
+    async fn publish(&self, job: &Job) {
+        if self.persist().await {
+            job.checkpoint(self.hint());
+        }
+    }
+}
+
+/// A resume that already re-checked the source and the partial file.
+struct Prepared<S, D> {
+    source: S,
+    destination: D,
+    ledger: Ledger,
+    written: u64,
+}
+
 /// Writes one local file into the remote directory, under a temporary name first.
 async fn upload(session: &SftpSession, request: &TransferRequest, job: &mut Job) -> End {
     let local = PathBuf::from(&request.source);
-    let total = match tokio::fs::metadata(&local).await {
-        Ok(metadata) if metadata.is_file() => Some(metadata.len()),
-        Ok(_) | Err(_) => return End::Failed(TransferFailure::SourceUnreadable, None),
+    let identity = match local_identity(&local).await {
+        Some(identity) => identity,
+        None => return End::Failed(TransferFailure::SourceUnreadable, None, None),
+    };
+    let total = Some(identity.size);
+    // A resume is refused before the overwrite question and before any write. The
+    // refusal carries no progress, so the old offset cannot be mistaken for this attempt.
+    let prepared = match prepare_upload(session, &local, &identity, request).await {
+        Ok(prepared) => prepared,
+        Err(end) => return end,
     };
     let target = request.destination.clone();
-    // The directory is what the server is asked about when a write fails for a reason it
-    // did not name: free space belongs to a file system, not to a file.
     let target_directory = parent_path(&target).unwrap_or_else(|| "/".to_owned());
-    // The question is asked before anything is created, so a refusal of it writes
-    // nothing at all.
     let existing = session.symlink_metadata(&target).await.is_ok();
     match ask_about_target(existing, total, job).await {
         Question::Replace => {}
+        // The question itself wrote nothing. A resumed partial belongs to the earlier
+        // task, so this attempt must not delete it on the way out.
         Question::Stop(end) => return end,
     }
+    if request.resume.is_some()
+        && local_identity(&local)
+            .await
+            .is_none_or(|again| !identity_matches(&identity, &again))
+    {
+        return End::Failed(
+            TransferFailure::ResumeRefused {
+                reason: ResumeRefusal::SourceChanged,
+            },
+            None,
+            None,
+        );
+    }
 
-    let temporary = remote_partial(&target, job.id);
-    let mut source = match tokio::fs::File::open(&local).await {
-        Ok(file) => file,
-        Err(_) => return End::Failed(TransferFailure::SourceUnreadable, None),
-    };
-    let mut remote = match session.create(&temporary).await {
-        Ok(file) => file,
-        Err(error) => return End::Failed(failure_of(&error), None),
+    let (temporary, mut source, mut remote, mut ledger, mut written) = match prepared {
+        Some(prepared) => {
+            let written = prepared.written;
+            job.progress(written, total);
+            (
+                prepared.ledger.partial.clone(),
+                prepared.source,
+                prepared.destination,
+                prepared.ledger,
+                written,
+            )
+        }
+        None => {
+            let temporary = remote_partial(&target, job.id);
+            let source = match tokio::fs::File::open(&local).await {
+                Ok(file) => file,
+                Err(_) => return End::Failed(TransferFailure::SourceUnreadable, None, None),
+            };
+            let remote = match session.create(&temporary).await {
+                Ok(file) => file,
+                Err(error) => return End::Failed(failure_of(&error), None, None),
+            };
+            let ledger = Ledger::fresh(job.id, request, identity, temporary.clone());
+            (temporary, source, remote, ledger, 0)
+        }
     };
 
-    let mut written = 0u64;
     let mut buffer = vec![0u8; CHUNK];
     let mut reported = Instant::now();
     loop {
         if job.interrupted() {
             drop(remote);
-            return End::Cancelled(discard_remote(session, &temporary).await);
+            let (residue, resume) = settle_remote(session, &ledger, &temporary, true).await;
+            return End::Cancelled(residue, resume);
         }
         let read = match source.read(&mut buffer).await {
             Ok(read) => read,
             Err(_) => {
                 drop(remote);
-                return End::Failed(
-                    TransferFailure::SourceUnreadable,
-                    discard_remote(session, &temporary).await,
-                );
+                let (residue, resume) =
+                    settle_remote(session, &ledger, &temporary, ledger.offset > 0).await;
+                return End::Failed(TransferFailure::SourceUnreadable, residue, resume);
             }
         };
         if read == 0 {
@@ -405,77 +559,75 @@ async fn upload(session: &SftpSession, request: &TransferRequest, job: &mut Job)
         if let Err(error) = remote.write_all(&buffer[..read]).await {
             drop(remote);
             let failure = write_failure(session, &target_directory, &error).await;
-            return End::Failed(failure, discard_remote(session, &temporary).await);
+            let (residue, resume) =
+                settle_remote(session, &ledger, &temporary, ledger.offset > 0).await;
+            return End::Failed(failure, residue, resume);
         }
+        // The server has acknowledged the bytes. Only then are they confirmed.
+        if let Err(error) = remote.flush().await {
+            drop(remote);
+            let failure = write_failure(session, &target_directory, &error).await;
+            let (residue, resume) =
+                settle_remote(session, &ledger, &temporary, ledger.offset > 0).await;
+            return End::Failed(failure, residue, resume);
+        }
+        ledger.note(&buffer[..read]);
         written += read as u64;
         if reported.elapsed() >= PROGRESS_INTERVAL {
+            ledger.publish(job).await;
             job.progress(written, total);
             reported = Instant::now();
         }
     }
+    ledger.publish(job).await;
     job.progress(written, total);
-    // A write onto a full disk can also surface when the handle is closed, because that
-    // is where the last queued write is answered.
     if let Err(error) = remote.shutdown().await {
         let failure = write_failure(session, &target_directory, &error).await;
-        return End::Failed(failure, discard_remote(session, &temporary).await);
+        let (residue, resume) =
+            settle_remote(session, &ledger, &temporary, ledger.offset > 0).await;
+        return End::Failed(failure, residue, resume);
     }
 
-    // The temporary file is the only thing that was written so far, so it is asked what
-    // it holds: a close that lost bytes must not become a rename that replaces a file.
     match session.metadata(&temporary).await {
         Ok(metadata) if metadata.size.is_some_and(|size| size == written) => {}
         Ok(_) => {
-            return End::Failed(
-                TransferFailure::FinalizeFailed,
-                discard_remote(session, &temporary).await,
-            );
+            let (residue, _) = settle_remote(session, &ledger, &temporary, false).await;
+            return End::Failed(TransferFailure::FinalizeFailed, residue, None);
         }
         Err(error) => {
-            return End::Failed(
-                failure_of(&error),
-                discard_remote(session, &temporary).await,
-            );
+            let (residue, resume) =
+                settle_remote(session, &ledger, &temporary, ledger.offset > 0).await;
+            return End::Failed(failure_of(&error), residue, resume);
         }
     }
 
-    if existing {
-        // SFTP's rename does not replace an existing name on every server, so the old
-        // target is removed first. Doing it now - after the bytes are complete - keeps
-        // the window in which the target is missing as small as it can be.
-        //
-        // A target that cannot be removed - a directory, or a name the server refuses to
-        // touch - is the final replacement failing: the temporary file is complete, the
-        // target is not what the user asked for, and only the server can say what it now
-        // holds. The complete copy stays where it is and is named as the residue: it is
-        // the only good copy left, so deleting it would lose both.
-        if session.remove_file(&target).await.is_err() {
-            return End::Failed(TransferFailure::FinalizeFailed, Some(temporary));
-        }
+    if existing && session.remove_file(&target).await.is_err() {
+        let (residue, resume) = settle_remote(session, &ledger, &temporary, true).await;
+        return End::Failed(TransferFailure::FinalizeFailed, residue, resume);
     }
     match session.rename(&temporary, &target).await {
-        Ok(()) => End::Completed(written),
-        // The target was already removed, so both copies would be lost by discarding
-        // this one: the bytes are complete, they simply never got the name the user
-        // asked for. It is kept and reported instead.
-        Err(_) => End::Failed(TransferFailure::FinalizeFailed, Some(temporary)),
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&ledger.record_path).await;
+            End::Completed(written)
+        }
+        Err(_) => {
+            let (residue, resume) = settle_remote(session, &ledger, &temporary, true).await;
+            End::Failed(TransferFailure::FinalizeFailed, residue, resume)
+        }
     }
 }
 
 /// Reads one remote file into the local directory, under a temporary name first.
 async fn download(session: &SftpSession, request: &TransferRequest, job: &mut Job) -> End {
-    let source = request.source.clone();
-    let total = match session.metadata(&source).await {
-        Ok(metadata) if metadata.is_dir() => {
-            return End::Failed(
-                TransferFailure::Refused {
-                    reason: "the source is a directory, not a file".to_owned(),
-                },
-                None,
-            );
-        }
-        Ok(metadata) => metadata.size,
-        Err(error) => return End::Failed(failure_of(&error), None),
+    let source_path = request.source.clone();
+    let identity = match remote_identity(session, &source_path).await {
+        Ok(identity) => identity,
+        Err(failure) => return End::Failed(failure, None, None),
+    };
+    let total = Some(identity.size);
+    let prepared = match prepare_download(session, &identity, request).await {
+        Ok(prepared) => prepared,
+        Err(end) => return end,
     };
     let target = PathBuf::from(&request.destination);
     let existing = tokio::fs::metadata(&target).await.is_ok();
@@ -483,33 +635,65 @@ async fn download(session: &SftpSession, request: &TransferRequest, job: &mut Jo
         Question::Replace => {}
         Question::Stop(end) => return end,
     }
+    if request.resume.is_some() {
+        match remote_identity(session, &source_path).await {
+            Ok(again) if identity_matches(&identity, &again) => {}
+            _ => {
+                return End::Failed(
+                    TransferFailure::ResumeRefused {
+                        reason: ResumeRefusal::SourceChanged,
+                    },
+                    None,
+                    None,
+                );
+            }
+        }
+    }
 
-    let temporary = local_partial(&target, job.id);
-    let mut destination = match tokio::fs::File::create(&temporary).await {
-        Ok(file) => file,
-        Err(_) => return End::Failed(TransferFailure::DestinationUnwritable, None),
-    };
-    let mut remote = match session.open(&source).await {
-        Ok(file) => file,
-        Err(error) => {
-            drop(destination);
-            return End::Failed(failure_of(&error), discard_local(&temporary).await);
+    let (temporary, mut remote, mut destination, mut ledger, mut written) = match prepared {
+        Some(prepared) => {
+            let written = prepared.written;
+            job.progress(written, total);
+            (
+                PathBuf::from(&prepared.ledger.partial),
+                prepared.source,
+                prepared.destination,
+                prepared.ledger,
+                written,
+            )
+        }
+        None => {
+            let temporary = local_partial(&target, job.id);
+            let destination = match tokio::fs::File::create(&temporary).await {
+                Ok(file) => file,
+                Err(_) => return End::Failed(TransferFailure::DestinationUnwritable, None, None),
+            };
+            let remote = match session.open(&source_path).await {
+                Ok(file) => file,
+                Err(error) => {
+                    let residue = discard_local(&temporary).await;
+                    return End::Failed(failure_of(&error), residue, None);
+                }
+            };
+            let ledger = Ledger::fresh(job.id, request, identity, temporary.display().to_string());
+            (temporary, remote, destination, ledger, 0)
         }
     };
 
-    let mut written = 0u64;
     let mut buffer = vec![0u8; CHUNK];
     let mut reported = Instant::now();
     loop {
         if job.interrupted() {
             drop(destination);
-            return End::Cancelled(discard_local(&temporary).await);
+            let (residue, resume) = settle_local(&ledger, &temporary, true).await;
+            return End::Cancelled(residue, resume);
         }
         let read = match remote.read(&mut buffer).await {
             Ok(read) => read,
             Err(error) => {
                 drop(destination);
-                return End::Failed(io_failure(&error), discard_local(&temporary).await);
+                let (residue, resume) = settle_local(&ledger, &temporary, ledger.offset > 0).await;
+                return End::Failed(io_failure(&error), residue, resume);
             }
         };
         if read == 0 {
@@ -517,44 +701,44 @@ async fn download(session: &SftpSession, request: &TransferRequest, job: &mut Jo
         }
         if destination.write_all(&buffer[..read]).await.is_err() {
             drop(destination);
-            return End::Failed(
-                TransferFailure::DestinationUnwritable,
-                discard_local(&temporary).await,
-            );
+            let (residue, resume) = settle_local(&ledger, &temporary, ledger.offset > 0).await;
+            return End::Failed(TransferFailure::DestinationUnwritable, residue, resume);
         }
+        if destination.flush().await.is_err() {
+            drop(destination);
+            let (residue, resume) = settle_local(&ledger, &temporary, ledger.offset > 0).await;
+            return End::Failed(TransferFailure::DestinationUnwritable, residue, resume);
+        }
+        ledger.note(&buffer[..read]);
         written += read as u64;
         if reported.elapsed() >= PROGRESS_INTERVAL {
+            ledger.publish(job).await;
             job.progress(written, total);
             reported = Instant::now();
         }
     }
+    ledger.publish(job).await;
     job.progress(written, total);
-    if destination.flush().await.is_err() {
+    if destination.flush().await.is_err() || destination.set_len(written).await.is_err() {
         drop(destination);
-        return End::Failed(
-            TransferFailure::DestinationUnwritable,
-            discard_local(&temporary).await,
-        );
+        let (residue, resume) = settle_local(&ledger, &temporary, false).await;
+        return End::Failed(TransferFailure::DestinationUnwritable, residue, resume);
     }
-    // The handle is closed before the rename: a platform that refuses to replace a file
-    // that is still open would otherwise report a finalize failure for a finished copy.
     drop(destination);
 
-    // As on the upload side: once the old target is gone, the completed copy is the
-    // only one left, so a replacement that fails keeps it and names it instead of
-    // throwing it away.
     if existing && tokio::fs::remove_file(&target).await.is_err() {
-        return End::Failed(
-            TransferFailure::FinalizeFailed,
-            Some(temporary.display().to_string()),
-        );
+        let (residue, resume) = settle_local(&ledger, &temporary, true).await;
+        return End::Failed(TransferFailure::FinalizeFailed, residue, resume);
     }
     match tokio::fs::rename(&temporary, &target).await {
-        Ok(()) => End::Completed(written),
-        Err(_) => End::Failed(
-            TransferFailure::FinalizeFailed,
-            Some(temporary.display().to_string()),
-        ),
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&ledger.record_path).await;
+            End::Completed(written)
+        }
+        Err(_) => {
+            let (residue, resume) = settle_local(&ledger, &temporary, true).await;
+            End::Failed(TransferFailure::FinalizeFailed, residue, resume)
+        }
     }
 }
 
@@ -573,7 +757,487 @@ async fn ask_about_target(existing: bool, total: Option<u64>, job: &mut Job) -> 
         // Keeping the existing file is the transfer ending without writing it: the
         // target is untouched, and the report says the transfer was cancelled rather
         // than completed.
-        Decision::Keep | Decision::Cancel => Question::Stop(End::Cancelled(None)),
+        Decision::Keep | Decision::Cancel => Question::Stop(End::Cancelled(None, None)),
+    }
+}
+
+async fn prepare_upload(
+    session: &SftpSession,
+    local: &Path,
+    identity: &SourceIdentity,
+    request: &TransferRequest,
+) -> Result<Option<Prepared<tokio::fs::File, russh_sftp::client::fs::File>>, End> {
+    let Some(hint) = &request.resume else {
+        return Ok(None);
+    };
+    match open_upload_resume(session, local, identity, request, hint).await {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(reason) => {
+            if matches!(
+                reason,
+                ResumeRefusal::SourceChanged | ResumeRefusal::PartialDamaged
+            ) {
+                let _ = discard_remote(session, &hint.partial).await;
+                let _ = tokio::fs::remove_file(&hint.record).await;
+            }
+            Err(End::Failed(
+                TransferFailure::ResumeRefused { reason },
+                None,
+                None,
+            ))
+        }
+    }
+}
+
+async fn open_upload_resume(
+    session: &SftpSession,
+    local: &Path,
+    identity: &SourceIdentity,
+    request: &TransferRequest,
+    hint: &ResumeHint,
+) -> Result<Prepared<tokio::fs::File, russh_sftp::client::fs::File>, ResumeRefusal> {
+    let record = load_matching_record(hint, request).await?;
+    assess_identity(
+        &record,
+        identity.size,
+        identity.modified_unix,
+        identity.content_sha256.as_deref(),
+    )?;
+    let partial_len = remote_len(session, &hint.partial).await?;
+    let partial_hash = hash_remote_prefix(session, &hint.partial, record.confirmed_offset)
+        .await
+        .ok_or(ResumeRefusal::PartialDamaged)?;
+    let mut source = tokio::fs::File::open(local)
+        .await
+        .map_err(|_| ResumeRefusal::Unverifiable)?;
+    let mut hasher = Sha256::new();
+    if !absorb(&mut source, &mut hasher, record.confirmed_offset).await {
+        return Err(ResumeRefusal::Unverifiable);
+    }
+    let source_hash = hex_encode(&hasher.clone().finalize());
+    assess_prefix(&record, partial_len, &partial_hash, &source_hash)?;
+    let mut remote = match session
+        .open_with_flags(&hint.partial, OpenFlags::WRITE)
+        .await
+    {
+        Ok(file) => file,
+        Err(_) => {
+            return Err(if session.metadata(&hint.partial).await.is_ok() {
+                ResumeRefusal::Unsupported
+            } else {
+                ResumeRefusal::PartialDamaged
+            });
+        }
+    };
+    if remote
+        .seek(SeekFrom::Start(record.confirmed_offset))
+        .await
+        .is_err()
+    {
+        return Err(ResumeRefusal::Unsupported);
+    }
+    let mut ledger = Ledger::fresh(
+        record.transfer,
+        request,
+        identity.clone(),
+        hint.partial.clone(),
+    );
+    ledger.generation = record.generation;
+    ledger.offset = record.confirmed_offset;
+    ledger.hasher = hasher;
+    ledger.record_path = PathBuf::from(&hint.record);
+    ledger.partial = hint.partial.clone();
+    Ok(Prepared {
+        source,
+        destination: remote,
+        written: record.confirmed_offset,
+        ledger,
+    })
+}
+
+async fn prepare_download(
+    session: &SftpSession,
+    identity: &SourceIdentity,
+    request: &TransferRequest,
+) -> Result<Option<Prepared<russh_sftp::client::fs::File, tokio::fs::File>>, End> {
+    let Some(hint) = &request.resume else {
+        return Ok(None);
+    };
+    match open_download_resume(session, identity, request, hint).await {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(reason) => {
+            if matches!(
+                reason,
+                ResumeRefusal::SourceChanged | ResumeRefusal::PartialDamaged
+            ) {
+                let _ = discard_local(Path::new(&hint.partial)).await;
+                let _ = tokio::fs::remove_file(&hint.record).await;
+            }
+            Err(End::Failed(
+                TransferFailure::ResumeRefused { reason },
+                None,
+                None,
+            ))
+        }
+    }
+}
+
+async fn open_download_resume(
+    session: &SftpSession,
+    identity: &SourceIdentity,
+    request: &TransferRequest,
+    hint: &ResumeHint,
+) -> Result<Prepared<russh_sftp::client::fs::File, tokio::fs::File>, ResumeRefusal> {
+    let record = load_matching_record(hint, request).await?;
+    assess_identity(
+        &record,
+        identity.size,
+        identity.modified_unix,
+        identity.content_sha256.as_deref(),
+    )?;
+    let partial_path = PathBuf::from(&hint.partial);
+    let partial_len = tokio::fs::metadata(&partial_path)
+        .await
+        .map_err(|_| ResumeRefusal::PartialDamaged)?
+        .len();
+    let partial_hash = hash_local_prefix(&partial_path, record.confirmed_offset)
+        .await
+        .ok_or(ResumeRefusal::PartialDamaged)?;
+    let mut remote = session
+        .open(&request.source)
+        .await
+        .map_err(|_| ResumeRefusal::Unverifiable)?;
+    let mut hasher = Sha256::new();
+    if !absorb(&mut remote, &mut hasher, record.confirmed_offset).await {
+        return Err(ResumeRefusal::Unverifiable);
+    }
+    let source_hash = hex_encode(&hasher.clone().finalize());
+    assess_prefix(&record, partial_len, &partial_hash, &source_hash)?;
+    let mut destination = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(&partial_path)
+        .await
+        .map_err(|_| ResumeRefusal::Unsupported)?;
+    if destination
+        .seek(SeekFrom::Start(record.confirmed_offset))
+        .await
+        .is_err()
+    {
+        return Err(ResumeRefusal::Unsupported);
+    }
+    let mut ledger = Ledger::fresh(
+        record.transfer,
+        request,
+        identity.clone(),
+        hint.partial.clone(),
+    );
+    ledger.generation = record.generation;
+    ledger.offset = record.confirmed_offset;
+    ledger.hasher = hasher;
+    ledger.record_path = PathBuf::from(&hint.record);
+    Ok(Prepared {
+        source: remote,
+        destination,
+        written: record.confirmed_offset,
+        ledger,
+    })
+}
+
+async fn load_matching_record(
+    hint: &ResumeHint,
+    request: &TransferRequest,
+) -> Result<PartialRecord, ResumeRefusal> {
+    let record = read_record(Path::new(&hint.record)).await?;
+    assess_hint(&record, hint, request)?;
+    Ok(record)
+}
+
+fn assess_hint(
+    record: &PartialRecord,
+    hint: &ResumeHint,
+    request: &TransferRequest,
+) -> Result<(), ResumeRefusal> {
+    if record.direction != request.direction
+        || record.source != request.source
+        || record.destination != request.destination
+        || record.generation != hint.generation
+        || record.confirmed_offset != hint.offset
+        || record.prefix_sha256.len() != 64
+        || hint.offset == 0
+        || hint.partial.is_empty()
+    {
+        return Err(ResumeRefusal::Unverifiable);
+    }
+    if record.confirmed_offset > record.source_size {
+        return Err(ResumeRefusal::PartialDamaged);
+    }
+    Ok(())
+}
+
+fn assess_identity(
+    record: &PartialRecord,
+    size: u64,
+    modified_unix: Option<u64>,
+    content_sha256: Option<&str>,
+) -> Result<(), ResumeRefusal> {
+    if size != record.source_size {
+        return Err(ResumeRefusal::SourceChanged);
+    }
+    match record.source_modified_unix {
+        Some(expected) => match modified_unix {
+            Some(actual) if actual == expected => Ok(()),
+            Some(_) => Err(ResumeRefusal::SourceChanged),
+            None => Err(ResumeRefusal::Unverifiable),
+        },
+        None => match (record.content_sha256.as_deref(), content_sha256) {
+            (Some(expected), Some(actual)) if expected == actual => Ok(()),
+            (Some(_), Some(_)) => Err(ResumeRefusal::SourceChanged),
+            _ => Err(ResumeRefusal::Unverifiable),
+        },
+    }
+}
+
+fn assess_prefix(
+    record: &PartialRecord,
+    partial_len: u64,
+    partial_hash: &str,
+    source_hash: &str,
+) -> Result<(), ResumeRefusal> {
+    if partial_len < record.confirmed_offset || partial_len > record.source_size {
+        return Err(ResumeRefusal::PartialDamaged);
+    }
+    if partial_hash != record.prefix_sha256 {
+        return Err(ResumeRefusal::PartialDamaged);
+    }
+    if source_hash != record.prefix_sha256 {
+        return Err(ResumeRefusal::SourceChanged);
+    }
+    Ok(())
+}
+
+fn identity_matches(before: &SourceIdentity, after: &SourceIdentity) -> bool {
+    before.size == after.size
+        && before.modified_unix == after.modified_unix
+        && before.content_sha256 == after.content_sha256
+}
+
+async fn local_identity(path: &Path) -> Option<SourceIdentity> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified_unix = metadata.modified().ok().and_then(unix_secs);
+    let content_sha256 = if modified_unix.is_none() {
+        Some(hash_local_all(path).await?)
+    } else {
+        None
+    };
+    Some(SourceIdentity {
+        size: metadata.len(),
+        modified_unix,
+        content_sha256,
+    })
+}
+
+async fn remote_identity(
+    session: &SftpSession,
+    path: &str,
+) -> Result<SourceIdentity, TransferFailure> {
+    let metadata = match session.metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) => return Err(failure_of(&error)),
+    };
+    if metadata.is_dir() {
+        return Err(TransferFailure::Refused {
+            reason: "the source is a directory, not a file".to_owned(),
+        });
+    }
+    let Some(size) = metadata.size else {
+        return Err(TransferFailure::Refused {
+            reason: "the server did not report the source size".to_owned(),
+        });
+    };
+    let modified_unix = metadata.mtime.map(u64::from);
+    let content_sha256 = if modified_unix.is_none() {
+        Some(
+            hash_remote_all(session, path)
+                .await
+                .ok_or(TransferFailure::SourceUnreadable)?,
+        )
+    } else {
+        None
+    };
+    Ok(SourceIdentity {
+        size,
+        modified_unix,
+        content_sha256,
+    })
+}
+
+async fn remote_len(session: &SftpSession, path: &str) -> Result<u64, ResumeRefusal> {
+    let metadata = session
+        .metadata(path)
+        .await
+        .map_err(|_| ResumeRefusal::PartialDamaged)?;
+    metadata.size.ok_or(ResumeRefusal::PartialDamaged)
+}
+
+async fn hash_remote_prefix(session: &SftpSession, path: &str, len: u64) -> Option<String> {
+    let mut file = session.open(path).await.ok()?;
+    let mut hasher = Sha256::new();
+    if !absorb(&mut file, &mut hasher, len).await {
+        return None;
+    }
+    Some(hex_encode(&hasher.finalize()))
+}
+
+async fn hash_remote_all(session: &SftpSession, path: &str) -> Option<String> {
+    let mut file = session.open(path).await.ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let read = file.read(&mut buffer).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hex_encode(&hasher.finalize()))
+}
+
+async fn hash_local_prefix(path: &Path, len: u64) -> Option<String> {
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut hasher = Sha256::new();
+    if !absorb(&mut file, &mut hasher, len).await {
+        return None;
+    }
+    Some(hex_encode(&hasher.finalize()))
+}
+
+async fn hash_local_all(path: &Path) -> Option<String> {
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        let read = file.read(&mut buffer).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hex_encode(&hasher.finalize()))
+}
+
+async fn absorb(reader: &mut (impl AsyncReadExt + Unpin), hasher: &mut Sha256, len: u64) -> bool {
+    let mut left = len;
+    let mut buffer = vec![0u8; CHUNK];
+    while left > 0 {
+        let want = usize::try_from(left.min(CHUNK as u64)).unwrap_or(CHUNK);
+        let read = match reader.read(&mut buffer[..want]).await {
+            Ok(read) => read,
+            Err(_) => return false,
+        };
+        if read == 0 {
+            return false;
+        }
+        hasher.update(&buffer[..read]);
+        left -= read as u64;
+    }
+    true
+}
+
+fn resume_record_path(id: TransferId) -> PathBuf {
+    std::env::temp_dir()
+        .join("shellune-transfers")
+        .join(format!("{id}.json"))
+}
+
+async fn write_record(path: &Path, record: &PartialRecord) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if tokio::fs::create_dir_all(parent).await.is_err() {
+        return false;
+    }
+    let bytes = match serde_json::to_vec(record) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let temporary = path.with_extension("tmp");
+    if tokio::fs::write(&temporary, bytes).await.is_err() {
+        return false;
+    }
+    tokio::fs::rename(&temporary, path).await.is_ok()
+}
+
+async fn read_record(path: &Path) -> Result<PartialRecord, ResumeRefusal> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|_| ResumeRefusal::Unverifiable)?;
+    serde_json::from_slice(&bytes).map_err(|_| ResumeRefusal::Unverifiable)
+}
+
+/// Keeps a remote partial when its prefix was confirmed, and removes it otherwise.
+async fn settle_remote(
+    session: &SftpSession,
+    ledger: &Ledger,
+    partial: &str,
+    keep: bool,
+) -> (Option<String>, Option<ResumeHint>) {
+    if keep && ledger.offset > 0 {
+        if ledger.persist().await {
+            return (Some(partial.to_owned()), Some(ledger.hint()));
+        }
+        return (Some(partial.to_owned()), None);
+    }
+    let residue = discard_remote(session, partial).await;
+    let _ = tokio::fs::remove_file(&ledger.record_path).await;
+    (residue, None)
+}
+
+/// Keeps a local partial when its prefix was confirmed, and removes it otherwise.
+async fn settle_local(
+    ledger: &Ledger,
+    partial: &Path,
+    keep: bool,
+) -> (Option<String>, Option<ResumeHint>) {
+    if keep && ledger.offset > 0 {
+        if ledger.persist().await {
+            return (Some(partial.display().to_string()), Some(ledger.hint()));
+        }
+        return (Some(partial.display().to_string()), None);
+    }
+    let residue = discard_local(partial).await;
+    let _ = tokio::fs::remove_file(&ledger.record_path).await;
+    (residue, None)
+}
+
+fn unix_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+impl Clone for SourceIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            size: self.size,
+            modified_unix: self.modified_unix,
+            content_sha256: self.content_sha256.clone(),
+        }
     }
 }
 
@@ -772,6 +1436,7 @@ mod tests {
             direction: TransferDirection::Upload,
             source: "a.txt".to_owned(),
             destination: "/home/deploy/a.txt".to_owned(),
+            resume: None,
         })));
         link.close();
         assert!(link.is_closed());
@@ -797,5 +1462,101 @@ mod tests {
         assert_eq!(request.direction, TransferDirection::Download);
         assert_eq!(request.source, "/home/deploy/说明 文档.txt");
         assert_eq!(request.destination, "C:/work/说明 文档.txt");
+        assert!(request.resume.is_none());
+    }
+
+    fn record(offset: u64, size: u64) -> PartialRecord {
+        PartialRecord {
+            transfer: TransferId::new(),
+            direction: TransferDirection::Upload,
+            source: "C:/work/report.txt".to_owned(),
+            destination: "/home/deploy/report.txt".to_owned(),
+            source_size: size,
+            source_modified_unix: Some(10),
+            content_sha256: None,
+            prefix_sha256: "ab".repeat(32),
+            confirmed_offset: offset,
+            generation: 1,
+        }
+    }
+
+    fn hint_for(record: &PartialRecord) -> ResumeHint {
+        ResumeHint {
+            partial: "/home/deploy/.shellune-part-x".to_owned(),
+            record: "C:/temp/x.json".to_owned(),
+            offset: record.confirmed_offset,
+            generation: record.generation,
+        }
+    }
+
+    fn request_for(record: &PartialRecord) -> TransferRequest {
+        TransferRequest {
+            transfer: TransferId::new(),
+            direction: record.direction,
+            source: record.source.clone(),
+            destination: record.destination.clone(),
+            resume: Some(hint_for(record)),
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_rejects_a_source_that_changed_and_a_prefix_that_does_not_match() {
+        let record = record(4, 8);
+        let request = request_for(&record);
+        let hint = hint_for(&record);
+        assert_eq!(assess_hint(&record, &hint, &request), Ok(()));
+        assert_eq!(
+            assess_identity(&record, 8, Some(10), None),
+            Ok(()),
+            "the same size and mtime still describe this source"
+        );
+        assert_eq!(
+            assess_identity(&record, 9, Some(10), None),
+            Err(ResumeRefusal::SourceChanged)
+        );
+        assert_eq!(
+            assess_identity(&record, 8, Some(11), None),
+            Err(ResumeRefusal::SourceChanged)
+        );
+        assert_eq!(
+            assess_identity(&record, 8, None, None),
+            Err(ResumeRefusal::Unverifiable),
+            "a recorded mtime that can no longer be read is not a resume"
+        );
+        let hash = record.prefix_sha256.clone();
+        assert_eq!(assess_prefix(&record, 4, &hash, &hash), Ok(()));
+        assert_eq!(
+            assess_prefix(&record, 3, &hash, &hash),
+            Err(ResumeRefusal::PartialDamaged),
+            "a short partial file is damaged"
+        );
+        assert_eq!(
+            assess_prefix(&record, 4, "ff", &hash),
+            Err(ResumeRefusal::PartialDamaged)
+        );
+        assert_eq!(
+            assess_prefix(&record, 4, &hash, "ee"),
+            Err(ResumeRefusal::SourceChanged),
+            "a prefix that is not the source's prefix is not resumed"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_without_a_time_needs_the_content_hash() {
+        let mut record = record(4, 8);
+        record.source_modified_unix = None;
+        record.content_sha256 = Some("cd".repeat(32));
+        assert_eq!(
+            assess_identity(&record, 8, None, Some(&"cd".repeat(32))),
+            Ok(())
+        );
+        assert_eq!(
+            assess_identity(&record, 8, None, Some(&"00".repeat(32))),
+            Err(ResumeRefusal::SourceChanged)
+        );
+        assert_eq!(
+            assess_identity(&record, 8, None, None),
+            Err(ResumeRefusal::Unverifiable)
+        );
     }
 }

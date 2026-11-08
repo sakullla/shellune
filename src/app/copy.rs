@@ -539,6 +539,28 @@ pub struct Strings {
     pub transfers_close_cancel: &'static str,
     /// Answer that closes the session and cancels its transfers.
     pub transfers_close_confirm: &'static str,
+    /// Button that continues a checkpointed partial file.
+    pub transfers_resume: &'static str,
+    /// Button that starts again from the first byte.
+    pub transfers_restart: &'static str,
+    /// Word before a confirmed offset that can be resumed.
+    pub transfers_resume_from: &'static str,
+    /// Resume refused because the source changed.
+    pub transfers_resume_source: &'static str,
+    /// Resume refused because the partial file could not be checked.
+    pub transfers_resume_unverifiable: &'static str,
+    /// Resume refused because the target cannot continue a partial file.
+    pub transfers_resume_unsupported: &'static str,
+    /// Resume refused because the partial file is damaged.
+    pub transfers_resume_damaged: &'static str,
+    /// Question before the application closes with transfers still running.
+    pub transfers_close_app_question: &'static str,
+    /// Answer that keeps the application open.
+    pub transfers_close_app_cancel: &'static str,
+    /// Answer that closes the application and stops its transfers.
+    pub transfers_close_app_confirm: &'static str,
+    /// Label before the host a transfer belongs to.
+    pub transfers_host: &'static str,
     /// Button and hint that open the command palette.
     pub palette_open: &'static str,
     /// Short name of the palette in the shortcut hints.
@@ -1067,6 +1089,17 @@ pub static ENGLISH: Strings = Strings {
     transfers_close_question: "Closing this session cancels its transfers",
     transfers_close_cancel: "Keep the session open",
     transfers_close_confirm: "Close and cancel",
+    transfers_resume: "Resume",
+    transfers_restart: "Transfer again",
+    transfers_resume_from: "Confirmed offset",
+    transfers_resume_source: "The source changed, so the partial file was not resumed.",
+    transfers_resume_unverifiable: "The partial file could not be checked, so it was not resumed.",
+    transfers_resume_unsupported: "This target cannot resume, so the transfer did not continue.",
+    transfers_resume_damaged: "The partial file is damaged, so it was not resumed.",
+    transfers_close_app_question: "Closing the application stops these transfers",
+    transfers_close_app_cancel: "Keep working",
+    transfers_close_app_confirm: "Close and stop them",
+    transfers_host: "Host",
     palette_open: "Search…",
     palette_hint_short: "Command palette",
     palette_placeholder: "Search sessions, shells, hosts and actions",
@@ -1447,6 +1480,17 @@ pub static CHINESE: Strings = Strings {
     transfers_close_question: "关闭这个会话会取消它的传输",
     transfers_close_cancel: "保持会话打开",
     transfers_close_confirm: "关闭并取消",
+    transfers_resume: "续传",
+    transfers_restart: "重新传输",
+    transfers_resume_from: "已确认偏移",
+    transfers_resume_source: "源已变化，没有从部分文件续传。",
+    transfers_resume_unverifiable: "无法校验部分文件，因此没有续传。",
+    transfers_resume_unsupported: "目标不支持续传，因此没有继续。",
+    transfers_resume_damaged: "部分文件已损坏，因此没有续传。",
+    transfers_close_app_question: "关闭应用会中断这些传输",
+    transfers_close_app_cancel: "继续工作",
+    transfers_close_app_confirm: "关闭并停止",
+    transfers_host: "主机",
     palette_open: "搜索…",
     palette_hint_short: "命令面板",
     palette_placeholder: "搜索会话、Shell、主机与操作",

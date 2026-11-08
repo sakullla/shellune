@@ -16,10 +16,14 @@
 //! * [`TransferState::Failed`] and [`TransferState::Cancelled`] - the transfer did not
 //!   finish. Both carry the leftover path when a partial file could not be removed - or
 //!   when the connection ended under a running task, whose worker can no longer report
-//!   anything - so a residue is stated instead of being silently pretended away.
+//!   anything - so a residue is stated instead of being silently pretended away. A
+//!   [`ResumeHint`] is attached only when that partial file has a durable checkpoint;
+//!   a failure that cannot be checked carries none.
 //!
-//! Retrying is a new task with a new [`TransferId`]: nothing here resumes bytes, which
-//! is why [`TransferQueue::retry`] builds a fresh [`Transfer`] from the same two paths.
+//! [`TransferQueue::retry`] builds a new [`TransferId`]. It carries the failed task's
+//! hint when one was recorded, and the worker must still re-check the bytes before it
+//! may continue. [`TransferQueue::restart`] never carries a hint: a transfer that
+//! cannot resume starts again at zero, and the failed task stays in the list.
 
 use std::path::Path;
 
@@ -104,6 +108,84 @@ impl OverwriteChoice {
     }
 }
 
+/// Why a partial file must not be continued.
+///
+/// Each case is a reason to transfer again from the start, never a reason to pretend
+/// the old offset still counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResumeRefusal {
+    /// The source size, time or bytes are not the ones that were checkpointed.
+    SourceChanged,
+    /// Identity or the checkpoint itself could not be checked.
+    Unverifiable,
+    /// The target cannot be opened without truncating, or cannot seek.
+    Unsupported,
+    /// The partial file is missing, short, or does not hold the checkpointed bytes.
+    PartialDamaged,
+}
+
+impl std::fmt::Display for ResumeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::SourceChanged => "the source changed, so the partial file was not resumed",
+            Self::Unverifiable => "the partial file could not be checked, so it was not resumed",
+            Self::Unsupported => {
+                "the target cannot resume, so the transfer did not continue from the partial file"
+            }
+            Self::PartialDamaged => "the partial file is damaged, so it was not resumed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+/// Where a confirmed prefix lives, and which checkpoint describes it.
+///
+/// The hint is not progress. A later attempt may continue only after it has read the
+/// source and the partial file again and both still match this checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeHint {
+    /// The partial file that holds the confirmed prefix.
+    pub partial: String,
+    /// The checkpoint record written beside that attempt.
+    pub record: String,
+    /// Bytes that were flushed and recorded.
+    pub offset: u64,
+    /// Which checkpoint generation this hint refers to.
+    pub generation: u64,
+}
+
+/// The checkpoint stored next to a partial file.
+///
+/// It names the attempt that wrote the prefix, both paths, the source size, whichever
+/// of mtime or a full-content hash could be recorded, the hash of the confirmed
+/// prefix, the offset and the generation. A resume reads this and then reads the
+/// files again; the record alone is not proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialRecord {
+    /// The task that first wrote this partial file.
+    pub transfer: TransferId,
+    /// Which way the bytes were moving.
+    pub direction: TransferDirection,
+    /// Source path at the time of the checkpoint.
+    pub source: String,
+    /// Destination path at the time of the checkpoint.
+    pub destination: String,
+    /// Size of the source when the checkpoint was written.
+    pub source_size: u64,
+    /// Source mtime, in unix seconds, when the source provided one.
+    #[serde(default)]
+    pub source_modified_unix: Option<u64>,
+    /// SHA-256 of the whole source, lowercase hex, when no mtime was available.
+    #[serde(default)]
+    pub content_sha256: Option<String>,
+    /// SHA-256 of the confirmed prefix, lowercase hex.
+    pub prefix_sha256: String,
+    /// Bytes covered by [`Self::prefix_sha256`].
+    pub confirmed_offset: u64,
+    /// Generation of this partial file. A newer file must not reuse an older one.
+    pub generation: u64,
+}
+
 /// Why a transfer did not complete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferFailure {
@@ -128,6 +210,11 @@ pub enum TransferFailure {
         /// What the server said, so the reason is specific instead of guessed at.
         reason: String,
     },
+    /// A resume was requested and refused before any further byte was written.
+    ResumeRefused {
+        /// Why the partial file was not continued.
+        reason: ResumeRefusal,
+    },
 }
 
 impl std::fmt::Display for TransferFailure {
@@ -148,6 +235,7 @@ impl std::fmt::Display for TransferFailure {
             Self::Refused { reason } => {
                 return write!(formatter, "the server refused the transfer: {reason}");
             }
+            Self::ResumeRefused { reason } => return write!(formatter, "{reason}"),
         };
         formatter.write_str(message)
     }
@@ -193,11 +281,17 @@ pub enum TransferState {
         /// A partial file left behind: one that could not be removed, or the temporary
         /// file a running task was writing when its connection ended.
         residue: Option<String>,
+        /// A checkpoint that may be resumed, only when the partial file was kept for that.
+        #[serde(default)]
+        resume: Option<ResumeHint>,
     },
     /// Cancelled by the user.
     Cancelled {
-        /// A partial file left behind, when it could not be removed.
+        /// A partial file left behind, when it could not be removed or was kept to resume.
         residue: Option<String>,
+        /// A checkpoint that may be resumed, only when the partial file was kept for that.
+        #[serde(default)]
+        resume: Option<ResumeHint>,
     },
 }
 
@@ -242,7 +336,16 @@ impl TransferState {
     #[must_use]
     pub fn residue(&self) -> Option<&str> {
         match self {
-            Self::Failed { residue, .. } | Self::Cancelled { residue } => residue.as_deref(),
+            Self::Failed { residue, .. } | Self::Cancelled { residue, .. } => residue.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The checkpoint a later attempt may try to continue, when the partial file was kept.
+    #[must_use]
+    pub fn resume(&self) -> Option<&ResumeHint> {
+        match self {
+            Self::Failed { resume, .. } | Self::Cancelled { resume, .. } => resume.as_ref(),
             _ => None,
         }
     }
@@ -315,14 +418,22 @@ pub enum TransferUpdate {
     Failed {
         /// Why it stopped.
         failure: TransferFailure,
-        /// A partial file that could not be removed.
+        /// A partial file that could not be removed, or that was kept to resume.
         residue: Option<String>,
+        /// A checkpoint kept with that partial file, when it is safe to try again.
+        #[serde(default)]
+        resume: Option<ResumeHint>,
     },
     /// The user cancelled the transfer.
     Cancelled {
-        /// A partial file that could not be removed.
+        /// A partial file that could not be removed, or that was kept to resume.
         residue: Option<String>,
+        /// A checkpoint kept with that partial file, when it is safe to try again.
+        #[serde(default)]
+        resume: Option<ResumeHint>,
     },
+    /// A confirmed prefix was flushed. This is not progress by itself.
+    Checkpoint(ResumeHint),
 }
 
 /// A transfer update tagged with the task it belongs to.
@@ -410,6 +521,7 @@ impl TransferUpdate {
             Self::Completed { .. } => "completion",
             Self::Failed { .. } => "failure",
             Self::Cancelled { .. } => "cancellation",
+            Self::Checkpoint(_) => "a checkpoint",
         }
     }
 }
@@ -423,6 +535,12 @@ pub struct Transfer {
     source: String,
     destination: String,
     state: TransferState,
+    /// Last durable checkpoint reported while the task was running.
+    ///
+    /// A queued retry copies a hint into here so the worker can re-check it. It is not
+    /// progress: the state stays queued until the worker reports real bytes.
+    #[serde(default)]
+    checkpoint: Option<ResumeHint>,
 }
 
 impl Transfer {
@@ -441,6 +559,7 @@ impl Transfer {
             source: source.into(),
             destination: destination.into(),
             state: TransferState::Queued,
+            checkpoint: None,
         }
     }
 
@@ -482,6 +601,15 @@ impl Transfer {
     #[must_use]
     pub fn partial_path(&self) -> String {
         partial_path(self.direction, &self.destination, self.id)
+    }
+
+    /// The checkpoint a worker should re-check before continuing, when there is one.
+    ///
+    /// A running task's checkpoint and a finished task's recorded hint are the same
+    /// fact: bytes already confirmed. Neither one is a claim that the target is complete.
+    #[must_use]
+    pub fn resume_hint(&self) -> Option<&ResumeHint> {
+        self.state.resume().or(self.checkpoint.as_ref())
     }
 
     /// The partial file this task may have left on disk when its connection ended.
@@ -540,6 +668,7 @@ impl Transfer {
         self.apply_update(TransferUpdate::Failed {
             failure,
             residue: None,
+            resume: None,
         })
     }
 
@@ -552,8 +681,13 @@ impl Transfer {
         &mut self,
         failure: TransferFailure,
         residue: Option<String>,
+        resume: Option<ResumeHint>,
     ) -> Result<(), TransferUpdateError> {
-        self.apply_update(TransferUpdate::Failed { failure, residue })
+        self.apply_update(TransferUpdate::Failed {
+            failure,
+            residue,
+            resume,
+        })
     }
 
     /// Cancels the transfer from any unfinished state.
@@ -562,7 +696,10 @@ impl Transfer {
     ///
     /// Returns [`TransferUpdateError::Finished`] when the transfer already ended.
     pub fn cancel(&mut self) -> Result<(), TransferUpdateError> {
-        self.apply_update(TransferUpdate::Cancelled { residue: None })
+        self.apply_update(TransferUpdate::Cancelled {
+            residue: None,
+            resume: None,
+        })
     }
 
     /// Cancels the transfer and names the partial file it left behind.
@@ -570,8 +707,12 @@ impl Transfer {
     /// # Errors
     ///
     /// Returns [`TransferUpdateError::Finished`] when the transfer already ended.
-    pub fn cancel_with(&mut self, residue: Option<String>) -> Result<(), TransferUpdateError> {
-        self.apply_update(TransferUpdate::Cancelled { residue })
+    pub fn cancel_with(
+        &mut self,
+        residue: Option<String>,
+        resume: Option<ResumeHint>,
+    ) -> Result<(), TransferUpdateError> {
+        self.apply_update(TransferUpdate::Cancelled { residue, resume })
     }
 
     /// Applies a worker update if it belongs to this task.
@@ -647,39 +788,63 @@ impl Transfer {
             (TransferState::Running { .. }, TransferUpdate::Completed { bytes }) => {
                 self.state = TransferState::Completed { bytes: *bytes };
             }
+            (TransferState::Running { .. }, TransferUpdate::Checkpoint(hint)) => {
+                // A checkpoint names bytes already flushed. It does not move the
+                // progress number; the next progress report does that.
+                if hint.offset > 0 {
+                    self.checkpoint = Some(hint.clone());
+                }
+            }
             (
                 TransferState::Queued
                 | TransferState::AwaitingOverwrite { .. }
                 | TransferState::Running { .. },
-                TransferUpdate::Failed { failure, residue },
+                TransferUpdate::Failed {
+                    failure,
+                    residue,
+                    resume,
+                },
             ) => {
+                if let Some(hint) = resume {
+                    self.checkpoint = Some(hint.clone());
+                }
                 self.state = TransferState::Failed {
                     failure: failure.clone(),
                     residue: residue.clone(),
+                    resume: resume.clone(),
                 };
             }
             (
                 TransferState::Queued
                 | TransferState::AwaitingOverwrite { .. }
                 | TransferState::Running { .. },
-                TransferUpdate::Cancelled { residue },
+                TransferUpdate::Cancelled { residue, resume },
             ) => {
+                if let Some(hint) = resume {
+                    self.checkpoint = Some(hint.clone());
+                }
                 self.state = TransferState::Cancelled {
                     residue: residue.clone(),
+                    resume: resume.clone(),
                 };
             }
             // A cancellation the window already reported can still learn which partial
             // file survived it: the outcome does not change, only the detail, and a
             // residue the user is never told about would be the one thing worse than the
-            // file itself.
+            // file itself. A checkpoint arrives the same way, and only then.
             (
-                TransferState::Cancelled { residue: None },
-                TransferUpdate::Cancelled {
-                    residue: residue @ Some(_),
+                TransferState::Cancelled {
+                    residue: previous,
+                    resume: None,
                 },
-            ) => {
+                TransferUpdate::Cancelled { residue, resume },
+            ) if residue.is_some() || resume.is_some() => {
+                if let Some(hint) = resume {
+                    self.checkpoint = Some(hint.clone());
+                }
                 self.state = TransferState::Cancelled {
-                    residue: residue.clone(),
+                    residue: residue.clone().or_else(|| previous.clone()),
+                    resume: resume.clone(),
                 };
             }
             (state, _) if state.is_finished() => {
@@ -803,14 +968,19 @@ impl TransferQueue {
     /// Cancels every active task of one session, returning the identifiers to tell.
     ///
     /// This is what closing a session does: the tasks of that session end, and the
-    /// tasks of every other session keep running.
+    /// tasks of every other session keep running. A checkpoint the worker already
+    /// reported stays on the task, because the connection is about to go away and
+    /// cannot be relied on to send that fact again. A task with no checkpoint is
+    /// cancelled without one, and does not invent an offset.
     pub fn cancel_session(&mut self, session: SessionId) -> Vec<TransferId> {
         self.transfers
             .iter_mut()
             .filter(|transfer| transfer.session() == session && transfer.is_active())
             .filter_map(|transfer| {
                 let id = transfer.id();
-                transfer.cancel().ok().map(|()| id)
+                let resume = transfer.checkpoint.clone().filter(|hint| hint.offset > 0);
+                let residue = resume.as_ref().map(|hint| hint.partial.clone());
+                transfer.cancel_with(residue, resume).ok().map(|()| id)
             })
             .collect()
     }
@@ -833,8 +1003,15 @@ impl TransferQueue {
             .filter_map(|transfer| {
                 let id = transfer.id();
                 let residue = transfer.residue_on_loss();
+                // The worker died with the connection, so the last checkpoint it managed
+                // to report is the only resume fact left. A task that never checkpointed
+                // names its partial file and does not pretend that file can be continued.
+                let resume = residue
+                    .as_ref()
+                    .and_then(|_| transfer.checkpoint.clone())
+                    .filter(|hint| hint.offset > 0);
                 transfer
-                    .fail_with(failure.clone(), residue)
+                    .fail_with(failure.clone(), residue, resume)
                     .ok()
                     .map(|()| id)
             })
@@ -843,18 +1020,40 @@ impl TransferQueue {
 
     /// Starts a new task for the same two paths.
     ///
-    /// The returned task has its own [`TransferId`] and starts at zero bytes: a retry
-    /// is new work, never a continuation of the attempt that failed.
+    /// The returned task has its own [`TransferId`] and stays queued. When the failed
+    /// task recorded a checkpoint, the new task carries that hint so the worker can
+    /// re-check it; the hint is not progress. Without a hint the new task has nothing
+    /// to continue, which is a transfer from the first byte.
     #[must_use]
     pub fn retry(&self, id: TransferId) -> Option<Transfer> {
         self.get(id).map(|failed| {
-            Transfer::queued(
+            let mut next = Transfer::queued(
                 failed.session(),
                 failed.direction(),
                 failed.source(),
                 failed.destination(),
-            )
+            );
+            next.checkpoint = failed.state().resume().cloned();
+            next
         })
+    }
+
+    /// Starts a new task from the first byte, ignoring any checkpoint.
+    ///
+    /// This is the explicit re-transfer: the previous failure stays in the queue, and
+    /// the new task must not display the old offset.
+    #[must_use]
+    pub fn restart(&self, id: TransferId) -> Option<Transfer> {
+        self.get(id)
+            .filter(|failed| !failed.state().is_success())
+            .map(|failed| {
+                Transfer::queued(
+                    failed.session(),
+                    failed.direction(),
+                    failed.source(),
+                    failed.destination(),
+                )
+            })
     }
 
     /// Drops one task from the list, which is what the view's own dismissal does.
@@ -989,7 +1188,10 @@ mod tests {
         transfer.cancel().expect("cancel applies");
         assert_eq!(
             transfer.state(),
-            &TransferState::Cancelled { residue: None }
+            &TransferState::Cancelled {
+                residue: None,
+                resume: None,
+            }
         );
         assert!(!transfer.state().is_success());
         assert_eq!(
@@ -1022,7 +1224,10 @@ mod tests {
         transfer.cancel().expect("cancel applies");
         assert_eq!(
             transfer.state(),
-            &TransferState::Cancelled { residue: None }
+            &TransferState::Cancelled {
+                residue: None,
+                resume: None,
+            }
         );
 
         assert_eq!(
@@ -1032,7 +1237,10 @@ mod tests {
         );
         assert_eq!(
             transfer.state(),
-            &TransferState::Cancelled { residue: None }
+            &TransferState::Cancelled {
+                residue: None,
+                resume: None,
+            }
         );
     }
 
@@ -1043,6 +1251,7 @@ mod tests {
             .fail_with(
                 TransferFailure::FinalizeFailed,
                 Some("/home/deploy/.shellune-part-7".to_owned()),
+                None,
             )
             .expect("failure applies");
         assert_eq!(
@@ -1062,7 +1271,7 @@ mod tests {
 
         let mut cancelled = started(upload());
         cancelled
-            .cancel_with(Some("C:/work/.shellune-part-3".to_owned()))
+            .cancel_with(Some("C:/work/.shellune-part-3".to_owned()), None)
             .expect("cancel applies");
         assert_eq!(
             cancelled.state().residue(),
@@ -1376,5 +1585,173 @@ mod tests {
             None,
             "a task that never ran left no partial file to name"
         );
+    }
+
+    fn hint(offset: u64) -> ResumeHint {
+        ResumeHint {
+            partial: format!("/home/deploy/{PARTIAL_PREFIX}kept"),
+            record: "C:/temp/kept.json".to_owned(),
+            offset,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_is_kept_when_the_connection_ends_and_is_not_progress() {
+        let session = SessionId::new();
+        let mut queue = TransferQueue::new();
+        let id = queue.add(Transfer::queued(
+            session,
+            TransferDirection::Upload,
+            "C:/work/report.txt",
+            "/home/deploy/report.txt",
+        ));
+        queue
+            .apply(&TransferEvent::progress(id, 1024, Some(4096)))
+            .expect("progress applies");
+        queue
+            .apply(&TransferEvent {
+                transfer: id,
+                update: TransferUpdate::Checkpoint(hint(1024)),
+            })
+            .expect("the checkpoint applies");
+        assert_eq!(
+            queue.get(id).and_then(|task| task.state().transferred()),
+            Some(1024),
+            "a checkpoint does not invent a second progress number"
+        );
+
+        queue.fail_session(session, TransferFailure::ConnectionLost);
+        let failed = queue.get(id).expect("the task stays listed");
+        assert!(!failed.state().is_success());
+        assert_eq!(failed.state().resume(), Some(&hint(1024)));
+        assert_eq!(failed.resume_hint().map(|item| item.offset), Some(1024));
+
+        let resumed = queue.retry(id).expect("the failure can be retried");
+        assert_ne!(resumed.id(), id);
+        assert_eq!(resumed.state(), &TransferState::Queued);
+        assert_eq!(
+            resumed.state().transferred(),
+            None,
+            "carrying a hint does not display the old offset as progress"
+        );
+        assert_eq!(resumed.resume_hint(), Some(&hint(1024)));
+
+        let fresh = queue.restart(id).expect("the same failure can start over");
+        assert!(fresh.resume_hint().is_none());
+        assert_eq!(fresh.state(), &TransferState::Queued);
+        assert!(queue.get(id).is_some(), "the failed task stays readable");
+    }
+
+    #[test]
+    fn closing_a_session_keeps_that_sessions_checkpoint_only() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let mut queue = TransferQueue::new();
+        let running = queue.add(Transfer::queued(
+            first,
+            TransferDirection::Upload,
+            "C:/work/report.txt",
+            "/home/deploy/report.txt",
+        ));
+        let waiting = queue.add(Transfer::queued(
+            first,
+            TransferDirection::Upload,
+            "C:/work/other.txt",
+            "/home/deploy/other.txt",
+        ));
+        let other = queue.add(Transfer::queued(
+            second,
+            TransferDirection::Download,
+            "/home/deploy/keep.bin",
+            "C:/work/keep.bin",
+        ));
+        queue
+            .apply(&TransferEvent::progress(running, 1024, Some(4096)))
+            .expect("progress applies");
+        queue
+            .apply(&TransferEvent {
+                transfer: running,
+                update: TransferUpdate::Checkpoint(hint(1024)),
+            })
+            .expect("the checkpoint applies");
+        queue
+            .apply(&TransferEvent::progress(other, 64, Some(128)))
+            .expect("the other session reports its own progress");
+
+        let stopped = queue.cancel_session(first);
+        assert_eq!(stopped, vec![running, waiting]);
+        let closed = queue.get(running).expect("the task stays listed");
+        assert!(!closed.state().is_success());
+        assert_eq!(closed.state().resume(), Some(&hint(1024)));
+        assert_eq!(
+            closed.state().residue(),
+            Some(hint(1024).partial.as_str()),
+            "the confirmed partial file is named"
+        );
+        assert!(
+            queue
+                .get(waiting)
+                .is_some_and(|task| task.state().resume().is_none() && !task.state().is_success()),
+            "a task that never checkpointed does not invent an offset"
+        );
+        assert_eq!(
+            queue.get(other).and_then(|task| task.state().transferred()),
+            Some(64),
+            "the other session's transfer is still the progress it reported"
+        );
+        assert_eq!(queue.active_count(second), 1);
+        assert_eq!(queue.active_count(first), 0);
+    }
+
+    #[test]
+    fn a_resume_that_is_refused_is_not_a_completed_transfer() {
+        let mut transfer = upload();
+        let id = transfer.id();
+        transfer
+            .apply(TransferEvent {
+                transfer: id,
+                update: TransferUpdate::Failed {
+                    failure: TransferFailure::ResumeRefused {
+                        reason: ResumeRefusal::SourceChanged,
+                    },
+                    residue: None,
+                    resume: None,
+                },
+            })
+            .expect("the refusal applies");
+        assert!(!transfer.state().is_success());
+        assert!(transfer.state().resume().is_none());
+        assert_eq!(
+            transfer.state().failure().map(ToString::to_string),
+            Some("the source changed, so the partial file was not resumed".to_owned())
+        );
+        assert_eq!(
+            transfer.complete(10),
+            Err(TransferUpdateError::Finished),
+            "a refused resume cannot be completed afterwards"
+        );
+    }
+
+    #[test]
+    fn a_cancellation_can_learn_the_partial_file_it_kept() {
+        let mut transfer = started(upload());
+        transfer.cancel().expect("the window cancels at once");
+        let id = transfer.id();
+        transfer
+            .apply(TransferEvent {
+                transfer: id,
+                update: TransferUpdate::Cancelled {
+                    residue: Some("/home/deploy/.shellune-part-kept".to_owned()),
+                    resume: Some(hint(512)),
+                },
+            })
+            .expect("the worker's residue applies");
+        assert_eq!(
+            transfer.state().residue(),
+            Some("/home/deploy/.shellune-part-kept")
+        );
+        assert_eq!(transfer.state().resume().map(|item| item.offset), Some(512));
+        assert!(!transfer.state().is_success());
     }
 }

@@ -13,8 +13,9 @@
 //!   what the list says;
 //! * a session that closes cancels exactly its own tasks and nothing else, because the
 //!   queue answers which tasks a session owns;
-//! * a retry starts a new task from the same two paths. Nothing here resumes bytes, and
-//!   the failed task stays readable beside the new one.
+//! * a retry starts a new task from the same two paths. It carries a checkpoint only
+//!   when the failed task recorded one; the worker still has to re-check the bytes,
+//!   and a restart never carries the checkpoint. The failed task stays readable.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -255,10 +256,22 @@ impl TransferViews {
 
     /// Starts a new task for the same two paths.
     ///
-    /// A retry is new work with a new identifier: the bytes start again at zero, and the
-    /// task that failed keeps its own report.
+    /// When the failed task has a checkpoint, the new task carries it and stays queued:
+    /// the worker re-checks the partial file before any byte is written, and the old
+    /// offset is not progress. Without a checkpoint this is a transfer from the first
+    /// byte. The task that failed keeps its own report.
     pub fn retry(&mut self, id: TransferId) -> Option<TransferId> {
-        let transfer = self.queue.retry(id)?;
+        self.launch(self.queue.retry(id)?)
+    }
+
+    /// Starts a new task from the first byte, dropping any checkpoint.
+    ///
+    /// This is the confirmed re-transfer. The failed task stays in the list.
+    pub fn restart(&mut self, id: TransferId) -> Option<TransferId> {
+        self.launch(self.queue.restart(id)?)
+    }
+
+    fn launch(&mut self, transfer: Transfer) -> Option<TransferId> {
         let session = transfer.session();
         let id = self.queue.add(transfer.clone());
         if !self.dispatch(
@@ -374,6 +387,7 @@ pub fn default_download_directory() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shellune_core::ResumeHint;
     use std::sync::{Arc, Mutex};
 
     /// What a scripted connection holds.
@@ -527,7 +541,10 @@ mod tests {
         // The worker answers a "keep" with a cancellation: nothing was written.
         channel.push(TransferEvent {
             transfer: id,
-            update: shellune_core::TransferUpdate::Cancelled { residue: None },
+            update: shellune_core::TransferUpdate::Cancelled {
+                residue: None,
+                resume: None,
+            },
         });
         views.pump();
         assert!(
@@ -602,6 +619,7 @@ mod tests {
             update: shellune_core::TransferUpdate::Failed {
                 failure: TransferFailure::ConnectionLost,
                 residue: None,
+                resume: None,
             },
         });
         views.pump();
@@ -617,6 +635,52 @@ mod tests {
             &shellune_core::TransferState::Queued,
             "a retry starts at the beginning, never in the middle"
         );
+        assert!(channel.starts()[1].resume.is_none());
+    }
+
+    #[test]
+    fn a_checkpoint_is_retried_without_pretending_the_old_offset_and_a_restart_drops_it() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = views(session, channel.clone());
+        let id = views
+            .upload(session, "C:/work/a.txt", Some("/home/deploy"))
+            .expect("the upload starts");
+        let hint = ResumeHint {
+            partial: "/home/deploy/.shellune-part-kept".to_owned(),
+            record: "C:/temp/kept.json".to_owned(),
+            offset: 2048,
+            generation: 1,
+        };
+        channel.push(TransferEvent::progress(id, 2048, Some(4096)));
+        channel.push(TransferEvent {
+            transfer: id,
+            update: shellune_core::TransferUpdate::Failed {
+                failure: TransferFailure::ConnectionLost,
+                residue: Some(hint.partial.clone()),
+                resume: Some(hint.clone()),
+            },
+        });
+        views.pump();
+
+        let retried = views.retry(id).expect("the failure can be retried");
+        let resumed = &channel.starts()[1];
+        assert_eq!(resumed.transfer, retried);
+        assert_eq!(resumed.resume.as_ref(), Some(&hint));
+        assert_eq!(
+            views.get(retried).expect("the new task").state(),
+            &shellune_core::TransferState::Queued,
+            "the confirmed offset is not shown as progress before the worker re-checks it"
+        );
+        assert!(
+            views.get(id).is_some(),
+            "the failed task stays beside the new one"
+        );
+
+        let fresh = views.restart(id).expect("the failure can start over");
+        assert!(channel.starts()[2].resume.is_none());
+        assert_ne!(fresh, id);
+        assert_ne!(fresh, retried);
     }
 
     #[test]
