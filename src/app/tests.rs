@@ -9171,7 +9171,14 @@ async fn local_and_remote_sessions_share_the_workspace(cx: &mut TestAppContext) 
 
     click(cx, "nav.hosts");
     assert_eq!(
-        cx.update(|_window, app| view.read(app).workspace().context()),
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .capture_snapshot()
+                .expect("the context panel is part of the workspace snapshot")
+                .panel()
+                .section()
+        }),
         shellune_core::PanelSection::Hosts
     );
     click(cx, "hosts.connect.0");
@@ -9195,7 +9202,14 @@ async fn local_and_remote_sessions_share_the_workspace(cx: &mut TestAppContext) 
         .expect("the remote session is current");
     assert_eq!(destination_of(&view, cx), Destination::LocalShells);
     assert_eq!(
-        cx.update(|_window, app| view.read(app).workspace().context()),
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .capture_snapshot()
+                .expect("the context panel is part of the workspace snapshot")
+                .panel()
+                .section()
+        }),
         shellune_core::PanelSection::None,
         "the connected session comes back to the workspace"
     );

@@ -337,11 +337,6 @@ impl Workspace {
         }
     }
 
-    /// The context panel selected beside the session workspace.
-    pub fn context(&self) -> PanelSection {
-        self.context
-    }
-
     /// Records which context panel is open. This does not start a task.
     pub fn set_context(&mut self, section: PanelSection) {
         self.context = section;
