@@ -197,6 +197,15 @@ struct Attempt {
     pending_rules: Vec<ForwardId>,
 }
 
+/// The facts a connected attempt still needs after its transport has been taken.
+struct ConnectedSession {
+    host: HostConfig,
+    ephemeral: bool,
+    show: bool,
+    forward_only: bool,
+    pending_rules: Vec<ForwardId>,
+}
+
 /// An accepted chain identity that has not been written yet.
 struct PendingTrust {
     host_id: HostId,
@@ -3230,11 +3239,13 @@ impl ShelluneView {
             id,
             link,
             pending,
-            host,
-            ephemeral,
-            show,
-            forward_only,
-            pending_rules,
+            ConnectedSession {
+                host,
+                ephemeral,
+                show,
+                forward_only,
+                pending_rules,
+            },
             cx,
         );
         false
@@ -3299,13 +3310,16 @@ impl ShelluneView {
         id: SessionId,
         mut link: AttemptLink,
         pending: Vec<SourceEvent>,
-        host: HostConfig,
-        ephemeral: bool,
-        show: bool,
-        forward_only: bool,
-        pending_rules: Vec<ForwardId>,
+        connected: ConnectedSession,
         cx: &mut Context<Self>,
     ) {
+        let ConnectedSession {
+            host,
+            ephemeral,
+            show,
+            forward_only,
+            pending_rules,
+        } = connected;
         let Some(tag) = self.workspace.session(id).map(|session| session.tag()) else {
             return;
         };
