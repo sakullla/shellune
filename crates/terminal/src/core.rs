@@ -1318,7 +1318,10 @@ mod tests {
         terminal.feed(b"\r\nafter-out\r\n");
         terminal.feed(&osc("133;D;0"));
         let blocks = terminal.command_blocks();
-        assert_eq!(blocks[0], vim, "the earlier command stays as it was recorded");
+        assert_eq!(
+            blocks[0], vim,
+            "the earlier command stays as it was recorded"
+        );
         assert_eq!(blocks[1].command, "echo after");
         assert_eq!(blocks[1].output, "after-out");
         assert!(blocks[1].status.is_success());
