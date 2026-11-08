@@ -660,7 +660,9 @@ fn local_answer(request: &BrowseRequest) -> BrowseResponse {
             directory, name, ..
         } => {
             let target = join_path(directory, name);
-            let action = MutationAction::CreateDirectory { path: target.clone() };
+            let action = MutationAction::CreateDirectory {
+                path: target.clone(),
+            };
             let outcome = match create_local_directory(directory, name) {
                 Ok(()) => MutationOutcome::new(
                     action,
@@ -693,9 +695,10 @@ fn local_answer(request: &BrowseRequest) -> BrowseResponse {
                 kind: *kind,
             };
             let outcome = match delete_local(path, *kind) {
-                Ok(()) => {
-                    MutationOutcome::new(action, vec![MutationStep::done(path.clone(), Some(*kind))])
-                }
+                Ok(()) => MutationOutcome::new(
+                    action,
+                    vec![MutationStep::done(path.clone(), Some(*kind))],
+                ),
                 Err(failure) => MutationOutcome::refused(action, failure),
             };
             BrowseResponse::Changed {
@@ -1678,12 +1681,17 @@ mod tests {
             "showing the local column does not retarget the remote one"
         );
 
-        local.0.lock().expect("a free lock").answers.push(BrowseResponse::Failed {
-            request: 2,
-            failure: BrowseFailure::PermissionDenied {
-                path: "/tmp/secret".to_owned(),
-            },
-        });
+        local
+            .0
+            .lock()
+            .expect("a free lock")
+            .answers
+            .push(BrowseResponse::Failed {
+                request: 2,
+                failure: BrowseFailure::PermissionDenied {
+                    path: "/tmp/secret".to_owned(),
+                },
+            });
         assert!(views.list_at(session, FileSource::Local, "/tmp/secret"));
         views.pump();
         assert!(
@@ -1805,7 +1813,11 @@ mod tests {
         );
         assert!(!root.path().join("日志").exists());
         assert_eq!(
-            remote.requests().iter().filter(|request| !request.is_listing()).count(),
+            remote
+                .requests()
+                .iter()
+                .filter(|request| !request.is_listing())
+                .count(),
             0,
             "a local change is not sent to the server"
         );
@@ -1825,11 +1837,7 @@ mod tests {
         views.attach(session, "web", "deploy@10.0.0.7:22", Box::new(remote));
         views.open(session);
 
-        assert!(views.list_at(
-            session,
-            FileSource::Local,
-            &local_os_to_protocol(&empty)
-        ));
+        assert!(views.list_at(session, FileSource::Local, &local_os_to_protocol(&empty)));
         views.pump();
         assert!(
             views
@@ -1856,11 +1864,7 @@ mod tests {
             "the remote listing survives a missing local path"
         );
 
-        assert!(views.list_at(
-            session,
-            FileSource::Local,
-            &local_os_to_protocol(&file)
-        ));
+        assert!(views.list_at(session, FileSource::Local, &local_os_to_protocol(&file)));
         views.pump();
         assert!(
             matches!(
@@ -1955,7 +1959,13 @@ mod tests {
         assert_eq!(children, vec!["inside".to_owned()]);
         assert!(create_local_directory(&directory, "日志").is_ok());
         assert!(work.join("日志").is_dir());
-        assert!(rename_local(&join_path(&directory, "日志"), &join_path(&directory, "说明")).is_ok());
+        assert!(
+            rename_local(
+                &join_path(&directory, "日志"),
+                &join_path(&directory, "说明")
+            )
+            .is_ok()
+        );
         assert!(work.join("说明").is_dir());
         assert!(!work.join("日志").exists());
     }

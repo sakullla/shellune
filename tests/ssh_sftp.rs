@@ -816,10 +816,18 @@ fn a_change_to_a_path_that_does_not_exist_is_reported_as_missing() {
 
 #[test]
 fn an_empty_directory_is_empty_and_the_shell_stays_authenticated() {
-    if skip("listing an empty directory") {
+    if !Harness::is_available() {
+        eprintln!(
+            "SKIPPED listing an empty directory: this host cannot start a disposable OpenSSH \
+             server, so nothing is verified here and nothing is claimed."
+        );
         return;
     }
-    let server = shared().as_ref().expect("a server");
+    // The accepted-auth lines live in this sshd's own log. The server named "sftp" is
+    // shared by the other cases in this process, so their logins land in that count
+    // whenever the tests run together. This case needs a log nobody else writes.
+    let server = own_server("sftp-empty");
+    let server = &server;
     let home = server.home();
     let empty = format!("{home}/empty-shellune");
     server
