@@ -1128,7 +1128,7 @@ fn node_has_pending(node: &Node) -> bool {
     }
 }
 
-fn find_node<'a>(node: &'a Node, pane: PaneId) -> Option<&'a Node> {
+fn find_node(node: &Node, pane: PaneId) -> Option<&Node> {
     match node {
         Node::Leaf(leaf) if leaf.id() == pane => Some(node),
         Node::Leaf(_) => None,
@@ -1205,9 +1205,9 @@ impl ShelluneView {
             .layout()
             .leaves()
             .iter()
-            .filter_map(|leaf| match leaf.mark() {
-                Some(crate::app::layout::LeafMark::MissingHost { host }) => Some(*host),
-                None => None,
+            .filter_map(|leaf| {
+                leaf.mark()
+                    .map(|crate::app::layout::LeafMark::MissingHost { host }| *host)
             })
             .collect()
     }

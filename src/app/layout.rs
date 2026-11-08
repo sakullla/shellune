@@ -288,10 +288,7 @@ impl SessionLayout {
     /// draw every tab read [`Self::tabs`] instead.
     #[must_use]
     pub fn tab_anchors(&self) -> Vec<SessionId> {
-        self.tabs
-            .iter()
-            .filter_map(|tab| anchor_session(tab))
-            .collect()
+        self.tabs.iter().filter_map(anchor_session).collect()
     }
 
     /// The anchor session of the tab at `index`, when that tab has one.
@@ -855,7 +852,7 @@ fn set_leaf_mode(node: &mut Node, session: SessionId, mode: TerminalMode) -> boo
     }
 }
 
-fn leaf<'a>(node: &'a Node, id: PaneId) -> Option<&'a Leaf> {
+fn leaf(node: &Node, id: PaneId) -> Option<&Leaf> {
     match node {
         Node::Leaf(leaf) if leaf.id == id => Some(leaf),
         Node::Leaf(_) => None,
