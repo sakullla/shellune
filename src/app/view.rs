@@ -9690,8 +9690,10 @@ impl ShelluneView {
         modified: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut keystroke = gpui::Keystroke::default();
-        keystroke.key = key.to_owned();
+        let mut keystroke = gpui::Keystroke {
+            key: key.to_owned(),
+            ..gpui::Keystroke::default()
+        };
         if modified {
             keystroke.modifiers.control = true;
         }
