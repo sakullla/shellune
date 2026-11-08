@@ -111,17 +111,18 @@ impl ShelluneView {
         let listen_port = self.forward_listen_port.read(cx).text().to_owned();
         let target_host = self.forward_target_host.read(cx).text().to_owned();
         let target_port = self.forward_target_port.read(cx).text().to_owned();
-        let book = match self
-            .forwards
-            .preview(&listen_host, &listen_port, &target_host, &target_port)
-        {
-            Ok(book) => book,
-            Err(error) => {
-                self.forwards.fail_editor(error);
-                cx.notify();
-                return;
-            }
-        };
+        let book =
+            match self
+                .forwards
+                .preview(&listen_host, &listen_port, &target_host, &target_port)
+            {
+                Ok(book) => book,
+                Err(error) => {
+                    self.forwards.fail_editor(error);
+                    cx.notify();
+                    return;
+                }
+            };
         let store = ForwardStore::at(self.store.root());
         if let Err(error) = store.save(&book) {
             self.forwards.fail_editor(error.to_string());
@@ -157,9 +158,8 @@ impl ShelluneView {
             .into_iter()
             .find(|row| row.rule.id() == id)
             .and_then(|row| match row.phase {
-                ForwardPhase::Listening { session, .. } | ForwardPhase::Starting { session, .. } => {
-                    Some(session)
-                }
+                ForwardPhase::Listening { session, .. }
+                | ForwardPhase::Starting { session, .. } => Some(session),
                 _ => None,
             })
         {
@@ -249,19 +249,23 @@ impl ShelluneView {
     }
 
     pub(super) fn carrier_for_host(&self, host: HostId) -> Option<SessionId> {
-        self.workspace.sessions().items().iter().find_map(|session| {
-            let SessionKind::Remote { host: saved } = session.kind() else {
-                return None;
-            };
-            if *saved == host
-                && matches!(session.state(), SessionState::Connected)
-                && self.forwards.has_carrier(session.id())
-            {
-                Some(session.id())
-            } else {
-                None
-            }
-        })
+        self.workspace
+            .sessions()
+            .items()
+            .iter()
+            .find_map(|session| {
+                let SessionKind::Remote { host: saved } = session.kind() else {
+                    return None;
+                };
+                if *saved == host
+                    && matches!(session.state(), SessionState::Connected)
+                    && self.forwards.has_carrier(session.id())
+                {
+                    Some(session.id())
+                } else {
+                    None
+                }
+            })
     }
 
     pub(super) fn watch_forwards(&mut self, cx: &mut Context<Self>) {
@@ -314,19 +318,16 @@ impl ShelluneView {
         let ids: Vec<SessionId> = self.forward_carriers.keys().copied().collect();
         let mut changed = false;
         for id in ids {
-            let dead = self
-                .forward_carriers
-                .get_mut(&id)
-                .is_some_and(|link| {
-                    link.drain().iter().any(|event| {
-                        matches!(
-                            event,
-                            crate::app::remote::LinkEvent::Exited { .. }
-                                | crate::app::remote::LinkEvent::FailedRemote(_)
-                                | crate::app::remote::LinkEvent::FailedChain(_)
-                        )
-                    })
-                });
+            let dead = self.forward_carriers.get_mut(&id).is_some_and(|link| {
+                link.drain().iter().any(|event| {
+                    matches!(
+                        event,
+                        crate::app::remote::LinkEvent::Exited { .. }
+                            | crate::app::remote::LinkEvent::FailedRemote(_)
+                            | crate::app::remote::LinkEvent::FailedChain(_)
+                    )
+                })
+            });
             if dead {
                 self.forwards.detach(id);
                 self.forward_carriers.remove(&id);
@@ -380,7 +381,10 @@ impl ShelluneView {
             && self.forwards.editor().is_none()
             && self.pending_exposure.is_none()
         {
-            list = list.child(self.section_card(Destination::Forwards, crate::app::workspace::SectionState::Empty));
+            list = list.child(self.section_card(
+                Destination::Forwards,
+                crate::app::workspace::SectionState::Empty,
+            ));
         }
         if let Some(id) = self.pending_exposure {
             list = list.child(self.exposure_question(id, cx));
@@ -417,35 +421,47 @@ impl ShelluneView {
             });
             list = list.child(
                 components_row(self, index, cx)
-                    .child(div().flex().flex_col().flex_1().min_w(px(0.0)).child(
+                    .child(
                         div()
-                            .text_size(metrics.label_size())
-                            .when(listening, move |line| {
-                                line.debug_selector(move || format!("forwards.listening.{index}"))
-                            })
-                            .child(SharedString::from(format!(
-                                "{kind} · {host_name} · {status}"
-                            ))),
-                    ).child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .child(SharedString::from(format!(
-                                "{} {listen} · {} {target}",
-                                strings.forward_listen, strings.forward_target
-                            ))),
-                    ).children(detail.map(|detail| {
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::DANGER))
-                            .child(SharedString::from(detail))
-                    })).children(fault.map(|message| {
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::DANGER))
-                            .debug_selector(move || format!("forwards.fault.{index}"))
-                            .child(SharedString::from(message))
-                    })))
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(metrics.label_size())
+                                    .when(listening, move |line| {
+                                        line.debug_selector(move || {
+                                            format!("forwards.listening.{index}")
+                                        })
+                                    })
+                                    .child(SharedString::from(format!(
+                                        "{kind} · {host_name} · {status}"
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(SharedString::from(format!(
+                                        "{} {listen} · {} {target}",
+                                        strings.forward_listen, strings.forward_target
+                                    ))),
+                            )
+                            .children(detail.map(|detail| {
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::DANGER))
+                                    .child(SharedString::from(detail))
+                            }))
+                            .children(fault.map(|message| {
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::DANGER))
+                                    .debug_selector(move || format!("forwards.fault.{index}"))
+                                    .child(SharedString::from(message))
+                            })),
+                    )
                     .child(
                         div()
                             .flex()
@@ -558,12 +574,7 @@ impl ShelluneView {
 
     /// Replaces the listen fields, for a test.
     #[cfg(test)]
-    pub fn set_forward_listen_for_test(
-        &mut self,
-        host: &str,
-        port: &str,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_forward_listen_for_test(&mut self, host: &str, port: &str, cx: &mut Context<Self>) {
         self.forward_listen_host
             .update(cx, |field, cx| field.set_text(host, cx));
         self.forward_listen_port
@@ -711,11 +722,7 @@ impl ShelluneView {
     }
 }
 
-fn components_row(
-    view: &ShelluneView,
-    index: usize,
-    _cx: &mut Context<ShelluneView>,
-) -> gpui::Div {
+fn components_row(view: &ShelluneView, index: usize, _cx: &mut Context<ShelluneView>) -> gpui::Div {
     crate::app::components::row(view.metrics())
         .debug_selector(move || format!("forwards.row.{index}"))
 }

@@ -1053,9 +1053,7 @@ async fn socks5_target(stream: &mut TcpStream) -> Result<(String, u16), String> 
         return Err("the SOCKS request is not version 5".to_owned());
     }
     if header[1] != 1 {
-        return Err(
-            "only SOCKS CONNECT is supported. BIND and UDP are refused.".to_owned(),
-        );
+        return Err("only SOCKS CONNECT is supported. BIND and UDP are refused.".to_owned());
     }
     let host = match header[3] {
         1 => {
@@ -1204,7 +1202,7 @@ mod tests {
             "localhost and 127.0.0.1 are the same loopback endpoint"
         );
         assert!(
-            select_inbound(&[specific.clone()], "10.1.1.5", 9000).is_none(),
+            select_inbound(std::slice::from_ref(&specific), "10.1.1.5", 9000).is_none(),
             "a specific rule does not accept a different address on its port"
         );
         assert_eq!(

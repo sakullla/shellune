@@ -46,12 +46,11 @@ use gpui::{
 use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
     FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
-    MovePaneDown,
-    MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell,
-    NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab, ResizePaneDown,
-    ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
-    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight,
-    ToggleLanguage, ToggleSidebar, ZoomPane,
+    MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight,
+    NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab,
+    ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2,
+    SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
+    SplitPaneDown, SplitPaneRight, ToggleLanguage, ToggleSidebar, ZoomPane,
 };
 use crate::app::nav::{Destination, Platform};
 

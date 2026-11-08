@@ -119,9 +119,7 @@ fn wait_settled(link: &mut ForwardLink) -> ForwardEvent {
 fn expect_listening(link: &mut ForwardLink, id: ForwardId) -> u16 {
     match wait_settled(link) {
         ForwardEvent::Listening {
-            id: event_id,
-            port,
-            ..
+            id: event_id, port, ..
         } => {
             assert_eq!(event_id, id);
             port
@@ -290,7 +288,12 @@ fn local_remote_and_dynamic_forward_real_traffic_until_stopped_or_disconnected()
     let echo = start_wsl_echo(&server);
     let (mut session, mut link) = dial(&server, false);
 
-    let local = spec(ForwardKind::Local, Harness::free_port(), Some("127.0.0.1"), Some(echo));
+    let local = spec(
+        ForwardKind::Local,
+        Harness::free_port(),
+        Some("127.0.0.1"),
+        Some(echo),
+    );
     let local_id = local.id;
     assert!(link.send(ForwardCommand::Start(local)));
     let local_port = expect_listening(&mut link, local_id);
@@ -312,7 +315,14 @@ fn local_remote_and_dynamic_forward_real_traffic_until_stopped_or_disconnected()
                     "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\", 0)); print(s.getsockname()[1])'",
                 )
                 .expect("remote port");
-            listed.trim().lines().last().unwrap().trim().parse().unwrap()
+            listed
+                .trim()
+                .lines()
+                .last()
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
         },
         Some("127.0.0.1"),
         Some(windows),
@@ -337,7 +347,10 @@ fn local_remote_and_dynamic_forward_real_traffic_until_stopped_or_disconnected()
     let dynamic_id = dynamic.id;
     assert!(link.send(ForwardCommand::Start(dynamic)));
     let socks = expect_listening(&mut link, dynamic_id);
-    assert_eq!(socks5(socks, "127.0.0.1", echo, b"socks-token\n"), b"socks-token\n");
+    assert_eq!(
+        socks5(socks, "127.0.0.1", echo, b"socks-token\n"),
+        b"socks-token\n"
+    );
     assert!(link.send(ForwardCommand::Stop { id: dynamic_id }));
     assert!(matches!(
         wait_settled(&mut link),
@@ -345,7 +358,12 @@ fn local_remote_and_dynamic_forward_real_traffic_until_stopped_or_disconnected()
     ));
     refuse(socks);
 
-    let again = spec(ForwardKind::Local, Harness::free_port(), Some("127.0.0.1"), Some(echo));
+    let again = spec(
+        ForwardKind::Local,
+        Harness::free_port(),
+        Some("127.0.0.1"),
+        Some(echo),
+    );
     let again_id = again.id;
     assert!(link.send(ForwardCommand::Start(again)));
     let again_port = expect_listening(&mut link, again_id);
@@ -392,7 +410,12 @@ fn bind_refusal_and_a_dead_target_keep_the_reason_and_the_shell() {
     }
     shell_still_answers(&mut session);
 
-    let missing = spec(ForwardKind::Local, Harness::free_port(), Some("127.0.0.1"), Some(1));
+    let missing = spec(
+        ForwardKind::Local,
+        Harness::free_port(),
+        Some("127.0.0.1"),
+        Some(1),
+    );
     assert!(link.send(ForwardCommand::Start(missing)));
     match wait_settled(&mut link) {
         ForwardEvent::Failed {
@@ -414,7 +437,12 @@ fn a_server_that_disables_forwarding_is_named_and_the_shell_stays() {
     let server =
         Harness::start_without_forwarding("fwd-deny", Harness::free_port()).expect("server");
     let (mut session, mut link) = dial(&server, true);
-    let rule = spec(ForwardKind::Local, Harness::free_port(), Some("127.0.0.1"), Some(9));
+    let rule = spec(
+        ForwardKind::Local,
+        Harness::free_port(),
+        Some("127.0.0.1"),
+        Some(9),
+    );
     assert!(link.send(ForwardCommand::Start(rule)));
     match wait_settled(&mut link) {
         ForwardEvent::Failed {
@@ -423,7 +451,9 @@ fn a_server_that_disables_forwarding_is_named_and_the_shell_stays() {
         } => {
             let text = detail.to_ascii_lowercase();
             assert!(
-                text.contains("administratively") || text.contains("denied") || text.contains("refus"),
+                text.contains("administratively")
+                    || text.contains("denied")
+                    || text.contains("refus"),
                 "{detail}"
             );
         }
@@ -474,7 +504,12 @@ fn a_jump_carries_the_forward_to_the_target_and_dies_with_the_jump() {
             None => thread::sleep(Duration::from_millis(20)),
         }
     }
-    let rule = spec(ForwardKind::Local, Harness::free_port(), Some("127.0.0.1"), Some(echo));
+    let rule = spec(
+        ForwardKind::Local,
+        Harness::free_port(),
+        Some("127.0.0.1"),
+        Some(echo),
+    );
     let id = rule.id;
     assert!(link.send(ForwardCommand::Start(rule)));
     let port = expect_listening(&mut link, id);

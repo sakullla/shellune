@@ -779,7 +779,9 @@ mod tests {
         assert!(matches!(start, ForwardStart::Exposure { .. }));
         assert!(!center.any_active());
         center.confirm_exposure(rule.id());
-        let start = center.prepare_start(rule.id(), None).expect("after confirm");
+        let start = center
+            .prepare_start(rule.id(), None)
+            .expect("after confirm");
         assert!(matches!(start, ForwardStart::Connection { .. }));
         assert!(!center.any_active(), "no connection means no listener");
     }

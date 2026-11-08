@@ -7654,7 +7654,11 @@ impl ShelluneView {
             return preferred;
         }
         let content = self.files_content_width();
-        if content < preferred { content } else { preferred }
+        if content < preferred {
+            content
+        } else {
+            preferred
+        }
     }
 
     /// Width beside the rail, which is where the terminal and the file columns sit.
