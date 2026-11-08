@@ -69,13 +69,30 @@ impl Harness {
     ///
     /// Returns the reason the server could not be started, which includes "this host
     /// has no WSL to run a Linux server in".
+    ///
+    /// Starts a server that refuses TCP forwarding.
+    ///
+    /// The account and host key are the ordinary ones. Only `AllowTcpForwarding`
+    /// changes, so a refusal is the server's and not a missing user.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the server could not be started.
+    pub fn start_without_forwarding(name: &str, port: u16) -> Result<Self, String> {
+        let mut harness = Self::start(name, Self::free_port())?;
+        harness.run("stop")?;
+        harness.write_config_forwarding(port, false)?;
+        harness.port = port;
+        Ok(harness)
+    }
+
     pub fn start_without_sftp(name: &str, port: u16) -> Result<Self, String> {
         // The ordinary start creates the account, the keys and the authorized_keys
         // entry; this server reuses them and only changes what sshd is configured to
         // offer.
         let mut harness = Self::start(name, Self::free_port())?;
         harness.run("stop")?;
-        harness.write_config_without_sftp(port)?;
+        harness.write_config_forwarding(port, true)?;
         harness.port = port;
         Ok(harness)
     }
@@ -211,12 +228,14 @@ runuser -u '{user}' -- bash '{file}'",
         &self.dir
     }
 
-    /// Writes a configuration without an SFTP subsystem and starts a server with it.
+    /// Writes a configuration and starts sshd with it.
     ///
     /// The configuration is written from here rather than by a shell script on the
     /// Linux side: a heredoc would have to travel as one command-line argument, and
     /// wsl.exe expands command substitutions inside those before bash ever sees them.
-    fn write_config_without_sftp(&self, port: u16) -> Result<(), String> {
+    /// This configuration has no SFTP subsystem. `allow` is `AllowTcpForwarding`.
+    fn write_config_forwarding(&self, port: u16, allow: bool) -> Result<(), String> {
+        let allow = if allow { "yes" } else { "no" };
         let work = wsl_path(&self.dir);
         let config = format!(
             "Port {port}\n\
@@ -232,8 +251,9 @@ runuser -u '{user}' -- bash '{file}'",
              StrictModes no\n\
              PrintMotd no\n\
              PrintLastLog no\n\
-             AllowTcpForwarding yes\n\
+             AllowTcpForwarding {allow}\n\
              PermitOpen any\n\
+             PermitListen any\n\
              MaxSessions 50\n\
              MaxStartups 50:30:200\n\
              PerSourcePenalties no\n\

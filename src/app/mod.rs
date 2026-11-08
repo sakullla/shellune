@@ -16,6 +16,7 @@
 pub mod components;
 pub mod copy;
 pub mod files;
+pub mod forwarding;
 pub mod hosts;
 pub mod icons;
 pub mod layout;
@@ -44,7 +45,8 @@ use gpui::{
 
 use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers, MovePaneDown,
+    FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
+    MovePaneDown,
     MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell,
     NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab, ResizePaneDown,
     ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
@@ -65,6 +67,7 @@ pub mod actions {
             GoToHosts,
             GoToSessions,
             GoToTransfers,
+            GoToForwards,
             NextDestination,
             PreviousDestination,
             CycleTextSize,
@@ -152,6 +155,11 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
         KeyBinding::new(
             &Destination::Transfers.keystroke(platform),
             GoToTransfers,
+            Some(KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            &Destination::Forwards.keystroke(platform),
+            GoToForwards,
             Some(KEY_CONTEXT),
         ),
         KeyBinding::new(

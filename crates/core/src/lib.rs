@@ -33,8 +33,8 @@ pub use files::{
 };
 pub use fingerprint::sha256_fingerprint;
 pub use forward::{
-    Endpoint, FORWARD_FORMAT_VERSION, ForwardBook, ForwardBookError, ForwardBuildError,
-    ForwardFault, ForwardKind, ForwardRule,
+    BindExposure, Endpoint, FORWARD_FORMAT_VERSION, ForwardBook, ForwardBookError,
+    ForwardBuildError, ForwardFault, ForwardKind, ForwardRule,
 };
 pub use host::{
     DEFAULT_SSH_PORT, HostConfig, HostValidationError, JumpFault, Port, connection_jump_fault,

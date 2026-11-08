@@ -375,7 +375,13 @@ impl ShelluneView {
                     self.open_remote(&host, cx);
                 }
             }
-            Command::GoTo(destination) => self.select(destination, window, cx),
+            Command::GoTo(destination) => {
+                if destination == Destination::Forwards {
+                    self.open_global_forwards(window, cx);
+                } else {
+                    self.select(destination, window, cx);
+                }
+            }
             Command::NewHost => {
                 self.select(Destination::Hosts, window, cx);
                 self.open_create_host(cx);

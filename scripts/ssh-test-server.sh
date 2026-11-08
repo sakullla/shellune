@@ -56,6 +56,7 @@ PrintLastLog no
 # distro default cannot turn a two-hop connection into a refusal.
 AllowTcpForwarding yes
 PermitOpen any
+PermitListen any
 MaxSessions 50
 MaxStartups 50:30:200
 # A test deliberately tries a wrong password and then the right key on the same

@@ -857,6 +857,74 @@ pub struct Strings {
     pub terminal_filter_failed: &'static str,
     /// Filter: commands that exited zero. Not a generic success.
     pub terminal_filter_zero: &'static str,
+    /// Navigation entry: forwarding rules.
+    pub nav_forwards: &'static str,
+    /// One-line description of the forwarding page.
+    pub nav_forwards_summary: &'static str,
+    /// Unit after a count of forwarding rules.
+    pub count_forwards: &'static str,
+    /// Primary action on the forwarding page.
+    pub primary_forwards: &'static str,
+    /// Empty forwarding page title.
+    pub empty_forwards_title: &'static str,
+    /// Empty forwarding page body. Restore does not listen.
+    pub empty_forwards_body: &'static str,
+    /// Kind label: local forward.
+    pub forward_local: &'static str,
+    /// Kind label: remote forward.
+    pub forward_remote: &'static str,
+    /// Kind label: dynamic SOCKS.
+    pub forward_dynamic: &'static str,
+    /// Runtime: saved, not started.
+    pub forward_saved: &'static str,
+    /// Runtime: start sent, not confirmed.
+    pub forward_starting: &'static str,
+    /// Runtime: the listener is up.
+    pub forward_listening: &'static str,
+    /// Runtime: the user stopped it.
+    pub forward_stopped: &'static str,
+    /// Runtime: the last start failed.
+    pub forward_failed: &'static str,
+    /// Starts the selected rule.
+    pub forward_start: &'static str,
+    /// Stops the selected rule.
+    pub forward_stop: &'static str,
+    /// Saves the form without starting it.
+    pub forward_save: &'static str,
+    /// Deletes a saved rule.
+    pub forward_delete: &'static str,
+    /// Copies a rule into a new saved rule that is not listening.
+    pub forward_copy: &'static str,
+    /// Edits a saved rule.
+    pub forward_edit: &'static str,
+    /// Opens the new-rule form.
+    pub forward_new: &'static str,
+    /// Listen endpoint label.
+    pub forward_listen: &'static str,
+    /// Target endpoint label.
+    pub forward_target: &'static str,
+    /// Host that carries the rule.
+    pub forward_host: &'static str,
+    /// Title of the non-loopback confirmation.
+    pub forward_exposure_title: &'static str,
+    /// Explains a listen on every interface.
+    pub forward_exposure_all: &'static str,
+    /// Explains a listen on one non-loopback address.
+    pub forward_exposure_named: &'static str,
+    /// Confirms the exposure and only then starts.
+    pub forward_exposure_confirm: &'static str,
+    /// Cancels a non-loopback start. The rule stays saved.
+    pub forward_exposure_cancel: &'static str,
+    /// Close question: these rules stop with this connection.
+    pub forward_close_rules: &'static str,
+    /// Close question for the application when forwards are listening.
+    pub forward_close_app: &'static str,
+    /// Button that opens the forwarding page for one host or session.
+    pub forward_open: &'static str,
+    /// The connection carrying a rule closed.
+    pub forward_carrier_lost: &'static str,
+    /// Shown when a pure forward connection is being opened.
+    pub forward_connect_only: &'static str,
 }
 
 /// English copy.
@@ -1248,6 +1316,40 @@ pub static ENGLISH: Strings = Strings {
     terminal_filter_unknown: "Unknown exit",
     terminal_filter_failed: "Non-zero exit",
     terminal_filter_zero: "Exit 0 only",
+    nav_forwards: "Forwards",
+    nav_forwards_summary: "Local, remote and dynamic tunnels",
+    count_forwards: "forward",
+    primary_forwards: "New forward",
+    empty_forwards_title: "No forwarding rules",
+    empty_forwards_body: "Saved rules stay here until you start one. Opening this page does not listen.",
+    forward_local: "Local",
+    forward_remote: "Remote",
+    forward_dynamic: "Dynamic",
+    forward_saved: "Saved",
+    forward_starting: "Starting",
+    forward_listening: "Listening",
+    forward_stopped: "Stopped",
+    forward_failed: "Not listening",
+    forward_start: "Start",
+    forward_stop: "Stop",
+    forward_save: "Save rule",
+    forward_delete: "Delete",
+    forward_copy: "Copy",
+    forward_edit: "Edit",
+    forward_new: "New rule",
+    forward_listen: "Listen",
+    forward_target: "Target",
+    forward_host: "Connection host",
+    forward_exposure_title: "This listen address is not loopback",
+    forward_exposure_all: "Binding every interface lets other machines that can reach this computer connect. The rule is not started until you confirm.",
+    forward_exposure_named: "This address is not loopback. Machines that can reach it can connect. The rule is not started until you confirm.",
+    forward_exposure_confirm: "Listen on this address",
+    forward_exposure_cancel: "Keep it saved",
+    forward_close_rules: "Closing this connection stops only these forwards",
+    forward_close_app: "Closing the application stops these forwards",
+    forward_open: "Forwards",
+    forward_carrier_lost: "The connection closed, so this forward is no longer listening.",
+    forward_connect_only: "Connect without a terminal",
 };
 
 /// Chinese copy.
@@ -1639,6 +1741,40 @@ pub static CHINESE: Strings = Strings {
     terminal_filter_unknown: "未知退出",
     terminal_filter_failed: "非零退出",
     terminal_filter_zero: "仅退出码 0",
+    nav_forwards: "转发",
+    nav_forwards_summary: "本地、远程与动态隧道",
+    count_forwards: "条转发",
+    primary_forwards: "新建转发",
+    empty_forwards_title: "还没有转发规则",
+    empty_forwards_body: "规则保存在这里，直到你启动。打开这一页不会监听。",
+    forward_local: "本地转发",
+    forward_remote: "远程转发",
+    forward_dynamic: "动态代理",
+    forward_saved: "已保存",
+    forward_starting: "正在启动",
+    forward_listening: "监听中",
+    forward_stopped: "已停止",
+    forward_failed: "未在监听",
+    forward_start: "启动",
+    forward_stop: "停止",
+    forward_save: "保存规则",
+    forward_delete: "删除",
+    forward_copy: "复制",
+    forward_edit: "编辑",
+    forward_new: "新建规则",
+    forward_listen: "监听",
+    forward_target: "目标",
+    forward_host: "承载主机",
+    forward_exposure_title: "监听地址不是回环",
+    forward_exposure_all: "绑定全部网卡后，能访问这台电脑的其他机器都可以连入。确认之前不会启动。",
+    forward_exposure_named: "这个地址不是回环。能访问它的机器都可以连入。确认之前不会启动。",
+    forward_exposure_confirm: "在这个地址上监听",
+    forward_exposure_cancel: "只保留规则",
+    forward_close_rules: "关闭这个连接只会停止这些转发",
+    forward_close_app: "关闭应用会停止这些转发",
+    forward_open: "转发",
+    forward_carrier_lost: "连接已关闭，这条转发不再监听。",
+    forward_connect_only: "只建立转发连接，不打开终端",
 };
 
 /// A count followed by its unit, in the grammar of the language.

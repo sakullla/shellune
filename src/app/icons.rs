@@ -20,6 +20,8 @@ pub enum Icon {
     Layers,
     /// Opposed arrows: file transfers.
     Transfer,
+    /// A tunnel: forwarding rules.
+    Forward,
     /// A plus sign.
     Plus,
     /// A downward chevron for menus.
@@ -88,11 +90,12 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
         Self::Transfer,
+        Self::Forward,
         Self::Plus,
         Self::ChevronDown,
         Self::ChevronRight,
@@ -134,6 +137,7 @@ impl Icon {
             Self::Server => "icons/server.svg",
             Self::Layers => "icons/layers.svg",
             Self::Transfer => "icons/transfer.svg",
+            Self::Forward => "icons/forward.svg",
             Self::Plus => "icons/plus.svg",
             Self::ChevronDown => "icons/chevron-down.svg",
             Self::ChevronRight => "icons/chevron-right.svg",
@@ -183,6 +187,9 @@ impl Icon {
             }
             Self::Transfer => {
                 r#"<path d="M7 20V4"/><path d="M3 8l4-4 4 4"/><path d="M17 4v16"/><path d="M21 16l-4 4-4-4"/>"#
+            }
+            Self::Forward => {
+                r#"<path d="M4 8h10"/><path d="M11 5l3 3-3 3"/><path d="M20 16H10"/><path d="M13 13l-3 3 3 3"/><path d="M18 4v4"/><path d="M6 16v4"/>"#
             }
             Self::Plus => r#"<path d="M12 5v14"/><path d="M5 12h14"/>"#,
             Self::ChevronDown => r#"<path d="M6 9l6 6 6-6"/>"#,

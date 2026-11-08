@@ -17,12 +17,15 @@
 //!   ProxyCommand all become after the chain has decided to open them;
 //! * [sftp] browses directories over the connection the shell already authenticated;
 //! * [transfer] moves file contents over that same connection, under a temporary name;
+//! * [forwarding] binds local and dynamic listeners and asks the server for remote
+//!   ones, on the connection that is already authenticated;
 //! * [error] keeps every failure free of credentials.
 
 pub mod agent;
 pub mod auth;
 mod chain;
 pub mod error;
+pub mod forwarding;
 pub mod hostkey;
 pub mod session;
 pub mod sftp;
@@ -39,6 +42,7 @@ pub use session::ScriptedSession;
 
 pub use chain::{ChainEvent, ChainRequest, ChainSession, HopAuth};
 pub use error::{ChainFailure, ConnectError, HopLocation};
+pub use forwarding::{ForwardCommand, ForwardEvent, ForwardFailure, ForwardLink, ForwardSpec};
 pub use hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 pub use session::{
     CONNECT_TIMEOUT, ConnectRequest, PtySize, RemoteEvent, RemoteSession, TERM_VALUE, TrustAnswer,

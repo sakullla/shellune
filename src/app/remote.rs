@@ -851,6 +851,14 @@ impl AttemptLink {
             Self::Chain(session) => session.take_transfer_link(),
         }
     }
+
+    /// The forwarding side, once.
+    pub fn take_forward_link(&mut self) -> Option<shellune_ssh::ForwardLink> {
+        match self {
+            Self::Remote(session) => session.take_forward_link(),
+            Self::Chain(session) => session.take_forward_link(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -170,6 +170,51 @@ impl Endpoint {
             "localhost" | "127.0.0.1" | "::1" | "[::1]"
         )
     }
+
+    /// How widely a local bind of this address would be reachable.
+    ///
+    /// The answer is derived from the saved text. Nothing is bound here.
+    #[must_use]
+    pub fn bind_exposure(&self) -> BindExposure {
+        if self.is_loopback() {
+            BindExposure::Loopback
+        } else if is_wildcard_host(&self.host) {
+            BindExposure::AllInterfaces
+        } else {
+            BindExposure::Named
+        }
+    }
+}
+
+/// Whether a listen address is only this machine, one chosen address, or every interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindExposure {
+    /// Loopback. A local listener may bind this without an extra question.
+    Loopback,
+    /// Every interface (`0.0.0.0`, `::`).
+    AllInterfaces,
+    /// One non-loopback address. Other machines that can route to it can connect.
+    Named,
+}
+
+fn is_wildcard_host(host: &str) -> bool {
+    matches!(
+        host.trim()
+            .trim_matches(|character| character == '[' || character == ']')
+            .to_ascii_lowercase()
+            .as_str(),
+        "0.0.0.0" | "::" | "*"
+    )
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(formatter, "[{}]:{}", self.host, self.port.get())
+        } else {
+            write!(formatter, "{}:{}", self.host, self.port.get())
+        }
+    }
 }
 
 /// One saved forwarding rule.
@@ -283,6 +328,38 @@ impl ForwardRule {
         Self::from_parts(ForwardId::new(), host, ForwardKind::Dynamic, listen, None)
     }
 
+    /// An edit of a saved rule. The id stays so the file still names the same rule.
+    ///
+    /// # Errors
+    ///
+    /// A local or remote rule without a target, or a dynamic rule with one, is rejected.
+    /// Nothing is bound.
+    pub fn rebuild(
+        id: ForwardId,
+        host: HostId,
+        kind: ForwardKind,
+        listen: Endpoint,
+        target: Option<Endpoint>,
+    ) -> Result<Self, ForwardBuildError> {
+        match kind {
+            ForwardKind::Dynamic => {
+                if target.is_some() {
+                    return Err(ForwardBuildError::UnexpectedTarget { id });
+                }
+                Ok(Self::from_parts(id, host, kind, listen, None))
+            }
+            ForwardKind::Local | ForwardKind::Remote => {
+                let Some(target) = target else {
+                    return Err(ForwardBuildError::MissingTarget {
+                        id,
+                        kind: kind.label(),
+                    });
+                };
+                Ok(Self::from_parts(id, host, kind, listen, Some(target)))
+            }
+        }
+    }
+
     /// Stable id.
     #[must_use]
     pub fn id(&self) -> ForwardId {
@@ -311,6 +388,21 @@ impl ForwardRule {
     #[must_use]
     pub fn target(&self) -> Option<&Endpoint> {
         self.target.as_ref()
+    }
+
+    /// The same tunnel under a new id.
+    ///
+    /// Copying a rule does not copy a listener: the new rule is configuration until
+    /// something starts it.
+    #[must_use]
+    pub fn copied(&self) -> Self {
+        Self::from_parts(
+            ForwardId::new(),
+            self.host,
+            self.kind,
+            self.listen.clone(),
+            self.target.clone(),
+        )
     }
 
     /// Whether a later start must ask before binding a non-loopback local port.

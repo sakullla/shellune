@@ -22,12 +22,13 @@ use std::thread;
 use std::time::Duration;
 
 use russh::client::{self, Handler};
-use russh::{ChannelMsg, Disconnect};
+use russh::{Channel, ChannelMsg, Disconnect};
 use shellune_core::{AuthMethod, HostConfig, HostId, connection_jump_fault};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
 use crate::error::{ChainFailure, ConnectError, HopLocation};
+use crate::forwarding::{self, ForwardLink};
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 use crate::session::{
     self, Command, DialFailure, HandshakeProgress, HandshakeStage, KEEPALIVE_INTERVAL, Material,
@@ -111,6 +112,7 @@ pub struct ChainRequest {
     auth: Vec<HopAuth>,
     size: PtySize,
     connect_timeout: Duration,
+    open_shell: bool,
 }
 
 impl ChainRequest {
@@ -123,7 +125,18 @@ impl ChainRequest {
             auth,
             size,
             connect_timeout: session::CONNECT_TIMEOUT,
+            open_shell: true,
         }
+    }
+
+    /// The same chain without a shell on the target.
+    ///
+    /// Trust and authentication are unchanged. The target reports connected once
+    /// those succeed, and the chain then carries forwarding instead of a terminal.
+    #[must_use]
+    pub fn without_shell(mut self) -> Self {
+        self.open_shell = false;
+        self
     }
 
     /// The same request with another deadline for each hop's machine work.
@@ -145,6 +158,7 @@ pub struct ChainSession {
     closed: bool,
     files: Option<FileLink>,
     transfers: Option<TransferLink>,
+    forwards: Option<ForwardLink>,
 }
 
 impl ChainSession {
@@ -173,6 +187,7 @@ impl ChainSession {
             commands: transfer_command_rx,
             events: transfer_events,
         };
+        let (forward_link, forward_events, forward_gate) = forwarding::channel(commands.clone());
         let size = request.size;
         let open_commands = commands.clone();
         let failure_sender = events_tx.clone();
@@ -184,6 +199,7 @@ impl ChainSession {
             open_commands,
             size,
             timeout: request.connect_timeout,
+            open_shell: request.open_shell,
         };
 
         thread::Builder::new()
@@ -200,7 +216,15 @@ impl ChainSession {
                     }));
                     return;
                 };
-                runtime.block_on(run_chain(request, command_rx, attempt, files, transfers));
+                runtime.block_on(run_chain(
+                    request,
+                    command_rx,
+                    attempt,
+                    files,
+                    transfers,
+                    forward_events,
+                    forward_gate,
+                ));
             })
             .expect("the SSH chain thread can be created");
 
@@ -214,7 +238,13 @@ impl ChainSession {
             closed: false,
             files: Some(FileLink::new(file_requests, file_response_rx)),
             transfers: Some(TransferLink::new(transfer_commands, transfer_event_rx)),
+            forwards: Some(forward_link),
         }
+    }
+
+    /// Takes the forwarding side of the target connection, once.
+    pub fn take_forward_link(&mut self) -> Option<ForwardLink> {
+        self.forwards.take()
     }
 
     /// Takes the browsable side of the target connection, once.
@@ -419,6 +449,7 @@ struct HopHandler {
     cancel: Cancel,
     progress: Arc<HandshakeProgress>,
     recorded: Arc<Mutex<Option<ConnectError>>>,
+    gate: std::sync::Arc<forwarding::ForwardGate>,
 }
 
 impl HopHandler {
@@ -463,6 +494,38 @@ impl Handler for HopHandler {
                 Ok(false)
             }
             KnownHostKey::Unknown => self.ask_trust(presented).await,
+        }
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        forwarding::open_inbound(
+            &self.gate,
+            channel,
+            connected_address,
+            connected_port,
+            reply,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        self.gate.mark_lost();
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
+            client::DisconnectReason::Error(error) => Err(error),
         }
     }
 }
@@ -525,6 +588,7 @@ struct Attempt {
     open_commands: UnboundedSender<Command>,
     size: PtySize,
     timeout: Duration,
+    open_shell: bool,
 }
 
 async fn run_chain(
@@ -533,8 +597,12 @@ async fn run_chain(
     attempt: Attempt,
     files: sftp::Wiring,
     transfers: transfer::Wiring,
+    forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
+    gate: Arc<forwarding::ForwardGate>,
 ) {
-    if let Err(error) = connect_chain(request, &mut commands, &attempt, files, transfers).await {
+    if let Err(error) =
+        connect_chain(request, &mut commands, &attempt, files, transfers, forwards, gate).await
+    {
         let _ = attempt.events.send(ChainEvent::Failed(error));
     }
 }
@@ -545,6 +613,8 @@ async fn connect_chain(
     attempt: &Attempt,
     files: sftp::Wiring,
     transfers: transfer::Wiring,
+    forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
+    gate: Arc<forwarding::ForwardGate>,
 ) -> Result<(), ChainFailure> {
     let cancel = &attempt.cancel;
     let planned = plan_chain(&request.hosts, request.target, request.auth)?;
@@ -558,7 +628,12 @@ async fn connect_chain(
                 hop: Some(Box::new(current)),
             });
         }
-        let opened = match open_hop(hop, index > 0, live.last_mut(), attempt).await {
+        let hop_gate = if index + 1 == count {
+            Arc::clone(&gate)
+        } else {
+            forwarding::ForwardGate::reject_all()
+        };
+        let opened = match open_hop(hop, index > 0, live.last_mut(), attempt, hop_gate).await {
             Ok(opened) => opened,
             Err(error) => {
                 cleanup(&mut live).await;
@@ -567,7 +642,16 @@ async fn connect_chain(
         };
         live.push(opened);
         if index + 1 == count {
-            let result = drive_shell(&mut live, commands, attempt, files, transfers).await;
+            let result = drive_shell(
+                &mut live,
+                commands,
+                attempt,
+                files,
+                transfers,
+                forwards,
+                gate,
+            )
+            .await;
             cleanup(&mut live).await;
             return result;
         }
@@ -701,6 +785,7 @@ async fn open_hop(
     has_previous: bool,
     previous: Option<&mut LiveHop>,
     attempt: &Attempt,
+    gate: Arc<forwarding::ForwardGate>,
 ) -> Result<LiveHop, ChainFailure> {
     let events = &attempt.events;
     let trust = &attempt.trust;
@@ -759,6 +844,7 @@ async fn open_hop(
         cancel: cancel.clone(),
         progress: Arc::clone(&progress),
         recorded: Arc::clone(&recorded),
+        gate,
     };
     let config = Arc::new(client::Config {
         nodelay: true,
@@ -1024,6 +1110,8 @@ async fn drive_shell(
     attempt: &Attempt,
     files: sftp::Wiring,
     transfers: transfer::Wiring,
+    forward_events: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
+    gate: Arc<forwarding::ForwardGate>,
 ) -> Result<(), ChainFailure> {
     let events = &attempt.events;
     let cancel = &attempt.cancel;
@@ -1034,48 +1122,56 @@ async fn drive_shell(
     let target = &mut target_slot[0];
     let location = target.location.clone();
     let handle = &mut target.handle;
+    let mut carrier_lost = gate.subscribe_lost();
+    let mut forwards = forwarding::ForwardLoop::new(forward_events, gate, open_commands.clone());
 
-    let channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|error| ChainFailure::Hop {
-            hop: Box::new(location.clone()),
-            error: Box::new(ConnectError::PtyRejected {
-                reason: error.to_string(),
-            }),
-        })?;
-    channel
-        .request_pty(
-            true,
-            TERM_VALUE,
-            size.cols,
-            size.rows,
-            0,
-            0,
-            &[] as &[(russh::Pty, u32)],
-        )
-        .await
-        .map_err(|error| ChainFailure::Hop {
-            hop: Box::new(location.clone()),
-            error: Box::new(ConnectError::PtyRejected {
-                reason: error.to_string(),
-            }),
-        })?;
-    channel
-        .request_shell(true)
-        .await
-        .map_err(|error| ChainFailure::Hop {
-            hop: Box::new(location.clone()),
-            error: Box::new(ConnectError::PtyRejected {
-                reason: error.to_string(),
-            }),
-        })?;
+    let shell = if attempt.open_shell {
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|error| ChainFailure::Hop {
+                hop: Box::new(location.clone()),
+                error: Box::new(ConnectError::PtyRejected {
+                    reason: error.to_string(),
+                }),
+            })?;
+        channel
+            .request_pty(
+                true,
+                TERM_VALUE,
+                size.cols,
+                size.rows,
+                0,
+                0,
+                &[] as &[(russh::Pty, u32)],
+            )
+            .await
+            .map_err(|error| ChainFailure::Hop {
+                hop: Box::new(location.clone()),
+                error: Box::new(ConnectError::PtyRejected {
+                    reason: error.to_string(),
+                }),
+            })?;
+        channel
+            .request_shell(true)
+            .await
+            .map_err(|error| ChainFailure::Hop {
+                hop: Box::new(location.clone()),
+                error: Box::new(ConnectError::PtyRejected {
+                    reason: error.to_string(),
+                }),
+            })?;
+        Some(channel.split())
+    } else {
+        None
+    };
     if events
         .send(ChainEvent::Connected {
             hop: location.clone(),
         })
         .is_err()
     {
+        forwards.shutdown(handle).await;
         return Err(ChainFailure::Cancelled {
             hop: Some(Box::new(location)),
         });
@@ -1083,13 +1179,135 @@ async fn drive_shell(
     tokio::spawn(sftp::serve(files, open_commands.clone()));
     tokio::spawn(transfer::serve(transfers, open_commands));
 
-    let (mut read_half, write_half) = channel.split();
-    let mut exit_code: Option<u32> = None;
+    if let Some((mut read_half, write_half)) = shell {
+        let mut exit_code: Option<u32> = None;
+        loop {
+            tokio::select! {
+                biased;
+                changed = carrier_lost.changed() => {
+                    if changed.is_err() || *carrier_lost.borrow() {
+                        forwards.shutdown(handle).await;
+                        return Err(ChainFailure::Hop {
+                            hop: Box::new(location.clone()),
+                            error: Box::new(ConnectError::Disconnected {
+                                reason: "the connection to this hop closed".to_owned(),
+                            }),
+                        });
+                    }
+                }
+                index = hop_ended(jumps) => {
+                    let hop = jumps[index].location.clone();
+                    forwards.shutdown(handle).await;
+                    return Err(ChainFailure::Hop {
+                        hop: Box::new(hop),
+                        error: Box::new(ConnectError::Disconnected {
+                            reason: "the connection to this hop closed".to_owned(),
+                        }),
+                    });
+                }
+                _ = cancel.cancelled() => {
+                    let _ = write_half.eof().await;
+                    let _ = write_half.close().await;
+                    forwards.shutdown(handle).await;
+                    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                    return Ok(());
+                }
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        let _ = write_half.eof().await;
+                        let _ = write_half.close().await;
+                        forwards.shutdown(handle).await;
+                        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                        return Ok(());
+                    };
+                    let Some(command) = forwards.accept_command(handle, command).await else {
+                        continue;
+                    };
+                    match command {
+                        Command::Close => {
+                            let _ = write_half.eof().await;
+                            let _ = write_half.close().await;
+                            forwards.shutdown(handle).await;
+                            let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                            return Ok(());
+                        }
+                        Command::Write(bytes) => {
+                            if let Err(error) = write_half.data_bytes(bytes).await {
+                                forwards.shutdown(handle).await;
+                                return Err(ChainFailure::Hop {
+                                    hop: Box::new(location.clone()),
+                                    error: Box::new(ConnectError::Disconnected { reason: error.to_string() }),
+                                });
+                            }
+                        }
+                        Command::Sftp(reply) => {
+                            let _ = reply.send(open_sftp_channel(handle).await);
+                        }
+                        Command::Resize(next) => {
+                            if let Err(error) = write_half.window_change(next.cols, next.rows, 0, 0).await {
+                                forwards.shutdown(handle).await;
+                                return Err(ChainFailure::Hop {
+                                    hop: Box::new(location.clone()),
+                                    error: Box::new(ConnectError::Disconnected { reason: error.to_string() }),
+                                });
+                            }
+                        }
+                        Command::Forward(_) | Command::DirectTcp { .. } => {}
+                    }
+                }
+                message = read_half.wait() => match message {
+                    Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        if events.send(ChainEvent::Data(data.to_vec())).is_err() {
+                            forwards.shutdown(handle).await;
+                            return Ok(());
+                        }
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        exit_code = Some(exit_status);
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                        // A jump that died looks like the shell closing. Prefer the
+                        // hop that actually dropped when it says so quickly.
+                        if exit_code.is_none()
+                            && let Some(index) = jump_died(jumps).await
+                        {
+                            let hop = jumps[index].location.clone();
+                            forwards.shutdown(handle).await;
+                            return Err(ChainFailure::Hop {
+                                hop: Box::new(hop),
+                                error: Box::new(ConnectError::Disconnected {
+                                    reason: "the connection to this hop closed".to_owned(),
+                                }),
+                            });
+                        }
+                        let _ = events.send(ChainEvent::Exited { code: exit_code });
+                        forwards.shutdown(handle).await;
+                        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             biased;
+            changed = carrier_lost.changed() => {
+                if changed.is_err() || *carrier_lost.borrow() {
+                    forwards.shutdown(handle).await;
+                    return Err(ChainFailure::Hop {
+                        hop: Box::new(location.clone()),
+                        error: Box::new(ConnectError::Disconnected {
+                            reason: "the connection to this hop closed".to_owned(),
+                        }),
+                    });
+                }
+            }
             index = hop_ended(jumps) => {
                 let hop = jumps[index].location.clone();
+                forwards.shutdown(handle).await;
                 return Err(ChainFailure::Hop {
                     hop: Box::new(hop),
                     error: Box::new(ConnectError::Disconnected {
@@ -1098,67 +1316,31 @@ async fn drive_shell(
                 });
             }
             _ = cancel.cancelled() => {
-                let _ = write_half.eof().await;
-                let _ = write_half.close().await;
+                forwards.shutdown(handle).await;
                 let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                 return Ok(());
             }
-            command = commands.recv() => match command {
-                None | Some(Command::Close) => {
-                    let _ = write_half.eof().await;
-                    let _ = write_half.close().await;
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    forwards.shutdown(handle).await;
                     let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                     return Ok(());
-                }
-                Some(Command::Write(bytes)) => {
-                    if let Err(error) = write_half.data_bytes(bytes).await {
-                        return Err(ChainFailure::Hop {
-                            hop: Box::new(location.clone()),
-                            error: Box::new(ConnectError::Disconnected { reason: error.to_string() }),
-                        });
-                    }
-                }
-                Some(Command::Sftp(reply)) => {
-                    let _ = reply.send(open_sftp_channel(handle).await);
-                }
-                Some(Command::Resize(next)) => {
-                    if let Err(error) = write_half.window_change(next.cols, next.rows, 0, 0).await {
-                        return Err(ChainFailure::Hop {
-                            hop: Box::new(location.clone()),
-                            error: Box::new(ConnectError::Disconnected { reason: error.to_string() }),
-                        });
-                    }
-                }
-            },
-            message = read_half.wait() => match message {
-                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    if events.send(ChainEvent::Data(data.to_vec())).is_err() {
+                };
+                let Some(command) = forwards.accept_command(handle, command).await else {
+                    continue;
+                };
+                match command {
+                    Command::Close => {
+                        forwards.shutdown(handle).await;
+                        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                         return Ok(());
                     }
-                }
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    exit_code = Some(exit_status);
-                }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    // A jump that died looks like the shell closing. Prefer the
-                    // hop that actually dropped when it says so quickly.
-                    if exit_code.is_none()
-                        && let Some(index) = jump_died(jumps).await
-                    {
-                        let hop = jumps[index].location.clone();
-                        return Err(ChainFailure::Hop {
-                            hop: Box::new(hop),
-                            error: Box::new(ConnectError::Disconnected {
-                                reason: "the connection to this hop closed".to_owned(),
-                            }),
-                        });
+                    Command::Sftp(reply) => {
+                        let _ = reply.send(open_sftp_channel(handle).await);
                     }
-                    let _ = events.send(ChainEvent::Exited { code: exit_code });
-                    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-                    return Ok(());
+                    Command::Write(_) | Command::Resize(_) | Command::Forward(_) | Command::DirectTcp { .. } => {}
                 }
-                Some(_) => {}
-            },
+            }
         }
     }
 }

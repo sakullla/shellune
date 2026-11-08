@@ -179,15 +179,18 @@ pub enum Destination {
     Sessions,
     /// Upload and download tasks.
     Transfers,
+    /// Local, remote and dynamic forwarding rules.
+    Forwards,
 }
 
 impl Destination {
     /// Every destination, in rail order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::LocalShells,
         Self::Hosts,
         Self::Sessions,
         Self::Transfers,
+        Self::Forwards,
     ];
 
     /// Position in [`Destination::ALL`].
@@ -205,6 +208,7 @@ impl Destination {
             Self::Hosts => strings.nav_hosts,
             Self::Sessions => strings.nav_sessions,
             Self::Transfers => strings.nav_transfers,
+            Self::Forwards => strings.nav_forwards,
         }
     }
 
@@ -215,6 +219,7 @@ impl Destination {
             Self::Hosts => strings.nav_hosts_summary,
             Self::Sessions => strings.nav_sessions_summary,
             Self::Transfers => strings.nav_transfers_summary,
+            Self::Forwards => strings.nav_forwards_summary,
         }
     }
 
@@ -227,6 +232,7 @@ impl Destination {
             Self::LocalShells | Self::Sessions => strings.count_sessions,
             Self::Hosts => strings.count_hosts,
             Self::Transfers => strings.count_transfers,
+            Self::Forwards => strings.count_forwards,
         }
     }
 
@@ -237,6 +243,7 @@ impl Destination {
             Self::Hosts => "nav.hosts",
             Self::Sessions => "nav.sessions",
             Self::Transfers => "nav.transfers",
+            Self::Forwards => "nav.forwards",
         }
     }
 

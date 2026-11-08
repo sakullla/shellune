@@ -7,7 +7,7 @@
 
 use gpui::prelude::*;
 use gpui::{Context, Div, MouseButton, Pixels, Point, SharedString, Stateful, Window, div, px};
-use shellune_core::{Session, SessionId, SessionState};
+use shellune_core::{Session, SessionId, SessionKind, SessionState};
 
 use super::ShelluneView;
 use super::overlays::clamp_menu;
@@ -301,6 +301,22 @@ impl ShelluneView {
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     this.close_session_menu(window, cx);
                     this.duplicate_session(id, window, cx);
+                })),
+            );
+        }
+        if let SessionKind::Remote { host } = session.kind().clone() {
+            menu = menu.child(
+                menu_entry(
+                    strings.forward_open,
+                    "session.menu.forwards",
+                    Some(Icon::Forward),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_session_menu(window, cx);
+                    this.show_forwards_scope(crate::app::forwarding::ForwardScope::Host(host), cx);
                 })),
             );
         }

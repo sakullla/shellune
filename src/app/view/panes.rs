@@ -54,7 +54,11 @@ impl ShelluneView {
                         PanelSection::Transfers => {
                             self.workspace.select(Destination::Transfers);
                         }
-                        PanelSection::Files | PanelSection::Forwards | PanelSection::None => {}
+                        PanelSection::Forwards => {
+                            self.workspace.select(Destination::Forwards);
+                            self.workspace.set_context(PanelSection::Forwards);
+                        }
+                        PanelSection::Files | PanelSection::None => {}
                     }
                 }
                 if self.workspace.layout().has_tabs() {
@@ -113,7 +117,7 @@ impl ShelluneView {
         self.showing_connection_form = false;
         if matches!(
             self.workspace.destination(),
-            Destination::Hosts | Destination::Transfers
+            Destination::Hosts | Destination::Transfers | Destination::Forwards
         ) {
             self.workspace.select(Destination::LocalShells);
         }

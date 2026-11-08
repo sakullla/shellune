@@ -13,8 +13,9 @@
 //! ever produced.
 
 use shellune_core::{
-    HostConfig, HostId, LocalShell, PaneId, PaneTarget, PanelConfig, PanelSection, Session,
-    SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, Transfer, WorkspaceSnapshot,
+    ForwardRule, HostConfig, HostId, LocalShell, PaneId, PaneTarget, PanelConfig, PanelSection,
+    Session, SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, Transfer,
+    WorkspaceSnapshot,
 };
 
 use crate::app::layout::SessionLayout;
@@ -257,6 +258,7 @@ pub struct Workspace {
     sessions: Section<Session>,
     hosts: Section<HostConfig>,
     transfers: Section<Transfer>,
+    forwards: Section<ForwardRule>,
     shells: Vec<LocalShell>,
     shell_choice: usize,
     local_font_size: f32,
@@ -295,6 +297,7 @@ impl Workspace {
             // because a worker reported it, which is what lets an empty page mean
             // "nothing was transferred" (R10).
             transfers: Section::ready(Vec::new()),
+            forwards: Section::ready(Vec::new()),
             shells: shellune_terminal::discover(),
             shell_choice: 0,
             local_font_size: shellune_terminal::DEFAULT_FONT_SIZE,
@@ -501,6 +504,11 @@ impl Workspace {
         self.transfers.replace(SectionStatus::Ready, items);
     }
 
+    /// Saved forwarding rules. Replacing the list does not start a listener.
+    pub fn replace_forwards(&mut self, items: Vec<ForwardRule>) {
+        self.forwards.replace(SectionStatus::Ready, items);
+    }
+
     /// Sessions that run on this machine.
     pub fn local_sessions(&self) -> impl Iterator<Item = &Session> {
         self.sessions
@@ -535,6 +543,7 @@ impl Workspace {
                 _ => self.sessions.state(),
             },
             Destination::Transfers => self.transfers.state(),
+            Destination::Forwards => self.forwards.state(),
         }
     }
 
@@ -545,6 +554,7 @@ impl Workspace {
             Destination::Hosts => self.hosts.count(),
             Destination::Sessions => self.sessions.count(),
             Destination::Transfers => self.transfers.count(),
+            Destination::Forwards => self.forwards.count(),
         }
     }
 
@@ -554,6 +564,7 @@ impl Workspace {
             Destination::LocalShells | Destination::Sessions => self.sessions.status(),
             Destination::Hosts => self.hosts.status(),
             Destination::Transfers => self.transfers.status(),
+            Destination::Forwards => self.forwards.status(),
         };
         match status {
             SectionStatus::Failed(failure) => Some(failure),

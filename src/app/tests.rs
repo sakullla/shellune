@@ -28,7 +28,9 @@ use shellune_storage::{
 };
 use shellune_terminal::{BlockStatus, GridSize, TermMode, encode_paste};
 
-use crate::app::actions::{CycleTextSize, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage};
+use crate::app::actions::{
+    CycleTextSize, GoToForwards, GoToHosts, GoToSessions, GoToTransfers, ToggleLanguage,
+};
 use crate::app::copy::{CHINESE, ENGLISH, Locale, Strings};
 use crate::app::hosts::HostView;
 use crate::app::layout::Direction;
@@ -901,6 +903,40 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_filter_unknown,
             terminal_filter_failed,
             terminal_filter_zero,
+            nav_forwards,
+            nav_forwards_summary,
+            count_forwards,
+            primary_forwards,
+            empty_forwards_title,
+            empty_forwards_body,
+            forward_local,
+            forward_remote,
+            forward_dynamic,
+            forward_saved,
+            forward_starting,
+            forward_listening,
+            forward_stopped,
+            forward_failed,
+            forward_start,
+            forward_stop,
+            forward_save,
+            forward_delete,
+            forward_copy,
+            forward_edit,
+            forward_new,
+            forward_listen,
+            forward_target,
+            forward_host,
+            forward_exposure_title,
+            forward_exposure_all,
+            forward_exposure_named,
+            forward_exposure_confirm,
+            forward_exposure_cancel,
+            forward_close_rules,
+            forward_close_app,
+            forward_open,
+            forward_carrier_lost,
+            forward_connect_only,
             field_cut,
             field_copy,
             field_paste,
@@ -986,8 +1022,9 @@ fn shortcuts_follow_each_platform_convention() {
     assert_eq!(Destination::Hosts.keystroke(Platform::MacOs), "cmd-2");
 
     assert_eq!(Destination::LocalShells.next(), Destination::Hosts);
-    assert_eq!(Destination::Transfers.next(), Destination::LocalShells);
-    assert_eq!(Destination::LocalShells.previous(), Destination::Transfers);
+    assert_eq!(Destination::Transfers.next(), Destination::Forwards);
+    assert_eq!(Destination::Forwards.next(), Destination::LocalShells);
+    assert_eq!(Destination::LocalShells.previous(), Destination::Forwards);
     for destination in Destination::ALL {
         assert_eq!(destination.next().previous(), destination);
         assert_eq!(Destination::ALL[destination.index()], destination);
@@ -1002,7 +1039,7 @@ fn the_navigation_hint_names_the_keys_the_keymap_binds() {
         // labels of the first and last entries, so it cannot name a key this platform
         // does not bind.
         let first = Destination::LocalShells.shortcut_label(platform);
-        let last_digit = Destination::Transfers
+        let last_digit = Destination::ALL[Destination::ALL.len() - 1]
             .shortcut_label(platform)
             .chars()
             .last()
@@ -1076,6 +1113,7 @@ fn a_status_chip_never_stands_in_for_a_count_or_a_unit() {
         ENGLISH.count_hosts,
         ENGLISH.count_sessions,
         ENGLISH.count_transfers,
+        ENGLISH.count_forwards,
     ];
     let states = [
         SectionState::Loading,
@@ -10270,6 +10308,11 @@ async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(cx: &mut Te
         "restore must not run the shell or ProxyCommand"
     );
     std::net::TcpListener::bind(("127.0.0.1", port)).expect("restore must not listen");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_restore_state()),
+        (1, false),
+        "the saved rule is loaded and is not listening"
+    );
     assert!(
         cx.update(|_window, app| view.read(app).open_sessions().is_empty()),
         "no terminal process was started"
@@ -10326,6 +10369,60 @@ async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(cx: &mut Te
         rewritten,
         "closing the window does not replace the saved layout"
     );
+}
+
+#[gpui::test]
+async fn a_restored_forward_is_listed_and_stays_unbound(cx: &mut TestAppContext) {
+    let dir = TempDir::new("forward-visible");
+    let port = layout_port();
+    let exposed = layout_port();
+    let saved = stored_host("web", "10.0.0.5", 22, "deploy", None);
+    seed(&dir.store(), vec![saved.clone()]);
+    let mut rules = ForwardBook::new();
+    rules
+        .insert(ForwardRule::local(
+            saved.id(),
+            Endpoint::loopback(port).expect("listen"),
+            Endpoint::new("db.internal", 5432).expect("target"),
+        ))
+        .expect("rule");
+    rules
+        .insert(ForwardRule::local(
+            saved.id(),
+            Endpoint::new("0.0.0.0", exposed).expect("listen"),
+            Endpoint::loopback(9).expect("target"),
+        ))
+        .expect("exposed");
+    ForwardStore::at(dir.path()).save(&rules).expect("rules");
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    focus_root(&view, cx);
+    cx.dispatch_action(GoToForwards);
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Forwards);
+    assert!(
+        cx.debug_bounds("forwards.row.0").is_some(),
+        "the saved rule is on the page"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_restore_state()),
+        (2, false)
+    );
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("opening the page must not listen");
+    let start = bounds_of(cx, "forwards.start.1");
+    let center = start.center();
+    cx.simulate_click(point(center.x, center.y), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("forwards.exposure").is_some(),
+        "a non-loopback listen asks before it binds"
+    );
+    std::net::TcpListener::bind(("127.0.0.1", exposed)).expect("confirming is required first");
 }
 
 #[gpui::test]

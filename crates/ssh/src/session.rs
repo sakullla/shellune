@@ -34,6 +34,7 @@ use tokio::sync::oneshot;
 use crate::agent;
 use crate::auth::load_private_key;
 use crate::error::ConnectError;
+use crate::forwarding::{self, ForwardLink};
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 use crate::sftp::{self, ChannelFailure, FileLink};
 use crate::transfer::{self, TransferLink};
@@ -151,6 +152,8 @@ pub struct ConnectRequest {
     /// [CONNECT_TIMEOUT] unless a test needs the same behaviour without waiting
     /// twenty real seconds for it.
     pub connect_timeout: Duration,
+    /// Whether this connection opens a shell. A pure forward leaves it false.
+    open_shell: bool,
 }
 
 impl ConnectRequest {
@@ -172,7 +175,19 @@ impl ConnectRequest {
             size,
             known,
             connect_timeout: CONNECT_TIMEOUT,
+            open_shell: true,
         }
+    }
+
+    /// The same connection without a shell channel.
+    ///
+    /// Authentication and host trust stay the same. The session reports
+    /// [`RemoteEvent::Connected`] when those succeed and then only carries
+    /// forwarding, SFTP and transfers.
+    #[must_use]
+    pub fn without_shell(mut self) -> Self {
+        self.open_shell = false;
+        self
     }
 
     /// The same request with another deadline for the machine part.
@@ -218,6 +233,24 @@ pub(crate) enum Command {
     /// connection handle; the answer is dropped unanswered when the loop ends, which
     /// is how a browser waiting for it learns the connection is gone.
     Sftp(oneshot::Sender<Result<Channel<client::Msg>, ChannelFailure>>),
+    /// Start or stop one forwarding rule on this connection.
+    Forward(forwarding::ForwardCommand),
+    /// Open one `direct-tcpip` channel for a listener that is already up.
+    ///
+    /// The accept loop cannot open the channel itself: this task owns the
+    /// connection handle. The reply is how that loop learns the result.
+    DirectTcp {
+        /// Target host, as the client asked for it.
+        host: String,
+        /// Target port.
+        port: u32,
+        /// Address the local socket saw the client on.
+        origin_host: String,
+        /// Port the local socket saw the client on.
+        origin_port: u32,
+        /// Where the opened channel is sent.
+        reply: oneshot::Sender<Result<Channel<client::Msg>, russh::Error>>,
+    },
 }
 
 /// A remote session, from the first handshake to its last byte.
@@ -233,6 +266,8 @@ pub struct RemoteSession {
     files: Option<FileLink>,
     /// The transfer side of this connection, until the window takes it.
     transfers: Option<TransferLink>,
+    /// The forwarding side of this connection, until the window takes it.
+    forwards: Option<ForwardLink>,
 }
 
 impl RemoteSession {
@@ -263,6 +298,7 @@ impl RemoteSession {
             commands: transfer_command_rx,
             events: transfer_events,
         };
+        let (forward_link, forward_events, forward_gate) = forwarding::channel(commands.clone());
         let size = request.size;
         // The file browser asks the loop for its channel through the same command
         // channel the terminal uses, so it needs a sender of its own.
@@ -291,6 +327,8 @@ impl RemoteSession {
                         cancelled: cancel_rx,
                         files,
                         transfers,
+                        forwards: forward_events,
+                        gate: forward_gate,
                         open: open_commands,
                     },
                 ));
@@ -306,7 +344,16 @@ impl RemoteSession {
             closed: false,
             files: Some(FileLink::new(file_requests, file_response_rx)),
             transfers: Some(TransferLink::new(transfer_commands, transfer_event_rx)),
+            forwards: Some(forward_link),
         }
+    }
+
+    /// Takes the forwarding side of this connection, once.
+    ///
+    /// The rules then run on the connection that is already authenticated.
+    /// None means the link was already taken, or the session has no server.
+    pub fn take_forward_link(&mut self) -> Option<ForwardLink> {
+        self.forwards.take()
     }
 
     /// Takes the transfer side of this connection.
@@ -435,6 +482,8 @@ struct Channels {
     cancelled: UnboundedReceiver<()>,
     files: sftp::Wiring,
     transfers: transfer::Wiring,
+    forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
+    gate: std::sync::Arc<forwarding::ForwardGate>,
     open: UnboundedSender<Command>,
 }
 
@@ -457,9 +506,12 @@ async fn connect_and_shell(
         cancelled,
         files,
         transfers,
+        forwards: forward_events,
+        gate,
         open: open_commands,
     } = channels;
     let target = request.target();
+    let open_shell = request.open_shell;
     let material = Material::resolve(request.auth).await?;
 
     let config = Arc::new(client::Config {
@@ -469,6 +521,7 @@ async fn connect_and_shell(
     });
     let recorded = Arc::new(Mutex::new(None::<ConnectError>));
     let progress = Arc::new(HandshakeProgress::default());
+    let mut carrier_lost = gate.subscribe_lost();
     let handler = ClientHandler {
         host: request.host.clone(),
         port: request.port,
@@ -478,6 +531,7 @@ async fn connect_and_shell(
         cancelled,
         progress: Arc::clone(&progress),
         recorded: Arc::clone(&recorded),
+        gate: Arc::clone(&gate),
     };
 
     let mut handle = match dial(
@@ -502,98 +556,167 @@ async fn connect_and_shell(
 
     authenticate(&mut handle, &request.user, material).await?;
 
-    let channel =
-        handle
-            .channel_open_session()
+    let shell = if open_shell {
+        let channel =
+            handle
+                .channel_open_session()
+                .await
+                .map_err(|error| ConnectError::PtyRejected {
+                    reason: error.to_string(),
+                })?;
+        let size = request.size;
+        channel
+            .request_pty(
+                true,
+                TERM_VALUE,
+                size.cols,
+                size.rows,
+                0,
+                0,
+                &[] as &[(russh::Pty, u32)],
+            )
             .await
             .map_err(|error| ConnectError::PtyRejected {
                 reason: error.to_string(),
             })?;
-    let size = request.size;
-    channel
-        .request_pty(
-            true,
-            TERM_VALUE,
-            size.cols,
-            size.rows,
-            0,
-            0,
-            &[] as &[(russh::Pty, u32)],
-        )
-        .await
-        .map_err(|error| ConnectError::PtyRejected {
-            reason: error.to_string(),
-        })?;
-    channel
-        .request_shell(true)
-        .await
-        .map_err(|error| ConnectError::PtyRejected {
-            reason: error.to_string(),
-        })?;
+        channel
+            .request_shell(true)
+            .await
+            .map_err(|error| ConnectError::PtyRejected {
+                reason: error.to_string(),
+            })?;
+        Some(channel.split())
+    } else {
+        None
+    };
 
     let _ = events.send(RemoteEvent::Connected);
 
     // The file browser works on this same authenticated connection: its task asks
     // the loop below for an SFTP channel and then runs on its own, so reading a
-    // directory never stops the terminal from reading or writing.
+    // directory never stops the terminal from reading or writing. A pure forward
+    // keeps the same path and simply never opens a shell channel.
     tokio::spawn(sftp::serve(files, open_commands.clone()));
-    tokio::spawn(transfer::serve(transfers, open_commands));
+    tokio::spawn(transfer::serve(transfers, open_commands.clone()));
+    let mut forwards = forwarding::ForwardLoop::new(forward_events, gate, open_commands);
 
-    let (mut read_half, write_half) = channel.split();
-    let mut exit_code: Option<u32> = None;
-    loop {
-        tokio::select! {
-            command = commands.recv() => match command {
-                None | Some(Command::Close) => {
-                    let _ = write_half.eof().await;
-                    let _ = write_half.close().await;
-                    let _ = handle
-                        .disconnect(Disconnect::ByApplication, "", "")
-                        .await;
-                    return Ok(());
-                }
-                Some(Command::Write(bytes)) => {
-                    if let Err(error) = write_half.data_bytes(bytes).await {
+    if let Some((mut read_half, write_half)) = shell {
+        let mut exit_code: Option<u32> = None;
+        loop {
+            tokio::select! {
+                biased;
+                changed = carrier_lost.changed() => {
+                    if changed.is_err() || *carrier_lost.borrow() {
+                        forwards.shutdown(&handle).await;
                         return Err(ConnectError::Disconnected {
-                            reason: error.to_string(),
+                            reason: "the SSH connection closed".to_owned(),
                         });
                     }
                 }
-                Some(Command::Sftp(reply)) => {
-                    // One round trip, inside the loop: the channel has to be opened
-                    // where the connection handle is, and this is the only owner.
-                    let _ = reply.send(open_sftp_channel(&handle).await);
-                }
-                Some(Command::Resize(next)) => {
-                    if let Err(error) = write_half
-                        .window_change(next.cols, next.rows, 0, 0)
-                        .await
-                    {
-                        return Err(ConnectError::Disconnected {
-                            reason: error.to_string(),
-                        });
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        let _ = write_half.eof().await;
+                        let _ = write_half.close().await;
+                        forwards.shutdown(&handle).await;
+                        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                        return Ok(());
+                    };
+                    let Some(command) = forwards.accept_command(&handle, command).await else {
+                        continue;
+                    };
+                    match command {
+                        Command::Close => {
+                            let _ = write_half.eof().await;
+                            let _ = write_half.close().await;
+                            forwards.shutdown(&handle).await;
+                            let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                            return Ok(());
+                        }
+                        Command::Write(bytes) => {
+                            if let Err(error) = write_half.data_bytes(bytes).await {
+                                forwards.shutdown(&handle).await;
+                                return Err(ConnectError::Disconnected {
+                                    reason: error.to_string(),
+                                });
+                            }
+                        }
+                        Command::Sftp(reply) => {
+                            // One round trip, inside the loop: the channel has to be opened
+                            // where the connection handle is, and this is the only owner.
+                            let _ = reply.send(open_sftp_channel(&handle).await);
+                        }
+                        Command::Resize(next) => {
+                            if let Err(error) = write_half
+                                .window_change(next.cols, next.rows, 0, 0)
+                                .await
+                            {
+                                forwards.shutdown(&handle).await;
+                                return Err(ConnectError::Disconnected {
+                                    reason: error.to_string(),
+                                });
+                            }
+                        }
+                        Command::Forward(_) | Command::DirectTcp { .. } => {}
                     }
                 }
-            },
-            message = read_half.wait() => match message {
-                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    // A terminal shows stderr and stdout in one grid, so both arrive
-                    // as output; the distinction the protocol makes is not one the
-                    // pane can draw.
-                    if events.send(RemoteEvent::Data(data.to_vec())).is_err() {
+                message = read_half.wait() => match message {
+                    Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        // A terminal shows stderr and stdout in one grid, so both arrive
+                        // as output; the distinction the protocol makes is not one the
+                        // pane can draw.
+                        if events.send(RemoteEvent::Data(data.to_vec())).is_err() {
+                            forwards.shutdown(&handle).await;
+                            return Ok(());
+                        }
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        exit_code = Some(exit_status);
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                        let _ = events.send(RemoteEvent::Exited { code: exit_code });
+                        forwards.shutdown(&handle).await;
+                        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                         return Ok(());
                     }
+                    Some(_) => {}
+                },
+            }
+        }
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            changed = carrier_lost.changed() => {
+                if changed.is_err() || *carrier_lost.borrow() {
+                    forwards.shutdown(&handle).await;
+                    return Err(ConnectError::Disconnected {
+                        reason: "the SSH connection closed".to_owned(),
+                    });
                 }
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    exit_code = Some(exit_status);
-                }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    let _ = events.send(RemoteEvent::Exited { code: exit_code });
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    forwards.shutdown(&handle).await;
                     let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                     return Ok(());
+                };
+                let Some(command) = forwards.accept_command(&handle, command).await else {
+                    continue;
+                };
+                match command {
+                    Command::Close => {
+                        forwards.shutdown(&handle).await;
+                        let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                        return Ok(());
+                    }
+                    Command::Sftp(reply) => {
+                        let _ = reply.send(open_sftp_channel(&handle).await);
+                    }
+                    // A pure forward has no shell to write to or resize.
+                    Command::Write(_) | Command::Resize(_) | Command::Forward(_) | Command::DirectTcp { .. } => {}
                 }
-                Some(_) => {}
-            },
+            }
         }
     }
 }
@@ -805,6 +928,7 @@ struct ClientHandler {
     cancelled: UnboundedReceiver<()>,
     progress: Arc<HandshakeProgress>,
     recorded: Arc<Mutex<Option<ConnectError>>>,
+    gate: Arc<forwarding::ForwardGate>,
 }
 
 impl ClientHandler {
@@ -893,6 +1017,38 @@ impl client::Handler for ClientHandler {
             }
         }
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        forwarding::open_inbound(
+            &self.gate,
+            channel,
+            connected_address,
+            connected_port,
+            reply,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        self.gate.mark_lost();
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
+            client::DisconnectReason::Error(error) => Err(error),
+        }
+    }
 }
 
 /// A session whose events are supplied by a test instead of a server.
@@ -948,6 +1104,7 @@ impl ScriptedSession {
                 // transfer side: the window's tests supply those answers themselves.
                 files: None,
                 transfers: None,
+                forwards: None,
             }),
             events,
             answers,

@@ -16,10 +16,12 @@ use gpui::{
     Context, Div, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Render, SharedString,
     Stateful, Window, div, px,
 };
+use std::collections::HashMap;
+
 use shellune_core::{
-    BrowseFailure, BrowseState, EventTag, FileKind, HostConfig, HostId, HostValidationError,
-    LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, Transfer,
-    TransferDirection, join_path,
+    BrowseFailure, BrowseState, EventTag, FileKind, ForwardId, ForwardRule, HostConfig, HostId,
+    HostValidationError, LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState,
+    SplitAxis, Transfer, TransferDirection, join_path,
 };
 use shellune_ssh::PtySize;
 #[cfg(test)]
@@ -32,7 +34,7 @@ use shellune_terminal::GridSize;
 
 use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers, MovePaneDown,
+    FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers, MovePaneDown,
     MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell,
     NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab, ResizePaneDown,
     ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
@@ -43,6 +45,7 @@ use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(test)]
 use crate::app::files::BrowseChannel;
+use crate::app::forwarding::ForwardCenter;
 use crate::app::files::{
     FileSource, FileViews, FilesDialog, browse_failure_text, display_path, kind_label,
     local_protocol_to_os, path_crumbs, path_problem_text, problem_text, transfer_problem_text,
@@ -69,6 +72,7 @@ use crate::app::transfers::{
 use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Workspace};
 use crate::app::{components, theme::radius};
 
+mod forwarding;
 mod host_dialog;
 mod overlays;
 mod panes;
@@ -187,6 +191,10 @@ struct Attempt {
     target: HostConfig,
     /// The host was not written to the host file.
     ephemeral: bool,
+    /// This dial must not open a shell channel.
+    forward_only: bool,
+    /// Rules to start once this dial authenticates.
+    pending_rules: Vec<ForwardId>,
 }
 
 /// An accepted chain identity that has not been written yet.
@@ -308,6 +316,22 @@ pub struct ShelluneView {
     files: FileViews,
     /// The transfers of the remote sessions and how far each one is (R10, R17).
     transfers: TransferViews,
+    /// Saved forwarding rules and the listeners a connection is actually running.
+    forwards: ForwardCenter,
+    forward_listen_host: Entity<TextField>,
+    forward_listen_port: Entity<TextField>,
+    forward_target_host: Entity<TextField>,
+    forward_target_port: Entity<TextField>,
+    /// Whether forward events are being polled.
+    forwards_polling: bool,
+    /// The next dial is a pure forward and must not open a shell.
+    forward_only_dial: bool,
+    /// Rules waiting for that dial to authenticate.
+    pending_forward_rules: Vec<ForwardId>,
+    /// A non-loopback listen waiting for confirmation. Nothing is bound.
+    pending_exposure: Option<ForwardId>,
+    /// Pure-forward connections, kept alive without a terminal pane.
+    forward_carriers: HashMap<SessionId, AttemptLink>,
     /// Why the last upload or download could not start at all (R10).
     ///
     /// A path this window refuses keeps its own question open; a connection that cannot
@@ -506,6 +530,10 @@ impl ShelluneView {
             field.set_revealable(true, cx);
             field
         });
+        let forward_listen_host = cx.new(|cx| TextField::new(strings.forward_listen, cx));
+        let forward_listen_port = cx.new(|cx| TextField::new(strings.forward_listen, cx));
+        let forward_target_host = cx.new(|cx| TextField::new(strings.forward_target, cx));
+        let forward_target_port = cx.new(|cx| TextField::new(strings.forward_target, cx));
 
         let mut view = Self {
             workspace,
@@ -553,6 +581,16 @@ impl ShelluneView {
             secrets: default_secrets(),
             files: FileViews::new(),
             transfers: TransferViews::new(),
+            forwards: ForwardCenter::new(),
+            forward_listen_host,
+            forward_listen_port,
+            forward_target_host,
+            forward_target_port,
+            forwards_polling: false,
+            forward_only_dial: false,
+            pending_forward_rules: Vec::new(),
+            pending_exposure: None,
+            forward_carriers: HashMap::new(),
             transfer_problem: None,
             closing: None,
             closing_app: false,
@@ -588,6 +626,7 @@ impl ShelluneView {
         view.bind_remote_fields(cx);
         view.restore_hosts(cx);
         view.restore_trust();
+        view.reload_forwards();
         view.restore_workspace_layout();
         view
     }
@@ -639,6 +678,12 @@ impl ShelluneView {
         // that can say what is really saved.
         self.book =
             HostBook::from_hosts(self.workspace.hosts().items().to_vec()).unwrap_or_default();
+    }
+
+    /// How many forwarding rules are saved, and whether any is listening.
+    #[cfg(test)]
+    pub fn forward_restore_state(&self) -> (usize, bool) {
+        (self.forwards.book().rules().len(), self.forwards.any_active())
     }
 
     /// The saved records this shell last read or wrote.
@@ -893,6 +938,11 @@ impl ShelluneView {
     /// the same way, so a tab can be closed while its connection is still being made,
     /// and the other sessions keep answering.
     pub fn close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.stop_session_forwards(id);
+        if let Some(mut link) = self.forward_carriers.remove(&id) {
+            link.close();
+        }
+        self.forwards.detach(id);
         self.discard_attempt(id);
         self.unsaved.retain(|(session, _)| *session != id);
         self.drop_pane(id, cx);
@@ -1112,7 +1162,7 @@ impl ShelluneView {
     /// stated first, with how many tasks would stop. A session with nothing in flight
     /// closes at once, because there is nothing to warn about.
     pub fn request_close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if self.transfers.active_count(id) > 0 {
+        if self.transfers.active_count(id) > 0 || !self.forwards.active_on(id).is_empty() {
             self.closing = Some(id);
             cx.notify();
             return;
@@ -1146,7 +1196,8 @@ impl ShelluneView {
             .filter(|task| task.is_active())
             .cloned()
             .collect();
-        if active.is_empty() {
+        let rules = self.forwards.active_on(id);
+        if active.is_empty() && rules.is_empty() {
             return None;
         }
         let metrics = self.metrics();
@@ -1155,6 +1206,15 @@ impl ShelluneView {
             .workspace
             .session(id)
             .map_or_else(String::new, |session| session.title().to_owned());
+        let heading = if active.is_empty() {
+            format!("{}: {target}", strings.forward_close_rules)
+        } else {
+            format!(
+                "{}: {target} · {}",
+                strings.transfers_close_question,
+                active.len()
+            )
+        };
         let mut question = components::banner(Tone::Danger, metrics)
             .flex_col()
             .gap(metrics.scale(spacing::HAIRLINE))
@@ -1167,13 +1227,20 @@ impl ShelluneView {
                     .min_w(px(0.0))
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .debug_selector(|| "session.close.question.text".to_owned())
-                    .child(SharedString::from(format!(
-                        "{}: {target} · {}",
-                        strings.transfers_close_question,
-                        active.len()
-                    ))),
+                    .child(SharedString::from(heading)),
             );
         question = self.interrupted_task_lines(question, "session.close.task", &active, metrics);
+        if !rules.is_empty() {
+            if !active.is_empty() {
+                question = question.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(strings.forward_close_rules),
+                );
+            }
+            question = self.interrupted_forward_lines(question, "session.close.forward", &rules, metrics);
+        }
         Some(
             question.child(
                 div()
@@ -1203,7 +1270,8 @@ impl ShelluneView {
     /// Returning false keeps the window, and the question lists every task that would
     /// stop. Cancelling that question leaves them running.
     fn refuse_app_close(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.app_close_confirmed || !self.transfers.any_active() {
+        if self.app_close_confirmed || (!self.transfers.any_active() && !self.forwards.any_active())
+        {
             return true;
         }
         self.closing_app = true;
@@ -1235,11 +1303,17 @@ impl ShelluneView {
             .filter(|task| task.is_active())
             .cloned()
             .collect();
-        if active.is_empty() {
+        let rules = self.forwards.active_rules();
+        if active.is_empty() && rules.is_empty() {
             return None;
         }
         let metrics = self.metrics();
         let strings = self.strings();
+        let heading = if active.is_empty() {
+            strings.forward_close_app
+        } else {
+            strings.transfers_close_app_question
+        };
         let mut question = components::banner(Tone::Danger, metrics)
             .flex_col()
             .gap(metrics.scale(spacing::HAIRLINE))
@@ -1251,9 +1325,18 @@ impl ShelluneView {
                 div()
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .debug_selector(|| "app.close.question.text".to_owned())
-                    .child(SharedString::from(strings.transfers_close_app_question)),
+                    .child(SharedString::from(heading)),
             );
         question = self.interrupted_task_lines(question, "app.close.task", &active, metrics);
+        if !rules.is_empty() && !active.is_empty() {
+            question = question.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(strings.forward_close_app),
+            );
+        }
+        question = self.interrupted_forward_lines(question, "app.close.forward", &rules, metrics);
         let confirm = components::compact_button(
             strings.transfers_close_app_confirm,
             Variant::Danger,
@@ -1283,6 +1366,36 @@ impl ShelluneView {
     }
 
     /// Direction, host, source and target of a task a close would interrupt.
+    fn interrupted_forward_lines(
+        &self,
+        mut question: Div,
+        prefix: &'static str,
+        rules: &[ForwardRule],
+        metrics: Metrics,
+    ) -> Div {
+        for (index, rule) in rules.iter().enumerate() {
+            let target = rule
+                .target()
+                .map(|endpoint| endpoint.to_string())
+                .unwrap_or_else(|| "SOCKS".to_owned());
+            question = question.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector({
+                        let prefix = prefix.to_owned();
+                        move || format!("{prefix}.{index}")
+                    })
+                    .child(SharedString::from(format!(
+                        "{} · {} → {target}",
+                        rule.kind().label(),
+                        rule.listen()
+                    ))),
+            );
+        }
+        question
+    }
+
     fn interrupt_line(&self, task: &Transfer) -> String {
         format!(
             "{} · {} · {} → {}",
@@ -1325,7 +1438,17 @@ impl ShelluneView {
         // Shutdown must not overwrite the saved tree with the empty one this close
         // produces. The next launch restores that tree as pending panes.
         self.layout_persist = false;
-        let ids = self.open_sessions();
+        let mut ids = self.open_sessions();
+        for id in self.forwards.carrier_sessions() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        for id in self.forward_carriers.keys().copied() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
         for id in ids {
             self.close_session(id, cx);
         }
@@ -1484,6 +1607,7 @@ impl ShelluneView {
             Destination::Hosts => strings.primary_hosts,
             Destination::Sessions => strings.primary_sessions,
             Destination::Transfers => strings.primary_transfers,
+            Destination::Forwards => strings.primary_forwards,
         }
     }
 
@@ -1505,6 +1629,7 @@ impl ShelluneView {
         self.workspace.set_context(match destination {
             Destination::Hosts => shellune_core::PanelSection::Hosts,
             Destination::Transfers => shellune_core::PanelSection::Transfers,
+            Destination::Forwards => shellune_core::PanelSection::Forwards,
             _ => shellune_core::PanelSection::None,
         });
         if self.shows_terminal(destination)
@@ -1548,6 +1673,7 @@ impl ShelluneView {
                 }
                 None => self.select(Destination::Hosts, window, cx),
             },
+            Destination::Forwards => self.open_forward_editor(cx),
         }
         cx.notify();
     }
@@ -2016,6 +2142,7 @@ impl ShelluneView {
                     cx.notify();
                     return;
                 }
+                self.reload_forwards();
                 // A finished import still names every host and rule that did not land.
                 // The flag stays a failure while any of those remain, so the line is
                 // not the success text of a complete import.
@@ -2275,6 +2402,8 @@ impl ShelluneView {
             asking_hop: None,
             target,
             ephemeral,
+            forward_only: false,
+            pending_rules: Vec::new(),
         });
         self.checkpoint_layout();
     }
@@ -2313,6 +2442,8 @@ impl ShelluneView {
             asking_hop: None,
             target,
             ephemeral,
+            forward_only: false,
+            pending_rules: Vec::new(),
         });
     }
 
@@ -2484,6 +2615,8 @@ impl ShelluneView {
     /// cancelled, and its session stays. The new form asks only for what this host
     /// still needs.
     pub(crate) fn open_remote(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.forward_only_dial = false;
+        self.pending_forward_rules.clear();
         self.park_focused_form();
         self.open_remote_after_park(host, cx);
     }
@@ -2816,11 +2949,19 @@ impl ShelluneView {
             self.chain = Some(draft);
             return;
         };
-        let Some(request) = draft.into_request(PtySize::new(100, 30)) else {
+        let Some(mut request) = draft.into_request(PtySize::new(100, 30)) else {
             return;
         };
         let Some(id) = self.session_for_form(&target_host) else {
             return;
+        };
+        let forward_only = self.forward_only_dial;
+        self.forward_only_dial = false;
+        let pending_rules = if forward_only {
+            request = request.without_shell();
+            std::mem::take(&mut self.pending_forward_rules)
+        } else {
+            Vec::new()
         };
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Connecting);
@@ -2850,6 +2991,8 @@ impl ShelluneView {
             asking_hop: None,
             target: target_host,
             ephemeral,
+            forward_only,
+            pending_rules,
         });
         self.watch_attempt(id, cx);
         cx.notify();
@@ -3037,6 +3180,17 @@ impl ShelluneView {
             .iter()
             .find(|attempt| attempt.id == id)
             .is_some_and(|attempt| attempt.ephemeral);
+        let forward_only = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == id)
+            .is_some_and(|attempt| attempt.forward_only);
+        let pending_rules = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == id)
+            .map(|attempt| attempt.pending_rules.clone())
+            .unwrap_or_default();
         let Some(link) = self.take_transport(id) else {
             return false;
         };
@@ -3045,7 +3199,17 @@ impl ShelluneView {
             return false;
         };
         let show = self.form_session == Some(id);
-        self.on_remote_connected(id, link, pending, host, ephemeral, show, cx);
+        self.on_remote_connected(
+            id,
+            link,
+            pending,
+            host,
+            ephemeral,
+            show,
+            forward_only,
+            pending_rules,
+            cx,
+        );
         false
     }
 
@@ -3111,6 +3275,8 @@ impl ShelluneView {
         host: HostConfig,
         ephemeral: bool,
         show: bool,
+        forward_only: bool,
+        pending_rules: Vec<ForwardId>,
         cx: &mut Context<Self>,
     ) {
         let Some(tag) = self.workspace.session(id).map(|session| session.tag()) else {
@@ -3121,6 +3287,38 @@ impl ShelluneView {
         // session: the file view then asks on the connection that is already
         // authenticated, and never has to ask for credentials a second time.
         let file_link = link.take_file_link();
+        let forward_link = link.take_forward_link();
+        if forward_only {
+            if let Some(forward_link) = forward_link {
+                self.forwards.attach(id, forward_link);
+            }
+            self.forward_carriers.insert(id, link);
+            self.workspace.session_verified_and_authenticated(id);
+            self.workspace.session_connected(id);
+            if ephemeral {
+                self.unsaved.push((id, host.clone()));
+            } else if self.book.host(host.id()).is_some() {
+                self.record_host_connection(host.id(), remote::now_unix(), cx);
+            }
+            if show {
+                self.form_session = None;
+                if let Some(panel) = self.remote.as_mut() {
+                    panel.clear_secrets();
+                }
+                self.remote = None;
+                self.chain = None;
+                self.showing_connection_form = false;
+            }
+            self.active = Some(id);
+            self.pending_forward_rules = pending_rules;
+            self.start_pending_forwards(id, cx);
+            self.present_forwards(cx);
+            return;
+        }
+        if let Some(forward_link) = forward_link {
+            self.forwards.attach(id, forward_link);
+            self.watch_forwards(cx);
+        }
         // The transfer side is taken here too, for the same reason: a transfer runs on
         // the connection the shell already authenticated and never asks for credentials
         // of its own.
@@ -3505,6 +3703,8 @@ impl ShelluneView {
             asking_hop: None,
             target,
             ephemeral,
+            forward_only: false,
+            pending_rules: Vec::new(),
         });
         self.scripted.retain(|(session, _)| *session != id);
         self.scripted.push((id, scripted));
@@ -3680,6 +3880,8 @@ impl ShelluneView {
         self.reconnect = None;
         self.pending_ephemeral = None;
         self.chain = None;
+        self.forward_only_dial = false;
+        self.pending_forward_rules.clear();
         cx.notify();
     }
 
@@ -3921,12 +4123,14 @@ impl ShelluneView {
                 // cancelled, so a partial file is never presented as a finished one.
                 self.transfers
                     .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
+                self.forwards.detach(id);
                 self.end_files(id);
             }
             PaneState::Failed(failure) => {
                 self.workspace.session_failed(id, failure);
                 self.transfers
                     .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
+                self.forwards.detach(id);
                 self.end_files(id);
             }
         }
@@ -4182,6 +4386,21 @@ impl ShelluneView {
                     |view, cx| view.close_remote(cx),
                 )),
         );
+        let forward_only = self.forward_only_dial
+            || self.form_session.is_some_and(|id| {
+                self.attempts
+                    .iter()
+                    .any(|attempt| attempt.id == id && attempt.forward_only)
+            });
+        if forward_only {
+            column = column.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "remote.forward_only".to_owned())
+                    .child(strings.forward_connect_only),
+            );
+        }
 
         if let Some(prompt) = status.prompt() {
             let algorithm = prompt.algorithm().to_owned();
@@ -5209,6 +5428,15 @@ impl ShelluneView {
                     move |view, cx| view.open_remote(&target, cx),
                 ))
                 .child(self.text_button(
+                    SharedString::from(format!("hosts.forwards.{index}")),
+                    strings.forward_open,
+                    Variant::Ghost,
+                    cx,
+                    move |view, cx| {
+                        view.show_forwards_scope(crate::app::forwarding::ForwardScope::Host(id), cx);
+                    },
+                ))
+                .child(self.text_button(
                     SharedString::from(format!("hosts.edit.{index}")),
                     strings.host_edit,
                     Variant::Ghost,
@@ -5274,6 +5502,18 @@ impl ShelluneView {
                         Variant::Soft,
                         cx,
                         move |view, cx| view.open_remote(&reconnect_target, cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("hosts.recent.forwards.{index}")),
+                        strings.forward_open,
+                        Variant::Ghost,
+                        cx,
+                        move |view, cx| {
+                            view.show_forwards_scope(
+                                crate::app::forwarding::ForwardScope::Host(id),
+                                cx,
+                            );
+                        },
                     ))
                     .child(self.text_button(
                         SharedString::from(format!("hosts.recent.edit.{index}")),
@@ -5550,7 +5790,9 @@ impl ShelluneView {
                 .iter()
                 .filter(open)
                 .count(),
-            Destination::Hosts | Destination::Transfers => self.workspace.item_count(destination),
+            Destination::Hosts | Destination::Transfers | Destination::Forwards => {
+                self.workspace.item_count(destination)
+            }
         }
     }
 
@@ -5577,6 +5819,13 @@ impl ShelluneView {
                 };
             }
             Destination::Hosts => return Tone::Neutral,
+            Destination::Forwards => {
+                return if self.forwards.any_active() {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                };
+            }
         };
         if sessions
             .iter()
@@ -6080,7 +6329,7 @@ impl ShelluneView {
         match self.workspace.destination() {
             Destination::LocalShells => self.shows_terminal(Destination::LocalShells),
             Destination::Sessions => true,
-            Destination::Hosts | Destination::Transfers => false,
+            Destination::Hosts | Destination::Transfers | Destination::Forwards => false,
         }
     }
 
@@ -6156,6 +6405,7 @@ impl ShelluneView {
                     Icon::Server
                 }
             }
+            Destination::Forwards => Icon::Plus,
         };
         // The main button and the shell menu form one split control, so the default
         // shell and "pick another" read as two halves of the same action.
@@ -6578,12 +6828,14 @@ impl ShelluneView {
                     Destination::Hosts => strings.empty_hosts_title,
                     Destination::Sessions => strings.empty_sessions_title,
                     Destination::Transfers => strings.empty_transfers_title,
+                    Destination::Forwards => strings.empty_forwards_title,
                 },
                 match destination {
                     Destination::LocalShells => strings.empty_local_body,
                     Destination::Hosts => strings.empty_hosts_body,
                     Destination::Sessions => strings.empty_sessions_body,
                     Destination::Transfers => strings.empty_transfers_body,
+                    Destination::Forwards => strings.empty_forwards_body,
                 },
                 None,
                 metrics,
@@ -6605,6 +6857,7 @@ impl ShelluneView {
             Destination::Hosts => list,
             Destination::Sessions => self.session_rows(list, cx),
             Destination::Transfers => self.transfer_rows(list, cx),
+            Destination::Forwards => self.forward_rows(list, cx),
         }
     }
 
@@ -6630,7 +6883,7 @@ impl ShelluneView {
         match destination {
             Destination::LocalShells => true,
             Destination::Sessions => self.session_terminal,
-            Destination::Hosts | Destination::Transfers => false,
+            Destination::Hosts | Destination::Transfers | Destination::Forwards => false,
         }
     }
 
@@ -6718,6 +6971,10 @@ impl ShelluneView {
             // The hosts destination renders its own empty, failed and populated
             // states: the tools, the form and the list are one panel.
             self.hosts_destination(cx)
+        } else if destination == Destination::Forwards {
+            // Saved rules stay on this page, including while the list is empty,
+            // so the form and a failure reason are not hidden behind the empty card.
+            self.forward_rows(div().flex().flex_col().gap(metrics.panel_gap()), cx)
         } else {
             let card = self.section_card(destination, state);
             if state == SectionState::Populated {
@@ -10002,6 +10259,9 @@ impl Render for ShelluneView {
             .on_action(cx.listener(|this, _: &GoToTransfers, window, cx| {
                 this.select(Destination::Transfers, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &GoToForwards, window, cx| {
+                this.open_global_forwards(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &NextDestination, window, cx| {
                 this.workspace.select_next();
                 let next = this.workspace.destination();
@@ -10415,6 +10675,7 @@ fn destination_icon(destination: Destination) -> Icon {
         Destination::Hosts => Icon::Server,
         Destination::Sessions => Icon::Layers,
         Destination::Transfers => Icon::Transfer,
+        Destination::Forwards => Icon::Forward,
     }
 }
 
