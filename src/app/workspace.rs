@@ -432,6 +432,21 @@ impl Workspace {
         self.locale = self.locale.toggle();
     }
 
+    /// Sets the language, as restored from the saved preferences.
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.locale = locale;
+    }
+
+    /// Sets the text size, as restored from the saved preferences.
+    pub fn set_zoom(&mut self, zoom: Zoom) {
+        self.zoom = zoom;
+    }
+
+    /// Sets the motion setting, as restored from the saved preferences.
+    pub fn set_motion(&mut self, motion: Motion) {
+        self.motion = motion;
+    }
+
     /// The text-size preference.
     pub fn zoom(&self) -> Zoom {
         self.zoom

@@ -30,6 +30,7 @@ mod book;
 mod credentials;
 mod error;
 mod forwarding;
+mod preferences;
 mod ssh_config;
 mod store;
 mod trust;
@@ -42,6 +43,7 @@ pub use book::{
 pub use credentials::{MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
 pub use error::{BookError, PersistError, StorageError};
 pub use forwarding::{FILE_NAME as FORWARD_FILE_NAME, ForwardStore};
+pub use preferences::{FILE_NAME as PREFERENCES_FILE_NAME, Preferences, PreferencesStore};
 pub use ssh_config::{
     DEFAULT_CONFIG_TEXT, ImportError, ImportLimits, ImportNote, ImportOutcome, ImportPlan,
     ImportPreview, ImportedForward, ImportedHost, JumpSpec, NoteKind, PlannedForward, SkippedHost,

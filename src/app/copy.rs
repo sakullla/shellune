@@ -783,6 +783,8 @@ pub struct Strings {
     pub pane_pending_body: &'static str,
     /// Starts the pane the user is looking at. Nothing starts before this.
     pub pane_connect: &'static str,
+    /// Starts every waiting local pane of the tab at once.
+    pub pane_connect_all: &'static str,
     /// Removes one pane.
     pub pane_remove: &'static str,
     /// Closes one pane and leaves the others running.
@@ -1279,6 +1281,7 @@ pub static ENGLISH: Strings = Strings {
     pane_pending: "Not connected",
     pane_pending_body: "This pane is waiting. Nothing was started, and earlier output is not shown.",
     pane_connect: "Connect",
+    pane_connect_all: "Start all panes",
     pane_remove: "Remove pane",
     pane_close: "Close pane",
     pane_resize_less: "Shrink pane",
@@ -1704,6 +1707,7 @@ pub static CHINESE: Strings = Strings {
     pane_pending: "待连接",
     pane_pending_body: "这个窗格在等待。没有启动任何进程，之前的输出也不会显示。",
     pane_connect: "连接",
+    pane_connect_all: "全部启动",
     pane_remove: "移除窗格",
     pane_close: "关闭窗格",
     pane_resize_less: "缩小窗格",

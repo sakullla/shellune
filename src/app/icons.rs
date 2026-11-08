@@ -86,11 +86,17 @@ pub enum Icon {
     SplitDown,
     /// Four corners: zoom the active pane.
     Zoom,
+    /// A pencil: edit a record.
+    Pencil,
+    /// A leftward chevron.
+    ChevronLeft,
+    /// An upward chevron.
+    ChevronUp,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 40] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -128,6 +134,9 @@ impl Icon {
         Self::SplitRight,
         Self::SplitDown,
         Self::Zoom,
+        Self::Pencil,
+        Self::ChevronLeft,
+        Self::ChevronUp,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -170,6 +179,9 @@ impl Icon {
             Self::SplitRight => "icons/split-right.svg",
             Self::SplitDown => "icons/split-down.svg",
             Self::Zoom => "icons/zoom.svg",
+            Self::Pencil => "icons/pencil.svg",
+            Self::ChevronLeft => "icons/chevron-left.svg",
+            Self::ChevronUp => "icons/chevron-up.svg",
         }
     }
 
@@ -261,6 +273,11 @@ impl Icon {
             Self::Zoom => {
                 r#"<path d="M9 4H5.5A1.5 1.5 0 0 0 4 5.5V9"/><path d="M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9"/><path d="M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15"/><path d="M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15"/>"#
             }
+            Self::Pencil => {
+                r#"<path d="M4 20h4L19 9a2.83 2.83 0 0 0-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>"#
+            }
+            Self::ChevronLeft => r#"<path d="M15 6l-6 6 6 6"/>"#,
+            Self::ChevronUp => r#"<path d="M6 15l6-6 6 6"/>"#,
         }
     }
 

@@ -204,9 +204,32 @@ pub fn icon_label_button(
 
 /// A square button holding one icon, quiet until pointed at.
 pub fn icon_only_button(icon: Icon, metrics: Metrics) -> Div {
+    icon_only_button_hover(
+        icon,
+        metrics,
+        theme::swatch(palette::SURFACE_HOVER),
+        theme::swatch(palette::TEXT_PRIMARY),
+    )
+}
+
+/// [`icon_only_button`] for a destructive action: it warns in the danger colour
+/// under the pointer, before the click.
+pub fn danger_icon_button(icon: Icon, metrics: Metrics) -> Div {
+    icon_only_button_hover(
+        icon,
+        metrics,
+        theme::swatch(Tone::Danger.tint()),
+        theme::swatch(palette::DANGER),
+    )
+}
+
+fn icon_only_button_hover(
+    icon: Icon,
+    metrics: Metrics,
+    hover: gpui::Rgba,
+    hover_text: gpui::Rgba,
+) -> Div {
     let size = metrics.compact_control_height();
-    let hover = theme::swatch(palette::SURFACE_HOVER);
-    let hover_text = theme::swatch(palette::TEXT_PRIMARY);
     div()
         .group(ICON_GROUP)
         .flex()

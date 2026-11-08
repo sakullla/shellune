@@ -1007,6 +1007,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             pane_pending,
             pane_pending_body,
             pane_connect,
+            pane_connect_all,
             pane_remove,
             pane_close,
             pane_resize_less,
@@ -11038,5 +11039,102 @@ async fn a_damaged_snapshot_is_left_unchanged(cx: &mut TestAppContext) {
     assert_eq!(
         cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
         0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pane chrome, empty pages and waiting panes
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn a_single_pane_has_no_frame_and_a_split_brings_the_pane_headers(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    click(cx, "header.primary");
+    assert!(
+        cx.debug_bounds("pane.close").is_none(),
+        "a lone pane is the session: no pane header repeats it"
+    );
+    assert!(
+        cx.debug_bounds("pane.split.right").is_some()
+            && cx.debug_bounds("pane.split.down").is_some(),
+        "the split buttons move to the session bar"
+    );
+    click(cx, "pane.split.right");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_leaf_sessions_for_test())
+            .len(),
+        2
+    );
+    assert!(
+        cx.debug_bounds("pane.close").is_some(),
+        "two panes each get a header again"
+    );
+    assert!(cx.debug_bounds("pane.active").is_some());
+}
+
+#[gpui::test]
+async fn an_empty_sessions_page_shows_one_empty_state(cx: &mut TestAppContext) {
+    // Opened straight on the sessions page, so the welcome (which shares the
+    // selector) is never drawn.
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Sessions);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Sessions);
+    assert!(
+        cx.debug_bounds("workspace.empty").is_none(),
+        "no session was ever opened, so there is no pane to explain"
+    );
+}
+
+#[gpui::test]
+async fn start_all_starts_every_waiting_local_pane(cx: &mut TestAppContext) {
+    let dir = TempDir::new("start-all");
+    seed(&dir.store(), Vec::new());
+    let root = PaneNode::split(
+        SplitAxis::LeftRight,
+        5000,
+        PaneNode::leaf(PaneTarget::local(None), TerminalMode::Classic),
+        PaneNode::leaf(PaneTarget::local(None), TerminalMode::Classic),
+    )
+    .expect("split");
+    let tab = WorkspaceTab::new("Work", root).expect("title");
+    let snapshot = WorkspaceSnapshot::new(vec![tab], PanelConfig::new(false, PanelSection::None))
+        .expect("snapshot");
+    WorkspaceStore::at(dir.path())
+        .save(&snapshot)
+        .expect("snapshot saves");
+
+    let workspace = Workspace::new();
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        2
+    );
+    click(cx, "pane.connect_all");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        0,
+        "both panes started"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_sessions().len()),
+        2
     );
 }

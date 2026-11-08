@@ -28,7 +28,7 @@ use shellune_ssh::PtySize;
 use shellune_ssh::RemoteEvent;
 use shellune_storage::{
     BookError, ForwardStore, HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview,
-    ImportedHost, SecretStore, StorageError, TrustStore,
+    ImportedHost, PreferencesStore, SecretStore, StorageError, TrustStore,
 };
 use shellune_terminal::GridSize;
 
@@ -390,6 +390,10 @@ pub struct ShelluneView {
     palette: Option<Entity<TextField>>,
     /// What the palette's field held when the list was last ranked.
     palette_query: String,
+    /// Whether the last input was the pointer. A focus ring answers "where are the
+    /// keys?", which only matters to someone using them; a click already shows
+    /// where it landed.
+    pointer_input: bool,
     /// The highlighted palette entry.
     palette_selected: usize,
     /// Keeps the highlighted palette entry in view.
@@ -412,6 +416,10 @@ pub struct ShelluneView {
     rail_collapsed: bool,
     /// What the user chose for the palette.
     theme_choice: theme::ThemeChoice,
+    /// The preferences last written (or read), so a draw only writes a change.
+    /// `None` while preferences are not kept, as in the unit tests, which share
+    /// one scratch directory per process.
+    saved_preferences: Option<shellune_storage::Preferences>,
     /// Whether the window already tells this view when the system palette changes.
     watching_appearance: bool,
     /// Whether the host dialog's first field takes the keyboard on the next draw.
@@ -628,6 +636,7 @@ impl ShelluneView {
             files_layout_override: None,
             palette: None,
             palette_query: String::new(),
+            pointer_input: false,
             palette_selected: 0,
             palette_scroll: gpui::ScrollHandle::new(),
             tab_menu: None,
@@ -637,6 +646,7 @@ impl ShelluneView {
             restore_focus_pending: false,
             rail_collapsed: false,
             theme_choice: theme::ThemeChoice::default(),
+            saved_preferences: None,
             watching_appearance: false,
             layout_persist: false,
             layout_error: None,
@@ -653,7 +663,105 @@ impl ShelluneView {
         view.restore_trust();
         view.reload_forwards();
         view.restore_workspace_layout();
+        view.restore_preferences();
         view
+    }
+
+    /// Applies the saved theme, language, text size, motion, sidebar and terminal
+    /// font size. Unit tests keep the defaults, so one test's choice cannot leak
+    /// into the next.
+    fn restore_preferences(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        let saved = PreferencesStore::at(self.store.root()).load();
+        if let Some(choice) = saved.theme.as_deref().and_then(|value| match value {
+            "system" => Some(theme::ThemeChoice::System),
+            "light" => Some(theme::ThemeChoice::Light),
+            "dark" => Some(theme::ThemeChoice::Dark),
+            _ => None,
+        }) {
+            self.theme_choice = choice;
+        }
+        if let Some(locale) = saved.language.as_deref().and_then(|value| match value {
+            "en" => Some(Locale::English),
+            "zh" => Some(Locale::Chinese),
+            _ => None,
+        }) {
+            self.workspace.set_locale(locale);
+        }
+        if let Some(zoom) = saved.text_size.and_then(|percent| {
+            theme::Zoom::ALL
+                .into_iter()
+                .find(|zoom| zoom_percent(*zoom) == percent)
+        }) {
+            self.workspace.set_zoom(zoom);
+        }
+        if let Some(motion) = saved.motion.as_deref().and_then(|value| match value {
+            "full" => Some(theme::Motion::Full),
+            "reduced" => Some(theme::Motion::Reduced),
+            _ => None,
+        }) {
+            self.workspace.set_motion(motion);
+        }
+        if let Some(collapsed) = saved.sidebar_collapsed {
+            self.rail_collapsed = collapsed;
+        }
+        if let Some(size) = saved
+            .terminal_font_size
+            .filter(|size| size.is_finite() && (6.0..=72.0).contains(size))
+        {
+            self.workspace.set_local_font_size(size);
+        }
+        self.saved_preferences = Some(self.current_preferences());
+    }
+
+    /// The preferences as they stand now.
+    fn current_preferences(&self) -> shellune_storage::Preferences {
+        shellune_storage::Preferences {
+            theme: Some(
+                match self.theme_choice {
+                    theme::ThemeChoice::System => "system",
+                    theme::ThemeChoice::Light => "light",
+                    theme::ThemeChoice::Dark => "dark",
+                }
+                .to_owned(),
+            ),
+            language: Some(
+                match self.workspace.locale() {
+                    Locale::English => "en",
+                    Locale::Chinese => "zh",
+                }
+                .to_owned(),
+            ),
+            text_size: Some(zoom_percent(self.workspace.zoom())),
+            motion: Some(
+                if self.workspace.motion().allows_animation() {
+                    "full"
+                } else {
+                    "reduced"
+                }
+                .to_owned(),
+            ),
+            sidebar_collapsed: Some(self.rail_collapsed),
+            terminal_font_size: Some(self.workspace.local_font_size()),
+        }
+    }
+
+    /// Writes the preferences when one changed since the last write. Called from
+    /// every draw, so the sidebar, the palette and the shortcuts all persist
+    /// through one path. A failed write is not worth a banner: the choice still
+    /// holds for this run, and the next change tries again.
+    fn persist_preferences(&mut self) {
+        let Some(saved) = &self.saved_preferences else {
+            return;
+        };
+        let now = self.current_preferences();
+        if *saved == now {
+            return;
+        }
+        let _ = PreferencesStore::at(self.store.root()).save(&now);
+        self.saved_preferences = Some(now);
     }
 
     /// Ends every session when the window that shows them closes (R7).
@@ -5468,10 +5576,11 @@ impl ShelluneView {
                     cx,
                     move |view, cx| view.open_remote(&target, cx),
                 ))
-                .child(self.text_button(
+                .child(self.row_icon_button(
                     SharedString::from(format!("hosts.forwards.{index}")),
+                    Icon::Forward,
                     strings.forward_open,
-                    Variant::Ghost,
+                    false,
                     cx,
                     move |view, cx| {
                         view.show_forwards_scope(
@@ -5480,17 +5589,19 @@ impl ShelluneView {
                         );
                     },
                 ))
-                .child(self.text_button(
+                .child(self.row_icon_button(
                     SharedString::from(format!("hosts.edit.{index}")),
+                    Icon::Pencil,
                     strings.host_edit,
-                    Variant::Ghost,
+                    false,
                     cx,
                     move |view, cx| view.open_edit_host(&edited, cx),
                 ))
-                .child(self.text_button(
+                .child(self.row_icon_button(
                     SharedString::from(format!("hosts.delete.{index}")),
+                    Icon::Trash,
                     strings.host_delete,
-                    Variant::Ghost,
+                    true,
                     cx,
                     move |view, cx| view.ask_delete_host(id, cx),
                 )),
@@ -5547,10 +5658,11 @@ impl ShelluneView {
                         cx,
                         move |view, cx| view.open_remote(&reconnect_target, cx),
                     ))
-                    .child(self.text_button(
+                    .child(self.row_icon_button(
                         SharedString::from(format!("hosts.recent.forwards.{index}")),
+                        Icon::Forward,
                         strings.forward_open,
-                        Variant::Ghost,
+                        false,
                         cx,
                         move |view, cx| {
                             view.show_forwards_scope(
@@ -5559,17 +5671,19 @@ impl ShelluneView {
                             );
                         },
                     ))
-                    .child(self.text_button(
+                    .child(self.row_icon_button(
                         SharedString::from(format!("hosts.recent.edit.{index}")),
+                        Icon::Pencil,
                         strings.host_edit,
-                        Variant::Ghost,
+                        false,
                         cx,
                         move |view, cx| view.open_edit_host(&edited, cx),
                     ))
-                    .child(self.text_button(
+                    .child(self.row_icon_button(
                         SharedString::from(format!("hosts.recent.delete.{index}")),
+                        Icon::Trash,
                         strings.host_delete,
-                        Variant::Ghost,
+                        true,
                         cx,
                         move |view, cx| view.ask_delete_host(id, cx),
                     )),
@@ -5622,6 +5736,32 @@ impl ShelluneView {
         components::compact_button(label, variant, metrics)
             .id(id)
             .debug_selector(move || selector.clone())
+            .on_click(cx.listener(move |this, _event, _window, cx| click(this, cx)))
+    }
+
+    /// A secondary row action as a square icon with its name in a tooltip, so the
+    /// row's one labelled button is the action people come for. A destructive
+    /// action turns the danger colour under the pointer.
+    fn row_icon_button(
+        &self,
+        id: SharedString,
+        icon: Icon,
+        label: &'static str,
+        danger: bool,
+        cx: &mut Context<Self>,
+        click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let selector = id.to_string();
+        let button = if danger {
+            components::danger_icon_button(icon, metrics)
+        } else {
+            components::icon_only_button(icon, metrics)
+        };
+        button
+            .id(id)
+            .debug_selector(move || selector.clone())
+            .tooltip(components::tooltip(label))
             .on_click(cx.listener(move |this, _event, _window, cx| click(this, cx)))
     }
 
@@ -5706,7 +5846,7 @@ impl ShelluneView {
         let strings = self.strings();
         let state = self.workspace.state(destination);
         let selected = self.workspace.destination() == destination;
-        let focused = self.destination_focus(destination).is_focused(window);
+        let focused = self.destination_focus(destination).is_focused(window) && !self.pointer_input;
         // The dot only appears when the destination has something to say: a live
         // session, a failure, a load in flight. An idle entry stays quiet.
         let tone = match state {
@@ -10087,11 +10227,13 @@ impl ShelluneView {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                                 .debug_selector(|| "session.identity".to_owned())
-                                .child(SharedString::from(format!(
-                                    "{} · {}",
-                                    strings.workspace_current,
-                                    session.title()
-                                ))),
+                                // "Current" only tells panes apart; a lone pane is
+                                // simply the session.
+                                .child(SharedString::from(if self.active_tab_is_solo() {
+                                    session.title().to_owned()
+                                } else {
+                                    format!("{} · {}", strings.workspace_current, session.title())
+                                })),
                         )
                         .children(target.map(|target| {
                             div()
@@ -10120,6 +10262,7 @@ impl ShelluneView {
                         .flex_none()
                         .items_center()
                         .gap(metrics.scale(spacing::HAIRLINE))
+                        .children(self.solo_split_buttons(cx))
                         .when_some(files_button, |row, button| row.child(button))
                         .when(can_reconnect, |row| {
                             row.child(self.icon_text_button(
@@ -10424,6 +10567,7 @@ impl Render for ShelluneView {
         // Small views that are not handed the workspace (a text field's menu) read the
         // language from here.
         self.workspace.locale().set_current();
+        self.persist_preferences();
         self.viewport_width = window.viewport_size().width;
         // The palette is decided before anything is drawn: the user's choice, or the
         // system's when the choice is to follow it, which the window reports when it
@@ -10485,6 +10629,15 @@ impl Render for ShelluneView {
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .key_context("Shellune")
             .track_focus(&self.root_focus)
+            .capture_any_mouse_down(cx.listener(|this, _event, _window, _cx| {
+                this.pointer_input = true;
+            }))
+            .capture_key_down(cx.listener(|this, _event, _window, cx| {
+                if this.pointer_input {
+                    this.pointer_input = false;
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &GoToLocalShells, window, cx| {
                 this.select(Destination::LocalShells, window, cx);
             }))
@@ -10859,6 +11012,16 @@ fn session_target(book: &HostBook, session: &Session) -> String {
 #[cfg(not(test))]
 fn default_store() -> HostStore {
     HostStore::default_location()
+}
+
+/// A text size as the percent the preferences file records.
+fn zoom_percent(zoom: theme::Zoom) -> u16 {
+    match zoom {
+        theme::Zoom::Compact => 90,
+        theme::Zoom::Regular => 100,
+        theme::Zoom::Comfortable => 115,
+        theme::Zoom::Largest => 200,
+    }
 }
 
 /// A scratch store, so a test that mounts the whole shell never reads or writes the

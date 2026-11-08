@@ -533,15 +533,16 @@ impl ShelluneView {
             .justify_center()
             .gap(metrics.scale(1.0))
             .when(across, |bar| {
-                bar.w(metrics.scale(14.0))
+                bar.w(metrics.scale(12.0))
                     .h_full()
                     .flex_col()
                     .cursor_col_resize()
             })
             .when(!across, |bar| {
-                bar.h(metrics.scale(14.0)).w_full().cursor_row_resize()
+                bar.h(metrics.scale(12.0)).w_full().cursor_row_resize()
             })
             .bg(theme::swatch(palette::SURFACE))
+            .hover(|bar| bar.bg(theme::swatch(palette::SURFACE_HOVER)))
             .border_color(theme::swatch(palette::BORDER))
             .when(across, |bar| bar.border_l_1().border_r_1())
             .when(!across, |bar| bar.border_t_1().border_b_1())
@@ -566,9 +567,16 @@ impl ShelluneView {
     ) -> gpui::Stateful<gpui::Div> {
         let metrics = self.metrics();
         let selector = format!("pane.resize.{name}");
-        crate::app::components::icon_only_button(Icon::ChevronDown, metrics)
-            .w(metrics.scale(16.0))
-            .h(metrics.scale(16.0))
+        // The chevron points the way the divider moves.
+        let icon = match direction {
+            Direction::Left => Icon::ChevronLeft,
+            Direction::Right => Icon::ChevronRight,
+            Direction::Up => Icon::ChevronUp,
+            Direction::Down => Icon::ChevronDown,
+        };
+        crate::app::components::icon_only_button(icon, metrics)
+            .w(metrics.scale(12.0))
+            .h(metrics.scale(12.0))
             .id(SharedString::from(format!("pane.resize.{split}.{name}")))
             .debug_selector(move || selector.clone())
             .tooltip(crate::app::components::tooltip(label))
@@ -682,6 +690,10 @@ impl ShelluneView {
         let pane = leaf.id();
         let active = self.workspace.layout().active_pane() == Some(pane);
         let session = leaf.session();
+        // A tab with one pane needs no pane chrome: the session bar already names
+        // it and carries the split buttons, and a focus frame around the only pane
+        // marks nothing.
+        let solo = self.active_tab_is_solo() && !leaf.is_pending();
         let mut frame = div()
             .id(SharedString::from(format!("pane.leaf.{pane}")))
             .flex()
@@ -689,12 +701,13 @@ impl ShelluneView {
             .flex_1()
             .size_full()
             .overflow_hidden()
-            .border_1()
-            .border_color(theme::swatch(if active {
-                palette::ACCENT
-            } else {
-                palette::BORDER
-            }))
+            .when(!solo, |frame| {
+                frame.border_1().border_color(theme::swatch(if active {
+                    palette::ACCENT
+                } else {
+                    palette::BORDER
+                }))
+            })
             .when(active, |frame| {
                 frame.debug_selector(|| "pane.active".to_owned())
             })
@@ -707,7 +720,9 @@ impl ShelluneView {
                     this.focus_leaf(pane, window, cx);
                 }),
             );
-        frame = frame.child(self.leaf_header(leaf, active, cx));
+        if !solo {
+            frame = frame.child(self.leaf_header(leaf, active, cx));
+        }
         if leaf.is_pending() {
             frame = frame.child(self.pending_card(leaf, cx));
         } else if let Some(id) = session
@@ -837,6 +852,52 @@ impl ShelluneView {
             ))
     }
 
+    /// Whether the active tab holds exactly one pane and shows it unzoomed.
+    pub(super) fn active_tab_is_solo(&self) -> bool {
+        self.workspace
+            .layout()
+            .active_tab()
+            .is_some_and(|tab| matches!(tab.root(), Node::Leaf(_)) && tab.zoomed().is_none())
+    }
+
+    /// The split buttons, for the session bar of a tab with a single pane.
+    pub(super) fn solo_split_buttons(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.active_tab_is_solo() {
+            return None;
+        }
+        let pane = self.workspace.layout().active_pane()?;
+        let strings = self.strings();
+        let control = self.metrics().compact_control_height();
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(self.metrics().scale(spacing::HAIRLINE))
+                .child(
+                    self.pane_icon(
+                        pane,
+                        "split.right",
+                        Icon::SplitRight,
+                        strings.pane_split_right,
+                        cx,
+                        |this, window, cx| this.split_active(SplitAxis::LeftRight, window, cx),
+                    )
+                    .size(control),
+                )
+                .child(
+                    self.pane_icon(
+                        pane,
+                        "split.down",
+                        Icon::SplitDown,
+                        strings.pane_split_down,
+                        cx,
+                        |this, window, cx| this.split_active(SplitAxis::TopBottom, window, cx),
+                    )
+                    .size(control),
+                ),
+        )
+    }
+
     fn pane_icon(
         &self,
         pane: PaneId,
@@ -913,18 +974,41 @@ impl ShelluneView {
                 .flex()
                 .gap(metrics.scale(spacing::TIGHT))
                 .when(!missing, |row| {
-                    row.child(self.text_button(
-                        SharedString::from(format!("pane.connect.{pane}")),
-                        strings.pane_connect,
-                        Variant::Primary,
-                        cx,
-                        move |this, cx| {
-                            // The button's click path has no window of its own here.
-                            // `connect_leaf` focuses through the active window when it
-                            // starts a local shell, and a remote pane only opens a form.
-                            this.connect_leaf(pane, None, cx);
-                        },
-                    ))
+                    // The click hands over its window, so a local shell that starts
+                    // here takes the keyboard at once, as one started anywhere else
+                    // does; a remote pane only opens its form.
+                    row.child(
+                        crate::app::components::compact_button(
+                            strings.pane_connect,
+                            Variant::Primary,
+                            metrics,
+                        )
+                        .id(SharedString::from(format!("pane.connect.{pane}")))
+                        .debug_selector(move || format!("pane.connect.{pane}"))
+                        .on_click(cx.listener(
+                            move |this, _event, window, cx| {
+                                cx.stop_propagation();
+                                this.connect_leaf(pane, Some(window), cx);
+                            },
+                        )),
+                    )
+                })
+                .when(!missing && self.waiting_local_panes().len() > 1, |row| {
+                    row.child(
+                        crate::app::components::compact_button(
+                            strings.pane_connect_all,
+                            Variant::Secondary,
+                            metrics,
+                        )
+                        .id(SharedString::from(format!("pane.connect_all.{pane}")))
+                        .debug_selector(|| "pane.connect_all".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, window, cx| {
+                                cx.stop_propagation();
+                                this.connect_waiting_local_panes(window, cx);
+                            },
+                        )),
+                    )
                 })
                 .child(self.text_button(
                     SharedString::from(format!("pane.remove.{pane}")),
@@ -1066,6 +1150,46 @@ impl ShelluneView {
         }
     }
 
+    /// The waiting panes of the active tab that a click can start on its own: local
+    /// shells whose target is still known. A remote pane asks for its sign-in first.
+    fn waiting_local_panes(&self) -> Vec<PaneId> {
+        let Some(tab) = self.workspace.layout().active_tab() else {
+            return Vec::new();
+        };
+        let mut leaves = Vec::new();
+        collect_leaves(tab.root(), &mut leaves);
+        leaves
+            .into_iter()
+            .filter(|leaf| {
+                leaf.is_pending()
+                    && leaf.mark().is_none()
+                    && matches!(leaf.target(), PaneTarget::Local { .. })
+            })
+            .map(|leaf| leaf.id())
+            .collect()
+    }
+
+    /// Starts every waiting local pane of the active tab, one after another (a
+    /// local start finishes before it returns), and leaves the keyboard in the
+    /// active pane, or in the last one started.
+    fn connect_waiting_local_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut panes = self.waiting_local_panes();
+        let active = self.workspace.layout().active_pane();
+        if let Some(index) = active.and_then(|active| panes.iter().position(|p| *p == active)) {
+            let active = panes.remove(index);
+            panes.push(active);
+        }
+        let last = panes.len().saturating_sub(1);
+        for (index, pane) in panes.into_iter().enumerate() {
+            if index == last {
+                self.connect_leaf(pane, Some(&mut *window), cx);
+            } else {
+                self.connect_leaf(pane, None, cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// The empty-workspace note, when no tab is open on a session page.
     pub(super) fn workspace_empty_banner(&self) -> Option<gpui::Div> {
         if self.workspace.layout().has_tabs() {
@@ -1077,9 +1201,10 @@ impl ShelluneView {
         ) {
             return None;
         }
-        if self.workspace.destination() == Destination::LocalShells
-            && self.workspace.state(Destination::LocalShells)
-                == crate::app::workspace::SectionState::Empty
+        // An empty page already says so in its own state card (and the local page
+        // is the welcome); the note is only for a page that still lists sessions.
+        if self.workspace.state(self.workspace.destination())
+            == crate::app::workspace::SectionState::Empty
         {
             return None;
         }
@@ -1125,6 +1250,16 @@ fn node_has_pending(node: &Node) -> bool {
     match node {
         Node::Leaf(leaf) => leaf.is_pending(),
         Node::Split { first, second, .. } => node_has_pending(first) || node_has_pending(second),
+    }
+}
+
+fn collect_leaves<'a>(node: &'a Node, out: &mut Vec<&'a crate::app::layout::Leaf>) {
+    match node {
+        Node::Leaf(leaf) => out.push(leaf),
+        Node::Split { first, second, .. } => {
+            collect_leaves(first, out);
+            collect_leaves(second, out);
+        }
     }
 }
 

@@ -104,35 +104,29 @@ impl ShelluneView {
     fn jump_section(&self, fields: &HostFields, draft: &HostDraft, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let mut heading = div()
+        let mut column = div()
             .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "hosts.jump".to_owned())
             .child(
                 div()
-                    .flex_none()
                     .text_size(metrics.caption_size())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(strings.host_jump_title),
             );
         if draft.jumps().is_empty() {
-            heading = heading.child(
+            column = column.child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(strings.host_jump_empty),
             );
         }
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "hosts.jump".to_owned())
-            .child(heading);
+        // The chain in the order it is travelled, numbered, with its reordering as
+        // small arrows: a first hop cannot go up, nor a last one down.
+        let count = draft.jumps().len();
         for (index, id) in draft.jumps().iter().copied().enumerate() {
             let name = self
                 .book
@@ -144,10 +138,22 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
+                    .pl(metrics.scale(spacing::TIGHT))
+                    .rounded(px(radius::MEDIUM))
+                    .border_1()
+                    .border_color(theme::swatch(palette::BORDER))
+                    .bg(theme::swatch(palette::SURFACE))
                     .debug_selector({
                         let selector = format!("hosts.jump.{index}");
                         move || selector
                     })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(format!("{}", index + 1))),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -157,24 +163,31 @@ impl ShelluneView {
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .child(SharedString::from(name)),
                     )
-                    .child(self.text_button(
-                        SharedString::from(format!("hosts.jump.up.{index}")),
-                        strings.host_jump_up,
-                        Variant::Ghost,
-                        cx,
-                        move |view, cx| view.move_host_jump(index, true, cx),
-                    ))
-                    .child(self.text_button(
-                        SharedString::from(format!("hosts.jump.down.{index}")),
-                        strings.host_jump_down,
-                        Variant::Ghost,
-                        cx,
-                        move |view, cx| view.move_host_jump(index, false, cx),
-                    ))
-                    .child(self.text_button(
+                    .when(index > 0, |row| {
+                        row.child(self.row_icon_button(
+                            SharedString::from(format!("hosts.jump.up.{index}")),
+                            Icon::ChevronUp,
+                            strings.host_jump_up,
+                            false,
+                            cx,
+                            move |view, cx| view.move_host_jump(index, true, cx),
+                        ))
+                    })
+                    .when(index + 1 < count, |row| {
+                        row.child(self.row_icon_button(
+                            SharedString::from(format!("hosts.jump.down.{index}")),
+                            Icon::ChevronDown,
+                            strings.host_jump_down,
+                            false,
+                            cx,
+                            move |view, cx| view.move_host_jump(index, false, cx),
+                        ))
+                    })
+                    .child(self.row_icon_button(
                         SharedString::from(format!("hosts.jump.remove.{index}")),
+                        Icon::Close,
                         strings.host_jump_remove,
-                        Variant::Danger,
+                        true,
                         cx,
                         move |view, cx| view.remove_host_jump(index, cx),
                     )),
@@ -189,14 +202,28 @@ impl ShelluneView {
             .filter(|host| editing != Some(host.id()) && !present.contains(&host.id()))
             .map(|host| (host.id(), host.name().to_owned()))
             .collect();
-        for (index, (id, name)) in additions.into_iter().enumerate() {
-            column = column.child(self.text_button(
-                SharedString::from(format!("hosts.jump.add.{index}")),
-                format!("{} {name}", strings.host_jump_add),
-                Variant::Secondary,
-                cx,
-                move |view, cx| view.add_host_jump(id, cx),
-            ));
+        // The saved hosts that can be added, as small buttons that wrap, so a long
+        // host book does not push the rest of the form out of reach.
+        if !additions.is_empty() {
+            let mut choices = div()
+                .flex()
+                .flex_wrap()
+                .gap(metrics.scale(spacing::HAIRLINE));
+            for (index, (id, name)) in additions.into_iter().enumerate() {
+                choices = choices.child(
+                    self.icon_text_button(
+                        SharedString::from(format!("hosts.jump.add.{index}")),
+                        Icon::Plus,
+                        name,
+                        Variant::Secondary,
+                        cx,
+                        move |view, cx| view.add_host_jump(id, cx),
+                    )
+                    .max_w(metrics.scale(220.0))
+                    .tooltip(components::tooltip(strings.host_jump_add)),
+                );
+            }
+            column = column.child(choices);
         }
         column = column
             .child(self.dialog_field(fields, HostField::ProxyCommand, None, 1.0))
