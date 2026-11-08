@@ -298,7 +298,31 @@ impl ForwardCenter {
     }
 
     /// Stores a book that was just written to disk.
+    ///
+    /// Kind, host and endpoints are the saved shape. Changing that shape while
+    /// the rule is listening or starting stops that generation first, so the new
+    /// configuration is not shown as the listener that is still bound. A save
+    /// that keeps the shape leaves the listener up. A non-loopback confirmation
+    /// does not carry over to a different shape.
     pub fn adopt(&mut self, book: ForwardBook) {
+        let changed: Vec<ForwardId> = book
+            .rules()
+            .iter()
+            .filter(|rule| {
+                self.book
+                    .rule(rule.id())
+                    .is_some_and(|previous| rule_shape_changed(previous, rule))
+            })
+            .map(ForwardRule::id)
+            .collect();
+        for id in changed {
+            if self.exposure == Some(id) {
+                self.exposure = None;
+            }
+            if self.phase.get(&id).is_some_and(ForwardPhase::is_active) {
+                let _ = self.stop_one(id);
+            }
+        }
         self.replace_book(book);
         self.editor = None;
     }
@@ -513,6 +537,12 @@ impl ForwardCenter {
                 host,
                 port,
             } => {
+                // Stopped stays stopped until a later start sets a new generation.
+                // A late success of the generation that was just stopped must not
+                // put the old bind back on screen.
+                if matches!(self.phase.get(&id), Some(ForwardPhase::Stopped)) {
+                    return;
+                }
                 if !self.current(id, generation) {
                     return;
                 }
@@ -569,6 +599,43 @@ impl ForwardCenter {
             .get(&id)
             .and_then(ForwardPhase::generation)
             .is_none_or(|current| current == generation)
+    }
+
+    /// Marks one saved rule as listening, for a test that cannot bind a socket.
+    #[cfg(test)]
+    pub fn note_listening_for_test(
+        &mut self,
+        id: ForwardId,
+        session: SessionId,
+        host: &str,
+        port: u16,
+    ) {
+        self.phase.insert(
+            id,
+            ForwardPhase::Listening {
+                generation: 1,
+                session,
+                host: host.to_owned(),
+                port,
+            },
+        );
+    }
+
+    /// Attaches a link whose commands the caller can read. Nothing is bound.
+    #[cfg(test)]
+    pub fn attach_observed_for_test(
+        &mut self,
+        session: SessionId,
+    ) -> shellune_ssh::forwarding::ObservedForwards {
+        let (link, observed) = ForwardLink::observe();
+        self.attach(session, link);
+        observed
+    }
+
+    /// Whether the rule is in the listening phase.
+    #[cfg(test)]
+    pub fn is_listening_for_test(&self, id: ForwardId) -> bool {
+        matches!(self.phase.get(&id), Some(ForwardPhase::Listening { .. }))
     }
 
     fn mark_carrier_lost(&mut self, session: SessionId) {
@@ -636,6 +703,13 @@ fn new_rule(
         )),
         ForwardKind::Dynamic => Ok(ForwardRule::dynamic(host, listen)),
     }
+}
+
+fn rule_shape_changed(previous: &ForwardRule, next: &ForwardRule) -> bool {
+    previous.kind() != next.kind()
+        || previous.host() != next.host()
+        || previous.listen() != next.listen()
+        || previous.target() != next.target()
 }
 
 fn rule_with_id(
@@ -785,5 +859,186 @@ mod tests {
             center.phase.get(&second.id()),
             Some(ForwardPhase::Listening { .. })
         ));
+    }
+
+    #[test]
+    fn saving_a_different_shape_stops_the_listener_and_an_unchanged_save_does_not() {
+        let id_host = host();
+        let rule = ForwardRule::local(
+            id_host,
+            Endpoint::new("0.0.0.0", 4500).expect("listen"),
+            Endpoint::loopback(80).expect("target"),
+        );
+        let mut book = ForwardBook::new();
+        book.insert(rule.clone()).expect("insert");
+        let mut center = ForwardCenter::new();
+        center.replace_book(book.clone());
+        let session = SessionId::new();
+        center.phase.insert(
+            rule.id(),
+            ForwardPhase::Listening {
+                generation: 4,
+                session,
+                host: "0.0.0.0".to_owned(),
+                port: 4500,
+            },
+        );
+        let (link, mut observed) = ForwardLink::observe();
+        center.attach(session, link);
+
+        center.adopt(book);
+        assert!(
+            matches!(
+                center.phase.get(&rule.id()),
+                Some(ForwardPhase::Listening {
+                    port: 4500,
+                    host,
+                    ..
+                }) if host == "0.0.0.0"
+            ),
+            "the same endpoints stay listening"
+        );
+        assert!(
+            observed.commands().is_empty(),
+            "an unchanged save sends nothing"
+        );
+
+        let narrowed = ForwardRule::rebuild(
+            rule.id(),
+            id_host,
+            ForwardKind::Local,
+            Endpoint::loopback(4500).expect("loopback"),
+            Some(Endpoint::loopback(80).expect("target")),
+        )
+        .expect("rebuild");
+        let mut narrowed_book = ForwardBook::new();
+        narrowed_book.insert(narrowed).expect("insert");
+        center.adopt(narrowed_book);
+        assert!(
+            matches!(center.phase.get(&rule.id()), Some(ForwardPhase::Stopped)),
+            "the new loopback address is not the listener that was bound"
+        );
+        assert!(!center.any_active());
+        assert_eq!(
+            observed.commands(),
+            vec![ForwardCommand::Stop { id: rule.id() }],
+            "the old generation is stopped, so that channel cannot be used"
+        );
+        observed.push(ForwardEvent::Listening {
+            id: rule.id(),
+            generation: 4,
+            host: "0.0.0.0".to_owned(),
+            port: 4500,
+        });
+        assert!(center.pump());
+        assert!(
+            matches!(center.phase.get(&rule.id()), Some(ForwardPhase::Stopped)),
+            "a late listening event does not restore the generation that was stopped"
+        );
+
+        let exposed = ForwardRule::rebuild(
+            rule.id(),
+            id_host,
+            ForwardKind::Local,
+            Endpoint::new("0.0.0.0", 4500).expect("listen"),
+            Some(Endpoint::new("10.0.0.8", 81).expect("target")),
+        )
+        .expect("rebuild");
+        let mut exposed_book = ForwardBook::new();
+        exposed_book.insert(exposed).expect("insert");
+        center.confirm_exposure(rule.id());
+        center.adopt(exposed_book);
+        assert!(matches!(
+            center.phase.get(&rule.id()),
+            Some(ForwardPhase::Stopped)
+        ));
+        let start = center
+            .prepare_start(rule.id(), Some(session))
+            .expect("decision");
+        assert!(
+            matches!(start, ForwardStart::Exposure { .. }),
+            "a non-loopback listen asks again before the next real start"
+        );
+        assert!(!center.any_active());
+        center.confirm_exposure(rule.id());
+        let started = center
+            .prepare_start(rule.id(), Some(session))
+            .expect("after confirm");
+        assert!(matches!(started, ForwardStart::Ready { .. }));
+        let generation = match center.phase.get(&rule.id()) {
+            Some(ForwardPhase::Starting { generation, .. }) => *generation,
+            other => panic!("the new start is not listening yet: {other:?}"),
+        };
+        observed.push(ForwardEvent::Listening {
+            id: rule.id(),
+            generation,
+            host: "0.0.0.0".to_owned(),
+            port: 4500,
+        });
+        assert!(center.pump());
+        assert!(
+            center.is_listening_for_test(rule.id()),
+            "a later start can listen again after the old one was stopped"
+        );
+
+        let retargeted = ForwardRule::rebuild(
+            rule.id(),
+            id_host,
+            ForwardKind::Local,
+            Endpoint::new("0.0.0.0", 4500).expect("listen"),
+            Some(Endpoint::new("10.0.0.8", 82).expect("target")),
+        )
+        .expect("rebuild");
+        let mut retargeted_book = ForwardBook::new();
+        retargeted_book.insert(retargeted).expect("insert");
+        center.adopt(retargeted_book);
+        assert!(
+            matches!(center.phase.get(&rule.id()), Some(ForwardPhase::Stopped)),
+            "a new target is not the path the listener is still using"
+        );
+
+        let other_host = host();
+        center.note_listening_for_test(rule.id(), session, "0.0.0.0", 4500);
+        let moved = ForwardRule::rebuild(
+            rule.id(),
+            other_host,
+            ForwardKind::Local,
+            Endpoint::new("0.0.0.0", 4500).expect("listen"),
+            Some(Endpoint::new("10.0.0.8", 82).expect("target")),
+        )
+        .expect("rebuild");
+        let mut moved_book = ForwardBook::new();
+        moved_book.insert(moved).expect("insert");
+        center.adopt(moved_book);
+        assert!(
+            matches!(center.phase.get(&rule.id()), Some(ForwardPhase::Stopped)),
+            "a different host is not the connection that is still carrying the rule"
+        );
+
+        center.note_listening_for_test(rule.id(), session, "0.0.0.0", 4500);
+        let dynamic = ForwardRule::rebuild(
+            rule.id(),
+            other_host,
+            ForwardKind::Dynamic,
+            Endpoint::loopback(4500).expect("listen"),
+            None,
+        )
+        .expect("rebuild");
+        let mut dynamic_book = ForwardBook::new();
+        dynamic_book.insert(dynamic).expect("insert");
+        center.adopt(dynamic_book);
+        assert!(
+            matches!(center.phase.get(&rule.id()), Some(ForwardPhase::Stopped)),
+            "a different kind is not the listener that is still bound"
+        );
+        let stops = observed
+            .commands()
+            .into_iter()
+            .filter(|command| matches!(command, ForwardCommand::Stop { id } if *id == rule.id()))
+            .count();
+        assert!(
+            stops >= 3,
+            "each shape change while the rule is active stops that generation, got {stops}"
+        );
     }
 }

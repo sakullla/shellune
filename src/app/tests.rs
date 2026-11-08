@@ -10426,6 +10426,336 @@ async fn a_restored_forward_is_listed_and_stays_unbound(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+async fn closing_a_tab_or_removing_a_session_with_an_active_forward_asks_first(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let host = shellune_core::HostId::new();
+    let rule_a = ForwardRule::local(
+        host,
+        Endpoint::loopback(45111).expect("listen"),
+        Endpoint::new("10.0.0.8", 80).expect("target"),
+    );
+    let rule_b = ForwardRule::local(
+        host,
+        Endpoint::loopback(45112).expect("listen"),
+        Endpoint::new("10.0.0.9", 80).expect("target"),
+    );
+    let id_a = rule_a.id();
+    let id_b = rule_b.id();
+    let (mut observed_a, mut observed_b) = cx.update(|_window, app| {
+        view.update(app, |view, _cx| {
+            let observed_a = view.install_listening_forward_for_test(
+                tabs[0],
+                rule_a,
+                "127.0.0.1",
+                45111,
+            );
+            let observed_b = view.install_listening_forward_for_test(
+                tabs[1],
+                rule_b,
+                "127.0.0.1",
+                45112,
+            );
+            (observed_a, observed_b)
+        })
+    });
+    let connected = |cx: &mut VisualTestContext, id: SessionId| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .session(id)
+                .is_some_and(|session| matches!(session.state(), SessionState::Connected))
+        })
+    };
+    let listening = |cx: &mut VisualTestContext, id| {
+        cx.update(|_window, app| view.read(app).forward_listening_for_test(id))
+    };
+
+    click(cx, "session.tab.close.0");
+    assert!(
+        cx.debug_bounds("session.close.question").is_some(),
+        "closing the tab lists the forward before the connection stops"
+    );
+    assert!(cx.debug_bounds("session.close.forward.0").is_some());
+    assert!(cx.debug_bounds("session.close.task.0").is_none());
+    let lines = cx.update(|_window, app| view.read(app).closing_forward_lines_for_test());
+    assert!(
+        lines.iter().any(|line| line.contains("45111")),
+        "the question names this connection's rule: {lines:?}"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("45112")),
+        "the other connection's rule is not in this question: {lines:?}"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        tabs,
+        "the tab stays until the question is answered"
+    );
+    assert!(connected(cx, tabs[0]) && connected(cx, tabs[1]));
+    assert!(listening(cx, id_a) && listening(cx, id_b));
+    assert!(observed_a.commands().is_empty() && observed_b.commands().is_empty());
+
+    click(cx, "session.close.cancel");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        None
+    );
+    assert!(connected(cx, tabs[0]) && listening(cx, id_a));
+    assert!(connected(cx, tabs[1]) && listening(cx, id_b));
+
+    right_click(cx, "session.tab.1");
+    click(cx, "tab.menu.close_others");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        Some(tabs[0]),
+        "close other tabs asks before it stops the forward on the other tab"
+    );
+    assert_eq!(cx.update(|_window, app| view.read(app).open_tabs()), tabs);
+    click(cx, "session.close.cancel");
+    assert!(listening(cx, id_a) && listening(cx, id_b));
+
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.close_right");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        Some(tabs[1]),
+        "close tabs to the right asks before it stops that forward"
+    );
+    assert_eq!(cx.update(|_window, app| view.read(app).open_tabs()), tabs);
+    let lines = cx.update(|_window, app| view.read(app).closing_forward_lines_for_test());
+    assert!(
+        lines.iter().any(|line| line.contains("45112")),
+        "the question names the rule on the tab to the right: {lines:?}"
+    );
+    click(cx, "session.close.cancel");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.remove_session(tabs[0], cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        Some(tabs[0]),
+        "removing the session asks before it drops the record"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).workspace().session(tabs[0]).is_some()),
+        "the record stays so the question still has a subject"
+    );
+    assert!(connected(cx, tabs[0]) && listening(cx, id_a));
+    assert_eq!(cx.update(|_window, app| view.read(app).open_tabs()), tabs);
+    click(cx, "session.close.cancel");
+    assert!(
+        observed_a.commands().is_empty() && observed_b.commands().is_empty(),
+        "cancelling does not stop either forward"
+    );
+
+    click(cx, "session.tab.close.0");
+    click(cx, "session.close.confirm");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![tabs[1]],
+        "confirming closes only the session that was asked about"
+    );
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .session(tabs[0])
+                .is_some_and(|session| matches!(session.state(), SessionState::Closed))
+        }),
+        "the confirmed session is closed"
+    );
+    assert!(!listening(cx, id_a));
+    assert_eq!(
+        observed_a.commands(),
+        vec![shellune_ssh::ForwardCommand::Stop { id: id_a }]
+    );
+    assert!(connected(cx, tabs[1]) && listening(cx, id_b));
+    assert!(
+        observed_b.commands().is_empty(),
+        "the other session's forward keeps its channel"
+    );
+}
+
+#[gpui::test]
+async fn saving_a_listening_rule_onto_a_new_endpoint_withdraws_the_old_listener(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("forward-save-live");
+    let port = layout_port();
+    let saved = stored_host("web", "10.0.0.5", 22, "deploy", None);
+    seed(&dir.store(), vec![saved.clone()]);
+    let rule = ForwardRule::local(
+        saved.id(),
+        Endpoint::new("0.0.0.0", port).expect("listen"),
+        Endpoint::loopback(9).expect("target"),
+    );
+    let id = rule.id();
+    let mut rules = ForwardBook::new();
+    rules.insert(rule.clone()).expect("rule");
+    ForwardStore::at(dir.path()).save(&rules).expect("rules");
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    focus_root(&view, cx);
+    let mut observed = cx.update(|_window, app| {
+        view.update(app, |view, _cx| {
+            view.install_listening_forward_for_test(
+                shellune_core::SessionId::new(),
+                rule,
+                "0.0.0.0",
+                port,
+            )
+        })
+    });
+    cx.dispatch_action(GoToForwards);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("forwards.listening.0").is_some(),
+        "the row shows the bound listener before the edit"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.edit_forward_for_test(id, cx);
+            view.save_forward_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).forward_listening_for_test(id)),
+        "saving the same endpoints leaves the listener up"
+    );
+    assert!(observed.commands().is_empty());
+    assert!(cx.debug_bounds("forwards.listening.0").is_some());
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.edit_forward_for_test(id, cx);
+            view.set_forward_listen_for_test("127.0.0.1", &port.to_string(), cx);
+            view.save_forward_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let summary = cx
+        .update(|_window, app| view.read(app).forward_row_summary_for_test(0))
+        .expect("the row is still saved");
+    assert!(
+        !summary.contains("Listening"),
+        "the new endpoint is not marked listening: {summary}"
+    );
+    assert!(
+        summary.contains("Stopped") && summary.contains(&format!("127.0.0.1:{port}")),
+        "the row shows the saved endpoint as stopped, not as the old bind: {summary}"
+    );
+    assert!(!cx.update(|_window, app| view.read(app).forward_listening_for_test(id)));
+    assert_eq!(
+        observed.commands(),
+        vec![shellune_ssh::ForwardCommand::Stop { id }]
+    );
+    let stored = ForwardStore::at(dir.path()).load().expect("rules");
+    assert_eq!(stored.rule(id).expect("rule").listen().host(), "127.0.0.1");
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("the new endpoint is not listening");
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.edit_forward_for_test(id, cx);
+            view.set_forward_listen_for_test("0.0.0.0", &port.to_string(), cx);
+            view.save_forward_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "forwards.start.0");
+    assert!(
+        cx.debug_bounds("forwards.exposure").is_some(),
+        "the next real start of a non-loopback listen still asks"
+    );
+    assert!(!cx.update(|_window, app| view.read(app).forward_listening_for_test(id)));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "the confirmation has not started a connection"
+    );
+}
+
+#[gpui::test]
+async fn a_forward_whose_host_was_deleted_explains_that_on_its_row(cx: &mut TestAppContext) {
+    let dir = TempDir::new("forward-missing-host");
+    let missing = shellune_core::HostId::new();
+    let port = layout_port();
+    let rule = ForwardRule::local(
+        missing,
+        Endpoint::loopback(port).expect("listen"),
+        Endpoint::new("db.internal", 5432).expect("target"),
+    );
+    let id = rule.id();
+    let mut rules = ForwardBook::new();
+    rules.insert(rule).expect("rule");
+    ForwardStore::at(dir.path()).save(&rules).expect("rules");
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    focus_root(&view, cx);
+    cx.dispatch_action(GoToForwards);
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("forwards.row.0").is_some());
+    assert!(cx.debug_bounds("forwards.form").is_none());
+    assert!(
+        cx.debug_bounds("forwards.fault.0").is_some(),
+        "the row itself says why this saved rule cannot start"
+    );
+    let fault = cx
+        .update(|_window, app| view.read(app).forward_fault_for_test(0))
+        .expect("the missing host is a fault");
+    assert!(
+        fault.contains(&missing.to_string()) && fault.contains(&id.to_string()),
+        "the fault names the rule and the host: {fault}"
+    );
+    assert!(
+        fault.contains("not saved") && fault.contains("not started"),
+        "the fault says the host is gone and nothing was started: {fault}"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0
+    );
+    assert!(!cx.update(|_window, app| view.read(app).forward_listening_for_test(id)));
+
+    click(cx, "forwards.start.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "starting does not dial a host that is not saved"
+    );
+    assert_eq!(destination_of(&view, cx), Destination::Forwards);
+    assert!(cx.debug_bounds("forwards.exposure").is_none());
+    assert!(cx.debug_bounds("forwards.fault.0").is_some());
+    assert!(!cx.update(|_window, app| view.read(app).forward_listening_for_test(id)));
+    let summary = cx
+        .update(|_window, app| view.read(app).forward_row_summary_for_test(0))
+        .expect("row");
+    assert!(
+        !summary.contains("Listening"),
+        "a saved rule with no host is not a listener: {summary}"
+    );
+}
+
+#[gpui::test]
 async fn an_empty_snapshot_does_not_replace_the_open_page(cx: &mut TestAppContext) {
     let dir = TempDir::new("empty-layout");
     let mut workspace = Workspace::new();

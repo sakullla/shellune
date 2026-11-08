@@ -116,12 +116,12 @@ impl ShelluneView {
 
     /// Removes one session: its tab first when it still has one, then its record.
     ///
-    /// A session with transfers running asks first, as its close button does; the
-    /// record then stays until the user has answered, because removing it would take
-    /// the question's subject away.
+    /// A session with transfers or forwards running asks first, as its close button
+    /// does; the record then stays until the user has answered, because removing it
+    /// would take the question's subject away.
     pub fn remove_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
         if !self.is_closed(id) {
-            if self.transfers.active_count(id) > 0 {
+            if self.close_needs_confirmation(id) {
                 self.closing = Some(id);
                 cx.notify();
                 return;

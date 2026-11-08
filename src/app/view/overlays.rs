@@ -763,13 +763,13 @@ impl ShelluneView {
 
     /// Closes every tab in `ids`.
     ///
-    /// A session with transfers still running is not closed behind the user's back:
-    /// the others close at once, and the first such session asks, as its own close
-    /// button would.
+    /// A session with transfers or forwards still running is not closed behind the
+    /// user's back: the others close at once, and the first such session asks, as
+    /// its own close button would.
     pub fn close_sessions(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
         let mut asked = false;
         for id in ids {
-            if self.transfers.active_count(id) > 0 {
+            if self.close_needs_confirmation(id) {
                 if !asked {
                     self.closing = Some(id);
                     asked = true;

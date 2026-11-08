@@ -242,6 +242,49 @@ impl ForwardLink {
     pub fn events_open(&self) -> bool {
         !self.events_closed
     }
+
+    /// A link with no connection behind it.
+    ///
+    /// The handle reads commands and delivers events. Nothing is bound.
+    #[must_use]
+    pub fn observe() -> (Self, ObservedForwards) {
+        let (commands, command_rx) = unbounded_channel();
+        let (events, event_rx) = unbounded_channel();
+        (
+            Self::new(commands, event_rx),
+            ObservedForwards {
+                commands: command_rx,
+                events,
+            },
+        )
+    }
+}
+
+/// Commands and events of a [`ForwardLink::observe`] link.
+///
+/// Tests use it to see a stop that was sent and to deliver a late event.
+/// Nothing is bound.
+pub struct ObservedForwards {
+    commands: UnboundedReceiver<Command>,
+    events: UnboundedSender<ForwardEvent>,
+}
+
+impl ObservedForwards {
+    /// Forward commands received since the last call.
+    pub fn commands(&mut self) -> Vec<ForwardCommand> {
+        let mut commands = Vec::new();
+        while let Ok(command) = self.commands.try_recv() {
+            if let Command::Forward(command) = command {
+                commands.push(command);
+            }
+        }
+        commands
+    }
+
+    /// Delivers one event to the link, as the connection would.
+    pub fn push(&self, event: ForwardEvent) {
+        let _ = self.events.send(event);
+    }
 }
 
 /// Shared record of the remote rules whose inbound channels may be accepted.

@@ -338,11 +338,12 @@ impl ShelluneView {
             .collect();
         let mut sessions = Vec::new();
         for (tab, in_tab) in tabs {
-            // A transfer still has to be confirmed, so that session's tab stays until
-            // the user answers. Waiting panes on the named tab do not stay with it.
+            // A transfer or a forward still has to be confirmed, so that session's
+            // tab stays until the user answers. Waiting panes on the named tab do
+            // not stay with it.
             let busy = in_tab
                 .iter()
-                .any(|id| self.transfers.active_count(*id) > 0);
+                .any(|id| self.close_needs_confirmation(*id));
             if busy {
                 self.workspace.layout_mut().drop_pending_on_tab(tab);
                 sessions.extend(in_tab);

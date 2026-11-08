@@ -3,8 +3,8 @@
 use gpui::prelude::*;
 use gpui::{Context, SharedString, Window, div, px};
 use shellune_core::{
-    BindExposure, ForwardId, ForwardKind, ForwardRule, HostConfig, HostId, SessionId, SessionKind,
-    SessionState,
+    BindExposure, ForwardFault, ForwardId, ForwardKind, ForwardRule, HostConfig, HostId, SessionId,
+    SessionKind, SessionState,
 };
 use shellune_ssh::{ForwardCommand, ForwardFailure};
 use shellune_storage::ForwardStore;
@@ -388,6 +388,10 @@ impl ShelluneView {
         if let Some(editor) = self.forwards.editor().cloned() {
             list = list.child(self.forward_form(&editor, cx));
         }
+        let faults = self
+            .forwards
+            .book()
+            .faults(|host| self.book.host(host).is_some());
         for (index, row) in self.forwards.rows().into_iter().enumerate() {
             let id = row.rule.id();
             let host_name = self
@@ -396,7 +400,7 @@ impl ShelluneView {
                 .map(HostConfig::name)
                 .unwrap_or("?");
             let kind = kind_label(row.rule.kind(), strings);
-            let listen = row.rule.listen().to_string();
+            let listen = displayed_listen(&row.rule, &row.phase);
             let target = row
                 .rule
                 .target()
@@ -404,11 +408,21 @@ impl ShelluneView {
                 .unwrap_or_else(|| "SOCKS".to_owned());
             let (status, tone, detail) = phase_text(&row.phase, row.attempt.as_ref(), strings);
             let active = row.phase.is_active();
+            let listening = matches!(row.phase, ForwardPhase::Listening { .. });
+            let fault = faults.iter().find_map(|fault| match fault {
+                ForwardFault::MissingHost { rule, message, .. } if *rule == id => {
+                    Some(message.clone())
+                }
+                _ => None,
+            });
             list = list.child(
                 components_row(self, index, cx)
                     .child(div().flex().flex_col().flex_1().min_w(px(0.0)).child(
                         div()
                             .text_size(metrics.label_size())
+                            .when(listening, move |line| {
+                                line.debug_selector(move || format!("forwards.listening.{index}"))
+                            })
                             .child(SharedString::from(format!(
                                 "{kind} · {host_name} · {status}"
                             ))),
@@ -425,6 +439,12 @@ impl ShelluneView {
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::DANGER))
                             .child(SharedString::from(detail))
+                    })).children(fault.map(|message| {
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::DANGER))
+                            .debug_selector(move || format!("forwards.fault.{index}"))
+                            .child(SharedString::from(message))
                     })))
                     .child(
                         div()
@@ -477,6 +497,83 @@ impl ShelluneView {
             let _ = tone;
         }
         list
+    }
+
+    /// Puts a saved rule into the listening phase and returns the link's commands.
+    ///
+    /// The rule is inserted when it is not already in the book. Nothing is bound.
+    #[cfg(test)]
+    pub fn install_listening_forward_for_test(
+        &mut self,
+        session: SessionId,
+        rule: ForwardRule,
+        host: &str,
+        port: u16,
+    ) -> shellune_ssh::forwarding::ObservedForwards {
+        let id = rule.id();
+        if self.forwards.book().rule(id).is_none() {
+            let mut book = self.forwards.book().clone();
+            book.insert(rule).expect("the test rule is new");
+            self.forwards.replace_book(book);
+        }
+        self.forwards
+            .note_listening_for_test(id, session, host, port);
+        self.forwards.attach_observed_for_test(session)
+    }
+
+    /// Whether the rule's phase is listening.
+    #[cfg(test)]
+    pub fn forward_listening_for_test(&self, id: ForwardId) -> bool {
+        self.forwards.is_listening_for_test(id)
+    }
+
+    /// Status and listen text the row draws for one saved rule.
+    #[cfg(test)]
+    pub fn forward_row_summary_for_test(&self, index: usize) -> Option<String> {
+        let row = self.forwards.rows().into_iter().nth(index)?;
+        let (status, _, _) = phase_text(&row.phase, row.attempt.as_ref(), self.strings());
+        let listen = displayed_listen(&row.rule, &row.phase);
+        Some(format!("{status} {listen}"))
+    }
+
+    /// The missing-host fault the row draws, when this rule has one.
+    #[cfg(test)]
+    pub fn forward_fault_for_test(&self, index: usize) -> Option<String> {
+        let id = self.forwards.rows().into_iter().nth(index)?.rule.id();
+        self.forwards
+            .book()
+            .faults(|host| self.book.host(host).is_some())
+            .into_iter()
+            .find_map(|fault| match fault {
+                ForwardFault::MissingHost { rule, message, .. } if rule == id => Some(message),
+                _ => None,
+            })
+    }
+
+    /// Opens the editor on one rule, for a test.
+    #[cfg(test)]
+    pub fn edit_forward_for_test(&mut self, id: ForwardId, cx: &mut Context<Self>) {
+        self.edit_forward(id, cx);
+    }
+
+    /// Replaces the listen fields, for a test.
+    #[cfg(test)]
+    pub fn set_forward_listen_for_test(
+        &mut self,
+        host: &str,
+        port: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.forward_listen_host
+            .update(cx, |field, cx| field.set_text(host, cx));
+        self.forward_listen_port
+            .update(cx, |field, cx| field.set_text(port, cx));
+    }
+
+    /// Saves the open forward form, for a test.
+    #[cfg(test)]
+    pub fn save_forward_for_test(&mut self, cx: &mut Context<Self>) {
+        self.save_forward(cx);
     }
 
     fn exposure_question(&self, id: ForwardId, cx: &mut Context<Self>) -> gpui::Div {
@@ -621,6 +718,19 @@ fn components_row(
 ) -> gpui::Div {
     crate::app::components::row(view.metrics())
         .debug_selector(move || format!("forwards.row.{index}"))
+}
+
+fn displayed_listen(rule: &ForwardRule, phase: &ForwardPhase) -> String {
+    match phase {
+        ForwardPhase::Listening { host, port, .. } => {
+            if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            }
+        }
+        _ => rule.listen().to_string(),
+    }
 }
 
 fn kind_label(kind: ForwardKind, strings: &Strings) -> &'static str {

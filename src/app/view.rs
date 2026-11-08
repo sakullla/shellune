@@ -1161,8 +1161,13 @@ impl ShelluneView {
     /// Closing a session cancels the transfers that belong to it, so that consequence is
     /// stated first, with how many tasks would stop. A session with nothing in flight
     /// closes at once, because there is nothing to warn about.
+    /// Whether closing this session would stop a transfer or a forward (R9, R11).
+    pub(crate) fn close_needs_confirmation(&self, id: SessionId) -> bool {
+        self.transfers.active_count(id) > 0 || !self.forwards.active_on(id).is_empty()
+    }
+
     pub fn request_close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if self.transfers.active_count(id) > 0 || !self.forwards.active_on(id).is_empty() {
+        if self.close_needs_confirmation(id) {
             self.closing = Some(id);
             cx.notify();
             return;
@@ -9421,6 +9426,25 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn interrupt_line_for_test(&self, id: shellune_core::TransferId) -> Option<String> {
         self.transfers.get(id).map(|task| self.interrupt_line(task))
+    }
+
+    /// The forward lines the close question draws for the session it is asking about.
+    #[cfg(test)]
+    pub fn closing_forward_lines_for_test(&self) -> Vec<String> {
+        let Some(id) = self.closing else {
+            return Vec::new();
+        };
+        self.forwards
+            .active_on(id)
+            .iter()
+            .map(|rule| {
+                let target = rule
+                    .target()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "SOCKS".to_owned());
+                format!("{} · {} → {target}", rule.kind().label(), rule.listen())
+            })
+            .collect()
     }
 
     /// The file view of one session, as the window holds it.
