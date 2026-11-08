@@ -123,11 +123,11 @@ impl ShelluneView {
     /// click that opens the overlay may already have blurred that field.
     pub(super) fn remember_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = window.focused(cx);
-        if let Some(handle) = current.as_ref() {
-            if !self.is_page_focus(handle) {
-                self.focus_return = Some(handle.downgrade());
-                return;
-            }
+        if let Some(handle) = current.as_ref()
+            && !self.is_page_focus(handle)
+        {
+            self.focus_return = Some(handle.downgrade());
+            return;
         }
         let kept = self
             .focus_return

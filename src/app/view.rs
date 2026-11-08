@@ -6146,10 +6146,10 @@ impl ShelluneView {
         {
             return;
         }
-        if let Some(handle) = window.focused(cx) {
-            if !self.is_page_focus(&handle) {
-                self.focus_return = Some(handle.downgrade());
-            }
+        if let Some(handle) = window.focused(cx)
+            && !self.is_page_focus(&handle)
+        {
+            self.focus_return = Some(handle.downgrade());
         }
     }
 
