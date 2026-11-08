@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use shellune_core::{
-    AuthMethod, OverwriteChoice, PARTIAL_PREFIX, ResumeHint, TransferDirection, TransferEvent,
-    TransferFailure, TransferId, TransferUpdate,
+    AuthMethod, OverwriteChoice, PARTIAL_PREFIX, PartialRecord, ResumeHint, SessionId, Transfer,
+    TransferDirection, TransferEvent, TransferFailure, TransferId, TransferQueue, TransferUpdate,
 };
 use shellune_ssh::testserver::Harness;
 use shellune_ssh::{
@@ -1602,4 +1602,355 @@ fn closing_one_connection_does_not_stop_the_other_transfers() {
     second_session.close();
     let _ = shell(server, &format!("rm -rf '{first_dir}' '{second_dir}'"));
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// Waits until one task reports a terminal update.
+fn until_settled(
+    recorder: &mut Recorder,
+    link: &mut TransferLink,
+    id: TransferId,
+) -> TransferUpdate {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        recorder.collect(link);
+        if let Some(update) = recorder
+            .updates(id)
+            .into_iter()
+            .rev()
+            .find(|update| {
+                matches!(
+                    update,
+                    TransferUpdate::Failed { .. }
+                        | TransferUpdate::Cancelled { .. }
+                        | TransferUpdate::Completed { .. }
+                )
+            })
+            .cloned()
+        {
+            return update;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the transfer did not settle: {:?}",
+            recorder.updates(id)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn last_checkpoint(recorder: &Recorder, id: TransferId) -> ResumeHint {
+    recorder
+        .updates(id)
+        .into_iter()
+        .rev()
+        .find_map(|update| match update {
+            TransferUpdate::Checkpoint(hint) => Some(hint.clone()),
+            _ => None,
+        })
+        .expect("a checkpoint was published")
+}
+
+fn read_checkpoint(hint: &ResumeHint) -> PartialRecord {
+    let bytes = std::fs::read(&hint.record).unwrap_or_else(|error| {
+        panic!("the checkpoint {} could not be read: {error}", hint.record)
+    });
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("the checkpoint {} is not a record: {error}", hint.record))
+}
+
+/// Applies the window's freeze, then the worker's settlement, and returns the hint kept.
+fn hint_after_freeze(
+    source: &str,
+    destination: &str,
+    checkpoint: ResumeHint,
+    settlement: &TransferUpdate,
+) -> ResumeHint {
+    let session = SessionId::new();
+    let mut queue = TransferQueue::new();
+    let earlier = queue.add(Transfer::queued(
+        session,
+        TransferDirection::Upload,
+        source,
+        destination,
+    ));
+    queue
+        .apply(&TransferEvent::progress(
+            earlier,
+            checkpoint.offset,
+            Some(checkpoint.offset + 1),
+        ))
+        .expect("progress applies");
+    queue
+        .apply(&TransferEvent {
+            transfer: earlier,
+            update: TransferUpdate::Checkpoint(checkpoint),
+        })
+        .expect("the checkpoint applies");
+    queue.fail_session(session, TransferFailure::ConnectionLost);
+    queue
+        .apply(&TransferEvent {
+            transfer: earlier,
+            update: settlement.clone(),
+        })
+        .expect("the settlement applies");
+    queue
+        .get(earlier)
+        .and_then(|task| task.state().resume().cloned())
+        .expect("the flushed prefix is kept")
+}
+
+#[test]
+fn a_cancel_between_checkpoints_resumes_from_the_flushed_offset() {
+    if skip("resuming after a cancel between checkpoints") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let directory = own_directory(server, "gap");
+    let remote = format!("{directory}/gap.bin");
+    let bytes = sample(8 * 1024 * 1024);
+    let scratch = scratch_directory("gap");
+    let local = local_file(&scratch, "gap.bin", &bytes);
+
+    let (mut session, mut link) = live_with_link(server);
+    let mut recorder = Recorder::default();
+    let id = start(
+        &mut link,
+        TransferDirection::Upload,
+        local.to_string_lossy().as_ref(),
+        &remote,
+    );
+    recorder.until_partial_checkpoint(&mut link, id, bytes.len() as u64);
+    // More chunks flush before the next checkpoint is published. Cancelling now
+    // is the confirmed-close path: the worker settles what it flushed.
+    std::thread::sleep(Duration::from_millis(25));
+    cancel(&mut link, id);
+    let settlement = until_settled(&mut recorder, &mut link, id);
+    assert!(
+        !matches!(settlement, TransferUpdate::Completed { .. }),
+        "the disconnect must not complete the transfer: {settlement:?}"
+    );
+    let (residue, resume) = match &settlement {
+        TransferUpdate::Failed {
+            residue, resume, ..
+        }
+        | TransferUpdate::Cancelled { residue, resume } => (residue.clone(), resume.clone()),
+        other => panic!("the transfer did not settle: {other:?}"),
+    };
+    let hint = resume.expect("the flushed prefix is settled with a checkpoint");
+    let record = read_checkpoint(&hint);
+    assert_eq!(
+        record.confirmed_offset, hint.offset,
+        "the record and the settlement name the same offset"
+    );
+    let stale = last_checkpoint(&recorder, id);
+    assert!(
+        hint.offset >= stale.offset,
+        "the settlement is not behind the last published checkpoint"
+    );
+    let partial = residue.expect("the partial file is named");
+    assert_eq!(partial, hint.partial);
+    assert_eq!(
+        partial,
+        shellune_core::partial_path(TransferDirection::Upload, &remote, id),
+        "a first transfer's temporary file is named from that task"
+    );
+    assert!(server_size(server, &remote).is_none());
+    assert!(server_size(server, &partial).is_some_and(|size| size >= hint.offset));
+
+    // When the worker flushed past the last checkpoint, the frozen hint has to
+    // move forward. When it did not, the published checkpoint is already that offset.
+    let kept = if hint.offset > stale.offset {
+        hint_after_freeze(
+            local.to_string_lossy().as_ref(),
+            &remote,
+            stale,
+            &settlement,
+        )
+    } else {
+        hint.clone()
+    };
+    assert_eq!(kept.offset, hint.offset);
+    assert_eq!(kept.partial, partial);
+
+    let (mut again, mut again_link) = live_with_link(server);
+    let mut again_recorder = Recorder::default();
+    let resumed = start_from(
+        &mut again_link,
+        TransferDirection::Upload,
+        local.to_string_lossy().as_ref(),
+        &remote,
+        Some(kept),
+    );
+    match again_recorder.until_finished(&mut again_link, resumed) {
+        TransferUpdate::Completed { bytes: moved } => assert_eq!(moved, bytes.len() as u64),
+        other => panic!("the flushed prefix did not resume: {other:?}"),
+    }
+    assert_eq!(first_progress(&again_recorder, resumed), Some(hint.offset));
+    assert_eq!(
+        read_back(&mut again_link, &mut again_recorder, &remote, "gap-back"),
+        bytes
+    );
+    again.close();
+    session.close();
+    let _ = shell(server, &format!("rm -rf '{directory}'"));
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_resumed_upload_that_loses_the_connection_names_the_original_partial() {
+    if skip("a resumed upload losing its connection") {
+        return;
+    }
+    let server = shared().as_ref().expect("a server");
+    let (mut session, mut link) = live_with_link(server);
+    let (mut recorder, held) = hold_upload(server, &mut link, "resume-loss", 8 * 1024 * 1024);
+    let resumed = start_from(
+        &mut link,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+        Some(held.hint.clone()),
+    );
+    let published = recorder.until_partial_checkpoint(&mut link, resumed, held.bytes.len() as u64);
+    std::thread::sleep(Duration::from_millis(25));
+    session.close();
+    let wait_until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < wait_until {
+        recorder.collect(&mut link);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !recorder
+            .updates(resumed)
+            .iter()
+            .any(|update| matches!(update, TransferUpdate::Completed { .. })),
+        "a lost connection must not complete the resume: {:?}",
+        recorder.updates(resumed)
+    );
+    let invented = shellune_core::partial_path(TransferDirection::Upload, &held.remote, resumed);
+    assert_ne!(invented, held.partial);
+    assert!(
+        server_size(server, &invented).is_none(),
+        "the resume must not create a partial file under its own id"
+    );
+    // The worker may be dropped with the runtime before it can report. The record it
+    // last managed to write is the prefix that can still be checked.
+    let record = read_checkpoint(&published);
+    assert!(record.confirmed_offset >= published.offset);
+    let settled = recorder
+        .updates(resumed)
+        .into_iter()
+        .rev()
+        .find_map(|update| match update {
+            TransferUpdate::Failed { resume, .. } | TransferUpdate::Cancelled { resume, .. } => {
+                resume.clone()
+            }
+            _ => None,
+        });
+    let hint = settled.clone().unwrap_or(ResumeHint {
+        offset: record.confirmed_offset,
+        ..published.clone()
+    });
+    assert_eq!(hint.partial, held.partial);
+    assert_eq!(hint.offset, record.confirmed_offset);
+    assert!(server_size(server, &held.partial).is_some_and(|size| size >= hint.offset));
+
+    let session_id = SessionId::new();
+    let mut queue = TransferQueue::new();
+    let earlier = queue.add(Transfer::queued(
+        session_id,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+    ));
+    queue
+        .apply(&TransferEvent::progress(
+            earlier,
+            held.hint.offset,
+            Some(held.bytes.len() as u64),
+        ))
+        .expect("progress applies");
+    queue
+        .apply(&TransferEvent {
+            transfer: earlier,
+            update: TransferUpdate::Checkpoint(held.hint.clone()),
+        })
+        .expect("the original checkpoint applies");
+    queue.fail_session(session_id, TransferFailure::ConnectionLost);
+    let next = queue.retry(earlier).expect("the resume is a new task");
+    let id = queue.add(next);
+    queue
+        .apply(&TransferEvent::progress(
+            id,
+            published.offset,
+            Some(held.bytes.len() as u64),
+        ))
+        .expect("the resume has started");
+    queue
+        .apply(&TransferEvent {
+            transfer: id,
+            update: TransferUpdate::Checkpoint(published.clone()),
+        })
+        .expect("the published checkpoint applies");
+    queue.fail_session(session_id, TransferFailure::ConnectionLost);
+    assert_eq!(
+        queue
+            .get(id)
+            .and_then(|task| task.state().residue().map(str::to_owned)),
+        Some(held.partial.clone()),
+        "the failure names the original partial, not {}",
+        queue.get(id).expect("listed").partial_path()
+    );
+    if let Some(later) = settled.clone() {
+        assert!(later.offset >= published.offset);
+        if later.offset > published.offset {
+            queue
+                .apply(&TransferEvent {
+                    transfer: id,
+                    update: TransferUpdate::Failed {
+                        failure: TransferFailure::ConnectionLost,
+                        residue: Some(later.partial.clone()),
+                        resume: Some(later),
+                    },
+                })
+                .expect("a further settlement replaces the frozen checkpoint");
+        }
+    }
+    let kept = queue
+        .get(id)
+        .and_then(|task| task.state().resume().cloned())
+        .expect("the flushed prefix is kept");
+    assert_eq!(kept.offset, hint.offset);
+    assert_eq!(kept.partial, held.partial);
+    assert!(!queue.get(id).expect("listed").state().is_success());
+
+    let (mut again, mut again_link) = live_with_link(server);
+    let mut again_recorder = Recorder::default();
+    let continued = start_from(
+        &mut again_link,
+        TransferDirection::Upload,
+        held.local.to_string_lossy().as_ref(),
+        &held.remote,
+        Some(kept),
+    );
+    match again_recorder.until_finished(&mut again_link, continued) {
+        TransferUpdate::Completed { bytes } => assert_eq!(bytes, held.bytes.len() as u64),
+        other => panic!("the original partial did not resume: {other:?}"),
+    }
+    assert_eq!(
+        first_progress(&again_recorder, continued),
+        Some(hint.offset)
+    );
+    assert_eq!(
+        read_back(
+            &mut again_link,
+            &mut again_recorder,
+            &held.remote,
+            "resume-loss-back"
+        ),
+        held.bytes
+    );
+    again.close();
+    let _ = shell(server, &format!("rm -rf '{}'", held.directory));
+    let _ = std::fs::remove_dir_all(&held.scratch);
 }

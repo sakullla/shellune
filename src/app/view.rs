@@ -7648,8 +7648,11 @@ impl ShelluneView {
             cx.notify();
         }
         // Leaving the file view does not stop a transfer. The loop stays up while any
-        // task can still change, so the transfer center keeps the worker's events.
-        let open = self.files.any_open() || self.transfers.any_active();
+        // task can still change, and while a stopped task can still receive the prefix
+        // its worker flushed after the last checkpoint.
+        let open = self.files.any_open()
+            || self.transfers.any_active()
+            || self.transfers.awaiting_settlement();
         if !open {
             self.files_polling = false;
         }

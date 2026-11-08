@@ -136,6 +136,8 @@ pub struct TransferLink {
     commands: UnboundedSender<TransferCommand>,
     events: UnboundedReceiver<TransferEvent>,
     closed: bool,
+    /// The worker's event sender is gone, so nothing further will arrive.
+    events_closed: bool,
 }
 
 impl TransferLink {
@@ -148,6 +150,7 @@ impl TransferLink {
             commands,
             events,
             closed: false,
+            events_closed: false,
         }
     }
 
@@ -164,12 +167,29 @@ impl TransferLink {
     }
 
     /// Every event that arrived since the last call.
+    ///
+    /// An event that was sent before the worker disappeared is still returned. The
+    /// link then reports [`Self::events_open`] as false, so the window can stop waiting
+    /// without dropping an event that was already queued.
     pub fn drain(&mut self) -> Vec<TransferEvent> {
         let mut events = Vec::new();
-        while let Ok(event) = self.events.try_recv() {
-            events.push(event);
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.events_closed = true;
+                    break;
+                }
+            }
         }
         events
+    }
+
+    /// Whether the worker can still report a later settlement.
+    #[must_use]
+    pub fn events_open(&self) -> bool {
+        !self.events_closed
     }
 
     /// Stops sending; used when the session is closed.
@@ -1446,6 +1466,38 @@ mod tests {
             }),
             "a closed link must not promise to serve a command"
         );
+        assert!(link.drain().is_empty());
+        assert!(
+            link.events_open(),
+            "closing commands does not drop a queued report"
+        );
+    }
+
+    #[test]
+    fn a_queued_report_is_read_after_the_worker_is_gone() {
+        let (commands, _receiver) = unbounded_channel();
+        let (events, incoming) = unbounded_channel();
+        let mut link = TransferLink::new(commands, incoming);
+        let id = TransferId::new();
+        events
+            .send(TransferEvent {
+                transfer: id,
+                update: TransferUpdate::Checkpoint(ResumeHint {
+                    partial: "/home/deploy/.shellune-part-kept".to_owned(),
+                    record: "kept.json".to_owned(),
+                    offset: 4096,
+                    generation: 1,
+                }),
+            })
+            .expect("the report is queued");
+        drop(events);
+        let drained = link.drain();
+        assert_eq!(drained.len(), 1, "the queued report is not discarded");
+        assert!(matches!(
+            drained[0].update,
+            TransferUpdate::Checkpoint(ref hint) if hint.offset == 4096
+        ));
+        assert!(!link.events_open(), "the worker is gone after that report");
         assert!(link.drain().is_empty());
     }
 

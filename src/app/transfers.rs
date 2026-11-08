@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use shellune_core::{
     OverwriteChoice, SessionId, Transfer, TransferDirection, TransferEvent, TransferFailure,
-    TransferId, TransferQueue, join_path,
+    TransferId, TransferQueue, TransferUpdate, join_path,
 };
 use shellune_ssh::{TransferCommand, TransferLink, TransferRequest};
 
@@ -35,6 +35,13 @@ pub trait TransferChannel {
     fn send(&mut self, command: TransferCommand) -> bool;
     /// Every event that arrived since the last call.
     fn drain(&mut self) -> Vec<TransferEvent>;
+    /// Whether a later settlement can still arrive.
+    ///
+    /// A scripted channel stays open: the test decides when the worker's report is
+    /// pushed. A live connection reports false once the worker's sender is gone.
+    fn events_open(&self) -> bool {
+        true
+    }
 }
 
 impl TransferChannel for TransferLink {
@@ -44,6 +51,10 @@ impl TransferChannel for TransferLink {
 
     fn drain(&mut self) -> Vec<TransferEvent> {
         TransferLink::drain(self)
+    }
+
+    fn events_open(&self) -> bool {
+        TransferLink::events_open(self)
     }
 }
 
@@ -75,6 +86,10 @@ pub enum PathProblem {
 #[derive(Default)]
 pub struct TransferViews {
     channels: HashMap<SessionId, Box<dyn TransferChannel>>,
+    /// Connections that have ended but whose workers may still report a settlement.
+    settling: HashMap<SessionId, Box<dyn TransferChannel>>,
+    /// Tasks whose worker has not yet reported the flush it was in the middle of.
+    pending_settlement: HashMap<SessionId, Vec<TransferId>>,
     queue: TransferQueue,
 }
 
@@ -131,6 +146,16 @@ impl TransferViews {
     #[must_use]
     pub fn any_active(&self) -> bool {
         !self.queue.active().is_empty()
+    }
+
+    /// Whether a closed session can still report the prefix it flushed.
+    ///
+    /// The list already shows the task as stopped. Polling continues only so the
+    /// worker's settlement can replace a stale checkpoint with the offset it actually
+    /// wrote.
+    #[must_use]
+    pub fn awaiting_settlement(&self) -> bool {
+        !self.settling.is_empty()
     }
 
     /// Whether anything at all is in the list, which is when the page has content.
@@ -288,28 +313,113 @@ impl TransferViews {
     /// Applies every event that arrived, returning whether anything changed.
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
+        let mut live = Vec::new();
         for channel in self.channels.values_mut() {
-            for event in channel.drain() {
-                // The queue answers which task the event belongs to; an event nobody
-                // owns is dropped here and changes nothing.
+            live.extend(channel.drain());
+        }
+        let sessions: Vec<SessionId> = self.settling.keys().copied().collect();
+        let mut settled = Vec::new();
+        let mut disconnected = Vec::new();
+        for session in sessions {
+            let Some(channel) = self.settling.get_mut(&session) else {
+                continue;
+            };
+            let events = channel.drain();
+            let open = channel.events_open();
+            settled.push((session, events));
+            if !open {
+                disconnected.push(session);
+            }
+        }
+        for event in live {
+            if self.queue.apply(&event).is_some() {
+                changed = true;
+            }
+        }
+        for (session, events) in settled {
+            for event in events {
+                // The worker is done with this task even when the settlement only
+                // confirms the checkpoint the window already had.
+                self.observe_settlement(session, &event);
                 if self.queue.apply(&event).is_some() {
                     changed = true;
                 }
             }
         }
+        for session in disconnected {
+            self.settling.remove(&session);
+            self.pending_settlement.remove(&session);
+        }
+        let finished: Vec<SessionId> = self
+            .pending_settlement
+            .iter()
+            .filter(|(_, ids)| ids.is_empty())
+            .map(|(session, _)| *session)
+            .collect();
+        for session in finished {
+            self.pending_settlement.remove(&session);
+            self.settling.remove(&session);
+        }
         changed
+    }
+
+    /// Forgets a task whose worker has reported that it stopped.
+    fn observe_settlement(&mut self, session: SessionId, event: &TransferEvent) {
+        let done = matches!(
+            event.update,
+            TransferUpdate::Failed { .. }
+                | TransferUpdate::Cancelled { .. }
+                | TransferUpdate::Completed { .. }
+        );
+        if !done {
+            return;
+        }
+        if let Some(waiting) = self.pending_settlement.get_mut(&session) {
+            waiting.retain(|id| *id != event.transfer);
+        }
+    }
+
+    /// Keeps the connection until each of `ids` has reported its settlement.
+    ///
+    /// Dropping the link first discards that report. The window would keep the last
+    /// checkpoint it drew, while the worker writes a later offset into the same record.
+    fn note_settlement(&mut self, session: SessionId, ids: Vec<TransferId>) {
+        if ids.is_empty() {
+            if self
+                .pending_settlement
+                .get(&session)
+                .is_none_or(|waiting| waiting.is_empty())
+            {
+                self.channels.remove(&session);
+                self.settling.remove(&session);
+                self.pending_settlement.remove(&session);
+            }
+            return;
+        }
+        self.pending_settlement
+            .entry(session)
+            .or_default()
+            .extend(ids);
+        if let Some(channel) = self.channels.remove(&session) {
+            self.settling.insert(session, channel);
+        }
     }
 
     /// Reports every active task of a session as failed, which is what a connection that
     /// ended leaves behind.
     ///
     /// The reason is the transport's, so the list says a session was lost instead of
-    /// showing a transfer that appears to be still running. A task that was moving bytes
-    /// keeps its own report: its worker died with the connection and can no longer say
-    /// anything, so the queue names the temporary file that task was writing - the file
-    /// is still on the far side, and a user who is not told about it finds it later.
+    /// showing a transfer that appears to be still running. The partial file named at
+    /// that moment is the one the task was writing. The worker may still settle a later
+    /// flushed prefix; that report replaces the checkpoint, and it is not dropped with
+    /// the link.
     pub fn session_lost(&mut self, session: SessionId, failure: TransferFailure) -> bool {
-        !self.queue.fail_session(session, failure).is_empty()
+        let failed = self.queue.fail_session(session, failure);
+        // The worker can still be settling the prefix it flushed after the last
+        // checkpoint. The link stays until that report arrives.
+        self.note_settlement(session, failed.clone());
+        self.pump();
+        !failed.is_empty()
     }
 
     /// Ends the transfers of a session that is closing.
@@ -325,7 +435,8 @@ impl TransferViews {
         for id in &cancelled {
             self.dispatch(session, TransferCommand::Cancel { transfer: *id });
         }
-        self.channels.remove(&session);
+        self.note_settlement(session, cancelled.clone());
+        self.pump();
         cancelled.len()
     }
 
@@ -839,5 +950,140 @@ mod tests {
         assert_eq!(file_name("/"), None);
         assert_eq!(file_name(""), None);
         assert_eq!(file_name("/home/deploy/."), None);
+    }
+
+    #[test]
+    fn a_lost_connection_keeps_a_resumed_partial_and_a_later_settlement() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = views(session, channel.clone());
+        let id = views
+            .upload(session, "C:/work/report.txt", Some("/home/deploy"))
+            .expect("the upload starts");
+        let stale = ResumeHint {
+            partial: "/home/deploy/.shellune-part-original".to_owned(),
+            record: "C:/temp/original.json".to_owned(),
+            offset: 1024,
+            generation: 1,
+        };
+        channel.push(TransferEvent::progress(id, 1024, Some(8192)));
+        channel.push(TransferEvent {
+            transfer: id,
+            update: shellune_core::TransferUpdate::Checkpoint(stale.clone()),
+        });
+        views.pump();
+        let invented = views.get(id).expect("the task is listed").partial_path();
+        assert_ne!(invented, stale.partial);
+
+        assert!(views.session_lost(session, TransferFailure::ConnectionLost));
+        assert!(
+            !views.can_transfer(session),
+            "a lost connection cannot start another transfer"
+        );
+        let frozen = views.get(id).expect("the task stays listed");
+        assert_eq!(
+            frozen.state().failure(),
+            Some(&TransferFailure::ConnectionLost)
+        );
+        assert_eq!(frozen.state().residue(), Some(stale.partial.as_str()));
+        assert_eq!(frozen.state().resume().map(|hint| hint.offset), Some(1024));
+        assert!(views.awaiting_settlement());
+
+        let flushed = ResumeHint {
+            offset: 4096,
+            ..stale.clone()
+        };
+        channel.push(TransferEvent {
+            transfer: id,
+            update: shellune_core::TransferUpdate::Failed {
+                failure: TransferFailure::ConnectionLost,
+                residue: Some(flushed.partial.clone()),
+                resume: Some(flushed.clone()),
+            },
+        });
+        assert!(views.pump());
+        let settled = views.get(id).expect("the task stays listed");
+        assert_eq!(settled.state().resume(), Some(&flushed));
+        assert_eq!(settled.state().residue(), Some(flushed.partial.as_str()));
+        assert!(!settled.state().is_success());
+        assert!(
+            !views.awaiting_settlement(),
+            "the worker's settlement is the last report"
+        );
+        let retried = views.retry(id);
+        assert!(
+            retried.is_none(),
+            "the lost connection cannot start the resume itself"
+        );
+    }
+
+    #[test]
+    fn closing_a_session_accepts_the_workers_later_checkpoint_only_for_that_session() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let first_channel = FakeChannel::accepting();
+        let second_channel = FakeChannel::accepting();
+        let mut views = TransferViews::new();
+        views.attach(first, Box::new(first_channel.clone()));
+        views.attach(second, Box::new(second_channel.clone()));
+        let first_upload = views
+            .upload(first, "C:/work/a.txt", Some("/home/deploy"))
+            .expect("the first upload starts");
+        let second_upload = views
+            .upload(second, "C:/work/b.txt", Some("/home/deploy"))
+            .expect("the second upload starts");
+        let stale = ResumeHint {
+            partial: "/home/deploy/.shellune-part-original".to_owned(),
+            record: "C:/temp/original.json".to_owned(),
+            offset: 2048,
+            generation: 1,
+        };
+        first_channel.push(TransferEvent::progress(first_upload, 2048, Some(8192)));
+        first_channel.push(TransferEvent {
+            transfer: first_upload,
+            update: shellune_core::TransferUpdate::Checkpoint(stale.clone()),
+        });
+        second_channel.push(TransferEvent::progress(second_upload, 32, Some(64)));
+        views.pump();
+
+        views.detach(first);
+        assert!(!views.can_transfer(first));
+        assert_eq!(views.active_count(first), 0);
+        assert_eq!(views.active_count(second), 1);
+        assert_eq!(
+            views
+                .get(first_upload)
+                .and_then(|task| task.state().residue().map(str::to_owned)),
+            Some(stale.partial.clone())
+        );
+
+        let flushed = ResumeHint {
+            offset: 6144,
+            ..stale
+        };
+        first_channel.push(TransferEvent {
+            transfer: first_upload,
+            update: shellune_core::TransferUpdate::Cancelled {
+                residue: Some(flushed.partial.clone()),
+                resume: Some(flushed.clone()),
+            },
+        });
+        // A late completion of the closed session must not be applied as success, and
+        // the open session's channel is a different one.
+        second_channel.push(TransferEvent {
+            transfer: first_upload,
+            update: shellune_core::TransferUpdate::Completed { bytes: 8192 },
+        });
+        views.pump();
+        let closed = views.get(first_upload).expect("the task stays listed");
+        assert_eq!(closed.state().resume(), Some(&flushed));
+        assert!(!closed.state().is_success());
+        assert_eq!(
+            views
+                .get(second_upload)
+                .and_then(|task| task.state().transferred()),
+            Some(32)
+        );
+        assert_eq!(views.active_count(second), 1);
     }
 }

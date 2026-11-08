@@ -7490,6 +7490,112 @@ async fn a_connection_that_ends_mid_transfer_names_the_partial_file_it_left(
 }
 
 #[gpui::test]
+async fn a_resumed_transfer_keeps_its_partial_when_the_connection_ends_and_a_later_offset(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let started = transfers.starts();
+    let task = started[0].transfer;
+    let destination = started[0].destination.clone();
+    let stale = shellune_core::ResumeHint {
+        partial: "/home/deploy/.shellune-part-original".to_owned(),
+        record: "C:/temp/original.json".to_owned(),
+        offset: 1024,
+        generation: 1,
+    };
+    transfers.push(shellune_core::TransferEvent::progress(
+        task,
+        1024,
+        Some(8192),
+    ));
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Checkpoint(stale.clone()),
+    });
+    pump_files(cx, &view);
+
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the remote terminal exists");
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+    let accepted = cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::Lost("the channel was closed".to_owned())],
+                cx,
+            )
+        })
+    });
+    assert!(accepted, "the event belongs to this session");
+    cx.run_until_parked();
+
+    let invented = {
+        let parent = destination
+            .rsplit_once('/')
+            .map(|(directory, _name)| directory)
+            .expect("the target is inside a directory");
+        format!("{parent}/{}{task}", shellune_core::PARTIAL_PREFIX)
+    };
+    let detail = cx
+        .update(|_window, app| view.read(app).transfer_detail_for_test(task))
+        .expect("the task is listed");
+    assert!(
+        detail.contains(&stale.partial),
+        "the residue is the partial file the resume was writing: {detail}"
+    );
+    assert!(
+        !detail.contains(&invented),
+        "the list must not name a partial file this attempt never created: {detail}"
+    );
+    assert!(
+        detail.contains("1024"),
+        "the frozen checkpoint is still shown: {detail}"
+    );
+
+    let flushed = shellune_core::ResumeHint {
+        offset: 4096,
+        ..stale.clone()
+    };
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Failed {
+            failure: shellune_core::TransferFailure::ConnectionLost,
+            residue: Some(flushed.partial.clone()),
+            resume: Some(flushed.clone()),
+        },
+    });
+    pump_files(cx, &view);
+    let tasks = cx.update(|_window, app| view.read(app).transfer_tasks());
+    let failed = tasks
+        .iter()
+        .find(|listed| listed.id() == task)
+        .expect("the task stays listed");
+    assert!(!failed.state().is_success());
+    assert_eq!(failed.state().resume(), Some(&flushed));
+    assert_eq!(failed.state().residue(), Some(flushed.partial.as_str()));
+    let detail = cx
+        .update(|_window, app| view.read(app).transfer_detail_for_test(task))
+        .expect("the task is listed");
+    assert!(
+        detail.contains("4096"),
+        "the later flushed offset replaces the stale checkpoint: {detail}"
+    );
+    assert!(detail.contains(&flushed.partial), "{detail}");
+}
+
+#[gpui::test]
 async fn a_delete_the_browser_refuses_keeps_its_question_and_says_why(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
