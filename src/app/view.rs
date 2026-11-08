@@ -2740,19 +2740,19 @@ impl ShelluneView {
         {
             return;
         }
-        if self.chain.is_none() {
-            if let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) {
-                let draft = if self
-                    .pending_ephemeral
-                    .as_ref()
-                    .is_some_and(|pending| pending.id() == host.id())
-                {
-                    ChainDraft::single(host)
-                } else {
-                    ChainDraft::prepare(self.book.hosts(), &host)
-                };
-                self.chain = Some(draft);
-            }
+        if self.chain.is_none()
+            && let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone())
+        {
+            let draft = if self
+                .pending_ephemeral
+                .as_ref()
+                .is_some_and(|pending| pending.id() == host.id())
+            {
+                ChainDraft::single(host)
+            } else {
+                ChainDraft::prepare(self.book.hosts(), &host)
+            };
+            self.chain = Some(draft);
         }
         if let Some(reason) = self
             .chain
@@ -2973,10 +2973,10 @@ impl ShelluneView {
 
     /// Dials the chain. A ProxyCommand stays unstarted until the user confirms it.
     fn dial_chain(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.reconnect {
-            if !self.workspace.session_reconnecting(id) {
-                return;
-            }
+        if let Some(id) = self.reconnect
+            && !self.workspace.session_reconnecting(id)
+        {
+            return;
         }
         let Some(draft) = self.chain.take() else {
             return;
