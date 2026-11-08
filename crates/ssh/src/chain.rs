@@ -341,9 +341,12 @@ impl ChainSession {
             return;
         }
         self.closed = true;
+        // The flag is published before the open question is dropped. A hop that
+        // wakes because its answer disappeared must already see the attempt as
+        // cancelled, or it can report an unanswered identity instead.
+        self.cancel.fire();
         self.trust.close();
         self.proxy.close();
-        self.cancel.fire();
         let _ = self.commands.send(Command::Close);
     }
 
@@ -563,21 +566,17 @@ impl HopHandler {
         };
         self.trust.clear_if(self.location.host_id);
         self.progress.set(HandshakeStage::UserDecided);
-        if self.cancel.is_cancelled() {
-            self.record(ConnectError::HostKeyUndecided { presented });
+        // No answer means the question was closed. Mark the attempt cancelled
+        // before the handshake failure is classified, and do not accept the key.
+        if self.cancel.is_cancelled() || decision.is_none() {
+            self.cancel.fire();
             return Ok(false);
         }
-        match decision {
-            Some(true) => Ok(true),
-            Some(false) => {
-                self.record(ConnectError::HostKeyRejected { presented });
-                Ok(false)
-            }
-            None => {
-                self.record(ConnectError::HostKeyUndecided { presented });
-                Ok(false)
-            }
+        if decision == Some(false) {
+            self.record(ConnectError::HostKeyRejected { presented });
+            return Ok(false);
         }
+        Ok(true)
     }
 }
 
