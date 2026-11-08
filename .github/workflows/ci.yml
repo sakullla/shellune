@@ -29,7 +29,7 @@ jobs:
           - name: ubuntu-22.04-x86_64
             os: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install the Linux graphics headers
         if: runner.os == 'Linux'

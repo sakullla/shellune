@@ -22,7 +22,7 @@ jobs:
     outputs:
       version: ${{ steps.read.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: read
         name: Read the version and check the tag
         run: |
@@ -44,7 +44,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
@@ -58,7 +58,7 @@ jobs:
           choco install nsis -y --no-progress
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" "/DVERSION=$env:VERSION" packaging\windows\shellune.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shellune-windows-x86_64
           path: |
@@ -72,7 +72,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Checked before the build, so a release without the certificate fails in seconds
       # instead of after a full build, and never falls back to an ad-hoc signature.
       - name: Require the stable signing certificate
@@ -153,12 +153,12 @@ jobs:
             || { echo "::error::the signature does not carry the bundle identifier"; exit 1; }
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign --display --requirements - "$app"
-      - name: Archive
-        run: ditto -c -k --keepParent dist/Shellune.app "dist/Shellune-$VERSION-macos-arm64.zip"
-      - uses: actions/upload-artifact@v4
+      - name: Disk image
+        run: python3 packaging/macos/make-dmg.py --app dist/Shellune.app --version "$VERSION"
+      - uses: actions/upload-artifact@v7
         with:
           name: shellune-macos-arm64
-          path: dist/Shellune-${{ env.VERSION }}-macos-arm64.zip
+          path: dist/Shellune-${{ env.VERSION }}-macos-arm64.dmg
           if-no-files-found: error
 
   linux:
@@ -167,22 +167,22 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Install the graphics headers
+      - uses: actions/checkout@v7
+      - name: Install the graphics headers and the deb tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
-            libxcb1-dev pkg-config cmake
+            libxcb1-dev pkg-config cmake dpkg-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
-      - name: Tarball
-        run: python3 packaging/linux/make-tarball.py --binary target/release/shellune --version "$VERSION"
-      - uses: actions/upload-artifact@v4
+      - name: Deb package
+        run: python3 packaging/linux/make-deb.py --binary target/release/shellune --version "$VERSION"
+      - uses: actions/upload-artifact@v7
         with:
           name: shellune-linux-x86_64
-          path: dist/Shellune-${{ env.VERSION }}-linux-x86_64.tar.gz
+          path: dist/shellune_${{ env.VERSION }}_amd64.deb
           if-no-files-found: error
 
   publish:
@@ -195,8 +195,8 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

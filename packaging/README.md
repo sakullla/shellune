@@ -7,8 +7,9 @@ archive; nothing here builds Shellune itself or changes its behaviour.
 | --- | --- | --- | --- |
 | Windows x86_64 | `packaging/windows/make-portable.py` | `dist/Shellune-<version>-windows-x86_64-portable.zip` | Any host with Python 3; the binary must be a Windows build |
 | Windows x86_64 | `packaging/windows/shellune.nsi` | `Shellune-<version>-setup.exe` via NSIS | Windows with NSIS 3 installed |
-| macOS aarch64 | `packaging/macos/make-app-bundle.py` | `Shellune.app` (+ optional `.zip`) | macOS; needs a Mach-O binary |
-| Linux x86_64 | `packaging/linux/make-tarball.py` | `Shellune-<version>-linux-x86_64.tar.gz` | Linux; needs an ELF binary |
+| macOS aarch64 | `packaging/macos/make-app-bundle.py` | `Shellune.app` | macOS; needs a Mach-O binary |
+| macOS aarch64 | `packaging/macos/make-dmg.py` | `Shellune-<version>-macos-arm64.dmg` | macOS; run it on the signed bundle |
+| Linux x86_64 | `packaging/linux/make-deb.py` | `shellune_<version>_amd64.deb` | Linux; needs an ELF binary and the dpkg-dev tools |
 
 Build the binary first, with the same profile the release uses:
 
@@ -33,7 +34,9 @@ The path to the produced binary is `$CARGO_TARGET_DIR/release/shellune` (or
   signature. The bundle is **not notarised**: on first launch Gatekeeper asks the
   user to allow it (right-click → Open, or System Settings → Privacy & Security).
   Replacing the certificate changes the signer, and users are asked again once.
-- Linux: no signature at all; a tarball has no signing step.
+- Linux: no signature at all; the deb has no signing step. Its `Depends` come from
+  `dpkg-shlibdeps` over the built binary, so the build host needs the runtime
+  libraries the binary links.
 
 ## What the scripts refuse to do
 

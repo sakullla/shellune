@@ -23,11 +23,12 @@ python packaging/windows/make-portable.py --binary <target>/release/shellune.exe
 # Windows: installer (needs NSIS)
 makensis packaging/windows/shellune.nsi
 
-# macOS: app bundle (run on macOS)
+# macOS: app bundle, then a drag-to-install disk image (run on macOS)
 python3 packaging/macos/make-app-bundle.py --binary <target>/release/shellune
+python3 packaging/macos/make-dmg.py --app dist/Shellune.app
 
-# Linux: tarball with a desktop entry (run on Linux)
-python3 packaging/linux/make-tarball.py --binary <target>/release/shellune
+# Linux: deb package (run on Linux; needs dpkg-deb and dpkg-shlibdeps)
+python3 packaging/linux/make-deb.py --binary <target>/release/shellune
 ```
 
 Everything lands in `dist/`, next to a `.sha256` file for the archive.
