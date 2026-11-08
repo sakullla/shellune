@@ -348,6 +348,7 @@ impl SessionLayout {
     }
 
     /// Split ratios of the active tab, outer splits first.
+    #[cfg(test)]
     #[must_use]
     pub fn active_ratios(&self) -> Vec<(SplitAxis, u16)> {
         let Some(tab) = self.active_tab() else {
@@ -915,6 +916,7 @@ fn collect_leaves<'a>(node: &'a Node, out: &mut Vec<&'a Leaf>) {
     }
 }
 
+#[cfg(test)]
 fn collect_ratios(node: &Node, out: &mut Vec<(SplitAxis, u16)>) {
     if let Node::Split {
         axis,

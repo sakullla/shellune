@@ -791,14 +791,6 @@ pub struct Strings {
     pub pane_resize_less: &'static str,
     /// Grows the active pane along its split.
     pub pane_resize_more: &'static str,
-    /// Moves the active pane left.
-    pub pane_move_left: &'static str,
-    /// Moves the active pane right.
-    pub pane_move_right: &'static str,
-    /// Moves the active pane up.
-    pub pane_move_up: &'static str,
-    /// Moves the active pane down.
-    pub pane_move_down: &'static str,
     /// Tab menu: move this tab toward the start.
     pub tab_menu_move_left: &'static str,
     /// Tab menu: move this tab toward the end.
@@ -1291,10 +1283,6 @@ pub static ENGLISH: Strings = Strings {
     pane_close: "Close pane",
     pane_resize_less: "Shrink pane",
     pane_resize_more: "Grow pane",
-    pane_move_left: "Move pane left",
-    pane_move_right: "Move pane right",
-    pane_move_up: "Move pane up",
-    pane_move_down: "Move pane down",
     tab_menu_move_left: "Move tab left",
     tab_menu_move_right: "Move tab right",
     workspace_empty_title: "No pane is open",
@@ -1720,10 +1708,6 @@ pub static CHINESE: Strings = Strings {
     pane_close: "关闭窗格",
     pane_resize_less: "缩小窗格",
     pane_resize_more: "放大尺寸",
-    pane_move_left: "左移窗格",
-    pane_move_right: "右移窗格",
-    pane_move_up: "上移窗格",
-    pane_move_down: "下移窗格",
     tab_menu_move_left: "标签左移",
     tab_menu_move_right: "标签右移",
     workspace_empty_title: "没有打开的窗格",

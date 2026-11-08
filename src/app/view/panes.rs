@@ -121,9 +121,7 @@ impl ShelluneView {
         ) {
             self.workspace.select(Destination::LocalShells);
         }
-        let handle = self
-            .destination_focus(self.workspace.destination())
-            .clone();
+        let handle = self.destination_focus(self.workspace.destination()).clone();
         window.focus(&handle);
         cx.notify();
     }
@@ -290,9 +288,7 @@ impl ShelluneView {
             return;
         }
         self.showing_connection_form = false;
-        let handle = self
-            .destination_focus(self.workspace.destination())
-            .clone();
+        let handle = self.destination_focus(self.workspace.destination()).clone();
         window.focus(&handle);
         cx.notify();
     }
@@ -341,9 +337,7 @@ impl ShelluneView {
             // A transfer or a forward still has to be confirmed, so that session's
             // tab stays until the user answers. Waiting panes on the named tab do
             // not stay with it.
-            let busy = in_tab
-                .iter()
-                .any(|id| self.close_needs_confirmation(*id));
+            let busy = in_tab.iter().any(|id| self.close_needs_confirmation(*id));
             if busy {
                 self.workspace.layout_mut().drop_pending_on_tab(tab);
                 sessions.extend(in_tab);
@@ -440,8 +434,7 @@ impl ShelluneView {
         let mut banners = Vec::new();
         if let Some(reason) = &self.layout_error {
             banners.push(
-                components_banner(Tone::Danger, metrics)
-                    .child(SharedString::from(reason.clone())),
+                components_banner(Tone::Danger, metrics).child(SharedString::from(reason.clone())),
             );
         }
         for notice in self.workspace.layout().notices() {
@@ -490,19 +483,11 @@ impl ShelluneView {
         let metrics = self.metrics();
         let fraction = f32::from(ratio) / 10_000.0;
         let across = matches!(axis, SplitAxis::LeftRight);
-        let mut row = div()
-            .flex()
-            .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0));
+        let mut row = div().flex().flex_1().min_w(px(0.0)).min_h(px(0.0));
         row = if across { row } else { row.flex_col() };
         row.child(self.sized_child(self.layout_node(first, true, cx), fraction, across))
             .child(self.split_divider(id, axis, cx, metrics))
-            .child(self.sized_child(
-                self.layout_node(second, true, cx),
-                1.0 - fraction,
-                across,
-            ))
+            .child(self.sized_child(self.layout_node(second, true, cx), 1.0 - fraction, across))
     }
 
     fn sized_child(&self, child: gpui::Div, fraction: f32, across: bool) -> gpui::Div {
@@ -770,7 +755,11 @@ impl ShelluneView {
         let pane = leaf.id();
         let title = leaf
             .session()
-            .and_then(|id| self.workspace.session(id).map(|session| session.title().to_owned()))
+            .and_then(|id| {
+                self.workspace
+                    .session(id)
+                    .map(|session| session.title().to_owned())
+            })
             .unwrap_or_else(|| {
                 self.workspace
                     .layout()
@@ -871,11 +860,7 @@ impl ShelluneView {
             }))
     }
 
-    fn pending_card(
-        &self,
-        leaf: &crate::app::layout::Leaf,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    fn pending_card(&self, leaf: &crate::app::layout::Leaf, cx: &mut Context<Self>) -> gpui::Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let pane = leaf.id();
@@ -916,7 +901,10 @@ impl ShelluneView {
             card = card
                 .debug_selector(|| "pane.missing".to_owned())
                 .child(self.notice_line(
-                    format!("{} {}", strings.pane_missing_host, strings.pane_missing_next),
+                    format!(
+                        "{} {}",
+                        strings.pane_missing_host, strings.pane_missing_next
+                    ),
                     Tone::Warning,
                 ));
         }
@@ -949,7 +937,11 @@ impl ShelluneView {
     }
 
     /// A tab that is only waiting, drawn in the same strip as live sessions.
-    pub(super) fn pending_tab(&self, index: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub(super) fn pending_tab(
+        &self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let title = self
@@ -986,11 +978,10 @@ impl ShelluneView {
         } else {
             tab.border_color(theme::clear())
         };
-        tab.child(
-            div()
-                .truncate()
-                .child(SharedString::from(format!("{title} · {}", strings.pane_pending))),
-        )
+        tab.child(div().truncate().child(SharedString::from(format!(
+            "{title} · {}",
+            strings.pane_pending
+        ))))
         .child(
             crate::app::components::icon_only_button(Icon::Close, metrics)
                 .w(metrics.scale(20.0))
@@ -1107,6 +1098,7 @@ fn snapshot_is_blank(snapshot: &WorkspaceSnapshot) -> bool {
     snapshot.tabs().is_empty() && snapshot.active_tab().is_none() && !snapshot.panel().visible()
 }
 
+#[cfg(test)]
 fn leaf_sessions(node: &Node) -> Vec<Option<SessionId>> {
     match node {
         Node::Leaf(leaf) => vec![leaf.session()],
@@ -1241,7 +1233,10 @@ impl ShelluneView {
             .collect()
     }
 
-    pub fn leaf_snapshot_for_test(&self, pane: PaneId) -> Option<(bool, PaneTarget, Option<SessionId>)> {
+    pub fn leaf_snapshot_for_test(
+        &self,
+        pane: PaneId,
+    ) -> Option<(bool, PaneTarget, Option<SessionId>)> {
         self.workspace
             .layout()
             .leaves()
