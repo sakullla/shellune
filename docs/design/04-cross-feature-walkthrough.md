@@ -18,7 +18,9 @@
 
 命令面板、标签菜单和会话菜单记下打开前的焦点，关闭后还回那个字段或终端。点击这些层时，焦点可能先落到页面上；上一帧的字段或终端不会被这次页面焦点盖掉。主机关闭或保存后，下一帧回到打开对话框之前的位置。选中的导航项在持有键盘焦点时也画 accent 环：底色是当前页，环是键盘位置。
 
-文件拖放仍走已有的按钮和键盘路径。终端内的 Esc、Ctrl+L、Ctrl+C 仍交给终端程序。本轮没有改粘贴确认、备用屏幕、本地文件名边界、文件视图、传输中心、续传、转发关闭确认、端点保存和缺失主机提示。
+文件拖放仍走已有的按钮和键盘路径。终端内的 Esc、Ctrl+L、Ctrl+C 仍交给终端程序。本轮没有改粘贴确认、备用屏幕、本地文件名边界、传输中心、续传、转发关闭确认、端点保存和缺失主机提示。
+
+文件栏首选宽度 340 随文字缩放。两栏只在侧边栏以外放得下两栏缩放宽度，并且还留得下终端（100% 时 192，同样缩放）时并排。否则只显示一个来源，栏宽收到内容区，路径、刷新和关闭留在窗口内。来源切换不合并本地和远程路径。终端列裁切会话栏，避免会话栏盖住这些控件。
 
 ## 2. Windows 实测
 
@@ -59,6 +61,12 @@
 - 终端按键：`escape_reaches_the_program_running_in_the_terminal`、`ctrl_l_reaches_the_program_running_in_the_terminal`、`a_ctrl_c_reaches_the_default_shell_that_is_running_a_command`。
 - 拖放的非拖放路径：`file_actions_have_a_button_path_and_a_drop_uses_that_same_request`。
 - 既有行为仍在同一套件里：多行粘贴确认与取消、备用屏幕、传输中心与续传、转发关闭确认、端点保存、缺失主机说明。
+
+文件栏返修后的命令：
+
+`cargo test --bin shellune --offline -- --test-threads=8`
+
+结果：257 passed、0 failed、0 ignored，耗时 18.04 秒。测试程序是 `C:/Users/12976/.cargo/target/debug/deps/shellune-ac8311f8bd553847.exe`。其中 `two_hundred_percent_file_columns_stay_inside_the_window` 在 200% 下打开文件视图：720×480 与 1120×720 为单栏，路径、刷新、关闭和来源切换落在窗口内，切换后本地与远程路径仍分开；2400×900 才出现双栏，两栏也落在窗口内。这是 GPUI 测试窗口，不是第 2 节那个实窗的逐页点击。
 
 正式交付用的 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features -- --include-ignored` 和 release 构建，本轮没有跑，也不记为通过。
 

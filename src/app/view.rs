@@ -13,8 +13,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    Context, Div, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Render, SharedString,
-    Stateful, Window, div, px,
+    Context, Div, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Pixels, Render,
+    SharedString, Stateful, Window, div, px,
 };
 use std::collections::HashMap;
 
@@ -215,11 +215,21 @@ pub const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// panel keeps a size that is worth typing into.
 pub const REMOTE_TERMINAL_HEIGHT: f32 = 340.0;
 
-/// Width of the file view beside the terminal.
+/// Preferred width of one file column, before text scale.
 ///
 /// Beside rather than above: a directory list and a terminal are two things a user
-/// reads at the same time, and stacking them leaves neither enough rows.
+/// reads at the same time, and stacking them leaves neither enough rows. The drawn
+/// width is this length scaled by the text size, then clamped to the content area
+/// when only one column fits.
 pub const FILES_PANEL_WIDTH: f32 = 340.0;
+
+/// Logical width kept for the terminal when both file columns are open.
+///
+/// At 100% the expanded rail is 208 wide, so a 1080-wide window fits two 340 columns
+/// and leaves 192 (1080 − 208 − 680). That reserve scales with the text size. Two
+/// columns open only when both scaled columns and this reserve fit in the area beside
+/// the rail; otherwise one column is shown and it shrinks to that area.
+pub const FILES_TERMINAL_RESERVE: f32 = 192.0;
 
 /// How often the shell looks for answers from a file view.
 ///
@@ -7511,6 +7521,12 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let wide = self.files_side_by_side();
+        let column_width = self.files_column_width();
+        let files_width = if wide {
+            column_width * 2.0
+        } else {
+            column_width
+        };
         let shown = self.files.shown(id).unwrap_or(FileSource::Remote);
         let mut columns = div()
             .flex()
@@ -7518,12 +7534,21 @@ impl ShelluneView {
             .flex_1()
             .min_h(px(0.0))
             .min_w(px(0.0))
-            .overflow_hidden();
+            .overflow_hidden()
+            // A removed selector keeps its last bounds, so the mode has to be a
+            // selector that exists only in the frame that drew it.
+            .debug_selector(move || {
+                if wide {
+                    "files.layout.dual".to_owned()
+                } else {
+                    "files.layout.single".to_owned()
+                }
+            });
         if wide || shown == FileSource::Local {
-            columns = columns.child(self.files_panel(id, FileSource::Local, cx));
+            columns = columns.child(self.files_panel(id, FileSource::Local, column_width, cx));
         }
         if wide || shown == FileSource::Remote {
-            columns = columns.child(self.files_panel(id, FileSource::Remote, cx));
+            columns = columns.child(self.files_panel(id, FileSource::Remote, column_width, cx));
         }
         let switch = (!wide).then(|| {
             div()
@@ -7559,6 +7584,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_none()
+            .w(files_width)
             .h_full()
             .overflow_hidden()
             .min_h(px(0.0))
@@ -7588,7 +7614,9 @@ impl ShelluneView {
         div()
             .flex()
             .flex_1()
+            .min_w(px(0.0))
             .min_h(px(0.0))
+            .overflow_hidden()
             .child(
                 div()
                     .flex()
@@ -7596,15 +7624,56 @@ impl ShelluneView {
                     .flex_1()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
+                    // A squeezed terminal must not paint its session bar over the file controls.
+                    .overflow_hidden()
                     .child(column),
             )
             .child(files)
     }
 
-    /// Whether the window is wide enough for both file sources at once.
+    /// Whether both file sources fit beside a usable terminal.
+    ///
+    /// The check uses scaled column widths plus [`FILES_TERMINAL_RESERVE`], measured
+    /// in the area beside the rail. A viewport threshold that ignores text scale
+    /// opens the second column at 200% and clips it.
     fn files_side_by_side(&self) -> bool {
-        self.files_layout_override
-            .unwrap_or(self.viewport_width >= px(1080.0))
+        if let Some(wide) = self.files_layout_override {
+            return wide;
+        }
+        let metrics = self.metrics();
+        let both = metrics.scale(FILES_PANEL_WIDTH) * 2.0;
+        let terminal = metrics.scale(FILES_TERMINAL_RESERVE);
+        self.files_content_width() >= both + terminal
+    }
+
+    /// Width of one file column: the preferred scaled width, or the content area
+    /// when that width would pass the window.
+    fn files_column_width(&self) -> Pixels {
+        let preferred = self.metrics().scale(FILES_PANEL_WIDTH);
+        if self.files_side_by_side() {
+            return preferred;
+        }
+        let content = self.files_content_width();
+        if content < preferred { content } else { preferred }
+    }
+
+    /// Width beside the rail, which is where the terminal and the file columns sit.
+    fn files_content_width(&self) -> Pixels {
+        let content = self.viewport_width - self.rail_width_used();
+        if content < px(0.0) { px(0.0) } else { content }
+    }
+
+    /// The rail width currently drawn, including the macOS traffic-light column.
+    fn rail_width_used(&self) -> Pixels {
+        let metrics = self.metrics();
+        if !self.rail_is_collapsed() {
+            return metrics.rail_width();
+        }
+        if Platform::current() == Platform::MacOs {
+            metrics.scale(titlebar::TRAFFIC_LIGHT_ROOM + 4.0)
+        } else {
+            metrics.collapsed_rail_width()
+        }
     }
 
     fn files_show(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
@@ -8315,6 +8384,7 @@ impl ShelluneView {
         &self,
         id: SessionId,
         source: FileSource,
+        width: Pixels,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let metrics = self.metrics();
@@ -8528,7 +8598,7 @@ impl ShelluneView {
             FileSource::Local => &self.files_local_focus,
             FileSource::Remote => &self.files_remote_focus,
         };
-        let mut panel = components::file_column(FILES_PANEL_WIDTH, metrics)
+        let mut panel = components::file_column(width, metrics)
             .id(panel_id.clone())
             .debug_selector({
                 let panel_id = panel_id.clone();

@@ -6807,6 +6807,103 @@ async fn a_narrow_window_switches_source_without_merging_them(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+async fn two_hundred_percent_file_columns_stay_inside_the_window(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_remote, _local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[("报告.txt", shellune_core::FileKind::File)],
+    );
+    focus_root(&view, cx);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
+
+    // 720 and 1120 cannot hold two scaled columns plus a terminal. 2400 can:
+    // expanded rail 416 + two columns 1360 + terminal reserve 384 = 2160.
+    for (window, dual) in [
+        (minimum_window(), false),
+        (design_window(), false),
+        (size(px(2400.0), px(900.0)), true),
+    ] {
+        cx.simulate_resize(window);
+        cx.run_until_parked();
+        let viewport = cx.update(|window, _app| window.viewport_size());
+        assert_file_column_inside(cx, "files.panel", viewport);
+        assert_file_column_inside(cx, "files.path", viewport);
+        assert_file_column_inside(cx, "files.refresh", viewport);
+        assert_file_column_inside(cx, "files.close", viewport);
+        let mode = if dual {
+            "files.layout.dual"
+        } else {
+            "files.layout.single"
+        };
+        assert!(
+            cx.debug_bounds(mode).is_some(),
+            "file columns use {mode} in {viewport:?}"
+        );
+        if dual {
+            assert_file_column_inside(cx, "files.local.panel", viewport);
+            assert_file_column_inside(cx, "files.local.path", viewport);
+            assert_file_column_inside(cx, "files.local.refresh", viewport);
+        } else {
+            assert_file_column_inside(cx, "files.show.local", viewport);
+            assert_file_column_inside(cx, "files.show.remote", viewport);
+        }
+    }
+
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    click(cx, "files.show.local");
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_shown(id)),
+        Some(crate::app::files::FileSource::Local)
+    );
+    assert!(
+        cx.debug_bounds("files.layout.single").is_some(),
+        "the minimum window stays on one source after the switch"
+    );
+    assert_file_column_inside(cx, "files.local.panel", viewport);
+    assert_file_column_inside(cx, "files.local.path", viewport);
+    assert_file_column_inside(cx, "files.local.refresh", viewport);
+    assert_file_column_inside(cx, "files.close", viewport);
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_browser(id)
+                .and_then(|browser| browser.path().map(str::to_owned))
+        }),
+        Some("/home/deploy".to_owned()),
+        "the hidden remote path stays the remote directory"
+    );
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .files_local_browser(id)
+                .and_then(|browser| browser.path().map(str::to_owned))
+        }),
+        Some("/C:/work".to_owned()),
+        "showing the local column does not retarget it"
+    );
+}
+
+fn assert_file_column_inside(
+    cx: &mut VisualTestContext,
+    selector: &'static str,
+    viewport: Size<Pixels>,
+) {
+    assert_within_width(bounds_of(cx, selector), viewport, selector);
+}
+
+#[gpui::test]
 async fn file_actions_have_a_button_path_and_a_drop_uses_that_same_request(
     cx: &mut TestAppContext,
 ) {

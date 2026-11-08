@@ -10,7 +10,9 @@
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{Animation, AnimationExt, AnyElement, AnyView, App, Div, SharedString, Window, div, px};
+use gpui::{
+    Animation, AnimationExt, AnyElement, AnyView, App, Div, Pixels, SharedString, Window, div, px,
+};
 
 use crate::app::icons::{self, Icon};
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
@@ -243,15 +245,16 @@ fn variant_text(variant: Variant) -> gpui::Rgba {
 
 /// One column of a dual file view.
 ///
-/// The width is fixed so a wide window can put two sources beside the terminal, and
-/// a narrow window can show one of them, without either column borrowing the other's
-/// identity. The caller supplies the source heading and the listing.
-pub fn file_column(width: f32, metrics: Metrics) -> Div {
+/// `width` is already resolved: the preferred scaled width when the window can hold
+/// it, or the content area when a single column would otherwise run past the window.
+/// Neither column borrows the other's identity. The caller supplies the heading and
+/// the listing.
+pub fn file_column(width: Pixels, metrics: Metrics) -> Div {
     div()
         .flex()
         .flex_col()
         .flex_none()
-        .w(metrics.scale(width))
+        .w(width)
         .min_w(px(0.0))
         .min_h(px(0.0))
         .gap(metrics.scale(spacing::TIGHT + 2.0))
