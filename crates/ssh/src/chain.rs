@@ -25,7 +25,7 @@ use russh::client::{self, Handler};
 use russh::{Channel, ChannelMsg, Disconnect};
 use shellune_core::{AuthMethod, HostConfig, HostId, connection_jump_fault};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::error::{ChainFailure, ConnectError, HopLocation};
 use crate::forwarding::{self, ForwardLink};
@@ -439,6 +439,8 @@ struct LiveHop {
     handle: client::Handle<HopHandler>,
     proxy: Option<ProxyProcess>,
     bridge: Option<tokio::task::JoinHandle<()>>,
+    /// Set by this hop's handler when its own SSH connection ends.
+    lost: watch::Receiver<bool>,
 }
 
 struct HopHandler {
@@ -600,8 +602,16 @@ async fn run_chain(
     forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
     gate: Arc<forwarding::ForwardGate>,
 ) {
-    if let Err(error) =
-        connect_chain(request, &mut commands, &attempt, files, transfers, forwards, gate).await
+    if let Err(error) = connect_chain(
+        request,
+        &mut commands,
+        &attempt,
+        files,
+        transfers,
+        forwards,
+        gate,
+    )
+    .await
     {
         let _ = attempt.events.send(ChainEvent::Failed(error));
     }
@@ -643,13 +653,7 @@ async fn connect_chain(
         live.push(opened);
         if index + 1 == count {
             let result = drive_shell(
-                &mut live,
-                commands,
-                attempt,
-                files,
-                transfers,
-                forwards,
-                gate,
+                &mut live, commands, attempt, files, transfers, forwards, gate,
             )
             .await;
             cleanup(&mut live).await;
@@ -836,6 +840,7 @@ async fn open_hop(
 
     let recorded = Arc::new(Mutex::new(None));
     let progress = Arc::new(HandshakeProgress::default());
+    let lost = gate.subscribe_lost();
     let handler = HopHandler {
         location: location.clone(),
         known: hop.known,
@@ -921,6 +926,7 @@ async fn open_hop(
         handle,
         proxy: opened.proxy,
         bridge: opened.bridge,
+        lost,
     })
 }
 
@@ -1184,26 +1190,19 @@ async fn drive_shell(
         loop {
             tokio::select! {
                 biased;
+                index = hop_ended(jumps) => {
+                    forwards.shutdown(handle).await;
+                    return Err(hop_disconnected(jumps[index].location.clone()));
+                }
                 changed = carrier_lost.changed() => {
                     if changed.is_err() || *carrier_lost.borrow() {
+                        // The target carrier also drops when a jump in front of
+                        // it drops. Name that jump when it has reported, or
+                        // reports before the wait ends.
+                        let failure = blame_closed(jumps, &location).await;
                         forwards.shutdown(handle).await;
-                        return Err(ChainFailure::Hop {
-                            hop: Box::new(location.clone()),
-                            error: Box::new(ConnectError::Disconnected {
-                                reason: "the connection to this hop closed".to_owned(),
-                            }),
-                        });
+                        return Err(failure);
                     }
-                }
-                index = hop_ended(jumps) => {
-                    let hop = jumps[index].location.clone();
-                    forwards.shutdown(handle).await;
-                    return Err(ChainFailure::Hop {
-                        hop: Box::new(hop),
-                        error: Box::new(ConnectError::Disconnected {
-                            reason: "the connection to this hop closed".to_owned(),
-                        }),
-                    });
                 }
                 _ = cancel.cancelled() => {
                     let _ = write_half.eof().await;
@@ -1271,14 +1270,8 @@ async fn drive_shell(
                         if exit_code.is_none()
                             && let Some(index) = jump_died(jumps).await
                         {
-                            let hop = jumps[index].location.clone();
                             forwards.shutdown(handle).await;
-                            return Err(ChainFailure::Hop {
-                                hop: Box::new(hop),
-                                error: Box::new(ConnectError::Disconnected {
-                                    reason: "the connection to this hop closed".to_owned(),
-                                }),
-                            });
+                            return Err(hop_disconnected(jumps[index].location.clone()));
                         }
                         let _ = events.send(ChainEvent::Exited { code: exit_code });
                         forwards.shutdown(handle).await;
@@ -1294,26 +1287,16 @@ async fn drive_shell(
     loop {
         tokio::select! {
             biased;
+            index = hop_ended(jumps) => {
+                forwards.shutdown(handle).await;
+                return Err(hop_disconnected(jumps[index].location.clone()));
+            }
             changed = carrier_lost.changed() => {
                 if changed.is_err() || *carrier_lost.borrow() {
+                    let failure = blame_closed(jumps, &location).await;
                     forwards.shutdown(handle).await;
-                    return Err(ChainFailure::Hop {
-                        hop: Box::new(location.clone()),
-                        error: Box::new(ConnectError::Disconnected {
-                            reason: "the connection to this hop closed".to_owned(),
-                        }),
-                    });
+                    return Err(failure);
                 }
-            }
-            index = hop_ended(jumps) => {
-                let hop = jumps[index].location.clone();
-                forwards.shutdown(handle).await;
-                return Err(ChainFailure::Hop {
-                    hop: Box::new(hop),
-                    error: Box::new(ConnectError::Disconnected {
-                        reason: "the connection to this hop closed".to_owned(),
-                    }),
-                });
             }
             _ = cancel.cancelled() => {
                 forwards.shutdown(handle).await;
@@ -1351,20 +1334,54 @@ fn hop_ended(hops: &mut [LiveHop]) -> impl Future<Output = usize> + '_ {
 
 fn poll_dead_hop(hops: &mut [LiveHop], cx: &mut Context<'_>) -> Poll<usize> {
     for (index, hop) in hops.iter_mut().enumerate() {
-        if Pin::new(&mut hop.handle).poll(cx).is_ready() {
+        if *hop.lost.borrow() || Pin::new(&mut hop.handle).poll(cx).is_ready() {
             return Poll::Ready(index);
         }
     }
     Poll::Pending
 }
 
+fn hop_disconnected(hop: HopLocation) -> ChainFailure {
+    ChainFailure::Hop {
+        hop: Box::new(hop),
+        error: Box::new(ConnectError::Disconnected {
+            reason: "the connection to this hop closed".to_owned(),
+        }),
+    }
+}
+
+/// Names an earlier hop when the target's carrier died because that hop did.
+async fn blame_closed(jumps: &mut [LiveHop], target: &HopLocation) -> ChainFailure {
+    match jump_died(jumps).await {
+        Some(index) => hop_disconnected(jumps[index].location.clone()),
+        None => hop_disconnected(target.clone()),
+    }
+}
+
+fn lost_hop(hops: &mut [LiveHop]) -> Option<usize> {
+    let waker = std::task::Waker::noop();
+    let mut context = Context::from_waker(waker);
+    for (index, hop) in hops.iter_mut().enumerate() {
+        if *hop.lost.borrow() || Pin::new(&mut hop.handle).poll(&mut context).is_ready() {
+            return Some(index);
+        }
+    }
+    None
+}
+
 async fn jump_died(hops: &mut [LiveHop]) -> Option<usize> {
     if hops.is_empty() {
         return None;
     }
-    tokio::select! {
-        index = hop_ended(hops) => Some(index),
-        _ = tokio::time::sleep(Duration::from_secs(1)) => None,
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(index) = lost_hop(hops) {
+            return Some(index);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
