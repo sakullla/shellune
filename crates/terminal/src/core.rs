@@ -27,6 +27,7 @@ use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode, point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb, StdSyncHandler};
+use regex::{Regex, RegexBuilder};
 use shellune_core::TerminalMode;
 
 use crate::blocks::{
@@ -152,15 +153,127 @@ pub struct RenderedCursor {
 /// One line of real scrollback that contains a search query.
 ///
 /// The line index is the grid's own index, including negative history lines, and
-/// `text` is that line with its trailing line break removed.
+/// `text` is that line with its trailing line break removed. A line that holds the
+/// query twice is two matches, so the number a find bar shows is the number of
+/// places a person can step through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryMatch {
     /// Grid line. Negative values are above the live screen.
     pub line: i32,
     /// Byte index of the query inside [`HistoryMatch::text`].
     pub column: usize,
+    /// Length of this match in bytes, so repeated matches in one line stay apart.
+    pub length: usize,
     /// The line as the grid stores it.
     pub text: String,
+}
+
+/// How a query is compared with the terminal's text (R1).
+///
+/// The scrollback and the command blocks read the same options, so one query means
+/// the same thing in both places. Literal text is the default; the two switches
+/// only narrow or widen that same comparison.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Whether letters must also match in case.
+    ///
+    /// Off by default: a search usually starts from text the user half remembers,
+    /// and prompts and output do not agree on case.
+    pub case_sensitive: bool,
+    /// Whether the query is a regular expression instead of literal text.
+    pub regex: bool,
+}
+
+impl SearchOptions {
+    /// Literal, case-insensitive matching: what a query means before any switch.
+    #[must_use]
+    pub const fn literal() -> Self {
+        Self {
+            case_sensitive: false,
+            regex: false,
+        }
+    }
+}
+
+/// Why a search could not run at all.
+///
+/// An invalid expression is not an empty result: the caller has to be able to say
+/// "this pattern is wrong" instead of "nothing matched", and neither may be
+/// reported as success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchFailure {
+    /// The query that could not be compiled.
+    pub query: String,
+    /// What the expression engine said about it, in one line.
+    pub reason: String,
+}
+
+impl std::fmt::Display for SearchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.query, self.reason)
+    }
+}
+
+impl std::error::Error for SearchFailure {}
+
+/// One query, compiled once and then run over every line or block of a search.
+///
+/// A literal query is escaped rather than special-cased, so the escaping rules and
+/// the case folding are the engine's, not a second implementation's that could
+/// disagree with it.
+pub(crate) struct Matcher {
+    pattern: Regex,
+}
+
+impl Matcher {
+    pub(crate) fn compile(query: &str, options: SearchOptions) -> Result<Self, SearchFailure> {
+        let source = if options.regex {
+            query.to_owned()
+        } else {
+            regex::escape(query)
+        };
+        RegexBuilder::new(&source)
+            .case_insensitive(!options.case_sensitive)
+            .build()
+            .map(|pattern| Self { pattern })
+            .map_err(|error| SearchFailure {
+                query: query.to_owned(),
+                reason: one_line(&error),
+            })
+    }
+
+    /// Every non-empty match in `text`, as byte ranges.
+    ///
+    /// An empty match is dropped: a pattern such as `a*` matches the gap before
+    /// every character, and counting those would report places with nothing in
+    /// them as results.
+    pub(crate) fn find_all(&self, text: &str) -> Vec<(usize, usize)> {
+        self.pattern
+            .find_iter(text)
+            .filter(|found| !found.is_empty())
+            .map(|found| (found.start(), found.end()))
+            .collect()
+    }
+
+    /// Whether `text` holds at least one non-empty match.
+    pub(crate) fn is_match(&self, text: &str) -> bool {
+        self.pattern.find_iter(text).any(|found| !found.is_empty())
+    }
+}
+
+/// The engine's complaint, as the one line an overlay can draw.
+///
+/// A syntax error is drawn with the offending pattern and a caret above it; the
+/// useful sentence is the last line, not the banner.
+fn one_line(error: &regex::Error) -> String {
+    let text = error.to_string();
+    text.lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map_or_else(
+            || text.clone(),
+            |line| line.strip_prefix("error: ").unwrap_or(line).to_owned(),
+        )
 }
 
 /// A complete picture of what the terminal shows.
@@ -538,17 +651,19 @@ impl TerminalCore {
         self.blocks.blocks()
     }
 
-    /// Blocks whose command or output contains `query`, limited by `filter`.
+    /// Blocks whose command or output matches `query`, limited by `filter`.
     ///
-    /// An empty query matches every block the filter allows. The match is the
-    /// block's own text, which was taken from the grid or from an `E` marker.
-    #[must_use]
+    /// An empty query matches every block the filter allows: the block list is the
+    /// record of what ran, so it is shown whole until a query narrows it. The
+    /// matching itself is the same one the scrollback uses, so a query means the
+    /// same thing in both places.
     pub fn search_blocks(
         &self,
         query: &str,
         filter: BlockFilter,
-    ) -> Vec<crate::blocks::CommandBlock> {
-        self.blocks.search(query, filter)
+        options: SearchOptions,
+    ) -> Result<Vec<crate::blocks::CommandBlock>, SearchFailure> {
+        self.blocks.search(query, filter, options)
     }
 
     /// Command and output of one block, for the clipboard.
@@ -572,24 +687,39 @@ impl TerminalCore {
         })
     }
 
-    /// Lines of the real grid, including scrollback, that contain `query`.
+    /// Lines of the real grid, including scrollback, that match `query`.
     ///
-    /// The search does not consult a side log. An empty query matches nothing.
-    #[must_use]
-    pub fn search_history(&self, query: &str) -> Vec<HistoryMatch> {
+    /// The search does not consult a side log: every match carries the grid line,
+    /// the byte column inside that line and the line's text, so a match is also the
+    /// place to scroll to. Every occurrence in a line is its own match.
+    ///
+    /// An empty query matches nothing: there is no "everything" to step through,
+    /// and the caller keeps its panel open for typing. An unusable expression is an
+    /// error rather than an empty list, so the two are never confused.
+    pub fn search_history(
+        &self,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<HistoryMatch>, SearchFailure> {
         if query.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
+        let matcher = Matcher::compile(query, options)?;
         let top = self.term.grid().topmost_line().0;
         let bottom = self.term.grid().bottommost_line().0;
         let mut matches = Vec::new();
         for line in top..=bottom {
             let text = self.line_text(Line(line));
-            if let Some(column) = text.find(query) {
-                matches.push(HistoryMatch { line, column, text });
+            for (column, end) in matcher.find_all(&text) {
+                matches.push(HistoryMatch {
+                    line,
+                    column,
+                    length: end - column,
+                    text: text.clone(),
+                });
             }
         }
-        matches
+        Ok(matches)
     }
 
     /// Scrolls so `line` is the top of the viewport, without moving the cursor.
@@ -1062,10 +1192,14 @@ mod tests {
             .copy_block_text(block.id)
             .expect("the block can be copied");
         assert_eq!(copied, "echo hello\nhello");
-        let found = terminal.search_blocks("hello", BlockFilter::ExitedZero);
+        let found = terminal
+            .search_blocks("hello", BlockFilter::ExitedZero, SearchOptions::literal())
+            .expect("a literal query compiles");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, block.id);
-        let history = terminal.search_history("hello");
+        let history = terminal
+            .search_history("hello", SearchOptions::literal())
+            .expect("a literal query compiles");
         assert!(
             history.iter().any(|hit| hit.text.contains("hello")),
             "history search reads the grid, got {history:?}"
@@ -1103,11 +1237,18 @@ mod tests {
         );
         assert!(
             terminal
-                .search_blocks("false", BlockFilter::ExitedZero)
+                .search_blocks("false", BlockFilter::ExitedZero, SearchOptions::literal())
+                .expect("a literal query compiles")
                 .is_empty(),
             "the success filter does not keep an unknown exit"
         );
-        assert_eq!(terminal.search_blocks("", BlockFilter::Unknown).len(), 1);
+        assert_eq!(
+            terminal
+                .search_blocks("", BlockFilter::Unknown, SearchOptions::literal())
+                .expect("an empty query compiles")
+                .len(),
+            1
+        );
 
         let command = terminal.rerun_command(first.id).expect("rerun text");
         assert_eq!(command, "false");
@@ -1155,13 +1296,181 @@ mod tests {
         for line in 0..10 {
             terminal.feed(format!("older {line}\r\n").as_bytes());
         }
-        let hits = terminal.search_history("older 0");
+        let hits = terminal
+            .search_history("older 0", SearchOptions::literal())
+            .expect("a literal query compiles");
         assert!(!hits.is_empty(), "the scrolled line is still in history");
         terminal.reveal_history(hits[0].line);
         let shown = terminal.snapshot().text().join("\n");
         assert!(
             shown.contains("older 0"),
             "revealing a history match scrolls the real grid, got {shown}"
+        );
+    }
+
+    #[test]
+    fn every_occurrence_in_a_line_is_a_match_and_the_switches_narrow_it() {
+        let mut terminal = core();
+        terminal.feed("needle and Needle and needle\r\n".as_bytes());
+
+        let folded = terminal
+            .search_history("needle", SearchOptions::literal())
+            .expect("a literal query compiles");
+        assert_eq!(
+            folded.iter().map(|hit| hit.column).collect::<Vec<_>>(),
+            vec![0, "needle and ".len(), "needle and Needle and ".len()],
+            "every occurrence counts and the capitals fold in: {folded:?}"
+        );
+        assert_eq!(folded[0].length, "needle".len());
+
+        let exact = terminal
+            .search_history(
+                "needle",
+                SearchOptions {
+                    case_sensitive: true,
+                    regex: false,
+                },
+            )
+            .expect("a literal query compiles");
+        assert_eq!(
+            exact.iter().map(|hit| hit.column).collect::<Vec<_>>(),
+            vec![0, "needle and Needle and ".len()],
+            "the capitalised one is excluded: {exact:?}"
+        );
+
+        let expression = terminal
+            .search_history(
+                "N.edle",
+                SearchOptions {
+                    case_sensitive: true,
+                    regex: true,
+                },
+            )
+            .expect("a valid expression compiles");
+        assert_eq!(expression.len(), 1, "only the capitalised one matches");
+        assert_eq!(expression[0].column, "needle and ".len());
+
+        let both = terminal
+            .search_history(
+                "(?i)needle",
+                SearchOptions {
+                    case_sensitive: true,
+                    regex: true,
+                },
+            )
+            .expect("a valid expression compiles");
+        assert_eq!(
+            both.len(),
+            3,
+            "the expression's own case flag is respected: {both:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_query_is_not_a_result_and_a_broken_expression_is_an_error() {
+        let mut terminal = core();
+        terminal.set_presentation(TerminalMode::Integrated);
+        feed_block(&mut terminal, "echo Hello", "Hello there", "133;D;0");
+
+        assert!(
+            terminal
+                .search_history("", SearchOptions::literal())
+                .expect("an empty query compiles")
+                .is_empty(),
+            "an empty query steps through nothing"
+        );
+        assert!(
+            terminal
+                .search_history("absent", SearchOptions::literal())
+                .expect("a literal query compiles")
+                .is_empty(),
+            "a query nothing matches is an empty list, not an error"
+        );
+
+        let failure = terminal
+            .search_history(
+                "Hel(lo",
+                SearchOptions {
+                    case_sensitive: false,
+                    regex: true,
+                },
+            )
+            .expect_err("an unclosed group cannot be compiled");
+        assert_eq!(failure.query, "Hel(lo");
+        assert!(
+            !failure.reason.is_empty() && !failure.reason.contains('\n'),
+            "the reason is one readable line, got {:?}",
+            failure.reason
+        );
+        assert!(
+            terminal
+                .search_history("Hel(lo", SearchOptions::literal())
+                .expect("the same text is literal when the switch is off")
+                .is_empty(),
+            "literal text is not parsed as an expression"
+        );
+
+        // The blocks read the same options as the scrollback.
+        let insensitive = terminal
+            .search_blocks("hello", BlockFilter::All, SearchOptions::literal())
+            .expect("a literal query compiles");
+        assert_eq!(insensitive.len(), 1, "case folds in the block search too");
+        let sensitive = terminal
+            .search_blocks(
+                "hello",
+                BlockFilter::All,
+                SearchOptions {
+                    case_sensitive: true,
+                    regex: false,
+                },
+            )
+            .expect("a literal query compiles");
+        assert!(
+            sensitive.is_empty(),
+            "a case-sensitive query does not match Hello"
+        );
+        let expression = terminal
+            .search_blocks(
+                "H.llo there$",
+                BlockFilter::All,
+                SearchOptions {
+                    case_sensitive: true,
+                    regex: true,
+                },
+            )
+            .expect("a valid expression compiles");
+        assert_eq!(expression.len(), 1, "the output is searched as a line");
+        assert!(
+            terminal
+                .search_blocks(
+                    "Hel(lo",
+                    BlockFilter::All,
+                    SearchOptions {
+                        case_sensitive: false,
+                        regex: true,
+                    },
+                )
+                .is_err(),
+            "a broken expression is an error for the block list as well"
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_reports_no_places() {
+        let mut terminal = core();
+        terminal.feed(b"abc\r\n");
+        let hits = terminal
+            .search_history(
+                "x*",
+                SearchOptions {
+                    case_sensitive: false,
+                    regex: true,
+                },
+            )
+            .expect("the expression compiles");
+        assert!(
+            hits.is_empty(),
+            "zero-width matches are not places to step through: {hits:?}"
         );
     }
 

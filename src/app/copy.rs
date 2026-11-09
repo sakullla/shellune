@@ -769,8 +769,16 @@ pub struct Strings {
     pub terminal_search: &'static str,
     /// Shown when a search matches nothing in this terminal.
     pub terminal_search_empty: &'static str,
+    /// Shown when a query cannot be read as a regular expression.
+    pub terminal_search_invalid: &'static str,
     /// Moves to the next history match.
     pub terminal_search_next: &'static str,
+    /// Moves to the previous history match.
+    pub terminal_search_previous: &'static str,
+    /// Switch: a match must also agree on upper and lower case.
+    pub terminal_search_case: &'static str,
+    /// Switch: the query is a regular expression instead of literal text.
+    pub terminal_search_regex: &'static str,
     /// Closes the history search.
     pub terminal_search_close: &'static str,
     /// Title of the paste confirmation.
@@ -1193,7 +1201,11 @@ pub static ENGLISH: Strings = Strings {
     terminal_block_rerun: "Run again",
     terminal_search: "Search this terminal",
     terminal_search_empty: "No matches in this terminal",
+    terminal_search_invalid: "Invalid regular expression",
     terminal_search_next: "Next match",
+    terminal_search_previous: "Previous match",
+    terminal_search_case: "Match case",
+    terminal_search_regex: "Regular expression",
     terminal_search_close: "Close search",
     terminal_paste_title: "Confirm paste",
     terminal_paste_target: "Target session",
@@ -1579,7 +1591,11 @@ pub static CHINESE: Strings = Strings {
     terminal_block_rerun: "重新运行",
     terminal_search: "搜索这个终端",
     terminal_search_empty: "这个终端里没有匹配",
+    terminal_search_invalid: "正则表达式无效",
     terminal_search_next: "下一个匹配",
+    terminal_search_previous: "上一个匹配",
+    terminal_search_case: "区分大小写",
+    terminal_search_regex: "正则表达式",
     terminal_search_close: "关闭搜索",
     terminal_paste_title: "确认粘贴",
     terminal_paste_target: "目标会话",

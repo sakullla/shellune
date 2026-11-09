@@ -12,6 +12,7 @@
 use std::time::{Duration, Instant};
 
 use shellune_core::{LocalShell, TerminalMode};
+use shellune_terminal::core::SearchOptions;
 use shellune_terminal::{
     BlockStatus, ExitReport, GridSize, LocalSession, PtyEvent, Snapshot, TermMode, TerminalCore,
     encode_text, palette, platform_default, program_exists,
@@ -552,7 +553,10 @@ fn a_real_shell_reports_command_blocks_without_using_its_process_exit() {
     );
     assert!(unknown.output.contains("nope"));
 
-    let before_alt = session.core.search_history("hello-block");
+    let before_alt = session
+        .core
+        .search_history("hello-block", SearchOptions::literal())
+        .expect("a literal query compiles");
     assert!(!before_alt.is_empty(), "the output is in the real grid");
     session.run(&shell_print(&session, "\u{1b}[?1049h"));
     session.wait_for("the alternate screen", |snapshot, _| {
@@ -567,7 +571,11 @@ fn a_real_shell_reports_command_blocks_without_using_its_process_exit() {
         !snapshot.mode.contains(TermMode::ALT_SCREEN)
     });
     assert!(
-        !session.core.search_history("hello-block").is_empty(),
+        !session
+            .core
+            .search_history("hello-block", SearchOptions::literal())
+            .expect("a literal query compiles")
+            .is_empty(),
         "leaving the alternate screen keeps the earlier output"
     );
     assert!(session.core.shows_command_blocks());

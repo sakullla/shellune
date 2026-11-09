@@ -39,7 +39,7 @@ use crate::app::layout::Direction;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
-use crate::app::terminal::{PaneState, SourceEvent, TerminalPane, TerminalShortcuts};
+use crate::app::terminal::{PaneState, SearchNote, SourceEvent, TerminalPane, TerminalShortcuts};
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
 };
@@ -991,7 +991,11 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_block_rerun,
             terminal_search,
             terminal_search_empty,
+            terminal_search_invalid,
             terminal_search_next,
+            terminal_search_previous,
+            terminal_search_case,
+            terminal_search_regex,
             terminal_search_close,
             terminal_paste_title,
             terminal_paste_target,
@@ -1852,6 +1856,443 @@ async fn integration_markers_become_blocks_and_the_alternate_screen_stays_classi
         "turning command blocks off does not rewrite the grid"
     );
     assert!(!cx.update(|_window, app| pane.read(app).shows_blocks_for_test()));
+}
+
+// ---------------------------------------------------------------------------
+// Terminal search (R1)
+// ---------------------------------------------------------------------------
+
+/// Forty lines, every tenth of which holds the word the find bar tests search for.
+fn lines_with_needles() -> String {
+    needle_lines(40)
+}
+
+/// `count` lines, every tenth of which holds the word the find bar tests search for.
+fn needle_lines(count: usize) -> String {
+    (0..count)
+        .map(|line| {
+            if line % 10 == 0 {
+                format!("needle line {line}")
+            } else {
+                format!("line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+fn search_state_of(
+    pane: &Entity<TerminalPane>,
+    cx: &mut VisualTestContext,
+) -> crate::app::terminal::SearchBarState {
+    cx.update(|_window, app| pane.read(app).search_state())
+}
+
+#[gpui::test]
+async fn the_find_bar_counts_the_places_and_steps_both_ways(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with(&lines_with_needles(), cx);
+    click(cx, "terminal.search");
+    assert_eq!(
+        search_state_of(&pane, cx),
+        crate::app::terminal::SearchBarState {
+            open: true,
+            focused: true,
+            query: String::new(),
+            case_sensitive: false,
+            regex: false,
+            note: SearchNote::Silent,
+            blocks: 0,
+        },
+        "opening the bar starts with an empty query and no count to claim"
+    );
+
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    let found = search_state_of(&pane, cx);
+    assert_eq!(
+        found.note,
+        SearchNote::Position {
+            position: 1,
+            total: 4
+        },
+        "every line with the word is a place, and the first one is current: {found:?}"
+    );
+    assert!(
+        cx.debug_bounds("terminal.search.position").is_some(),
+        "the bar draws which place of how many it is at"
+    );
+
+    // Both the keyboard and the buttons step through the same list.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 2,
+            total: 4
+        },
+        "Enter steps on"
+    );
+    click(cx, "terminal.search.next");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 3,
+            total: 4
+        }
+    );
+    click(cx, "terminal.search.previous");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 2,
+            total: 4
+        },
+        "the button steps back"
+    );
+    cx.simulate_keystrokes("shift-enter");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 4
+        },
+        "Shift+Enter steps back"
+    );
+    cx.simulate_keystrokes("shift-enter");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 4,
+            total: 4
+        },
+        "stepping back from the first place wraps to the last"
+    );
+}
+
+#[gpui::test]
+async fn closing_the_find_bar_restores_the_scroll_position_and_the_keyboard(
+    cx: &mut TestAppContext,
+) {
+    // Long enough that the whole history cannot fit on one screen: the pane grows to
+    // the test window, so a short transcript would leave nothing to scroll through.
+    let (pane, cx) = pane_with(&needle_lines(400), cx);
+    let center = bounds_of(cx, "terminal.viewport").center();
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Lines(point(0.0, 3.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: Default::default(),
+    });
+    cx.run_until_parked();
+    let before = cx.update(|_window, app| pane.read(app).display_offset());
+    assert!(before > 0, "the wheel moved the viewport back into history");
+
+    click(cx, "terminal.search");
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    assert_ne!(
+        cx.update(|_window, app| pane.read(app).display_offset()),
+        before,
+        "locating a match moves the viewport to it"
+    );
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).display_offset()),
+        before,
+        "closing the bar puts the reader back on the line they were reading"
+    );
+    assert!(!search_state_of(&pane, cx).open);
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "the keyboard is back on the terminal"
+    );
+    cx.simulate_input("echo");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"echo".to_vec(),
+        "typing reaches the shell again instead of the closed bar"
+    );
+}
+
+#[gpui::test]
+async fn the_case_and_expression_switches_narrow_the_same_query(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("needle\r\nNeedle", cx);
+    click(cx, "terminal.search");
+    cx.simulate_input("needle");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 2
+        },
+        "literal text folds case by default"
+    );
+
+    click(cx, "terminal.search.case");
+    let exact = search_state_of(&pane, cx);
+    assert!(exact.case_sensitive, "the switch is on: {exact:?}");
+    assert_eq!(
+        exact.note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        },
+        "only the line spelled the same way matches"
+    );
+    click(cx, "terminal.search.case");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 2
+        }
+    );
+
+    for _ in 0.."needle".len() {
+        cx.simulate_keystrokes("backspace");
+    }
+    cx.simulate_input("^N.edle$");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Empty,
+        "literal text is not read as an expression"
+    );
+
+    click(cx, "terminal.search.regex");
+    let expression = search_state_of(&pane, cx);
+    assert!(expression.regex, "the switch is on: {expression:?}");
+    assert_eq!(
+        expression.note,
+        SearchNote::Position {
+            position: 1,
+            total: 2
+        },
+        "the same text read as an expression finds both lines: {expression:?}"
+    );
+    assert!(
+        cx.debug_bounds("terminal.search.position").is_some(),
+        "a working expression shows where it is, not an error"
+    );
+}
+
+#[gpui::test]
+async fn a_paste_while_the_find_bar_is_open_edits_the_query(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("needle\r\nother", cx);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+        "needle\r\nother".to_owned(),
+    ));
+    click(cx, "terminal.search");
+    cx.dispatch_action(crate::app::actions::TerminalPaste);
+    cx.run_until_parked();
+
+    assert_eq!(
+        search_state_of(&pane, cx).query,
+        "needle other",
+        "pasted text edits the query, with its line breaks flattened"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        Vec::<u8>::new(),
+        "a copy-pasted command must not reach the shell behind the bar"
+    );
+}
+
+#[gpui::test]
+async fn an_empty_query_an_empty_result_and_a_broken_expression_stay_apart(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("needle\r\nother", cx);
+    let before = cx.update(|_window, app| pane.read(app).visible_text());
+    click(cx, "terminal.search");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Silent,
+        "an empty query says nothing about matches"
+    );
+
+    cx.simulate_input("absent");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Empty,
+        "a query nothing matches is an empty result"
+    );
+    assert!(
+        cx.debug_bounds("terminal.search.empty").is_some(),
+        "the empty result is drawn"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text()),
+        before,
+        "a search that matches nothing neither moves the viewport nor rewrites the grid"
+    );
+
+    for _ in 0.."absent".len() {
+        cx.simulate_keystrokes("backspace");
+    }
+    click(cx, "terminal.search.regex");
+    cx.run_until_parked();
+    cx.simulate_input("need(le");
+    cx.run_until_parked();
+    let broken = search_state_of(&pane, cx);
+    assert!(
+        matches!(broken.note, SearchNote::Invalid(_)),
+        "an unclosed group is reported instead of being counted: {broken:?}"
+    );
+    assert!(
+        cx.debug_bounds("terminal.search.error").is_some(),
+        "the reason is drawn"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text()),
+        before,
+        "an unusable expression leaves the terminal as it was"
+    );
+}
+
+#[gpui::test]
+async fn the_find_bar_narrows_the_command_blocks_with_the_same_switches(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.set_presentation(TerminalMode::Integrated, cx);
+            let mut bytes = Vec::new();
+            bytes.extend(osc_bytes("133;B"));
+            bytes.extend(b"echo Hello");
+            bytes.extend(osc_bytes("133;C"));
+            bytes.extend(b"\r\nHello output\r\n");
+            bytes.extend(osc_bytes("133;D;0"));
+            pane.feed_for_test(&bytes, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).blocks,
+        1,
+        "the recorded command is listed"
+    );
+    assert!(cx.debug_bounds("terminal.block.1").is_some());
+
+    click(cx, "terminal.search");
+    cx.simulate_input("hello");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).blocks,
+        1,
+        "the block list folds case the way the scrollback does"
+    );
+
+    click(cx, "terminal.search.case");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).blocks,
+        0,
+        "a case-sensitive query drops the block too: {:?}",
+        search_state_of(&pane, cx)
+    );
+
+    click(cx, "terminal.search.case");
+    click(cx, "terminal.search.regex");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).blocks,
+        1,
+        "a valid expression keeps the block"
+    );
+
+    click(cx, "terminal.search.close");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).blocks,
+        1,
+        "closing the bar shows every block again"
+    );
+    assert!(!search_state_of(&pane, cx).open);
+}
+
+#[gpui::test]
+async fn a_full_screen_program_keeps_the_find_bar_shut_and_its_keys(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    // On an ordinary screen the same action opens the bar, so the check below is
+    // about the full-screen program and not about a listener that never ran.
+    cx.dispatch_action(crate::app::actions::TerminalSearch);
+    cx.run_until_parked();
+    assert!(
+        search_state_of(&pane, cx).open,
+        "the search action opens the bar"
+    );
+    cx.simulate_keystrokes("escape");
+    assert!(!search_state_of(&pane, cx).open);
+
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"\x1b[?1049h\x1b[Hinside", cx)
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| pane.read(app).alternate_for_test()));
+
+    cx.dispatch_action(crate::app::actions::TerminalSearch);
+    cx.run_until_parked();
+    assert!(
+        !search_state_of(&pane, cx).open,
+        "a full-screen program's screen is not this pane's history to search"
+    );
+
+    // The button on the bar refuses as well, and the keys stay with the program.
+    click(cx, "terminal.search");
+    assert!(!search_state_of(&pane, cx).open);
+    cx.simulate_input("q");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"q".to_vec(),
+        "the typed key reaches the full-screen program instead of a bar"
+    );
+}
+
+#[gpui::test]
+async fn a_full_screen_program_hides_the_bar_and_gives_it_back(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("needle\r\nother", cx);
+    click(cx, "terminal.search");
+    cx.simulate_input("needle");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        }
+    );
+
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"\x1b[?1049h\x1b[Hinside", cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Empty,
+        "the full-screen grid is not the history that matched"
+    );
+    cx.simulate_input("q");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"q".to_vec(),
+        "typing belongs to the full-screen program, not to the bar behind it"
+    );
+
+    cx.update(|_window, app| pane.update(app, |pane, cx| pane.feed_for_test(b"\x1b[?1049l", cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        },
+        "leaving the full-screen program finds the earlier history again"
+    );
 }
 
 #[gpui::test]

@@ -26,6 +26,7 @@ use shellune_ssh::{
     ConnectError, ConnectRequest, KnownHostKey, PtySize, RemoteEvent, RemoteSession,
 };
 use shellune_storage::{HostKey, HostTrust, TrustStore, TrustVerdict};
+use shellune_terminal::core::SearchOptions;
 use shellune_terminal::{BlockStatus, TermMode, TerminalCore};
 
 /// How long any single wait may take.
@@ -688,7 +689,9 @@ fn remote_shell_integration_markers_are_command_blocks_and_not_the_process_exit(
         "the remote primary screen",
         |core| {
             !core.mode().contains(TermMode::ALT_SCREEN)
-                && !core.search_history("hello-block").is_empty()
+                && core
+                    .search_history("hello-block", SearchOptions::literal())
+                    .is_ok_and(|hits| !hits.is_empty())
         },
     );
 

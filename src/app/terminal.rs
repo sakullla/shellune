@@ -30,6 +30,7 @@ use std::ops::Range;
 
 use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession};
+use shellune_terminal::core::SearchOptions;
 use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
     GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, MouseAction,
@@ -360,11 +361,22 @@ pub struct TerminalPane {
     search_open: bool,
     /// When set, typed text edits the search query instead of the shell.
     ///
-    /// Escape, Ctrl+L and Ctrl+C are never taken by the search.
+    /// Ctrl+C, Ctrl+L and the program's own arrow keys were never taken by the
+    /// search; Escape belongs to the find bar only while it holds the keyboard, and
+    /// then it closes the bar and gives the terminal back (R1, R4).
     search_focused: bool,
     search_query: String,
+    /// Why the query could not be compiled, in the expression engine's words.
+    ///
+    /// An unusable expression is its own answer: it is never drawn as "no matches".
+    search_error: Option<String>,
     search_hits: Vec<HistoryMatch>,
+    /// Index of the match the viewport was last put on, counted from zero.
     search_at: usize,
+    /// Literal, case and expression switches, shared by the scrollback and the blocks.
+    search_options: SearchOptions,
+    /// Where the viewport was when the bar opened, put back when it closes.
+    search_scroll: Option<usize>,
     block_filter: BlockFilter,
     /// The shortcuts the pane's own controls answer, as the bindings in force show
     /// them (R5). The view keeps this in step with the settings page.
@@ -410,6 +422,50 @@ struct PendingPaste {
     text: String,
     /// The session label captured when the paste was offered.
     target: String,
+}
+
+/// What the find bar says beside the query (R1).
+///
+/// Exactly one of these is drawn, so "nothing matched" and "this pattern is broken"
+/// never look alike, and an empty query claims neither of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchNote {
+    /// The query is empty, so no count is claimed.
+    Silent,
+    /// The place the viewport is at, counted from one, of how many matched.
+    Position {
+        /// One-based position among the matches.
+        position: usize,
+        /// How many places matched.
+        total: usize,
+    },
+    /// The query matched nothing.
+    Empty,
+    /// The expression could not be read; the reason is the engine's own words.
+    Invalid(String),
+}
+
+/// What the find bar is showing, for tests that assert what a person reads there.
+///
+/// It is the same state the bar draws from, so a test cannot pass on a number the
+/// user would never see.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchBarState {
+    /// Whether the bar is open.
+    pub open: bool,
+    /// Whether typed text edits the query rather than reaching the shell.
+    pub focused: bool,
+    /// The query as typed.
+    pub query: String,
+    /// Whether the case switch is on.
+    pub case_sensitive: bool,
+    /// Whether the query is read as an expression.
+    pub regex: bool,
+    /// What the bar says beside the query.
+    pub note: SearchNote,
+    /// How many command blocks the list below the bar is drawing.
+    pub blocks: usize,
 }
 
 impl TerminalPane {
@@ -460,8 +516,11 @@ impl TerminalPane {
             search_open: false,
             search_focused: false,
             search_query: String::new(),
+            search_error: None,
             search_hits: Vec::new(),
             search_at: 0,
+            search_options: SearchOptions::literal(),
+            search_scroll: None,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
         };
@@ -514,8 +573,11 @@ impl TerminalPane {
             search_open: false,
             search_focused: false,
             search_query: String::new(),
+            search_error: None,
             search_hits: Vec::new(),
             search_at: 0,
+            search_options: SearchOptions::literal(),
+            search_scroll: None,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
         };
@@ -567,8 +629,11 @@ impl TerminalPane {
             search_open: false,
             search_focused: false,
             search_query: String::new(),
+            search_error: None,
             search_hits: Vec::new(),
             search_at: 0,
+            search_options: SearchOptions::literal(),
+            search_scroll: None,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
         };
@@ -636,8 +701,11 @@ impl TerminalPane {
             search_open: false,
             search_focused: false,
             search_query: String::new(),
+            search_error: None,
             search_hits: Vec::new(),
             search_at: 0,
+            search_options: SearchOptions::literal(),
+            search_scroll: None,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
         }
@@ -646,8 +714,10 @@ impl TerminalPane {
     /// Feeds bytes as if the shell had produced them.
     #[cfg(test)]
     pub fn feed_for_test(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        let was_alternate = self.alternate_screen();
         let effects = self.core.feed(bytes);
         self.apply_effects(effects, cx);
+        self.recount_after_output(was_alternate);
         cx.notify();
     }
 
@@ -805,8 +875,10 @@ impl TerminalPane {
     fn handle_event(&mut self, event: SourceEvent, cx: &mut Context<Self>) -> bool {
         match event {
             SourceEvent::Data(bytes) => {
+                let was_alternate = self.alternate_screen();
                 let effects = self.core.feed(&bytes);
                 self.apply_effects(effects, cx);
+                self.recount_after_output(was_alternate);
                 self.state.accepts_input()
             }
             SourceEvent::Exited(report) => {
@@ -852,7 +924,7 @@ impl TerminalPane {
     }
 
     /// Sends what a key press means, or scrolls for the view-only combinations.
-    fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() && event.keystroke.key == "escape" {
             self.menu = None;
             cx.notify();
@@ -865,11 +937,43 @@ impl TerminalPane {
             alt: keystroke.modifiers.alt,
             platform: keystroke.modifiers.platform,
         };
+        let plain = !modifiers.control && !modifiers.alt && !modifiers.platform;
+
+        // While the find bar holds the keyboard, the keys that edit and leave it are
+        // the bar's: Escape closes it and hands the terminal back, Enter steps to the
+        // next match and Shift+Enter to the previous one, so a search can be run
+        // without a pointer (R1, R4). None of these reaches the shell.
+        if self.search_focused && self.search_open && !self.alternate_screen() {
+            match keystroke.key.as_str() {
+                "escape" if plain => {
+                    self.close_search(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" if plain => {
+                    if modifiers.shift {
+                        self.previous_search_hit(cx);
+                    } else {
+                        self.next_search_hit(cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "backspace" if plain => {
+                    self.search_query.pop();
+                    self.refresh_search(true);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
 
         // The terminal's own clipboard and search keys arrive as actions, so the
-        // settings page can rebind or unbind them (R5). These two confirm or cancel a
-        // paste and step through search hits; they are not Escape, Ctrl+L or Ctrl+C,
-        // which stay program input below.
+        // settings page can rebind or unbind them (R5). These confirm or cancel a
+        // paste and step through search hits; they are not Ctrl+L or Ctrl+C, which
+        // stay program input below.
         if modifiers.control && modifiers.shift {
             match keystroke.key.as_str() {
                 "enter" if self.pending_paste.is_some() => {
@@ -889,19 +993,6 @@ impl TerminalPane {
                 }
                 _ => {}
             }
-        }
-        if self.search_focused
-            && !self.alternate_screen()
-            && !modifiers.control
-            && !modifiers.alt
-            && !modifiers.platform
-            && keystroke.key == "backspace"
-        {
-            self.search_query.pop();
-            self.refresh_search();
-            cx.stop_propagation();
-            cx.notify();
-            return;
         }
         if modifiers.platform {
             return;
@@ -973,11 +1064,22 @@ impl TerminalPane {
     ///
     /// Holding it writes nothing. Confirmation encodes with the mode the program
     /// has set at confirm time, and only into this pane.
+    ///
+    /// While the find bar holds the keyboard, pasted text edits the query instead:
+    /// a copy-pasted command must not reach the shell just because the bar was open
+    /// (R1).
     fn paste(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
         if let Some(text) = item.text().filter(|text| !text.is_empty()) {
+            if self.search_focused && self.search_open && !self.alternate_screen() {
+                // Line breaks have no meaning in a query: a pasted block becomes one
+                // line, exactly as a single-line field would take it.
+                let query = text.lines().collect::<Vec<_>>().join(" ");
+                self.append_search_query(&query, cx);
+                return;
+            }
             self.stage_paste(&text, cx);
             return;
         }
@@ -1145,34 +1247,192 @@ impl TerminalPane {
         !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks())
     }
 
-    fn toggle_search(&mut self, cx: &mut Context<Self>) {
-        self.search_open = !self.search_open;
-        self.search_focused = self.search_open;
+    /// Opens or closes the find bar (R1).
+    ///
+    /// A full-screen program owns the screen and its own keys, so an alternate-screen
+    /// terminal never opens one: its contents are not this pane's history, and the
+    /// keys the bar would take have to reach the program.
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_open {
-            self.refresh_search();
+            self.close_search(window, cx);
+        } else if !self.alternate_screen() {
+            self.open_search(window, cx);
         }
+    }
+
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = true;
+        self.search_focused = true;
+        // Remembered before anything scrolls, so closing puts the reader back on the
+        // line they were reading rather than at the bottom of a live shell.
+        self.search_scroll = Some(self.core.display_offset());
+        self.refresh_search(true);
+        window.focus(&self.focus);
         cx.notify();
     }
 
-    fn refresh_search(&mut self) {
-        self.search_hits = self.core.search_history(&self.search_query);
-        if self.search_hits.is_empty() {
-            self.search_at = 0;
+    /// Closes the bar, restores the scroll position and gives the keyboard back.
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = false;
+        self.search_focused = false;
+        self.search_query.clear();
+        self.search_hits.clear();
+        self.search_at = 0;
+        self.search_error = None;
+        if let Some(offset) = self.search_scroll.take() {
+            self.scroll_to_offset(offset);
+        }
+        // The terminal is where the keyboard was, and where it goes back to.
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// Moves the viewport so `offset` lines are above the live screen.
+    fn scroll_to_offset(&mut self, offset: usize) {
+        let current = i32::try_from(self.core.display_offset()).unwrap_or(i32::MAX);
+        let target = i32::try_from(offset).unwrap_or(i32::MAX);
+        self.core.scroll(target.saturating_sub(current));
+    }
+
+    /// Re-runs the query over the scrollback.
+    ///
+    /// `reveal` scrolls to the current match. Output that arrives while the bar is
+    /// open only recounts, so the numbers stay true without moving the viewport the
+    /// reader is looking at.
+    fn refresh_search(&mut self, reveal: bool) {
+        let previous = self.search_hits.get(self.search_at).map(|hit| hit.line);
+        self.search_hits.clear();
+        self.search_at = 0;
+        self.search_error = None;
+        if self.search_query.is_empty() {
             return;
         }
-        self.search_at = self.search_at.min(self.search_hits.len() - 1);
-        let line = self.search_hits[self.search_at].line;
-        self.core.reveal_history(line);
+        match self
+            .core
+            .search_history(&self.search_query, self.search_options)
+        {
+            Ok(hits) => {
+                self.search_hits = hits;
+                let Some(last) = self.search_hits.len().checked_sub(1) else {
+                    return;
+                };
+                // A longer query keeps the reader near the line they were on: the
+                // first match at or below it, or the last one when the query moved
+                // past every remaining match.
+                self.search_at = match previous {
+                    Some(line) => self
+                        .search_hits
+                        .iter()
+                        .position(|hit| hit.line >= line)
+                        .unwrap_or(last),
+                    None => 0,
+                };
+                if reveal {
+                    self.reveal_current();
+                }
+            }
+            // A pattern the engine cannot compile is reported, and the empty list it
+            // leaves behind is never drawn as "no matches".
+            Err(failure) => self.search_error = Some(failure.reason),
+        }
+    }
+
+    fn reveal_current(&mut self) {
+        if let Some(hit) = self.search_hits.get(self.search_at) {
+            self.core.reveal_history(hit.line);
+        }
+    }
+
+    /// Adds text to the query, the way typing or pasting into the bar does.
+    fn append_search_query(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        self.search_query.push_str(text);
+        self.refresh_search(true);
+        cx.notify();
+    }
+
+    /// Counts the matches again after the grid changed.
+    ///
+    /// The viewport is left where the reader put it: a search that jumped on every
+    /// chunk of output would fight the person reading the screen. A change between
+    /// the primary and the full-screen grid is the exception — the matches belong to
+    /// the screen that has just come back, so the reader is put back on one.
+    fn recount_after_output(&mut self, was_alternate: bool) {
+        if !self.search_open {
+            return;
+        }
+        self.refresh_search(self.alternate_screen() != was_alternate);
     }
 
     fn next_search_hit(&mut self, cx: &mut Context<Self>) {
-        if self.search_hits.is_empty() {
+        self.step_search(1, cx);
+    }
+
+    fn previous_search_hit(&mut self, cx: &mut Context<Self>) {
+        self.step_search(-1, cx);
+    }
+
+    /// Steps through the matches, wrapping at either end.
+    fn step_search(&mut self, step: i32, cx: &mut Context<Self>) {
+        let count = i32::try_from(self.search_hits.len()).unwrap_or(0);
+        if count == 0 {
             return;
         }
-        self.search_at = (self.search_at + 1) % self.search_hits.len();
-        let line = self.search_hits[self.search_at].line;
-        self.core.reveal_history(line);
+        let current = i32::try_from(self.search_at).unwrap_or(0);
+        let next = (current + step).rem_euclid(count);
+        self.search_at = usize::try_from(next).unwrap_or(0);
+        self.reveal_current();
         cx.notify();
+    }
+
+    /// Turns the case switch over and shows the matches it leaves.
+    fn toggle_case_sensitive(&mut self, cx: &mut Context<Self>) {
+        self.search_options.case_sensitive = !self.search_options.case_sensitive;
+        self.refresh_search(true);
+        cx.notify();
+    }
+
+    /// Turns literal text into an expression, or back.
+    fn toggle_regex(&mut self, cx: &mut Context<Self>) {
+        self.search_options.regex = !self.search_options.regex;
+        self.refresh_search(true);
+        cx.notify();
+    }
+
+    /// The state the find bar draws, for tests that assert what a person sees.
+    #[cfg(test)]
+    #[must_use]
+    pub fn search_state(&self) -> SearchBarState {
+        SearchBarState {
+            open: self.search_open,
+            focused: self.search_focused,
+            query: self.search_query.clone(),
+            case_sensitive: self.search_options.case_sensitive,
+            regex: self.search_options.regex,
+            note: self.search_note(),
+            blocks: self.listed_blocks().len(),
+        }
+    }
+
+    /// What the bar says beside the query, which is also what it draws.
+    fn search_note(&self) -> SearchNote {
+        if let Some(error) = &self.search_error {
+            return SearchNote::Invalid(error.clone());
+        }
+        let total = self.search_hits.len();
+        if total > 0 {
+            return SearchNote::Position {
+                position: self.search_at + 1,
+                total,
+            };
+        }
+        if self.search_query.is_empty() {
+            SearchNote::Silent
+        } else {
+            SearchNote::Empty
+        }
     }
 
     fn copy_block(&mut self, id: CommandBlockId, cx: &mut Context<Self>) {
@@ -1592,9 +1852,9 @@ impl TerminalPane {
                     true,
                     "terminal.menu.search",
                 )
-                .on_click(cx.listener(|this, _event, _window, cx| {
+                .on_click(cx.listener(|this, _event, window, cx| {
                     this.menu = None;
-                    this.toggle_search(cx);
+                    this.toggle_search(window, cx);
                 })),
             );
         Some(
@@ -2008,8 +2268,8 @@ impl TerminalPane {
             .tooltip(components::tooltip(SharedString::from(
                 Self::with_shortcut(strings.terminal_search, &self.shortcuts.search),
             )))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.toggle_search(cx);
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.toggle_search(window, cx);
             }))
     }
 
@@ -2120,30 +2380,32 @@ impl TerminalPane {
             )
     }
 
+    /// The blocks the list shows for the current query, filter and switches.
+    ///
+    /// A query that cannot be read leaves no rows: the bar says why, so the list
+    /// never pretends the terminal holds nothing.
+    fn listed_blocks(&self) -> Vec<CommandBlock> {
+        self.core
+            .search_blocks(&self.search_query, self.block_filter, self.search_options)
+            .unwrap_or_default()
+    }
+
+    /// The panel under the grid: the find bar and the command blocks (R1).
+    ///
+    /// The bar and the block list read one query, so a search means the same thing
+    /// in both: the numbers come from the real scrollback, the rows from the blocks
+    /// whose command or output matches with the same switches.
     fn block_overlay(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let strings = self.locale.strings();
-        let blocks = self
-            .core
-            .search_blocks(&self.search_query, self.block_filter);
-        let filter_label = match self.block_filter {
-            BlockFilter::All => strings.terminal_filter_all,
-            BlockFilter::Running => strings.terminal_filter_running,
-            BlockFilter::Unknown => strings.terminal_filter_unknown,
-            BlockFilter::Failed => strings.terminal_filter_failed,
-            BlockFilter::ExitedZero => strings.terminal_filter_zero,
-        };
-        let query = if self.search_query.is_empty() {
-            strings.terminal_search.to_owned()
-        } else {
-            self.search_query.clone()
-        };
-        let hits = self.search_hits.len();
+        let blocks = self.listed_blocks();
         let mut panel = div()
             .absolute()
             .bottom(px(SHELL_BAR_HEIGHT))
             .left(px(0.0))
             .right(px(0.0))
-            .max_h(px(180.0))
+            // The bar grows with the text; the panel stops at a height that still
+            // leaves the grid readable behind it and scrolls inside itself.
+            .max_h(metrics.scale(180.0).clamp(px(180.0), px(260.0)))
             .flex()
             .flex_col()
             .id("terminal.blocks")
@@ -2160,85 +2422,205 @@ impl TerminalPane {
                     cx.stop_propagation();
                 }),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .debug_selector(|| "terminal.search.query".to_owned())
-                            .font_family(monospace_family())
-                            .text_size(metrics.caption_size())
-                            .child(SharedString::from(query)),
-                    )
-                    .when(self.search_open, |row| {
-                        row.child(
-                            div()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(shell_palette::TEXT_MUTED))
-                                .child(SharedString::from(if hits == 0 {
-                                    strings.terminal_search_empty.to_owned()
-                                } else {
-                                    format!("{hits}")
-                                })),
-                        )
-                        .child(
-                            components::compact_button(
-                                strings.terminal_search_next,
-                                components::Variant::Ghost,
-                                metrics,
-                            )
-                            .id("terminal.search.next")
-                            .debug_selector(|| "terminal.search.next".to_owned())
-                            .on_click(cx.listener(
-                                |this, _event, _window, cx| {
-                                    this.next_search_hit(cx);
-                                },
-                            )),
-                        )
-                        .child(
-                            components::compact_button(
-                                strings.terminal_search_close,
-                                components::Variant::Ghost,
-                                metrics,
-                            )
-                            .id("terminal.search.close")
-                            .debug_selector(|| "terminal.search.close".to_owned())
-                            .on_click(cx.listener(
-                                |this, _event, _window, cx| {
-                                    this.search_open = false;
-                                    this.search_focused = false;
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                    })
-                    .when(self.core.shows_command_blocks(), |row| {
-                        row.child(
-                            components::compact_button(
-                                filter_label,
-                                components::Variant::Ghost,
-                                metrics,
-                            )
-                            .id("terminal.blocks.filter")
-                            .debug_selector(|| "terminal.blocks.filter".to_owned())
-                            .on_click(cx.listener(
-                                |this, _event, _window, cx| {
-                                    this.block_filter = this.block_filter.cycle();
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                    }),
-            );
+            .when(self.search_open, |panel| {
+                panel.child(self.search_bar(metrics, cx))
+            })
+            .when(self.core.shows_command_blocks(), |panel| {
+                panel.child(self.block_header(metrics, strings, cx))
+            });
         for block in blocks {
             panel = panel.child(self.block_row(&block, metrics, strings, cx));
         }
         panel
+    }
+
+    /// The find bar: the query, where it is, and the switches that narrow it.
+    ///
+    /// Exactly one note is drawn beside the query — position and total, an empty
+    /// result, or the reason an expression could not be read — so "nothing matched"
+    /// and "this pattern is broken" never look alike, and an empty query says
+    /// neither (R1).
+    fn search_bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
+        let strings = self.locale.strings();
+        let empty_query = self.search_query.is_empty();
+        let query = if empty_query {
+            strings.terminal_search.to_owned()
+        } else {
+            self.search_query.clone()
+        };
+        let note = match self.search_note() {
+            SearchNote::Silent => None,
+            SearchNote::Position { position, total } => Some(
+                div()
+                    .flex_none()
+                    .debug_selector(|| "terminal.search.position".to_owned())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
+                    .child(SharedString::from(format!("{position} / {total}"))),
+            ),
+            SearchNote::Empty => Some(
+                div()
+                    .flex_none()
+                    .debug_selector(|| "terminal.search.empty".to_owned())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                    .child(SharedString::from(strings.terminal_search_empty.to_owned())),
+            ),
+            SearchNote::Invalid(reason) => Some(
+                div()
+                    .flex_none()
+                    .debug_selector(|| "terminal.search.error".to_owned())
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Danger.text())
+                    .child(SharedString::from(format!(
+                        "{}: {reason}",
+                        strings.terminal_search_invalid
+                    ))),
+            ),
+        };
+
+        let mut bar = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "terminal.search.bar".to_owned())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(80.0))
+                    .truncate()
+                    .debug_selector(|| "terminal.search.query".to_owned())
+                    .font_family(monospace_family())
+                    .text_size(metrics.caption_size())
+                    .text_color(if empty_query {
+                        theme::swatch(shell_palette::TEXT_MUTED)
+                    } else {
+                        theme::swatch(shell_palette::TEXT_PRIMARY)
+                    })
+                    .child(SharedString::from(query)),
+            );
+        if let Some(note) = note {
+            bar = bar.child(note);
+        }
+        bar.child(
+            components::compact_button(
+                strings.terminal_search_previous,
+                components::Variant::Ghost,
+                metrics,
+            )
+            .h(metrics.hit_target())
+            .id("terminal.search.previous")
+            .debug_selector(|| "terminal.search.previous".to_owned())
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.previous_search_hit(cx);
+            })),
+        )
+        .child(
+            components::compact_button(
+                strings.terminal_search_next,
+                components::Variant::Ghost,
+                metrics,
+            )
+            .h(metrics.hit_target())
+            .id("terminal.search.next")
+            .debug_selector(|| "terminal.search.next".to_owned())
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.next_search_hit(cx);
+            })),
+        )
+        .child(Self::search_switch(
+            strings.terminal_search_case,
+            self.search_options.case_sensitive,
+            metrics,
+            "terminal.search.case",
+            Self::toggle_case_sensitive,
+            cx,
+        ))
+        .child(Self::search_switch(
+            strings.terminal_search_regex,
+            self.search_options.regex,
+            metrics,
+            "terminal.search.regex",
+            Self::toggle_regex,
+            cx,
+        ))
+        .child(
+            components::compact_button(
+                strings.terminal_search_close,
+                components::Variant::Ghost,
+                metrics,
+            )
+            .h(metrics.hit_target())
+            .id("terminal.search.close")
+            .debug_selector(|| "terminal.search.close".to_owned())
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.close_search(window, cx);
+            })),
+        )
+    }
+
+    /// One switch of the find bar.
+    ///
+    /// The box in the label says which state it is in, so the state is readable as
+    /// text; the filled variant only repeats it instead of carrying the answer alone
+    /// (R3). The identifier is also the debug selector, so a test clicks the same
+    /// control a person does.
+    fn search_switch(
+        label: &'static str,
+        on: bool,
+        metrics: Metrics,
+        id: &'static str,
+        toggle: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let box_mark = if on { "[x]" } else { "[ ]" };
+        components::compact_button(
+            format!("{box_mark} {label}"),
+            if on {
+                components::Variant::Soft
+            } else {
+                components::Variant::Ghost
+            },
+            metrics,
+        )
+        .h(metrics.hit_target())
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .tooltip(components::tooltip(SharedString::from(label)))
+        .on_click(cx.listener(move |this, _event, _window, cx| toggle(this, cx)))
+    }
+
+    /// The block list's own row: how the list is filtered, and the switch that
+    /// changes it.
+    fn block_header(
+        &self,
+        metrics: Metrics,
+        strings: &crate::app::copy::Strings,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let filter_label = match self.block_filter {
+            BlockFilter::All => strings.terminal_filter_all,
+            BlockFilter::Running => strings.terminal_filter_running,
+            BlockFilter::Unknown => strings.terminal_filter_unknown,
+            BlockFilter::Failed => strings.terminal_filter_failed,
+            BlockFilter::ExitedZero => strings.terminal_filter_zero,
+        };
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "terminal.blocks.header".to_owned())
+            .child(
+                components::compact_button(filter_label, components::Variant::Ghost, metrics)
+                    .id("terminal.blocks.filter")
+                    .debug_selector(|| "terminal.blocks.filter".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.block_filter = this.block_filter.cycle();
+                        cx.notify();
+                    })),
+            )
     }
 
     fn block_row(
@@ -2414,12 +2796,11 @@ impl TerminalPane {
             // The clipboard and search shortcuts are actions rather than key
             // branches, so the settings page can rebind or unbind them: an unbound
             // combination falls through to the program below.
-            .on_action(cx.listener(|this, _: &TerminalSearch, _window, cx| {
+            .on_action(cx.listener(|this, _: &TerminalSearch, window, cx| {
                 // A full-screen program owns the screen: its contents are not history
-                // and must not be searched (R1).
-                if !this.alternate_screen() {
-                    this.toggle_search(cx);
-                }
+                // and must not be searched (R1). The bar refuses to open there itself,
+                // so no other entry point can open one either.
+                this.toggle_search(window, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &TerminalCopy, _window, cx| {
@@ -3007,10 +3388,8 @@ impl EntityInputHandler for TerminalPane {
         // A commit replaces any composition with its final text, so the pending
         // marker is dropped before the text is sent.
         self.marked = None;
-        if self.search_focused && !self.alternate_screen() {
-            self.search_query.push_str(text);
-            self.refresh_search();
-            cx.notify();
+        if self.search_focused && self.search_open && !self.alternate_screen() {
+            self.append_search_query(text, cx);
             return;
         }
         // A commit is program input, including one command that ends in a newline.

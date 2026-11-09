@@ -11,5 +11,6 @@ publish = false
 shellune-core = { path = "../core" }
 alacritty_terminal = { workspace = true }
 portable-pty = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

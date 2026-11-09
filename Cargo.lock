@@ -6106,6 +6106,7 @@ version = "0.3.2"
 dependencies = [
  "alacritty_terminal",
  "portable-pty",
+ "regex",
  "serde",
  "shellune-core",
  "thiserror 2.0.21",

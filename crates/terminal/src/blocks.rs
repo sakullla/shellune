@@ -11,6 +11,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::core::{Matcher, SearchFailure, SearchOptions};
+
 /// Stable id of one command block inside a single terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CommandBlockId(u64);
@@ -584,16 +586,33 @@ impl BlockBook {
         blocks
     }
 
-    pub(crate) fn search(&self, query: &str, filter: BlockFilter) -> Vec<CommandBlock> {
-        self.blocks()
+    /// Blocks whose command or output matches a query, limited by `filter`.
+    ///
+    /// The comparison is the scrollback's own ([`crate::core::SearchOptions`]), so
+    /// case and expressions mean the same thing in both places. An empty query keeps
+    /// every block the filter allows; an unusable expression is an error, never an
+    /// empty list.
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        filter: BlockFilter,
+        options: SearchOptions,
+    ) -> Result<Vec<CommandBlock>, SearchFailure> {
+        let matcher = if query.is_empty() {
+            None
+        } else {
+            Some(Matcher::compile(query, options)?)
+        };
+        Ok(self
+            .blocks()
             .into_iter()
             .filter(|block| {
                 filter.matches(block.status)
-                    && (query.is_empty()
-                        || block.command.contains(query)
-                        || block.output.contains(query))
+                    && matcher.as_ref().is_none_or(|matcher| {
+                        matcher.is_match(&block.command) || matcher.is_match(&block.output)
+                    })
             })
-            .collect()
+            .collect())
     }
 
     pub(crate) fn get(&self, id: CommandBlockId) -> Option<CommandBlock> {
