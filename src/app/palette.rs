@@ -37,8 +37,6 @@ pub enum Command {
     ToggleLanguage,
     /// Steps the interface text size.
     CycleTextSize,
-    /// Collapses or expands the sidebar.
-    ToggleSidebar,
     /// Steps the theme.
     CycleTheme,
     /// Switches short interface motion off or on.

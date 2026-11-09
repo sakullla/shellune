@@ -377,6 +377,19 @@ pub struct TextField {
 }
 
 impl TextField {
+    /// Replaces the placeholder, for a field whose language changed.
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = placeholder.into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
+    }
+
     /// Builds an empty field with a placeholder.
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self::with_text(placeholder, String::new(), cx)

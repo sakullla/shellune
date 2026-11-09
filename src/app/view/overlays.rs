@@ -244,7 +244,7 @@ impl ShelluneView {
             });
         }
 
-        for destination in Destination::ALL {
+        for destination in Destination::PAGES {
             entries.push(Entry {
                 command: Command::GoTo(destination),
                 group: Group::Navigate,
@@ -316,20 +316,6 @@ impl ShelluneView {
             detail: self.theme_label().to_owned(),
             shortcut: None,
             icon: self.theme_icon(),
-            current: false,
-        });
-        entries.push(Entry {
-            command: Command::ToggleSidebar,
-            group: Group::Actions,
-            title: if self.rail_collapsed {
-                strings.sidebar_expand
-            } else {
-                strings.sidebar_collapse
-            }
-            .to_owned(),
-            detail: String::new(),
-            shortcut: Some(platform.sidebar_label().to_owned()),
-            icon: Icon::Sidebar,
             current: false,
         });
         entries.push(Entry {
@@ -437,7 +423,6 @@ impl ShelluneView {
             Command::QuickConnect => self.open_quick_connect(window, cx),
             Command::CloseTab(id) => self.request_close_session(id, cx),
             Command::ToggleLanguage => self.toggle_locale(cx),
-            Command::ToggleSidebar => self.toggle_rail(cx),
             Command::CycleTheme => self.cycle_theme(cx),
             Command::CycleMotion => self.cycle_motion(cx),
             Command::CycleTextSize => {

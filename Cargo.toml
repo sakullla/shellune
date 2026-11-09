@@ -12,7 +12,7 @@ default-run = "shellune"
 # Builds the test-only flood program in src/bin/shellune-flood.rs. Everything the
 # interrupt tests need is in it, so a build without this feature - including every
 # release build - contains no test program at all.
-test-support = ["dep:windows-sys", "dep:libc"]
+test-support = ["dep:libc"]
 
 [[bin]]
 name = "shellune-flood"
@@ -29,9 +29,17 @@ shellune-storage = { path = "crates/storage" }
 shellune-terminal = { path = "crates/terminal" }
 
 [target.'cfg(windows)'.dependencies]
-# The test-only flood program has to be able to ignore Ctrl+C, which is a console
-# call. Optional, because only that program uses it.
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"], optional = true }
+# The custom title bar drives the window through the system: the caption starts the
+# native move loop, and the window buttons send the system's own commands. The
+# test-only flood program also uses it to ignore Ctrl+C.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# The window handle the title bar sends those commands to.
+raw-window-handle = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 # The same no-op Ctrl+C handler on Unix is one signal() call.

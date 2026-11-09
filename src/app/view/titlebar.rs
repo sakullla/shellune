@@ -9,7 +9,7 @@
 //! drawing the window's edges and shadow.
 
 use gpui::prelude::*;
-use gpui::{Context, Div, Stateful, Window, WindowControlArea, div, px};
+use gpui::{Context, Div, MouseButton, Stateful, Window, WindowControlArea, div, px};
 
 use super::ShelluneView;
 use crate::app::icons::{self, Icon};
@@ -33,12 +33,24 @@ const CLOSE_HOVER: u32 = 0xc42b1c;
 
 impl ShelluneView {
     /// A blank part of the top row: it drags the window and a double click maximises.
+    ///
+    /// The area occludes what is behind it, so a press here belongs to the caption
+    /// and to nothing drawn underneath.
     pub(super) fn drag_area(&self, id: &'static str) -> Stateful<Div> {
-        let area = div().id(id).debug_selector(move || id.to_owned());
+        let area = div().id(id).debug_selector(move || id.to_owned()).occlude();
         match Platform::current() {
-            // Windows answers the hit test itself: a press here is a press on the
-            // caption, with every system behaviour that comes with it.
-            Platform::Windows => area.window_control_area(WindowControlArea::Drag),
+            // Windows: a press here hands the window to the system's own move loop,
+            // so dragging, Aero Snap and moving between screens behave as on any
+            // caption. The application starts it itself instead of relying on the
+            // system's hit test, which did not reach the caption reliably. A double
+            // click maximises or restores, as on the system's caption.
+            Platform::Windows => area.on_mouse_down(MouseButton::Left, |event, window, _cx| {
+                if event.click_count >= 2 {
+                    win32::toggle_maximize(window);
+                } else {
+                    win32::begin_move(window);
+                }
+            }),
             // macOS drags the top of a window natively; the double click is forwarded so
             // it does what the user chose in the system settings.
             Platform::MacOs => area.on_click(|event, window, _cx| {
@@ -52,16 +64,21 @@ impl ShelluneView {
 
     /// Minimise, maximise or restore, and close, at the right end of the top row.
     ///
-    /// Only drawn on Windows. Each button is a window control area, so the press is the
-    /// system's: it minimises, maximises with snap layouts on hover, and closes the way
-    /// the caption buttons do.
+    /// Only drawn on Windows. Each button is a window control area, so hovering the
+    /// maximise button still shows the snap layouts, and each also sends its command
+    /// on click: it minimises, maximises or restores, and closes the way the caption
+    /// buttons do.
     pub(super) fn window_controls(&self, window: &Window, _cx: &mut Context<Self>) -> Option<Div> {
         if Platform::current() != Platform::Windows {
             return None;
         }
         let metrics = self.metrics();
         let height = metrics.header_height();
-        let button = |id: &'static str, icon: Icon, area: WindowControlArea, close: bool| {
+        let button = |id: &'static str,
+                      icon: Icon,
+                      area: WindowControlArea,
+                      close: bool,
+                      run: fn(&mut Window)| {
             let hover_bg = if close {
                 gpui::rgb(CLOSE_HOVER)
             } else {
@@ -82,7 +99,14 @@ impl ShelluneView {
                 .justify_center()
                 .w(px(46.0))
                 .h(height)
+                .occlude()
+                // The click is handled here and stops here, so the command runs once
+                // whether or not the system's own hit test saw the press.
                 .window_control_area(area)
+                .on_click(move |_event, window, cx| {
+                    cx.stop_propagation();
+                    run(window);
+                })
                 .hover(move |style| style.bg(hover_bg))
                 .child(
                     icons::icon(icon, px(14.0), theme::swatch(palette::TEXT_SECONDARY))
@@ -100,6 +124,7 @@ impl ShelluneView {
                     Icon::Minimize,
                     WindowControlArea::Min,
                     false,
+                    win32::minimize,
                 ))
                 .child(button(
                     "window.maximize",
@@ -110,13 +135,100 @@ impl ShelluneView {
                     },
                     WindowControlArea::Max,
                     false,
+                    win32::toggle_maximize,
                 ))
                 .child(button(
                     "window.close",
                     Icon::Close,
                     WindowControlArea::Close,
                     true,
+                    win32::close,
                 )),
         )
     }
+}
+
+/// The window commands of the custom title bar, sent to the system.
+///
+/// Off Windows the caption and buttons are the system's, so these do the closest
+/// portable thing or nothing.
+mod win32 {
+    use gpui::Window;
+
+    #[cfg(target_os = "windows")]
+    mod imp {
+        use gpui::Window;
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::Foundation::{HWND, POINT};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetCursorPos, HTCAPTION, IsZoomed, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
+            SC_RESTORE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
+        };
+
+        fn hwnd(window: &Window) -> Option<HWND> {
+            match window.window_handle().ok()?.as_raw() {
+                RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
+                _ => None,
+            }
+        }
+
+        /// Posted, not sent: the command runs after the event that asked for it.
+        fn system_command(window: &Window, command: u32) {
+            if let Some(hwnd) = hwnd(window) {
+                unsafe {
+                    PostMessageW(hwnd, WM_SYSCOMMAND, command as usize, 0);
+                }
+            }
+        }
+
+        /// Turns the press into a press on the caption: the system runs its move loop
+        /// from where the pointer is, with snapping and screen changes.
+        pub fn begin_move(window: &mut Window) {
+            let Some(hwnd) = hwnd(window) else {
+                return;
+            };
+            let mut point = POINT { x: 0, y: 0 };
+            unsafe {
+                GetCursorPos(&mut point);
+                ReleaseCapture();
+                let packed = ((point.y as u16 as u32) << 16) | (point.x as u16 as u32);
+                PostMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, packed as isize);
+            }
+        }
+
+        pub fn minimize(window: &mut Window) {
+            system_command(window, SC_MINIMIZE);
+        }
+
+        pub fn toggle_maximize(window: &mut Window) {
+            let zoomed = hwnd(window).is_some_and(|hwnd| unsafe { IsZoomed(hwnd) } != 0);
+            system_command(window, if zoomed { SC_RESTORE } else { SC_MAXIMIZE });
+        }
+
+        /// The request the system's close button makes, so an open transfer or tunnel
+        /// still asks before the window goes.
+        pub fn close(window: &mut Window) {
+            system_command(window, SC_CLOSE);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub use imp::{begin_move, close, minimize, toggle_maximize};
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn begin_move(_window: &mut Window) {}
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn minimize(window: &mut Window) {
+        window.minimize_window();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn toggle_maximize(window: &mut Window) {
+        window.zoom_window();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn close(_window: &mut Window) {}
 }

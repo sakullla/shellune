@@ -12,7 +12,7 @@ use shellune_core::{
 use shellune_ssh::{ForwardCommand, ForwardEvent, ForwardFailure, ForwardLink, ForwardSpec};
 
 /// Which rules the forward page is listing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardScope {
     /// Every saved rule.
     All,
@@ -196,6 +196,11 @@ impl ForwardCenter {
     }
 
     /// The page filter.
+    /// Which rules are listed.
+    pub fn scope(&self) -> ForwardScope {
+        self.scope
+    }
+
     pub fn set_scope(&mut self, scope: ForwardScope) {
         self.scope = scope;
     }

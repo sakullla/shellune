@@ -6,9 +6,6 @@
 /// Product name shown to users.
 pub const NAME: &str = "Shellune";
 
-/// How the product name is pronounced.
-pub const PRONUNCIATION: &str = "Shell-loon";
-
 /// English product tagline.
 pub const TAGLINE_EN: &str = "A modern terminal for local shells, SSH, and SFTP.";
 

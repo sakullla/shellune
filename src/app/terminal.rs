@@ -1095,7 +1095,7 @@ impl TerminalPane {
         cx.notify();
     }
 
-    fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+    pub(crate) fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
         let size = sanitize_font_size(size);
         if (size - self.font_size).abs() < f32::EPSILON {
             return;

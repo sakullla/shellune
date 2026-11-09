@@ -22,7 +22,7 @@ use crate::app::layout::SessionLayout;
 
 use crate::app::copy::{Locale, Strings};
 use crate::app::nav::Destination;
-use crate::app::theme::{Metrics, Motion, Tone, Zoom};
+use crate::app::theme::{Metrics, Motion, Zoom};
 
 /// What the user can do about a failure.
 ///
@@ -112,30 +112,6 @@ pub enum SectionState {
 }
 
 impl SectionState {
-    /// Tone that carries the meaning of the state.
-    pub fn tone(self) -> Tone {
-        match self {
-            Self::Loading => Tone::Warning,
-            Self::Empty => Tone::Neutral,
-            Self::Failed => Tone::Danger,
-            Self::Populated => Tone::Accent,
-        }
-    }
-
-    /// Chip label for the state.
-    ///
-    /// Every state has one, including a populated section: the chip reports the
-    /// status and the count beside it reports the amount. Reusing a unit word as
-    /// the chip would say "session" where the reader expects a state.
-    pub fn chip_label(self, strings: &Strings) -> &'static str {
-        match self {
-            Self::Loading => strings.state_loading,
-            Self::Empty => strings.state_empty,
-            Self::Failed => strings.state_failed,
-            Self::Populated => strings.state_ready,
-        }
-    }
-
     /// Whether the state may be drawn as a success.
     ///
     /// This is the single place that decides it, so a view cannot mark a loading or
@@ -566,6 +542,7 @@ impl Workspace {
             },
             Destination::Transfers => self.transfers.state(),
             Destination::Forwards => self.forwards.state(),
+            Destination::Settings => SectionState::Populated,
         }
     }
 
@@ -577,6 +554,7 @@ impl Workspace {
             Destination::Sessions => self.sessions.count(),
             Destination::Transfers => self.transfers.count(),
             Destination::Forwards => self.forwards.count(),
+            Destination::Settings => 0,
         }
     }
 
@@ -587,6 +565,7 @@ impl Workspace {
             Destination::Hosts => self.hosts.status(),
             Destination::Transfers => self.transfers.status(),
             Destination::Forwards => self.forwards.status(),
+            Destination::Settings => return None,
         };
         match status {
             SectionStatus::Failed(failure) => Some(failure),

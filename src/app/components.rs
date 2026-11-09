@@ -10,9 +10,7 @@
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{
-    Animation, AnimationExt, AnyElement, AnyView, App, Div, Pixels, SharedString, Window, div, px,
-};
+use gpui::{Animation, AnimationExt, AnyElement, AnyView, App, Div, SharedString, Window, div, px};
 
 use crate::app::icons::{self, Icon};
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
@@ -266,27 +264,6 @@ fn variant_text(variant: Variant) -> gpui::Rgba {
     }
 }
 
-/// One column of a dual file view.
-///
-/// `width` is already resolved: the preferred scaled width when the window can hold
-/// it, or the content area when a single column would otherwise run past the window.
-/// Neither column borrows the other's identity. The caller supplies the heading and
-/// the listing.
-pub fn file_column(width: Pixels, metrics: Metrics) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .flex_none()
-        .w(width)
-        .min_w(px(0.0))
-        .min_h(px(0.0))
-        .gap(metrics.scale(spacing::TIGHT + 2.0))
-        .p(metrics.scale(spacing::BASE - 2.0))
-        .bg(theme::swatch(palette::SURFACE))
-        .border_l_1()
-        .border_color(theme::swatch(palette::BORDER))
-}
-
 /// A compact button for toolbars, sized to sit inside a 36px bar.
 pub fn compact_button(label: impl Into<SharedString>, variant: Variant, metrics: Metrics) -> Div {
     button(label, variant, metrics)
@@ -399,47 +376,6 @@ pub fn segmented(metrics: Metrics) -> Div {
         .bg(theme::swatch(palette::CANVAS))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
-}
-
-/// A raised card that groups one form, panel or question.
-pub fn card(metrics: Metrics) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .gap(metrics.scale(spacing::SNUG + 2.0))
-        .p(metrics.scale(spacing::LOOSE - 4.0))
-        .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::SURFACE))
-        .border_1()
-        .border_color(theme::swatch(palette::BORDER))
-        .shadow_sm()
-}
-
-/// A card's title, with an optional line under it.
-pub fn card_title(
-    title: impl Into<SharedString>,
-    subtitle: Option<SharedString>,
-    metrics: Metrics,
-) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(metrics.scale(2.0))
-        .min_w(px(0.0))
-        .child(
-            div()
-                .text_size(metrics.title_size())
-                .font_weight(metrics.title_weight())
-                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .child(title.into()),
-        )
-        .children(subtitle.map(|subtitle| {
-            div()
-                .text_size(metrics.label_size())
-                .text_color(theme::swatch(palette::TEXT_MUTED))
-                .child(subtitle)
-        }))
 }
 
 /// A short uppercase-style label above a group of controls.

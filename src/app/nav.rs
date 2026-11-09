@@ -1,8 +1,9 @@
 //! Destination model for the navigation rail (R12).
 //!
-//! Navigation is a fixed list of five destinations — local shells, hosts,
-//! sessions, transfers and forwards — because those are the objects the product organises
-//! work around. The list is a model, not a layout: a future layout can render it
+//! Three pages are navigated: the hosts home (local shells and saved servers are
+//! one list, they only connect differently), the open terminals, and the settings.
+//! Transfers and forwards remain destinations of the model but open as tools of a
+//! host or a session. The list is a model, not a layout: a future layout can render it
 //! as a rail, a tab strip or a palette without touching the destinations.
 //!
 //! Shortcut labels are platform-specific on purpose: a macOS build shows and
@@ -87,24 +88,6 @@ impl Platform {
         }
     }
 
-    /// Keystroke that collapses or expands the sidebar.
-    ///
-    /// Shifted outside macOS: Ctrl+B is the tmux prefix, typed all day in a terminal.
-    pub fn sidebar_keystroke(self) -> &'static str {
-        match self {
-            Self::MacOs => "cmd-b",
-            Self::Windows | Self::Linux => "ctrl-shift-b",
-        }
-    }
-
-    /// Label of [`Platform::sidebar_keystroke`].
-    pub fn sidebar_label(self) -> &'static str {
-        match self {
-            Self::MacOs => "\u{2318}B",
-            Self::Windows | Self::Linux => "Ctrl+Shift+B",
-        }
-    }
-
     /// Keystroke that closes the session on screen.
     ///
     /// Ctrl+W alone deletes a word in the shell, so the shifted form is used outside
@@ -150,22 +133,6 @@ impl Platform {
             Self::Windows | Self::Linux => format!("Alt+{number}"),
         }
     }
-
-    /// The whole navigation range, for example "Ctrl+1-4" or "⌘1-4".
-    ///
-    /// Derived from the same modifier and digits as `Destination::shortcut_label`
-    /// so the hint written in the rail cannot name a key this platform does not
-    /// bind.
-    pub fn shortcut_range(self) -> String {
-        let first = Destination::ALL[0].shortcut_digit();
-        let last = Destination::ALL[Destination::ALL.len() - 1].shortcut_digit();
-        match self {
-            Self::MacOs => format!("{}{}-{}", self.shortcut_modifier(), first, last),
-            Self::Windows | Self::Linux => {
-                format!("{}+{}-{}", self.shortcut_modifier(), first, last)
-            }
-        }
-    }
 }
 
 /// One top-level place in the application.
@@ -181,17 +148,26 @@ pub enum Destination {
     Transfers,
     /// Local, remote and dynamic forwarding rules.
     Forwards,
+    /// Appearance, language, terminal and data settings.
+    Settings,
 }
 
 impl Destination {
-    /// Every destination, in rail order.
-    pub const ALL: [Self; 5] = [
+    /// Every destination. Each has its own focus handle.
+    pub const ALL: [Self; 6] = [
         Self::LocalShells,
         Self::Hosts,
         Self::Sessions,
         Self::Transfers,
         Self::Forwards,
+        Self::Settings,
     ];
+
+    /// The pages a user moves between: the hosts home (local shells and saved
+    /// servers in one list), the open terminals, and the settings. Transfers and
+    /// forwards are tools of a host or a session, opened from there; the old session
+    /// list repeated the terminal tabs and is gone.
+    pub const PAGES: [Self; 3] = [Self::Hosts, Self::LocalShells, Self::Settings];
 
     /// Position in [`Destination::ALL`].
     pub fn index(self) -> usize {
@@ -199,6 +175,12 @@ impl Destination {
             .iter()
             .position(|destination| *destination == self)
             .unwrap_or(0)
+    }
+
+    /// Whether this destination is one of [`Destination::PAGES`].
+    #[cfg(test)]
+    pub fn is_page(self) -> bool {
+        Self::PAGES.contains(&self)
     }
 
     /// Destination name in the current language.
@@ -209,6 +191,7 @@ impl Destination {
             Self::Sessions => strings.nav_sessions,
             Self::Transfers => strings.nav_transfers,
             Self::Forwards => strings.nav_forwards,
+            Self::Settings => crate::app::copy::ux().settings_title,
         }
     }
 
@@ -220,23 +203,12 @@ impl Destination {
             Self::Sessions => strings.nav_sessions_summary,
             Self::Transfers => strings.nav_transfers_summary,
             Self::Forwards => strings.nav_forwards_summary,
-        }
-    }
-
-    /// Unit word used after a count of the objects this destination holds.
-    ///
-    /// One unit per destination, so a count of hosts is never printed with the
-    /// word "session".
-    pub fn count_unit(self, strings: &Strings) -> &'static str {
-        match self {
-            Self::LocalShells | Self::Sessions => strings.count_sessions,
-            Self::Hosts => strings.count_hosts,
-            Self::Transfers => strings.count_transfers,
-            Self::Forwards => strings.count_forwards,
+            Self::Settings => crate::app::copy::ux().settings_summary,
         }
     }
 
     /// Debug selector of the navigation entry, used by the layout tests.
+    #[cfg(test)]
     pub fn debug_selector(self) -> &'static str {
         match self {
             Self::LocalShells => "nav.local",
@@ -244,12 +216,17 @@ impl Destination {
             Self::Sessions => "nav.sessions",
             Self::Transfers => "nav.transfers",
             Self::Forwards => "nav.forwards",
+            Self::Settings => "nav.settings",
         }
     }
 
-    /// Digit shown in the shortcut, one-based.
+    /// Digit shown in the shortcut, one-based: the place among
+    /// [`Destination::PAGES`]. A tool destination has none and reports 0.
     pub fn shortcut_digit(self) -> usize {
-        self.index() + 1
+        Self::PAGES
+            .iter()
+            .position(|page| *page == self)
+            .map_or(0, |index| index + 1)
     }
 
     /// Shortcut label for the given platform, for example "Ctrl+1" or "⌘1".
@@ -271,13 +248,20 @@ impl Destination {
         )
     }
 
-    /// The next destination, wrapping around, for the "next section" shortcut.
-    pub fn next(self) -> Self {
-        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    fn page_index(self) -> usize {
+        Self::PAGES
+            .iter()
+            .position(|page| *page == self)
+            .unwrap_or(0)
     }
 
-    /// The previous destination, wrapping around.
+    /// The next page, wrapping around, for the "next section" shortcut.
+    pub fn next(self) -> Self {
+        Self::PAGES[(self.page_index() + 1) % Self::PAGES.len()]
+    }
+
+    /// The previous page, wrapping around.
     pub fn previous(self) -> Self {
-        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+        Self::PAGES[(self.page_index() + Self::PAGES.len() - 1) % Self::PAGES.len()]
     }
 }

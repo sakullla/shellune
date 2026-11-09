@@ -109,21 +109,10 @@ pub struct Strings {
     pub empty_transfers_title: &'static str,
     /// Empty-state body on the transfers destination.
     pub empty_transfers_body: &'static str,
-    /// Chip label for an empty, loaded section.
-    pub state_empty: &'static str,
-    /// Chip label for a section holding real, non-empty data.
-    ///
-    /// It states the status, unlike the count next to it, which states the amount:
-    /// a unit word such as "session" must never stand in for a status.
-    pub state_ready: &'static str,
-    /// Chip label for a section that is loading.
-    pub state_loading: &'static str,
     /// Title shown while a section is loading.
     pub loading_title: &'static str,
     /// Body shown while a section is loading.
     pub loading_body: &'static str,
-    /// Chip label for a failed section.
-    pub state_failed: &'static str,
     /// Title of a failed section.
     pub failed_title: &'static str,
     /// Label introducing the suggested recovery step.
@@ -138,26 +127,12 @@ pub struct Strings {
     pub recovery_choose_shell: &'static str,
     /// Label introducing the next step of an empty section.
     pub next_step: &'static str,
-    /// Primary action on the local shells destination.
-    pub primary_local: &'static str,
     /// Primary action on the hosts destination.
     pub primary_hosts: &'static str,
-    /// Primary action on the sessions destination.
-    pub primary_sessions: &'static str,
-    /// Primary action on the transfers destination.
-    pub primary_transfers: &'static str,
     /// Feedback after an unavailable action was requested.
     pub unavailable_notice: &'static str,
-    /// Label of the zoom control.
-    pub zoom_control: &'static str,
-    /// Label of the language toggle.
-    pub language_control: &'static str,
     /// Suffix for a count of hosts.
     pub count_hosts: &'static str,
-    /// Suffix for a count of sessions.
-    pub count_sessions: &'static str,
-    /// Suffix for a count of transfers.
-    pub count_transfers: &'static str,
     /// Fallback name for a local session without a chosen shell.
     pub local_shell_fallback: &'static str,
     /// Button that reveals the free-text shell path field.
@@ -182,20 +157,10 @@ pub struct Strings {
     pub terminal_larger: &'static str,
     /// Heading above the shell tiles and the shell menu.
     pub shell_launch_title: &'static str,
-    /// Tooltip of the control that opens the shell menu.
-    pub shell_menu_hint: &'static str,
     /// The mark on the launcher tile the main button opens.
     pub shell_default: &'static str,
     /// The second line of the custom-path launcher tile.
     pub shell_custom_hint: &'static str,
-    /// The welcome page's link to the hosts destination.
-    pub welcome_hosts: &'static str,
-    /// The short label beside the section-switching shortcut.
-    pub nav_hint_short: &'static str,
-    /// The sidebar's activity line when nothing is open.
-    pub idle: &'static str,
-    /// Primary action on the transfers page when no connection can browse files yet.
-    pub primary_transfers_connect: &'static str,
     /// Placeholder in the host search field.
     pub hosts_search_placeholder: &'static str,
     /// Host list view: every saved host.
@@ -375,12 +340,6 @@ pub struct Strings {
 
     /// Button that opens the file view of a remote session.
     pub files_open: &'static str,
-    /// Button that closes the file view.
-    pub files_close: &'static str,
-    /// Label introducing the host a path belongs to.
-    pub files_host_label: &'static str,
-    /// Label introducing the current path.
-    pub files_path_label: &'static str,
     /// Button that lists the parent directory.
     pub files_up: &'static str,
     /// Button that lists the current directory again.
@@ -457,12 +416,6 @@ pub struct Strings {
     pub files_problem_missing: &'static str,
     /// Reason: the new name is the old one.
     pub files_problem_unchanged: &'static str,
-    /// Kind label of the local file column.
-    pub files_source_local: &'static str,
-    /// Kind label of the remote file column.
-    pub files_source_remote: &'static str,
-    /// Narrow-window button that shows the local column.
-    pub files_show_local: &'static str,
     /// Narrow-window button that shows the remote column.
     pub files_show_remote: &'static str,
     /// Button that uploads one local file into the remote directory on screen.
@@ -561,10 +514,6 @@ pub struct Strings {
     pub transfers_close_app_confirm: &'static str,
     /// Label before the host a transfer belongs to.
     pub transfers_host: &'static str,
-    /// Button and hint that open the command palette.
-    pub palette_open: &'static str,
-    /// Short name of the palette in the shortcut hints.
-    pub palette_hint_short: &'static str,
     /// Placeholder of the palette's search field.
     pub palette_placeholder: &'static str,
     /// Shown when nothing in the palette matches.
@@ -657,12 +606,6 @@ pub struct Strings {
     pub host_dialog_close: &'static str,
     /// Connection form: a remembered secret could not be read; the reason follows.
     pub remote_saved_secret_failed: &'static str,
-    /// Sidebar button and palette action: collapse the sidebar.
-    pub sidebar_collapse: &'static str,
-    /// Sidebar button and palette action: expand the sidebar.
-    pub sidebar_expand: &'static str,
-    /// Sidebar control: the palette the window is drawn in.
-    pub theme_control: &'static str,
     /// Theme value: follow the operating system.
     pub theme_system: &'static str,
     /// Theme value: light.
@@ -671,8 +614,6 @@ pub struct Strings {
     pub theme_dark: &'static str,
     /// Palette action: step the theme.
     pub palette_theme: &'static str,
-    /// Sidebar control: short interface motion.
-    pub motion_control: &'static str,
     /// Motion value: animations play.
     pub motion_full: &'static str,
     /// Motion value: animations are skipped.
@@ -797,10 +738,6 @@ pub struct Strings {
     pub tab_menu_move_left: &'static str,
     /// Tab menu: move this tab toward the end.
     pub tab_menu_move_right: &'static str,
-    /// Shown when the last pane has been closed.
-    pub workspace_empty_title: &'static str,
-    /// The next step after the last pane is closed.
-    pub workspace_empty_body: &'static str,
     /// A host id in a pane is not in the saved book.
     pub pane_missing_host: &'static str,
     /// What to do about a pane whose host is missing.
@@ -863,20 +800,10 @@ pub struct Strings {
     pub nav_forwards: &'static str,
     /// One-line description of the forwarding page.
     pub nav_forwards_summary: &'static str,
-    /// Unit after a count of forwarding rules.
-    pub count_forwards: &'static str,
-    /// Primary action on the forwarding page.
-    pub primary_forwards: &'static str,
     /// Empty forwarding page title.
     pub empty_forwards_title: &'static str,
     /// Empty forwarding page body. Restore does not listen.
     pub empty_forwards_body: &'static str,
-    /// Kind label: local forward.
-    pub forward_local: &'static str,
-    /// Kind label: remote forward.
-    pub forward_remote: &'static str,
-    /// Kind label: dynamic SOCKS.
-    pub forward_dynamic: &'static str,
     /// Runtime: saved, not started.
     pub forward_saved: &'static str,
     /// Runtime: start sent, not confirmed.
@@ -895,18 +822,8 @@ pub struct Strings {
     pub forward_save: &'static str,
     /// Deletes a saved rule.
     pub forward_delete: &'static str,
-    /// Copies a rule into a new saved rule that is not listening.
-    pub forward_copy: &'static str,
     /// Edits a saved rule.
     pub forward_edit: &'static str,
-    /// Opens the new-rule form.
-    pub forward_new: &'static str,
-    /// Listen endpoint label.
-    pub forward_listen: &'static str,
-    /// Target endpoint label.
-    pub forward_target: &'static str,
-    /// Host that carries the rule.
-    pub forward_host: &'static str,
     /// Title of the non-loopback confirmation.
     pub forward_exposure_title: &'static str,
     /// Explains a listen on every interface.
@@ -931,8 +848,8 @@ pub struct Strings {
 
 /// English copy.
 pub static ENGLISH: Strings = Strings {
-    nav_local: "Local shells",
-    nav_local_summary: "A shell on this machine",
+    nav_local: "Terminals",
+    nav_local_summary: "Open terminals, local and remote",
     nav_hosts: "Hosts",
     nav_hosts_summary: "Saved servers and SSH settings",
     nav_sessions: "Sessions",
@@ -947,12 +864,8 @@ pub static ENGLISH: Strings = Strings {
     empty_sessions_body: "Local and remote terminals appear here with their own name, type and state.",
     empty_transfers_title: "No transfer yet",
     empty_transfers_body: "Uploads and downloads list their source, target and progress here.",
-    state_empty: "Empty",
-    state_ready: "Ready",
-    state_loading: "Loading",
     loading_title: "Waiting for real data",
     loading_body: "Nothing is shown here until the system reports what actually exists.",
-    state_failed: "Failed",
     failed_title: "This could not be completed",
     recovery_label: "Suggested next step",
     recovery_retry: "Try again",
@@ -960,16 +873,9 @@ pub static ENGLISH: Strings = Strings {
     recovery_import_config: "Import an SSH configuration",
     recovery_choose_shell: "Choose a shell",
     next_step: "Next step",
-    primary_local: "New local shell",
     primary_hosts: "New host",
-    primary_sessions: "New local shell",
-    primary_transfers: "Browse files",
     unavailable_notice: "This action is not available in this build, so nothing was started.",
-    zoom_control: "Text size",
-    language_control: "Language",
     count_hosts: "host",
-    count_sessions: "session",
-    count_transfers: "transfer",
     local_shell_fallback: "System shell",
     shell_custom_button: "Custom path",
     shell_custom_placeholder: "Program name or full path, then Enter",
@@ -982,13 +888,8 @@ pub static ENGLISH: Strings = Strings {
     terminal_smaller: "Smaller text",
     terminal_larger: "Larger text",
     shell_launch_title: "Start a shell",
-    shell_menu_hint: "Choose which shell to open",
     shell_default: "Default",
     shell_custom_hint: "Any program, by path",
-    welcome_hosts: "Connect to a server",
-    nav_hint_short: "Switch sections",
-    idle: "Idle",
-    primary_transfers_connect: "Connect to a host",
     hosts_search_placeholder: "Search name, address, user or group",
     hosts_view_all: "All hosts",
     hosts_view_groups: "Groups",
@@ -1078,9 +979,6 @@ pub static ENGLISH: Strings = Strings {
     session_reconnect_missing_host: "The saved host this session used is no longer there, so it cannot be connected to again.",
     session_no_terminal: "This session has no terminal open",
     files_open: "Files",
-    files_close: "Close files",
-    files_host_label: "Host",
-    files_path_label: "Path",
     files_up: "Up",
     files_refresh: "Refresh",
     files_parent_row: "Parent directory",
@@ -1118,9 +1016,6 @@ pub static ENGLISH: Strings = Strings {
     files_problem_taken: "An entry with that name already exists here.",
     files_problem_missing: "That entry is no longer in this directory.",
     files_problem_unchanged: "The name did not change.",
-    files_source_local: "Local",
-    files_source_remote: "Remote",
-    files_show_local: "Show local",
     files_show_remote: "Show remote",
     files_to_remote: "Upload to remote",
     files_to_local: "Download to local",
@@ -1170,8 +1065,6 @@ pub static ENGLISH: Strings = Strings {
     transfers_close_app_cancel: "Keep working",
     transfers_close_app_confirm: "Close and stop them",
     transfers_host: "Host",
-    palette_open: "Search…",
-    palette_hint_short: "Command palette",
     palette_placeholder: "Search sessions, shells, hosts and actions",
     palette_empty: "Nothing matches",
     palette_group_sessions: "Open sessions",
@@ -1218,14 +1111,10 @@ pub static ENGLISH: Strings = Strings {
     host_save_connect: "Save and connect",
     host_dialog_close: "Close",
     remote_saved_secret_failed: "The saved password could not be read",
-    sidebar_collapse: "Collapse sidebar",
-    sidebar_expand: "Expand sidebar",
-    theme_control: "Theme",
     theme_system: "System",
     theme_light: "Light",
     theme_dark: "Dark",
     palette_theme: "Change theme",
-    motion_control: "Motion",
     motion_full: "Full",
     motion_reduced: "Reduced",
     palette_motion: "Reduce motion",
@@ -1288,8 +1177,6 @@ pub static ENGLISH: Strings = Strings {
     pane_resize_more: "Grow pane",
     tab_menu_move_left: "Move tab left",
     tab_menu_move_right: "Move tab right",
-    workspace_empty_title: "No pane is open",
-    workspace_empty_body: "Next step: open a local shell, or connect to a host. Other sessions were not closed with this one.",
     pane_missing_host: "This host is not saved",
     pane_missing_next: "Fix the host or remove the pane. Nothing was connected.",
     workspace_dangling_tab: "The saved active tab is not in this workspace. Choose a tab. The others were kept.",
@@ -1321,13 +1208,8 @@ pub static ENGLISH: Strings = Strings {
     terminal_filter_zero: "Exit 0 only",
     nav_forwards: "Forwards",
     nav_forwards_summary: "Local, remote and dynamic tunnels",
-    count_forwards: "forward",
-    primary_forwards: "New forward",
     empty_forwards_title: "No forwarding rules",
     empty_forwards_body: "Saved rules stay here until you start one. Opening this page does not listen.",
-    forward_local: "Local",
-    forward_remote: "Remote",
-    forward_dynamic: "Dynamic",
     forward_saved: "Saved",
     forward_starting: "Starting",
     forward_listening: "Listening",
@@ -1337,12 +1219,7 @@ pub static ENGLISH: Strings = Strings {
     forward_stop: "Stop",
     forward_save: "Save rule",
     forward_delete: "Delete",
-    forward_copy: "Copy",
     forward_edit: "Edit",
-    forward_new: "New rule",
-    forward_listen: "Listen",
-    forward_target: "Target",
-    forward_host: "Connection host",
     forward_exposure_title: "This listen address is not loopback",
     forward_exposure_all: "Binding every interface lets other machines that can reach this computer connect. The rule is not started until you confirm.",
     forward_exposure_named: "This address is not loopback. Machines that can reach it can connect. The rule is not started until you confirm.",
@@ -1357,8 +1234,8 @@ pub static ENGLISH: Strings = Strings {
 
 /// Chinese copy.
 pub static CHINESE: Strings = Strings {
-    nav_local: "本地终端",
-    nav_local_summary: "在本机上运行的 Shell",
+    nav_local: "终端",
+    nav_local_summary: "已打开的本地与远程终端",
     nav_hosts: "主机",
     nav_hosts_summary: "已保存的服务器与 SSH 设置",
     nav_sessions: "会话",
@@ -1373,12 +1250,8 @@ pub static CHINESE: Strings = Strings {
     empty_sessions_body: "本地与远程终端会各自显示名称、类型和当前状态。",
     empty_transfers_title: "还没有传输任务",
     empty_transfers_body: "上传与下载会在这里显示源、目标和进度。",
-    state_empty: "空",
-    state_ready: "已就绪",
-    state_loading: "加载中",
     loading_title: "正在等待真实数据",
     loading_body: "在系统返回实际结果之前，这里不会显示任何内容。",
-    state_failed: "失败",
     failed_title: "这一步没能完成",
     recovery_label: "建议的下一步",
     recovery_retry: "重试",
@@ -1386,16 +1259,9 @@ pub static CHINESE: Strings = Strings {
     recovery_import_config: "导入 SSH 配置",
     recovery_choose_shell: "选择 Shell",
     next_step: "下一步",
-    primary_local: "新建本地终端",
     primary_hosts: "新建主机",
-    primary_sessions: "新建本地终端",
-    primary_transfers: "浏览远程文件",
     unavailable_notice: "当前版本没有实现这个操作，因此没有启动任何任务。",
-    zoom_control: "文字大小",
-    language_control: "语言",
     count_hosts: "台主机",
-    count_sessions: "个会话",
-    count_transfers: "个传输",
     local_shell_fallback: "系统 Shell",
     shell_custom_button: "自定义路径",
     shell_custom_placeholder: "输入程序名或完整路径后按回车",
@@ -1408,13 +1274,8 @@ pub static CHINESE: Strings = Strings {
     terminal_smaller: "缩小字号",
     terminal_larger: "放大字号",
     shell_launch_title: "启动一个 Shell",
-    shell_menu_hint: "选择要打开的 Shell",
     shell_default: "默认",
     shell_custom_hint: "本机上的任意程序",
-    welcome_hosts: "连接到服务器",
-    nav_hint_short: "切换分区",
-    idle: "空闲",
-    primary_transfers_connect: "连接主机",
     hosts_search_placeholder: "搜索名称、地址、用户名或分组",
     hosts_view_all: "全部主机",
     hosts_view_groups: "按分组",
@@ -1504,9 +1365,6 @@ pub static CHINESE: Strings = Strings {
     session_reconnect_missing_host: "该会话使用的主机记录已被删除，无法再次连接。",
     session_no_terminal: "该会话当前没有终端",
     files_open: "文件",
-    files_close: "关闭文件视图",
-    files_host_label: "主机",
-    files_path_label: "当前路径",
     files_up: "上级",
     files_refresh: "刷新",
     files_parent_row: "上级目录",
@@ -1544,9 +1402,6 @@ pub static CHINESE: Strings = Strings {
     files_problem_taken: "这里已经有同名条目。",
     files_problem_missing: "这个条目已不在当前目录中。",
     files_problem_unchanged: "名称没有变化。",
-    files_source_local: "本地",
-    files_source_remote: "远程",
-    files_show_local: "显示本地",
     files_show_remote: "显示远程",
     files_to_remote: "上传到远程",
     files_to_local: "下载到本地",
@@ -1596,8 +1451,6 @@ pub static CHINESE: Strings = Strings {
     transfers_close_app_cancel: "继续工作",
     transfers_close_app_confirm: "关闭并停止",
     transfers_host: "主机",
-    palette_open: "搜索…",
-    palette_hint_short: "命令面板",
     palette_placeholder: "搜索会话、Shell、主机与操作",
     palette_empty: "没有匹配的结果",
     palette_group_sessions: "已打开的会话",
@@ -1644,14 +1497,10 @@ pub static CHINESE: Strings = Strings {
     host_save_connect: "保存并连接",
     host_dialog_close: "关闭",
     remote_saved_secret_failed: "无法读取已保存的密码",
-    sidebar_collapse: "收起侧边栏",
-    sidebar_expand: "展开侧边栏",
-    theme_control: "主题",
     theme_system: "跟随系统",
     theme_light: "浅色",
     theme_dark: "深色",
     palette_theme: "切换主题",
-    motion_control: "动态效果",
     motion_full: "完整",
     motion_reduced: "减少",
     palette_motion: "减少动态效果",
@@ -1714,8 +1563,6 @@ pub static CHINESE: Strings = Strings {
     pane_resize_more: "放大尺寸",
     tab_menu_move_left: "标签左移",
     tab_menu_move_right: "标签右移",
-    workspace_empty_title: "没有打开的窗格",
-    workspace_empty_body: "下一步：打开本地终端，或连接一台主机。关闭这个窗格不会关掉其他会话。",
     pane_missing_host: "这台主机没有保存",
     pane_missing_next: "修复主机或移除这个窗格。没有建立连接。",
     workspace_dangling_tab: "保存的活动标签不在这个工作区里。请另选一个标签，其余标签已保留。",
@@ -1747,13 +1594,8 @@ pub static CHINESE: Strings = Strings {
     terminal_filter_zero: "仅退出码 0",
     nav_forwards: "转发",
     nav_forwards_summary: "本地、远程与动态隧道",
-    count_forwards: "条转发",
-    primary_forwards: "新建转发",
     empty_forwards_title: "还没有转发规则",
     empty_forwards_body: "规则保存在这里，直到你启动。打开这一页不会监听。",
-    forward_local: "本地转发",
-    forward_remote: "远程转发",
-    forward_dynamic: "动态代理",
     forward_saved: "已保存",
     forward_starting: "正在启动",
     forward_listening: "监听中",
@@ -1763,12 +1605,7 @@ pub static CHINESE: Strings = Strings {
     forward_stop: "停止",
     forward_save: "保存规则",
     forward_delete: "删除",
-    forward_copy: "复制",
     forward_edit: "编辑",
-    forward_new: "新建规则",
-    forward_listen: "监听",
-    forward_target: "目标",
-    forward_host: "承载主机",
     forward_exposure_title: "监听地址不是回环",
     forward_exposure_all: "绑定全部网卡后，能访问这台电脑的其他机器都可以连入。确认之前不会启动。",
     forward_exposure_named: "这个地址不是回环。能访问它的机器都可以连入。确认之前不会启动。",
@@ -1780,17 +1617,6 @@ pub static CHINESE: Strings = Strings {
     forward_carrier_lost: "连接已关闭，这条转发不再监听。",
     forward_connect_only: "只建立转发连接，不打开终端",
 };
-
-/// A count followed by its unit, in the grammar of the language.
-///
-/// English takes the plural for anything but one ("2 sessions"); Chinese units
-/// already read correctly after any number.
-pub fn counted(count: usize, unit: &str, locale: Locale) -> String {
-    match locale {
-        Locale::English if count != 1 => format!("{count} {unit}s"),
-        _ => format!("{count} {unit}"),
-    }
-}
 
 /// Localized label for a session lifecycle state.
 ///
@@ -1895,5 +1721,433 @@ pub fn next_step_text(english: &str, locale: Locale) -> &str {
             }
             other => other,
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Copy of the redesigned shell: hosts home, settings, connection dialogs and the
+// host tools (port forwarding, files, transfers).
+// ---------------------------------------------------------------------------
+
+/// Strings of the redesigned shell, kept apart from [`Strings`] so the two can be
+/// read side by side.
+pub struct UxStrings {
+    /// Settings
+    pub settings_title: &'static str,
+    /// Appearance, language and terminal
+    pub settings_summary: &'static str,
+    /// New tab
+    pub new_tab: &'static str,
+    /// More ways to open a tab
+    pub new_tab_menu: &'static str,
+    /// Search hosts and commands
+    pub search: &'static str,
+    /// Hosts
+    pub home_title: &'static str,
+    /// Open a shell on this computer, or connect to a server
+    pub home_subtitle: &'static str,
+    /// This computer
+    pub home_local_section: &'static str,
+    /// Opens in a new tab
+    pub home_local_hint: &'static str,
+    /// Servers
+    pub home_hosts_section: &'static str,
+    /// Add your first server
+    pub home_welcome_title: &'static str,
+    /// Enter the address, user and sign-in once, then connect with one click. Just trying a server? Quick connect does not save anything.
+    pub home_welcome_body: &'static str,
+    /// Import from SSH config
+    pub home_import: &'static str,
+    /// No terminal is open
+    pub terminals_empty_title: &'static str,
+    /// Open a shell on this computer or connect to a server from Hosts.
+    pub terminals_empty_body: &'static str,
+    /// Appearance
+    pub settings_appearance: &'static str,
+    /// Theme
+    pub settings_theme: &'static str,
+    /// Follow the system, or stay light or dark
+    pub settings_theme_hint: &'static str,
+    /// Language
+    pub settings_language: &'static str,
+    /// Applies at once, including inside terminals
+    pub settings_language_hint: &'static str,
+    /// Interface text size
+    pub settings_text_size: &'static str,
+    /// Scales every label, button and list
+    pub settings_text_size_hint: &'static str,
+    /// Motion
+    pub settings_motion: &'static str,
+    /// Reduced skips short fades; nothing else changes
+    pub settings_motion_hint: &'static str,
+    /// Terminal
+    pub settings_terminal: &'static str,
+    /// Font size
+    pub settings_font_size: &'static str,
+    /// Used by new terminals and the open ones
+    pub settings_font_size_hint: &'static str,
+    /// Default shell
+    pub settings_default_shell: &'static str,
+    /// What the + button opens
+    pub settings_default_shell_hint: &'static str,
+    /// Data
+    pub settings_data: &'static str,
+    /// Saved hosts
+    pub settings_hosts_file: &'static str,
+    /// Adds hosts from ~/.ssh/config after a preview
+    pub settings_import_hint: &'static str,
+    /// About
+    pub settings_about: &'static str,
+    /// Version
+    pub settings_version: &'static str,
+    /// Connect to
+    pub connect_title: &'static str,
+    /// Choose how this server checks it is you. A password is only kept if you tick Remember.
+    pub connect_hint: &'static str,
+    /// Connect without saving. You can save the host afterwards from the session bar.
+    pub quick_hint: &'static str,
+    /// Close
+    pub tool_close: &'static str,
+    /// Keep connecting in the background
+    pub connect_background: &'static str,
+    /// Port forwarding
+    pub tool_forwards_title: &'static str,
+    /// Every saved tunnel
+    pub tool_forwards_all: &'static str,
+    /// Tunnels through
+    pub tool_forwards_host: &'static str,
+    /// Transfers
+    pub tool_transfers_title: &'static str,
+    /// Uploads and downloads of every connection
+    pub tool_transfers_subtitle: &'static str,
+    /// New tunnel
+    pub fwd_new: &'static str,
+    /// Edit tunnel
+    pub fwd_edit: &'static str,
+    /// Type
+    pub fwd_type: &'static str,
+    /// Local
+    pub fwd_kind_local: &'static str,
+    /// Remote
+    pub fwd_kind_remote: &'static str,
+    /// SOCKS proxy
+    pub fwd_kind_dynamic: &'static str,
+    /// Reach a service the server can see (a database, an admin page) from this computer.
+    pub fwd_kind_local_hint: &'static str,
+    /// Let the server reach a service running on this computer.
+    pub fwd_kind_remote_hint: &'static str,
+    /// Send apps through the server: set their SOCKS proxy to the local port.
+    pub fwd_kind_dynamic_hint: &'static str,
+    /// Through host
+    pub fwd_through: &'static str,
+    /// On this computer
+    pub fwd_listen_local: &'static str,
+    /// On the server
+    pub fwd_listen_remote: &'static str,
+    /// Destination, as the server sees it
+    pub fwd_target_remote: &'static str,
+    /// Destination on this computer
+    pub fwd_target_local: &'static str,
+    /// Opening {listen} on this computer reaches {target} through {host}.
+    pub fwd_preview_local: &'static str,
+    /// Opening {listen} on {host} reaches {target} on this computer.
+    pub fwd_preview_remote: &'static str,
+    /// Apps whose SOCKS proxy is {listen} go out through {host}.
+    pub fwd_preview_dynamic: &'static str,
+    /// No port forwarding yet
+    pub fwd_empty_title: &'static str,
+    /// A tunnel carries one port through an SSH host, so a service on one side can be used from the other.
+    pub fwd_empty_body: &'static str,
+    /// Save a host first: every tunnel runs through an SSH host.
+    pub fwd_no_hosts: &'static str,
+    /// Cancel
+    pub fwd_cancel: &'static str,
+    /// Duplicate
+    pub fwd_more: &'static str,
+    /// Name
+    pub files_name: &'static str,
+    /// Size
+    pub files_size: &'static str,
+    /// This computer
+    pub files_this_computer: &'static str,
+    /// Double-click a folder to open it. Drag a file to the other side to copy it.
+    pub files_hint: &'static str,
+    /// Folder
+    pub files_folder: &'static str,
+    /// Ports
+    pub session_forwards: &'static str,
+}
+
+impl UxStrings {
+    /// Every string, for the completeness test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn all(&self) -> Vec<&'static str> {
+        vec![
+            self.settings_title,
+            self.settings_summary,
+            self.new_tab,
+            self.new_tab_menu,
+            self.search,
+            self.home_title,
+            self.home_subtitle,
+            self.home_local_section,
+            self.home_local_hint,
+            self.home_hosts_section,
+            self.home_welcome_title,
+            self.home_welcome_body,
+            self.home_import,
+            self.terminals_empty_title,
+            self.terminals_empty_body,
+            self.settings_appearance,
+            self.settings_theme,
+            self.settings_theme_hint,
+            self.settings_language,
+            self.settings_language_hint,
+            self.settings_text_size,
+            self.settings_text_size_hint,
+            self.settings_motion,
+            self.settings_motion_hint,
+            self.settings_terminal,
+            self.settings_font_size,
+            self.settings_font_size_hint,
+            self.settings_default_shell,
+            self.settings_default_shell_hint,
+            self.settings_data,
+            self.settings_hosts_file,
+            self.settings_import_hint,
+            self.settings_about,
+            self.settings_version,
+            self.connect_title,
+            self.connect_hint,
+            self.quick_hint,
+            self.tool_close,
+            self.connect_background,
+            self.tool_forwards_title,
+            self.tool_forwards_all,
+            self.tool_forwards_host,
+            self.tool_transfers_title,
+            self.tool_transfers_subtitle,
+            self.fwd_new,
+            self.fwd_edit,
+            self.fwd_type,
+            self.fwd_kind_local,
+            self.fwd_kind_remote,
+            self.fwd_kind_dynamic,
+            self.fwd_kind_local_hint,
+            self.fwd_kind_remote_hint,
+            self.fwd_kind_dynamic_hint,
+            self.fwd_through,
+            self.fwd_listen_local,
+            self.fwd_listen_remote,
+            self.fwd_target_remote,
+            self.fwd_target_local,
+            self.fwd_preview_local,
+            self.fwd_preview_remote,
+            self.fwd_preview_dynamic,
+            self.fwd_empty_title,
+            self.fwd_empty_body,
+            self.fwd_no_hosts,
+            self.fwd_cancel,
+            self.fwd_more,
+            self.files_name,
+            self.files_size,
+            self.files_this_computer,
+            self.files_hint,
+            self.files_folder,
+            self.session_forwards,
+        ]
+    }
+}
+
+/// English.
+pub static ENGLISH_UX: UxStrings = UxStrings {
+    settings_title: "Settings",
+    settings_summary: "Appearance, language and terminal",
+    new_tab: "New tab",
+    new_tab_menu: "More ways to open a tab",
+    search: "Search hosts and commands",
+    home_title: "Hosts",
+    home_subtitle: "Open a shell on this computer, or connect to a server",
+    home_local_section: "This computer",
+    home_local_hint: "Opens in a new tab",
+    home_hosts_section: "Servers",
+    home_welcome_title: "Add your first server",
+    home_welcome_body: "Enter the address, user and sign-in once, then connect with one click. Just trying a server? Quick connect does not save anything.",
+    home_import: "Import from SSH config",
+    terminals_empty_title: "No terminal is open",
+    terminals_empty_body: "Open a shell on this computer or connect to a server from Hosts.",
+    settings_appearance: "Appearance",
+    settings_theme: "Theme",
+    settings_theme_hint: "Follow the system, or stay light or dark",
+    settings_language: "Language",
+    settings_language_hint: "Applies at once, including inside terminals",
+    settings_text_size: "Interface text size",
+    settings_text_size_hint: "Scales every label, button and list",
+    settings_motion: "Motion",
+    settings_motion_hint: "Reduced skips short fades; nothing else changes",
+    settings_terminal: "Terminal",
+    settings_font_size: "Font size",
+    settings_font_size_hint: "Used by new terminals and the open ones",
+    settings_default_shell: "Default shell",
+    settings_default_shell_hint: "What the + button opens",
+    settings_data: "Data",
+    settings_hosts_file: "Saved hosts",
+    settings_import_hint: "Adds hosts from ~/.ssh/config after a preview",
+    settings_about: "About",
+    settings_version: "Version",
+    connect_title: "Connect to",
+    connect_hint: "Choose how this server checks it is you. A password is only kept if you tick Remember.",
+    quick_hint: "Connect without saving. You can save the host afterwards from the session bar.",
+    tool_close: "Close",
+    connect_background: "Continue in background",
+    tool_forwards_title: "Port forwarding",
+    tool_forwards_all: "Every saved tunnel",
+    tool_forwards_host: "Tunnels through",
+    tool_transfers_title: "Transfers",
+    tool_transfers_subtitle: "Uploads and downloads of every connection",
+    fwd_new: "New tunnel",
+    fwd_edit: "Edit tunnel",
+    fwd_type: "Type",
+    fwd_kind_local: "Local",
+    fwd_kind_remote: "Remote",
+    fwd_kind_dynamic: "SOCKS proxy",
+    fwd_kind_local_hint: "Reach a service the server can see (a database, an admin page) from this computer.",
+    fwd_kind_remote_hint: "Let the server reach a service running on this computer.",
+    fwd_kind_dynamic_hint: "Send apps through the server: set their SOCKS proxy to the local port.",
+    fwd_through: "Through host",
+    fwd_listen_local: "On this computer",
+    fwd_listen_remote: "On the server",
+    fwd_target_remote: "Destination, as the server sees it",
+    fwd_target_local: "Destination on this computer",
+    fwd_preview_local: "Opening {listen} on this computer reaches {target} through {host}.",
+    fwd_preview_remote: "Opening {listen} on {host} reaches {target} on this computer.",
+    fwd_preview_dynamic: "Apps whose SOCKS proxy is {listen} go out through {host}.",
+    fwd_empty_title: "No port forwarding yet",
+    fwd_empty_body: "A tunnel carries one port through an SSH host, so a service on one side can be used from the other.",
+    fwd_no_hosts: "Save a host first: every tunnel runs through an SSH host.",
+    fwd_cancel: "Cancel",
+    fwd_more: "Duplicate",
+    files_name: "Name",
+    files_size: "Size",
+    files_this_computer: "This computer",
+    files_hint: "Click a folder to open it. Drag a file to the other side, or use its arrow, to copy it.",
+    files_folder: "Folder",
+    session_forwards: "Ports",
+};
+
+/// Simplified Chinese.
+pub static CHINESE_UX: UxStrings = UxStrings {
+    settings_title: "设置",
+    settings_summary: "外观、语言与终端",
+    new_tab: "新建标签",
+    new_tab_menu: "更多打开方式",
+    search: "搜索主机与命令",
+    home_title: "主机",
+    home_subtitle: "在本机打开终端，或连接到服务器",
+    home_local_section: "本机",
+    home_local_hint: "在新标签中打开",
+    home_hosts_section: "服务器",
+    home_welcome_title: "添加你的第一台服务器",
+    home_welcome_body: "填写一次地址、用户名和登录方式，以后一键连接。只是临时连一下？快速连接不会保存任何东西。",
+    home_import: "从 SSH 配置导入",
+    terminals_empty_title: "没有打开的终端",
+    terminals_empty_body: "在“主机”中打开本机终端或连接服务器。",
+    settings_appearance: "外观",
+    settings_theme: "主题",
+    settings_theme_hint: "跟随系统，或固定为浅色 / 深色",
+    settings_language: "语言",
+    settings_language_hint: "立即生效，终端内也一样",
+    settings_text_size: "界面文字大小",
+    settings_text_size_hint: "缩放所有文字、按钮和列表",
+    settings_motion: "动态效果",
+    settings_motion_hint: "“减少”会跳过短暂的淡入效果，其他不变",
+    settings_terminal: "终端",
+    settings_font_size: "字号",
+    settings_font_size_hint: "新终端和已打开的终端都会使用",
+    settings_default_shell: "默认 Shell",
+    settings_default_shell_hint: "点击 + 时打开的 Shell",
+    settings_data: "数据",
+    settings_hosts_file: "主机文件",
+    settings_import_hint: "预览后从 ~/.ssh/config 添加主机",
+    settings_about: "关于",
+    settings_version: "版本",
+    connect_title: "连接到",
+    connect_hint: "选择服务器验证你身份的方式。只有勾选“记住”时才会保存密码。",
+    quick_hint: "不保存直接连接。连接后可以在会话栏中保存为主机。",
+    tool_close: "关闭",
+    connect_background: "转到后台",
+    tool_forwards_title: "端口转发",
+    tool_forwards_all: "所有已保存的端口转发",
+    tool_forwards_host: "经由此主机的端口转发：",
+    tool_transfers_title: "传输",
+    tool_transfers_subtitle: "所有连接的上传与下载",
+    fwd_new: "新建端口转发",
+    fwd_edit: "编辑端口转发",
+    fwd_type: "类型",
+    fwd_kind_local: "本地转发",
+    fwd_kind_remote: "远程转发",
+    fwd_kind_dynamic: "SOCKS 代理",
+    fwd_kind_local_hint: "在本机访问服务器能访问到的服务，例如数据库、管理后台。",
+    fwd_kind_remote_hint: "让服务器访问本机上运行的服务。",
+    fwd_kind_dynamic_hint: "让应用经由服务器上网：把应用的 SOCKS 代理设置为本机这个端口。",
+    fwd_through: "经由主机",
+    fwd_listen_local: "本机监听",
+    fwd_listen_remote: "服务器监听",
+    fwd_target_remote: "目标（从服务器看）",
+    fwd_target_local: "目标（本机上）",
+    fwd_preview_local: "在本机访问 {listen}，即经由 {host} 访问 {target}。",
+    fwd_preview_remote: "在 {host} 上访问 {listen}，即访问本机的 {target}。",
+    fwd_preview_dynamic: "SOCKS 代理设为 {listen} 的应用会经由 {host} 访问网络。",
+    fwd_empty_title: "还没有端口转发",
+    fwd_empty_body: "端口转发经由一台 SSH 主机传递一个端口，让一侧的服务可以在另一侧使用。",
+    fwd_no_hosts: "请先保存一台主机：每条端口转发都要经由 SSH 主机。",
+    fwd_cancel: "取消",
+    fwd_more: "复制一份",
+    files_name: "名称",
+    files_size: "大小",
+    files_this_computer: "本机",
+    files_hint: "单击文件夹打开；把文件拖到另一侧，或点它的箭头，即可复制过去。",
+    files_folder: "文件夹",
+    session_forwards: "端口转发",
+};
+
+/// The redesigned-shell strings of the current language.
+#[must_use]
+pub fn ux() -> &'static UxStrings {
+    match Locale::current() {
+        Locale::English => &ENGLISH_UX,
+        Locale::Chinese => &CHINESE_UX,
+    }
+}
+
+/// Fills `{name}` placeholders.
+#[must_use]
+pub fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
+    let mut text = template.to_owned();
+    for (name, value) in pairs {
+        text = text.replace(&format!("{{{name}}}"), value);
+    }
+    text
+}
+
+#[cfg(test)]
+mod ux_tests {
+    use super::*;
+
+    #[test]
+    fn both_ux_tables_are_complete_and_translated() {
+        let english = ENGLISH_UX.all();
+        let chinese = CHINESE_UX.all();
+        assert_eq!(english.len(), chinese.len());
+        for (en, zh) in english.iter().zip(chinese.iter()) {
+            assert!(!en.trim().is_empty() && !zh.trim().is_empty());
+            assert_ne!(en, zh, "{en} is not translated");
+        }
+    }
+
+    #[test]
+    fn fill_replaces_every_placeholder() {
+        assert_eq!(fill("{a} to {b}", &[("a", "x"), ("b", "y")]), "x to y");
     }
 }

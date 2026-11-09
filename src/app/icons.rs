@@ -92,11 +92,25 @@ pub enum Icon {
     ChevronLeft,
     /// An upward chevron.
     ChevronUp,
+    /// Sliders: settings.
+    Settings,
+    /// A sheet: a file.
+    File,
+    /// An arrow out of a tray: upload.
+    Upload,
+    /// An arrow into a tray: download.
+    Download,
+    /// A folder with a plus: new folder.
+    FolderPlus,
+    /// An arrow pointing up: the parent folder.
+    ArrowUp,
+    /// A square: stop.
+    Stop,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 47] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -137,6 +151,13 @@ impl Icon {
         Self::Pencil,
         Self::ChevronLeft,
         Self::ChevronUp,
+        Self::Settings,
+        Self::File,
+        Self::Upload,
+        Self::Download,
+        Self::FolderPlus,
+        Self::ArrowUp,
+        Self::Stop,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -182,6 +203,13 @@ impl Icon {
             Self::Pencil => "icons/pencil.svg",
             Self::ChevronLeft => "icons/chevron-left.svg",
             Self::ChevronUp => "icons/chevron-up.svg",
+            Self::Settings => "icons/settings.svg",
+            Self::File => "icons/file.svg",
+            Self::Upload => "icons/upload.svg",
+            Self::Download => "icons/download.svg",
+            Self::FolderPlus => "icons/folder-plus.svg",
+            Self::ArrowUp => "icons/arrow-up.svg",
+            Self::Stop => "icons/stop.svg",
         }
     }
 
@@ -278,6 +306,23 @@ impl Icon {
             }
             Self::ChevronLeft => r#"<path d="M15 6l-6 6 6 6"/>"#,
             Self::ChevronUp => r#"<path d="M6 15l6-6 6 6"/>"#,
+            Self::Settings => {
+                r#"<path d="M4 7h9"/><path d="M17 7h3"/><circle cx="15" cy="7" r="2"/><path d="M4 17h3"/><path d="M11 17h9"/><circle cx="9" cy="17" r="2"/>"#
+            }
+            Self::File => {
+                r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>"#
+            }
+            Self::Upload => {
+                r#"<path d="M12 15V4"/><path d="M7.5 8.5L12 4l4.5 4.5"/><path d="M5 20h14"/>"#
+            }
+            Self::Download => {
+                r#"<path d="M12 4v11"/><path d="M7.5 10.5L12 15l4.5-4.5"/><path d="M5 20h14"/>"#
+            }
+            Self::FolderPlus => {
+                r#"<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 10.5v6"/><path d="M9 13.5h6"/>"#
+            }
+            Self::ArrowUp => r#"<path d="M12 19V5"/><path d="M6 11l6-6 6 6"/>"#,
+            Self::Stop => r#"<rect x="6.5" y="6.5" width="11" height="11" rx="2"/>"#,
         }
     }
 

@@ -13,8 +13,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    Context, Div, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Pixels, Render,
-    SharedString, Stateful, Window, div, px,
+    Context, Div, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Render, SharedString,
+    Stateful, Window, div, px,
 };
 use std::collections::HashMap;
 
@@ -34,11 +34,11 @@ use shellune_terminal::GridSize;
 
 use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
-    MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight,
-    NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab,
-    ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2,
-    SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
+    FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToSettings,
+    GoToTransfers, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft,
+    MoveTabRight, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
+    PreviousTab, ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1,
+    SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
     SplitPaneDown, SplitPaneRight, ToggleLanguage, ToggleSidebar, ZoomPane,
 };
 use crate::app::components::Variant;
@@ -56,7 +56,6 @@ use crate::app::hosts::{
 };
 use crate::app::icons::{self, Icon};
 use crate::app::nav::{Destination, Platform};
-use crate::app::product;
 use crate::app::remote::{
     self, AttemptLink, ChainDraft, LinkEvent, MethodChoice, RemoteFailure, RemotePanel,
     RemoteStatus,
@@ -77,7 +76,11 @@ mod host_dialog;
 mod overlays;
 mod panes;
 mod sessions;
+mod shell;
 mod titlebar;
+
+#[cfg(test)]
+pub use shell::Tool;
 pub use titlebar::{TRAFFIC_LIGHT_POSITION, custom_titlebar};
 
 /// Where a terminal comes from.
@@ -231,14 +234,6 @@ pub const REMOTE_TERMINAL_HEIGHT: f32 = 340.0;
 /// width is this length scaled by the text size, then clamped to the content area
 /// when only one column fits.
 pub const FILES_PANEL_WIDTH: f32 = 340.0;
-
-/// Logical width kept for the terminal when both file columns are open.
-///
-/// At 100% the expanded rail is 208 wide, so a 1080-wide window fits two 340 columns
-/// and leaves 192 (1080 − 208 − 680). That reserve scales with the text size. Two
-/// columns open only when both scaled columns and this reserve fit in the area beside
-/// the rail; otherwise one column is shown and it shrinks to that area.
-pub const FILES_TERMINAL_RESERVE: f32 = 192.0;
 
 /// How often the shell looks for answers from a file view.
 ///
@@ -394,6 +389,13 @@ pub struct ShelluneView {
     /// keys?", which only matters to someone using them; a click already shows
     /// where it landed.
     pointer_input: bool,
+    /// The host tool open over the page, if any.
+    tool: Option<shell::Tool>,
+    /// A terminal that should have the keyboard by the next draw.
+    pane_focus_pending: Option<SessionId>,
+    /// Gives the keyboard back to the page when the focused control leaves the
+    /// screen (a dialog that closed, a form that was replaced).
+    focus_lost_watch: Option<gpui::Subscription>,
     /// The highlighted palette entry.
     palette_selected: usize,
     /// Keeps the highlighted palette entry in view.
@@ -561,10 +563,12 @@ impl ShelluneView {
             field.set_revealable(true, cx);
             field
         });
-        let forward_listen_host = cx.new(|cx| TextField::new(strings.forward_listen, cx));
-        let forward_listen_port = cx.new(|cx| TextField::new(strings.forward_listen, cx));
-        let forward_target_host = cx.new(|cx| TextField::new(strings.forward_target, cx));
-        let forward_target_port = cx.new(|cx| TextField::new(strings.forward_target, cx));
+        // Examples, not labels: the form names each field above it, and an address
+        // reads the same in every language.
+        let forward_listen_host = cx.new(|cx| TextField::new("127.0.0.1", cx));
+        let forward_listen_port = cx.new(|cx| TextField::new("8080", cx));
+        let forward_target_host = cx.new(|cx| TextField::new("db.internal", cx));
+        let forward_target_port = cx.new(|cx| TextField::new("5432", cx));
 
         let mut view = Self {
             workspace,
@@ -637,6 +641,9 @@ impl ShelluneView {
             palette: None,
             palette_query: String::new(),
             pointer_input: false,
+            tool: None,
+            pane_focus_pending: None,
+            focus_lost_watch: None,
             palette_selected: 0,
             palette_scroll: gpui::ScrollHandle::new(),
             tab_menu: None,
@@ -664,6 +671,7 @@ impl ShelluneView {
         view.reload_forwards();
         view.restore_workspace_layout();
         view.restore_preferences();
+        view.relabel_fields(cx);
         view
     }
 
@@ -913,15 +921,70 @@ impl ShelluneView {
         self.active.and_then(|id| self.pane_for(id))
     }
 
-    /// Takes the keyboard to the terminal of one session, when a window has one.
-    fn focus_pane(&self, id: SessionId, cx: &mut Context<Self>) {
+    /// Takes the keyboard to the terminal of one session.
+    ///
+    /// Focusing through the active window fails when there is none to borrow - a
+    /// connection that finishes while the window is in the background, or while the
+    /// window is busy with the event that started it - so the next draw also gives
+    /// the terminal the keyboard with its own window.
+    fn focus_pane(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let Some(pane) = self.pane_for(id) else {
             return;
         };
         let handle = pane.read(cx).focus_handle().clone();
+        self.pane_focus_pending = Some(id);
         if let Some(window) = cx.active_window() {
             let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
         }
+        cx.notify();
+    }
+
+    /// Puts the placeholders of the long-lived fields in the current language.
+    fn relabel_fields(&self, cx: &mut Context<Self>) {
+        let strings = self.strings();
+        let labels = [
+            (&self.shell_path, strings.shell_custom_placeholder),
+            (&self.hosts_search, strings.hosts_search_placeholder),
+            (&self.remote_fields.password, strings.auth_password),
+            (&self.remote_fields.key_path, strings.auth_key),
+            (&self.remote_fields.passphrase, strings.auth_key_passphrase),
+            (&self.quick_address, strings.host_field_address),
+            (&self.quick_port, strings.host_field_port),
+            (&self.quick_user, strings.host_field_user),
+            (&self.quick_password, strings.auth_password),
+            (&self.quick_key, strings.auth_key),
+            (&self.quick_passphrase, strings.auth_key_passphrase),
+        ];
+        for (field, label) in labels {
+            field.update(cx, |field, cx| field.set_placeholder(label, cx));
+        }
+    }
+
+    /// Puts the keyboard on what the page shows: the terminal on screen, or the page.
+    /// Without this a control that disappeared would take every shortcut with it.
+    fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let destination = self.workspace.destination();
+        if self.shows_terminal(destination)
+            && let Some(pane) = self.active_pane()
+        {
+            let handle = pane.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        } else {
+            let handle = self.destination_focus(destination).clone();
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// The text of a session's target: the saved host's, or the unsaved one's that
+    /// a quick connection made.
+    fn target_of(&self, session: &Session) -> String {
+        if let SessionKind::Remote { .. } = session.kind()
+            && let Some((_, host)) = self.unsaved.iter().find(|(id, _)| *id == session.id())
+        {
+            return host.target();
+        }
+        session_target(&self.book, session)
     }
 
     /// Adds a terminal for a session that just started and shows it.
@@ -945,6 +1008,13 @@ impl ShelluneView {
             .detach();
         self.panes.push(OpenPane { tag, pane });
         if focus {
+            // A terminal that just opened is what the user asked for: show it, from
+            // the hosts home or the settings alike.
+            if self.workspace.destination() != Destination::LocalShells {
+                self.workspace.select(Destination::LocalShells);
+                self.workspace
+                    .set_context(shellune_core::PanelSection::None);
+            }
             self.active = Some(tag.session);
             self.session_terminal = true;
             self.showing_connection_form = false;
@@ -1001,10 +1071,7 @@ impl ShelluneView {
         self.session_terminal = true;
         // Hosts and transfers are context panels. Coming back from one of them lands
         // on the workspace, which shows whichever session was selected.
-        if !matches!(
-            self.workspace.destination(),
-            Destination::LocalShells | Destination::Sessions
-        ) {
+        if self.workspace.destination() != Destination::LocalShells {
             self.workspace.select(Destination::LocalShells);
             self.workspace
                 .set_context(shellune_core::PanelSection::None);
@@ -1721,6 +1788,7 @@ impl ShelluneView {
     }
 
     /// The current workspace state.
+    #[cfg(test)]
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
     }
@@ -1743,27 +1811,30 @@ impl ShelluneView {
         self.workspace.metrics()
     }
 
-    fn primary_label(&self, destination: Destination, strings: &Strings) -> &'static str {
-        match destination {
-            Destination::LocalShells => strings.primary_local,
-            Destination::Hosts => strings.primary_hosts,
-            Destination::Sessions => strings.primary_sessions,
-            Destination::Transfers => strings.primary_transfers,
-            Destination::Forwards => strings.primary_forwards,
-        }
-    }
-
     /// Selects a destination, moving keyboard focus with it.
     ///
     /// Returning to the workspace gives the keyboard back to the session that was
     /// on screen. A host list that is still loading does not get in the way: the
     /// destination changes either way.
     fn select(&mut self, destination: Destination, window: &mut Window, cx: &mut Context<Self>) {
-        if destination == Destination::Sessions {
-            // The page itself was asked for: it lists the sessions.
-            self.session_terminal = false;
-            self.showing_connection_form = false;
-        }
+        // Transfers and forwards are tools over the page, not pages; the old session
+        // list is the terminal tabs.
+        let destination = match destination {
+            Destination::Transfers => {
+                self.open_tool(shell::Tool::Transfers, cx);
+                return;
+            }
+            Destination::Forwards => {
+                self.forwards
+                    .set_scope(crate::app::forwarding::ForwardScope::All);
+                self.sync_forward_section();
+                self.open_tool(shell::Tool::Forwards, cx);
+                return;
+            }
+            Destination::Sessions => Destination::LocalShells,
+            other => other,
+        };
+        self.shell_menu_open = false;
         if destination == Destination::LocalShells {
             self.showing_connection_form = false;
         }
@@ -1784,39 +1855,6 @@ impl ShelluneView {
         }
         let handle = self.destination_focus(destination).clone();
         window.focus(&handle);
-        cx.notify();
-    }
-
-    fn request_primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.workspace.destination() {
-            // The sessions page lists local shells too, so its main button opens one;
-            // the new terminal is shown right there.
-            Destination::LocalShells | Destination::Sessions => {
-                self.new_local_shell(window, cx);
-            }
-            Destination::Hosts => {
-                // A destination whose records could not be read offers reading them
-                // again; every other state of it offers a new host.
-                if self.workspace.state(Destination::Hosts) == SectionState::Failed {
-                    self.reload_hosts(cx);
-                } else {
-                    self.open_create_host(cx);
-                }
-            }
-            // A transfer starts from the file view of a connection, so the page's
-            // button goes there: to an open file view when a connection can browse,
-            // and to the saved hosts when none can yet. Nothing is started here.
-            Destination::Transfers => match self.browsable_session() {
-                Some(id) => {
-                    self.activate(id, cx);
-                    if !self.files.is_open(id) {
-                        self.toggle_files(id, cx);
-                    }
-                }
-                None => self.select(Destination::Hosts, window, cx),
-            },
-            Destination::Forwards => self.open_forward_editor(cx),
-        }
         cx.notify();
     }
 
@@ -2698,6 +2736,10 @@ impl ShelluneView {
         self.quick_error = None;
         self.sync_remote_fields(cx);
         cx.notify();
+        // The form has done its job: the connection it describes is prepared. Its
+        // fields leave the screen, so the keyboard goes back where it came from.
+        self.quick_open = false;
+        self.restore_focus_pending = true;
         true
     }
 
@@ -3921,12 +3963,6 @@ impl ShelluneView {
             .unwrap_or_default()
     }
 
-    /// Whether the quick-connection form is open.
-    #[cfg(test)]
-    pub(crate) fn quick_form_open(&self) -> bool {
-        self.quick_open
-    }
-
     /// Why the quick-connection form refused to dial, when it did.
     #[cfg(test)]
     pub(crate) fn quick_refusal(&self) -> Option<&str> {
@@ -4294,38 +4330,13 @@ impl ShelluneView {
     fn quick_panel(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let mut card = components::card(metrics)
+        // The dialog around the form carries its title, hint and close button.
+        let mut card = div()
+            .flex()
+            .flex_col()
             .w_full()
-            .max_w(metrics.scale(480.0))
+            .gap(metrics.scale(spacing::SNUG + 2.0))
             .debug_selector(|| "quick.panel".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(metrics.title_size())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(strings.quick_connect_title),
-                    )
-                    .child(
-                        components::icon_only_button(Icon::Close, metrics)
-                            .id("quick.close")
-                            .debug_selector(|| "quick.close".to_owned())
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.quick_open = false;
-                                this.quick_error = None;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(strings.quick_connect_hint),
-            )
             .child(self.remote_field(
                 SharedString::from("quick.address"),
                 strings.host_field_address,
@@ -4492,49 +4503,15 @@ impl ShelluneView {
             return div();
         };
         let status = panel.status();
-        let host = panel.host();
-        let (status_label, tone) = match status {
-            RemoteStatus::Idle => (strings.remote_idle, Tone::Neutral),
-            RemoteStatus::Connecting => (strings.remote_connecting, Tone::Warning),
-            RemoteStatus::VerifyingHost(_) => (strings.remote_verifying, Tone::Warning),
-            RemoteStatus::ConfirmingProxy { .. } => (strings.remote_proxy_title, Tone::Warning),
-            RemoteStatus::Live => (strings.remote_live, Tone::Positive),
-            RemoteStatus::Failed(_) => (strings.remote_failed, Tone::Danger),
-        };
 
-        let mut column = components::card(metrics)
-            .border_color(theme::swatch(palette::BORDER_STRONG))
+        // The dialog around this panel carries the host, its state and the close
+        // button; the panel is the conversation with the server.
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(metrics.scale(spacing::SNUG))
             .debug_selector(|| "remote.panel".to_owned());
-
-        column = column.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(metrics.scale(spacing::TIGHT))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .min_w(px(0.0))
-                        .child(host_avatar(host.name(), false, metrics))
-                        .child(components::stacked(
-                            host.name().to_owned(),
-                            host.target(),
-                            metrics,
-                        ))
-                        .child(components::chip(status_label, tone, metrics)),
-                )
-                .child(self.icon_text_button(
-                    SharedString::from("remote.close"),
-                    Icon::Close,
-                    strings.remote_close,
-                    Variant::Ghost,
-                    cx,
-                    |view, cx| view.close_remote(cx),
-                )),
-        );
         let forward_only = self.forward_only_dial
             || self.form_session.is_some_and(|id| {
                 self.attempts
@@ -4944,10 +4921,7 @@ impl ShelluneView {
         // started it, beside the host it is for. Attempts that are not the form on
         // screen stay listed after that form is closed, so each one can still be
         // cancelled on its own.
-        if self.remote.is_some() {
-            column = column.child(self.remote_panel(cx));
-        }
-        column = column.child(self.other_attempts(cx));
+
         // While the host dialog is open, its own refusals are shown inside it.
         if let Some(message) = self
             .hosts
@@ -4985,9 +4959,6 @@ impl ShelluneView {
         }
 
         column = column.child(self.hosts_toolbar(cx));
-        if self.import.is_open() {
-            column = column.child(self.import_panel(cx));
-        }
         if let Some(id) = self.hosts.pending_delete() {
             column = column.child(self.host_delete_bar(id, cx));
         }
@@ -5118,14 +5089,13 @@ impl ShelluneView {
             None => div().flex_1(),
         };
 
-        let mut card = components::card(metrics)
-            .border_color(theme::swatch(palette::BORDER_STRONG))
+        // The dialog around the panel carries its title and close button.
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(metrics.scale(spacing::SNUG + 2.0))
             .debug_selector(|| "hosts.import.panel".to_owned())
-            .child(components::card_title(
-                strings.import_title,
-                Some(SharedString::from(strings.import_read_only)),
-                metrics,
-            ))
             .child(
                 components::field_row(strings.import_path_label, metrics)
                     .child(path_field)
@@ -5787,177 +5757,6 @@ impl ShelluneView {
             .on_click(cx.listener(move |this, _event, _window, cx| click(this, cx)))
     }
 
-    /// The product mark: a gradient tile with a prompt, the name and how it is said.
-    fn brand(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        // The macOS window buttons sit at the left of this row.
-        let left = if Platform::current() == Platform::MacOs {
-            titlebar::TRAFFIC_LIGHT_ROOM
-        } else {
-            spacing::BASE - 2.0
-        };
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .h(metrics.header_height())
-            .pr(metrics.scale(spacing::TIGHT))
-            .child(
-                self.drag_area("brand.drag")
-                    .flex()
-                    .flex_1()
-                    .h_full()
-                    .items_center()
-                    .gap(metrics.scale(spacing::SNUG - 2.0))
-                    .min_w(px(0.0))
-                    .pl(metrics.scale(left))
-                    .when(Platform::current() != Platform::MacOs, |row| {
-                        row.child(brand_mark(metrics.scale(28.0), metrics))
-                    })
-                    .child(
-                        // The pronunciation is one hover away: the row keeps room for the
-                        // sidebar button without cutting the name.
-                        div()
-                            .id("brand.name")
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_size(metrics.display_size())
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .tooltip(components::tooltip(SharedString::from(format!(
-                                "{} · {}",
-                                product::NAME,
-                                product::PRONUNCIATION
-                            ))))
-                            .child(product::NAME),
-                    ),
-            )
-            .child(self.rail_toggle(cx))
-    }
-
-    fn nav_entry(
-        &self,
-        destination: Destination,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let state = self.workspace.state(destination);
-        let selected = self.workspace.destination() == destination;
-        let focused = self.destination_focus(destination).is_focused(window) && !self.pointer_input;
-        // The dot only appears when the destination has something to say: a live
-        // session, a failure, a load in flight. An idle entry stays quiet.
-        let tone = match state {
-            SectionState::Populated => self.destination_tone(destination),
-            state => state.tone(),
-        };
-
-        let index = destination.index();
-        let count = self.badge_count(destination);
-        let hover = theme::swatch(palette::SURFACE_HOVER);
-        let hover_text = theme::swatch(palette::TEXT_PRIMARY);
-        let group = SharedString::from(format!("nav-{index}"));
-        let tooltip = format!(
-            "{} · {}",
-            destination.label(strings),
-            destination.shortcut_label(Platform::current())
-        );
-
-        let collapsed = self.rail_is_collapsed();
-        let mut entry = div()
-            .id(("nav", index))
-            .group(group.clone())
-            .relative()
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::SNUG - 2.0))
-            .h(metrics.nav_row_height())
-            .when(collapsed, |entry| entry.justify_center())
-            .when(!collapsed, |entry| {
-                entry
-                    .pl(metrics.scale(spacing::SNUG - 2.0))
-                    .pr(metrics.scale(spacing::TIGHT))
-            })
-            .rounded(px(radius::MEDIUM))
-            .border_1()
-            // The ring is the keyboard focus, including on the selected entry: its fill
-            // says which page is open, and the ring says which control has the keys.
-            .border_color(if focused {
-                theme::swatch(palette::ACCENT)
-            } else {
-                theme::clear()
-            })
-            .text_size(metrics.body_size())
-            .cursor_pointer()
-            .track_focus(self.destination_focus(destination))
-            .debug_selector(move || destination.debug_selector().to_owned())
-            .tooltip(components::tooltip(tooltip))
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                this.select(Destination::ALL[index], window, cx);
-            }));
-        let icon_color = if selected {
-            theme::swatch(palette::ACCENT)
-        } else {
-            theme::swatch(palette::TEXT_MUTED)
-        };
-        entry = if selected {
-            entry
-                .bg(theme::swatch(palette::SURFACE_SELECTED))
-                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .font_weight(FontWeight::MEDIUM)
-        } else {
-            entry
-                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                .hover(move |style| style.bg(hover).text_color(hover_text))
-        };
-
-        let live = !matches!(tone, Tone::Neutral | Tone::Planned);
-        let icon = icons::icon(
-            destination_icon(destination),
-            metrics.icon_size(),
-            icon_color,
-        )
-        .group_hover(group, move |style| style.text_color(hover_text));
-        if collapsed {
-            // Only the icon, with the state as a dot on its corner; the name and the
-            // shortcut are in the tooltip.
-            return entry.child(icon).when(live, |entry| {
-                entry.child(
-                    div()
-                        .absolute()
-                        .top(metrics.scale(6.0))
-                        .right(metrics.scale(6.0))
-                        .child(components::status_dot(tone, metrics)),
-                )
-            });
-        }
-        entry
-            .child(icon)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .child(destination.label(strings)),
-            )
-            .when(live, |entry| {
-                entry.child(components::status_dot(tone, metrics))
-            })
-            .when(count > 0, |entry| {
-                entry.child(components::badge(
-                    count,
-                    if selected {
-                        Tone::Accent
-                    } else {
-                        Tone::Neutral
-                    },
-                    metrics,
-                ))
-            })
-    }
-
     /// The number beside a destination in the sidebar.
     ///
     /// For the session pages it counts what is still open, so it matches the tabs: a
@@ -5974,251 +5773,11 @@ impl ShelluneView {
                 .iter()
                 .filter(open)
                 .count(),
-            Destination::Hosts | Destination::Transfers | Destination::Forwards => {
-                self.workspace.item_count(destination)
-            }
+            Destination::Hosts
+            | Destination::Transfers
+            | Destination::Forwards
+            | Destination::Settings => self.workspace.item_count(destination),
         }
-    }
-
-    /// The tone a populated destination's dot is drawn in.
-    ///
-    /// A list of sessions is green only while one of them is live; a list where every
-    /// session ended says so instead of looking healthy, and a transfer in flight shows
-    /// as work in progress.
-    fn destination_tone(&self, destination: Destination) -> Tone {
-        let sessions: Vec<&Session> = match destination {
-            Destination::LocalShells => self.workspace.local_sessions().collect(),
-            Destination::Sessions => self.workspace.sessions().items().iter().collect(),
-            Destination::Transfers => {
-                let running = self
-                    .workspace
-                    .transfers()
-                    .items()
-                    .iter()
-                    .any(Transfer::is_active);
-                return if running {
-                    Tone::Warning
-                } else {
-                    Tone::Neutral
-                };
-            }
-            Destination::Hosts => return Tone::Neutral,
-            Destination::Forwards => {
-                return if self.forwards.any_active() {
-                    Tone::Warning
-                } else {
-                    Tone::Neutral
-                };
-            }
-        };
-        if sessions
-            .iter()
-            .any(|session| session.state() == &SessionState::Connected)
-        {
-            Tone::Positive
-        } else if sessions
-            .iter()
-            .any(|session| session_tone(session.state()) == Tone::Warning)
-        {
-            Tone::Warning
-        } else {
-            Tone::Neutral
-        }
-    }
-
-    fn rail(&self, window: &Window, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let mut nav = div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(2.0))
-            .px(metrics.scale(if self.rail_collapsed {
-                spacing::TIGHT
-            } else {
-                spacing::TIGHT + 2.0
-            }))
-            .pt(metrics.scale(spacing::TIGHT));
-        for destination in Destination::ALL {
-            nav = nav.child(self.nav_entry(destination, window, cx));
-        }
-
-        if self.rail_is_collapsed() {
-            return self.collapsed_rail(nav, cx);
-        }
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(metrics.rail_width())
-            .h_full()
-            .bg(theme::swatch(palette::SURFACE))
-            .border_r_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .debug_selector(|| "rail".to_owned())
-            .child(self.brand(cx))
-            .child(
-                div()
-                    .id("rail.scroll")
-                    .debug_selector(|| "rail.scroll".to_owned())
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .child(self.palette_trigger(cx))
-                    .child(nav),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_none()
-                    .gap(metrics.scale(2.0))
-                    .px(metrics.scale(spacing::TIGHT + 2.0))
-                    .pb(metrics.scale(spacing::SNUG))
-                    .child(
-                        div()
-                            .mx(metrics.scale(spacing::HAIRLINE))
-                            .mb(metrics.scale(spacing::TIGHT))
-                            .h(px(1.0))
-                            .bg(theme::swatch(palette::BORDER)),
-                    )
-                    .child(
-                        self.rail_control(
-                            self.theme_icon(),
-                            strings.theme_control,
-                            self.theme_label(),
-                        )
-                        .id("theme.control")
-                        .debug_selector(|| "theme.control".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.cycle_theme(cx);
-                            },
-                        )),
-                    )
-                    // The language control is clickable because the shortcut it
-                    // duplicates cannot be: inside a terminal Ctrl+L is the shell's key.
-                    .child(
-                        self.rail_control(
-                            Icon::Globe,
-                            strings.language_control,
-                            self.workspace.locale().endonym(),
-                        )
-                        .id("status.language")
-                        .debug_selector(|| "status.language".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.toggle_locale(cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        self.rail_control(
-                            Icon::TextSize,
-                            strings.zoom_control,
-                            self.workspace.zoom().label(),
-                        )
-                        .id("zoom.control")
-                        .debug_selector(|| "zoom.control".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.workspace.cycle_text_size();
-                                cx.notify();
-                            },
-                        )),
-                    )
-                    .child(
-                        self.rail_control(Icon::Play, strings.motion_control, self.motion_label())
-                            .id("motion.control")
-                            .debug_selector(|| "motion.control".to_owned())
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.cycle_motion(cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                            .px(metrics.scale(spacing::SNUG - 2.0))
-                            .pt(metrics.scale(spacing::TIGHT))
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(components::status_dot(
-                                if self.any_live() {
-                                    Tone::Positive
-                                } else {
-                                    Tone::Neutral
-                                },
-                                metrics,
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .child(SharedString::from(self.activity_summary())),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .debug_selector(|| "status.version".to_owned())
-                                    .child(SharedString::from(format!("v{}", self.version()))),
-                            ),
-                    ),
-            )
-    }
-
-    /// The search box at the top of the sidebar, which opens the command palette.
-    ///
-    /// It looks like a field because that is what it leads to, and it names its
-    /// shortcut, so a user who clicks it once learns how not to next time.
-    fn palette_trigger(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let hover_border = theme::swatch(palette::BORDER_STRONG);
-        let hover_text = theme::swatch(palette::TEXT_SECONDARY);
-        div()
-            .id("palette.open")
-            .debug_selector(|| "palette.open".to_owned())
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .mx(metrics.scale(spacing::TIGHT + 2.0))
-            .mb(metrics.scale(spacing::HAIRLINE))
-            .h(metrics.scale(30.0))
-            .pl(metrics.scale(spacing::TIGHT + 1.0))
-            .pr(metrics.scale(spacing::HAIRLINE + 1.0))
-            .rounded(px(radius::MEDIUM))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .bg(theme::swatch(palette::CANVAS))
-            .text_size(metrics.label_size())
-            .text_color(theme::swatch(palette::TEXT_MUTED))
-            .cursor_pointer()
-            .hover(move |style| style.border_color(hover_border).text_color(hover_text))
-            .on_click(cx.listener(|this, _event, window, cx| {
-                this.toggle_palette(window, cx);
-            }))
-            .child(icons::icon(
-                Icon::Search,
-                metrics.small_icon_size(),
-                theme::swatch(palette::TEXT_MUTED),
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .child(strings.palette_open),
-            )
-            .child(components::keycap(
-                Platform::current().palette_label(),
-                metrics,
-            ))
     }
 
     /// Steps the theme: system, light, dark.
@@ -6242,11 +5801,6 @@ impl ShelluneView {
         } else {
             strings.motion_reduced
         }
-    }
-
-    /// Icon rail when the user collapsed it, or when the labels would crowd the page out.
-    fn rail_is_collapsed(&self) -> bool {
-        self.rail_collapsed || self.viewport_forces_icon_rail()
     }
 
     /// True when the labelled rail plus the page's main action would not fit.
@@ -6345,230 +5899,6 @@ impl ShelluneView {
         self.rail_collapsed
     }
 
-    /// The button that collapses or expands the sidebar, with its shortcut.
-    fn rail_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let label = if self.rail_collapsed {
-            strings.sidebar_expand
-        } else {
-            strings.sidebar_collapse
-        };
-        components::icon_only_button(Icon::Sidebar, metrics)
-            .id("rail.toggle")
-            .debug_selector(|| "rail.toggle".to_owned())
-            .tooltip(components::tooltip(SharedString::from(format!(
-                "{label} ({})",
-                Platform::current().sidebar_label()
-            ))))
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.toggle_rail(cx);
-            }))
-    }
-
-    /// The sidebar collapsed to its icons: the brand, search, the pages and the two
-    /// settings, each named in its tooltip.
-    fn collapsed_rail(&self, nav: Div, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let platform = Platform::current();
-        let square = |icon: Icon, id: &'static str, tooltip: String| {
-            components::icon_only_button(icon, metrics)
-                .size(metrics.scale(36.0))
-                .id(id)
-                .debug_selector(move || id.to_owned())
-                .tooltip(components::tooltip(SharedString::from(tooltip)))
-        };
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(if Platform::current() == Platform::MacOs {
-                metrics.scale(titlebar::TRAFFIC_LIGHT_ROOM + 4.0)
-            } else {
-                metrics.collapsed_rail_width()
-            })
-            .h_full()
-            .bg(theme::swatch(palette::SURFACE))
-            .border_r_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .debug_selector(|| "rail".to_owned())
-            .child(
-                self.drag_area("brand.drag")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .h(metrics.header_height())
-                    // On macOS the window buttons take this place.
-                    .when(Platform::current() != Platform::MacOs, |row| {
-                        row.child(brand_mark(metrics.scale(28.0), metrics))
-                    }),
-            )
-            .child(
-                div()
-                    .id("rail.scroll")
-                    .debug_selector(|| "rail.scroll".to_owned())
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(metrics.scale(2.0))
-                            .child(self.rail_toggle(cx).size(metrics.scale(36.0)))
-                            .child(
-                                square(
-                                    Icon::Search,
-                                    "palette.open",
-                                    format!(
-                                        "{} ({})",
-                                        strings.palette_hint_short,
-                                        platform.palette_label()
-                                    ),
-                                )
-                                .on_click(cx.listener(
-                                    |this, _event, window, cx| {
-                                        this.toggle_palette(window, cx);
-                                    },
-                                )),
-                            ),
-                    )
-                    .child(nav)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(metrics.scale(2.0))
-                            .pb(metrics.scale(spacing::SNUG))
-                            .child(
-                                square(
-                                    self.theme_icon(),
-                                    "theme.control",
-                                    format!("{} · {}", strings.theme_control, self.theme_label()),
-                                )
-                                .on_click(cx.listener(
-                                    |this, _event, _window, cx| {
-                                        this.cycle_theme(cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                square(
-                                    Icon::Globe,
-                                    "status.language",
-                                    format!(
-                                        "{} · {}",
-                                        strings.language_control,
-                                        self.workspace.locale().endonym()
-                                    ),
-                                )
-                                .on_click(cx.listener(
-                                    |this, _event, _window, cx| {
-                                        this.toggle_locale(cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                square(
-                                    Icon::TextSize,
-                                    "zoom.control",
-                                    format!(
-                                        "{} · {}",
-                                        strings.zoom_control,
-                                        self.workspace.zoom().label()
-                                    ),
-                                )
-                                .on_click(cx.listener(
-                                    |this, _event, _window, cx| {
-                                        this.workspace.cycle_text_size();
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                            .child(div().pt(metrics.scale(spacing::HAIRLINE)).child(
-                                components::status_dot(
-                                    if self.any_live() {
-                                        Tone::Positive
-                                    } else {
-                                        Tone::Neutral
-                                    },
-                                    metrics,
-                                ),
-                            )),
-                    ),
-            )
-    }
-
-    /// One quiet setting at the foot of the sidebar: an icon, a name and its value.
-    fn rail_control(&self, icon: Icon, label: &'static str, value: &'static str) -> Div {
-        let metrics = self.metrics();
-        let hover = theme::swatch(palette::SURFACE_HOVER);
-        let hover_text = theme::swatch(palette::TEXT_PRIMARY);
-        div()
-            .group(components::ICON_GROUP)
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::SNUG - 2.0))
-            .h(metrics.scale(30.0))
-            .pl(metrics.scale(spacing::SNUG - 2.0))
-            .pr(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::MEDIUM))
-            .text_size(metrics.label_size())
-            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover).text_color(hover_text))
-            .child(
-                icons::icon(
-                    icon,
-                    metrics.small_icon_size(),
-                    theme::swatch(palette::TEXT_MUTED),
-                )
-                .group_hover(components::ICON_GROUP, move |style| {
-                    style.text_color(hover_text)
-                }),
-            )
-            .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
-            .child(components::keycap(value, metrics))
-    }
-
-    /// Whether any session is live right now.
-    fn any_live(&self) -> bool {
-        self.workspace
-            .sessions()
-            .items()
-            .iter()
-            .any(|session| session.state() == &SessionState::Connected)
-    }
-
-    /// The non-zero counts, or that nothing is running, in one short line.
-    fn activity_summary(&self) -> String {
-        let strings = self.strings();
-        let locale: Locale = self.workspace.locale();
-        let parts: Vec<String> = [
-            (
-                self.badge_count(Destination::Sessions),
-                strings.count_sessions,
-            ),
-            (self.workspace.transfers().count(), strings.count_transfers),
-        ]
-        .into_iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, unit)| copy::counted(count, unit, locale))
-        .collect();
-        if parts.is_empty() {
-            strings.idle.to_owned()
-        } else {
-            parts.join(" · ")
-        }
-    }
-
     fn notice_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
         let notice = self.workspace.notice()?;
         let metrics = self.metrics();
@@ -6601,229 +5931,6 @@ impl ShelluneView {
                         ),
                 ),
         )
-    }
-
-    /// Whether the header offers the shell menu beside its main button.
-    ///
-    /// The menu replaces the shell tiles once a terminal fills the panel, and on the
-    /// sessions page, whose main button opens a local shell as well.
-    fn offers_shell_menu(&self) -> bool {
-        match self.workspace.destination() {
-            Destination::LocalShells => self.shows_terminal(Destination::LocalShells),
-            Destination::Sessions => true,
-            Destination::Hosts | Destination::Transfers | Destination::Forwards => false,
-        }
-    }
-
-    /// The label of the header's main button, which can depend on what is open.
-    fn header_primary_label(&self, destination: Destination) -> &'static str {
-        let strings = self.strings();
-        match destination {
-            Destination::Transfers if self.browsable_session().is_none() => {
-                strings.primary_transfers_connect
-            }
-            destination => self.primary_label(destination, strings),
-        }
-    }
-
-    fn header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let destination = self.workspace().destination();
-        let state = self.workspace().state(destination);
-        // With a terminal on screen the header is the tab bar: the page title would
-        // only repeat what the tabs and the sidebar already say.
-        let terminal_mode = self.shows_terminal(destination);
-
-        // What the page holds, said once: the summary, and the amount when there is one.
-        let subtitle = if state == SectionState::Populated {
-            format!(
-                "{} · {}",
-                destination.summary(strings),
-                copy::counted(
-                    self.workspace.item_count(destination),
-                    destination.count_unit(strings),
-                    self.workspace.locale()
-                )
-            )
-        } else {
-            destination.summary(strings).to_owned()
-        };
-
-        let mut title_row = div()
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .min_w(px(0.0))
-            .child(
-                div()
-                    .text_size(metrics.heading_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .truncate()
-                    .debug_selector(|| "header.title".to_owned())
-                    .child(destination.label(strings)),
-            );
-        // A ready page needs no badge to say so; loading and failure do, because they
-        // change what the content below can be trusted for.
-        if matches!(state, SectionState::Loading | SectionState::Failed) {
-            title_row = title_row.child(components::chip(
-                state.chip_label(strings),
-                state.tone(),
-                metrics,
-            ));
-        }
-
-        let menu = self.offers_shell_menu();
-        let open = self.shell_menu_open;
-        let primary_label = self.header_primary_label(destination);
-        let primary_icon = match destination {
-            Destination::LocalShells | Destination::Sessions => Icon::Plus,
-            Destination::Hosts => Icon::Plus,
-            Destination::Transfers => {
-                if self.browsable_session().is_some() {
-                    Icon::Folder
-                } else {
-                    Icon::Server
-                }
-            }
-            Destination::Forwards => Icon::Plus,
-        };
-        // The main button and the shell menu form one split control, so the default
-        // shell and "pick another" read as two halves of the same action.
-        let mut primary =
-            components::icon_label_button(primary_icon, primary_label, Variant::Primary, metrics);
-        if menu {
-            primary = primary.rounded_r(px(0.0));
-        }
-        let mut actions = div().relative().flex().flex_none().items_center().child(
-            div()
-                .id("header.primary")
-                .debug_selector(|| "header.primary".to_owned())
-                .when(terminal_mode, |control| {
-                    control.tooltip(components::tooltip(SharedString::from(format!(
-                        "{primary_label} ({})",
-                        new_shell_shortcut_label(Platform::current())
-                    ))))
-                })
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.request_primary(window, cx);
-                }))
-                .child(primary),
-        );
-        if menu {
-            let hover = theme::swatch(palette::ACCENT_HOVER);
-            actions = actions.child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .w(metrics.scale(28.0))
-                    .h(metrics.control_height())
-                    .rounded_r(px(radius::MEDIUM))
-                    .border_1()
-                    .border_l_1()
-                    .border_color(theme::swatch(palette::ACCENT_HOVER))
-                    .bg(theme::swatch(if open {
-                        palette::ACCENT_HOVER
-                    } else {
-                        palette::ACCENT
-                    }))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
-                    .child(
-                        div()
-                            .w(px(1.0))
-                            .h(metrics.scale(16.0))
-                            .absolute()
-                            .left(px(-1.0))
-                            .bg(theme::faded(theme::swatch(palette::ON_ACCENT), 0.25)),
-                    )
-                    .child(icons::icon(
-                        Icon::ChevronDown,
-                        metrics.small_icon_size(),
-                        theme::swatch(palette::ON_ACCENT),
-                    ))
-                    .id("shell.menu")
-                    .debug_selector(|| "shell.menu".to_owned())
-                    .when(!open, |button| {
-                        button.tooltip(components::tooltip(strings.shell_menu_hint))
-                    })
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.shell_menu_open = !this.shell_menu_open;
-                        cx.notify();
-                    })),
-            );
-            if open {
-                actions = actions.child(self.shell_menu(window, cx));
-            }
-        }
-
-        // The blank part of the row is the window's caption: it drags the window. The
-        // tabs and buttons stay outside it, so a press on them is never a drag.
-        let leading = if terminal_mode {
-            div()
-                .id("header.leading")
-                .flex()
-                .flex_1()
-                .h_full()
-                .items_center()
-                .min_w(px(0.0))
-                .child(self.tab_row(cx).flex_initial())
-                .child(self.drag_area("header.drag").flex_1().h_full())
-        } else {
-            self.drag_area("header.drag")
-                .flex()
-                .flex_1()
-                .h_full()
-                .items_center()
-                .min_w(px(0.0))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(metrics.scale(1.0))
-                        .min_w(px(0.0))
-                        .child(title_row)
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(SharedString::from(subtitle)),
-                        ),
-                )
-        };
-        let controls = self.window_controls(window, cx);
-
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(metrics.scale(spacing::BASE))
-            .h(metrics.header_height())
-            .flex_none()
-            .pl(metrics.scale(if terminal_mode {
-                spacing::TIGHT
-            } else {
-                spacing::LOOSE
-            }))
-            .pr(if controls.is_some() {
-                px(0.0)
-            } else {
-                metrics.scale(spacing::SNUG)
-            })
-            .bg(theme::swatch(if terminal_mode {
-                palette::SURFACE
-            } else {
-                palette::CANVAS
-            }))
-            .border_b_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .child(leading)
-            .child(actions)
-            .children(controls)
     }
 
     /// The menu under the header's shell control: every shell, and a typed path.
@@ -7064,13 +6171,6 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// The first remote session whose connection can list files, if any.
-    fn browsable_session(&self) -> Option<SessionId> {
-        self.tab_sessions()
-            .into_iter()
-            .find(|id| self.files.can_browse(*id))
-    }
-
     /// The card a section shows when it holds no rows.
     fn section_card(&self, destination: Destination, state: SectionState) -> gpui::Div {
         let metrics = self.metrics();
@@ -7111,6 +6211,7 @@ impl ShelluneView {
                     Destination::Sessions => strings.empty_sessions_title,
                     Destination::Transfers => strings.empty_transfers_title,
                     Destination::Forwards => strings.empty_forwards_title,
+                    Destination::Settings => copy::ux().settings_title,
                 },
                 match destination {
                     Destination::LocalShells => strings.empty_local_body,
@@ -7118,6 +6219,7 @@ impl ShelluneView {
                     Destination::Sessions => strings.empty_sessions_body,
                     Destination::Transfers => strings.empty_transfers_body,
                     Destination::Forwards => strings.empty_forwards_body,
+                    Destination::Settings => copy::ux().settings_summary,
                 },
                 None,
                 metrics,
@@ -7140,70 +6242,30 @@ impl ShelluneView {
             Destination::Sessions => self.session_rows(list, cx),
             Destination::Transfers => self.transfer_rows(list, cx),
             Destination::Forwards => self.forward_rows(list, cx),
+            Destination::Settings => list,
         }
     }
 
-    /// Whether a destination shows the selected terminal instead of a list.
+    /// Whether a destination shows the selected terminal.
     ///
-    /// Local and remote sessions share the workspace. The kind is written on the
-    /// session itself, not by sending the user to a different page. Hosts and
-    /// transfers stay context panels and do not hide the fact that a session exists.
+    /// Only the terminals destination does, and only while a terminal or a waiting
+    /// pane exists. A connection form is a dialog over the page, so it never hides
+    /// the terminal behind it.
     fn shows_terminal(&self, destination: Destination) -> bool {
-        if self.showing_connection_form
-            && self.remote.is_some()
-            && destination != Destination::Hosts
-        {
+        if destination != Destination::LocalShells {
             return false;
         }
         let live = self.active.is_some_and(|id| self.pane_for(id).is_some());
         // A waiting pane is drawn in the workspace. A session that is only
         // connecting still has no terminal, so it does not take the page over.
-        let waiting = self.workspace.layout().has_pending();
-        if !live && !waiting {
-            return false;
-        }
-        match destination {
-            Destination::LocalShells => true,
-            Destination::Sessions => self.session_terminal,
-            Destination::Hosts | Destination::Transfers | Destination::Forwards => false,
-        }
+        live || self.workspace.layout().has_pending()
     }
 
+    /// The content under the top bar: the settings, a terminal, or the hosts home.
     fn destination_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let metrics = self.metrics();
         let destination = self.workspace.destination();
-        let state = self.workspace.state(destination);
-
-        // A terminal fills the panel edge to edge; everything else is a reading
-        // column that scrolls. A connection form opened from the workspace replaces
-        // the terminal until the user picks a session tab again; the attempts behind
-        // it keep running.
-        if destination != Destination::Hosts
-            && self.showing_connection_form
-            && self.remote.is_some()
-        {
-            return div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h(px(0.0))
-                .id("content.scroll")
-                .debug_selector(|| "content".to_owned())
-                .overflow_y_scroll()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .w_full()
-                        .max_w(metrics.content_max_width())
-                        .mx_auto()
-                        .px(metrics.scale(spacing::LOOSE))
-                        .py(metrics.scale(spacing::LOOSE))
-                        .gap(metrics.panel_gap())
-                        .children(self.quick_open.then(|| self.quick_panel(cx)))
-                        .child(self.remote_panel(cx))
-                        .child(self.other_attempts(cx)),
-                );
+        if destination == Destination::Settings {
+            return self.settings_page(cx);
         }
         if self.shows_terminal(destination) {
             return div()
@@ -7213,363 +6275,10 @@ impl ShelluneView {
                 .min_h(px(0.0))
                 .id("content.scroll")
                 .debug_selector(|| "content".to_owned())
-                .children(self.quick_open.then(|| {
-                    div()
-                        .flex_none()
-                        .px(metrics.scale(spacing::SNUG))
-                        .pt(metrics.scale(spacing::TIGHT))
-                        .child(self.quick_panel(cx))
-                }))
+                .track_focus(self.destination_focus(destination))
                 .child(self.terminal_panel(cx));
         }
-
-        // The first page a new user sees is a welcome, not a report: the shells are
-        // the call to action, laid out in full.
-        if destination == Destination::LocalShells && state == SectionState::Empty {
-            return div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h(px(0.0))
-                .id("content.scroll")
-                .debug_selector(|| "content".to_owned())
-                .overflow_y_scroll()
-                .child(if self.workspace.layout().has_tabs() {
-                    self.shell_launcher(cx)
-                } else {
-                    // The selector must not add a box. The launcher fills this column
-                    // and centres itself, which is what keeps it inside 720×480.
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .debug_selector(|| "workspace.empty".to_owned())
-                        .child(self.shell_launcher(cx))
-                });
-        }
-
-        let body = if destination == Destination::Hosts {
-            // The hosts destination renders its own empty, failed and populated
-            // states: the tools, the form and the list are one panel.
-            self.hosts_destination(cx)
-        } else if destination == Destination::Forwards {
-            // Saved rules stay on this page, including while the list is empty,
-            // so the form and a failure reason are not hidden behind the empty card.
-            self.forward_rows(div().flex().flex_col().gap(metrics.panel_gap()), cx)
-        } else {
-            let card = self.section_card(destination, state);
-            if state == SectionState::Populated {
-                self.rows_for(destination, card, cx)
-            } else {
-                card
-            }
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(px(0.0))
-            .id("content.scroll")
-            .debug_selector(|| "content".to_owned())
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .max_w(metrics.content_max_width())
-                    .mx_auto()
-                    .px(metrics.scale(spacing::LOOSE))
-                    .py(metrics.scale(spacing::LOOSE))
-                    .gap(metrics.panel_gap())
-                    // A session list is neither a terminal nor the empty welcome, and
-                    // the form still has to appear on the page the user is already on.
-                    .children(self.quick_open.then(|| self.quick_panel(cx)))
-                    .children(self.workspace_empty_banner())
-                    .child(body),
-            )
-    }
-
-    /// The welcome page: the shells this machine offers, as tiles that open one in a
-    /// click (R2), and the ways to go further.
-    ///
-    /// The empty local page is where a first shell is started, so the choices are
-    /// laid out in full instead of hiding in a menu; the tile that is the default
-    /// for the header's button is marked.
-    fn shell_launcher(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let platform = Platform::current();
-        let mut tiles = div()
-            .flex()
-            .flex_wrap()
-            .w_full()
-            .justify_center()
-            .gap(metrics.scale(spacing::SNUG));
-
-        for (index, shell) in self.workspace.shells().iter().enumerate() {
-            let selected = index == self.workspace.shell_choice();
-            tiles = tiles.child(
-                self.shell_tile(
-                    shell.name().to_owned(),
-                    Some(program_label(shell.program())),
-                    selected,
-                )
-                .id(("shell.choice", index))
-                .debug_selector(move || format!("shell.choice.{index}"))
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.launch_choice(index, window, cx);
-                })),
-            );
-        }
-        tiles = tiles.child(
-            self.shell_tile(
-                format!("{}{ELLIPSIS}", strings.shell_custom_button),
-                None,
-                self.custom_shell_open,
-            )
-            .id("shell.custom")
-            .debug_selector(|| "shell.custom".to_owned())
-            .on_click(cx.listener(|this, _event, window, cx| {
-                this.toggle_custom_shell(window, cx);
-            })),
-        );
-
-        let hero = div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .child(brand_mark(metrics.scale(52.0), metrics).rounded(px(radius::XLARGE - 2.0)))
-            .child(
-                div()
-                    .mt(metrics.scale(spacing::HAIRLINE))
-                    .text_size(metrics.hero_size())
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .text_center()
-                    .child(strings.shell_launch_title),
-            )
-            .child(
-                div()
-                    .max_w(metrics.scale(440.0))
-                    .text_size(metrics.body_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .text_center()
-                    .child(match self.workspace.locale() {
-                        Locale::English => product::TAGLINE_EN,
-                        Locale::Chinese => product::TAGLINE_ZH,
-                    }),
-            );
-
-        let mut launcher = div().flex().flex_col().items_center();
-        // The form is the thing the user just asked for, so it leads. Leaving it under
-        // the tiles centres it out of a short window, where its button cannot be reached.
-        if self.quick_open {
-            launcher = launcher.child(self.quick_panel(cx));
-        }
-        launcher = launcher
-            .w_full()
-            .max_w(metrics.scale(720.0))
-            .gap(metrics.scale(spacing::LOOSE - 4.0))
-            .debug_selector(|| "shell.picker".to_owned())
-            .child(hero);
-        if self.workspace.shells().is_empty() {
-            launcher = launcher.child(
-                components::banner(Tone::Warning, metrics)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(strings.shell_none_found),
-            );
-        }
-        launcher = launcher.child(tiles);
-        if self.custom_shell_open {
-            launcher = launcher.child(
-                div()
-                    .w_full()
-                    .max_w(metrics.scale(480.0))
-                    .debug_selector(|| "shell.path".to_owned())
-                    .child(self.shell_path.clone()),
-            );
-        }
-
-        let hint = |keys: String, label: &'static str| {
-            div()
-                .flex()
-                .items_center()
-                .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                .child(components::keycap(keys, metrics))
-                .child(label)
-        };
-        launcher = launcher
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .mt(metrics.scale(spacing::HAIRLINE))
-                    .justify_center()
-                    .items_center()
-                    .gap(metrics.scale(spacing::LOOSE - 4.0))
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(hint(
-                        new_shell_shortcut_label(platform).to_owned(),
-                        strings.primary_local,
-                    ))
-                    .child(hint(platform.shortcut_range(), strings.nav_hint_short))
-                    .child(hint(
-                        platform.palette_label().to_owned(),
-                        strings.palette_hint_short,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        components::icon_label_button(
-                            Icon::Plug,
-                            strings.quick_connect,
-                            Variant::Secondary,
-                            metrics,
-                        )
-                        .id("welcome.quick")
-                        .debug_selector(|| "welcome.quick".to_owned())
-                        .tooltip(components::tooltip(strings.quick_connect_hint))
-                        .on_click(cx.listener(
-                            |this, _event, window, cx| {
-                                this.open_quick_connect(window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        components::icon_label_button(
-                            Icon::Server,
-                            strings.welcome_hosts,
-                            Variant::Ghost,
-                            metrics,
-                        )
-                        .id("welcome.hosts")
-                        .debug_selector(|| "welcome.hosts".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, window, cx| {
-                                this.select(Destination::Hosts, window, cx);
-                            },
-                        )),
-                    ),
-            );
-
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .when(self.quick_open, |page| page.justify_start())
-            .when(!self.quick_open, |page| page.justify_center())
-            .flex_1()
-            .min_h_full()
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::LOOSE))
-            .child(launcher.w_full())
-    }
-
-    /// One launcher tile: the shell's name and the program it runs.
-    fn shell_tile(&self, name: String, program: Option<String>, selected: bool) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let hover = theme::swatch(palette::SURFACE_HOVER);
-        let hover_border = theme::swatch(palette::BORDER_STRONG);
-        let custom = program.is_none();
-        let emblem_color = if custom {
-            theme::swatch(palette::TEXT_SECONDARY)
-        } else {
-            theme::swatch(palette::ACCENT)
-        };
-        let tile = div()
-            .relative()
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::SNUG))
-            .w(metrics.scale(224.0))
-            .h(metrics.scale(64.0))
-            .px(metrics.scale(spacing::SNUG + 2.0))
-            .rounded(px(radius::LARGE + 2.0))
-            .border_1()
-            .cursor_pointer()
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .w(metrics.scale(36.0))
-                    .h(metrics.scale(36.0))
-                    .rounded(px(radius::MEDIUM + 1.0))
-                    .bg(theme::swatch(if custom {
-                        palette::SURFACE_SELECTED
-                    } else {
-                        palette::ACCENT_TINT
-                    }))
-                    .child(icons::icon(
-                        if custom { Icon::Search } else { Icon::Terminal },
-                        metrics.icon_size() + px(2.0),
-                        emblem_color,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .gap(metrics.scale(2.0))
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_size(metrics.body_size() + px(1.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(name)),
-                            )
-                            .when(selected && !custom, |row| {
-                                row.child(components::chip(
-                                    strings.shell_default,
-                                    Tone::Accent,
-                                    metrics,
-                                ))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .truncate()
-                            .when(!custom, |line| {
-                                line.font_family(terminal::monospace_family())
-                            })
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(
-                                program.unwrap_or_else(|| strings.shell_custom_hint.to_owned()),
-                            )),
-                    ),
-            );
-        if selected {
-            tile.bg(theme::swatch(palette::SURFACE_RAISED))
-                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.7))
-                .shadow_md()
-        } else {
-            tile.bg(theme::swatch(palette::SURFACE))
-                .border_color(theme::swatch(palette::BORDER))
-                .hover(move |style| style.bg(hover).border_color(hover_border))
-        }
+        self.home_page(cx)
     }
 
     /// The selected terminal, the session it belongs to and the shell it runs.
@@ -7639,7 +6348,10 @@ impl ShelluneView {
                         .child(notice),
                 );
             }
-            frame = frame.child(pane.clone());
+            match id.filter(|id| self.files.is_open(*id)) {
+                Some(open) => frame = frame.child(self.files_view(open, cx)),
+                None => frame = frame.child(pane.clone()),
+            }
         } else if let Some(session) = session {
             // A session can outlive its terminal: a reconnect that was refused before
             // it opened one, or a process that never started. The session still holds
@@ -7663,26 +6375,21 @@ impl ShelluneView {
             };
             frame = frame.child(div().p(metrics.scale(spacing::SNUG)).child(notice));
         }
-        column = column.child(frame);
-        self.with_files_panel(column, id, cx)
+        column.child(frame)
     }
 
     /// The terminal, with the file view beside it while one is open (R9).
-    fn with_files_panel(&self, column: Div, id: Option<SessionId>, cx: &mut Context<Self>) -> Div {
-        let Some(id) = id.filter(|id| self.files.is_open(*id)) else {
-            return column;
-        };
+    /// The terminal column, or - while the file view of this session is open - the
+    /// file manager in its place: this computer and the server side by side, with
+    /// the transfers underneath. The session bar stays on top either way.
+    fn files_view(&self, id: SessionId, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
         let wide = self.files_side_by_side();
-        let column_width = self.files_column_width();
-        let files_width = if wide {
-            column_width * 2.0
-        } else {
-            column_width
-        };
         let shown = self.files.shown(id).unwrap_or(FileSource::Remote);
-        let mut columns = div()
+
+        let mut panes = div()
             .flex()
             .flex_row()
             .flex_1()
@@ -7699,139 +6406,101 @@ impl ShelluneView {
                 }
             });
         if wide || shown == FileSource::Local {
-            columns = columns.child(self.files_panel(id, FileSource::Local, column_width, cx));
+            panes = panes.child(self.files_panel(id, FileSource::Local, cx));
+        }
+        if wide {
+            panes = panes.child(
+                div()
+                    .flex_none()
+                    .w(px(1.0))
+                    .h_full()
+                    .bg(theme::swatch(palette::BORDER)),
+            );
         }
         if wide || shown == FileSource::Remote {
-            columns = columns.child(self.files_panel(id, FileSource::Remote, column_width, cx));
+            panes = panes.child(self.files_panel(id, FileSource::Remote, cx));
         }
+
         let switch = (!wide).then(|| {
-            div()
-                .flex()
-                .flex_none()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .child(self.text_button(
-                    SharedString::from("files.show.local"),
-                    strings.files_show_local,
-                    if shown == FileSource::Local {
-                        Variant::Secondary
-                    } else {
-                        Variant::Ghost
-                    },
-                    cx,
-                    move |view, cx| view.files_show(id, FileSource::Local, cx),
+            let segment = |selector: &'static str, label: &'static str, source: FileSource| {
+                components::segment(label, shown == source, metrics)
+                    .id(selector)
+                    .debug_selector(move || selector.to_owned())
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.files_show(id, source, cx);
+                    }))
+            };
+            components::segmented(metrics)
+                .child(segment(
+                    "files.show.local",
+                    ux.files_this_computer,
+                    FileSource::Local,
                 ))
-                .child(self.text_button(
-                    SharedString::from("files.show.remote"),
+                .child(segment(
+                    "files.show.remote",
                     strings.files_show_remote,
-                    if shown == FileSource::Remote {
-                        Variant::Secondary
-                    } else {
-                        Variant::Ghost
-                    },
-                    cx,
-                    move |view, cx| view.files_show(id, FileSource::Remote, cx),
+                    FileSource::Remote,
                 ))
         });
-        let files = div()
+        let toolbar = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .h(metrics.scale(40.0))
+            .px(metrics.scale(spacing::SNUG))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_b_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .children(switch)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(ux.files_hint),
+            );
+
+        let transfers = div()
+            .id("files.transfers")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .max_h(metrics.scale(180.0))
+            .overflow_y_scroll()
+            .px(metrics.scale(spacing::BASE))
+            .py(metrics.scale(spacing::TIGHT))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .child(self.transfers_panel(id, cx));
+
+        div()
             .id("files.panes")
             .debug_selector(|| "files.panes".to_owned())
             .flex()
             .flex_col()
-            .flex_none()
-            .w(files_width)
-            .h_full()
-            .overflow_hidden()
-            .min_h(px(0.0))
-            .bg(theme::swatch(palette::SURFACE))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .px(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(spacing::HAIRLINE))
-                    .border_b_1()
-                    .border_l_1()
-                    .border_color(theme::swatch(palette::BORDER))
-                    .children(switch)
-                    .child(self.text_button(
-                        SharedString::from("files.close"),
-                        strings.files_close,
-                        Variant::Ghost,
-                        cx,
-                        move |view, cx| view.toggle_files(id, cx),
-                    )),
-            )
-            .child(columns);
-        div()
-            .flex()
             .flex_1()
             .min_w(px(0.0))
             .min_h(px(0.0))
             .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .min_h(px(0.0))
-                    // A squeezed terminal must not paint its session bar over the file controls.
-                    .overflow_hidden()
-                    .child(column),
-            )
-            .child(files)
+            .bg(theme::swatch(palette::CANVAS))
+            .child(toolbar)
+            .child(panes)
+            .child(transfers)
     }
 
-    /// Whether both file sources fit beside a usable terminal.
+    /// Whether this computer and the server fit side by side.
     ///
-    /// The check uses scaled column widths plus [`FILES_TERMINAL_RESERVE`], measured
-    /// in the area beside the rail. A viewport threshold that ignores text scale
-    /// opens the second column at 200% and clips it.
+    /// The file view takes the terminal's place, so the whole window width is
+    /// available; at 200% text a small window shows one side at a time.
     fn files_side_by_side(&self) -> bool {
         if let Some(wide) = self.files_layout_override {
             return wide;
         }
-        let metrics = self.metrics();
-        let both = metrics.scale(FILES_PANEL_WIDTH) * 2.0;
-        let terminal = metrics.scale(FILES_TERMINAL_RESERVE);
-        self.files_content_width() >= both + terminal
-    }
-
-    /// Width of one file column: the preferred scaled width, or the content area
-    /// when that width would pass the window.
-    fn files_column_width(&self) -> Pixels {
-        let preferred = self.metrics().scale(FILES_PANEL_WIDTH);
-        if self.files_side_by_side() {
-            return preferred;
-        }
-        let content = self.files_content_width();
-        if content < preferred {
-            content
-        } else {
-            preferred
-        }
-    }
-
-    /// Width beside the rail, which is where the terminal and the file columns sit.
-    fn files_content_width(&self) -> Pixels {
-        let content = self.viewport_width - self.rail_width_used();
-        if content < px(0.0) { px(0.0) } else { content }
-    }
-
-    /// The rail width currently drawn, including the macOS traffic-light column.
-    fn rail_width_used(&self) -> Pixels {
-        let metrics = self.metrics();
-        if !self.rail_is_collapsed() {
-            return metrics.rail_width();
-        }
-        if Platform::current() == Platform::MacOs {
-            metrics.scale(titlebar::TRAFFIC_LIGHT_ROOM + 4.0)
-        } else {
-            metrics.collapsed_rail_width()
-        }
+        self.viewport_width >= self.metrics().scale(FILES_PANEL_WIDTH * 2.0 + 120.0)
     }
 
     fn files_show(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
@@ -8538,15 +7207,17 @@ impl ShelluneView {
     }
 
     /// One file column: the source it is, the path it shows and the entries of that source.
+    /// One side of the file manager: where it is, its toolbar, the path as
+    /// breadcrumbs, and the listing.
     fn files_panel(
         &self,
         id: SessionId,
         source: FileSource,
-        width: Pixels,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
         let Some(browser) = self.files.browser_in(id, source) else {
             return div().id(files_element_id(source, "panel"));
         };
@@ -8555,13 +7226,10 @@ impl ShelluneView {
         let path = browser.path().map(str::to_owned);
         let changing = browser.is_changing();
         let state = browser.state().clone();
-        let source_label = match source {
-            FileSource::Local => strings.files_source_local,
-            FileSource::Remote => strings.files_source_remote,
-        };
-        let host_text = match source {
-            FileSource::Remote => format!("{host} · {target}"),
-            FileSource::Local => host,
+        let remote = source == FileSource::Remote;
+        let (title, subtitle) = match source {
+            FileSource::Remote => (host, target),
+            FileSource::Local => (ux.files_this_computer.to_owned(), host),
         };
         let shown_path = path
             .as_deref()
@@ -8572,11 +7240,55 @@ impl ShelluneView {
         let host_id = files_element_id(source, "host");
         let header_id = files_element_id(source, "header");
         let path_id = files_element_id(source, "path");
+
+        let mut tools = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(2.0))
+            .child(self.row_icon_button(
+                files_element_id(source, "up"),
+                Icon::ArrowUp,
+                strings.files_up,
+                false,
+                cx,
+                move |view, cx| view.files_up(id, source, cx),
+            ))
+            .child(self.row_icon_button(
+                files_element_id(source, "refresh"),
+                Icon::Refresh,
+                strings.files_refresh,
+                false,
+                cx,
+                move |view, cx| view.files_refresh(id, source, cx),
+            ))
+            .child(self.row_icon_button(
+                files_element_id(source, "new"),
+                Icon::FolderPlus,
+                strings.files_new,
+                false,
+                cx,
+                move |view, cx| view.files_new(id, source, cx),
+            ));
+        if remote {
+            tools = tools.child(
+                self.icon_text_button(
+                    SharedString::from("files.upload"),
+                    Icon::Upload,
+                    strings.transfers_upload,
+                    Variant::Soft,
+                    cx,
+                    move |view, cx| view.files_ask_upload(id, cx),
+                )
+                .ml(metrics.scale(spacing::HAIRLINE)),
+            );
+        }
+
         let header = div()
             .flex()
-            .flex_col()
             .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE))
+            .items_center()
+            .gap(metrics.scale(spacing::SNUG - 2.0))
             .debug_selector({
                 let header_id = header_id.clone();
                 move || header_id.to_string()
@@ -8584,66 +7296,78 @@ impl ShelluneView {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        components::kind_badge(source_label, source == FileSource::Remote, metrics)
-                            .debug_selector({
-                                let source_id = source_id.clone();
-                                move || source_id.to_string()
-                            }),
-                    )
-                    .child(components::kind_badge(
-                        strings.files_host_label,
-                        source == FileSource::Remote,
-                        metrics,
-                    ))
+                    .justify_center()
+                    .size(metrics.scale(32.0))
+                    .rounded(px(radius::MEDIUM))
+                    .bg(theme::swatch(if remote {
+                        palette::ACCENT_TINT
+                    } else {
+                        palette::SURFACE_SELECTED
+                    }))
+                    .debug_selector({
+                        let source_id = source_id.clone();
+                        move || source_id.to_string()
+                    })
+                    .child(icons::icon(
+                        if remote { Icon::Server } else { Icon::Monitor },
+                        metrics.small_icon_size(),
+                        theme::swatch(if remote {
+                            palette::ACCENT
+                        } else {
+                            palette::TEXT_SECONDARY
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .child(
                         div()
-                            .min_w(px(0.0))
                             .truncate()
                             .text_size(metrics.body_size())
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector({
                                 let host_id = host_id.clone();
                                 move || host_id.to_string()
                             })
-                            .child(SharedString::from(host_text)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(components::kind_badge(
-                        strings.files_path_label,
-                        false,
-                        metrics,
-                    ))
+                            .child(SharedString::from(title)),
+                    )
                     .child(
                         div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .font_family(terminal::monospace_family())
+                            .truncate()
                             .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .debug_selector({
-                                let path_id = path_id.clone();
-                                move || path_id.to_string()
-                            })
-                            .child(SharedString::from(shown_path)),
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(subtitle)),
                     ),
-            );
+            )
+            .child(tools);
 
+        // The path, as breadcrumbs that each go back up to that folder.
         let crumbs = path.as_deref().map(path_crumbs).unwrap_or_default();
         let mut crumb_row = div()
             .flex()
-            .flex_wrap()
             .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE));
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(2.0))
+            .px(metrics.scale(spacing::HAIRLINE + 2.0))
+            .py(metrics.scale(3.0))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::CANVAS))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector({
+                let path_id = path_id.clone();
+                move || path_id.to_string()
+            });
+        let _ = &shown_path;
+        let last = crumbs.len().saturating_sub(1);
         for (index, crumb) in crumbs.iter().enumerate() {
             let crumb_path = crumb.path.clone();
             let label = if index == 0 && source == FileSource::Local {
@@ -8652,50 +7376,35 @@ impl ShelluneView {
                 crumb.label.clone()
             };
             let crumb_id = files_element_id(source, &format!("crumb.{index}"));
-            crumb_row = crumb_row.child(self.text_button(
-                crumb_id,
-                SharedString::from(label),
-                Variant::Ghost,
-                cx,
-                move |view, cx| view.files_go(id, source, &crumb_path, cx),
-            ));
-        }
-
-        let mut toolbar = div()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .child(self.text_button(
-                files_element_id(source, "up"),
-                strings.files_up,
-                Variant::Ghost,
-                cx,
-                move |view, cx| view.files_up(id, source, cx),
-            ))
-            .child(self.text_button(
-                files_element_id(source, "refresh"),
-                strings.files_refresh,
-                Variant::Ghost,
-                cx,
-                move |view, cx| view.files_refresh(id, source, cx),
-            ))
-            .child(self.text_button(
-                files_element_id(source, "new"),
-                strings.files_new,
-                Variant::Ghost,
-                cx,
-                move |view, cx| view.files_new(id, source, cx),
-            ));
-        if source == FileSource::Remote {
-            toolbar = toolbar.child(self.text_button(
-                SharedString::from("files.upload"),
-                strings.transfers_upload,
-                Variant::Soft,
-                cx,
-                move |view, cx| view.files_ask_upload(id, cx),
-            ));
+            let hover = theme::swatch(palette::SURFACE_HOVER);
+            if index > 0 {
+                crumb_row = crumb_row.child(icons::icon(
+                    Icon::ChevronRight,
+                    metrics.scale(12.0),
+                    theme::swatch(palette::TEXT_MUTED),
+                ));
+            }
+            crumb_row = crumb_row.child(
+                div()
+                    .id(crumb_id.clone())
+                    .debug_selector(move || crumb_id.to_string())
+                    .px(metrics.scale(spacing::HAIRLINE + 1.0))
+                    .py(metrics.scale(1.0))
+                    .rounded(px(radius::SMALL))
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(if index == last {
+                        palette::TEXT_PRIMARY
+                    } else {
+                        palette::TEXT_SECONDARY
+                    }))
+                    .when(index == last, |crumb| crumb.font_weight(FontWeight::MEDIUM))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.files_go(id, source, &crumb_path, cx);
+                    }))
+                    .child(SharedString::from(label)),
+            );
         }
 
         let body: gpui::AnyElement = match &state {
@@ -8703,10 +7412,8 @@ impl ShelluneView {
                 let loading_id = files_element_id(source, "loading");
                 div()
                     .flex_none()
-                    .rounded(px(radius::SMALL))
-                    .p(metrics.scale(spacing::TIGHT))
-                    .bg(theme::swatch(palette::SURFACE))
-                    .text_size(metrics.caption_size())
+                    .p(metrics.scale(spacing::SNUG))
+                    .text_size(metrics.label_size())
                     .text_color(Tone::Warning.text())
                     .debug_selector(move || loading_id.to_string())
                     .child(SharedString::from(strings.files_loading))
@@ -8723,12 +7430,31 @@ impl ShelluneView {
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
-                    .gap(metrics.scale(1.0))
                     .overflow_y_scroll()
+                    .rounded(px(radius::MEDIUM))
+                    .bg(theme::swatch(palette::SURFACE))
+                    .border_1()
+                    .border_color(theme::swatch(palette::BORDER))
                     .debug_selector({
                         let list_id = list_id.clone();
                         move || list_id.to_string()
-                    });
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(metrics.scale(28.0))
+                            .px(metrics.scale(spacing::SNUG))
+                            .border_b_1()
+                            .border_color(theme::swatch(palette::BORDER))
+                            .text_size(metrics.caption_size())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(div().flex_1().child(ux.files_name))
+                            .child(div().w(metrics.scale(80.0)).child(ux.files_size))
+                            .child(div().w(metrics.scale(96.0))),
+                    );
                 if path.as_deref().is_some_and(|path| path != "/") {
                     list = list.child(self.files_parent_row(id, source, cx));
                 }
@@ -8737,8 +7463,8 @@ impl ShelluneView {
                     list = list.child(
                         div()
                             .flex_none()
-                            .p(metrics.scale(spacing::HAIRLINE))
-                            .text_size(metrics.caption_size())
+                            .p(metrics.scale(spacing::SNUG))
+                            .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .debug_selector(move || empty_id.to_string())
                             .child(SharedString::from(strings.files_empty)),
@@ -8756,7 +7482,14 @@ impl ShelluneView {
             FileSource::Local => &self.files_local_focus,
             FileSource::Remote => &self.files_remote_focus,
         };
-        let mut panel = components::file_column(width, metrics)
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .gap(metrics.scale(spacing::TIGHT + 2.0))
+            .p(metrics.scale(spacing::BASE - 2.0))
             .id(panel_id.clone())
             .debug_selector({
                 let panel_id = panel_id.clone();
@@ -8775,12 +7508,14 @@ impl ShelluneView {
                     .downcast_ref::<FileDrag>()
                     .is_some_and(|drag| drag.session == id && drag.source != source)
             })
+            .drag_over::<FileDrag>(|style, _drag, _window, _cx| {
+                style.bg(theme::swatch(palette::ACCENT_TINT))
+            })
             .on_drop(cx.listener(move |view, drag: &FileDrag, _window, cx| {
                 view.files_accept_drop(id, source, drag, cx);
             }))
             .child(header)
-            .child(crumb_row)
-            .child(toolbar);
+            .child(crumb_row);
         if let Some(question) = self.files_question(id, source, cx) {
             panel = panel.child(question);
         } else if changing {
@@ -8790,13 +7525,8 @@ impl ShelluneView {
                 FileSource::Remote => strings.files_change_pending,
             };
             panel = panel.child(
-                div()
-                    .flex_none()
-                    .rounded(px(radius::SMALL))
-                    .p(metrics.scale(spacing::HAIRLINE))
-                    .bg(theme::swatch(palette::SURFACE))
+                components::banner(Tone::Warning, metrics)
                     .text_size(metrics.caption_size())
-                    .text_color(Tone::Warning.text())
                     .debug_selector(move || pending_id.to_string())
                     .child(SharedString::from(pending)),
             );
@@ -8804,9 +7534,6 @@ impl ShelluneView {
         panel = panel.child(body);
         if let Some(report) = self.files_report(id, source) {
             panel = panel.child(report);
-        }
-        if source == FileSource::Remote {
-            panel = panel.child(self.transfers_panel(id, cx));
         }
         panel
     }
@@ -9471,34 +8198,39 @@ impl ShelluneView {
     ) -> Stateful<Div> {
         let metrics = self.metrics();
         let parent_id = files_element_id(source, "parent");
+        let hover = theme::swatch(palette::SURFACE_HOVER);
         div()
             .id(parent_id.clone())
             .debug_selector(move || parent_id.to_string())
             .flex()
             .items_center()
             .flex_none()
-            .px(metrics.scale(spacing::TIGHT))
-            .h(metrics.compact_control_height())
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .gap(metrics.scale(spacing::TIGHT))
+            .h(metrics.scale(30.0))
+            .px(metrics.scale(spacing::SNUG))
             .text_size(metrics.label_size())
             .text_color(theme::swatch(palette::TEXT_SECONDARY))
             .cursor_pointer()
+            .hover(move |style| style.bg(hover))
             .on_click(cx.listener(move |view, _event, _window, cx| {
                 view.files_up(id, source, cx);
             }))
+            .child(icons::icon(
+                Icon::ArrowUp,
+                metrics.small_icon_size(),
+                theme::swatch(palette::TEXT_MUTED),
+            ))
             .child(SharedString::from(format!(
                 "..  {}",
                 self.strings().files_parent_row
             )))
     }
 
-    /// One entry of the listing: what it is, and the two changes it allows (R11).
+    /// One entry of the listing on one line: icon, name, size, and its actions.
     ///
-    /// The row is two lines because the entry keeps its own click - opening a
-    /// directory is not a change - while rename and delete are about the entry rather
-    /// than about opening it. Each button names its target when it is pressed, so a
-    /// narrow panel never leaves it unclear which row a question is about.
+    /// A folder opens on click; a file is selected on click and can be dragged to
+    /// the other side. Rename, copy to the other side and delete are small icons at
+    /// the end of the row, each with its name in a tooltip.
     fn files_row(
         &self,
         id: SessionId,
@@ -9509,7 +8241,7 @@ impl ShelluneView {
     ) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
-        let label = kind_label(entry.kind(), strings);
+        let ux = copy::ux();
         let name = entry.name();
         let size = entry.size();
         let kind = entry.kind();
@@ -9525,39 +8257,47 @@ impl ShelluneView {
         };
         let name_selector = format!("{prefix}.name.{index}");
         let entry_selector = format!("{prefix}.entry.{index}");
+        let size_text = match size {
+            Some(bytes) if !openable => human_size(bytes),
+            _ if openable => ux.files_folder.to_owned(),
+            _ => kind_label(kind, strings).to_owned(),
+        };
         let mut entry_row = div()
             .id(SharedString::from(entry_selector.clone()))
             .debug_selector(move || entry_selector.clone())
             .flex()
+            .flex_1()
+            .min_w(px(0.0))
             .items_center()
-            .justify_between()
             .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(2.0))
-            .rounded(px(radius::SMALL))
-            .text_size(metrics.label_size())
+            .h_full()
+            .child(icons::icon(
+                if openable { Icon::Folder } else { Icon::File },
+                metrics.small_icon_size(),
+                theme::swatch(if openable {
+                    palette::ACCENT
+                } else {
+                    palette::TEXT_MUTED
+                }),
+            ))
             .child(
                 div()
+                    .flex_1()
                     .min_w(px(0.0))
                     .truncate()
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .when(openable, |name| name.font_weight(FontWeight::MEDIUM))
-                    .text_color(theme::swatch(if openable {
-                        palette::TEXT_PRIMARY
-                    } else {
-                        palette::TEXT_SECONDARY
-                    }))
                     .debug_selector(move || name_selector.clone())
                     .child(SharedString::from(name.to_owned())),
             )
             .child(
                 div()
                     .flex_none()
+                    .w(metrics.scale(80.0))
+                    .truncate()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(SharedString::from(match size {
-                        Some(bytes) => format!("{label} · {bytes} B"),
-                        None => label.to_owned(),
-                    })),
+                    .child(SharedString::from(size_text)),
             );
         if openable {
             let open_name = name.to_owned();
@@ -9587,6 +8327,68 @@ impl ShelluneView {
                 },
             );
         }
+
+        let mut actions = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_end()
+            .w(metrics.scale(96.0))
+            .gap(metrics.scale(1.0));
+        // Only a file has content to copy; a folder button would promise a transfer
+        // the connection cannot do. Dragging a file does the same.
+        if !openable {
+            if source == FileSource::Remote {
+                actions = actions
+                    .child(self.files_action(
+                        SharedString::from(format!("files.download.{index}")),
+                        Icon::Download,
+                        strings.transfers_download,
+                        false,
+                        cx,
+                        move |view, cx| view.files_ask_download(id, &download, cx),
+                    ))
+                    .child(self.files_action(
+                        SharedString::from(format!("files.to_local.{index}")),
+                        Icon::ChevronLeft,
+                        strings.files_to_local,
+                        false,
+                        cx,
+                        move |view, cx| {
+                            view.files_transfer_named(id, FileSource::Remote, &transfer_name, cx)
+                        },
+                    ));
+            } else {
+                actions = actions.child(self.files_action(
+                    SharedString::from(format!("files.local.to_remote.{index}")),
+                    Icon::ChevronRight,
+                    strings.files_to_remote,
+                    false,
+                    cx,
+                    move |view, cx| {
+                        view.files_transfer_named(id, FileSource::Local, &transfer_name, cx)
+                    },
+                ));
+            }
+        }
+        actions = actions
+            .child(self.files_action(
+                SharedString::from(format!("{prefix}.rename.{index}")),
+                Icon::Pencil,
+                strings.files_rename,
+                false,
+                cx,
+                move |view, cx| view.files_ask_rename(id, source, &rename, cx),
+            ))
+            .child(self.files_action(
+                SharedString::from(format!("{prefix}.delete.{index}")),
+                Icon::Trash,
+                strings.files_delete,
+                true,
+                cx,
+                move |view, cx| view.files_ask_delete(id, source, &delete, kind, cx),
+            ));
+
         let hover = theme::swatch(palette::SURFACE_HOVER);
         let row_selector = format!("{prefix}.row.{index}");
         let selected = self.files.selected(id, source) == Some(name);
@@ -9594,83 +8396,37 @@ impl ShelluneView {
             .id(SharedString::from(row_selector.clone()))
             .debug_selector(move || row_selector.clone())
             .flex()
-            .flex_col()
+            .items_center()
             .flex_none()
-            .py(metrics.scale(2.0))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(if selected {
-                palette::ACCENT_TINT
-            } else {
-                palette::SURFACE_RAISED
-            }))
-            .hover(move |style| style.bg(hover))
+            .gap(metrics.scale(spacing::TIGHT))
+            .h(metrics.scale(30.0))
+            .px(metrics.scale(spacing::SNUG))
+            .text_size(metrics.label_size())
+            .when(selected, |row| row.bg(theme::swatch(palette::ACCENT_TINT)))
+            .when(!selected, |row| row.hover(move |style| style.bg(hover)))
             .on_click(cx.listener(move |view, _event, _window, cx| {
                 view.files.select(id, source, Some(select_name.clone()));
                 cx.notify();
             }))
             .child(entry_row)
-            .child({
-                let mut actions = div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .px(metrics.scale(spacing::HAIRLINE))
-                    .pb(metrics.scale(1.0))
-                    .child(self.text_button(
-                        SharedString::from(format!("{prefix}.rename.{index}")),
-                        strings.files_rename,
-                        Variant::Ghost,
-                        cx,
-                        move |view, cx| view.files_ask_rename(id, source, &rename, cx),
-                    ));
-                // Only a file has content to copy. A directory button would promise a
-                // transfer the connection cannot do. Dragging a file calls this too.
-                if !openable {
-                    if source == FileSource::Remote {
-                        actions = actions.child(self.text_button(
-                            SharedString::from(format!("files.download.{index}")),
-                            strings.transfers_download,
-                            Variant::Ghost,
-                            cx,
-                            move |view, cx| view.files_ask_download(id, &download, cx),
-                        ));
-                        actions = actions.child(self.text_button(
-                            SharedString::from(format!("files.to_local.{index}")),
-                            strings.files_to_local,
-                            Variant::Ghost,
-                            cx,
-                            move |view, cx| {
-                                view.files_transfer_named(
-                                    id,
-                                    FileSource::Remote,
-                                    &transfer_name,
-                                    cx,
-                                )
-                            },
-                        ));
-                    } else {
-                        actions = actions.child(self.text_button(
-                            SharedString::from(format!("files.local.to_remote.{index}")),
-                            strings.files_to_remote,
-                            Variant::Ghost,
-                            cx,
-                            move |view, cx| {
-                                view.files_transfer_named(id, FileSource::Local, &transfer_name, cx)
-                            },
-                        ));
-                    }
-                }
-                actions.child(self.text_button(
-                    SharedString::from(format!("{prefix}.delete.{index}")),
-                    strings.files_delete,
-                    Variant::Ghost,
-                    cx,
-                    move |view, cx| view.files_ask_delete(id, source, &delete, kind, cx),
-                ))
-            })
+            .child(actions)
     }
-    /// tests that check what the window does with a listing therefore attach their
+
+    /// A small icon action of a file row.
+    fn files_action(
+        &self,
+        id: SharedString,
+        icon: Icon,
+        label: &'static str,
+        danger: bool,
+        cx: &mut Context<Self>,
+        click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        self.row_icon_button(id, icon, label, danger, cx, click)
+            .size(metrics.scale(22.0))
+    }
+
     /// own channel here.
     #[cfg(test)]
     pub(crate) fn attach_files_for_test(
@@ -9965,7 +8721,8 @@ impl ShelluneView {
             .layout()
             .tabs()
             .get(index)
-            .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id());
+            .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id())
+            && self.workspace.destination() == Destination::LocalShells;
         let kind = PaneKind::of(session.kind());
         let tone = session_tone(session.state());
         let state_label = copy::session_state_label(session.state(), self.workspace.locale());
@@ -9982,7 +8739,7 @@ impl ShelluneView {
         let tooltip = format!(
             "{} · {kind_label} · {} · {state_label}{jump}",
             session.title(),
-            session_target(&self.book, session)
+            self.target_of(session)
         );
         let selector = format!("session.tab.{index}");
         let hover = theme::swatch(palette::SURFACE_HOVER);
@@ -10037,9 +8794,19 @@ impl ShelluneView {
         };
 
         tab.child(components::status_dot(tone, metrics))
-            .when(kind == PaneKind::Remote, |tab| {
-                tab.child(components::kind_badge(kind_label, true, metrics))
-            })
+            .child(icons::icon(
+                if kind == PaneKind::Remote {
+                    Icon::Server
+                } else {
+                    Icon::Terminal
+                },
+                metrics.scale(13.0),
+                theme::swatch(if selected {
+                    palette::ACCENT
+                } else {
+                    palette::TEXT_MUTED
+                }),
+            ))
             .child(
                 div()
                     .flex_1()
@@ -10116,37 +8883,6 @@ impl ShelluneView {
         row
     }
 
-    /// The tab strip a list page shows while sessions are open, with the button that
-    /// opens another local shell; on a terminal page the tabs live in the header.
-    fn tab_strip(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        div()
-            .flex()
-            .items_center()
-            .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .h(metrics.scale(44.0))
-            .px(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_b_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .child(self.tab_row(cx).flex_initial())
-            .child(
-                components::icon_only_button(Icon::Plus, metrics)
-                    .id("session.tab.new")
-                    .debug_selector(|| "session.tab.new".to_owned())
-                    .tooltip(components::tooltip(SharedString::from(format!(
-                        "{} ({})",
-                        strings.primary_local,
-                        new_shell_shortcut_label(Platform::current())
-                    ))))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.new_local_shell(window, cx);
-                    })),
-            )
-    }
-
     /// The state, the object and the actions of the selected session.
     fn session_bar(&self, id: Option<SessionId>, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
@@ -10161,8 +8897,8 @@ impl ShelluneView {
             PaneKind::Remote => strings.session_kind_remote,
         };
         let target = match session.kind() {
-            SessionKind::Local { .. } => program_label(&session_target(&self.book, session)),
-            SessionKind::Remote { .. } => session_target(&self.book, session),
+            SessionKind::Local { .. } => program_label(&self.target_of(session)),
+            SessionKind::Remote { .. } => self.target_of(session),
         };
         // A local shell's program is often its own title; saying it twice is noise.
         let target = (target.to_lowercase() != session.title().to_lowercase()).then_some(target);
@@ -10173,24 +8909,59 @@ impl ShelluneView {
         // session has no server to ask, and a session whose connection ended has no
         // directory left to show.
         let browsable = self.files.can_browse(id);
+        // A saved host's tunnels are one click away from its terminal.
+        let forward_host = match session.kind() {
+            SessionKind::Remote { host } if self.book.host(*host).is_some() => Some(*host),
+            _ => None,
+        };
         let files_open = self.files.is_open(id);
+        // Terminal and files are two views of the same connection: a switch, not a
+        // pair of open and close buttons.
         let files_button = browsable.then(|| {
-            self.icon_text_button(
-                SharedString::from("session.files"),
-                Icon::Folder,
-                if files_open {
-                    strings.files_close
-                } else {
-                    strings.files_open
-                },
-                if files_open {
-                    Variant::Secondary
-                } else {
-                    Variant::Soft
-                },
-                cx,
-                move |view, cx| view.toggle_files(id, cx),
-            )
+            let ux = copy::ux();
+            let view_segment =
+                |selector: &'static str, icon: Icon, label: &'static str, selected: bool| {
+                    let color = theme::swatch(if selected {
+                        palette::TEXT_PRIMARY
+                    } else {
+                        palette::TEXT_SECONDARY
+                    });
+                    components::segment("", selected, metrics)
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::HAIRLINE + 1.0))
+                        .child(icons::icon(icon, metrics.small_icon_size(), color))
+                        .child(label)
+                        .id(selector)
+                        .debug_selector(move || selector.to_owned())
+                };
+            components::segmented(metrics)
+                .child(
+                    view_segment(
+                        "files.close",
+                        Icon::Terminal,
+                        ux.settings_terminal,
+                        !files_open,
+                    )
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        if view.files.is_open(id) {
+                            view.toggle_files(id, cx);
+                        }
+                    })),
+                )
+                .child(
+                    view_segment(
+                        "session.files",
+                        Icon::Folder,
+                        strings.files_open,
+                        files_open,
+                    )
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        if !view.files.is_open(id) {
+                            view.toggle_files(id, cx);
+                        }
+                    })),
+                )
         });
 
         let row =
@@ -10264,6 +9035,21 @@ impl ShelluneView {
                         .gap(metrics.scale(spacing::HAIRLINE))
                         .children(self.solo_split_buttons(cx))
                         .when_some(files_button, |row, button| row.child(button))
+                        .when_some(forward_host, |row, host| {
+                            row.child(self.icon_text_button(
+                                SharedString::from("session.forwards"),
+                                Icon::Forward,
+                                copy::ux().session_forwards,
+                                Variant::Ghost,
+                                cx,
+                                move |view, cx| {
+                                    view.show_forwards_scope(
+                                        crate::app::forwarding::ForwardScope::Host(host),
+                                        cx,
+                                    );
+                                },
+                            ))
+                        })
                         .when(can_reconnect, |row| {
                             row.child(self.icon_text_button(
                                 SharedString::from("session.reconnect"),
@@ -10418,7 +9204,7 @@ impl ShelluneView {
                     strings.next_step
                 )
             }
-            _ => session_target(&self.book, session),
+            _ => self.target_of(session),
         };
         components::row(metrics)
             .child(
@@ -10546,6 +9332,7 @@ impl ShelluneView {
     /// while a terminal has the keyboard (there Ctrl+L belongs to the shell).
     fn toggle_locale(&mut self, cx: &mut Context<Self>) {
         self.workspace.toggle_locale();
+        self.relabel_fields(cx);
         let locale = self.workspace.locale();
         // Every open terminal keeps its own labels, so each one is told: the ones
         // that are not on screen must come back in the new language too.
@@ -10568,6 +9355,11 @@ impl Render for ShelluneView {
         // language from here.
         self.workspace.locale().set_current();
         self.persist_preferences();
+        if self.focus_lost_watch.is_none() {
+            self.focus_lost_watch = Some(cx.on_focus_lost(window, |view, window, cx| {
+                view.reclaim_focus(window, cx);
+            }));
+        }
         self.viewport_width = window.viewport_size().width;
         // The palette is decided before anything is drawn: the user's choice, or the
         // system's when the choice is to follow it, which the window reports when it
@@ -10600,6 +9392,16 @@ impl Render for ShelluneView {
         // A closed overlay asked to put the keyboard back where it was opened from.
         // Otherwise a panel that closed while one of its fields had the keyboard leaves
         // nothing focused, and every shortcut would go nowhere; the page takes it back.
+        if let Some(id) = self.pane_focus_pending.take()
+            && self.active == Some(id)
+            && self.shows_terminal(self.workspace.destination())
+            && let Some(pane) = self.pane_for(id)
+        {
+            let handle = pane.read(cx).focus_handle().clone();
+            if !handle.is_focused(window) {
+                window.focus(&handle);
+            }
+        }
         if std::mem::take(&mut self.restore_focus_pending) {
             self.restore_overlay_focus(window, cx);
         } else if window.focused(cx).is_none() {
@@ -10643,6 +9445,9 @@ impl Render for ShelluneView {
             }))
             .on_action(cx.listener(|this, _: &GoToHosts, window, cx| {
                 this.select(Destination::Hosts, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToSettings, window, cx| {
+                this.select(Destination::Settings, window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoToSessions, window, cx| {
                 this.select(Destination::Sessions, window, cx);
@@ -10804,7 +9609,9 @@ impl Render for ShelluneView {
             .children(self.tab_menu_overlay(window, cx))
             .children(self.session_menu_overlay(window, cx))
             .children(self.host_dialog_overlay(window, cx))
-            .child(self.rail(window, cx))
+            .children(self.connection_overlay(window, cx))
+            .children(self.import_overlay(window, cx))
+            .children(self.tool_overlay(window, cx))
             .child(
                 div()
                     .flex()
@@ -10812,18 +9619,8 @@ impl Render for ShelluneView {
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
-                    .child(self.header(window, cx))
+                    .child(self.top_bar(window, cx))
                     .children(notice)
-                    .children(
-                        (!self.workspace.layout().tabs().is_empty()
-                            && !self.shows_terminal(self.workspace.destination()))
-                        .then(|| self.tab_strip(cx)),
-                    )
-                    .children(
-                        (!self.shows_terminal(self.workspace.destination())
-                            && self.active.is_some())
-                        .then(|| self.session_bar(self.active, cx)),
-                    )
                     .children(self.close_transfer_question(cx))
                     .children(self.close_app_question(cx))
                     .child(self.destination_panel(cx)),
@@ -11069,6 +9866,36 @@ pub(crate) fn scratch_store() -> HostStore {
     HostStore::at(std::env::temp_dir().join(unique))
 }
 
+/// A byte count as people read it: 12 B, 3.4 KB, 120 MB.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// The words and tone of a connection's state.
+fn remote_status_label(status: &RemoteStatus, strings: &Strings) -> (&'static str, Tone) {
+    match status {
+        RemoteStatus::Idle => (strings.remote_idle, Tone::Neutral),
+        RemoteStatus::Connecting => (strings.remote_connecting, Tone::Warning),
+        RemoteStatus::VerifyingHost(_) => (strings.remote_verifying, Tone::Warning),
+        RemoteStatus::ConfirmingProxy { .. } => (strings.remote_proxy_title, Tone::Warning),
+        RemoteStatus::Live => (strings.remote_live, Tone::Positive),
+        RemoteStatus::Failed(_) => (strings.remote_failed, Tone::Danger),
+    }
+}
+
 /// The icon a destination is drawn with in the sidebar.
 fn destination_icon(destination: Destination) -> Icon {
     match destination {
@@ -11077,6 +9904,7 @@ fn destination_icon(destination: Destination) -> Icon {
         Destination::Sessions => Icon::Layers,
         Destination::Transfers => Icon::Transfer,
         Destination::Forwards => Icon::Forward,
+        Destination::Settings => Icon::Settings,
     }
 }
 

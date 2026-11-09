@@ -115,10 +115,7 @@ impl ShelluneView {
         self.active = None;
         self.session_terminal = true;
         self.showing_connection_form = false;
-        if matches!(
-            self.workspace.destination(),
-            Destination::Hosts | Destination::Transfers | Destination::Forwards
-        ) {
+        if self.workspace.destination() != Destination::LocalShells {
             self.workspace.select(Destination::LocalShells);
         }
         let handle = self.destination_focus(self.workspace.destination()).clone();
@@ -393,7 +390,10 @@ impl ShelluneView {
                 );
             }
         }
-        if let Some(tab) = self.workspace.layout().active_tab() {
+        let files = session_id.filter(|id| self.files.is_open(*id));
+        if let Some(id) = files {
+            column = column.child(self.files_view(id, cx));
+        } else if let Some(tab) = self.workspace.layout().active_tab() {
             let zoomed = tab.zoomed();
             let tree = if let Some(zoomed) = zoomed {
                 self.zoomed_leaf(tab.root(), zoomed, cx)
@@ -405,7 +405,7 @@ impl ShelluneView {
         if self.split_drag.is_some() {
             column = column.child(self.split_drag_canvas(cx));
         }
-        self.with_files_panel(column, session_id, cx)
+        column
     }
 
     fn active_failure_notice(
@@ -1040,7 +1040,8 @@ impl ShelluneView {
             .layout()
             .tabs()
             .get(index)
-            .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id());
+            .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id())
+            && self.workspace.destination() == Destination::LocalShells;
         let selector = format!("session.tab.{index}");
         let mut tab = div()
             .id(("session.tab", index))
@@ -1188,34 +1189,6 @@ impl ShelluneView {
             }
         }
         cx.notify();
-    }
-
-    /// The empty-workspace note, when no tab is open on a session page.
-    pub(super) fn workspace_empty_banner(&self) -> Option<gpui::Div> {
-        if self.workspace.layout().has_tabs() {
-            return None;
-        }
-        if !matches!(
-            self.workspace.destination(),
-            Destination::LocalShells | Destination::Sessions
-        ) {
-            return None;
-        }
-        // An empty page already says so in its own state card (and the local page
-        // is the welcome); the note is only for a page that still lists sessions.
-        if self.workspace.state(self.workspace.destination())
-            == crate::app::workspace::SectionState::Empty
-        {
-            return None;
-        }
-        let metrics = self.metrics();
-        let strings = self.strings();
-        Some(
-            components_banner(Tone::Neutral, metrics)
-                .debug_selector(|| "workspace.empty".to_owned())
-                .child(SharedString::from(strings.workspace_empty_title.to_owned()))
-                .child(SharedString::from(strings.workspace_empty_body.to_owned())),
-        )
     }
 }
 

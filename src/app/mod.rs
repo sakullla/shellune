@@ -45,12 +45,11 @@ use gpui::{
 
 use crate::app::actions::{
     CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
-    MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight,
-    NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab,
-    ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2,
-    SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
-    SplitPaneDown, SplitPaneRight, ToggleLanguage, ToggleSidebar, ZoomPane,
+    FocusPaneUp, GoToHosts, GoToLocalShells, GoToSettings, MovePaneDown, MovePaneLeft,
+    MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell, NextDestination, NextTab,
+    OpenPalette, PreviousDestination, PreviousTab, ResizePaneDown, ResizePaneLeft, ResizePaneRight,
+    ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+    SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleLanguage, ZoomPane,
 };
 use crate::app::nav::{Destination, Platform};
 
@@ -67,6 +66,7 @@ pub mod actions {
             GoToSessions,
             GoToTransfers,
             GoToForwards,
+            GoToSettings,
             NextDestination,
             PreviousDestination,
             CycleTextSize,
@@ -146,21 +146,15 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
             GoToHosts,
             Some(KEY_CONTEXT),
         ),
+        // Transfers and forwards are tools of a host now and the session list is the
+        // tab strip, so only the three pages keep a number; settings also answer the
+        // platform's usual comma.
         KeyBinding::new(
-            &Destination::Sessions.keystroke(platform),
-            GoToSessions,
+            &Destination::Settings.keystroke(platform),
+            GoToSettings,
             Some(KEY_CONTEXT),
         ),
-        KeyBinding::new(
-            &Destination::Transfers.keystroke(platform),
-            GoToTransfers,
-            Some(KEY_CONTEXT),
-        ),
-        KeyBinding::new(
-            &Destination::Forwards.keystroke(platform),
-            GoToForwards,
-            Some(KEY_CONTEXT),
-        ),
+        KeyBinding::new(&format!("{modifier}-,"), GoToSettings, Some(KEY_CONTEXT)),
         KeyBinding::new(
             &format!("{modifier}-tab"),
             NextDestination,
@@ -195,11 +189,6 @@ pub fn key_bindings(platform: Platform) -> Vec<KeyBinding> {
         KeyBinding::new(
             platform.close_tab_keystroke(),
             CloseActiveTab,
-            Some(KEY_CONTEXT),
-        ),
-        KeyBinding::new(
-            platform.sidebar_keystroke(),
-            ToggleSidebar,
             Some(KEY_CONTEXT),
         ),
         KeyBinding::new(

@@ -190,26 +190,33 @@ fn forgetting_a_session_that_never_started_keeps_the_others() {
 // Rendered layout
 // ---------------------------------------------------------------------------
 
+/// The controls of the top bar that every page shares.
+const TOP_BAR: [&str; 5] = [
+    "nav.hosts",
+    "header.primary",
+    "header.drag",
+    "palette.open",
+    "nav.settings",
+];
+
 #[gpui::test]
-async fn every_navigation_entry_is_measured_inside_the_design_window(cx: &mut TestAppContext) {
+async fn the_top_bar_and_the_home_fit_inside_the_design_window(cx: &mut TestAppContext) {
     let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
 
     let viewport = cx.update(|window, _app| window.viewport_size());
-    for destination in Destination::ALL {
-        let bounds = bounds_of(cx, destination.debug_selector());
-        assert_fits_inside(bounds, viewport, destination.debug_selector());
+    for selector in TOP_BAR {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
     }
-    assert_fits_inside(bounds_of(cx, "header.title"), viewport, "header title");
-    assert_fits_inside(bounds_of(cx, "header.primary"), viewport, "primary action");
+    assert_fits_inside(bounds_of(cx, "header.title"), viewport, "home title");
+    assert_fits_inside(bounds_of(cx, "shell.picker"), viewport, "local shells");
+    assert_fits_inside(bounds_of(cx, "hosts.new"), viewport, "new host");
     assert_fits_inside(bounds_of(cx, "content"), viewport, "content panel");
 }
 
 #[gpui::test]
-async fn the_minimum_window_still_shows_the_navigation_and_the_current_object(
-    cx: &mut TestAppContext,
-) {
+async fn the_minimum_window_still_shows_the_top_bar_and_the_home(cx: &mut TestAppContext) {
     let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(minimum_window());
     cx.run_until_parked();
@@ -220,13 +227,11 @@ async fn the_minimum_window_still_shows_the_navigation_and_the_current_object(
         minimum_window(),
         "the test window is not the design minimum"
     );
-    for destination in Destination::ALL {
-        let bounds = bounds_of(cx, destination.debug_selector());
-        assert_fits_inside(bounds, viewport, destination.debug_selector());
+    for selector in TOP_BAR {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
     }
     assert_fits_inside(bounds_of(cx, "content"), viewport, "content panel");
-    // The first page is the welcome: the shells it offers are the current object.
-    assert_fits_inside(bounds_of(cx, "shell.picker"), viewport, "shell picker");
+    assert_fits_inside(bounds_of(cx, "hosts.new"), viewport, "new host");
 }
 
 #[gpui::test]
@@ -245,15 +250,14 @@ async fn one_step_of_text_size_is_115_percent_and_stays_inside_the_minimum_windo
         "one step from the default is 115%"
     );
     let viewport = cx.update(|window, _app| window.viewport_size());
-    for destination in Destination::ALL {
-        let bounds = bounds_of(cx, destination.debug_selector());
-        assert_fits_inside(bounds, viewport, destination.debug_selector());
+    for selector in TOP_BAR {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
     }
     assert_fits_inside(bounds_of(cx, "content"), viewport, "content panel");
 }
 
 #[gpui::test]
-async fn two_hundred_percent_chinese_keeps_primary_actions_in_the_minimum_window(
+async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
@@ -274,47 +278,34 @@ async fn two_hundred_percent_chinese_keeps_primary_actions_in_the_minimum_window
         Locale::Chinese
     );
     let viewport = cx.update(|window, _app| window.viewport_size());
-    let rail = bounds_of(cx, "rail").size.width;
-    assert!(
-        rail < px(160.0),
-        "200% text in the minimum window keeps the icon rail so the page still fits, got {rail:?}"
-    );
-
-    let pages = [
-        (Destination::LocalShells, "local"),
+    for (page, name) in [
         (Destination::Hosts, "hosts"),
-        (Destination::Sessions, "sessions"),
-        (Destination::Transfers, "transfers"),
-        (Destination::Forwards, "forwards"),
-    ];
-    for (destination, name) in pages {
-        match destination {
-            Destination::LocalShells => cx.dispatch_action(GoToLocalShells),
-            Destination::Hosts => cx.dispatch_action(GoToHosts),
-            Destination::Sessions => cx.dispatch_action(GoToSessions),
-            Destination::Transfers => cx.dispatch_action(GoToTransfers),
-            Destination::Forwards => cx.dispatch_action(GoToForwards),
+        (Destination::Settings, "settings"),
+    ] {
+        match page {
+            Destination::Settings => cx.dispatch_action(crate::app::actions::GoToSettings),
+            _ => cx.dispatch_action(GoToHosts),
         }
         cx.run_until_parked();
-        assert_eq!(destination_of(&view, cx), destination, "{name}");
+        assert_eq!(destination_of(&view, cx), page, "{name}");
         assert_fits_inside(bounds_of(cx, "header.title"), viewport, name);
-        assert_fits_inside(bounds_of(cx, "header.primary"), viewport, name);
+        assert_fits_inside(bounds_of(cx, "nav.settings"), viewport, name);
         assert_within_width(bounds_of(cx, "content"), viewport, name);
     }
 }
 
 #[gpui::test]
 async fn reduced_motion_drops_the_loading_fade_and_keeps_the_state(cx: &mut TestAppContext) {
-    let mut workspace = Workspace::with_sections(
+    let workspace = Workspace::with_sections(
         Section::<Session>::ready(Vec::new()),
         Section::<HostConfig>::ready(Vec::new()),
         Section::<Transfer>::loading(),
     );
-    workspace.select(Destination::Transfers);
     let (view, cx) =
         cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
+    go(cx, GoToTransfers);
 
     assert!(
         cx.debug_bounds("state.motion.pulse").is_some(),
@@ -323,7 +314,8 @@ async fn reduced_motion_drops_the_loading_fade_and_keeps_the_state(cx: &mut Test
     assert!(cx.debug_bounds("state.motion.still").is_none());
     assert!(cx.debug_bounds("state.card").is_some());
 
-    click(cx, "motion.control");
+    cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+    cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().motion()),
         Motion::Reduced
@@ -360,7 +352,7 @@ async fn closing_the_palette_returns_focus_to_the_field_that_opened_it(cx: &mut 
         "the custom shell field takes the keyboard when it opens"
     );
 
-    click(cx, "palette.open");
+    go(cx, crate::app::actions::OpenPalette);
     assert!(cx.update(|_window, app| view.read(app).palette_open()));
     assert!(
         !cx.update(|window, app| view.read(app).shell_path_focused(window, app)),
@@ -398,27 +390,34 @@ async fn clicking_a_navigation_entry_switches_the_current_object(cx: &mut TestAp
 }
 
 #[gpui::test]
-async fn keyboard_shortcuts_move_between_destinations(cx: &mut TestAppContext) {
+async fn keyboard_shortcuts_move_between_pages_and_open_the_tools(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     focus_root(&view, cx);
 
-    let transfers = Destination::Transfers.keystroke(Platform::current());
-    cx.simulate_keystrokes(&transfers);
+    let settings = Destination::Settings.keystroke(Platform::current());
+    cx.simulate_keystrokes(&settings);
     cx.run_until_parked();
     assert_eq!(
         destination_of(&view, cx),
-        Destination::Transfers,
-        "the {transfers} shortcut did not reach the shell"
+        Destination::Settings,
+        "the {settings} shortcut did not reach the shell"
     );
-
-    cx.dispatch_action(GoToSessions);
-    cx.run_until_parked();
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
 
     cx.dispatch_action(GoToHosts);
     cx.run_until_parked();
     assert_eq!(destination_of(&view, cx), Destination::Hosts);
+
+    // The old session list is the tab strip: asking for it lands on the terminals.
+    cx.dispatch_action(GoToSessions);
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+
+    // Transfers and forwards are tools over the page, not pages.
+    cx.dispatch_action(GoToTransfers);
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    assert!(cx.debug_bounds("transfers.dialog").is_some());
 }
 
 #[gpui::test]
@@ -447,40 +446,36 @@ async fn language_and_text_size_shortcuts_are_wired(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 #[gpui::test]
-async fn the_transfers_action_leads_to_the_hosts_when_nothing_can_browse(cx: &mut TestAppContext) {
-    // The transfers page has no transfer of its own to start - a transfer is started
-    // from the file view of a session - so with no connection that can browse, its
-    // header action takes the user to the hosts instead of pretending one was queued.
+async fn transfers_and_forwards_open_over_the_page_and_close_again(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     focus_root(&view, cx);
-    cx.dispatch_action(GoToTransfers);
-    cx.run_until_parked();
 
-    let bounds = bounds_of(cx, "header.primary");
-    let center = bounds.center();
-    cx.simulate_click(point(center.x, center.y), Modifiers::default());
-    cx.run_until_parked();
+    go(cx, GoToTransfers);
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert_fits_inside(bounds_of(cx, "transfers.dialog"), viewport, "transfers");
+    assert_fits_inside(bounds_of(cx, "state.card"), viewport, "no transfer yet");
+    click(cx, "transfers.dialog.close");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        None,
+        "the close button closes the tool"
+    );
 
+    go(cx, GoToForwards);
+    assert_fits_inside(bounds_of(cx, "forwards.dialog"), viewport, "forwards");
+    assert!(
+        cx.debug_bounds("forwards.empty").is_some(),
+        "no rule yet says what a tunnel is"
+    );
     cx.update(|_window, app| {
         let workspace = view.read(app).workspace();
-        assert_eq!(
-            workspace.destination(),
-            Destination::Hosts,
-            "the action leads to where a connection is made"
-        );
         assert_eq!(
             workspace.notice(),
             None,
             "nothing failed, so nothing is noticed"
         );
         assert_eq!(workspace.state(Destination::Transfers), SectionState::Empty);
-        assert_eq!(workspace.item_count(Destination::Transfers), 0);
-        assert_eq!(workspace.item_count(Destination::Hosts), 0);
-        assert!(
-            view.read(app).pane().is_none(),
-            "leading to the hosts must not start a terminal"
-        );
     });
 }
 
@@ -530,6 +525,9 @@ async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut Test
             cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
         cx.simulate_resize(design_window());
         cx.run_until_parked();
+        if destination == Destination::Transfers {
+            go(cx, GoToTransfers);
+        }
 
         let viewport = cx.update(|window, _app| window.viewport_size());
         assert_eq!(
@@ -537,7 +535,14 @@ async fn every_empty_loading_and_failed_state_renders_a_state_card(cx: &mut Test
             expected,
             "the {name} fixture did not keep its state"
         );
-        assert_fits_inside(bounds_of(cx, "state.card"), viewport, name);
+        // An empty host list is the home page's first-run card, which says what a
+        // host is and offers the ways to add one.
+        let card = if destination == Destination::Hosts && expected == SectionState::Empty {
+            "hosts.empty"
+        } else {
+            "state.card"
+        };
+        assert_fits_inside(bounds_of(cx, card), viewport, name);
         assert!(
             cx.debug_bounds("row.0").is_none(),
             "the {name} state must not render list rows"
@@ -592,34 +597,6 @@ async fn a_host_file_that_cannot_be_read_stays_failed_when_it_is_retried(cx: &mu
             "the reason names the file it could not read: {reason}"
         );
     });
-}
-
-#[gpui::test]
-async fn a_populated_section_renders_one_row_per_real_object(cx: &mut TestAppContext) {
-    let workspace = Workspace::with_sections(
-        Section::ready(vec![
-            connected_local_session("pwsh"),
-            connected_local_session("cmd"),
-        ]),
-        Section::<HostConfig>::ready(Vec::new()),
-        Section::<Transfer>::ready(Vec::new()),
-    );
-    let (view, cx) =
-        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
-    cx.simulate_resize(design_window());
-    cx.run_until_parked();
-
-    let viewport = cx.update(|window, _app| window.viewport_size());
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).workspace().state(Destination::LocalShells)),
-        SectionState::Populated
-    );
-    assert_fits_inside(bounds_of(cx, "row.0"), viewport, "first session row");
-    assert_fits_inside(bounds_of(cx, "row.1"), viewport, "second session row");
-    assert!(
-        cx.debug_bounds("row.2").is_none(),
-        "two sessions must not render three rows"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -770,12 +747,8 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             empty_sessions_body,
             empty_transfers_title,
             empty_transfers_body,
-            state_empty,
-            state_ready,
-            state_loading,
             loading_title,
             loading_body,
-            state_failed,
             failed_title,
             recovery_label,
             recovery_retry,
@@ -783,22 +756,12 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             recovery_import_config,
             recovery_choose_shell,
             next_step,
-            primary_local,
             primary_hosts,
-            primary_sessions,
-            primary_transfers,
             unavailable_notice,
-            nav_hint_short,
             shell_default,
             shell_custom_hint,
-            welcome_hosts,
-            zoom_control,
-            language_control,
             count_hosts,
-            count_sessions,
-            count_transfers,
             local_shell_fallback,
-            idle,
             shell_custom_button,
             shell_custom_placeholder,
             shell_none_found,
@@ -864,9 +827,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             session_reconnect_no_shell,
             session_reconnect_missing_host,
             files_open,
-            files_close,
-            files_host_label,
-            files_path_label,
             files_up,
             files_refresh,
             files_parent_row,
@@ -876,9 +836,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             files_failed,
             files_terminal_note,
             files_refresh_source,
-            files_source_local,
-            files_source_remote,
-            files_show_local,
             files_show_remote,
             files_to_remote,
             files_to_local,
@@ -910,8 +867,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             files_kind_file,
             files_kind_link,
             files_kind_other,
-            palette_open,
-            palette_hint_short,
             palette_placeholder,
             palette_empty,
             palette_group_sessions,
@@ -930,12 +885,10 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             tab_menu_close,
             tab_menu_close_others,
             tab_menu_close_right,
-            theme_control,
             theme_system,
             theme_light,
             theme_dark,
             palette_theme,
-            motion_control,
             motion_full,
             motion_reduced,
             palette_motion,
@@ -965,8 +918,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             quick_save_unknown_next,
             quick_save_inconsistent,
             quick_save_inconsistent_next,
-            sidebar_collapse,
-            sidebar_expand,
             host_auth_title,
             host_secret_passphrase,
             host_remember_password,
@@ -1014,8 +965,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             pane_resize_more,
             tab_menu_move_left,
             tab_menu_move_right,
-            workspace_empty_title,
-            workspace_empty_body,
             pane_missing_host,
             pane_missing_next,
             workspace_dangling_tab,
@@ -1047,13 +996,8 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_filter_zero,
             nav_forwards,
             nav_forwards_summary,
-            count_forwards,
-            primary_forwards,
             empty_forwards_title,
             empty_forwards_body,
-            forward_local,
-            forward_remote,
-            forward_dynamic,
             forward_saved,
             forward_starting,
             forward_listening,
@@ -1063,12 +1007,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             forward_stop,
             forward_save,
             forward_delete,
-            forward_copy,
             forward_edit,
-            forward_new,
-            forward_listen,
-            forward_target,
-            forward_host,
             forward_exposure_title,
             forward_exposure_all,
             forward_exposure_named,
@@ -1142,144 +1081,29 @@ fn locale_for_tagline() -> (&'static str, &'static str) {
 
 #[test]
 fn shortcuts_follow_each_platform_convention() {
+    // Only the three pages have a number: hosts, terminals, settings.
     assert_eq!(
-        Destination::LocalShells.shortcut_label(Platform::Windows),
+        Destination::Hosts.shortcut_label(Platform::Windows),
         "Ctrl+1"
     );
     assert_eq!(
-        Destination::Transfers.shortcut_label(Platform::Windows),
-        "Ctrl+4"
+        Destination::LocalShells.shortcut_label(Platform::Linux),
+        "Ctrl+2"
     );
-    assert_eq!(
-        Destination::Transfers.shortcut_label(Platform::Linux),
-        "Ctrl+4"
-    );
-    assert_eq!(
-        Destination::LocalShells.shortcut_label(Platform::MacOs),
-        "⌘1"
-    );
-    assert_eq!(Destination::Transfers.shortcut_label(Platform::MacOs), "⌘4");
-
-    assert_eq!(Destination::Hosts.keystroke(Platform::Windows), "ctrl-2");
-    assert_eq!(Destination::Hosts.keystroke(Platform::MacOs), "cmd-2");
-
-    assert_eq!(Destination::LocalShells.next(), Destination::Hosts);
-    assert_eq!(Destination::Transfers.next(), Destination::Forwards);
-    assert_eq!(Destination::Forwards.next(), Destination::LocalShells);
-    assert_eq!(Destination::LocalShells.previous(), Destination::Forwards);
+    assert_eq!(Destination::Settings.shortcut_label(Platform::MacOs), "⌘3");
+    assert_eq!(Destination::Hosts.keystroke(Platform::Windows), "ctrl-1");
+    assert_eq!(Destination::Settings.keystroke(Platform::MacOs), "cmd-3");
+    assert_eq!(Destination::Hosts.next(), Destination::LocalShells);
+    assert_eq!(Destination::Settings.next(), Destination::Hosts);
+    assert_eq!(Destination::Hosts.previous(), Destination::Settings);
+    for page in Destination::PAGES {
+        assert!(page.is_page());
+        assert_eq!(page.next().previous(), page);
+    }
     for destination in Destination::ALL {
-        assert_eq!(destination.next().previous(), destination);
         assert_eq!(Destination::ALL[destination.index()], destination);
     }
-}
-
-#[test]
-fn the_navigation_hint_names_the_keys_the_keymap_binds() {
-    for platform in [Platform::Windows, Platform::MacOs, Platform::Linux] {
-        let hint = format!("{} {}", platform.shortcut_range(), ENGLISH.nav_hint_short);
-        // The welcome page shows this range beside its label; it joins the shortcut
-        // labels of the first and last entries, so it cannot name a key this platform
-        // does not bind.
-        let first = Destination::LocalShells.shortcut_label(platform);
-        let last_digit = Destination::ALL[Destination::ALL.len() - 1]
-            .shortcut_label(platform)
-            .chars()
-            .last()
-            .expect("a shortcut label ends with a digit");
-        assert!(
-            hint.starts_with(&first),
-            "{platform:?} hint {hint:?} does not start with {first:?}"
-        );
-        // The printed range must end on the digit bound for the last entry.
-        let range = hint
-            .split_once(' ')
-            .map_or(hint.as_str(), |(range, _)| range);
-        assert!(
-            range.ends_with(last_digit),
-            "{platform:?} hint {hint:?} does not end with {last_digit:?}"
-        );
-        assert_eq!(
-            hint.contains("Ctrl"),
-            platform != Platform::MacOs,
-            "{platform:?} hint {hint:?} names a modifier the keymap does not bind"
-        );
-        assert!(
-            hint.contains(platform.shortcut_modifier()),
-            "{platform:?} hint {hint:?} omits the platform modifier"
-        );
-    }
-
-    // The Chinese table carries the same platform-derived range, not a
-    // Windows-only one.
-    let english = format!(
-        "{} {}",
-        Platform::MacOs.shortcut_range(),
-        ENGLISH.nav_hint_short
-    );
-    let chinese = format!(
-        "{} {}",
-        Platform::MacOs.shortcut_range(),
-        CHINESE.nav_hint_short
-    );
-    let range_of = |hint: &str| hint.split_once(' ').map(|(range, _)| range.to_owned());
-    assert_eq!(
-        range_of(&chinese),
-        range_of(&english),
-        "the Chinese hint must use the same range as the English one"
-    );
-    let hint = chinese;
-    assert!(
-        hint.contains("\u{5207}\u{6362}"),
-        "the Chinese hint lost its meaning: {hint}"
-    );
-}
-
-#[test]
-fn a_section_count_uses_the_unit_of_its_own_destination() {
-    assert_eq!(Destination::Hosts.count_unit(&ENGLISH), "host");
-    assert_eq!(Destination::Transfers.count_unit(&ENGLISH), "transfer");
-    assert_eq!(Destination::LocalShells.count_unit(&ENGLISH), "session");
-    assert_eq!(Destination::Sessions.count_unit(&ENGLISH), "session");
-    for destination in Destination::ALL {
-        assert_ne!(
-            destination.count_unit(&ENGLISH),
-            destination.label(&ENGLISH),
-            "{destination:?} uses its own name as a count unit"
-        );
-    }
-}
-
-#[test]
-fn a_status_chip_never_stands_in_for_a_count_or_a_unit() {
-    let units = [
-        ENGLISH.count_hosts,
-        ENGLISH.count_sessions,
-        ENGLISH.count_transfers,
-        ENGLISH.count_forwards,
-    ];
-    let states = [
-        SectionState::Loading,
-        SectionState::Empty,
-        SectionState::Failed,
-        SectionState::Populated,
-    ];
-    for state in states {
-        let label = state.chip_label(&ENGLISH);
-        assert!(
-            !units.contains(&label),
-            "{state:?} uses the unit word {label:?} as its status chip"
-        );
-        assert!(
-            !label.chars().any(|c| c.is_ascii_digit()),
-            "{state:?} chip carries a count: {label:?}"
-        );
-    }
-    assert_ne!(
-        SectionState::Populated.chip_label(&ENGLISH),
-        SectionState::Empty.chip_label(&ENGLISH),
-        "a section with real data must not read like an empty one"
-    );
-    assert_eq!(SectionState::Populated.chip_label(&ENGLISH), "Ready");
+    assert!(!Destination::Transfers.is_page());
 }
 
 #[test]
@@ -1287,9 +1111,9 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
     let bindings = key_bindings(Platform::current());
     assert_eq!(
         bindings.len(),
-        Destination::ALL.len() + 6 + 5 + crate::app::TAB_JUMP_COUNT + 2 + 1 + 4 + 4 + 4 + 2,
-        "four destinations, next and previous, zoom, new shell, language and dismiss; \
-         the palette, the sidebar, close tab, next and previous tab; one jump per \
+        Destination::PAGES.len() + 1 + 6 + 4 + crate::app::TAB_JUMP_COUNT + 2 + 1 + 4 + 4 + 4 + 2,
+        "three pages and the settings comma, next and previous, zoom, new shell, language \
+         and dismiss; the palette, close tab, next and previous tab; one jump per \
          tab digit; split right and split down, zoom pane, focus, resize and move in \
          four directions, and move tab left and right"
     );
@@ -2201,8 +2025,9 @@ async fn a_shell_that_does_not_exist_shows_the_reason_and_keeps_no_session(
         "a failed launch must not draw a terminal"
     );
     assert!(
-        cx.debug_bounds("state.card").is_some(),
-        "the failure must be shown in the section card"
+        cx.update(|_window, app| view.read(app).local_error_for_test())
+            .is_some(),
+        "the failure is said on the home page"
     );
 }
 
@@ -2422,13 +2247,13 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
     click(cx, "nav.hosts");
     click(cx, "nav.hosts");
     assert_eq!(destination_of(&view, cx), Destination::Hosts);
-    click(cx, "nav.local");
+    go(cx, crate::app::actions::GoToLocalShells);
     assert_eq!(destination_of(&view, cx), Destination::LocalShells);
     assert_eq!(
         cx.update(|_window, app| view.read(app).active_session()),
         Some(open)
     );
-    click(cx, "palette.open");
+    go(cx, crate::app::actions::OpenPalette);
     assert!(cx.update(|_window, app| view.read(app).palette_open()));
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
@@ -2445,8 +2270,8 @@ async fn a_shell_picked_from_the_menu_opens_another_tab_and_closes_the_menu(
         return;
     }
     assert!(
-        cx.debug_bounds("shell.menu").is_none(),
-        "the empty page shows the shells as tiles, not behind a menu"
+        cx.debug_bounds("shell.choice.0").is_some(),
+        "the home page shows the shells as cards, not only behind a menu"
     );
 
     click(cx, "header.primary");
@@ -2774,15 +2599,11 @@ async fn ctrl_l_reaches_the_program_running_in_the_terminal(cx: &mut TestAppCont
         "the language must not change when Ctrl+L is pressed inside a terminal"
     );
 
-    // The control in the status bar is the in-terminal path to the same intent: it has
-    // to keep working, or the shortcut above would have made the language unreachable.
-    let control = bounds_of(cx, "status.language");
-    let control_center = control.center();
-    cx.simulate_click(
-        point(control_center.x, control_center.y),
-        Modifiers::default(),
-    );
-    cx.run_until_parked();
+    // The settings page is the in-terminal path to the same intent: it has to keep
+    // working, or the shortcut above would have made the language unreachable.
+    go(cx, crate::app::actions::GoToSettings);
+    click(cx, "settings.language.1");
+    go(cx, GoToLocalShells);
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().locale()),
         Locale::Chinese,
@@ -2969,6 +2790,23 @@ fn hosts_view(
     (view, cx)
 }
 
+/// Opens the connection form of the saved host at `index`, as the palette does.
+fn open_saved_host(cx: &mut VisualTestContext, view: &Entity<ShelluneView>, index: usize) {
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let host = view.book().hosts()[index].clone();
+            view.open_remote(&host, cx);
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// Dispatches a keyboard action and lets the window settle.
+fn go(cx: &mut VisualTestContext, action: impl gpui::Action) {
+    cx.dispatch_action(action);
+    cx.run_until_parked();
+}
+
 /// Clicks the centre of a rendered element.
 fn click(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = bounds_of(cx, selector);
@@ -3044,11 +2882,11 @@ async fn a_new_host_is_created_through_the_form_and_reaches_the_file(cx: &mut Te
         "no form before the action"
     );
     assert!(
-        cx.debug_bounds("state.card").is_some(),
+        cx.debug_bounds("hosts.empty").is_some(),
         "an empty store explains itself"
     );
 
-    click(cx, "header.primary");
+    click(cx, "hosts.new");
     assert!(
         cx.debug_bounds("hosts.editor").is_some(),
         "the primary action opens the form"
@@ -3190,7 +3028,7 @@ async fn an_invalid_port_is_refused_and_nothing_is_written(cx: &mut TestAppConte
     let dir = TempDir::new("port");
     let (view, cx) = hosts_view(cx, dir.store());
 
-    click(cx, "header.primary");
+    click(cx, "hosts.new");
     type_into(cx, "hosts.field.name", "web");
     type_into(cx, "hosts.field.address", "10.0.0.5");
     type_into(cx, "hosts.field.user", "deploy");
@@ -3434,7 +3272,7 @@ async fn a_write_that_the_platform_refuses_keeps_the_list_and_reports_the_reason
     std::fs::remove_dir_all(dir.path()).expect("the directory is removed");
     std::fs::write(dir.path(), "not a directory").expect("the path becomes a file");
 
-    click(cx, "header.primary");
+    click(cx, "hosts.new");
     type_into(cx, "hosts.field.name", "db");
     type_into(cx, "hosts.field.address", "10.0.0.6");
     type_into(cx, "hosts.field.user", "postgres");
@@ -3531,7 +3369,7 @@ async fn deleting_a_host_asks_first_and_the_file_follows(cx: &mut TestAppContext
         assert_eq!(workspace.item_count(Destination::Hosts), 0);
     });
     assert!(
-        cx.debug_bounds("state.card").is_some(),
+        cx.debug_bounds("hosts.empty").is_some(),
         "an empty book explains itself instead of listing nothing"
     );
     let reloaded = HostStore::at(dir.path())
@@ -3545,7 +3383,7 @@ async fn the_host_form_edits_at_the_caret_instead_of_appending_only(cx: &mut Tes
     let dir = TempDir::new("caret");
     let (view, cx) = hosts_view(cx, dir.store());
 
-    click(cx, "header.primary");
+    click(cx, "hosts.new");
     type_into(cx, "hosts.field.name", "web");
     // Home then typing inserts in front of the existing text, and Backspace removes
     // the character before the caret. Appending only would make the field unusable
@@ -3657,7 +3495,8 @@ async fn the_import_panel_opens_on_the_platform_file_and_reads_a_named_one(
     let dir = TempDir::new("import-open");
     let (view, cx) = hosts_view(cx, dir.store());
 
-    click(cx, "hosts.import");
+    // An empty host list offers the import on its first-run card.
+    click(cx, "hosts.import.open");
     assert!(
         cx.debug_bounds("hosts.import.panel").is_some(),
         "the button opens the import panel"
@@ -5117,13 +4956,13 @@ async fn a_pending_connection_keeps_navigation_and_the_other_session_usable(
     );
 
     // Navigation keeps working while the attempt waits.
-    click(cx, "nav.sessions");
+    go(cx, crate::app::actions::GoToLocalShells);
     assert_eq!(
         destination_of(&view, cx),
-        Destination::Sessions,
+        Destination::LocalShells,
         "a pending connection does not pin the navigation"
     );
-    click(cx, "nav.local");
+    go(cx, crate::app::actions::GoToLocalShells);
     assert_eq!(destination_of(&view, cx), Destination::LocalShells);
 
     // The live session still answers, and the attempt is still being watched.
@@ -6745,7 +6584,7 @@ async fn both_columns_name_their_own_source_and_a_narrow_window_switches(cx: &mu
 async fn a_narrow_window_switches_source_without_merging_them(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
-    cx.simulate_resize(size(px(1000.0), px(720.0)));
+    cx.simulate_resize(size(px(760.0), px(720.0)));
     cx.run_until_parked();
     let (remote, local) = open_both_sources(
         cx,
@@ -7471,7 +7310,7 @@ async fn replacing_an_existing_target_is_what_the_user_confirmed(cx: &mut TestAp
         "the target really holds the content now"
     );
     // The transfers page reads the same list.
-    click(cx, "nav.transfers");
+    go(cx, crate::app::actions::GoToTransfers);
     assert!(
         cx.debug_bounds("row.0").is_some(),
         "the finished transfer is listed on its own page"
@@ -7977,8 +7816,11 @@ async fn the_transfer_center_keeps_a_task_after_the_file_view_closes(cx: &mut Te
         1,
         "closing the file view does not stop the transfer"
     );
-    click(cx, "nav.transfers");
-    assert_eq!(destination_of(&view, cx), Destination::Transfers);
+    go(cx, crate::app::actions::GoToTransfers);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Transfers)
+    );
     assert!(
         cx.debug_bounds("transfers.center.summary.0").is_some(),
         "the same task is on the transfer center"
@@ -8052,7 +7894,7 @@ async fn an_overwrite_answer_from_the_transfer_center_is_the_same_decision(
         !cx.update(|_window, app| view.read(app).files_visible(id)),
         "the file view is closed"
     );
-    click(cx, "nav.transfers");
+    go(cx, crate::app::actions::GoToTransfers);
     assert!(
         cx.debug_bounds("transfers.center.overwrite.keep.0")
             .is_some(),
@@ -8205,7 +8047,7 @@ async fn a_refused_resume_stays_failed_and_transfer_again_is_a_new_task(cx: &mut
     );
 
     click(cx, "files.close");
-    click(cx, "nav.transfers");
+    go(cx, crate::app::actions::GoToTransfers);
     assert!(cx.debug_bounds("transfers.center.restart.0").is_some());
     click(cx, "transfers.center.restart.0");
     let starts = transfers.starts();
@@ -8374,7 +8216,7 @@ async fn escape_closes_the_palette_without_running_anything(cx: &mut TestAppCont
     cx.run_until_parked();
     focus_root(&view, cx);
 
-    click(cx, "palette.open");
+    go(cx, crate::app::actions::OpenPalette);
     assert!(cx.update(|_window, app| view.read(app).palette_open()));
     cx.simulate_input("hosts");
     cx.run_until_parked();
@@ -8407,7 +8249,7 @@ async fn a_search_without_a_match_says_so(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
-    click(cx, "palette.open");
+    go(cx, crate::app::actions::OpenPalette);
     cx.simulate_input("zzqqxx");
     cx.run_until_parked();
     assert!(cx.update(|_window, app| view.read(app).palette_titles().is_empty()));
@@ -8812,65 +8654,6 @@ fn every_ssh_next_step_is_translated() {
 // Managing session records
 // ---------------------------------------------------------------------------
 
-/// The ids of the records that are closed, for the management tests.
-fn closed_records(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> Vec<SessionId> {
-    cx.update(|_window, app| view.read(app).workspace().closed_sessions())
-}
-
-#[gpui::test]
-async fn the_sessions_page_lists_every_session_while_tabs_are_open(cx: &mut TestAppContext) {
-    let Some((view, cx)) = two_shells(cx) else {
-        return;
-    };
-    // One tab closed leaves a record; one is still open and on screen.
-    click(cx, "session.tab.close.0");
-    assert_eq!(closed_records(cx, &view).len(), 1);
-
-    click(cx, "nav.sessions");
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
-    assert!(
-        cx.debug_bounds("row.0").is_some() && cx.debug_bounds("row.1").is_some(),
-        "the page reached from the sidebar lists the sessions, the closed one included"
-    );
-    assert!(
-        cx.debug_bounds("sessions.closed").is_some(),
-        "the list says how many records are closed and offers to clear them"
-    );
-}
-
-#[gpui::test]
-async fn a_closed_record_can_be_removed_and_all_closed_ones_cleared(cx: &mut TestAppContext) {
-    let Some((view, cx)) = two_shells(cx) else {
-        return;
-    };
-    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
-    click(cx, "session.tab.close.1");
-    click(cx, "session.tab.close.0");
-    assert_eq!(closed_records(cx, &view).len(), 2);
-
-    // Every tab is closed, so the local page lists the records.
-    click(cx, "nav.local");
-    click(cx, "row.remove.0");
-    let remaining = closed_records(cx, &view);
-    assert_eq!(
-        remaining.len(),
-        1,
-        "only the record whose button was pressed went"
-    );
-    assert!(
-        cx.update(|_window, app| view.read(app).workspace().session(tabs[0]).is_none()),
-        "the first record is the one removed"
-    );
-
-    click(cx, "sessions.remove_closed");
-    assert!(closed_records(cx, &view).is_empty());
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).workspace().sessions().count()),
-        0,
-        "nothing but closed records was there, so nothing is left"
-    );
-}
-
 #[gpui::test]
 async fn removing_an_open_session_closes_it_first(cx: &mut TestAppContext) {
     let Some((view, cx)) = two_shells(cx) else {
@@ -8885,44 +8668,6 @@ async fn removing_an_open_session_closes_it_first(cx: &mut TestAppContext) {
         "the removed session's tab closed; the other one is untouched"
     );
     assert!(cx.update(|_window, app| view.read(app).workspace().session(tabs[0]).is_none()));
-}
-
-#[gpui::test]
-async fn a_session_row_menu_opens_on_right_click_and_reopens_a_closed_shell(
-    cx: &mut TestAppContext,
-) {
-    let Some((view, cx)) = two_shells(cx) else {
-        return;
-    };
-    click(cx, "session.tab.close.1");
-    click(cx, "session.tab.close.0");
-    click(cx, "nav.local");
-    let closed = closed_records(cx, &view);
-
-    let center = bounds_of(cx, "row.0").center();
-    cx.simulate_mouse_down(center, MouseButton::Right, Modifiers::default());
-    cx.simulate_mouse_up(center, MouseButton::Right, Modifiers::default());
-    cx.run_until_parked();
-    assert!(cx.update(|_window, app| view.read(app).session_menu_open()));
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    assert!(
-        !cx.update(|_window, app| view.read(app).session_menu_open()),
-        "Escape closes the row menu"
-    );
-
-    cx.simulate_mouse_down(center, MouseButton::Right, Modifiers::default());
-    cx.simulate_mouse_up(center, MouseButton::Right, Modifiers::default());
-    cx.run_until_parked();
-    click(cx, "session.menu.reopen");
-    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
-    assert_eq!(tabs.len(), 1, "reopening started the shell again in a tab");
-    let after = closed_records(cx, &view);
-    assert_eq!(
-        after.len(),
-        closed.len() - 1,
-        "the reopened record does not stay behind as a closed copy"
-    );
 }
 
 #[test]
@@ -8969,7 +8714,7 @@ fn dialog_view(
 
 /// Fills the dialog for a host on `127.0.0.1:1`, which refuses at once if dialled.
 fn fill_new_host(cx: &mut VisualTestContext) {
-    click(cx, "header.primary");
+    click(cx, "hosts.new");
     assert!(
         cx.debug_bounds("hosts.editor").is_some(),
         "the form opens as a dialog"
@@ -9099,7 +8844,7 @@ async fn the_dialog_shows_the_fields_of_the_chosen_sign_in_and_closes_on_escape(
     cx: &mut TestAppContext,
 ) {
     let (view, cx, _dir) = dialog_view(cx, Vec::new());
-    click(cx, "header.primary");
+    click(cx, "hosts.new");
     click(cx, "hosts.auth.remote.method.agent");
     let auth = cx.update(|_window, app| {
         view.read(app)
@@ -9163,7 +8908,7 @@ async fn the_startup_command_is_typed_once_the_connection_is_live(cx: &mut TestA
 async fn local_and_remote_sessions_share_the_workspace(cx: &mut TestAppContext) {
     let (view, cx, _dir) =
         dialog_view(cx, vec![stored_host("web", "10.0.0.5", 22, "deploy", None)]);
-    click(cx, "nav.local");
+    go(cx, crate::app::actions::GoToLocalShells);
     let local = start_local_session(cx, &view);
 
     click(cx, "nav.hosts");
@@ -9243,15 +8988,14 @@ async fn local_and_remote_sessions_share_the_workspace(cx: &mut TestAppContext) 
         );
     }
 
-    click(cx, "nav.sessions");
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
-    assert!(
-        cx.debug_bounds("row.0").is_some(),
-        "the sessions page lists what the workspace is showing"
-    );
+    // The hosts home and the terminal tab of the session are one click apart.
+    click(cx, "nav.hosts");
+    assert_eq!(destination_of(&view, cx), Destination::Hosts);
+    go(cx, crate::app::actions::GoToLocalShells);
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
     assert!(
         cx.debug_bounds("session.identity").is_some(),
-        "leaving the terminal does not hide which session is current"
+        "coming back shows which session is current"
     );
 }
 
@@ -9292,9 +9036,9 @@ async fn a_quick_connection_does_not_write_a_host_until_asked(cx: &mut TestAppCo
         "the password is not written"
     );
 
-    click(cx, "nav.sessions");
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
-    click(cx, "palette.open");
+    go(cx, crate::app::actions::GoToLocalShells);
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    go(cx, crate::app::actions::OpenPalette);
     assert!(cx.update(|_window, app| view.read(app).palette_open()));
 }
 
@@ -9382,53 +9126,6 @@ async fn a_quick_connection_can_be_saved_as_a_host_afterwards(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-async fn quick_connect_opens_on_the_sessions_list(cx: &mut TestAppContext) {
-    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
-    cx.simulate_resize(design_window());
-    cx.run_until_parked();
-
-    click(cx, "nav.sessions");
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
-    assert!(
-        cx.debug_bounds("quick.panel").is_none(),
-        "the sessions list does not show the form until it is asked for"
-    );
-
-    click(cx, "shell.menu");
-    click(cx, "menu.quick");
-    assert_eq!(
-        destination_of(&view, cx),
-        Destination::Sessions,
-        "opening quick connect stays on the sessions list"
-    );
-    assert!(cx.debug_bounds("quick.panel").is_some());
-    assert!(cx.debug_bounds("quick.address").is_some());
-    assert!(cx.update(|_window, app| view.read(app).quick_form_open()));
-
-    click(cx, "quick.close");
-    assert!(!cx.update(|_window, app| view.read(app).quick_form_open()));
-
-    click(cx, "palette.open");
-    cx.simulate_input("Quick connect");
-    cx.run_until_parked();
-    let titles = cx.update(|_window, app| view.read(app).palette_titles());
-    assert_eq!(
-        titles.first().map(String::as_str),
-        Some(ENGLISH.quick_connect),
-        "the palette offers quick connect, got {titles:?}"
-    );
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
-    assert!(cx.update(|_window, app| view.read(app).quick_form_open()));
-    assert!(
-        cx.debug_bounds("quick.panel").is_some(),
-        "the command palette mounts the form on the sessions list"
-    );
-    assert!(cx.debug_bounds("quick.address").is_some());
-}
-
-#[gpui::test]
 async fn quick_connect_names_the_field_when_input_is_rejected(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
@@ -9479,7 +9176,7 @@ async fn quick_connect_names_the_field_when_input_is_rejected(cx: &mut TestAppCo
         )
     );
 
-    click(cx, "status.language");
+    go(cx, ToggleLanguage);
     click(cx, "quick.connect");
     let reason = cx
         .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
@@ -9513,7 +9210,7 @@ async fn quick_connect_names_the_field_when_input_is_rejected(cx: &mut TestAppCo
         ""
     );
 
-    click(cx, "status.language");
+    go(cx, ToggleLanguage);
     click(cx, "quick.connect");
     let reason = cx
         .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
@@ -9534,7 +9231,7 @@ async fn quick_connect_names_the_field_when_input_is_rejected(cx: &mut TestAppCo
         "{reason}"
     );
 
-    click(cx, "status.language");
+    go(cx, ToggleLanguage);
     click(cx, "quick.connect");
     let reason = cx
         .update(|_window, app| view.read(app).quick_refusal().map(str::to_owned))
@@ -9679,7 +9376,7 @@ async fn saving_a_quick_host_shows_a_write_failure_on_the_session_bar(cx: &mut T
     cx.run_until_parked();
 
     assert!(cx.debug_bounds("session.save_host").is_some());
-    click(cx, "status.language");
+    go(cx, ToggleLanguage);
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().locale()),
         Locale::Chinese
@@ -9762,7 +9459,9 @@ async fn two_connection_forms_keep_their_own_secrets(cx: &mut TestAppContext) {
     );
     click(cx, "hosts.connect.0");
     type_into(cx, "remote.password", "alpha-secret");
-    click(cx, "hosts.connect.1");
+    // The dialog covers the page, so the next host is opened the way the command
+    // palette does it.
+    open_saved_host(cx, &view, 1);
     type_into(cx, "remote.password", "beta-secret");
     assert!(cx.debug_bounds("attempt.others").is_some());
     click(cx, "attempt.row.0");
@@ -9926,6 +9625,8 @@ async fn connection_attempts_wait_and_cancel_on_their_own(cx: &mut TestAppContex
     cx.update(|_window, app| {
         view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
     });
+    // The first attempt keeps running behind its tab while the next host is chosen.
+    click(cx, "remote.hide");
     click(cx, "hosts.connect.1");
     cx.update(|_window, app| {
         view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
@@ -9938,6 +9639,7 @@ async fn connection_attempts_wait_and_cancel_on_their_own(cx: &mut TestAppContex
     assert!(cx.debug_bounds("attempt.others").is_some());
     assert!(cx.debug_bounds("session.tab.1").is_some());
 
+    click(cx, "remote.hide");
     click(cx, "session.tab.close.0");
     assert_eq!(
         cx.update(|_window, app| view.read(app).pending_attempt_count()),
@@ -9947,13 +9649,14 @@ async fn connection_attempts_wait_and_cancel_on_their_own(cx: &mut TestAppContex
     let waiting = cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
     assert!(waiting, "the remaining attempt is still polled");
 
-    click(cx, "nav.local");
+    go(cx, crate::app::actions::GoToLocalShells);
     assert_eq!(destination_of(&view, cx), Destination::LocalShells);
-    click(cx, "palette.open");
+    go(cx, crate::app::actions::OpenPalette);
     assert!(cx.update(|_window, app| view.read(app).palette_open()));
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    click(cx, "nav.hosts");
+    // The attempt that is left is a tab; its dialog comes back from there.
+    click(cx, "session.tab.0");
     click(cx, "remote.close");
     assert_eq!(
         cx.update(|_window, app| view.read(app).pending_attempt_count()),
@@ -9982,6 +9685,7 @@ async fn one_attempt_failing_leaves_the_other_waiting(cx: &mut TestAppContext) {
             );
         });
     });
+    click(cx, "remote.hide");
     click(cx, "hosts.connect.1");
     cx.update(|_window, app| {
         view.update(app, |view, cx| view.script_remote_attempt(Vec::new(), cx));
@@ -10023,9 +9727,9 @@ async fn one_attempt_failing_leaves_the_other_waiting(cx: &mut TestAppContext) {
         cx.debug_bounds("remote.failure").is_some(),
         "cancelling the other attempt leaves this failure on screen"
     );
-    click(cx, "nav.sessions");
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
-    click(cx, "palette.open");
+    go(cx, crate::app::actions::GoToLocalShells);
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+    go(cx, crate::app::actions::OpenPalette);
     assert!(cx.update(|_window, app| view.read(app).palette_open()));
 }
 
@@ -10053,7 +9757,7 @@ async fn a_failed_host_file_does_not_block_the_rest_of_the_window(cx: &mut TestA
     );
     assert!(cx.debug_bounds("state.card").is_some());
 
-    click(cx, "nav.local");
+    go(cx, crate::app::actions::GoToLocalShells);
     assert_eq!(destination_of(&view, cx), Destination::LocalShells);
     if let Some(local) = local {
         assert_eq!(
@@ -10063,7 +9767,7 @@ async fn a_failed_host_file_does_not_block_the_rest_of_the_window(cx: &mut TestA
         let sent = sent_after_typing(cx, &view, local, "still-typing");
         assert!(sent.contains("still-typing"), "{sent:?}");
     }
-    click(cx, "palette.open");
+    go(cx, crate::app::actions::OpenPalette);
     assert!(cx.update(|_window, app| view.read(app).palette_open()));
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
@@ -10077,43 +9781,6 @@ async fn a_failed_host_file_does_not_block_the_rest_of_the_window(cx: &mut TestA
 // ---------------------------------------------------------------------------
 // Collapsing the sidebar
 // ---------------------------------------------------------------------------
-
-#[gpui::test]
-async fn the_sidebar_collapses_to_its_icons_and_navigation_keeps_working(cx: &mut TestAppContext) {
-    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
-    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
-    cx.simulate_resize(minimum_window());
-    cx.run_until_parked();
-    let wide = bounds_of(cx, "rail").size.width;
-
-    click(cx, "rail.toggle");
-    assert!(cx.update(|_window, app| view.read(app).rail_collapsed()));
-    // The rail is drawn again at its narrow width (bounds of a selector keep the latest
-    // frame that drew it, and both widths draw "rail").
-    let narrow = bounds_of(cx, "rail").size.width;
-    assert!(
-        narrow < wide / 2.0,
-        "collapsed to its icons: {narrow:?} vs {wide:?}"
-    );
-
-    // Every page is still one click away, by its icon.
-    click(cx, "nav.hosts");
-    assert_eq!(destination_of(&view, cx), Destination::Hosts);
-    let viewport = minimum_window();
-    for destination in Destination::ALL {
-        assert_fits_inside(
-            bounds_of(cx, destination.debug_selector()),
-            viewport,
-            destination.debug_selector(),
-        );
-    }
-
-    // The shortcut expands it again from anywhere in the window.
-    focus_root(&view, cx);
-    cx.simulate_keystrokes(Platform::current().sidebar_keystroke());
-    cx.run_until_parked();
-    assert!(!cx.update(|_window, app| view.read(app).rail_collapsed()));
-}
 
 // ---------------------------------------------------------------------------
 // The light palette
@@ -10252,7 +9919,8 @@ async fn the_theme_control_switches_the_palette(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
-    click(cx, "theme.control");
+    cx.update(|_window, app| view.update(app, |view, cx| view.cycle_theme(cx)));
+    cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).theme_choice()),
         theme::ThemeChoice::Light
@@ -10263,7 +9931,8 @@ async fn the_theme_control_switches_the_palette(cx: &mut TestAppContext) {
         gpui::rgb(light(palette::CANVAS)),
         "a token resolves to its light value"
     );
-    click(cx, "theme.control");
+    cx.update(|_window, app| view.update(app, |view, cx| view.cycle_theme(cx)));
+    cx.run_until_parked();
     assert_eq!(theme::appearance(), theme::Appearance::Dark, "drawn dark");
     // Leave the thread as the other tests expect it.
     theme::set_appearance(theme::Appearance::Dark);
@@ -10451,8 +10120,8 @@ async fn nested_splits_keep_input_and_resize_on_the_active_pane(cx: &mut TestApp
     });
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("workspace.empty").is_some(),
-        "the last pane leaves an empty state"
+        cx.update(|_window, app| view.read(app).home_is_shown_for_test()),
+        "the last pane leaves the hosts home, with its shells and servers"
     );
     assert!(
         cx.debug_bounds("shell.picker").is_some()
@@ -10657,7 +10326,10 @@ async fn a_restored_forward_is_listed_and_stays_unbound(cx: &mut TestAppContext)
     focus_root(&view, cx);
     cx.dispatch_action(GoToForwards);
     cx.run_until_parked();
-    assert_eq!(destination_of(&view, cx), Destination::Forwards);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Forwards)
+    );
     assert!(
         cx.debug_bounds("forwards.row.0").is_some(),
         "the saved rule is on the page"
@@ -10987,7 +10659,10 @@ async fn a_forward_whose_host_was_deleted_explains_that_on_its_row(cx: &mut Test
         0,
         "starting does not dial a host that is not saved"
     );
-    assert_eq!(destination_of(&view, cx), Destination::Forwards);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Forwards)
+    );
     assert!(cx.debug_bounds("forwards.exposure").is_none());
     assert!(cx.debug_bounds("forwards.fault.0").is_some());
     assert!(!cx.update(|_window, app| view.read(app).forward_listening_for_test(id)));
@@ -11078,23 +10753,6 @@ async fn a_single_pane_has_no_frame_and_a_split_brings_the_pane_headers(cx: &mut
 }
 
 #[gpui::test]
-async fn an_empty_sessions_page_shows_one_empty_state(cx: &mut TestAppContext) {
-    // Opened straight on the sessions page, so the welcome (which shares the
-    // selector) is never drawn.
-    let mut workspace = Workspace::new();
-    workspace.select(Destination::Sessions);
-    let (view, cx) =
-        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
-    cx.simulate_resize(design_window());
-    cx.run_until_parked();
-    assert_eq!(destination_of(&view, cx), Destination::Sessions);
-    assert!(
-        cx.debug_bounds("workspace.empty").is_none(),
-        "no session was ever opened, so there is no pane to explain"
-    );
-}
-
-#[gpui::test]
 async fn start_all_starts_every_waiting_local_pane(cx: &mut TestAppContext) {
     let dir = TempDir::new("start-all");
     seed(&dir.store(), Vec::new());
@@ -11136,5 +10794,95 @@ async fn start_all_starts_every_waiting_local_pane(cx: &mut TestAppContext) {
     assert_eq!(
         cx.update(|_window, app| view.read(app).open_sessions().len()),
         2
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The redesigned shell: caption, settings and port forwarding
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn a_press_on_the_caption_does_not_take_the_keyboard(cx: &mut TestAppContext) {
+    // The caption is for moving the window. A press there must not move the keyboard
+    // out of the terminal, or the next keystroke would go nowhere.
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    click(cx, "header.primary");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane().cloned())
+        .expect("a terminal is open");
+    assert!(cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)));
+
+    let caption = bounds_of(cx, "header.drag").center();
+    cx.simulate_mouse_move(caption, None, Modifiers::default());
+    cx.simulate_mouse_down(caption, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(caption, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "the caption leaves the keyboard where it was"
+    );
+}
+
+#[gpui::test]
+async fn the_settings_page_changes_theme_language_and_font_size(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    assert_eq!(destination_of(&view, cx), Destination::Settings);
+
+    click(cx, "settings.theme.2");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).theme_choice()),
+        theme::ThemeChoice::Dark
+    );
+    click(cx, "settings.language.1");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese
+    );
+    click(cx, "settings.zoom.2");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Comfortable
+    );
+    let before = cx.update(|_window, app| view.read(app).workspace().local_font_size());
+    click(cx, "settings.font.more");
+    let after = cx.update(|_window, app| view.read(app).workspace().local_font_size());
+    assert!(after > before, "A+ makes the terminal font larger");
+}
+
+#[gpui::test]
+async fn the_tunnel_form_names_its_fields_and_says_what_it_will_do(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tunnel-form");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = hosts_view(cx, dir.store());
+    click(cx, "hosts.forwards.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Forwards)
+    );
+    click(cx, "forwards.new");
+    assert!(cx.debug_bounds("forwards.form").is_some());
+    assert!(cx.debug_bounds("forwards.listen").is_some());
+    assert!(cx.debug_bounds("forwards.target").is_some());
+    assert!(
+        cx.debug_bounds("forwards.preview").is_some(),
+        "the form says in one sentence what the tunnel will do"
+    );
+
+    // A SOCKS proxy has no fixed destination, so its target fields go away.
+    click(cx, "forwards.kind.2");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_editor_kind_for_test()),
+        Some(shellune_core::ForwardKind::Dynamic)
     );
 }

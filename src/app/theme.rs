@@ -118,8 +118,6 @@ pub mod type_scale {
     pub const TITLE: f32 = 15.0;
     /// Destination title in the header.
     pub const HEADING: f32 = 17.0;
-    /// Product name mark.
-    pub const DISPLAY: f32 = 15.0;
     /// The welcome title on an empty page.
     pub const HERO: f32 = 24.0;
 }
@@ -535,19 +533,9 @@ impl Metrics {
         self.scale(208.0)
     }
 
-    /// Width of the sidebar when it is collapsed to its icons.
-    pub fn collapsed_rail_width(self) -> Pixels {
-        self.scale(56.0)
-    }
-
     /// Height of the header that names the current object.
     pub fn header_height(self) -> Pixels {
         self.scale(52.0)
-    }
-
-    /// Height of one navigation entry.
-    pub fn nav_row_height(self) -> Pixels {
-        self.scale(34.0)
     }
 
     /// Height of one list row.
@@ -585,19 +573,6 @@ impl Metrics {
         self.scale(32.0)
     }
 
-    /// Widest a reading column of cards and rows grows to.
-    ///
-    /// Lists and forms stop widening here so a maximised window does not stretch a
-    /// host row across a whole monitor; the terminal ignores it and fills the panel.
-    pub fn content_max_width(self) -> Pixels {
-        self.scale(880.0)
-    }
-
-    /// Gap between panels.
-    pub fn panel_gap(self) -> Pixels {
-        self.scale(spacing::LOOSE)
-    }
-
     /// Body text size.
     pub fn body_size(self) -> Pixels {
         self.scale(type_scale::BODY)
@@ -626,11 +601,6 @@ impl Metrics {
     /// Welcome title size.
     pub fn hero_size(self) -> Pixels {
         self.scale(type_scale::HERO)
-    }
-
-    /// Product name size.
-    pub fn display_size(self) -> Pixels {
-        self.scale(type_scale::DISPLAY)
     }
 
     /// Weight for body copy.
