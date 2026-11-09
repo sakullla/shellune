@@ -1230,6 +1230,7 @@ pub fn path_problem_text(problem: &PathProblem, strings: &Strings) -> &'static s
         PathProblem::Empty => strings.transfers_problem_empty_path,
         PathProblem::NoName => strings.transfers_problem_no_name,
         PathProblem::NeedsRecursion => strings.transfers_problem_needs_recursion,
+        PathProblem::DirectoryNeedsScp => strings.transfers_problem_directory_needs_scp,
     }
 }
 
@@ -1241,6 +1242,7 @@ pub fn transfer_problem_text(problem: &TransferProblem, strings: &Strings) -> &'
         TransferProblem::DirectoryUnknown => strings.transfers_problem_no_directory,
         TransferProblem::CommandRefused => strings.transfers_problem_no_connection,
         TransferProblem::DirectoryNeedsRecursion => strings.transfers_problem_needs_recursion,
+        TransferProblem::DirectoryNeedsScp => strings.transfers_problem_directory_needs_scp,
     }
 }
 

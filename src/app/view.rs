@@ -1908,21 +1908,29 @@ impl ShelluneView {
         );
     }
 
-    /// Asks where one remote entry should be downloaded to (R10).
+    /// Asks which remote path is downloaded, and where it goes (R10).
     ///
     /// The remote path is editable for the same reason an upload's directory is, and the
     /// folder starts at this account's home directory: a real place on this machine that
     /// the user can correct, instead of an empty field with no hint.
-    fn files_ask_download(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
-        let Some(directory) = self
+    ///
+    /// A row asks about the entry it names. The toolbar and the failure card ask about
+    /// nothing in particular - a server without an SFTP subsystem has no listing to name
+    /// an entry from - so the remote path is typed, starting at that account's home, and
+    /// the download is the same task either way.
+    fn files_ask_download(&mut self, id: SessionId, name: Option<&str>, cx: &mut Context<Self>) {
+        let directory = self
             .files
             .browser(id)
             .and_then(|browser| browser.current_directory())
-            .map(str::to_owned)
-        else {
-            return;
+            .map(str::to_owned);
+        let remote = match (directory.as_deref(), name) {
+            (Some(directory), Some(name)) => join_path(directory, name),
+            (Some(directory), None) => directory.to_owned(),
+            // No listing means no directory to start from; `~` is where a session
+            // starts, and it is a path the user can see and correct before confirming.
+            (None, _) => "~".to_owned(),
         };
-        let remote = join_path(&directory, name);
         let protocol = self.session_protocol(id);
         let placeholder = self.strings().transfers_download_placeholder;
         let suggested = default_download_directory();
@@ -2058,6 +2066,10 @@ impl ShelluneView {
                     // was typed, so the field says so; a connection that could not take
                     // the command is not, and is reported beside the list instead.
                     TransferProblem::DirectoryNeedsRecursion => Some(PathProblem::NeedsRecursion),
+                    // A directory over a protocol that copies one file has its own next
+                    // step - the other protocol - so the question names it instead of
+                    // calling the directory a path without a name.
+                    TransferProblem::DirectoryNeedsScp => Some(PathProblem::DirectoryNeedsScp),
                 };
                 match (field_problem, self.files_dialog.as_mut()) {
                     (Some(field_problem), Some(dialog)) => dialog.fail_path(field_problem),
@@ -8294,7 +8306,9 @@ impl ShelluneView {
         // A server without an SFTP subsystem cannot be browsed, but its own `scp` can
         // still copy a file. The reason and the next step are both stated, because "the
         // directory cannot be listed" is not the same answer as "nothing can be copied",
-        // and only the first one is true.
+        // and only the first one is true. Both directions are offered here as a path the
+        // user types: with no listing there is no row to start an upload or a download
+        // from, and the card is where the missing entry would otherwise be.
         if source == FileSource::Remote && matches!(failure, BrowseFailure::Unavailable { .. }) {
             let hint_id = files_element_id(source, "failure.scp.hint");
             card = card.child(
@@ -8303,6 +8317,29 @@ impl ShelluneView {
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .debug_selector(move || hint_id.to_string())
                     .child(SharedString::from(strings.files_sftp_scp_hint)),
+            );
+            let upload_id = files_element_id(source, "failure.scp.upload");
+            let download_id = files_element_id(source, "failure.scp.download");
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .child(self.text_button(
+                        upload_id,
+                        strings.transfers_upload,
+                        Variant::Secondary,
+                        cx,
+                        move |view, cx| view.files_ask_upload(id, cx),
+                    ))
+                    .child(self.text_button(
+                        download_id,
+                        strings.transfers_download,
+                        Variant::Secondary,
+                        cx,
+                        move |view, cx| view.files_ask_download(id, None, cx),
+                    )),
             );
         }
         // The terminal still owns the connection, so Refresh is the action that
@@ -8344,6 +8381,10 @@ impl ShelluneView {
         let changing = browser.is_changing();
         let state = browser.state().clone();
         let remote = source == FileSource::Remote;
+        // A listing is where a row's own download lives. Without one there is no entry
+        // to click, so both directions are offered as a path the user types: that is the
+        // only way a server without an SFTP subsystem copies a file at all.
+        let manual_remote = remote && !matches!(&state, BrowseState::Ready(_));
         let (title, subtitle) = match source {
             FileSource::Remote => (host, target),
             FileSource::Local => (ux.files_this_computer.to_owned(), host),
@@ -8399,6 +8440,23 @@ impl ShelluneView {
                 )
                 .ml(metrics.scale(spacing::HAIRLINE)),
             );
+            // With a listing, a download starts from the entry a row names. Without one
+            // - a server that offers no SFTP subsystem - the remote path is typed, and
+            // then the download has to be reachable from here as well: a copy that only
+            // works in one direction is not the file transfer the server can still do.
+            if manual_remote {
+                tools = tools.child(
+                    self.icon_text_button(
+                        SharedString::from("files.download"),
+                        Icon::Download,
+                        strings.transfers_download,
+                        Variant::Soft,
+                        cx,
+                        move |view, cx| view.files_ask_download(id, None, cx),
+                    )
+                    .ml(metrics.scale(spacing::HAIRLINE)),
+                );
+            }
         }
 
         let header = div()
@@ -9611,7 +9669,7 @@ impl ShelluneView {
                         strings.transfers_download,
                         false,
                         cx,
-                        move |view, cx| view.files_ask_download(id, &download, cx),
+                        move |view, cx| view.files_ask_download(id, Some(&download), cx),
                     ))
                     .child(self.files_action(
                         SharedString::from(format!("files.to_local.{index}")),
@@ -9784,6 +9842,15 @@ impl ShelluneView {
         self.files_dialog
             .as_ref()
             .is_some_and(FilesDialog::recursive)
+    }
+
+    /// Why the open transfer question refused the path, for a test.
+    #[cfg(test)]
+    pub fn files_question_path_problem(&self) -> Option<PathProblem> {
+        self.files_dialog
+            .as_ref()
+            .and_then(FilesDialog::path_problem)
+            .copied()
     }
 
     /// Sends the open question, for a test that cannot press the confirm button.

@@ -463,6 +463,15 @@ fn a_file_goes_up_and_comes_down_over_a_server_without_sftp() {
     let _ = std::fs::remove_dir_all(&local);
 }
 
+/// A name of this run's own, so two runs cannot see each other's files.
+fn own_name(prefix: &str, suffix: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros())
+        .unwrap_or(0);
+    format!("{prefix}-{stamp}{suffix}")
+}
+
 /// Whether the disposable server's configuration offers the SFTP subsystem.
 fn server_config_mentions_sftp(server: &Harness) -> bool {
     let config = std::fs::read_to_string(server.dir().join("sshd_config")).unwrap_or_default();
@@ -470,6 +479,109 @@ fn server_config_mentions_sftp(server: &Harness) -> bool {
         .lines()
         .map(str::trim)
         .any(|line| line.to_lowercase().starts_with("subsystem") && line.contains("sftp"))
+}
+
+#[test]
+fn a_path_that_says_home_really_copies_into_and_out_of_the_account_home() {
+    // The question a server without SFTP leaves a user with starts at `~`, because that
+    // is the only remote directory the window can know without a listing. `~` is data
+    // the remote shell expands, so the sink has to be started in the real home - not in
+    // a directory literally called `~` at the root, which is what normalizing the path
+    // first would have asked for.
+    let Some(server) = without_sftp().as_ref() else {
+        if skip("a copy into and out of the home directory", without_sftp()) {
+            return;
+        }
+        unreachable!()
+    };
+    let local = scratch_directory("home");
+    let top_name = own_name("shellune-home", ".txt");
+    let sub_name = own_name("scp-home-sub", "");
+    let top_source = local.join("report.txt");
+    let top_bytes = sample(4_096);
+    std::fs::write(&top_source, &top_bytes).expect("the local file can be written");
+    // A directory of its own inside the home, so the `~/sub` case is observable too.
+    shell(
+        server,
+        &format!("mkdir -p {}/{}", quoted(&server.home()), quoted(&sub_name)),
+    )
+    .expect("the subdirectory can be made in the home");
+
+    let (_session, mut link) = live_with_link(server);
+    let mut recorder = Recorder::default();
+
+    // The destination is exactly what the upload question is prefilled with: `~/name`.
+    let home_target = format!("~/{top_name}");
+    let id = start(
+        &mut link,
+        Ask::upload(top_source.to_str().expect("a utf-8 path"), &home_target),
+    );
+    match recorder.until_finished(&mut link, id) {
+        TransferUpdate::Completed { bytes } => {
+            assert_eq!(bytes, top_bytes.len() as u64, "the whole file went up")
+        }
+        other => panic!("the copy into the home directory did not complete: {other:?}"),
+    }
+    let real_target = format!("{}/{}", server.home(), top_name);
+    assert_eq!(
+        server_size(server, &real_target),
+        Some(top_bytes.len() as u64),
+        "the file is in the account's home, under the name that was asked for"
+    );
+    assert!(
+        !server_has(server, &format!("/~/{top_name}")),
+        "nothing was written into a directory called ~ at the root"
+    );
+
+    // A path inside the home, typed the same way, lands in that subdirectory.
+    let sub_target = format!("~/{sub_name}/report.txt");
+    let id = start(
+        &mut link,
+        Ask::upload(top_source.to_str().expect("a utf-8 path"), &sub_target),
+    );
+    assert!(
+        matches!(
+            recorder.until_finished(&mut link, id),
+            TransferUpdate::Completed { .. }
+        ),
+        "the copy into ~/{sub_name} did not complete: {:?}",
+        recorder.updates(id)
+    );
+    assert_eq!(
+        server_listing(server, &format!("{}/{sub_name}", server.home())),
+        vec!["report.txt".to_owned()],
+        "the file arrived inside the subdirectory of the home"
+    );
+
+    // And it comes back down from the same `~/` path.
+    let downloaded = local.join("downloaded.txt");
+    let id = start(
+        &mut link,
+        Ask::download(&home_target, downloaded.to_str().expect("a utf-8 path")),
+    );
+    assert!(
+        matches!(
+            recorder.until_finished(&mut link, id),
+            TransferUpdate::Completed { .. }
+        ),
+        "the download from ~/{top_name} did not complete: {:?}",
+        recorder.updates(id)
+    );
+    assert_eq!(
+        std::fs::read(&downloaded).expect("the downloaded file exists"),
+        top_bytes,
+        "what came out of the home is what went into it"
+    );
+
+    let _ = shell(
+        server,
+        &format!(
+            "rm -f {} && rm -rf {}",
+            quoted(&real_target),
+            quoted(&format!("{}/{sub_name}", server.home()))
+        ),
+    );
+    let _ = std::fs::remove_dir_all(&local);
 }
 
 #[test]
@@ -564,6 +676,48 @@ fn a_directory_is_copied_only_when_recursion_was_chosen() {
     assert_eq!(
         std::fs::read(restored.join("readme.txt")).expect("the top file came down"),
         b"top"
+    );
+    // A tree's whole size is not known while it arrives, so its progress is bytes and
+    // never a percentage: a total that changed per file would be smaller than what was
+    // already written, and 100% of nothing is not a progress report.
+    let reports: Vec<&TransferUpdate> = recorder
+        .updates(id)
+        .into_iter()
+        .filter(|update| matches!(update, TransferUpdate::Progress { .. }))
+        .collect();
+    assert!(
+        !reports.is_empty(),
+        "the recursive download reported how far it had come: {:?}",
+        recorder.updates(id)
+    );
+    let mut highest = 0u64;
+    for update in reports.iter().copied() {
+        let TransferUpdate::Progress { transferred, total } = update else {
+            unreachable!("only progress updates are collected")
+        };
+        assert!(
+            total.is_none(),
+            "a tree download claims no total it cannot know: {update:?}"
+        );
+        assert!(
+            *transferred >= highest,
+            "the bytes written never go backwards: {update:?} after {highest}"
+        );
+        highest = *transferred;
+    }
+    assert_eq!(
+        highest,
+        b"top".len() as u64 + b"nested".len() as u64 + b"deep".len() as u64,
+        "the last report is the whole tree"
+    );
+    assert!(
+        recorder
+            .updates(id)
+            .into_iter()
+            .next_back()
+            .is_some_and(|update| matches!(update, TransferUpdate::Completed { .. })),
+        "the tree is complete only after its last file: {:?}",
+        recorder.updates(id)
     );
     let _ = std::fs::remove_dir_all(&local);
 }

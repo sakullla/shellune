@@ -164,7 +164,7 @@ impl ShelluneView {
                                 false,
                                 "files.menu.download",
                                 Box::new(move |view, cx| {
-                                    view.files_ask_download(id, &download, cx)
+                                    view.files_ask_download(id, Some(&download), cx)
                                 }),
                             )));
                         }

@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use russh::client;
 use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
-use shellune_core::{ResumeRefusal, TransferDirection, TransferFailure, parent_path};
+use shellune_core::{ResumeRefusal, TransferDirection, TransferFailure};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -507,7 +507,7 @@ async fn upload_inner(
     }
 
     let program = remote_program(commands).await?;
-    let target_directory = parent_path(&request.destination).unwrap_or_else(|| ".".to_owned());
+    let target_directory = parent_directory(&request.destination).unwrap_or_else(|| ".".to_owned());
     let mut options = String::new();
     if plan.is_directory() {
         options.push_str("-r ");
@@ -690,7 +690,7 @@ async fn download_inner(
             let mut file = tokio::fs::File::create(partial)
                 .await
                 .map_err(|_| Stop::Failed(TransferFailure::DestinationUnwritable))?;
-            receive_file(&mut pipe, job, &mut file, size, size, written).await?;
+            receive_file(&mut pipe, job, &mut file, size, Some(size), written).await?;
             file.flush()
                 .await
                 .map_err(|_| Stop::Failed(TransferFailure::DestinationUnwritable))?;
@@ -812,7 +812,12 @@ async fn receive_tree(pipe: &mut Pipe, job: &mut Job, root: &Path, written: &mut
                 let mut file = tokio::fs::File::create(&path)
                     .await
                     .map_err(|_| Stop::Failed(TransferFailure::DestinationUnwritable))?;
-                receive_file(pipe, job, &mut file, size, size, written).await?;
+                // A tree's whole size is not known while it arrives - no record names
+                // it and SCP cannot list - so the progress of a tree carries no total
+                // and the view prints bytes instead of a percentage. A total that
+                // changed with every file would be a number smaller than what was
+                // already written.
+                receive_file(pipe, job, &mut file, size, None, written).await?;
                 file.flush()
                     .await
                     .map_err(|_| Stop::Failed(TransferFailure::DestinationUnwritable))?;
@@ -838,12 +843,16 @@ async fn receive_tree(pipe: &mut Pipe, job: &mut Job, root: &Path, written: &mut
 }
 
 /// Reads one file's content into a local file, then its end marker.
+///
+/// `total` is the size of the whole task when it is known, and nothing when it is not:
+/// a tree being received knows only the size of the file that is arriving, so a
+/// percentage of the task would be a percentage of something that is not the task.
 async fn receive_file(
     pipe: &mut Pipe,
     job: &mut Job,
     file: &mut tokio::fs::File,
     size: u64,
-    total: u64,
+    total: Option<u64>,
     written: &mut u64,
 ) -> Step<()> {
     let mut left = size;
@@ -865,11 +874,11 @@ async fn receive_file(
         left -= read as u64;
         *written += read as u64;
         if last_report.elapsed() >= PROGRESS_INTERVAL {
-            job.progress(*written, Some(total));
+            job.progress(*written, total);
             last_report = Instant::now();
         }
     }
-    job.progress(*written, Some(total));
+    job.progress(*written, total);
     // The source writes one zero byte after the content; the sink acknowledges it.
     match pipe.read_byte().await? {
         Some(0) => {}
@@ -950,6 +959,23 @@ fn file_name(path: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+/// The remote directory one target path lies in, exactly as it was typed.
+///
+/// The path a task carries is text the user wrote, and a leading `~` is the one thing
+/// the remote shell expands. Normalizing it first would turn `~/report.txt` into
+/// `/~` - a directory called `~` at the root, which is not this account's home and
+/// does not exist there - while the existence probe beside it asks about the real
+/// home. Keeping the characters as they are means the probe and the sink look at one
+/// place, and only the last name is removed.
+fn parent_directory(path: &str) -> Option<String> {
+    let trimmed = path.trim().trim_end_matches('/');
+    let index = trimmed.rfind('/')?;
+    if index == 0 {
+        return Some("/".to_owned());
+    }
+    Some(trimmed[..index].to_owned())
 }
 
 /// One shell word that is only ever the path it was built from.
@@ -1241,6 +1267,38 @@ mod tests {
         }
         assert_eq!(shell_argument("~/notes.txt"), "\"$HOME\"/'notes.txt'");
         assert_eq!(shell_argument("~"), "\"$HOME\"");
+    }
+
+    #[test]
+    fn a_target_directory_keeps_the_home_path_as_it_was_typed() {
+        // `~` and `~/sub` are what the user typed, and the shell is what expands them.
+        // Normalizing first would ask the sink to write into a directory called `~`
+        // at the root while the existence probe looked in the real home.
+        assert_eq!(parent_directory("~/report.txt").as_deref(), Some("~"));
+        assert_eq!(
+            parent_directory("~/notes/report.txt").as_deref(),
+            Some("~/notes")
+        );
+        assert_eq!(
+            parent_directory("/home/deploy/report.txt").as_deref(),
+            Some("/home/deploy")
+        );
+        assert_eq!(parent_directory("/report.txt").as_deref(), Some("/"));
+        assert_eq!(parent_directory("report.txt"), None);
+        // The sink and the probe now expand to the same place.
+        assert_eq!(
+            shell_argument(&parent_directory("~/report.txt").expect("a parent")),
+            "\"$HOME\""
+        );
+        assert_eq!(
+            shell_argument(&parent_directory("~/notes/report.txt").expect("a parent")),
+            "\"$HOME\"/'notes'"
+        );
+        assert_eq!(shell_argument("~/report.txt"), "\"$HOME\"/'report.txt'");
+        assert_eq!(
+            shell_argument(&parent_directory("/home/deploy/report.txt").expect("a parent")),
+            "'/home/deploy'"
+        );
     }
 
     #[test]

@@ -489,6 +489,8 @@ pub struct Strings {
     pub transfers_problem_no_connection: &'static str,
     /// Reason: the source is a directory and recursion was not chosen.
     pub transfers_problem_needs_recursion: &'static str,
+    /// Reason: the source is a directory and the chosen protocol copies one file.
+    pub transfers_problem_directory_needs_scp: &'static str,
     /// Label of the protocol switch in a transfer question.
     pub transfers_protocol: &'static str,
     /// Protocol name of the SFTP subsystem.
@@ -1139,6 +1141,7 @@ pub static ENGLISH: Strings = Strings {
     transfers_problem_no_directory: "Open a directory first.",
     transfers_problem_no_connection: "The connection cannot take a transfer right now.",
     transfers_problem_needs_recursion: "The source is a directory: choose the recursive copy first.",
+    transfers_problem_directory_needs_scp: "The source is a directory: only traditional SCP copies a directory - choose SCP, then the recursive copy.",
     transfers_protocol: "Protocol",
     transfers_protocol_sftp: "SFTP",
     transfers_protocol_scp: "SCP",
@@ -1147,7 +1150,7 @@ pub static ENGLISH: Strings = Strings {
     transfers_remote_directory: "Remote directory",
     transfers_remote_path: "Remote path",
     transfers_protocol_label: "Protocol",
-    files_sftp_scp_hint: "Listing and managing a directory need SFTP. Copying a file still works with SCP: open Upload, type the remote directory and choose SCP.",
+    files_sftp_scp_hint: "Listing and managing a directory need SFTP. Copying a file still works with SCP: open Upload or Download, type the remote path yourself (for example ~/report.txt) and choose SCP.",
     transfers_close_question: "Closing this session cancels its transfers",
     transfers_close_cancel: "Keep the session open",
     transfers_close_confirm: "Close and cancel",
@@ -1568,6 +1571,7 @@ pub static CHINESE: Strings = Strings {
     transfers_problem_no_directory: "请先打开一个目录。",
     transfers_problem_no_connection: "连接当前无法接受传输。",
     transfers_problem_needs_recursion: "源是一个目录：请先选择递归复制。",
+    transfers_problem_directory_needs_scp: "源是一个目录：只有传统 SCP 能复制目录，请把协议改为 SCP 再勾选递归复制。",
     transfers_protocol: "协议",
     transfers_protocol_sftp: "SFTP",
     transfers_protocol_scp: "SCP",
@@ -1576,7 +1580,7 @@ pub static CHINESE: Strings = Strings {
     transfers_remote_directory: "远端目录",
     transfers_remote_path: "远端路径",
     transfers_protocol_label: "协议",
-    files_sftp_scp_hint: "目录列表与管理需要 SFTP。复制文件仍可用 SCP：打开“上传”，输入远端目录并选择 SCP。",
+    files_sftp_scp_hint: "目录列表与管理需要 SFTP。复制文件仍可用 SCP：打开“上传”或“下载”，手动输入远端路径（例如 ~/报告.txt）并选择 SCP。",
     transfers_close_question: "关闭这个会话会取消它的传输",
     transfers_close_cancel: "保持会话打开",
     transfers_close_confirm: "关闭并取消",

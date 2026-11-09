@@ -72,6 +72,12 @@ pub enum TransferProblem {
     /// A directory is never expanded into a tree behind the user's back: the choice is
     /// explicit, and a task without it would copy nothing meaningful.
     DirectoryNeedsRecursion,
+    /// The source is a directory and the chosen protocol copies one file at a time.
+    ///
+    /// SFTP copies a file; a directory source needs the other protocol and the
+    /// recursive choice, so the reason names that next step instead of saying the path
+    /// has no name - which is what a directory would otherwise be called.
+    DirectoryNeedsScp,
 }
 
 /// Why a download or upload could not be offered at all.
@@ -87,6 +93,8 @@ pub enum PathProblem {
     NoName,
     /// The path names a directory and copying it whole was not chosen.
     NeedsRecursion,
+    /// The path names a directory and only the other protocol copies directories.
+    DirectoryNeedsScp,
 }
 
 /// The transfers of every session this window can move files on.
@@ -213,9 +221,10 @@ impl TransferViews {
         let name = file_name(local).ok_or(TransferProblem::SourceNamesNoFile)?;
         let directory = directory.ok_or(TransferProblem::DirectoryUnknown)?;
         if !protocol.copies_directories() && is_directory(Path::new(local.trim())) {
-            // SFTP copies a file; a directory source would be refused by the worker
-            // anyway, so the window says so before a task is created.
-            return Err(TransferProblem::SourceNamesNoFile);
+            // SFTP copies a file, so a directory source would be refused by the worker
+            // anyway. The window says which protocol can copy it rather than calling a
+            // directory "a path without a name", which would name the wrong problem.
+            return Err(TransferProblem::DirectoryNeedsScp);
         }
         if !recursive && is_directory(Path::new(local.trim())) {
             return Err(TransferProblem::DirectoryNeedsRecursion);

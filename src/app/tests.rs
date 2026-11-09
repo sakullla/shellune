@@ -8206,9 +8206,225 @@ async fn a_server_without_sftp_says_so_and_offers_the_scp_copy_it_still_has(
         cx.debug_bounds("files.failure.scp.hint").is_some(),
         "the next step names the protocol that still copies files"
     );
+    // Both directions stay reachable without a listing: the toolbar and the card each
+    // offer the typed path, because a copy that only works one way is not what this
+    // server can still do.
+    assert!(
+        cx.debug_bounds("files.upload").is_some(),
+        "the toolbar still offers the typed upload"
+    );
+    assert!(
+        cx.debug_bounds("files.download").is_some(),
+        "the toolbar offers the typed download as well"
+    );
+    assert!(
+        cx.debug_bounds("files.failure.scp.upload").is_some(),
+        "the card offers the upload beside the reason"
+    );
+    assert!(
+        cx.debug_bounds("files.failure.scp.download").is_some(),
+        "the card offers the download beside the reason"
+    );
     // The upload question is still reachable, and it is where the remote path is typed.
     click(cx, "files.upload");
     assert!(cx.debug_bounds("files.question.remote").is_some());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
+        Some("~".to_owned()),
+        "with no listing the remote directory starts at the account's home"
+    );
+}
+
+#[gpui::test]
+async fn a_server_without_sftp_downloads_the_remote_path_the_user_types(cx: &mut TestAppContext) {
+    // R10 asks for an upload *and* a download on a server that offers no SFTP. With no
+    // listing there is no row to start a download from, so the typed remote path is the
+    // only way one can exist - and it has to reach the same task a row would.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    let channel = files.clone();
+    let transfers = TransferAnswers::accepting();
+    let transfer_channel = transfers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(id, "web", "deploy@10.0.0.5:22", Box::new(channel), cx);
+            view.attach_transfers_for_test(id, Box::new(transfer_channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+    files.fail(
+        1,
+        shellune_core::BrowseFailure::Unavailable {
+            reason: "the server refused the sftp subsystem".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+
+    // The card's own download entry opens the question, and the remote path is typed
+    // there instead of picked from a list that does not exist.
+    click(cx, "files.failure.scp.download");
+    assert!(cx.debug_bounds("files.question.remote").is_some());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
+        Some("~".to_owned()),
+        "the typed path starts at the account's home"
+    );
+    // SCP is the protocol that can copy here; the choice belongs to this one task.
+    click(cx, "files.question.protocol.scp");
+    let folder = std::env::temp_dir().join(format!("shellune-scp-download-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("a scratch directory can be made");
+    let folder = folder.to_string_lossy().into_owned();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_remote_for_test("~/report.txt");
+            view.files_question_set_text_for_test(&folder);
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let starts = transfers.starts();
+    assert_eq!(
+        starts.len(),
+        1,
+        "the typed download started exactly one task: {starts:?}"
+    );
+    assert_eq!(starts[0].direction, TransferDirection::Download);
+    assert_eq!(starts[0].protocol, shellune_core::TransferProtocol::Scp);
+    assert_eq!(
+        starts[0].source, "~/report.txt",
+        "the remote path is exactly what was typed, so the shell can expand it"
+    );
+    assert!(
+        starts[0]
+            .destination
+            .ends_with(&format!("{}report.txt", std::path::MAIN_SEPARATOR)),
+        "the file lands under its own name in the chosen folder: {}",
+        starts[0].destination
+    );
+    assert!(
+        !starts[0].resume.is_some(),
+        "an SCP download has nothing to continue"
+    );
+    let _ = std::fs::remove_dir_all(&folder);
+
+    // And the toolbar entry is the same question, not a second kind of task.
+    click(cx, "files.download");
+    assert!(cx.debug_bounds("files.question.remote").is_some());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
+        Some("~".to_owned())
+    );
+}
+
+#[gpui::test]
+async fn a_directory_over_sftp_names_the_protocol_that_can_copy_it(cx: &mut TestAppContext) {
+    // A directory is not "a path without a name": SFTP copies one file, and the step the
+    // user has to take is the other protocol plus the recursive choice. The reason has
+    // to say that, or the field marks a path that is perfectly well written.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_protocol()),
+        Some(shellune_core::TransferProtocol::Sftp),
+        "the question starts at the host's protocol"
+    );
+    let directory = std::env::temp_dir().join(format!("shellune-sftp-tree-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("a scratch directory can be made");
+    let directory = directory.to_string_lossy().into_owned();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test(&directory);
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        transfers.starts().is_empty(),
+        "SFTP copies one file, so nothing was started"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_text().map(str::to_owned)),
+        Some(directory.clone()),
+        "the path that was refused stays in the field"
+    );
+    assert!(
+        cx.debug_bounds("files.question.problem").is_some(),
+        "the question says why it cannot start"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_path_problem()),
+        Some(crate::app::transfers::PathProblem::DirectoryNeedsScp),
+        "a directory over SFTP names the protocol that can copy it, not a missing name"
+    );
+    let reason = crate::app::copy::Locale::English
+        .strings()
+        .transfers_problem_directory_needs_scp;
+    assert!(
+        reason.contains("SCP"),
+        "the reason names the protocol that can copy a directory: {reason}"
+    );
+    assert!(
+        !reason.contains("no file"),
+        "a directory is not a path without a name: {reason}"
+    );
+
+    // The next step really works: SCP with the recursive choice copies the tree.
+    click(cx, "files.question.protocol.scp");
+    click(cx, "files.question.recursive");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test(&directory);
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 1, "the chosen copy started: {starts:?}");
+    assert_eq!(starts[0].protocol, shellune_core::TransferProtocol::Scp);
+    assert!(starts[0].recursive);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[gpui::test]
+async fn a_download_whose_total_is_unknown_shows_bytes_and_no_percentage(cx: &mut TestAppContext) {
+    // A recursive SCP download cannot know the size of the tree while it arrives. What
+    // it reports is bytes: a percentage beside a total that is not the tree would be a
+    // number smaller than what was already written, and a share of the wrong whole is
+    // not progress.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.download.1");
+    assert!(cx.debug_bounds("files.question.remote").is_some());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
+        Some("/home/deploy/notes.txt".to_owned()),
+        "a row asks about the entry it names"
+    );
+    click(cx, "files.question.confirm");
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 1, "the download started: {starts:?}");
+    let task = starts[0].transfer;
+
+    transfers.push(shellune_core::TransferEvent::progress(task, 12, None));
+    pump_files(cx, &view);
+    let detail = cx
+        .update(|_window, app| view.read(app).transfer_detail_for_test(task))
+        .expect("the task is listed");
+    assert!(
+        detail.contains("12 B"),
+        "the bytes that arrived are shown: {detail}"
+    );
+    assert!(
+        !detail.contains('%'),
+        "no percentage is claimed for an unknown total: {detail}"
+    );
 }
 
 #[gpui::test]
