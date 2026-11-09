@@ -47,14 +47,17 @@ pub(super) fn tone_icon(tone: Tone) -> Icon {
 }
 
 impl ShelluneView {
-    /// Shows a message in the corner for a while.
+    /// Shows a message in the corner for a while, and says which one it was.
+    ///
+    /// The id lets a caller take the message away when what it describes stops being
+    /// true, instead of leaving a note about a state that is over.
     pub(super) fn toast(
         &mut self,
         tone: Tone,
         title: impl Into<String>,
         detail: Option<String>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> u64 {
         self.next_toast += 1;
         let id = self.next_toast;
         self.toasts.push(Toast {
@@ -69,6 +72,7 @@ impl ShelluneView {
         let stay = if tone == Tone::Danger { LONG } else { SHORT };
         self.expire_toast(id, stay, cx);
         cx.notify();
+        id
     }
 
     /// Takes a toast away after `after`, or later while the pointer is over the
@@ -192,6 +196,15 @@ impl ShelluneView {
         self.toasts
             .iter()
             .map(|toast| toast.title.clone())
+            .collect()
+    }
+
+    /// The tone and title of every toast on screen, oldest first, for a test.
+    #[cfg(test)]
+    pub fn toast_entries(&self) -> Vec<(Tone, String)> {
+        self.toasts
+            .iter()
+            .map(|toast| (toast.tone, toast.title.clone()))
             .collect()
     }
 }

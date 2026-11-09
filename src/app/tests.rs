@@ -40,7 +40,8 @@ use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
 use crate::app::terminal::{
-    PaneState, SearchNote, SourceEvent, TerminalAttention, TerminalPane, TerminalShortcuts,
+    PaneState, SearchNote, SnippetOffer, SourceEvent, TerminalAttention, TerminalPane,
+    TerminalShortcuts,
 };
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
@@ -14362,10 +14363,14 @@ async fn a_multi_line_command_asks_before_it_is_written_and_cancelling_writes_no
 ) {
     let (pane, cx) = pane_with("", cx);
     let body = "cargo fmt\ncargo test";
-    cx.update(|_window, app| {
-        pane.update(app, |pane, cx| pane.stage_snippet(body, true, cx));
-    });
+    let offer =
+        cx.update(|_window, app| pane.update(app, |pane, cx| pane.stage_snippet(body, true, cx)));
     cx.run_until_parked();
+    assert_eq!(
+        offer,
+        SnippetOffer::Waiting,
+        "the pane says nothing has been written yet, so the window cannot claim it was sent"
+    );
     assert_eq!(
         cx.update(|_window, app| pane.read(app).sent().to_vec()),
         Vec::<u8>::new(),
@@ -14389,10 +14394,14 @@ async fn a_multi_line_command_asks_before_it_is_written_and_cancelling_writes_no
     );
 
     // The same block inserted rather than run: no submit, and the prompt says so.
-    cx.update(|_window, app| {
-        pane.update(app, |pane, cx| pane.stage_snippet(body, false, cx));
-    });
+    let offer =
+        cx.update(|_window, app| pane.update(app, |pane, cx| pane.stage_snippet(body, false, cx)));
     cx.run_until_parked();
+    assert_eq!(
+        offer,
+        SnippetOffer::Waiting,
+        "an insert that is held is not reported as inserted either"
+    );
     assert!(
         !cx.update(|_window, app| pane.read(app).pending_paste_runs_for_test()),
         "an insert does not claim it will run"
@@ -14411,11 +14420,16 @@ async fn inserting_a_command_does_not_submit_it_and_running_submits_it_once(
 ) {
     let (pane, cx) = pane_with("", cx);
     // A body saved with a final newline must not submit itself when it is inserted.
-    cx.update(|_window, app| {
+    let offer = cx.update(|_window, app| {
         pane.update(app, |pane, cx| {
             pane.stage_snippet("make deploy\n", false, cx)
-        });
+        })
     });
+    assert_eq!(
+        offer,
+        SnippetOffer::Written,
+        "a plain line is in the pane as soon as it is offered"
+    );
     assert_eq!(
         cx.update(|_window, app| pane.read(app).sent().to_vec()),
         b"make deploy".to_vec(),
@@ -14427,17 +14441,172 @@ async fn inserting_a_command_does_not_submit_it_and_running_submits_it_once(
     );
 
     let before = cx.update(|_window, app| pane.read(app).sent().to_vec());
-    cx.update(|_window, app| {
+    let offer = cx.update(|_window, app| {
         pane.update(app, |pane, cx| {
-            pane.stage_snippet("make deploy\n\n", true, cx);
-        });
+            pane.stage_snippet("make deploy\n\n", true, cx)
+        })
     });
+    assert_eq!(
+        offer,
+        SnippetOffer::Written,
+        "running a single line writes it and asks nothing"
+    );
     assert_eq!(
         String::from_utf8_lossy(&cx.update(|_window, app| pane.read(app).sent().to_vec())),
         "make deploymake deploy\r",
         "running adds exactly one line break after the command, never two"
     );
     assert!(!before.is_empty());
+}
+
+#[gpui::test]
+async fn a_held_command_is_never_reported_as_sent_and_answering_the_prompt_settles_it(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippet-held");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut book = shellune_core::SnippetBook::new();
+    let block = "cargo fmt\ncargo test";
+    let held = book.create("checks", block).expect("a valid command");
+    let plain = book
+        .create("build", "cargo build")
+        .expect("a valid command");
+    shellune_storage::SnippetStore::at(dir.path())
+        .save(&book)
+        .expect("the library saves");
+    let (view, cx) = snippet_view(cx, &dir);
+    let session = live_remote(cx, &view);
+
+    let claims =
+        |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).toast_entries());
+    let claims_success = |entries: &[(Tone, String)]| {
+        entries.iter().any(|(tone, title)| {
+            *tone == Tone::Positive
+                && (title == copy::ENGLISH_UX.snippet_sent
+                    || title == copy::ENGLISH_UX.snippet_inserted)
+        })
+    };
+    let waits = |entries: &[(Tone, String)]| {
+        entries.iter().any(|(tone, title)| {
+            *tone == Tone::Neutral && title == copy::ENGLISH_UX.snippet_waiting
+        })
+    };
+
+    // Running a block asks in the pane first. The corner may point at that prompt, but it
+    // may not say the command was sent while nothing has been written.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(held, true, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("terminal.paste").is_some()
+            && cx
+                .update(|_window, app| {
+                    view.read(app)
+                        .pane_of(session)
+                        .and_then(|pane| pane.read(app).pending_paste_text().map(str::to_owned))
+                })
+                .is_some_and(|waiting| waiting == block),
+        "the pane holds the block and asks before anything is written"
+    );
+    let entries = claims(cx);
+    assert!(
+        waits(&entries),
+        "the corner says the command is waiting in the pane: {entries:?}"
+    );
+    assert!(
+        !claims_success(&entries),
+        "nothing claims a command reached the shell before it was confirmed: {entries:?}"
+    );
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        Vec::<u8>::new(),
+        "not one line of the block is written before the answer"
+    );
+
+    // Choosing not to paste writes nothing, and leaves no note behind that says a command
+    // is waiting for an answer that will never come.
+    click(cx, "terminal.paste.cancel");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        Vec::<u8>::new(),
+        "cancelling writes nothing, so no line of it runs"
+    );
+    let entries = claims(cx);
+    assert!(
+        !claims_success(&entries),
+        "a cancelled command is never reported as sent: {entries:?}"
+    );
+    assert!(
+        !waits(&entries),
+        "the note about the prompt leaves with the prompt: {entries:?}"
+    );
+
+    // Inserting the same block waits the same way, and confirming it types it once.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(held, false, cx));
+    });
+    cx.run_until_parked();
+    let entries = claims(cx);
+    assert!(
+        waits(&entries) && !claims_success(&entries),
+        "a held insert is not reported as inserted either: {entries:?}"
+    );
+    click(cx, "terminal.paste.confirm");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        encode_paste(block, TermMode::empty()),
+        "confirming types the block and submits nothing of its own"
+    );
+    let entries = claims(cx);
+    assert!(
+        !waits(&entries),
+        "the prompt was answered, so the note about it is gone: {entries:?}"
+    );
+
+    // A single line is written straight away, and only then is it reported as inserted.
+    let before = snippet_sent(cx, &view, session);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(plain, false, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        [before, b"cargo build".to_vec()].concat(),
+        "a plain line is in the pane without a question"
+    );
+    let entries = claims(cx);
+    assert!(
+        entries
+            .iter()
+            .any(|(tone, title)| *tone == Tone::Positive
+                && title == copy::ENGLISH_UX.snippet_inserted),
+        "a line that really was inserted says so: {entries:?}"
+    );
+
+    // The same holds for running one: it is written and submitted before it is reported.
+    let before = snippet_sent(cx, &view, session);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(plain, true, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        [before, b"cargo build\r".to_vec()].concat(),
+        "running a plain line submits it once"
+    );
+    let entries = claims(cx);
+    assert!(
+        entries
+            .iter()
+            .any(|(tone, title)| *tone == Tone::Positive && title == copy::ENGLISH_UX.snippet_sent),
+        "a line that really was sent says so: {entries:?}"
+    );
 }
 
 #[gpui::test]

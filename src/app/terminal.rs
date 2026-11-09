@@ -336,6 +336,22 @@ impl TerminalAttention {
     }
 }
 
+/// What offering a saved command to a pane did (R6).
+///
+/// The window may only report what really happened: a body held behind the paste prompt
+/// has not reached the shell, so it is not "inserted" or "sent" until the prompt is
+/// answered, and cancelling it leaves nothing behind but the fact that nothing happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnippetOffer {
+    /// The body is in this pane now, with or without its one line break; nothing waits.
+    Written,
+    /// The body waits behind the paste prompt. Nothing is written until it is confirmed,
+    /// so this is not a completion.
+    Waiting,
+    /// The body held no command, so nothing was offered and nothing waits.
+    Empty,
+}
+
 pub struct TerminalPane {
     /// Which session process this pane shows.
     ///
@@ -1261,13 +1277,23 @@ impl TerminalPane {
     ///
     /// A multi-line or otherwise risky body is held and confirmed the way a paste is —
     /// the same prompt, the same pane, the same rule that cancelling writes nothing.
-    pub fn stage_snippet(&mut self, body: &str, execute: bool, cx: &mut Context<Self>) {
+    ///
+    /// The answer says whether the bytes are in this pane now: the window reports a
+    /// command as inserted or sent only for [`SnippetOffer::Written`], because a body
+    /// waiting behind the prompt has not arrived anywhere yet.
+    #[must_use]
+    pub fn stage_snippet(
+        &mut self,
+        body: &str,
+        execute: bool,
+        cx: &mut Context<Self>,
+    ) -> SnippetOffer {
         // The body arrives as it is saved; the rule about its trailing line breaks lives in
         // one place so the editor, the list and this pane cannot disagree about what will
         // be typed.
         let trimmed = crate::app::snippets::body_for_terminal(body);
         if trimmed.trim().is_empty() {
-            return;
+            return SnippetOffer::Empty;
         }
         if paste_needs_confirmation(trimmed) {
             self.pending_paste = Some(PendingPaste {
@@ -1276,11 +1302,12 @@ impl TerminalPane {
                 execute,
             });
             cx.notify();
-            return;
+            return SnippetOffer::Waiting;
         }
         self.pending_paste = None;
         self.write_snippet(trimmed, execute, cx);
         cx.notify();
+        SnippetOffer::Written
     }
 
     /// Writes the held paste into this pane only.
@@ -1314,6 +1341,15 @@ impl TerminalPane {
         self.pending_paste
             .as_ref()
             .map(|paste| paste.target.as_str())
+    }
+
+    /// Whether a paste or a saved command is waiting for the user's answer.
+    ///
+    /// The window reads this to keep its own "waiting for confirmation" note honest: the
+    /// note leaves as soon as the prompt is answered either way.
+    #[must_use]
+    pub fn awaits_paste_confirmation(&self) -> bool {
+        self.pending_paste.is_some()
     }
 
     /// The text a held paste would send.

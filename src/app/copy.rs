@@ -2109,6 +2109,10 @@ pub struct UxStrings {
     pub snippet_inserted: &'static str,
     /// Toast: the command was sent to the terminal
     pub snippet_sent: &'static str,
+    /// Toast: the command is held in the pane's paste prompt, nothing written yet
+    pub snippet_waiting: &'static str,
+    /// What the prompt asks for next, after the note above
+    pub snippet_waiting_body: &'static str,
     /// Toast: the command was saved
     pub snippet_saved: &'static str,
     /// Toast: the command was deleted
@@ -2286,6 +2290,8 @@ impl UxStrings {
             self.snippet_terminal_ended_body,
             self.snippet_inserted,
             self.snippet_sent,
+            self.snippet_waiting,
+            self.snippet_waiting_body,
             self.snippet_saved,
             self.snippet_deleted,
             self.snippet_unreadable_title,
@@ -2445,6 +2451,8 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     snippet_terminal_ended_body: "Nothing was written. Start a shell in this tab, or open another terminal, then choose the command again.",
     snippet_inserted: "Inserted into the terminal",
     snippet_sent: "Sent to the terminal",
+    snippet_waiting: "Waiting for confirmation in the pane",
+    snippet_waiting_body: "Nothing is written yet. Confirm it in the terminal; choosing “{cancel}” writes nothing.",
     snippet_saved: "Shortcut command saved",
     snippet_deleted: "Shortcut command deleted",
     snippet_unreadable_title: "The saved commands could not be read",
@@ -2602,6 +2610,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     snippet_terminal_ended_body: "没有写入任何内容。在这个标签里重新启动 Shell，或换一个终端，再选这条命令。",
     snippet_inserted: "已插入到终端",
     snippet_sent: "已发送到终端",
+    snippet_waiting: "已在窗格中等待确认",
+    snippet_waiting_body: "还没有写入。请在终端里确认；选「{cancel}」不会写入任何内容。",
     snippet_saved: "已保存快捷命令",
     snippet_deleted: "已删除快捷命令",
     snippet_unreadable_title: "快捷命令文件读取失败",

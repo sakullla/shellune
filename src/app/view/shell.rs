@@ -14,12 +14,13 @@ use gpui::{
 
 use shellune_core::SnippetId;
 
-use super::{ELLIPSIS, ShelluneView, brand_mark, host_avatar, program_label};
+use super::{ELLIPSIS, ShelluneView, SnippetNote, brand_mark, host_avatar, program_label};
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, Locale};
 use crate::app::icons::{self, Icon};
 use crate::app::nav::{Destination, Platform};
 use crate::app::snippets::{SnippetEditor, body_preview};
+use crate::app::terminal::SnippetOffer;
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Motion, ThemeChoice, Tone, Zoom, palette, radius, spacing};
 use crate::app::workspace::{AttentionKind, SectionState};
@@ -2187,6 +2188,11 @@ impl ShelluneView {
     /// is confirmed first and cancelling writes nothing. Without a terminal on screen
     /// nothing is created and nothing is reported as run: the window says what to open
     /// first.
+    ///
+    /// What the corner says follows what the pane actually did. A body that reached the
+    /// pane is reported as inserted or sent; a body held behind the paste prompt is not,
+    /// because nothing has been written yet and cancelling writes nothing — the prompt in
+    /// the pane is the only place that completion can come from.
     pub(crate) fn use_snippet(&mut self, id: SnippetId, execute: bool, cx: &mut Context<Self>) {
         let ux = copy::ux();
         let Some(body) = self.snippets.get(id).map(|s| s.body().to_owned()) else {
@@ -2218,13 +2224,74 @@ impl ShelluneView {
             );
             return;
         }
-        pane.update(cx, |pane, cx| pane.stage_snippet(&body, execute, cx));
-        let title = if execute {
-            ux.snippet_sent
-        } else {
-            ux.snippet_inserted
+        let offer = pane.update(cx, |pane, cx| pane.stage_snippet(&body, execute, cx));
+        match offer {
+            SnippetOffer::Written => {
+                self.settle_snippet_note(cx);
+                let title = if execute {
+                    ux.snippet_sent
+                } else {
+                    ux.snippet_inserted
+                };
+                self.toast(Tone::Positive, title, None, cx);
+            }
+            SnippetOffer::Waiting => {
+                // Nothing has been written: the corner points at the prompt instead of
+                // reporting a command that did not go anywhere yet, and the note leaves
+                // when the prompt is answered.
+                self.settle_snippet_note(cx);
+                let toast = self.toast(
+                    Tone::Neutral,
+                    ux.snippet_waiting.to_owned(),
+                    Some(copy::fill(
+                        ux.snippet_waiting_body,
+                        &[(
+                            "cancel",
+                            self.workspace.locale().strings().terminal_paste_cancel,
+                        )],
+                    )),
+                    cx,
+                );
+                if let Some(session) = self.active {
+                    self.snippet_note = Some(SnippetNote { session, toast });
+                }
+            }
+            // A stored body with nothing in it cannot type anything, so nothing is claimed.
+            SnippetOffer::Empty => {
+                self.settle_snippet_note(cx);
+                self.toast(
+                    Tone::Warning,
+                    ux.snippet_problem_body_empty.to_owned(),
+                    None,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Takes the "waiting for confirmation" note away, if one is up.
+    fn settle_snippet_note(&mut self, cx: &mut Context<Self>) {
+        if let Some(note) = self.snippet_note.take() {
+            self.dismiss_toast(note.toast, cx);
+        }
+    }
+
+    /// Takes the note away as soon as the prompt it describes has been answered.
+    ///
+    /// The answer is given in the terminal — confirmed or cancelled — and the terminal is
+    /// what holds the command, so the note leaves the corner with the prompt. What is left
+    /// on screen is then the plain fact: a confirmed command is in the pane, and a
+    /// cancelled one was never written.
+    pub(super) fn settle_snippet_note_if_answered(&mut self, cx: &mut Context<Self>) {
+        let Some(note) = self.snippet_note else {
+            return;
         };
-        self.toast(Tone::Positive, title, None, cx);
+        let waiting = self
+            .pane_for(note.session)
+            .is_some_and(|pane| pane.read(cx).awaits_paste_confirmation());
+        if !waiting {
+            self.settle_snippet_note(cx);
+        }
     }
 
     /// The keys the manager reads before its fields do.

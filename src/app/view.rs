@@ -125,6 +125,21 @@ struct OpenPane {
     pane: Entity<TerminalPane>,
 }
 
+/// The corner note that says a saved command waits in one pane's paste prompt (R6).
+///
+/// The note is kept only while the prompt it describes is still open. Answering the
+/// prompt confirms or cancels the command, and the note leaves with it, so the corner
+/// never keeps saying a command is waiting when nothing waits any more. Only one note is
+/// tracked: the newest command asked for is the one the corner speaks about, and asking
+/// for another replaces it.
+#[derive(Clone, Copy)]
+struct SnippetNote {
+    /// The session whose terminal holds the command.
+    session: SessionId,
+    /// The toast that says so, so it can be taken away before it expires.
+    toast: u64,
+}
+
 /// A file dragged from one column onto the other.
 ///
 /// The directory is the one the file was listed in, so the drop asks to transfer
@@ -307,6 +322,8 @@ pub struct ShelluneView {
     /// Short messages in the corner, oldest first.
     toasts: Vec<toasts::Toast>,
     next_toast: u64,
+    /// The note that says a saved command waits for confirmation in a pane's prompt.
+    snippet_note: Option<SnippetNote>,
     /// The pointer is over the toasts, which holds them while they are read.
     toasts_hovered: bool,
     /// Where the header's "▾" was last drawn, so its menu can hang from it.
@@ -765,6 +782,7 @@ impl ShelluneView {
             files_menu: None,
             toasts: Vec::new(),
             next_toast: 0,
+            snippet_note: None,
             toasts_hovered: false,
             shell_menu_anchor: std::rc::Rc::default(),
             store,
@@ -1843,6 +1861,9 @@ impl ShelluneView {
         // A name dialog or a tab menu for a tab that no longer exists would describe
         // something gone; it closes with the tab it belonged to.
         self.forget_closed_tab_layers();
+        // A prompt that was waiting in the closed terminal is gone with it; its note goes
+        // too, rather than promising a confirmation nothing can give any more.
+        self.settle_snippet_note_if_answered(cx);
         self.sync_layout_focus(cx);
         self.checkpoint_layout();
         cx.notify();
@@ -4957,6 +4978,10 @@ impl ShelluneView {
     /// that exited cannot stay listed as running. The session is read from the pane's
     /// own entry, so a pane can never update a session other than its own.
     fn sync_pane(&mut self, pane: Entity<TerminalPane>, cx: &mut Context<Self>) {
+        // A saved command that was waiting for its confirmation is answered in the pane, so
+        // every change a pane reports is also a chance to take that note off the corner
+        // when the prompt it described is gone (R6).
+        self.settle_snippet_note_if_answered(cx);
         let tag = pane.read(cx).tag();
         let Some(id) = self
             .panes
