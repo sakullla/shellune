@@ -11,6 +11,7 @@
 //! * [`nav`] — the destinations and their platform shortcuts;
 //! * [`keymap`] — the action catalogue and the bindings in force (R5);
 //! * [`workspace`] — the shell state and its honest section statuses;
+//! * [`snippets`] — the saved shortcut commands and the manager's own state (R6);
 //! * [`components`] — reusable view pieces;
 //! * [`view`] — the composition the user actually sees.
 
@@ -27,6 +28,7 @@ pub mod nav;
 pub mod palette;
 pub mod product;
 pub mod remote;
+pub mod snippets;
 pub mod terminal;
 pub mod text_field;
 pub mod theme;

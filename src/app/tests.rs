@@ -26,7 +26,7 @@ use shellune_storage::{
     ForwardStore, HostBook, HostEdit, HostKey, HostStore, KeymapPreferences, TrustStore,
     WORKSPACE_FILE_NAME, WorkspaceStore,
 };
-use shellune_terminal::{BlockStatus, GridSize, TermMode, encode_paste};
+use shellune_terminal::{BlockStatus, ExitReport, GridSize, TermMode, encode_paste};
 
 use crate::app::actions::{
     CycleTextSize, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
@@ -890,6 +890,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             palette_group_hosts,
             palette_group_navigate,
             palette_group_actions,
+            palette_group_snippets,
             palette_close_tab,
             palette_language,
             palette_text_size,
@@ -1011,6 +1012,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_paste_confirm,
             terminal_paste_cancel,
             terminal_paste_lines,
+            terminal_paste_runs,
             terminal_no_blocks,
             terminal_blocks_failed,
             terminal_filter_all,
@@ -14065,5 +14067,570 @@ async fn a_marked_split_tab_is_cleared_when_it_is_looked_at(cx: &mut TestAppCont
     assert!(
         unread_of(cx, &view, focused).is_empty(),
         "the panes beside the focused one are seen, so they still mark nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Saved shortcut commands (R6)
+// ---------------------------------------------------------------------------
+
+/// Mounts the shell on a directory of its own, so a test's saved commands are its own too.
+fn snippet_view<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext) {
+    let workspace = Workspace::new();
+    let store = dir.store();
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// A library file a previous run would have left, with one command in it.
+fn seed_snippet(dir: &TempDir, name: &str, body: &str) -> shellune_core::SnippetId {
+    let mut book = shellune_core::SnippetBook::new();
+    let id = book.create(name, body).expect("a valid command");
+    shellune_storage::SnippetStore::at(dir.path())
+        .save(&book)
+        .expect("the library saves");
+    id
+}
+
+fn snippet_sent(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    session: SessionId,
+) -> Vec<u8> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(session)
+            .map(|pane| pane.read(app).sent().to_vec())
+            .unwrap_or_default()
+    })
+}
+
+#[gpui::test]
+async fn a_shortcut_command_is_saved_found_in_the_palette_and_read_back_after_a_restart(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippet-save");
+    let (view, vcx) = snippet_view(cx, &dir);
+
+    // Through the manager the palette offers: a name, a command, save.
+    vcx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(true, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("snippet.editor").is_some(),
+        "the editor is drawn when it is opened"
+    );
+    type_into(vcx, "snippet.editor.name", "deploy");
+    type_into(vcx, "snippet.editor.body", "make deploy");
+    click(vcx, "snippet.editor.save");
+    assert_eq!(
+        vcx.update(|_window, app| view.read(app).snippets().snippets().len()),
+        1,
+        "the command is in the library"
+    );
+    assert!(
+        !vcx.update(|_window, app| view.read(app).snippet_panel().is_editing()),
+        "the editor closes once the command is saved"
+    );
+    assert!(
+        vcx.debug_bounds("snippet.row.0").is_some(),
+        "the saved command is listed"
+    );
+
+    // The palette offers the two actions, named after the command.
+    vcx.simulate_keystrokes(palette_keystroke());
+    vcx.run_until_parked();
+    vcx.simulate_input("deploy");
+    vcx.run_until_parked();
+    let titles = vcx.update(|_window, app| view.read(app).palette_titles());
+    let insert = copy::fill(
+        copy::ENGLISH_UX.snippet_insert_action,
+        &[("name", "deploy")],
+    );
+    let run = copy::fill(copy::ENGLISH_UX.snippet_run_action, &[("name", "deploy")]);
+    assert!(
+        titles.iter().any(|title| title == &insert),
+        "the palette can type the command: {titles:?}"
+    );
+    assert!(
+        titles.iter().any(|title| title == &run),
+        "the palette can run the command: {titles:?}"
+    );
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    // A restart is a second window on the same directory.
+    let (restarted, vcx) = snippet_view(cx, &dir);
+    vcx.run_until_parked();
+    let read: Vec<(String, String)> = vcx.update(|_window, app| {
+        restarted
+            .read(app)
+            .snippets()
+            .snippets()
+            .iter()
+            .map(|snippet| (snippet.name().to_owned(), snippet.body().to_owned()))
+            .collect()
+    });
+    assert_eq!(
+        read,
+        vec![("deploy".to_owned(), "make deploy".to_owned())],
+        "the next run reads the command the last one saved"
+    );
+}
+
+#[gpui::test]
+async fn the_editor_keeps_a_line_break_so_a_block_is_saved_as_a_block(cx: &mut TestAppContext) {
+    let dir = TempDir::new("snippet-lines");
+    let (view, cx) = snippet_view(cx, &dir);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(true, cx));
+    });
+    cx.run_until_parked();
+    type_into(cx, "snippet.editor.name", "checks");
+    click(cx, "snippet.editor.body");
+    cx.simulate_input("cargo fmt");
+    cx.simulate_keystrokes("shift-enter");
+    cx.simulate_input("cargo test");
+    cx.run_until_parked();
+    click(cx, "snippet.editor.save");
+    let saved = cx.update(|_window, app| {
+        view.read(app)
+            .snippets()
+            .snippets()
+            .first()
+            .map(|snippet| snippet.body().to_owned())
+    });
+    assert_eq!(
+        saved.as_deref(),
+        Some("cargo fmt\ncargo test"),
+        "the break typed with Shift+Enter is saved, not flattened into a space"
+    );
+    assert!(
+        cx.debug_bounds("snippet.lines.0").is_some(),
+        "a multi-line command says so in the list"
+    );
+}
+
+#[gpui::test]
+async fn a_command_with_no_terminal_explains_and_creates_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("snippet-no-terminal");
+    let id = seed_snippet(&dir, "deploy", "make deploy");
+    let (view, cx) = snippet_view(cx, &dir);
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions().is_empty()),
+        "the window has no terminal on screen"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(id, false, cx));
+    });
+    cx.run_until_parked();
+    let toasts = cx.update(|_window, app| view.read(app).toast_titles());
+    assert!(
+        toasts
+            .iter()
+            .any(|title| title == copy::ENGLISH_UX.snippet_no_terminal),
+        "the window says a terminal is needed first: {toasts:?}"
+    );
+    assert!(
+        toasts
+            .iter()
+            .all(|title| title != copy::ENGLISH_UX.snippet_inserted
+                && title != copy::ENGLISH_UX.snippet_sent),
+        "nothing is reported as inserted or run: {toasts:?}"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions().is_empty()),
+        "no session is created for a command that has nowhere to go"
+    );
+}
+
+#[gpui::test]
+async fn running_a_command_submits_it_once_in_the_active_pane_only(cx: &mut TestAppContext) {
+    let dir = TempDir::new("snippet-run");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let id = seed_snippet(&dir, "release", "cargo build --release");
+    let (view, cx) = snippet_view(cx, &dir);
+    let first = live_remote(cx, &view);
+    let second = live_remote_second(cx, &view, first);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(second),
+        "the newest session is the one on screen"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(id, true, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        String::from_utf8_lossy(&snippet_sent(cx, &view, second)),
+        "cargo build --release\r",
+        "running types the command and submits it exactly once"
+    );
+    assert_eq!(
+        snippet_sent(cx, &view, first),
+        Vec::<u8>::new(),
+        "the session beside it receives nothing"
+    );
+
+    // Inserting is the same write without the submit.
+    let before = snippet_sent(cx, &view, second);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(id, false, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, second),
+        [before, b"cargo build --release".to_vec()].concat(),
+        "inserting appends the command and no line break of its own"
+    );
+    assert_eq!(
+        snippet_sent(cx, &view, first),
+        Vec::<u8>::new(),
+        "the other pane is still untouched"
+    );
+}
+
+#[gpui::test]
+async fn the_manager_is_walkable_with_the_keyboard_and_enter_inserts_the_chosen_command(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippet-keys");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut book = shellune_core::SnippetBook::new();
+    book.create("first", "echo one").expect("a valid command");
+    book.create("second", "echo two").expect("a valid command");
+    shellune_storage::SnippetStore::at(dir.path())
+        .save(&book)
+        .expect("the library saves");
+    let (view, cx) = snippet_view(cx, &dir);
+    let session = live_remote(cx, &view);
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(false, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("snippet.row.0").is_some() && cx.debug_bounds("snippet.row.1").is_some(),
+        "both saved commands are listed"
+    );
+
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).snippet_panel().selected()),
+        1,
+        "the arrow key moves the highlighted row"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        String::from_utf8_lossy(&snippet_sent(cx, &view, session)),
+        "echo two",
+        "Enter inserts the highlighted command without submitting it"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        None,
+        "Escape closes the manager"
+    );
+}
+
+#[gpui::test]
+async fn a_multi_line_command_asks_before_it_is_written_and_cancelling_writes_nothing(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("", cx);
+    let body = "cargo fmt\ncargo test";
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_snippet(body, true, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        Vec::<u8>::new(),
+        "a multi-line block writes nothing before it is confirmed"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().map(str::to_owned)),
+        Some(body.to_owned()),
+        "the confirmation is the paste prompt, holding the same text"
+    );
+    assert!(
+        cx.debug_bounds("terminal.paste.runs").is_some()
+            && cx.update(|_window, app| pane.read(app).pending_paste_runs_for_test()),
+        "the prompt says the block runs once it is confirmed"
+    );
+    click(cx, "terminal.paste.cancel");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        Vec::<u8>::new(),
+        "cancelling writes nothing, so no line of it runs"
+    );
+
+    // The same block inserted rather than run: no submit, and the prompt says so.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_snippet(body, false, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| pane.read(app).pending_paste_runs_for_test()),
+        "an insert does not claim it will run"
+    );
+    click(cx, "terminal.paste.confirm");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        encode_paste(body, TermMode::empty()),
+        "confirming an insert types the block and submits nothing of its own"
+    );
+}
+
+#[gpui::test]
+async fn inserting_a_command_does_not_submit_it_and_running_submits_it_once(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("", cx);
+    // A body saved with a final newline must not submit itself when it is inserted.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.stage_snippet("make deploy\n", false, cx)
+        });
+    });
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"make deploy".to_vec(),
+        "inserting drops the stored line ending instead of sending it"
+    );
+    assert!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().is_none()),
+        "a single line asks nothing"
+    );
+
+    let before = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.stage_snippet("make deploy\n\n", true, cx);
+        });
+    });
+    assert_eq!(
+        String::from_utf8_lossy(&cx.update(|_window, app| pane.read(app).sent().to_vec())),
+        "make deploymake deploy\r",
+        "running adds exactly one line break after the command, never two"
+    );
+    assert!(!before.is_empty());
+}
+
+#[gpui::test]
+async fn a_damaged_library_is_named_and_never_written_over(cx: &mut TestAppContext) {
+    let dir = TempDir::new("snippet-damaged");
+    let broken = b"{not a library";
+    std::fs::write(
+        dir.path().join(shellune_storage::SNIPPETS_FILE_NAME),
+        broken,
+    )
+    .expect("the damaged file is written");
+    let (view, cx) = snippet_view(cx, &dir);
+    assert!(
+        !cx.update(|_window, app| view.read(app).snippets().can_write()),
+        "an unreadable library is not written over"
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(true, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("snippets.unreadable").is_some(),
+        "the dialog names the file it could not read"
+    );
+    type_into(cx, "snippet.editor.name", "deploy");
+    type_into(cx, "snippet.editor.body", "make deploy");
+    click(cx, "snippet.editor.save");
+    assert_eq!(
+        std::fs::read(dir.path().join(shellune_storage::SNIPPETS_FILE_NAME))
+            .expect("the file is still there"),
+        broken.to_vec(),
+        "the unreadable file is exactly as it was"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).snippets().snippets().len()),
+        0,
+        "nothing was added to a library that could not be read"
+    );
+    assert!(
+        cx.debug_bounds("snippet.editor").is_some(),
+        "the draft stays on screen while the file waits to be repaired"
+    );
+    assert!(
+        cx.debug_bounds("session.notice").is_some(),
+        "the reason the save did not happen is stated"
+    );
+}
+
+#[gpui::test]
+async fn deleting_a_command_asks_first_and_removes_it_from_the_file(cx: &mut TestAppContext) {
+    let dir = TempDir::new("snippet-delete");
+    seed_snippet(&dir, "deploy", "make deploy");
+    let (view, vcx) = snippet_view(cx, &dir);
+    vcx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(false, cx));
+    });
+    vcx.run_until_parked();
+    click(vcx, "snippet.delete.0");
+    assert!(
+        vcx.debug_bounds("snippet.delete.question").is_some(),
+        "deleting a saved command asks first"
+    );
+    assert!(
+        vcx.update(|_window, app| view.read(app).snippet_panel().pending_delete().is_some()),
+        "the question names the command it would remove"
+    );
+    click(vcx, "snippet.delete.no");
+    assert_eq!(
+        vcx.update(|_window, app| view.read(app).snippets().snippets().len()),
+        1,
+        "keeping the command leaves it in the library"
+    );
+    click(vcx, "snippet.delete.0");
+    click(vcx, "snippet.delete.yes");
+    assert_eq!(
+        vcx.update(|_window, app| view.read(app).snippets().snippets().len()),
+        0,
+        "answering removes the command"
+    );
+
+    let (restarted, vcx) = snippet_view(cx, &dir);
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|_window, app| restarted.read(app).snippets().snippets().is_empty()),
+        "the file was written, so the next run has no such command"
+    );
+}
+
+#[gpui::test]
+async fn the_shortcut_command_dialog_stays_inside_the_minimum_window_at_200_percent(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippet-min");
+    seed_snippet(
+        &dir,
+        "a rather long name for a saved command",
+        "cargo fmt\ncargo test --workspace",
+    );
+    let (view, cx) = snippet_view(cx, &dir);
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(false, cx));
+    });
+    cx.run_until_parked();
+
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    // The dialog and its own controls stay on screen; the body between them scrolls, so a
+    // row that does not fit is reached by scrolling rather than by losing its actions.
+    for selector in [
+        "snippets.dialog",
+        "snippets.dialog.footer.close",
+        "snippets.new",
+    ] {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+    }
+    for selector in [
+        "snippet.row.0",
+        "snippet.insert.0",
+        "snippet.run.0",
+        "snippets.storage",
+    ] {
+        assert_within_width(bounds_of(cx, selector), viewport, selector);
+    }
+
+    // The editor's fields fit across the window too, so a command can be written at this
+    // text size without a field leaving the right edge. The footer's new-command button is
+    // what opens it here: the rows themselves are reached by scrolling in this window.
+    click(cx, "snippets.new");
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert_fits_inside(bounds_of(cx, "snippets.dialog"), viewport, "the dialog");
+    for selector in [
+        "snippet.editor.name",
+        "snippet.editor.body",
+        "snippet.editor.save",
+    ] {
+        assert_within_width(bounds_of(cx, selector), viewport, selector);
+    }
+}
+
+#[gpui::test]
+async fn a_terminal_whose_shell_ended_reports_that_instead_of_a_command_being_inserted(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippet-ended");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let id = seed_snippet(&dir, "deploy", "make deploy");
+    let (view, cx) = snippet_view(cx, &dir);
+    let session = live_remote(cx, &view);
+    // An ended shell keeps its last screen and takes no more input.
+    cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .pane_of(session)
+            .expect("the session has a pane")
+            .clone();
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(pane.tag(), vec![SourceEvent::Exited(ExitReport::Clean)], cx);
+        });
+    });
+    cx.run_until_parked();
+    let before = snippet_sent(cx, &view, session);
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(id, false, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        before,
+        "nothing is typed into a shell that has ended"
+    );
+    let toasts = cx.update(|_window, app| view.read(app).toast_titles());
+    assert!(
+        toasts
+            .iter()
+            .any(|title| title == copy::ENGLISH_UX.snippet_terminal_ended),
+        "the window says the terminal has no shell running: {toasts:?}"
+    );
+    assert!(
+        toasts
+            .iter()
+            .all(|title| title != copy::ENGLISH_UX.snippet_inserted),
+        "nothing is reported as inserted: {toasts:?}"
     );
 }

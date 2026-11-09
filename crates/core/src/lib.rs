@@ -21,6 +21,7 @@ mod host;
 mod ids;
 mod session;
 mod shell;
+mod snippet;
 mod task;
 mod workspace;
 
@@ -45,6 +46,10 @@ pub use session::{
     EventTag, Session, SessionFailure, SessionKind, SessionState, SessionTransitionError,
 };
 pub use shell::LocalShell;
+pub use snippet::{
+    MAX_SNIPPET_BODY_CHARS, MAX_SNIPPET_NAME_CHARS, SNIPPETS_FORMAT_VERSION, Snippet, SnippetBook,
+    SnippetId, SnippetProblem, check_body as check_snippet_body, check_name as check_snippet_name,
+};
 pub use task::{
     OverwriteChoice, PARTIAL_PREFIX, PartialRecord, ResumeHint, ResumeRefusal, Transfer,
     TransferDirection, TransferEvent, TransferFailure, TransferQueue, TransferState,

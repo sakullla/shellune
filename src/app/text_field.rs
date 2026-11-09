@@ -10,6 +10,11 @@
 //! The editing rules live in [`LineModel`], which knows nothing about drawing, so they
 //! are tested without a window; [`TextField`] draws the model and routes input to it.
 //! It is deliberately not an editor: one line, no undo, no wrapping.
+//!
+//! A field that keeps line breaks ([`TextField::set_keeps_line_breaks`]) stores them and
+//! draws each one as `\n`, so the break is visible in the same single line rather than
+//! becoming a space the user cannot see. The snippet body uses this: a saved command may
+//! be a short block, and the text a user typed has to be the text that is saved.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +35,12 @@ use crate::app::theme::{self, Metrics, palette, radius, spacing};
 
 /// The character drawn in place of a masked character.
 const MASK: char = '•';
+
+/// What is drawn in place of a kept line break.
+///
+/// Two ASCII characters rather than a corner glyph: every font draws them, and a reader
+/// can tell a break in the middle of a saved command from a space that was typed there.
+const BREAK: &str = "\\n";
 
 /// Width of the caret.
 const CARET_WIDTH: f32 = 1.5;
@@ -65,6 +76,8 @@ pub struct LineModel {
     text: String,
     selection: Range<usize>,
     reversed: bool,
+    /// Whether a line break is text this field keeps, as a snippet body does.
+    keeps_line_breaks: bool,
 }
 
 impl LineModel {
@@ -77,6 +90,7 @@ impl LineModel {
             text,
             selection: end..end,
             reversed: false,
+            keeps_line_breaks: false,
         }
     }
 
@@ -107,8 +121,24 @@ impl LineModel {
     }
 
     /// Replaces everything, with the caret at the end.
+    ///
+    /// What the field does with line breaks is a property of the field, not of the text
+    /// it holds, so a new value does not change it.
     pub fn set_text(&mut self, text: impl Into<String>) {
+        let keeps_line_breaks = self.keeps_line_breaks;
         *self = Self::new(text);
+        self.keeps_line_breaks = keeps_line_breaks;
+    }
+
+    /// Whether this field stores line breaks instead of flattening them.
+    #[must_use]
+    pub fn keeps_line_breaks(&self) -> bool {
+        self.keeps_line_breaks
+    }
+
+    /// Sets whether line breaks are text or become spaces.
+    pub fn set_keeps_line_breaks(&mut self, keeps: bool) {
+        self.keeps_line_breaks = keeps;
     }
 
     /// Puts the caret at `offset`, dropping the selection.
@@ -209,9 +239,14 @@ impl LineModel {
     ///
     /// The field is one line, so line breaks in pasted text become spaces instead of
     /// being dropped silently: a path or a command copied with its newline still
-    /// arrives whole.
+    /// arrives whole. A field that keeps breaks keeps them, normalised to `\n`, so a
+    /// body copied out of a script stays the block that was copied.
     pub fn insert(&mut self, text: &str) {
-        let text = single_line(text);
+        let text = if self.keeps_line_breaks {
+            kept_breaks(text)
+        } else {
+            single_line(text)
+        };
         let range = self.selection.clone();
         self.text.replace_range(range.clone(), &text);
         self.move_to(range.start + text.len());
@@ -339,6 +374,49 @@ fn single_line(text: &str) -> String {
     text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
+/// Text whose line breaks are kept, with every break written as `\n`.
+fn kept_breaks(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// How long `text` is once drawn, counting a kept break as the marker that replaces it.
+fn drawn_len(text: &str, keeps_line_breaks: bool) -> usize {
+    if keeps_line_breaks {
+        text.chars()
+            .map(|character| {
+                if character == '\n' {
+                    BREAK.len()
+                } else {
+                    character.len_utf8()
+                }
+            })
+            .sum()
+    } else {
+        text.len()
+    }
+}
+
+/// The byte offset in `text` of a drawn position, for a field that shows breaks as
+/// markers. A point inside the marker is the break it stands for.
+fn text_offset_in_drawn(text: &str, keeps_line_breaks: bool, drawn: usize) -> usize {
+    if !keeps_line_breaks {
+        return drawn.min(text.len());
+    }
+    let mut width = 0;
+    for (index, character) in text.char_indices() {
+        let piece = if character == '\n' {
+            BREAK.len()
+        } else {
+            character.len_utf8()
+        };
+        if drawn < width + piece {
+            return index;
+        }
+        width += piece;
+    }
+    text.len()
+}
+
 // ---------------------------------------------------------------------------
 // The view
 // ---------------------------------------------------------------------------
@@ -459,6 +537,18 @@ impl TextField {
         cx.notify();
     }
 
+    /// Lets the field hold line breaks, drawn as `\n` and inserted with Shift+Enter.
+    ///
+    /// The saved command body is the one field that needs this: a shortcut command can
+    /// be a short block, and the text that is saved has to be the text that was typed.
+    /// Enter still submits, so the dialog keeps its single keyboard path to save.
+    pub fn set_keeps_line_breaks(&mut self, keeps: bool, cx: &mut Context<Self>) {
+        if self.model.keeps_line_breaks() != keeps {
+            self.model.set_keeps_line_breaks(keeps);
+            cx.notify();
+        }
+    }
+
     /// Opens the system chooser; the path picked, if any, becomes the text.
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(kind) = self.browse else {
@@ -566,6 +656,11 @@ impl TextField {
         };
         let shift = modifiers.shift;
         match event.keystroke.key.as_str() {
+            // A field that keeps line breaks takes Shift+Enter as a break; Enter alone is
+            // still the submit that saves what was typed.
+            "enter" if shift && self.model.keeps_line_breaks() => {
+                self.edit(cx, |model| model.insert("\n"));
+            }
             "enter" => {
                 let text = self.model.text().to_owned();
                 let consumed = match &self.submit {
@@ -607,6 +702,9 @@ impl TextField {
     // -- Mapping between the text and the drawn line --------------------------------
 
     /// The line as drawn: the text or bullets, with the composition at the caret.
+    ///
+    /// A field that keeps line breaks draws each one as [`BREAK`], inside the same
+    /// single line, so the break is visible where it is.
     fn display_text(&self) -> String {
         let caret = self.model.caret();
         let text = self.model.text();
@@ -623,6 +721,9 @@ impl TextField {
         } else {
             shown.push_str(&text[caret..]);
         }
+        if self.model.keeps_line_breaks() && !self.hidden() {
+            return shown.replace('\n', BREAK);
+        }
         shown
     }
 
@@ -633,7 +734,7 @@ impl TextField {
         let base = if self.hidden() {
             text[..offset].chars().count() * MASK.len_utf8()
         } else {
-            offset
+            drawn_len(&text[..offset], self.model.keeps_line_breaks())
         };
         match &self.marked {
             Some(marked) if offset >= self.model.caret() && !marked.is_empty() => {
@@ -663,7 +764,7 @@ impl TextField {
                 .nth(characters)
                 .map_or(text.len(), |(index, _)| index)
         } else {
-            display.min(text.len())
+            text_offset_in_drawn(text, self.model.keeps_line_breaks(), display)
         }
     }
 
@@ -1461,6 +1562,57 @@ mod tests {
         let mut model = LineModel::new("");
         model.insert("cd /srv\r\nls -la\n");
         assert_eq!(model.text(), "cd /srv ls -la ");
+    }
+
+    #[test]
+    fn a_field_that_keeps_line_breaks_stores_them_as_bare_breaks() {
+        let mut model = LineModel::new("");
+        model.set_keeps_line_breaks(true);
+        model.insert("cd /srv\r\nls -la\r\n");
+        assert_eq!(
+            model.text(),
+            "cd /srv\nls -la\n",
+            "a copied block stays a block, with the platform's breaks normalised"
+        );
+        model.insert("\n");
+        assert_eq!(
+            model.text(),
+            "cd /srv\nls -la\n\n",
+            "Shift+Enter adds a break"
+        );
+        // A new value keeps the field's rule: what it does with breaks is its own.
+        model.set_text("one\ntwo");
+        assert!(model.keeps_line_breaks());
+        assert_eq!(model.text(), "one\ntwo");
+        model.set_keeps_line_breaks(false);
+        model.insert("\n");
+        assert_eq!(
+            model.text(),
+            "one\ntwo ",
+            "a field that does not keep breaks still flattens them"
+        );
+    }
+
+    #[test]
+    fn a_kept_break_is_drawn_as_its_marker_and_mapped_back() {
+        // The three characters of "a\nb" are drawn as the four of "a\\nb".
+        let text = "a\nb";
+        assert_eq!(drawn_len(text, true), 4);
+        assert_eq!(drawn_len(text, false), 3);
+        assert_eq!(text_offset_in_drawn(text, true, 0), 0, "before the a");
+        assert_eq!(text_offset_in_drawn(text, true, 1), 1, "on the break");
+        assert_eq!(
+            text_offset_in_drawn(text, true, 2),
+            1,
+            "inside the marker is the break it stands for"
+        );
+        assert_eq!(text_offset_in_drawn(text, true, 3), 2, "on the b");
+        assert_eq!(
+            text_offset_in_drawn(text, true, 99),
+            text.len(),
+            "past the end is the end"
+        );
+        assert_eq!(text_offset_in_drawn(text, false, 99), text.len());
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! [`crate::app::product`] because R18 fixes them independently of the UI
 //! language.
 
-use shellune_core::{SessionState, TabAccent, TransferState};
+use shellune_core::{SessionState, SnippetProblem, TabAccent, TransferState};
 
 /// UI language.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -529,6 +529,8 @@ pub struct Strings {
     pub palette_group_navigate: &'static str,
     /// Palette group: window actions.
     pub palette_group_actions: &'static str,
+    /// Palette group: saved shortcut commands.
+    pub palette_group_snippets: &'static str,
     /// Palette action: close the session on screen.
     pub palette_close_tab: &'static str,
     /// Palette action: switch the interface language.
@@ -845,6 +847,8 @@ pub struct Strings {
     pub terminal_paste_cancel: &'static str,
     /// Unit after the number of lines in a paste.
     pub terminal_paste_lines: &'static str,
+    /// Line of the confirmation that says a saved command runs once it is confirmed.
+    pub terminal_paste_runs: &'static str,
     /// Enhanced mode, but the shell has not emitted integration markers.
     pub terminal_no_blocks: &'static str,
     /// Integration was seen and then stopped being trustworthy.
@@ -1135,6 +1139,7 @@ pub static ENGLISH: Strings = Strings {
     palette_group_hosts: "Connect to host",
     palette_group_navigate: "Go to",
     palette_group_actions: "Actions",
+    palette_group_snippets: "Shortcut commands",
     palette_close_tab: "Close current session",
     palette_language: "Switch interface language",
     palette_text_size: "Change text size",
@@ -1293,6 +1298,7 @@ pub static ENGLISH: Strings = Strings {
     terminal_paste_confirm: "Paste into this session",
     terminal_paste_cancel: "Do not paste",
     terminal_paste_lines: "lines",
+    terminal_paste_runs: "Runs once you confirm",
     terminal_no_blocks: "This shell has not reported command blocks. The grid is unchanged.",
     terminal_blocks_failed: "Shell integration failed. The classic grid was kept.",
     terminal_filter_all: "All commands",
@@ -1552,6 +1558,7 @@ pub static CHINESE: Strings = Strings {
     palette_group_hosts: "连接到主机",
     palette_group_navigate: "前往",
     palette_group_actions: "操作",
+    palette_group_snippets: "快捷命令",
     palette_close_tab: "关闭当前会话",
     palette_language: "切换界面语言",
     palette_text_size: "调整文字大小",
@@ -1710,6 +1717,7 @@ pub static CHINESE: Strings = Strings {
     terminal_paste_confirm: "粘贴到这个会话",
     terminal_paste_cancel: "不粘贴",
     terminal_paste_lines: "行",
+    terminal_paste_runs: "确认后执行",
     terminal_no_blocks: "这个 Shell 没有报告命令块。网格保持原样。",
     terminal_blocks_failed: "Shell 集成已失效。经典网格已保留。",
     terminal_filter_all: "全部命令",
@@ -2047,6 +2055,92 @@ pub struct UxStrings {
     pub keys_problem_hint: &'static str,
     pub keys_save_failed: &'static str,
     pub keys_save_failed_next: &'static str,
+    /// Title of the shortcut-command manager
+    pub snippet_manage_title: &'static str,
+    /// What insert and run do
+    pub snippet_manage_hint: &'static str,
+    /// Where the commands are stored, and what must not be kept there
+    pub snippet_storage_note: &'static str,
+    /// Button: write a new command
+    pub snippet_new: &'static str,
+    /// Title of the editor when changing a command
+    pub snippet_edit_title: &'static str,
+    /// Label of the name field
+    pub snippet_field_name: &'static str,
+    /// Label of the command field
+    pub snippet_field_body: &'static str,
+    /// Placeholder of the name field
+    pub snippet_name_placeholder: &'static str,
+    /// Placeholder of the command field; names the key that adds a line
+    pub snippet_body_placeholder: &'static str,
+    /// Editor key hint under the fields
+    pub snippet_editor_keys: &'static str,
+    /// Button: save the command
+    pub snippet_save: &'static str,
+    /// Row button: type the command into the terminal
+    pub snippet_insert: &'static str,
+    /// Row button: type the command and submit it
+    pub snippet_run: &'static str,
+    /// Row button: change the command
+    pub snippet_edit: &'static str,
+    /// Row button: remove the command
+    pub snippet_delete: &'static str,
+    /// Question before a command is removed
+    pub snippet_delete_title: &'static str,
+    /// What deleting does, with the name filled in
+    pub snippet_delete_body: &'static str,
+    /// Answer that deletes the command
+    pub snippet_delete_yes: &'static str,
+    /// Answer that keeps the command
+    pub snippet_delete_no: &'static str,
+    /// Empty state of the manager
+    pub snippet_empty_title: &'static str,
+    /// What to do first when nothing is saved
+    pub snippet_empty_body: &'static str,
+    /// Toast and note: no terminal is open
+    pub snippet_no_terminal: &'static str,
+    /// Next step after that note
+    pub snippet_no_terminal_body: &'static str,
+    /// Toast and note: the terminal on screen has no running shell
+    pub snippet_terminal_ended: &'static str,
+    /// Next step after that note
+    pub snippet_terminal_ended_body: &'static str,
+    /// Toast: the command was typed into the terminal
+    pub snippet_inserted: &'static str,
+    /// Toast: the command was sent to the terminal
+    pub snippet_sent: &'static str,
+    /// Toast: the command was saved
+    pub snippet_saved: &'static str,
+    /// Toast: the command was deleted
+    pub snippet_deleted: &'static str,
+    /// Title shown when the file could not be read
+    pub snippet_unreadable_title: &'static str,
+    /// What happens to the unreadable file, with the path filled in
+    pub snippet_unreadable_body: &'static str,
+    /// Why a save did not happen, with the storage reason filled in
+    pub snippet_save_failed_detail: &'static str,
+    /// Line count of a command body, with the number filled in
+    pub snippet_line_count: &'static str,
+    /// How many commands are saved, with the number filled in
+    pub snippet_count: &'static str,
+    /// Palette action: open the manager
+    pub snippet_manage_action: &'static str,
+    /// Palette action: start a new command
+    pub snippet_new_action: &'static str,
+    /// Palette entry for inserting a command, with its name filled in
+    pub snippet_insert_action: &'static str,
+    /// Palette entry for running a command, with its name filled in
+    pub snippet_run_action: &'static str,
+    /// Refusal: the name is empty
+    pub snippet_problem_name_empty: &'static str,
+    /// Refusal: the name is too long, with the limit filled in
+    pub snippet_problem_name_long: &'static str,
+    /// Refusal: the body is empty
+    pub snippet_problem_body_empty: &'static str,
+    /// Refusal: the body is too long, with the limit filled in
+    pub snippet_problem_body_long: &'static str,
+    /// Refusal: the command is no longer in the library
+    pub snippet_problem_unknown: &'static str,
 }
 
 impl UxStrings {
@@ -2165,6 +2259,49 @@ impl UxStrings {
             self.keys_problem_hint,
             self.keys_save_failed,
             self.keys_save_failed_next,
+            self.snippet_manage_title,
+            self.snippet_manage_hint,
+            self.snippet_storage_note,
+            self.snippet_new,
+            self.snippet_edit_title,
+            self.snippet_field_name,
+            self.snippet_field_body,
+            self.snippet_name_placeholder,
+            self.snippet_body_placeholder,
+            self.snippet_editor_keys,
+            self.snippet_save,
+            self.snippet_insert,
+            self.snippet_run,
+            self.snippet_edit,
+            self.snippet_delete,
+            self.snippet_delete_title,
+            self.snippet_delete_body,
+            self.snippet_delete_yes,
+            self.snippet_delete_no,
+            self.snippet_empty_title,
+            self.snippet_empty_body,
+            self.snippet_no_terminal,
+            self.snippet_no_terminal_body,
+            self.snippet_terminal_ended,
+            self.snippet_terminal_ended_body,
+            self.snippet_inserted,
+            self.snippet_sent,
+            self.snippet_saved,
+            self.snippet_deleted,
+            self.snippet_unreadable_title,
+            self.snippet_unreadable_body,
+            self.snippet_save_failed_detail,
+            self.snippet_line_count,
+            self.snippet_count,
+            self.snippet_manage_action,
+            self.snippet_new_action,
+            self.snippet_insert_action,
+            self.snippet_run_action,
+            self.snippet_problem_name_empty,
+            self.snippet_problem_name_long,
+            self.snippet_problem_body_empty,
+            self.snippet_problem_body_long,
+            self.snippet_problem_unknown,
         ]
     }
 }
@@ -2281,6 +2418,49 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     keys_problem_hint: "Saved shortcuts were not applied; every action is at its default.",
     keys_save_failed: "This shortcut works for now but could not be written to the preferences file.",
     keys_save_failed_next: "The next change tries again; a restart shows what was saved.",
+    snippet_manage_title: "Shortcut commands",
+    snippet_manage_hint: "Insert types a command into the active terminal. Run also submits it, once.",
+    snippet_storage_note: "Saved as plain text in snippets.json on this computer. Keep passwords, keys and tokens out of shortcut commands.",
+    snippet_new: "New shortcut command",
+    snippet_edit_title: "Edit shortcut command",
+    snippet_field_name: "Name",
+    snippet_field_body: "Command",
+    snippet_name_placeholder: "Deploy the service",
+    snippet_body_placeholder: "make deploy && obsctl status",
+    snippet_editor_keys: "Enter saves. Shift+Enter starts a new line, shown as \\n in the field.",
+    snippet_save: "Save command",
+    snippet_insert: "Insert",
+    snippet_run: "Run",
+    snippet_edit: "Edit",
+    snippet_delete: "Delete",
+    snippet_delete_title: "Delete this shortcut command?",
+    snippet_delete_body: "“{name}” is removed from this computer. Nothing already in a terminal changes.",
+    snippet_delete_yes: "Delete it",
+    snippet_delete_no: "Keep it",
+    snippet_empty_title: "No shortcut commands yet",
+    snippet_empty_body: "Save a command you run often, then insert it from the command palette.",
+    snippet_no_terminal: "Open a terminal first",
+    snippet_no_terminal_body: "Inserting and running need an active terminal. Open a local shell or connect a server, then choose the command again.",
+    snippet_terminal_ended: "This terminal has no shell running",
+    snippet_terminal_ended_body: "Nothing was written. Start a shell in this tab, or open another terminal, then choose the command again.",
+    snippet_inserted: "Inserted into the terminal",
+    snippet_sent: "Sent to the terminal",
+    snippet_saved: "Shortcut command saved",
+    snippet_deleted: "Shortcut command deleted",
+    snippet_unreadable_title: "The saved commands could not be read",
+    snippet_unreadable_body: "The file {path} is left exactly as it is and is never written over. Repair or remove it, then reopen Shellune.",
+    snippet_save_failed_detail: "Nothing was saved: {reason}",
+    snippet_line_count: "{count} lines",
+    snippet_count: "{count} saved",
+    snippet_manage_action: "Shortcut commands…",
+    snippet_new_action: "New shortcut command…",
+    snippet_insert_action: "Insert “{name}”",
+    snippet_run_action: "Run “{name}”",
+    snippet_problem_name_empty: "A shortcut command needs a name.",
+    snippet_problem_name_long: "The name is limited to {max} characters.",
+    snippet_problem_body_empty: "A shortcut command needs a command body; nothing would be inserted or run.",
+    snippet_problem_body_long: "The command body is limited to {max} characters.",
+    snippet_problem_unknown: "That command is no longer in the library; reopen the list.",
 };
 
 /// Simplified Chinese.
@@ -2395,14 +2575,84 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     keys_problem_hint: "保存的快捷键未生效；所有动作已回到默认键位。",
     keys_save_failed: "快捷键本次已生效，但没能写入偏好文件。",
     keys_save_failed_next: "再改一次会重试；重启后显示的是已保存的状态。",
+    snippet_manage_title: "快捷命令",
+    snippet_manage_hint: "「插入」只把命令写进当前终端；「执行」还会提交一次。",
+    snippet_storage_note: "以明文保存在本机 snippets.json 中。不要在快捷命令里写密码、私钥或令牌。",
+    snippet_new: "新建快捷命令",
+    snippet_edit_title: "编辑快捷命令",
+    snippet_field_name: "名称",
+    snippet_field_body: "命令正文",
+    snippet_name_placeholder: "部署服务",
+    snippet_body_placeholder: "例如 make deploy && obsctl status",
+    snippet_editor_keys: "回车保存；Shift+回车换行，换行在字段里显示为 \\n。",
+    snippet_save: "保存命令",
+    snippet_insert: "插入",
+    snippet_run: "执行",
+    snippet_edit: "编辑",
+    snippet_delete: "删除",
+    snippet_delete_title: "删除这条快捷命令？",
+    snippet_delete_body: "「{name}」会从本机删除；终端里已有的内容不受影响。",
+    snippet_delete_yes: "删除",
+    snippet_delete_no: "保留",
+    snippet_empty_title: "还没有快捷命令",
+    snippet_empty_body: "把经常重复的命令存下来，之后从命令面板插入。",
+    snippet_no_terminal: "请先打开终端",
+    snippet_no_terminal_body: "插入和执行都需要当前终端。先打开本地 Shell 或连接主机，再选这条命令。",
+    snippet_terminal_ended: "这条终端没有正在运行的 Shell",
+    snippet_terminal_ended_body: "没有写入任何内容。在这个标签里重新启动 Shell，或换一个终端，再选这条命令。",
+    snippet_inserted: "已插入到终端",
+    snippet_sent: "已发送到终端",
+    snippet_saved: "已保存快捷命令",
+    snippet_deleted: "已删除快捷命令",
+    snippet_unreadable_title: "快捷命令文件读取失败",
+    snippet_unreadable_body: "文件 {path} 保持原样，不会被覆盖。修复或删除它，然后重新打开 Shellune。",
+    snippet_save_failed_detail: "没有保存：{reason}",
+    snippet_line_count: "{count} 行",
+    snippet_count: "已保存 {count} 条",
+    snippet_manage_action: "快捷命令…",
+    snippet_new_action: "新建快捷命令…",
+    snippet_insert_action: "插入「{name}」",
+    snippet_run_action: "执行「{name}」",
+    snippet_problem_name_empty: "快捷命令需要名称。",
+    snippet_problem_name_long: "名称最多 {max} 个字符。",
+    snippet_problem_body_empty: "快捷命令需要命令正文，否则插入或执行都是空的。",
+    snippet_problem_body_long: "命令正文最多 {max} 个字符。",
+    snippet_problem_unknown: "这条命令已不在库中，请重新打开列表。",
 };
 
 /// The redesigned-shell strings of the current language.
 #[must_use]
 pub fn ux() -> &'static UxStrings {
-    match Locale::current() {
+    ux_for(Locale::current())
+}
+
+/// The redesigned-shell strings of one language, for wording that has to be produced
+/// for a language the caller names rather than for the one on screen.
+#[must_use]
+pub fn ux_for(locale: Locale) -> &'static UxStrings {
+    match locale {
         Locale::English => &ENGLISH_UX,
         Locale::Chinese => &CHINESE_UX,
+    }
+}
+
+/// Why a shortcut command cannot be saved, in a language.
+///
+/// The domain crate words its refusals in English so they stay language-neutral; the
+/// dialog says them in the language of the window, with the limit filled in.
+#[must_use]
+pub fn snippet_problem_text(problem: &SnippetProblem, locale: Locale) -> String {
+    let ux = ux_for(locale);
+    match problem {
+        SnippetProblem::EmptyName => ux.snippet_problem_name_empty.to_owned(),
+        SnippetProblem::NameTooLong { max } => {
+            fill(ux.snippet_problem_name_long, &[("max", &max.to_string())])
+        }
+        SnippetProblem::EmptyBody => ux.snippet_problem_body_empty.to_owned(),
+        SnippetProblem::BodyTooLong { max } => {
+            fill(ux.snippet_problem_body_long, &[("max", &max.to_string())])
+        }
+        SnippetProblem::Unknown { .. } => ux.snippet_problem_unknown.to_owned(),
     }
 }
 

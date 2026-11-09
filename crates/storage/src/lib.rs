@@ -9,6 +9,8 @@
 //!   jump chain and a ProxyCommand; those are references and command text.
 //! * `ForwardStore` — saved local, remote and dynamic forwarding rules.
 //! * `WorkspaceStore` — the workspace snapshot: tabs, pane tree and panel.
+//! * `SnippetStore` — the saved commands: a name and a command body each, in their
+//!   own file, with no field that could hold a credential.
 //! * `PreferencesStore` — the interface choices and the custom key bindings, per
 //!   platform, with a reporting reader so a damaged file is never mistaken for a
 //!   default the user chose.
@@ -34,6 +36,7 @@ mod credentials;
 mod error;
 mod forwarding;
 mod preferences;
+mod snippets;
 mod ssh_config;
 mod store;
 mod trust;
@@ -50,6 +53,7 @@ pub use preferences::{
     FILE_NAME as PREFERENCES_FILE_NAME, KeymapEntry, KeymapPreferences, Preferences,
     PreferencesProblem, PreferencesStore,
 };
+pub use snippets::{FILE_NAME as SNIPPETS_FILE_NAME, SnippetStore};
 pub use ssh_config::{
     DEFAULT_CONFIG_TEXT, ImportError, ImportLimits, ImportNote, ImportOutcome, ImportPlan,
     ImportPreview, ImportedForward, ImportedHost, JumpSpec, NoteKind, PlannedForward, SkippedHost,

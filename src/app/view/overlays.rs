@@ -24,6 +24,7 @@ use crate::app::icons::{self, Icon};
 use crate::app::layout::Node;
 use crate::app::nav::Destination;
 use crate::app::palette::{self, Command, Entry, Group};
+use crate::app::snippets::body_preview;
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette as colors, radius, spacing};
 use crate::app::workspace::UnreadNotices;
@@ -108,6 +109,7 @@ fn group_label(group: Group, strings: &copy::Strings) -> &'static str {
         Group::Recent => strings.palette_group_recent,
         Group::Shells => strings.palette_group_shells,
         Group::Hosts => strings.palette_group_hosts,
+        Group::Snippets => strings.palette_group_snippets,
         Group::Navigate => strings.palette_group_navigate,
         Group::Actions => strings.palette_group_actions,
     }
@@ -218,6 +220,7 @@ impl ShelluneView {
     /// so a rebound or unbound action is shown as it really is (R5).
     fn palette_entries(&self) -> Vec<Entry> {
         let strings = self.strings();
+        let ux = copy::ux();
         let locale = self.workspace.locale();
         let mut entries = Vec::new();
 
@@ -297,6 +300,59 @@ impl ShelluneView {
                 current: false,
             });
         }
+
+        // The saved commands, each with the two things the palette can do with it (R6).
+        // Both entries name the command, so a search for the command finds the pair and a
+        // reader can tell "type it" from "run it" before choosing.
+        for snippet in self.snippets.snippets() {
+            let id = snippet.id();
+            let name = snippet.name().to_owned();
+            let lines = snippet.line_count();
+            let mut detail = body_preview(snippet.body(), 60);
+            if lines > 1 {
+                detail.push_str(" · ");
+                detail.push_str(&copy::fill(
+                    ux.snippet_line_count,
+                    &[("count", &lines.to_string())],
+                ));
+            }
+            entries.push(Entry {
+                command: Command::InsertSnippet(id),
+                group: Group::Snippets,
+                title: copy::fill(ux.snippet_insert_action, &[("name", &name)]),
+                detail: detail.clone(),
+                shortcut: None,
+                icon: Icon::Terminal,
+                current: false,
+            });
+            entries.push(Entry {
+                command: Command::RunSnippet(id),
+                group: Group::Snippets,
+                title: copy::fill(ux.snippet_run_action, &[("name", &name)]),
+                detail,
+                shortcut: None,
+                icon: Icon::Play,
+                current: false,
+            });
+        }
+        entries.push(Entry {
+            command: Command::ManageSnippets,
+            group: Group::Snippets,
+            title: ux.snippet_manage_action.to_owned(),
+            detail: ux.snippet_manage_hint.to_owned(),
+            shortcut: None,
+            icon: Icon::Terminal,
+            current: false,
+        });
+        entries.push(Entry {
+            command: Command::NewSnippet,
+            group: Group::Snippets,
+            title: ux.snippet_new_action.to_owned(),
+            detail: ux.snippet_storage_note.to_owned(),
+            shortcut: None,
+            icon: Icon::Plus,
+            current: false,
+        });
 
         for destination in Destination::PAGES {
             entries.push(Entry {
@@ -540,6 +596,10 @@ impl ShelluneView {
                 self.open_import(cx);
             }
             Command::QuickConnect => self.open_quick_connect(window, cx),
+            Command::InsertSnippet(id) => self.use_snippet(id, false, cx),
+            Command::RunSnippet(id) => self.use_snippet(id, true, cx),
+            Command::ManageSnippets => self.open_snippets(false, cx),
+            Command::NewSnippet => self.open_snippets(true, cx),
             Command::CloseTab(id) => self.request_close_session(id, cx),
             Command::RenameTab(id) => {
                 if let Some(tab) = self.workspace.tab_of_session(id) {

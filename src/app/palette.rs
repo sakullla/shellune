@@ -9,7 +9,7 @@
 //! This module is render-independent: it holds the entries and the ranking, so the
 //! matching rules can be tested without a window.
 
-use shellune_core::{HostId, SessionId};
+use shellune_core::{HostId, SessionId, SnippetId};
 
 use crate::app::icons::Icon;
 use crate::app::nav::Destination;
@@ -31,6 +31,14 @@ pub enum Command {
     ImportSshConfig,
     /// Connects with an address that is not saved as a host first.
     QuickConnect,
+    /// Types a saved command into the terminal on screen, without running it (R6).
+    InsertSnippet(SnippetId),
+    /// Types a saved command into the terminal on screen and submits it (R6).
+    RunSnippet(SnippetId),
+    /// Opens the manager of the saved commands.
+    ManageSnippets,
+    /// Opens the manager on a command that has not been written yet.
+    NewSnippet,
     /// Closes the session on screen.
     CloseTab(SessionId),
     /// Gives the tab of an open session a name of its own.
@@ -62,6 +70,8 @@ pub enum Group {
     Shells,
     /// Saved hosts.
     Hosts,
+    /// Saved shortcut commands (R6).
+    Snippets,
     /// The pages of the window.
     Navigate,
     /// Window actions and settings.

@@ -28,7 +28,8 @@ use shellune_ssh::PtySize;
 use shellune_ssh::RemoteEvent;
 use shellune_storage::{
     BookError, ForwardStore, HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview,
-    ImportedHost, PreferencesProblem, PreferencesStore, SecretStore, StorageError, TrustStore,
+    ImportedHost, PreferencesProblem, PreferencesStore, SecretStore, SnippetStore, StorageError,
+    TrustStore,
 };
 use shellune_terminal::GridSize;
 
@@ -61,6 +62,7 @@ use crate::app::remote::{
     self, AttemptLink, ChainDraft, LinkEvent, MethodChoice, RemoteFailure, RemotePanel,
     RemoteStatus,
 };
+use crate::app::snippets::{SnippetLibrary, SnippetsPanel};
 use crate::app::terminal::{self, PaneState, SourceEvent, TerminalAttention, TerminalPane};
 use crate::app::text_field::{Browse, TextField};
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
@@ -367,6 +369,18 @@ pub struct ShelluneView {
     transfers: TransferViews,
     /// Saved forwarding rules and the listeners a connection is actually running.
     forwards: ForwardCenter,
+    /// The saved shortcut commands and the file behind them (R6).
+    snippets: SnippetLibrary,
+    /// The manager of those commands: its editor, its deletion question and its row.
+    snippet_panel: SnippetsPanel,
+    /// The field of the command editor that takes the keyboard on the next draw.
+    ///
+    /// The dialog is opened from a button or the palette, neither of which has a window to
+    /// give the keyboard with, so the focus is handed over where a window exists.
+    snippet_focus_pending: Option<FocusHandle>,
+    /// The manager's own keyboard target, so its list answers the arrow keys while no
+    /// field of the editor is open.
+    snippet_focus: FocusHandle,
     forward_listen_host: Entity<TextField>,
     forward_listen_port: Entity<TextField>,
     forward_target_host: Entity<TextField>,
@@ -734,6 +748,9 @@ impl ShelluneView {
         let forward_listen_port = cx.new(|cx| TextField::new("8080", cx));
         let forward_target_host = cx.new(|cx| TextField::new("db.internal", cx));
         let forward_target_port = cx.new(|cx| TextField::new("5432", cx));
+        // The saved commands live beside the hosts, in the same data directory. Reading
+        // them here starts nothing; a damaged file is kept and reported by the library.
+        let snippet_store = SnippetStore::at(store.root());
 
         let mut view = Self {
             workspace,
@@ -787,6 +804,10 @@ impl ShelluneView {
             files: FileViews::new(),
             transfers: TransferViews::new(),
             forwards: ForwardCenter::new(),
+            snippets: SnippetLibrary::load(snippet_store),
+            snippet_panel: SnippetsPanel::new(),
+            snippet_focus_pending: None,
+            snippet_focus: cx.focus_handle(),
             forward_listen_host,
             forward_listen_port,
             forward_target_host,
@@ -1362,6 +1383,20 @@ impl ShelluneView {
     #[must_use]
     pub fn hosts_state(&self) -> &HostsPanel {
         &self.hosts
+    }
+
+    /// The saved shortcut commands, for the tests that check what a restart reads (R6).
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn snippets(&self) -> &SnippetLibrary {
+        &self.snippets
+    }
+
+    /// Whether the manager is showing an editor, and the row and question it holds.
+    #[cfg(test)]
+    #[must_use]
+    pub fn snippet_panel(&self) -> &SnippetsPanel {
+        &self.snippet_panel
     }
 
     /// The import panel and what the last read of a configuration file showed.
@@ -10462,6 +10497,13 @@ impl Render for ShelluneView {
                 window.focus(&handle);
             }
         }
+        // A command editor that was just opened takes the keyboard in its first field, so
+        // the dialog can be written without touching the pointer.
+        if let Some(handle) = self.snippet_focus_pending.take()
+            && !handle.is_focused(window)
+        {
+            window.focus(&handle);
+        }
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);
 
@@ -10536,6 +10578,23 @@ impl Render for ShelluneView {
                 }
                 if this.tab_rename.is_some() {
                     this.close_tab_rename(window, cx);
+                    return;
+                }
+                // The shortcut-command manager gives up one layer at a time: the editor, then
+                // the deletion question, then the dialog itself (R6).
+                if this.snippet_panel.is_editing() {
+                    this.close_snippet_editor(cx);
+                    return;
+                }
+                if this.snippet_panel.pending_delete().is_some() {
+                    this.snippet_panel.keep();
+                    cx.notify();
+                    return;
+                }
+                if this.tool == Some(shell::Tool::Snippets) {
+                    this.tool = None;
+                    this.restore_focus_pending = true;
+                    cx.notify();
                     return;
                 }
                 if this.tab_list_open {

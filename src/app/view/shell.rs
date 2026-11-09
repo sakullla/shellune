@@ -12,11 +12,15 @@ use gpui::{
     AnyElement, Context, Div, FontWeight, MouseButton, SharedString, Stateful, Window, div, px,
 };
 
+use shellune_core::SnippetId;
+
 use super::{ELLIPSIS, ShelluneView, brand_mark, host_avatar, program_label};
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, Locale};
 use crate::app::icons::{self, Icon};
 use crate::app::nav::{Destination, Platform};
+use crate::app::snippets::{SnippetEditor, body_preview};
+use crate::app::text_field::TextField;
 use crate::app::theme::{self, Motion, ThemeChoice, Tone, Zoom, palette, radius, spacing};
 use crate::app::workspace::{AttentionKind, SectionState};
 
@@ -27,6 +31,8 @@ pub enum Tool {
     Forwards,
     /// Uploads and downloads of every connection.
     Transfers,
+    /// The saved shortcut commands, with the editor for one of them (R6).
+    Snippets,
 }
 
 impl ShelluneView {
@@ -1916,6 +1922,8 @@ impl ShelluneView {
             this.tool = None;
             this.forwards.close_editor();
             this.pending_exposure = None;
+            this.snippet_panel.keep();
+            this.snippet_panel.end_edit();
             cx.notify();
         };
         match tool {
@@ -1972,6 +1980,7 @@ impl ShelluneView {
                     .into_any_element();
                 Some(self.modal(window, "transfers.dialog", 680.0, header, body, None))
             }
+            Tool::Snippets => Some(self.snippet_tool(window, cx, close)),
         }
     }
 
@@ -2017,5 +2026,701 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn tool_for_test(&self) -> Option<Tool> {
         self.tool
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shortcut commands (R6)
+// ---------------------------------------------------------------------------
+
+impl ShelluneView {
+    /// Opens the manager of the saved commands, on the list or on a new command.
+    ///
+    /// Opening it reads nothing new: the library was read when the window started, and a
+    /// file that could not be read then is still reported here. Nothing is inserted into a
+    /// terminal by opening the manager.
+    pub(crate) fn open_snippets(&mut self, new: bool, cx: &mut Context<Self>) {
+        self.open_tool(Tool::Snippets, cx);
+        self.snippet_panel.keep();
+        if new {
+            self.open_snippet_editor(None, cx);
+        } else {
+            self.close_snippet_editor(cx);
+            // The list takes the keyboard, so its arrow keys and Enter work without a
+            // pointer. The editor's first field takes it instead when one is opened.
+            self.snippet_focus_pending = Some(self.snippet_focus.clone());
+        }
+        cx.notify();
+    }
+
+    /// Opens the editor on one command, or on a command that has not been written yet.
+    ///
+    /// The fields are made per opening, so they start from what is really saved (or are
+    /// empty for a new one) and their placeholders are in the language on screen. The name
+    /// field takes the keyboard on the next draw, which is where a dialog's first field
+    /// belongs.
+    fn open_snippet_editor(&mut self, id: Option<SnippetId>, cx: &mut Context<Self>) {
+        let ux = copy::ux();
+        let (name_text, body_text) = match id.and_then(|id| self.snippets.get(id).cloned()) {
+            Some(snippet) => (snippet.name().to_owned(), snippet.body().to_owned()),
+            None => (String::new(), String::new()),
+        };
+        let name = cx.new(|cx| TextField::with_text(ux.snippet_name_placeholder, &name_text, cx));
+        let body = cx.new(|cx| {
+            let mut field = TextField::with_text(ux.snippet_body_placeholder, &body_text, cx);
+            // A command may be a short block, so the body keeps its line breaks; Enter
+            // still saves, which is what keeps the dialog on one keyboard path.
+            field.set_keeps_line_breaks(true, cx);
+            field
+        });
+        // Enter in either field saves what is typed. The field keeps its text so a refused
+        // draft stays on screen beside the reason it was refused.
+        let view = cx.entity().downgrade();
+        for field in [name.clone(), body.clone()] {
+            field.update(cx, |field, _cx| {
+                let view = view.clone();
+                field.on_submit(move |_text, _window, app| {
+                    view.update(app, |view, cx| {
+                        view.save_snippet_editor(cx);
+                        false
+                    })
+                    .unwrap_or(false)
+                });
+            });
+            // The dialog redraws as the draft changes, so the length warning appears while
+            // the text can still be shortened rather than only after a refused save.
+            cx.observe(&field, |_view, _field, cx| cx.notify()).detach();
+        }
+        let handle = name.read(cx).focus_handle().clone();
+        self.snippet_panel.begin_edit(SnippetEditor {
+            id,
+            name,
+            body,
+            problem: None,
+        });
+        // The keyboard goes to the first field on the next draw, which is the only place
+        // with a window to give it to.
+        self.snippet_focus_pending = Some(handle);
+        cx.notify();
+    }
+
+    /// Puts the editor away without saving anything. What was typed is dropped.
+    pub(super) fn close_snippet_editor(&mut self, cx: &mut Context<Self>) {
+        if self.snippet_panel.end_edit().is_some() {
+            self.snippet_list_focus();
+            cx.notify();
+        }
+    }
+
+    /// Gives the manager's list the keyboard again, once the editor it replaced is gone.
+    ///
+    /// The field that had the keyboard belongs to the editor, so leaving focus on it would
+    /// leave the dialog with nothing to type into; the list is what the next key press is
+    /// about.
+    fn snippet_list_focus(&mut self) {
+        if self.tool == Some(Tool::Snippets) {
+            self.snippet_focus_pending = Some(self.snippet_focus.clone());
+        }
+    }
+
+    /// Saves what the editor holds, or says why it cannot be saved.
+    ///
+    /// The library writes the file first and adopts the change only once the file has it,
+    /// so a failed save leaves the list as it was and the draft on screen.
+    fn save_snippet_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.snippet_panel.editor() else {
+            return;
+        };
+        let id = editor.id;
+        let name_field = editor.name.clone();
+        let body_field = editor.body.clone();
+        let name = name_field.read(cx).text().to_owned();
+        let body = body_field.read(cx).text().to_owned();
+        let locale = self.workspace.locale();
+        let outcome = match id {
+            Some(id) => self.snippets.replace(id, &name, &body),
+            None => self.snippets.create(&name, &body).map(|_id| ()),
+        };
+        match outcome {
+            Ok(()) => {
+                self.snippet_panel.end_edit();
+                self.snippet_list_focus();
+                self.toast(Tone::Positive, copy::ux().snippet_saved, None, cx);
+            }
+            Err(error) => {
+                let reason = error.text(locale);
+                if let Some(editor) = self.snippet_panel.editor_mut() {
+                    editor.problem = Some(reason);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Deletes the command the question was asked about.
+    fn confirm_snippet_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.snippet_panel.pending_delete() else {
+            return;
+        };
+        self.snippet_panel.keep();
+        let locale = self.workspace.locale();
+        match self.snippets.remove(id) {
+            Ok(true) => {
+                let count = self.snippets.snippets().len();
+                self.snippet_panel
+                    .select(self.snippet_panel.selected(), count);
+                self.toast(Tone::Positive, copy::ux().snippet_deleted, None, cx);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // The command is still in the library, because the file still holds it.
+                self.toast(Tone::Danger, error.text(locale), None, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Offers one saved command to the terminal on screen (R6).
+    ///
+    /// Inserting types the body and submits nothing; running types it and sends one line
+    /// break. Both go through the pane's own paste rule, so a multi-line or high-risk body
+    /// is confirmed first and cancelling writes nothing. Without a terminal on screen
+    /// nothing is created and nothing is reported as run: the window says what to open
+    /// first.
+    pub(crate) fn use_snippet(&mut self, id: SnippetId, execute: bool, cx: &mut Context<Self>) {
+        let ux = copy::ux();
+        let Some(body) = self.snippets.get(id).map(|s| s.body().to_owned()) else {
+            self.toast(
+                Tone::Danger,
+                ux.snippet_problem_unknown.to_owned(),
+                None,
+                cx,
+            );
+            return;
+        };
+        let Some(pane) = self.active_pane().cloned() else {
+            self.toast(
+                Tone::Warning,
+                ux.snippet_no_terminal.to_owned(),
+                Some(ux.snippet_no_terminal_body.to_owned()),
+                cx,
+            );
+            return;
+        };
+        // A pane whose shell has ended keeps its last screen; typing into it would go
+        // nowhere, so nothing is reported as inserted or run.
+        if !pane.read(cx).state().accepts_input() {
+            self.toast(
+                Tone::Warning,
+                ux.snippet_terminal_ended.to_owned(),
+                Some(ux.snippet_terminal_ended_body.to_owned()),
+                cx,
+            );
+            return;
+        }
+        pane.update(cx, |pane, cx| pane.stage_snippet(&body, execute, cx));
+        let title = if execute {
+            ux.snippet_sent
+        } else {
+            ux.snippet_inserted
+        };
+        self.toast(Tone::Positive, title, None, cx);
+    }
+
+    /// The keys the manager reads before its fields do.
+    ///
+    /// The list is walkable: Up and Down move the highlighted command and Enter inserts it
+    /// (the safe of its two actions), so a command can be used without a pointer. Escape is
+    /// the window's own "close what floats" action, which takes one layer at a time — the
+    /// editor, then the deletion question, then the dialog — so a single press never throws
+    /// a draft away.
+    fn snippet_panel_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        // While the editor is open the keys belong to its fields.
+        if self.snippet_panel.is_editing() {
+            return;
+        }
+        let len = self.snippets.snippets().len();
+        match key {
+            "down" => {
+                cx.stop_propagation();
+                self.snippet_panel.step(1, len);
+                cx.notify();
+            }
+            "up" => {
+                cx.stop_propagation();
+                self.snippet_panel.step(-1, len);
+                cx.notify();
+            }
+            "enter" if self.snippet_panel.pending_delete().is_none() => {
+                cx.stop_propagation();
+                if let Some(snippet) = self.snippets.snippets().get(self.snippet_panel.selected()) {
+                    let id = snippet.id();
+                    self.use_snippet(id, false, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The manager: the list of saved commands, the editor and the deletion question.
+    fn snippet_tool(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+        close: impl Fn(&mut Self, &mut Context<Self>) + Clone + 'static,
+    ) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let count = self.snippets.snippets().len();
+        let subtitle = if count == 0 {
+            ux.snippet_manage_hint.to_owned()
+        } else {
+            format!(
+                "{} · {}",
+                copy::fill(ux.snippet_count, &[("count", &count.to_string())]),
+                ux.snippet_manage_hint
+            )
+        };
+        let close_header = close.clone();
+        let header = self.modal_header(
+            Some(Icon::Terminal),
+            ux.snippet_manage_title.to_owned(),
+            Some(subtitle),
+            "snippets.dialog.close",
+            cx,
+            move |this, cx| close_header(this, cx),
+        );
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .pb(metrics.scale(spacing::SNUG))
+            .track_focus(&self.snippet_focus)
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.snippet_panel_key(event, window, cx);
+            }));
+
+        // A file that could not be read is named here, and no save is offered over it.
+        if let Some(problem) = self.snippets.read_problem() {
+            let path = self.snippets.store().path().display().to_string();
+            let reason = copy::fill(ux.snippet_unreadable_body, &[("path", &path)]);
+            body = body
+                .child(self.notice_line(ux.snippet_unreadable_title.to_owned(), Tone::Danger))
+                .child(
+                    components::banner(Tone::Danger, metrics)
+                        .debug_selector(|| "snippets.unreadable".to_owned())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(SharedString::from(reason)),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(SharedString::from(problem.to_owned())),
+                );
+        }
+        if let Some(problem) = self.snippets.write_problem() {
+            body = body.child(self.notice_line(
+                copy::fill(ux.snippet_save_failed_detail, &[("reason", problem)]),
+                Tone::Warning,
+            ));
+        }
+
+        if let Some(editor) = self.snippet_panel.editor() {
+            body = body.child(self.snippet_editor_form(editor, cx));
+        } else {
+            // An empty library says what to do next; a library that could not be read does
+            // not, because its file is the thing to deal with and the banner above says so.
+            if count == 0 && self.snippets.can_write() {
+                body = body.child(
+                    components::state_card_with_icon(
+                        Tone::Neutral,
+                        Some(Icon::Terminal),
+                        ux.snippet_empty_title,
+                        ux.snippet_empty_body,
+                        None,
+                        metrics,
+                    )
+                    .debug_selector(|| "snippets.empty".to_owned()),
+                );
+            }
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .debug_selector(|| "snippets.list".to_owned());
+            for index in 0..count {
+                list = list.child(self.snippet_row(index, cx));
+            }
+            body = body.child(list);
+            if let Some(question) = self.snippet_delete_question(cx) {
+                body = body.child(question);
+            }
+        }
+
+        // Where the commands live, and what must not be kept in one, in the words the
+        // editor does not hide behind a link.
+        body = body.child(
+            div()
+                .debug_selector(|| "snippets.storage".to_owned())
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(ux.snippet_storage_note),
+        );
+
+        let new_button = self
+            .text_button(
+                SharedString::from("snippets.new"),
+                ux.snippet_new,
+                Variant::Primary,
+                cx,
+                |this, cx| {
+                    this.snippet_panel.keep();
+                    this.open_snippet_editor(None, cx);
+                },
+            )
+            .when(!self.snippets.can_write(), |button| button.opacity(0.5));
+        let close_footer = close.clone();
+        let footer = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::SNUG))
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .child(new_button)
+            .child(self.text_button(
+                SharedString::from("snippets.dialog.footer.close"),
+                ux.tool_close,
+                Variant::Ghost,
+                cx,
+                move |this, cx| close_footer(this, cx),
+            ));
+
+        self.modal(
+            window,
+            "snippets.dialog",
+            640.0,
+            header,
+            body.into_any_element(),
+            Some(footer),
+        )
+    }
+
+    /// One saved command: what it is, what it runs and what can be done with it.
+    fn snippet_row(&self, index: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let Some(snippet) = self.snippets.snippets().get(index) else {
+            return div().id(SharedString::from(format!("snippet.row.{index}")));
+        };
+        let id = snippet.id();
+        let lines = snippet.line_count();
+        let selected = self.snippet_panel.selected() == index;
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        let mut detail = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .gap(px(1.0))
+            .child(
+                div()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(snippet.name().to_owned())),
+            )
+            .child(
+                div()
+                    .debug_selector({
+                        let selector = format!("snippet.preview.{index}");
+                        move || selector.clone()
+                    })
+                    .font_family(crate::app::terminal::monospace_family())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(SharedString::from(body_preview(snippet.body(), 96))),
+            );
+        if lines > 1 {
+            detail = detail.child(
+                components::chip(
+                    copy::fill(ux.snippet_line_count, &[("count", &lines.to_string())]),
+                    Tone::Neutral,
+                    metrics,
+                )
+                .debug_selector({
+                    let selector = format!("snippet.lines.{index}");
+                    move || selector.clone()
+                }),
+            );
+        }
+        div()
+            .id(SharedString::from(format!("snippet.row.{index}")))
+            .debug_selector({
+                let selector = format!("snippet.row.{index}");
+                move || selector.clone()
+            })
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::HAIRLINE + 2.0))
+            .rounded(px(radius::SMALL))
+            .when(selected, |row| {
+                row.bg(theme::swatch(palette::SURFACE_SELECTED))
+            })
+            .hover(move |style| style.bg(hover))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                let len = this.snippets.snippets().len();
+                this.snippet_panel.select(index, len);
+                cx.notify();
+            }))
+            .child(detail)
+            .child(self.snippet_row_button(
+                format!("snippet.insert.{index}"),
+                ux.snippet_insert,
+                id,
+                false,
+                cx,
+            ))
+            .child(self.snippet_row_button(
+                format!("snippet.run.{index}"),
+                ux.snippet_run,
+                id,
+                true,
+                cx,
+            ))
+            .child(self.text_button(
+                SharedString::from(format!("snippet.edit.{index}")),
+                ux.snippet_edit,
+                Variant::Ghost,
+                cx,
+                move |this, cx| this.open_snippet_editor(Some(id), cx),
+            ))
+            .child(self.text_button(
+                SharedString::from(format!("snippet.delete.{index}")),
+                ux.snippet_delete,
+                Variant::Ghost,
+                cx,
+                move |this, cx| {
+                    this.snippet_panel.ask_delete(id);
+                    let len = this.snippets.snippets().len();
+                    this.snippet_panel.select(index, len);
+                    cx.notify();
+                },
+            ))
+    }
+
+    /// The insert or run button of one row.
+    fn snippet_row_button(
+        &self,
+        selector: String,
+        label: &'static str,
+        id: SnippetId,
+        execute: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        self.text_button(
+            SharedString::from(selector),
+            label,
+            if execute {
+                Variant::Secondary
+            } else {
+                Variant::Ghost
+            },
+            cx,
+            move |this, cx| this.use_snippet(id, execute, cx),
+        )
+    }
+
+    /// The editor of one command: its name, its body and what to do with a refused draft.
+    fn snippet_editor_form(&self, editor: &SnippetEditor, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let form = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "snippet.editor".to_owned())
+            .child(
+                components::section_label(
+                    if editor.is_new() {
+                        ux.snippet_new
+                    } else {
+                        ux.snippet_edit_title
+                    },
+                    metrics,
+                )
+                .debug_selector(|| "snippet.editor.title".to_owned()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(ux.snippet_field_name),
+                    )
+                    .child(
+                        div()
+                            .h(metrics.control_height())
+                            .debug_selector(|| "snippet.editor.name".to_owned())
+                            .child(editor.name.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(ux.snippet_field_body),
+                    )
+                    .child(
+                        div()
+                            .h(metrics.control_height())
+                            .debug_selector(|| "snippet.editor.body".to_owned())
+                            .child(editor.body.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(ux.snippet_editor_keys),
+            )
+            // A draft that is already too long says so while it is being written: an empty
+            // name or body is not reported before anything is typed, because a new command
+            // starts empty on purpose.
+            .children(
+                crate::app::snippets::draft_problem(
+                    editor.name.read(cx).text(),
+                    editor.body.read(cx).text(),
+                )
+                .filter(|problem| {
+                    !matches!(
+                        problem,
+                        shellune_core::SnippetProblem::EmptyName
+                            | shellune_core::SnippetProblem::EmptyBody
+                    )
+                })
+                .map(|problem| {
+                    self.notice_line(
+                        copy::snippet_problem_text(&problem, self.workspace.locale()),
+                        Tone::Warning,
+                    )
+                    .debug_selector(|| "snippet.editor.limit".to_owned())
+                }),
+            )
+            .children(
+                editor
+                    .problem
+                    .as_ref()
+                    .map(|problem| self.notice_line(problem.clone(), Tone::Danger)),
+            );
+        // A library whose file could not be read offers no save: the change would have
+        // nowhere honest to go, and the banner above says which file to repair.
+        let writable = self.snippets.can_write();
+        let save = self
+            .text_button(
+                SharedString::from("snippet.editor.save"),
+                ux.snippet_save,
+                Variant::Primary,
+                cx,
+                |this, cx| this.save_snippet_editor(cx),
+            )
+            .when(!writable, |button| button.opacity(0.5));
+        let cancel = self.text_button(
+            SharedString::from("snippet.editor.cancel"),
+            ux.fwd_cancel,
+            Variant::Ghost,
+            cx,
+            |this, cx| this.close_snippet_editor(cx),
+        );
+        form.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(save)
+                .child(cancel),
+        )
+    }
+
+    /// The question that stands between a command and its deletion.
+    fn snippet_delete_question(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let id = self.snippet_panel.pending_delete()?;
+        let snippet = self.snippets.get(id)?;
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let name = snippet.name().to_owned();
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(metrics.scale(spacing::TIGHT))
+                .p(metrics.scale(spacing::SNUG))
+                .rounded(px(radius::SMALL))
+                .border_1()
+                .border_color(theme::swatch(palette::DANGER))
+                .bg(theme::swatch(palette::DANGER_TINT))
+                .debug_selector(|| "snippet.delete.question".to_owned())
+                .child(
+                    div()
+                        .text_size(metrics.label_size())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(ux.snippet_delete_title),
+                )
+                .child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .child(SharedString::from(copy::fill(
+                            ux.snippet_delete_body,
+                            &[("name", &name)],
+                        ))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(self.text_button(
+                            SharedString::from("snippet.delete.yes"),
+                            ux.snippet_delete_yes,
+                            Variant::Danger,
+                            cx,
+                            |this, cx| this.confirm_snippet_delete(cx),
+                        ))
+                        .child(self.text_button(
+                            SharedString::from("snippet.delete.no"),
+                            ux.snippet_delete_no,
+                            Variant::Ghost,
+                            cx,
+                            |this, cx| {
+                                this.snippet_panel.keep();
+                                cx.notify();
+                            },
+                        )),
+                ),
+        )
     }
 }

@@ -455,6 +455,12 @@ struct PendingPaste {
     text: String,
     /// The session label captured when the paste was offered.
     target: String,
+    /// Whether the text is a saved command that runs once it is confirmed (R6).
+    ///
+    /// A confirmation is asked for the same reason either way — the text is multi-line or
+    /// high-risk — but what happens after it differs: a paste is only typed, a command is
+    /// typed and submitted.
+    execute: bool,
 }
 
 /// What the find bar says beside the query (R1).
@@ -1234,12 +1240,46 @@ impl TerminalPane {
             self.pending_paste = Some(PendingPaste {
                 text: text.to_owned(),
                 target: self.origin.label().to_owned(),
+                execute: false,
             });
             cx.notify();
             return;
         }
         self.pending_paste = None;
         self.write_paste(text, cx);
+        cx.notify();
+    }
+
+    /// Offers a saved command to this pane (R6).
+    ///
+    /// `execute` is the only difference between the palette's two actions: inserting
+    /// types the body and submits nothing, running types it and sends one line break.
+    /// The body's own trailing line breaks are dropped first, so a command saved with a
+    /// final newline cannot run just because it was inserted; running then adds exactly
+    /// one break, so the command reaches the shell once rather than once per stored line
+    /// ending.
+    ///
+    /// A multi-line or otherwise risky body is held and confirmed the way a paste is —
+    /// the same prompt, the same pane, the same rule that cancelling writes nothing.
+    pub fn stage_snippet(&mut self, body: &str, execute: bool, cx: &mut Context<Self>) {
+        // The body arrives as it is saved; the rule about its trailing line breaks lives in
+        // one place so the editor, the list and this pane cannot disagree about what will
+        // be typed.
+        let trimmed = crate::app::snippets::body_for_terminal(body);
+        if trimmed.trim().is_empty() {
+            return;
+        }
+        if paste_needs_confirmation(trimmed) {
+            self.pending_paste = Some(PendingPaste {
+                text: trimmed.to_owned(),
+                target: self.origin.label().to_owned(),
+                execute,
+            });
+            cx.notify();
+            return;
+        }
+        self.pending_paste = None;
+        self.write_snippet(trimmed, execute, cx);
         cx.notify();
     }
 
@@ -1251,7 +1291,11 @@ impl TerminalPane {
         let Some(pending) = self.pending_paste.take() else {
             return false;
         };
-        self.write_paste(&pending.text, cx);
+        if pending.execute {
+            self.write_snippet(&pending.text, true, cx);
+        } else {
+            self.write_paste(&pending.text, cx);
+        }
         cx.notify();
         true
     }
@@ -1277,6 +1321,15 @@ impl TerminalPane {
     #[must_use]
     pub fn pending_paste_text(&self) -> Option<&str> {
         self.pending_paste.as_ref().map(|paste| paste.text.as_str())
+    }
+
+    /// Whether the held paste is a saved command that will run once it is confirmed.
+    #[cfg(test)]
+    #[must_use]
+    pub fn pending_paste_runs_for_test(&self) -> bool {
+        self.pending_paste
+            .as_ref()
+            .is_some_and(|paste| paste.execute)
     }
 
     /// Command blocks recorded from shell integration, including a running one.
@@ -1306,6 +1359,18 @@ impl TerminalPane {
 
     fn write_paste(&mut self, text: &str, cx: &mut Context<Self>) {
         let bytes = encode_paste(text, self.core.mode());
+        self.write(&bytes, cx);
+    }
+
+    /// Types a saved command, and submits it when `execute` says so.
+    ///
+    /// `text` must already be free of trailing line breaks; the one break this sends is
+    /// the submit that running asks for, and nothing else adds another.
+    fn write_snippet(&mut self, text: &str, execute: bool, cx: &mut Context<Self>) {
+        let mut bytes = encode_paste(text, self.core.mode());
+        if execute {
+            bytes.push(b'\r');
+        }
         self.write(&bytes, cx);
     }
 
@@ -2441,6 +2506,17 @@ impl TerminalPane {
                         strings.terminal_paste_lines
                     ))),
             )
+            // A saved command that was asked to run says so before it is confirmed: the
+            // prompt is otherwise the same one a paste gets, and what follows it differs.
+            .when(pending.execute, |column| {
+                column.child(
+                    div()
+                        .debug_selector(|| "terminal.paste.runs".to_owned())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(shell_palette::ACCENT))
+                        .child(strings.terminal_paste_runs),
+                )
+            })
             .child(
                 div()
                     .debug_selector(|| "terminal.paste.preview".to_owned())
