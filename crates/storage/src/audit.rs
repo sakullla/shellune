@@ -49,6 +49,10 @@ pub const CONFIG_KEYS: &[&str] = &[
     "active_tab",
     "panel",
     "title",
+    // A tab's own name and distinguishing colour: what the user called it, not a
+    // secret. Both are optional, so a file written before they existed still loads.
+    "custom_title",
+    "accent",
     "root",
     "active_pane",
     "node",

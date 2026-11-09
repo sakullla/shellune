@@ -14,8 +14,8 @@
 
 use shellune_core::{
     ForwardRule, HostConfig, HostId, LocalShell, PaneId, PaneTarget, PanelConfig, PanelSection,
-    Session, SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, Transfer,
-    WorkspaceSnapshot,
+    Session, SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, TabAccent, TabId,
+    Transfer, WorkspaceSnapshot,
 };
 
 use crate::app::layout::SessionLayout;
@@ -333,6 +333,40 @@ impl Workspace {
     #[must_use]
     pub fn tab_anchors(&self) -> Vec<SessionId> {
         self.layout.tab_anchors()
+    }
+
+    /// The tab that holds `session`, when the layout still has it.
+    #[must_use]
+    pub fn tab_of_session(&self, session: SessionId) -> Option<TabId> {
+        self.layout.tab_id_of_session(session)
+    }
+
+    /// The name the user gave one tab, if they gave one.
+    #[must_use]
+    pub fn tab_custom_title(&self, tab: TabId) -> Option<&str> {
+        self.layout.tab(tab).and_then(|tab| tab.custom_title())
+    }
+
+    /// The colour that tells one tab from its neighbours, if one was chosen.
+    #[must_use]
+    pub fn tab_accent(&self, tab: TabId) -> Option<TabAccent> {
+        self.layout.tab(tab).and_then(|tab| tab.accent())
+    }
+
+    /// Names one tab, or returns it to its automatic title when given `None`.
+    ///
+    /// The tab keeps its target, its kind, its state and its place, so two tabs with
+    /// one name are still told apart. Returns whether the name changed, which is what
+    /// tells the caller to write the snapshot.
+    pub fn rename_tab(&mut self, tab: TabId, title: Option<String>) -> bool {
+        self.layout.set_custom_title(tab, title)
+    }
+
+    /// Chooses the distinguishing colour of one tab, or clears it.
+    ///
+    /// Clearing the colour changes nothing else: no state is read from it.
+    pub fn recolor_tab(&mut self, tab: TabId, accent: Option<TabAccent>) -> bool {
+        self.layout.set_accent(tab, accent)
     }
 
     /// The next session splits the active pane instead of opening a tab.

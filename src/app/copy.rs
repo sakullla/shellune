@@ -10,7 +10,7 @@
 //! [`crate::app::product`] because R18 fixes them independently of the UI
 //! language.
 
-use shellune_core::{SessionState, TransferState};
+use shellune_core::{SessionState, TabAccent, TransferState};
 
 /// UI language.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -739,6 +739,40 @@ pub struct Strings {
     pub tab_menu_move_left: &'static str,
     /// Tab menu: move this tab toward the end.
     pub tab_menu_move_right: &'static str,
+    /// Tab menu: give this tab a name of its own.
+    pub tab_menu_rename: &'static str,
+    /// Title of the tab-name dialog.
+    pub tab_rename_title: &'static str,
+    /// Placeholder of the tab-name field.
+    pub tab_rename_placeholder: &'static str,
+    /// Explains what a tab name replaces, and what it never replaces.
+    pub tab_rename_hint: &'static str,
+    /// Saves the tab name.
+    pub tab_rename_save: &'static str,
+    /// Why an empty name was refused.
+    pub tab_rename_empty: &'static str,
+    /// Clears the model name and goes back to the automatic title.
+    pub tab_rename_auto: &'static str,
+    /// Heading above the colour choices of one tab.
+    pub tab_accent_label: &'static str,
+    /// No colour chosen for this tab.
+    pub tab_accent_none: &'static str,
+    /// Tab colour: blue.
+    pub tab_accent_iris: &'static str,
+    /// Tab colour: violet.
+    pub tab_accent_violet: &'static str,
+    /// Tab colour: teal.
+    pub tab_accent_teal: &'static str,
+    /// Tab colour: yellow-green.
+    pub tab_accent_lime: &'static str,
+    /// Tab colour: orchid pink.
+    pub tab_accent_orchid: &'static str,
+    /// Tab colour: warm clay.
+    pub tab_accent_clay: &'static str,
+    /// Title of the list of every open tab.
+    pub tab_list_title: &'static str,
+    /// Explains the tab list: strip order, and choosing one shows it.
+    pub tab_list_hint: &'static str,
     /// A host id in a pane is not in the saved book.
     pub pane_missing_host: &'static str,
     /// What to do about a pane whose host is missing.
@@ -1190,6 +1224,23 @@ pub static ENGLISH: Strings = Strings {
     pane_resize_more: "Grow pane",
     tab_menu_move_left: "Move tab left",
     tab_menu_move_right: "Move tab right",
+    tab_menu_rename: "Rename tab\u{2026}",
+    tab_rename_title: "Rename tab",
+    tab_rename_placeholder: "Tab name",
+    tab_rename_hint: "The name replaces the automatic title. The target, the kind and the state stay in the tooltip and in the tab list.",
+    tab_rename_save: "Save name",
+    tab_rename_empty: "A tab needs a name here. Choose \u{201c}Use automatic title\u{201d} to clear it.",
+    tab_rename_auto: "Use automatic title",
+    tab_accent_label: "Tab colour",
+    tab_accent_none: "No colour",
+    tab_accent_iris: "Iris",
+    tab_accent_violet: "Violet",
+    tab_accent_teal: "Teal",
+    tab_accent_lime: "Lime",
+    tab_accent_orchid: "Orchid",
+    tab_accent_clay: "Clay",
+    tab_list_title: "All tabs",
+    tab_list_hint: "Every open tab, in strip order. Choosing one shows it.",
     pane_missing_host: "This host is not saved",
     pane_missing_next: "Fix the host or remove the pane. Nothing was connected.",
     workspace_dangling_tab: "The saved active tab is not in this workspace. Choose a tab. The others were kept.",
@@ -1582,6 +1633,23 @@ pub static CHINESE: Strings = Strings {
     pane_resize_more: "放大尺寸",
     tab_menu_move_left: "标签左移",
     tab_menu_move_right: "标签右移",
+    tab_menu_rename: "重命名标签\u{2026}",
+    tab_rename_title: "重命名标签",
+    tab_rename_placeholder: "标签名称",
+    tab_rename_hint: "名称只替换自动标题；目标、类型和状态仍显示在悬停提示与标签列表里。",
+    tab_rename_save: "保存名称",
+    tab_rename_empty: "这里需要一个名称；要清除请用「恢复自动标题」。",
+    tab_rename_auto: "恢复自动标题",
+    tab_accent_label: "标签辨识色",
+    tab_accent_none: "不设颜色",
+    tab_accent_iris: "鸢尾蓝",
+    tab_accent_violet: "紫罗兰",
+    tab_accent_teal: "青绿",
+    tab_accent_lime: "黄绿",
+    tab_accent_orchid: "兰紫",
+    tab_accent_clay: "陶土",
+    tab_list_title: "全部标签",
+    tab_list_hint: "按顶栏顺序列出全部标签，选择即切换。",
     pane_missing_host: "这台主机没有保存",
     pane_missing_next: "修复主机或移除这个窗格。没有建立连接。",
     workspace_dangling_tab: "保存的活动标签不在这个工作区里。请另选一个标签，其余标签已保留。",
@@ -2268,6 +2336,23 @@ pub fn ux() -> &'static UxStrings {
     match Locale::current() {
         Locale::English => &ENGLISH_UX,
         Locale::Chinese => &CHINESE_UX,
+    }
+}
+
+/// The name of one tab colour in a language.
+///
+/// The colour is there to tell tabs apart, so it is also written out: a tab never
+/// depends on being seen in colour to be identified.
+#[must_use]
+pub fn tab_accent_label(accent: TabAccent, locale: Locale) -> &'static str {
+    let strings = locale.strings();
+    match accent {
+        TabAccent::Iris => strings.tab_accent_iris,
+        TabAccent::Violet => strings.tab_accent_violet,
+        TabAccent::Teal => strings.tab_accent_teal,
+        TabAccent::Lime => strings.tab_accent_lime,
+        TabAccent::Orchid => strings.tab_accent_orchid,
+        TabAccent::Clay => strings.tab_accent_clay,
     }
 }
 

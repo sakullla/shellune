@@ -7,14 +7,15 @@
 use gpui::prelude::*;
 use gpui::{
     Context, Div, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
-    SharedString, Window, div, px,
+    SharedString, Stateful, Window, div, px,
 };
-use shellune_core::{HostConfig, LocalShell, SessionId, SessionKind};
+use shellune_core::{HostConfig, LocalShell, PaneTarget, SessionId, SessionKind, TabAccent, TabId};
 
 use super::{PaneKind, ShelluneView, destination_icon, program_label, session_target};
-use crate::app::components;
+use crate::app::components::{self, Variant};
 use crate::app::copy;
 use crate::app::icons::{self, Icon};
+use crate::app::layout::Node;
 use crate::app::nav::Destination;
 use crate::app::palette::{self, Command, Entry, Group};
 use crate::app::text_field::TextField;
@@ -189,7 +190,7 @@ impl ShelluneView {
             entries.push(Entry {
                 command: Command::Switch(id),
                 group: Group::Sessions,
-                title: self.tab_title(id, index),
+                title: self.tab_title(id),
                 detail: format!(
                     "{kind_label} · {target} · {}",
                     copy::session_state_label(session.state(), locale)
@@ -275,6 +276,37 @@ impl ShelluneView {
                     .unwrap_or_default(),
                 shortcut: self.keymap.label("tab.close"),
                 icon: Icon::Close,
+                current: false,
+            });
+            // Naming a tab and colouring it are tab actions, so the palette is how
+            // they are reached without a pointer on the strip (R2, R4).
+            let tab = self.workspace.tab_of_session(id);
+            entries.push(Entry {
+                command: Command::RenameTab(id),
+                group: Group::Actions,
+                title: strings.tab_menu_rename.to_owned(),
+                detail: self.tab_title(id),
+                shortcut: None,
+                icon: Icon::Pencil,
+                current: false,
+            });
+            let accent = tab.and_then(|tab| self.workspace.tab_accent(tab));
+            entries.push(Entry {
+                command: Command::CycleTabAccent(id),
+                group: Group::Actions,
+                title: strings.tab_accent_label.to_owned(),
+                detail: format!(
+                    "{} → {}",
+                    accent.map_or(strings.tab_accent_none, |accent| {
+                        copy::tab_accent_label(accent, locale)
+                    }),
+                    copy::tab_accent_label(
+                        accent.map_or(TabAccent::ALL[0], TabAccent::next),
+                        locale
+                    )
+                ),
+                shortcut: None,
+                icon: Icon::Layers,
                 current: false,
             });
         }
@@ -437,6 +469,21 @@ impl ShelluneView {
             }
             Command::QuickConnect => self.open_quick_connect(window, cx),
             Command::CloseTab(id) => self.request_close_session(id, cx),
+            Command::RenameTab(id) => {
+                if let Some(tab) = self.workspace.tab_of_session(id) {
+                    self.open_tab_rename(tab, window, cx);
+                }
+            }
+            Command::CycleTabAccent(id) => {
+                if let Some(tab) = self.workspace.tab_of_session(id) {
+                    let next = Some(
+                        self.workspace
+                            .tab_accent(tab)
+                            .map_or(TabAccent::ALL[0], TabAccent::next),
+                    );
+                    self.set_tab_accent(tab, next, cx);
+                }
+            }
             Command::ToggleLanguage => self.toggle_locale(cx),
             Command::CycleTheme => self.cycle_theme(cx),
             Command::CycleMotion => self.cycle_motion(cx),
@@ -873,11 +920,21 @@ impl ShelluneView {
 
         let has_others = tab_count > 1;
         let has_right = index + 1 < tab_count;
+        let tab = self.workspace.tab_of_session(id);
+        // The menu holds more than it used to (a name, the colours and the close
+        // actions), so it caps its own height and scrolls: at 200% text in the
+        // smallest window the last entry still has to be reachable (R4).
+        let max_height =
+            (viewport.height - metrics.header_height() - metrics.scale(spacing::LOOSE))
+                .max(metrics.scale(120.0));
         let menu = div()
+            .id("tab.menu")
             .debug_selector(|| "tab.menu".to_owned())
             .flex()
             .flex_col()
             .min_w(metrics.scale(220.0))
+            .max_h(max_height)
+            .overflow_y_scroll()
             .p(metrics.scale(spacing::HAIRLINE))
             .rounded(px(radius::LARGE))
             .bg(theme::swatch(colors::SURFACE_RAISED))
@@ -892,6 +949,22 @@ impl ShelluneView {
                     }),
                 ),
             )
+            .child(
+                item(
+                    strings.tab_menu_rename,
+                    "tab.menu.rename",
+                    None,
+                    tab.is_some(),
+                )
+                .when_some(tab, |menu, tab| {
+                    menu.on_click(cx.listener(move |this, _event, window, cx| {
+                        this.close_tab_menu(window, cx);
+                        this.open_tab_rename(tab, window, cx);
+                    }))
+                }),
+            )
+            .child(divider())
+            .children(tab.map(|tab| self.tab_accent_choices(tab, "tab.menu", cx)))
             .child(divider())
             .child(
                 item(
@@ -1006,5 +1079,644 @@ pub(super) fn clamp_menu(
     Point {
         x: position.x.min(viewport.width - width).max(px(0.0)),
         y: position.y.max(top),
+    }
+}
+
+/// The first pane's target of a tab that has not been started.
+///
+/// A waiting tab has no session to describe it, so its target is read from the tree
+/// the snapshot restored. Nothing here is opened.
+fn first_target(node: &Node) -> Option<&PaneTarget> {
+    match node {
+        Node::Leaf(leaf) => Some(leaf.target()),
+        Node::Split { first, second, .. } => first_target(first).or_else(|| first_target(second)),
+    }
+}
+
+impl ShelluneView {
+    // -----------------------------------------------------------------------
+    // Tab identity: its own name, its colour and the list of every tab (R2)
+    // -----------------------------------------------------------------------
+
+    /// The colour choices of one tab, as a labelled row of swatches.
+    ///
+    /// The chosen colour carries a ring and the rest do not, so the row says which one
+    /// is set without relying on the mark on the tab being visible. Choosing a colour
+    /// changes the mark at once and nothing else: the state, the target and the name of
+    /// every tab stay what they are.
+    fn tab_accent_choices(&self, tab: TabId, prefix: &'static str, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let locale = self.workspace.locale();
+        let chosen = self.workspace.tab_accent(tab);
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .px(metrics.scale(spacing::TIGHT + 2.0))
+            .py(metrics.scale(2.0))
+            .debug_selector(move || format!("{prefix}.accents"));
+        let none_selector = format!("{prefix}.accent.none");
+        row = row.child(
+            components::compact_button(strings.tab_accent_none, Variant::Ghost, metrics)
+                .id(SharedString::from(none_selector.clone()))
+                .debug_selector({
+                    let selector = none_selector.clone();
+                    move || selector.clone()
+                })
+                .when(chosen.is_none(), |button| {
+                    button.border_color(theme::swatch(colors::ACCENT))
+                })
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.set_tab_accent(tab, None, cx);
+                })),
+        );
+        for accent in TabAccent::ALL {
+            let selector = format!("{prefix}.accent.{}", accent_selector(accent));
+            let selected = chosen == Some(accent);
+            row = row.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector({
+                        let selector = selector.clone();
+                        move || selector.clone()
+                    })
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(metrics.hit_target())
+                    .rounded(px(radius::SMALL))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::swatch(colors::TEXT_PRIMARY)
+                    } else {
+                        theme::clear()
+                    })
+                    .cursor_pointer()
+                    .tooltip(components::tooltip(copy::tab_accent_label(accent, locale)))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.set_tab_accent(tab, Some(accent), cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(metrics.scale(14.0))
+                            .rounded(px(radius::SMALL))
+                            .bg(theme::tab_accent_color(accent)),
+                    ),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(2.0))
+            .child(
+                div()
+                    .px(metrics.scale(spacing::TIGHT + 2.0))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(colors::TEXT_MUTED))
+                    .child(strings.tab_accent_label),
+            )
+            .child(row)
+    }
+
+    /// Drops the tab layers whose tab is gone.
+    ///
+    /// Closing a session can happen while its menu or its name dialog is open (the
+    /// close shortcut works behind an overlay). A layer that names a tab nobody has any
+    /// more would be describing something that no longer exists.
+    pub(super) fn forget_closed_tab_layers(&mut self) {
+        let alive = |view: &Self, tab: TabId| view.workspace.layout().tab(tab).is_some();
+        if self
+            .tab_rename
+            .as_ref()
+            .is_some_and(|dialog| !alive(self, dialog.tab))
+        {
+            self.tab_rename = None;
+        }
+        if let Some((id, _)) = self.tab_menu
+            && self
+                .workspace
+                .tab_of_session(id)
+                .is_none_or(|tab| !alive(self, tab))
+        {
+            self.tab_menu = None;
+        }
+    }
+
+    /// Chooses the distinguishing colour of one tab, or clears it.
+    fn set_tab_accent(&mut self, tab: TabId, accent: Option<TabAccent>, cx: &mut Context<Self>) {
+        if self.workspace.recolor_tab(tab, accent) {
+            // The colour is part of the saved layout, like the name and the order.
+            self.checkpoint_layout();
+        }
+        cx.notify();
+    }
+
+    /// Opens the dialog that names one tab.
+    ///
+    /// The field is made per opening, so it starts with the name the tab has now (or
+    /// empty when it has none) and its placeholder is in the language on screen.
+    pub(super) fn open_tab_rename(
+        &mut self,
+        tab: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.layout().tab(tab).is_none() {
+            return;
+        }
+        let current = self
+            .workspace
+            .tab_custom_title(tab)
+            .unwrap_or_default()
+            .to_owned();
+        let placeholder = self.strings().tab_rename_placeholder;
+        let field = cx.new(|cx| TextField::with_text(placeholder, &current, cx));
+        let view = cx.entity().downgrade();
+        field.update(cx, |text_field, _cx| {
+            text_field.on_submit(move |_text, _window, app| {
+                view.update(app, |view, cx| {
+                    view.submit_tab_rename(cx);
+                    // The field keeps its text: a refused name stays visible beside the
+                    // reason it was refused.
+                    false
+                })
+                .unwrap_or(false)
+            });
+        });
+        let session = self
+            .workspace
+            .tab_anchors()
+            .into_iter()
+            .find(|id| self.workspace.tab_of_session(*id) == Some(tab));
+        self.remember_focus(window, cx);
+        window.focus(field.read(cx).focus_handle());
+        self.tab_rename = Some(super::TabRename {
+            tab,
+            session,
+            field,
+            problem: None,
+        });
+        cx.notify();
+    }
+
+    /// Closes the name dialog and gives the keyboard back to what was on screen.
+    pub(super) fn close_tab_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_rename.take().is_some() {
+            self.restore_overlay_focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Closes the name dialog from a control that has no window, returning the keyboard
+    /// on the next frame.
+    fn close_tab_rename_pending(&mut self, cx: &mut Context<Self>) {
+        if self.tab_rename.take().is_some() {
+            self.restore_focus_pending = true;
+            cx.notify();
+        }
+    }
+
+    /// Names the tab the dialog is about, or says why the name cannot be used.
+    fn submit_tab_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.tab_rename.as_ref() else {
+            return;
+        };
+        let tab = dialog.tab;
+        let entered = dialog.field.read(cx).text().to_owned();
+        let name = entered.trim().to_owned();
+        if name.is_empty() {
+            let reason = self.strings().tab_rename_empty.to_owned();
+            if let Some(dialog) = self.tab_rename.as_mut() {
+                dialog.problem = Some(reason);
+            }
+            cx.notify();
+            return;
+        }
+        if self.workspace.rename_tab(tab, Some(name)) {
+            self.checkpoint_layout();
+        }
+        self.close_tab_rename_pending(cx);
+    }
+
+    /// Returns one tab to its automatic title, keeping its colour and its panes.
+    fn restore_tab_title(&mut self, tab: TabId, cx: &mut Context<Self>) {
+        if self.workspace.rename_tab(tab, None) {
+            self.checkpoint_layout();
+        }
+        self.close_tab_rename_pending(cx);
+    }
+
+    /// Whether the list of every tab is open.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn tab_list_open(&self) -> bool {
+        self.tab_list_open
+    }
+
+    /// Whether the tab-name dialog is open.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn tab_rename_open(&self) -> bool {
+        self.tab_rename.is_some()
+    }
+
+    /// Why the name dialog refused the name that was entered, if it did.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn tab_rename_problem(&self) -> Option<&str> {
+        self.tab_rename
+            .as_ref()
+            .and_then(|dialog| dialog.problem.as_deref())
+    }
+
+    /// Opens the all-tabs list, or closes it when it is open.
+    pub(super) fn toggle_tab_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_list_open {
+            self.close_tab_list(window, cx);
+            return;
+        }
+        self.shell_menu_open = false;
+        self.tab_menu = None;
+        self.remember_focus(window, cx);
+        self.tab_list_open = true;
+        cx.notify();
+    }
+
+    /// Closes the all-tabs list and gives the keyboard back to what was on screen.
+    pub(super) fn close_tab_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.tab_list_open) {
+            self.restore_overlay_focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The list of every open tab, drawn over the page.
+    ///
+    /// The strip can only show the tabs that fit; this list shows all of them, in strip
+    /// order, with the target, the kind and the state of each, so a session can be found
+    /// by what it connects to and not only by its name (R2, R4). Choosing a row shows
+    /// that tab; the pencil names it and the colours give it a mark.
+    pub(super) fn tab_list_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.tab_list_open {
+            return None;
+        }
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let locale = self.workspace.locale();
+        let count = self.workspace.layout().tabs().len();
+        let active = self.workspace.layout().active_tab_id();
+        let header = self.modal_header(
+            Some(Icon::Layers),
+            strings.tab_list_title.to_owned(),
+            Some(strings.tab_list_hint.to_owned()),
+            "tabs.list.close",
+            cx,
+            |this, cx| {
+                this.tab_list_open = false;
+                this.restore_focus_pending = true;
+                cx.notify();
+            },
+        );
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(2.0))
+            .debug_selector(|| "tabs.list".to_owned());
+        for index in 0..count {
+            let Some(tab) = self.workspace.layout().tabs().get(index) else {
+                continue;
+            };
+            let tab_id = tab.id();
+            let session = self
+                .workspace
+                .tab_anchors()
+                .into_iter()
+                .find(|id| self.workspace.tab_of_session(*id) == Some(tab_id));
+            let name = match session {
+                Some(id) => self.tab_title(id),
+                None => tab.display_title().to_owned(),
+            };
+            let (kind_label, remote, target, state_label, tone) =
+                match session.and_then(|id| self.workspace.session(id)) {
+                    Some(session) => {
+                        let kind = PaneKind::of(session.kind());
+                        let remote = kind == PaneKind::Remote;
+                        let target = match session.kind() {
+                            SessionKind::Local { .. } => {
+                                program_label(&session_target(&self.book, session))
+                            }
+                            SessionKind::Remote { .. } => session_target(&self.book, session),
+                        };
+                        (
+                            if remote {
+                                strings.session_kind_remote
+                            } else {
+                                strings.session_kind_local
+                            },
+                            remote,
+                            target,
+                            copy::session_state_label(session.state(), locale),
+                            super::session_tone(session.state()),
+                        )
+                    }
+                    None => {
+                        let target = first_target(tab.root())
+                            .map(|target| match target {
+                                PaneTarget::Local { shell } => shell
+                                    .as_deref()
+                                    .map(program_label)
+                                    .unwrap_or_else(|| strings.session_kind_local.to_owned()),
+                                PaneTarget::Remote { host } => self
+                                    .book
+                                    .host(*host)
+                                    .map(|host| host.target())
+                                    .unwrap_or_else(|| host.to_string()),
+                            })
+                            .unwrap_or_default();
+                        (
+                            strings.session_kind_local,
+                            false,
+                            target,
+                            strings.pane_pending.to_owned(),
+                            Tone::Warning,
+                        )
+                    }
+                };
+            let accent = tab.accent();
+            let selector = format!("tabs.list.row.{index}");
+            let current = active == Some(tab_id);
+            let hover = theme::swatch(colors::SURFACE_HOVER);
+            let rename = tab_id;
+            let row = div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector({
+                    let selector = selector.clone();
+                    move || selector.clone()
+                })
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap(metrics.scale(spacing::TIGHT))
+                .min_h(metrics.hit_target())
+                .px(metrics.scale(spacing::TIGHT + 2.0))
+                .py(metrics.scale(2.0))
+                .rounded(px(radius::SMALL))
+                .border_1()
+                .border_color(if current {
+                    theme::swatch(colors::BORDER_STRONG)
+                } else {
+                    theme::clear()
+                })
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_tab_list(window, cx);
+                    this.select_tab(index, window, cx);
+                }))
+                .children(accent.map(|accent| {
+                    super::tab_accent_mark(accent, metrics, format!("tabs.list.accent.{index}"))
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(metrics.scale(120.0))
+                        .truncate()
+                        .text_size(metrics.label_size())
+                        .when(current, |name| name.font_weight(FontWeight::MEDIUM))
+                        .text_color(theme::swatch(colors::TEXT_PRIMARY))
+                        .child(SharedString::from(name)),
+                )
+                .children(accent.map(|accent| {
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(colors::TEXT_MUTED))
+                        .debug_selector(move || format!("tabs.list.accent-name.{index}"))
+                        .child(copy::tab_accent_label(accent, locale))
+                }))
+                .child(components::kind_badge(kind_label, remote, metrics))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(metrics.scale(96.0))
+                        .truncate()
+                        .font_family(crate::app::terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(colors::TEXT_MUTED))
+                        .child(SharedString::from(target)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .child(components::status_dot(tone, metrics))
+                        .child(
+                            div()
+                                .text_size(metrics.caption_size())
+                                .text_color(tone.text())
+                                .child(SharedString::from(state_label)),
+                        ),
+                )
+                .when(current, |row| {
+                    row.child(components::chip(
+                        strings.palette_current,
+                        Tone::Accent,
+                        metrics,
+                    ))
+                })
+                .child(
+                    components::icon_only_button(Icon::Pencil, metrics)
+                        .id(SharedString::from(format!("tabs.list.rename.{index}")))
+                        .debug_selector(move || format!("tabs.list.rename.{index}"))
+                        .tooltip(components::tooltip(strings.tab_menu_rename))
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab_list(window, cx);
+                            this.open_tab_rename(rename, window, cx);
+                        })),
+                );
+            rows = rows.child(row);
+        }
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .pb(metrics.scale(spacing::LOOSE))
+            .child(rows)
+            .into_any_element();
+        Some(self.modal(window, "tabs.list.dialog", 680.0, header, body, None))
+    }
+
+    /// The dialog that names one tab and chooses its colour.
+    pub(super) fn tab_rename_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let dialog = self.tab_rename.as_ref()?;
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let tab = dialog.tab;
+        // The dialog names the tab it is about by what the tab shows and by what it
+        // connects to, so two tabs with one name are still told apart here (R2).
+        let shown = self
+            .workspace
+            .layout()
+            .tab(tab)
+            .map(|tab| tab.display_title().to_owned());
+        let target = dialog
+            .session
+            .and_then(|id| self.workspace.session(id))
+            .map(|session| match session.kind() {
+                SessionKind::Local { .. } => program_label(&session_target(&self.book, session)),
+                SessionKind::Remote { .. } => session_target(&self.book, session),
+            });
+        let subtitle = shown.map(|shown| match target {
+            Some(target) => format!("{shown} · {target}"),
+            None => shown,
+        });
+        let has_name = self.workspace.tab_custom_title(tab).is_some();
+        let tab_for_auto = tab;
+        let header = self.modal_header(
+            Some(Icon::Pencil),
+            strings.tab_rename_title.to_owned(),
+            subtitle,
+            "tab.rename.close",
+            cx,
+            |this, cx| this.close_tab_rename_pending(cx),
+        );
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .pb(metrics.scale(spacing::LOOSE))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(colors::TEXT_SECONDARY))
+                    .child(strings.tab_rename_hint),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "tab.rename.field".to_owned())
+                    // Escape closes the dialog; without this the field would take it to
+                    // empty itself, and the name just typed would be lost.
+                    .capture_key_down(cx.listener(
+                        |this, event: &gpui::KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                this.close_tab_rename(window, cx);
+                            }
+                        },
+                    ))
+                    .child(dialog.field.clone()),
+            )
+            .child(self.tab_accent_choices(tab, "tab.rename", cx))
+            .children(
+                dialog
+                    .problem
+                    .as_ref()
+                    .map(|problem| self.notice_line(problem.clone(), Tone::Danger)),
+            )
+            .into_any_element();
+        let footer = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::SNUG))
+            .border_t_1()
+            .border_color(theme::swatch(colors::BORDER))
+            .child(
+                components::compact_button(strings.tab_rename_auto, Variant::Ghost, metrics)
+                    .id("tab.rename.auto")
+                    .debug_selector(|| "tab.rename.auto".to_owned())
+                    .when(!has_name, |button| button.opacity(0.5))
+                    .when(has_name, |button| {
+                        button.on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.restore_tab_title(tab_for_auto, cx);
+                        }))
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(self.text_button(
+                        SharedString::from("tab.rename.cancel"),
+                        copy::ux().fwd_cancel,
+                        Variant::Ghost,
+                        cx,
+                        |this, cx| this.close_tab_rename_pending(cx),
+                    ))
+                    .child(
+                        components::button(strings.tab_rename_save, Variant::Primary, metrics)
+                            .id("tab.rename.save")
+                            .debug_selector(|| "tab.rename.save".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.submit_tab_rename(cx);
+                            })),
+                    ),
+            );
+        Some(self.modal(
+            window,
+            "tab.rename.dialog",
+            520.0,
+            header,
+            body,
+            Some(footer),
+        ))
+    }
+
+    /// The control beside the strip that opens the list of every tab.
+    ///
+    /// It is drawn outside the strip's clipped row, so it stays reachable however many
+    /// tabs are open, and it says how many there are (R2, R4).
+    pub(super) fn tab_list_control(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let count = self.workspace.layout().tabs().len();
+        if count == 0 {
+            return None;
+        }
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let open = self.tab_list_open;
+        let tooltip = format!("{} ({})", strings.tab_list_title, count);
+        Some(
+            components::icon_only_button(Icon::Layers, metrics)
+                .size(metrics.hit_target())
+                .rounded(px(radius::MEDIUM))
+                .when(open, |button| {
+                    button.bg(theme::swatch(colors::SURFACE_SELECTED))
+                })
+                .id("tabs.list.open")
+                .debug_selector(|| "tabs.list.open".to_owned())
+                .tooltip(components::tooltip(SharedString::from(tooltip)))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.toggle_tab_list(window, cx);
+                })),
+        )
+    }
+}
+
+/// The stable part of an accent's selector, for the tests that click one colour.
+fn accent_selector(accent: TabAccent) -> &'static str {
+    match accent {
+        TabAccent::Iris => "iris",
+        TabAccent::Violet => "violet",
+        TabAccent::Teal => "teal",
+        TabAccent::Lime => "lime",
+        TabAccent::Orchid => "orchid",
+        TabAccent::Clay => "clay",
     }
 }

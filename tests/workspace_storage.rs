@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use shellune_core::{
-    Endpoint, ForwardBook, ForwardKind, ForwardRule, HostConfig, HostId, PaneNode, PaneTarget,
-    PanelConfig, PanelSection, PendingConnection, SplitAxis, TerminalMode, WorkspaceSnapshot,
-    WorkspaceTab,
+    Endpoint, ForwardBook, ForwardKind, ForwardRule, HostConfig, HostId, PaneId, PaneNode,
+    PaneTarget, PanelConfig, PanelSection, PendingConnection, SplitAxis, TabAccent, TabId,
+    TerminalMode, WorkspaceSnapshot, WorkspaceTab,
 };
 use shellune_storage::{
     CONFIG_KEYS, FORWARD_FILE_NAME, ForwardStore, PersistError, WORKSPACE_FILE_NAME, WorkspaceStore,
@@ -170,6 +170,10 @@ fn a_snapshot_round_trips_tabs_splits_and_the_panel() {
         PaneNode::Leaf { .. } => panic!("the root is a split"),
     };
     servers.set_active_pane(Some(active));
+    // A tab can carry a name of its own and a colour that tells it from its
+    // neighbours; both are labels and both are saved.
+    assert!(servers.set_custom_title(Some("production".to_owned())));
+    assert!(servers.set_accent(Some(TabAccent::Orchid)));
     let local_tab = WorkspaceTab::new(
         "Local",
         PaneNode::leaf(PaneTarget::local(None), TerminalMode::Classic),
@@ -191,8 +195,69 @@ fn a_snapshot_round_trips_tabs_splits_and_the_panel() {
     assert!(loaded.panel().visible());
     assert_eq!(loaded.tabs().len(), 2);
     assert_eq!(loaded.tabs()[0].title(), "Servers");
+    assert_eq!(loaded.tabs()[0].custom_title(), Some("production"));
+    assert_eq!(loaded.tabs()[0].accent(), Some(TabAccent::Orchid));
+    assert_eq!(
+        loaded.tabs()[1].custom_title(),
+        None,
+        "a tab that was never named stays automatic"
+    );
     assert_eq!(loaded.active_tab(), Some(active_tab));
+    let restored = loaded.restore(|_| true);
+    assert_eq!(
+        restored.tabs()[0].custom_title(),
+        Some("production"),
+        "the name comes back with the tab"
+    );
+    assert_eq!(restored.tabs()[0].accent(), Some(TabAccent::Orchid));
+    assert!(
+        restored
+            .panes()
+            .iter()
+            .all(|pane| !pane.connection().is_started())
+    );
     assert_allowlisted(&std::fs::read_to_string(store.path()).expect("file"));
+}
+
+#[test]
+fn a_workspace_written_before_tab_names_and_colours_still_loads() {
+    let dir = TempDir::new("older-snapshot");
+    let store = WorkspaceStore::at(dir.path());
+    let tab = TabId::new();
+    let pane = PaneId::new();
+    // Exactly the document the previous format wrote: no name, no colour.
+    let older = format!(
+        r#"{{"version":1,"tabs":[{{"id":"{tab}","title":"Work","root":{{"node":"leaf","pane":{{"id":"{pane}","mode":"classic","target":{{"kind":"local","shell":"pwsh"}}}}}}}}],"panel":{{"visible":true,"section":"files"}}}}"#
+    );
+    std::fs::create_dir_all(dir.path()).expect("dir");
+    std::fs::write(store.path(), &older).expect("written");
+
+    let loaded = store.load().expect("an older snapshot still loads");
+    assert_eq!(loaded.tabs().len(), 1);
+    assert_eq!(loaded.tabs()[0].id(), tab);
+    assert_eq!(loaded.tabs()[0].title(), "Work");
+    assert_eq!(loaded.tabs()[0].custom_title(), None);
+    assert_eq!(loaded.tabs()[0].accent(), None);
+    assert_eq!(loaded.panel().section(), PanelSection::Files);
+
+    // Saving it again writes the same layout, and only where a name or a colour
+    // exists does the document grow.
+    store.save(&loaded).expect("saves");
+    let rewritten = std::fs::read_to_string(store.path()).expect("file");
+    assert!(
+        !rewritten.contains("custom_title"),
+        "a tab without a name writes no name: {rewritten}"
+    );
+    assert!(!rewritten.contains("accent"));
+
+    let restored = loaded.restore(|_| true);
+    assert!(
+        restored
+            .panes()
+            .iter()
+            .all(|pane| !pane.connection().is_started())
+    );
+    assert_eq!(restored.tabs()[0].custom_title(), None);
 }
 
 #[test]

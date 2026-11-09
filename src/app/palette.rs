@@ -33,6 +33,10 @@ pub enum Command {
     QuickConnect,
     /// Closes the session on screen.
     CloseTab(SessionId),
+    /// Gives the tab of an open session a name of its own.
+    RenameTab(SessionId),
+    /// Steps the distinguishing colour of an open session's tab.
+    CycleTabAccent(SessionId),
     /// Switches the interface language.
     ToggleLanguage,
     /// Steps the interface text size.

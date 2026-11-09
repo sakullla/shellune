@@ -54,6 +54,11 @@ impl WorkspaceStore {
     /// A missing file is a first run and yields an empty snapshot. Loading does
     /// not restore panes, so it cannot start a shell, a connection or a listener.
     ///
+    /// The format version stays at [`WORKSPACE_FORMAT_VERSION`] while only optional
+    /// tab fields are added: a tab's own name and its distinguishing colour are
+    /// written when they exist and default to "none" when they do not, so a file from
+    /// an older build keeps loading instead of being refused as a newer version.
+    ///
     /// # Errors
     ///
     /// Returns the read failure, the corruption, or the unsupported-version failure.

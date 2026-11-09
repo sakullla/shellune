@@ -16,6 +16,57 @@ use crate::ids::{HostId, PaneId, TabId};
 /// The format this build writes for a workspace snapshot.
 pub const WORKSPACE_FORMAT_VERSION: u32 = 1;
 
+/// The longest name a user can give one tab, in characters.
+///
+/// The limit keeps a tab strip readable and the snapshot bounded; a longer name is
+/// cut here rather than refused, so a name the user typed is never lost silently.
+pub const MAX_TAB_NAME_CHARS: usize = 64;
+
+/// A colour a user can give a tab to tell it apart from its neighbours.
+///
+/// The set is closed on purpose, like the host avatar pairs: the view checks each
+/// value's contrast in both palettes, so a tab can never be tinted with a colour
+/// that disappears into the surface it is drawn on. The colour only helps a person
+/// find a tab again; the target, the kind and the state are still written out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabAccent {
+    /// Blue.
+    Iris,
+    /// Violet.
+    Violet,
+    /// Teal.
+    Teal,
+    /// Yellow-green.
+    Lime,
+    /// Orchid pink.
+    Orchid,
+    /// Warm clay.
+    Clay,
+}
+
+impl TabAccent {
+    /// Every colour, in the order the picker offers them.
+    pub const ALL: [Self; 6] = [
+        Self::Iris,
+        Self::Violet,
+        Self::Teal,
+        Self::Lime,
+        Self::Orchid,
+        Self::Clay,
+    ];
+
+    /// The next colour, wrapping around, so one control can step through all of them.
+    #[must_use]
+    pub fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|accent| *accent == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+}
+
 /// Classic grid, or the optional shell-integration presentation.
 ///
 /// The mode is a preference. Restoring it does not replay terminal contents.
@@ -297,6 +348,17 @@ impl PanelConfig {
 pub struct WorkspaceTab {
     id: TabId,
     title: String,
+    /// The name the user gave this tab, when they gave one.
+    ///
+    /// It replaces the automatic title on screen and nothing else: the target, the
+    /// kind and the state keep coming from the session record, so two tabs with one
+    /// name are still told apart by what they connect to. A file written before this
+    /// field existed has no name here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_title: Option<String>,
+    /// The colour that distinguishes this tab, when the user chose one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accent: Option<TabAccent>,
     root: PaneNode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_pane: Option<PaneId>,
@@ -329,6 +391,8 @@ impl WorkspaceTab {
         Ok(Self {
             id,
             title,
+            custom_title: None,
+            accent: None,
             root,
             active_pane: None,
         })
@@ -344,6 +408,56 @@ impl WorkspaceTab {
     #[must_use]
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// The name the user gave this tab, if any.
+    ///
+    /// A blank name is not a name: it reads as "no override", so restoring the
+    /// automatic title cannot leave an empty tab behind.
+    #[must_use]
+    pub fn custom_title(&self) -> Option<&str> {
+        self.custom_title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+    }
+
+    /// Names the tab, or returns it to its automatic title when given `None`.
+    ///
+    /// The name is trimmed and cut to [`MAX_TAB_NAME_CHARS`]. Returns whether the
+    /// stored name changed, so a caller only writes the snapshot when it did.
+    pub fn set_custom_title(&mut self, title: Option<impl Into<String>>) -> bool {
+        let next = title
+            .map(Into::into)
+            .map(|title| {
+                title
+                    .trim()
+                    .chars()
+                    .take(MAX_TAB_NAME_CHARS)
+                    .collect::<String>()
+            })
+            .filter(|title| !title.is_empty());
+        if self.custom_title == next {
+            return false;
+        }
+        self.custom_title = next;
+        true
+    }
+
+    /// The colour chosen for this tab, if any. Not a status.
+    #[must_use]
+    pub fn accent(&self) -> Option<TabAccent> {
+        self.accent
+    }
+
+    /// Chooses the tab's distinguishing colour, or clears it.
+    ///
+    /// Returns whether the stored colour changed.
+    pub fn set_accent(&mut self, accent: Option<TabAccent>) -> bool {
+        if self.accent == accent {
+            return false;
+        }
+        self.accent = accent;
+        true
     }
 
     /// Pane tree.
@@ -580,6 +694,8 @@ fn restore_tab(
     RestoredTab {
         id: tab.id,
         title: tab.title.clone(),
+        custom_title: tab.custom_title().map(str::to_owned),
+        accent: tab.accent(),
         root: restore_node(&tab.root, tab, host_exists, issues),
         active_pane,
     }
@@ -742,6 +858,8 @@ fn collect_pending<'a>(node: &'a RestoredNode, out: &mut Vec<&'a PendingPane>) {
 pub struct RestoredTab {
     id: TabId,
     title: String,
+    custom_title: Option<String>,
+    accent: Option<TabAccent>,
     root: RestoredNode,
     active_pane: Option<PaneId>,
 }
@@ -757,6 +875,21 @@ impl RestoredTab {
     #[must_use]
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// The name the tab was given, when it had one.
+    ///
+    /// Restoring it is not a connection: it is the label the next frame draws, and
+    /// every pane behind it is still waiting for the user.
+    #[must_use]
+    pub fn custom_title(&self) -> Option<&str> {
+        self.custom_title.as_deref()
+    }
+
+    /// The colour the tab was given, when it had one.
+    #[must_use]
+    pub fn accent(&self) -> Option<TabAccent> {
+        self.accent
     }
 
     /// Restored pane tree.
@@ -927,5 +1060,98 @@ mod tests {
             ),
             Err(WorkspaceBuildError::EmptyTitle)
         ));
+    }
+
+    fn leaf() -> PaneNode {
+        PaneNode::leaf(PaneTarget::local(None), TerminalMode::Classic)
+    }
+
+    #[test]
+    fn a_tab_name_replaces_only_the_title_and_restores_to_the_automatic_one() {
+        let mut tab = WorkspaceTab::new("pwsh", leaf()).expect("title");
+        assert_eq!(tab.custom_title(), None);
+        assert_eq!(tab.title(), "pwsh", "the automatic title is unchanged");
+
+        assert!(tab.set_custom_title(Some("  deploy box  ")));
+        assert_eq!(tab.custom_title(), Some("deploy box"));
+        assert_eq!(tab.title(), "pwsh", "the automatic title is still there");
+
+        // Restoring the automatic title clears the override and nothing else.
+        assert!(tab.set_custom_title(Option::<String>::None));
+        assert_eq!(tab.custom_title(), None);
+        assert_eq!(tab.title(), "pwsh");
+
+        // Blank is not a name; setting it again changes nothing.
+        assert!(!tab.set_custom_title(Some("   ")));
+        assert_eq!(tab.custom_title(), None);
+        assert!(!tab.set_custom_title(Option::<String>::None));
+
+        let long = "名".repeat(MAX_TAB_NAME_CHARS + 10);
+        assert!(tab.set_custom_title(Some(long)));
+        assert_eq!(
+            tab.custom_title().map(|title| title.chars().count()),
+            Some(MAX_TAB_NAME_CHARS)
+        );
+    }
+
+    #[test]
+    fn a_tab_accent_is_a_closed_set_that_never_touches_the_title() {
+        let mut tab = WorkspaceTab::new("work", leaf()).expect("title");
+        assert_eq!(tab.accent(), None);
+        assert!(tab.set_accent(Some(TabAccent::Teal)));
+        assert_eq!(tab.accent(), Some(TabAccent::Teal));
+        assert!(!tab.set_accent(Some(TabAccent::Teal)));
+        assert_eq!(tab.title(), "work");
+        assert!(tab.set_accent(None));
+        assert_eq!(tab.accent(), None);
+        assert_eq!(TabAccent::ALL.len(), 6);
+        assert_eq!(TabAccent::Clay.next(), TabAccent::Iris, "the picker wraps");
+        let mut seen = TabAccent::ALL.to_vec();
+        seen.sort_by_key(|accent| format!("{accent:?}"));
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "every colour is distinct");
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_names_and_colours_and_a_older_file_still_loads() {
+        let mut tab = WorkspaceTab::new("Servers", leaf()).expect("title");
+        tab.set_custom_title(Some("production".to_owned()));
+        tab.set_accent(Some(TabAccent::Orchid));
+        let snapshot = WorkspaceSnapshot::new(vec![tab], PanelConfig::default()).expect("snapshot");
+        let json = serde_json::to_string(&snapshot).expect("json");
+        assert!(json.contains("\"custom_title\":\"production\""), "{json}");
+        assert!(json.contains("\"accent\":\"orchid\""), "{json}");
+        let loaded: WorkspaceSnapshot = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(loaded, snapshot);
+
+        let restored = loaded.restore(|_| true);
+        assert_eq!(restored.tabs()[0].custom_title(), Some("production"));
+        assert_eq!(restored.tabs()[0].accent(), Some(TabAccent::Orchid));
+
+        // A file written before the two fields existed still loads and restores.
+        let older = serde_json::json!({
+            "version": WORKSPACE_FORMAT_VERSION,
+            "tabs": [{
+                "id": TabId::new().to_string(),
+                "title": "Work",
+                "root": {
+                    "node": "leaf",
+                    "pane": {
+                        "id": PaneId::new().to_string(),
+                        "mode": "classic",
+                        "target": {"kind": "local"},
+                    },
+                },
+            }],
+            "panel": {"visible": false, "section": "none"},
+        });
+        let loaded: WorkspaceSnapshot = serde_json::from_value(older).expect("old file");
+        assert_eq!(loaded.tabs()[0].custom_title(), None);
+        assert_eq!(loaded.tabs()[0].accent(), None);
+        assert_eq!(loaded.tabs()[0].title(), "Work");
+        let restored = loaded.restore(|_| true);
+        assert_eq!(restored.tabs()[0].title(), "Work");
+        assert_eq!(restored.tabs()[0].custom_title(), None);
+        assert!(!restored.panes()[0].connection().is_started());
     }
 }

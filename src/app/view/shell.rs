@@ -139,6 +139,9 @@ impl ShelluneView {
             .debug_selector(|| "topbar".to_owned())
             .child(brand)
             .child(tabs)
+            // Beside the strip rather than inside it: the strip clips what does not
+            // fit, and the list of every tab has to stay reachable when it does (R2).
+            .children(self.tab_list_control(cx))
             .child(self.new_tab_control(cx))
             .child(
                 self.drag_area("header.drag")

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use shellune_core::{
     BrowseFailure, BrowseState, EventTag, FileKind, ForwardId, ForwardRule, HostConfig, HostId,
     HostValidationError, LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState,
-    SplitAxis, Transfer, TransferDirection, join_path,
+    SplitAxis, TabAccent, TabId, Transfer, TransferDirection, join_path,
 };
 use shellune_ssh::PtySize;
 #[cfg(test)]
@@ -435,6 +435,10 @@ pub struct ShelluneView {
     palette_scroll: gpui::ScrollHandle,
     /// The tab whose menu is open, and where the pointer opened it.
     tab_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
+    /// The tab whose name is being edited, while that dialog is open.
+    tab_rename: Option<TabRename>,
+    /// Whether the list of every open tab is open.
+    tab_list_open: bool,
     /// Whether a user edit may be written. Window close turns this off first.
     layout_persist: bool,
     /// Why the saved layout could not be read. The file is left as it was.
@@ -511,6 +515,23 @@ struct QuickSaveNotice {
 struct KeyCapture {
     action: &'static str,
     problem: Option<Problem>,
+}
+
+/// The tab-name dialog: which tab is being named, its field, and why the last name
+/// was refused.
+///
+/// The field is made per opening so its placeholder is in the current language and no
+/// earlier name is waiting in it. The dialog names a tab; it does not touch the
+/// session, its target or its state.
+struct TabRename {
+    /// The tab being named.
+    tab: TabId,
+    /// The session it holds, when it has one, for the dialog's subtitle.
+    session: Option<SessionId>,
+    /// The name the user typed, on its way to the tab.
+    field: Entity<TextField>,
+    /// Why the entered name could not be used, when it could not.
+    problem: Option<String>,
 }
 
 /// One control of a shortcut row.
@@ -748,6 +769,8 @@ impl ShelluneView {
             palette_selected: 0,
             palette_scroll: gpui::ScrollHandle::new(),
             tab_menu: None,
+            tab_rename: None,
+            tab_list_open: false,
             session_menu: None,
             focus_host_dialog: false,
             focus_return: None,
@@ -1685,6 +1708,9 @@ impl ShelluneView {
         if self.reconnect == Some(id) {
             self.reconnect = None;
         }
+        // A name dialog or a tab menu for a tab that no longer exists would describe
+        // something gone; it closes with the tab it belonged to.
+        self.forget_closed_tab_layers();
         self.sync_layout_focus(cx);
         self.checkpoint_layout();
         cx.notify();
@@ -9505,7 +9531,7 @@ impl ShelluneView {
         };
         let tooltip = format!(
             "{} · {kind_label} · {} · {state_label}{jump}",
-            session.title(),
+            self.tab_title(id),
             self.target_of(session)
         );
         let selector = format!("session.tab.{index}");
@@ -9561,6 +9587,16 @@ impl ShelluneView {
         };
 
         tab.child(components::status_dot(tone, metrics))
+            .children(
+                self.workspace
+                    .layout()
+                    .tabs()
+                    .get(index)
+                    .and_then(|tab| tab.accent())
+                    .map(|accent| {
+                        tab_accent_mark(accent, metrics, format!("session.tab.accent.{index}"))
+                    }),
+            )
             .child(icons::icon(
                 if kind == PaneKind::Remote {
                     Icon::Server
@@ -9580,7 +9616,7 @@ impl ShelluneView {
                     .min_w(px(0.0))
                     .truncate()
                     .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
-                    .child(SharedString::from(self.tab_title(id, index))),
+                    .child(SharedString::from(self.tab_title(id))),
             )
             .when(!live, |tab| {
                 tab.child(
@@ -9609,9 +9645,21 @@ impl ShelluneView {
             )
     }
 
-    /// The label of one tab: the session's title, numbered when an earlier tab has
-    /// the same one, so two shells of one program can be told apart at a glance.
-    fn tab_title(&self, id: SessionId, _index: usize) -> String {
+    /// The label of one tab: the user's own name, or the session's title numbered
+    /// when an earlier tab has the same one, so two shells of one program can be told
+    /// apart at a glance.
+    ///
+    /// A name the user typed is shown exactly as typed: numbering it would alter what
+    /// they wrote. Two tabs with one name are still told apart by the target, the kind
+    /// and the state, which the tooltip and the tab list both write out (R2).
+    fn tab_title(&self, id: SessionId) -> String {
+        let custom = self
+            .workspace
+            .tab_of_session(id)
+            .and_then(|tab| self.workspace.tab_custom_title(tab));
+        if let Some(custom) = custom {
+            return custom.to_owned();
+        }
         let Some(title) = self.workspace.session(id).map(Session::title) else {
             return String::new();
         };
@@ -9629,6 +9677,13 @@ impl ShelluneView {
         } else {
             title.to_owned()
         }
+    }
+
+    /// The label the tab strip shows for one session (R2), for the tests that name a
+    /// tab and then check what the strip really says.
+    #[cfg(test)]
+    pub fn tab_label_for_test(&self, id: SessionId) -> String {
+        self.tab_title(id)
     }
 
     /// The tabs of the sessions that are still open, in the order they were opened.
@@ -9673,7 +9728,8 @@ impl ShelluneView {
             SessionKind::Remote { .. } => self.target_of(session),
         };
         // A local shell's program is often its own title; saying it twice is noise.
-        let target = (target.to_lowercase() != session.title().to_lowercase()).then_some(target);
+        let label = self.tab_title(id);
+        let target = (target.to_lowercase() != label.to_lowercase()).then_some(target);
         let state_label = copy::session_state_label(session.state(), self.workspace.locale());
         let tone = session_tone(session.state());
         let can_reconnect = may_reconnect(session);
@@ -9789,9 +9845,9 @@ impl ShelluneView {
                                 // "Current" only tells panes apart; a lone pane is
                                 // simply the session.
                                 .child(SharedString::from(if self.active_tab_is_solo() {
-                                    session.title().to_owned()
+                                    label.clone()
                                 } else {
-                                    format!("{} · {}", strings.workspace_current, session.title())
+                                    format!("{} · {label}", strings.workspace_current)
                                 })),
                         )
                         .children(target.map(|target| {
@@ -10284,6 +10340,14 @@ impl Render for ShelluneView {
                     this.close_host_editor(cx);
                     return;
                 }
+                if this.tab_rename.is_some() {
+                    this.close_tab_rename(window, cx);
+                    return;
+                }
+                if this.tab_list_open {
+                    this.close_tab_list(window, cx);
+                    return;
+                }
                 if this.tab_menu.is_some() {
                     this.close_tab_menu(window, cx);
                     return;
@@ -10428,6 +10492,8 @@ impl Render for ShelluneView {
             .children(self.shell_menu_overlay(window, cx))
             .children(self.files_menu_overlay(window, cx))
             .children(self.tab_menu_overlay(window, cx))
+            .children(self.tab_rename_overlay(window, cx))
+            .children(self.tab_list_overlay(window, cx))
             .children(self.session_menu_overlay(window, cx))
             .children(self.palette_overlay(window, cx))
             .children(self.key_capture_overlay(window, cx))
@@ -10438,6 +10504,21 @@ impl Render for ShelluneView {
 /// A window-sized layer at the top-left of the root, for a dialog or a menu.
 fn overlay_layer() -> Div {
     div().absolute().top_0().left_0()
+}
+
+/// The small mark that gives a tab its own colour, when it has one.
+///
+/// It is drawn beside the status dot and never instead of it: the colour says which
+/// tab this is, while the dot and the state word say what the session is doing. A tab
+/// without a colour draws nothing here, so no state depends on colour being set (R2).
+fn tab_accent_mark(accent: TabAccent, metrics: Metrics, selector: String) -> Div {
+    div()
+        .flex_none()
+        .w(metrics.scale(3.0))
+        .h(metrics.scale(16.0))
+        .rounded_full()
+        .bg(theme::tab_accent_color(accent))
+        .debug_selector(move || selector.clone())
 }
 
 /// Why a port the quick form cannot dial, naming the field to change.

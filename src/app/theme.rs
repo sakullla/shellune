@@ -13,7 +13,7 @@
 //!   per view.
 
 use gpui::{FontWeight, Pixels, Rgba, px, rgb};
-use shellune_core::{SessionFailure, SessionKind, SessionState, TransferState};
+use shellune_core::{SessionFailure, SessionKind, SessionState, TabAccent, TransferState};
 
 /// Raw colour tokens as 24-bit sRGB values.
 ///
@@ -78,6 +78,39 @@ pub mod palette {
     ];
     /// Second stop of the brand gradient, a violet beside the accent.
     pub const BRAND_END: u32 = 0xb48cff;
+    /// Tab identity colours, in [`TabAccent::ALL`] order.
+    ///
+    /// They are deliberately not the status hues: green, amber and red keep meaning
+    /// "connected", "waiting" and "failed", and a tab colour must never be read as
+    /// one of those. Each value keeps its contrast on every tab surface in both
+    /// palettes (checked by the palette tests).
+    pub const TAB_ACCENTS: [u32; 6] = [
+        0x9db4ff, // iris
+        0xc9a8ff, // violet
+        0x7ad9c4, // teal
+        0xc4d98a, // lime
+        0xe5a6e0, // orchid
+        0xe8b48a, // clay
+    ];
+}
+
+/// The token a tab's distinguishing colour is drawn with.
+///
+/// The colour is an identity aid, never a status: a tab keeps its status dot, its
+/// state word and its target whatever colour the user gives it.
+#[must_use]
+pub fn tab_accent_token(accent: TabAccent) -> u32 {
+    let index = TabAccent::ALL
+        .iter()
+        .position(|candidate| *candidate == accent)
+        .unwrap_or(0);
+    palette::TAB_ACCENTS[index]
+}
+
+/// The colour a tab's distinguishing mark is drawn in, in the current palette.
+#[must_use]
+pub fn tab_accent_color(accent: TabAccent) -> Rgba {
+    swatch(tab_accent_token(accent))
 }
 
 /// Spacing scale in logical pixels before zoom is applied.
@@ -338,6 +371,13 @@ pub mod light {
         (dark::AVATARS[4].1, 0xa1285f),
         (dark::AVATARS[5].0, 0xdfeefc),
         (dark::AVATARS[5].1, 0x1b5f9e),
+        // Tab identity colours: the same hue, dark enough for a light surface.
+        (dark::TAB_ACCENTS[0], 0x3547bd),
+        (dark::TAB_ACCENTS[1], 0x6b3fb0),
+        (dark::TAB_ACCENTS[2], 0x0f6a5f),
+        (dark::TAB_ACCENTS[3], 0x5c6a12),
+        (dark::TAB_ACCENTS[4], 0x913a86),
+        (dark::TAB_ACCENTS[5], 0x8a4a12),
     ];
 
     /// The terminal's default colours and its 16 ANSI colours, light.

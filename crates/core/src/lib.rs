@@ -51,7 +51,8 @@ pub use task::{
     TransferUpdate, TransferUpdateError, partial_path,
 };
 pub use workspace::{
-    PaneNode, PaneTarget, PanelConfig, PanelSection, PendingConnection, PendingPane, RestoredNode,
-    RestoredTab, RestoredWorkspace, SplitAxis, SplitRatio, TerminalMode, WORKSPACE_FORMAT_VERSION,
-    WorkspaceBuildError, WorkspaceIssue, WorkspaceSnapshot, WorkspaceTab,
+    MAX_TAB_NAME_CHARS, PaneNode, PaneTarget, PanelConfig, PanelSection, PendingConnection,
+    PendingPane, RestoredNode, RestoredTab, RestoredWorkspace, SplitAxis, SplitRatio, TabAccent,
+    TerminalMode, WORKSPACE_FORMAT_VERSION, WorkspaceBuildError, WorkspaceIssue, WorkspaceSnapshot,
+    WorkspaceTab,
 };

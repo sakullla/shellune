@@ -1038,13 +1038,11 @@ impl ShelluneView {
     ) -> gpui::Stateful<gpui::Div> {
         let metrics = self.metrics();
         let strings = self.strings();
-        let title = self
-            .workspace
-            .layout()
-            .tabs()
-            .get(index)
-            .map(|tab| tab.title().to_owned())
+        let tab = self.workspace.layout().tabs().get(index);
+        let title = tab
+            .map(|tab| tab.display_title().to_owned())
             .unwrap_or_else(|| strings.pane_pending.to_owned());
+        let accent = tab.and_then(|tab| tab.accent());
         let selected = self
             .workspace
             .layout()
@@ -1073,7 +1071,14 @@ impl ShelluneView {
         } else {
             tab.border_color(theme::clear())
         };
-        tab.child(div().truncate().child(SharedString::from(format!(
+        tab.children(accent.map(|accent| {
+            crate::app::view::tab_accent_mark(
+                accent,
+                metrics,
+                format!("session.tab.accent.{index}"),
+            )
+        }))
+        .child(div().truncate().child(SharedString::from(format!(
             "{title} · {}",
             strings.pane_pending
         ))))

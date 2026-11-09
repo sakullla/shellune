@@ -5,9 +5,9 @@
 //! forward is created here. Closing one leaf leaves every other leaf in place.
 
 use shellune_core::{
-    HostId, PaneId, PaneNode, PaneTarget, PanelConfig, PendingConnection, RestoredNode,
-    RestoredWorkspace, SessionId, SplitAxis, TabId, TerminalMode, WorkspaceBuildError,
-    WorkspaceIssue, WorkspaceSnapshot, WorkspaceTab,
+    HostId, MAX_TAB_NAME_CHARS, PaneId, PaneNode, PaneTarget, PanelConfig, PendingConnection,
+    RestoredNode, RestoredWorkspace, SessionId, SplitAxis, TabAccent, TabId, TerminalMode,
+    WorkspaceBuildError, WorkspaceIssue, WorkspaceSnapshot, WorkspaceTab,
 };
 
 /// Which way a pane moves or grows.
@@ -158,6 +158,10 @@ pub enum Node {
 pub struct Tab {
     id: TabId,
     title: String,
+    /// The name the user gave the tab, when they gave one.
+    custom_title: Option<String>,
+    /// The colour that tells this tab from its neighbours, when one was chosen.
+    accent: Option<TabAccent>,
     root: Node,
     active: Option<PaneId>,
     /// The pane that fills the tab, when the user has zoomed. Not persisted.
@@ -172,9 +176,32 @@ impl Tab {
     }
 
     /// Title used when the tab has no session to name it.
+    ///
+    /// This is the automatic title: what the tab would be called without the user's
+    /// own name. Saving writes it, so restoring the automatic title still works.
     #[must_use]
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// The name the user gave this tab, if any.
+    #[must_use]
+    pub fn custom_title(&self) -> Option<&str> {
+        self.custom_title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+    }
+
+    /// The name the tab strip shows: the user's own, or the automatic title.
+    #[must_use]
+    pub fn display_title(&self) -> &str {
+        self.custom_title().unwrap_or(&self.title)
+    }
+
+    /// The colour chosen for this tab, if any. Never a status.
+    #[must_use]
+    pub fn accent(&self) -> Option<TabAccent> {
+        self.accent
     }
 
     /// Pane tree.
@@ -268,8 +295,58 @@ impl SessionLayout {
         &self.notices
     }
 
-    fn tab(&self, id: TabId) -> Option<&Tab> {
+    /// One tab, by identity.
+    #[must_use]
+    pub fn tab(&self, id: TabId) -> Option<&Tab> {
         self.tabs.iter().find(|tab| tab.id == id)
+    }
+
+    /// The tab that holds `session`.
+    ///
+    /// A session is a pane of exactly one tab, so this is how a session's own name
+    /// and colour are found without trusting a position in the strip.
+    #[must_use]
+    pub fn tab_id_of_session(&self, session: SessionId) -> Option<TabId> {
+        self.tabs
+            .iter()
+            .find(|tab| find_session(&tab.root, session).is_some())
+            .map(|tab| tab.id)
+    }
+
+    /// Names one tab, or returns it to its automatic title when given `None`.
+    ///
+    /// Returns whether the name changed. The panes, the sessions and the order are
+    /// untouched: this is a label, not a connection.
+    pub fn set_custom_title(&mut self, id: TabId, title: Option<String>) -> bool {
+        let next = title
+            .map(|title| {
+                title
+                    .trim()
+                    .chars()
+                    .take(MAX_TAB_NAME_CHARS)
+                    .collect::<String>()
+            })
+            .filter(|title| !title.is_empty());
+        match self.tab_mut(id) {
+            Some(tab) if tab.custom_title != next => {
+                tab.custom_title = next;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Chooses the colour that tells one tab from its neighbours, or clears it.
+    ///
+    /// Returns whether the colour changed.
+    pub fn set_accent(&mut self, id: TabId, accent: Option<TabAccent>) -> bool {
+        match self.tab_mut(id) {
+            Some(tab) if tab.accent != accent => {
+                tab.accent = accent;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
@@ -677,6 +754,10 @@ impl SessionLayout {
                 .unwrap_or_else(|| tab.title.clone());
             let mut saved = WorkspaceTab::with_id(tab.id, title, node_to_saved(&tab.root)?)?;
             saved.set_active_pane(tab.active.filter(|id| contains(&tab.root, *id)));
+            // The name and the colour travel with the tab, so the next run draws the
+            // same strip. They are labels: no pane in the snapshot is started.
+            saved.set_custom_title(tab.custom_title.clone());
+            saved.set_accent(tab.accent);
             tabs.push(saved);
         }
         let mut snapshot = WorkspaceSnapshot::new(tabs, panel)?;
@@ -699,6 +780,8 @@ impl SessionLayout {
             tabs.push(Tab {
                 id: tab.id(),
                 title: tab.title().to_owned(),
+                custom_title: tab.custom_title().map(str::to_owned),
+                accent: tab.accent(),
                 active: active.or_else(|| first_pane(&root)),
                 zoomed: None,
                 root,
@@ -794,6 +877,8 @@ impl SessionLayout {
         let tab = Tab {
             id: TabId::new(),
             title: title.to_owned(),
+            custom_title: None,
+            accent: None,
             active: Some(pane),
             zoomed: None,
             root: Node::Leaf(leaf),
@@ -1465,6 +1550,102 @@ mod tests {
         layout.close_pane(layout.active_pane().expect("last pane"));
         assert!(!layout.has_tabs());
         assert!(layout.active_session().is_none());
+    }
+
+    #[test]
+    fn a_named_and_tinted_tab_saves_and_restores_as_a_pending_tab() {
+        let mut layout = SessionLayout::new();
+        let (first, _) = session_leaf(&mut layout, "pwsh");
+        let (second, _) = session_leaf(&mut layout, "pwsh");
+        let first_tab = layout.tab_id_of_session(first).expect("the first tab");
+        let second_tab = layout.tab_id_of_session(second).expect("the second tab");
+        assert_ne!(first_tab, second_tab);
+
+        assert!(layout.set_custom_title(first_tab, Some("  deploy box  ".to_owned())));
+        assert!(layout.set_accent(first_tab, Some(TabAccent::Teal)));
+        assert!(!layout.set_custom_title(first_tab, Some("deploy box".to_owned())));
+        assert_eq!(
+            layout.tab_id_of_session(second),
+            Some(second_tab),
+            "the other tab is untouched"
+        );
+        assert_eq!(layout.tab(second_tab).expect("tab").custom_title(), None);
+        assert_eq!(layout.tab(second_tab).expect("tab").accent(), None);
+        assert_eq!(
+            layout.tab(first_tab).expect("tab").display_title(),
+            "deploy box"
+        );
+        assert_eq!(
+            layout.tab(first_tab).expect("tab").title(),
+            "pwsh",
+            "the automatic title is kept beside the name"
+        );
+
+        let panel = PanelConfig::new(false, shellune_core::PanelSection::None);
+        let saved = layout
+            .capture(|_| "pwsh".to_owned(), panel)
+            .expect("snapshot");
+        assert_eq!(
+            saved.tabs()[0].custom_title(),
+            Some("deploy box"),
+            "the name is saved"
+        );
+        assert_eq!(saved.tabs()[0].accent(), Some(TabAccent::Teal));
+        assert_eq!(saved.tabs()[0].title(), "pwsh");
+
+        let mut restored_layout = SessionLayout::new();
+        restored_layout.install_restored(saved.restore(|_| true));
+        let restored_tabs = restored_layout.tabs();
+        assert_eq!(restored_tabs.len(), 2, "the order is the saved order");
+        assert_eq!(restored_tabs[0].id(), first_tab);
+        assert_eq!(restored_tabs[0].display_title(), "deploy box");
+        assert_eq!(restored_tabs[0].accent(), Some(TabAccent::Teal));
+        assert_eq!(
+            restored_tabs[1].display_title(),
+            "pwsh",
+            "a tab without a name falls back to the automatic one"
+        );
+        assert!(
+            restored_layout
+                .leaves()
+                .iter()
+                .all(|leaf| leaf.is_pending()),
+            "a restored tab waits for the user"
+        );
+
+        // Restoring the automatic title clears only the name.
+        assert!(restored_layout.set_custom_title(first_tab, None));
+        let tab = restored_layout.tab(first_tab).expect("tab");
+        assert_eq!(tab.custom_title(), None);
+        assert_eq!(tab.display_title(), "pwsh");
+        assert_eq!(tab.accent(), Some(TabAccent::Teal), "the colour stays");
+        assert!(restored_layout.set_accent(first_tab, None));
+        assert_eq!(restored_layout.tab(first_tab).expect("tab").accent(), None);
+    }
+
+    #[test]
+    fn closing_a_named_tab_removes_its_name_with_it() {
+        let mut layout = SessionLayout::new();
+        let (first, _) = session_leaf(&mut layout, "one");
+        let (second, _) = session_leaf(&mut layout, "two");
+        let first_tab = layout.tab_id_of_session(first).expect("tab");
+        let second_tab = layout.tab_id_of_session(second).expect("tab");
+        layout.set_custom_title(first_tab, Some("named".to_owned()));
+
+        assert!(layout.take_tab(first_tab).contains(&first));
+        assert!(
+            layout.tab(first_tab).is_none(),
+            "the tab and its name are gone"
+        );
+        assert_eq!(
+            layout
+                .tab(second_tab)
+                .expect("the other tab")
+                .display_title(),
+            "two"
+        );
+        assert!(!layout.set_custom_title(first_tab, Some("late".to_owned())));
+        assert!(!layout.set_accent(first_tab, Some(TabAccent::Clay)));
     }
 
     #[test]

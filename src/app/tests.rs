@@ -1049,6 +1049,23 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             session_menu_remove_closed,
             session_more,
             session_closed_summary,
+            tab_menu_rename,
+            tab_rename_title,
+            tab_rename_placeholder,
+            tab_rename_hint,
+            tab_rename_save,
+            tab_rename_empty,
+            tab_rename_auto,
+            tab_accent_label,
+            tab_accent_none,
+            tab_accent_iris,
+            tab_accent_violet,
+            tab_accent_teal,
+            tab_accent_lime,
+            tab_accent_orchid,
+            tab_accent_clay,
+            tab_list_title,
+            tab_list_hint,
         ]
     )
 }
@@ -1244,6 +1261,57 @@ fn host_avatar_initials_are_readable_on_their_tint() {
         assert!(
             ratio >= BODY_CONTRAST_FLOOR,
             "avatar {text:#08x} on {tint:#08x} is {ratio:.2}:1"
+        );
+    }
+}
+
+#[test]
+fn tab_identity_colours_are_readable_distinct_and_not_status_hues() {
+    let surfaces = [
+        palette::CANVAS,
+        palette::SURFACE,
+        palette::SURFACE_RAISED,
+        palette::SURFACE_SELECTED,
+    ];
+    for token in palette::TAB_ACCENTS {
+        for surface in surfaces {
+            let dark = theme::contrast::ratio(token, surface);
+            assert!(
+                dark >= GRAPHIC_CONTRAST_FLOOR,
+                "tab colour {token:06x} on {surface:06x} is {dark:.2}:1"
+            );
+            let light = theme::contrast::ratio(light(token), light(surface));
+            assert!(
+                light >= GRAPHIC_CONTRAST_FLOOR,
+                "light tab colour {token:06x} on {surface:06x} is {light:.2}:1"
+            );
+        }
+    }
+    let mut tokens = palette::TAB_ACCENTS.to_vec();
+    let count = tokens.len();
+    tokens.sort_unstable();
+    tokens.dedup();
+    assert_eq!(tokens.len(), count, "two tab colours share a value");
+    // A tab colour only says which tab this is; it must never be read as a status.
+    for token in palette::TAB_ACCENTS {
+        for tone in [Tone::Positive, Tone::Warning, Tone::Danger, Tone::Accent] {
+            assert_ne!(
+                token,
+                tone.token(),
+                "{token:06x} is also the {tone:?} status colour"
+            );
+        }
+    }
+    for accent in shellune_core::TabAccent::ALL {
+        let token = theme::tab_accent_token(accent);
+        assert!(
+            palette::TAB_ACCENTS.contains(&token),
+            "{accent:?} has a colour of its own"
+        );
+        assert_ne!(
+            copy::tab_accent_label(accent, Locale::English),
+            copy::tab_accent_label(accent, Locale::Chinese),
+            "{accent:?} is named in both languages"
         );
     }
 }
@@ -9178,6 +9246,435 @@ async fn closing_a_mixed_tab_from_the_menu_drops_its_pending_pane(cx: &mut TestA
 }
 
 #[gpui::test]
+async fn the_tab_menu_names_a_tab_and_restores_its_automatic_title(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let first = tabs[0];
+    let tab = cx
+        .update(|_window, app| view.read(app).workspace().tab_of_session(first))
+        .expect("the session has a tab");
+    let automatic = cx.update(|_window, app| view.read(app).tab_label_for_test(first));
+
+    // A name is given from the tab's own menu, and only the label changes.
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.rename");
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_rename_open()),
+        "the name dialog opens"
+    );
+    cx.simulate_input("deploy");
+    cx.run_until_parked();
+    click(cx, "tab.rename.save");
+    assert!(
+        !cx.update(|_window, app| view.read(app).tab_rename_open()),
+        "saving closes the dialog"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .tab_custom_title(tab)
+            .map(str::to_owned)),
+        Some("deploy".to_owned())
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(first)),
+        "deploy"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .layout()
+            .tab(tab)
+            .map(|tab| tab.title().to_owned())),
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(first)
+            .map(|session| session.title().to_owned())),
+        "the automatic title is kept behind the name"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).workspace().session(first).is_some()),
+        "naming a tab does not change its session"
+    );
+    // The palette reads the same name, so the two places cannot disagree.
+    let titles = cx.update(|_window, app| view.read(app).tab_label_for_test(tabs[1]));
+    assert_ne!(titles, "deploy", "the other tab is untouched");
+
+    // Restoring the automatic title clears only the name.
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.rename");
+    click(cx, "tab.rename.auto");
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .tab_custom_title(tab)
+            .map(str::to_owned)),
+        None
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(first)),
+        automatic
+    );
+
+    // An empty name is refused with a reason, and the field keeps what was typed so
+    // the user can add the missing letter.
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.rename");
+    click(cx, "tab.rename.save");
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_rename_open()),
+        "an empty name leaves the dialog open"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_rename_problem().map(str::to_owned))
+            .is_some_and(|problem| !problem.trim().is_empty()),
+        "and says why"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).tab_rename_open()));
+
+    // A dialog that outlives its tab closes with it instead of naming something gone.
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.rename");
+    assert!(cx.update(|_window, app| view.read(app).tab_rename_open()));
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.close_session(first, cx));
+    });
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).tab_rename_open()));
+}
+
+#[gpui::test]
+async fn a_tab_colour_is_chosen_and_cleared_without_touching_its_state(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let (first, second) = (tabs[0], tabs[1]);
+    let second_tab = cx
+        .update(|_window, app| view.read(app).workspace().tab_of_session(second))
+        .expect("the session has a tab");
+    let first_tab = cx
+        .update(|_window, app| view.read(app).workspace().tab_of_session(first))
+        .expect("the session has a tab");
+
+    right_click(cx, "session.tab.1");
+    assert!(
+        cx.debug_bounds("tab.menu.accents").is_some(),
+        "the tab menu offers the colours"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.accent.1").is_none(),
+        "no tab carries a mark before one is chosen"
+    );
+    click(cx, "tab.menu.accent.teal");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().tab_accent(second_tab)),
+        Some(shellune_core::TabAccent::Teal)
+    );
+    assert!(
+        cx.debug_bounds("session.tab.accent.1").is_some(),
+        "the coloured tab carries its mark"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.accent.0").is_none(),
+        "the other tab has no mark"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().tab_accent(first_tab)),
+        None
+    );
+    // The state is still readable: the live session keeps its state, and its tab
+    // still shows the close button the colour must not have replaced.
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(second)
+            .is_some_and(|session| matches!(session.state(), SessionState::Connected))),
+        "a colour does not change what the session is doing"
+    );
+    assert!(cx.debug_bounds("session.tab.close.1").is_some());
+
+    // Clearing the colour leaves the tab exactly as it was otherwise.
+    click(cx, "tab.menu.accent.none");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().tab_accent(second_tab)),
+        None
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().tab_accent(first_tab)),
+        None,
+        "the other tab never got a colour"
+    );
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(second)
+            .is_some_and(|session| matches!(session.state(), SessionState::Connected))),
+        "clearing a colour does not change the session either"
+    );
+    let labels = cx.update(|_window, app| {
+        (
+            view.read(app).tab_label_for_test(first),
+            view.read(app).tab_label_for_test(second),
+        )
+    });
+    assert!(!labels.0.is_empty() && !labels.1.is_empty());
+}
+
+#[gpui::test]
+async fn the_tab_list_shows_every_tab_and_switches_to_it(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[1])
+    );
+    let viewport = minimum_window();
+    cx.simulate_resize(viewport);
+    cx.run_until_parked();
+    assert_fits_inside(
+        bounds_of(cx, "tabs.list.open"),
+        viewport,
+        "the all-tabs control",
+    );
+
+    click(cx, "tabs.list.open");
+    assert!(
+        cx.debug_bounds("tabs.list").is_some(),
+        "the list opens over the page"
+    );
+    assert!(cx.debug_bounds("tabs.list.row.0").is_some());
+    assert!(cx.debug_bounds("tabs.list.row.1").is_some());
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_list_open()),
+        "the list is open"
+    );
+
+    // Choosing a row shows that tab, and the list closes behind it.
+    click(cx, "tabs.list.row.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[0])
+    );
+    assert!(!cx.update(|_window, app| view.read(app).tab_list_open()));
+    assert_eq!(destination_of(&view, cx), Destination::LocalShells);
+
+    // Escape closes the list without switching anything.
+    click(cx, "tabs.list.open");
+    assert!(cx.debug_bounds("tabs.list").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).tab_list_open()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[0]),
+        "closing the list did not change the tab on screen"
+    );
+}
+
+#[gpui::test]
+async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_text(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let viewport = minimum_window();
+    cx.simulate_resize(viewport);
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest,
+        "the dialogs are measured at 200% text"
+    );
+
+    // At this size the strip itself has no room left, so the list of every tab is the
+    // way to a tab; its pencil opens the same name dialog.
+    assert!(
+        cx.debug_bounds("session.tab.0").is_some(),
+        "the tab is still laid out, even when the strip has to clip it"
+    );
+    assert_fits_inside(
+        bounds_of(cx, "tabs.list.open"),
+        viewport,
+        "the all-tabs control",
+    );
+    assert_pointer_target(cx, "tabs.list.open");
+    click(cx, "tabs.list.open");
+    assert_fits_inside(bounds_of(cx, "tabs.list.dialog"), viewport, "the tab list");
+    // The first row is on screen; the rest are reached by the dialog's own scroll, so
+    // the test asks that each one is rendered rather than that all fit at once.
+    assert_fits_inside(
+        bounds_of(cx, "tabs.list.row.0"),
+        viewport,
+        "the first tab row",
+    );
+    for index in 0..2 {
+        let selector: &'static str = Box::leak(format!("tabs.list.row.{index}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is in the list"
+        );
+        let rename: &'static str = Box::leak(format!("tabs.list.rename.{index}").into_boxed_str());
+        assert_pointer_target(cx, rename);
+    }
+    let close: &'static str = "tabs.list.close";
+    assert_fits_inside(bounds_of(cx, close), viewport, close);
+
+    click(cx, "tabs.list.rename.0");
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_rename_open()),
+        "the pencil in the tab list names the tab it belongs to"
+    );
+    // The name dialog keeps its field and its buttons on screen; the colours sit in
+    // its scrolling body, so they are reached by scrolling rather than being cut off.
+    assert_fits_inside(
+        bounds_of(cx, "tab.rename.dialog"),
+        viewport,
+        "the name dialog",
+    );
+    for selector in ["tab.rename.field", "tab.rename.save"] {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+    }
+    for selector in ["tab.rename.accent.teal", "tab.rename.accent.none"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is drawn in the dialog"
+        );
+    }
+    assert_pointer_target(cx, "tab.rename.accent.teal");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).tab_rename_open()));
+}
+
+#[gpui::test]
+async fn a_restored_strip_of_named_tabs_stays_pending_and_whole(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tab-identity-restore");
+    seed(&dir.store(), Vec::new());
+    let names = ["build", "staging", "production", "database"];
+    let accents = [
+        shellune_core::TabAccent::Iris,
+        shellune_core::TabAccent::Teal,
+        shellune_core::TabAccent::Clay,
+        shellune_core::TabAccent::Orchid,
+    ];
+    let mut tabs = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let program = format!("shellune-pending-{index}");
+        let mut tab = WorkspaceTab::new(
+            format!("automatic {index}"),
+            PaneNode::leaf(
+                PaneTarget::local(Some(program.clone())),
+                TerminalMode::Classic,
+            ),
+        )
+        .expect("title");
+        tab.set_custom_title(Some((*name).to_owned()));
+        tab.set_accent(Some(accents[index]));
+        tabs.push(tab);
+    }
+    let snapshot = WorkspaceSnapshot::new(tabs, PanelConfig::default()).expect("snapshot");
+    let ids: Vec<shellune_core::TabId> = snapshot.tabs().iter().map(WorkspaceTab::id).collect();
+    WorkspaceStore::at(dir.path())
+        .save(&snapshot)
+        .expect("snapshot saves");
+
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+
+    // Nothing was started: every restored tab is waiting.
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions().is_empty()),
+        "restoring a strip starts no process"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        names.len()
+    );
+    let restored: Vec<(String, Option<shellune_core::TabAccent>)> = cx.update(|_window, app| {
+        let view = view.read(app);
+        view.workspace()
+            .layout()
+            .tabs()
+            .iter()
+            .map(|tab| (tab.display_title().to_owned(), tab.accent()))
+            .collect()
+    });
+    let names_back: Vec<String> = restored.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(
+        names_back,
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>(),
+        "the names came back in the saved order"
+    );
+    for (index, accent) in accents.iter().enumerate() {
+        assert_eq!(
+            restored[index].1,
+            Some(*accent),
+            "tab {index} kept its colour"
+        );
+    }
+    assert!(
+        cx.debug_bounds("session.tab.accent.0").is_some(),
+        "a restored tab is drawn with its colour"
+    );
+
+    // The strip cannot show every tab at the smallest window, so the list is how all
+    // of them stay reachable.
+    let viewport = minimum_window();
+    assert_fits_inside(
+        bounds_of(cx, "tabs.list.open"),
+        viewport,
+        "the all-tabs control",
+    );
+    assert_pointer_target(cx, "tabs.list.open");
+    // The entries the strip could push aside keep their own room beside it.
+    for selector in ["header.primary", "palette.open", "nav.settings"] {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+    }
+    click(cx, "tabs.list.open");
+    for index in 0..names.len() {
+        let selector: &'static str = Box::leak(format!("tabs.list.row.{index}").into_boxed_str());
+        assert!(cx.debug_bounds(selector).is_some(), "tab {index} is listed");
+    }
+    let last: &'static str =
+        Box::leak(format!("tabs.list.row.{}", names.len() - 1).into_boxed_str());
+    click(cx, last);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().layout().active_tab_id()),
+        Some(ids[names.len() - 1]),
+        "choosing the last row shows the last tab"
+    );
+}
+
+#[gpui::test]
 async fn a_failed_local_adopt_keeps_the_pending_pane(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
@@ -10500,11 +10997,15 @@ fn every_token_has_a_light_value() {
         palette::PLANNED,
         palette::BRAND_END,
     ];
-    for token in tokens.into_iter().chain(
-        palette::AVATARS
-            .iter()
-            .flat_map(|(tint, text)| [*tint, *text]),
-    ) {
+    for token in tokens
+        .into_iter()
+        .chain(
+            palette::AVATARS
+                .iter()
+                .flat_map(|(tint, text)| [*tint, *text]),
+        )
+        .chain(palette::TAB_ACCENTS)
+    {
         assert_ne!(light(token), token, "{token:06x} has no light value");
     }
 }
@@ -10972,6 +11473,63 @@ async fn restoring_a_workspace_stays_pending_and_a_bad_host_is_local(cx: &mut Te
         std::fs::read(dir.path().join(WORKSPACE_FILE_NAME)).expect("file"),
         rewritten,
         "closing the window does not replace the saved layout"
+    );
+}
+
+#[gpui::test]
+async fn a_named_tinted_tab_is_written_and_comes_back_waiting(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tab-identity-write");
+    seed(&dir.store(), Vec::new());
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    click(cx, "header.primary");
+    let session = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("the shell opened a tab");
+
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.rename");
+    cx.simulate_input("build box");
+    cx.run_until_parked();
+    click(cx, "tab.rename.save");
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.accent.violet");
+
+    // The name and the colour are part of the saved layout, and the file keeps no
+    // output, no command and no secret.
+    let written = std::fs::read_to_string(dir.path().join(WORKSPACE_FILE_NAME))
+        .expect("the layout was written");
+    let document: serde_json::Value = serde_json::from_str(&written).expect("json");
+    assert_eq!(document["tabs"][0]["custom_title"], "build box");
+    assert_eq!(document["tabs"][0]["accent"], "violet");
+    assert!(!written.to_lowercase().contains("password"), "{written}");
+    assert!(!written.contains(&session.to_string()));
+
+    // The next start restores the same labels as a waiting object: no shell, no
+    // connection and no command runs.
+    let saved = WorkspaceStore::at(dir.path())
+        .load()
+        .expect("the snapshot loads");
+    let restored = saved.restore(|_| true);
+    assert_eq!(restored.tabs()[0].custom_title(), Some("build box"));
+    assert_eq!(
+        restored.tabs()[0].accent(),
+        Some(shellune_core::TabAccent::Violet)
+    );
+    assert!(
+        restored
+            .panes()
+            .iter()
+            .all(|pane| !pane.connection().is_started()),
+        "the restored pane is waiting"
     );
 }
 
