@@ -71,6 +71,7 @@ use crate::app::transfers::{
 use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Workspace};
 use crate::app::{components, theme::radius};
 
+mod files_menu;
 mod forwarding;
 mod host_dialog;
 mod overlays;
@@ -78,6 +79,7 @@ mod panes;
 mod sessions;
 mod shell;
 mod titlebar;
+mod toasts;
 
 #[cfg(test)]
 pub use shell::Tool;
@@ -274,6 +276,13 @@ pub struct ShelluneView {
     /// The menu is how another shell is started while a terminal fills the panel; the
     /// empty destination shows the same choices as tiles instead.
     shell_menu_open: bool,
+    /// The file view's right-click menu, while open.
+    files_menu: Option<files_menu::FilesMenu>,
+    /// Short messages in the corner, oldest first.
+    toasts: Vec<toasts::Toast>,
+    next_toast: u64,
+    /// The pointer is over the toasts, which holds them while they are read.
+    toasts_hovered: bool,
     /// Where the header's "▾" was last drawn, so its menu can hang from it.
     shell_menu_anchor: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     store: HostStore,
@@ -584,6 +593,10 @@ impl ShelluneView {
             shell_path,
             custom_shell_open: false,
             shell_menu_open: false,
+            files_menu: None,
+            toasts: Vec::new(),
+            next_toast: 0,
+            toasts_hovered: false,
             shell_menu_anchor: std::rc::Rc::default(),
             store,
             book: HostBook::new(),
@@ -1032,6 +1045,15 @@ impl ShelluneView {
         // list repeats the truth about that one session.
         cx.observe(&pane, |view, pane, cx| view.sync_pane(pane, cx))
             .detach();
+        // A remote terminal asks the window to upload what was dropped or pasted.
+        let session = tag.session;
+        cx.subscribe(
+            &pane,
+            move |view, pane, request: &terminal::PaneRequest, cx| {
+                view.answer_pane(session, &pane, request.clone(), cx);
+            },
+        )
+        .detach();
         self.panes.push(OpenPane { tag, pane });
         if focus {
             // A terminal that just opened is what the user asked for: show it, from
@@ -1045,6 +1067,104 @@ impl ShelluneView {
             self.session_terminal = true;
             self.showing_connection_form = false;
             self.focus_pane(tag.session, cx);
+        }
+        cx.notify();
+    }
+
+    /// Uploads what a remote terminal was given, then types where it went.
+    ///
+    /// The files go to the folder the file view shows, or, before it was opened,
+    /// to where the server starts a file session (the user's home), which the
+    /// shell reaches as `~`. The path is typed while the upload runs; the
+    /// transfer strip shows its progress.
+    fn answer_pane(
+        &mut self,
+        id: SessionId,
+        pane: &Entity<TerminalPane>,
+        request: terminal::PaneRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let locals: Vec<String> = match request {
+            terminal::PaneRequest::UploadFiles(paths) => paths
+                .iter()
+                .filter(|path| path.is_file())
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            terminal::PaneRequest::PasteImage(image) => {
+                let extension = image
+                    .format
+                    .mime_type()
+                    .rsplit('/')
+                    .next()
+                    .map_or("png", |subtype| subtype.trim_end_matches("+xml"));
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis());
+                let path = std::env::temp_dir().join(format!("shellune-paste-{stamp}.{extension}"));
+                if let Err(error) = std::fs::write(&path, &image.bytes) {
+                    let title = copy::ux().drop_upload_failed;
+                    self.toast(Tone::Danger, title, Some(error.to_string()), cx);
+                    return;
+                }
+                vec![path.to_string_lossy().into_owned()]
+            }
+        };
+        if locals.is_empty() {
+            self.toast(Tone::Warning, copy::ux().drop_folders_unsupported, None, cx);
+            return;
+        }
+        let directory = self
+            .files
+            .browser(id)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned);
+        let mut typed = Vec::new();
+        for local in &locals {
+            match self
+                .transfers
+                .upload(id, local, Some(directory.as_deref().unwrap_or(".")))
+            {
+                Ok(_) => {
+                    let name = std::path::Path::new(local)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let remote = match &directory {
+                        Some(directory) => shellune_core::join_path(directory, &name),
+                        None => format!("~/{name}"),
+                    };
+                    // `~` must stay outside the quotes for the shell to expand it.
+                    typed.push(match remote.strip_prefix("~/") {
+                        Some(rest) => format!("~/{}", terminal::quote_posix_path(rest)),
+                        None => terminal::quote_posix_path(&remote),
+                    });
+                }
+                Err(problem) => {
+                    let reason = match problem {
+                        TransferProblem::SourceNamesNoFile => {
+                            self.strings().transfers_problem_no_name
+                        }
+                        TransferProblem::DirectoryUnknown => {
+                            self.strings().transfers_problem_no_directory
+                        }
+                        TransferProblem::CommandRefused => {
+                            self.strings().transfers_problem_no_connection
+                        }
+                    };
+                    let title = copy::ux().drop_upload_failed;
+                    self.toast(Tone::Danger, title, Some(format!("{local} · {reason}")), cx);
+                }
+            }
+        }
+        if !typed.is_empty() {
+            let count = typed.len().to_string();
+            let mut text = typed.join(" ");
+            text.push(' ');
+            pane.update(cx, |pane, cx| pane.type_text(&text, cx));
+            self.watch_files(cx);
+            let title = copy::fill(copy::ux().drop_uploading, &[("count", &count)]);
+            let folder = directory.unwrap_or_else(|| "~".to_owned());
+            self.toast(Tone::Accent, title, Some(folder), cx);
         }
         cx.notify();
     }
@@ -1634,7 +1754,7 @@ impl ShelluneView {
     fn interrupt_line(&self, task: &Transfer) -> String {
         format!(
             "{} · {} · {} → {}",
-            theme::transfer_direction_label(task.direction()),
+            self.direction_label(task.direction()),
             self.transfer_host_label(task),
             task.source(),
             task.destination()
@@ -6533,40 +6653,36 @@ impl ShelluneView {
                     FileSource::Remote,
                 ))
         });
-        let toolbar = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .h(metrics.scale(40.0))
-            .px(metrics.scale(spacing::SNUG))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_b_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .children(switch)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(ux.files_hint),
-            );
+        // The switch is only needed when the window is too narrow for both sides.
+        let toolbar = switch.map(|switch| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(metrics.scale(40.0))
+                .px(metrics.scale(spacing::SNUG))
+                .bg(theme::swatch(palette::SURFACE))
+                .border_b_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .child(switch)
+        });
 
-        let transfers = div()
-            .id("files.transfers")
-            .flex()
-            .flex_col()
-            .flex_none()
-            .max_h(metrics.scale(180.0))
-            .overflow_y_scroll()
-            .px(metrics.scale(spacing::BASE))
-            .py(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .child(self.transfers_panel(id, cx));
+        // The transfer strip takes room only while there is something to show.
+        let transfers = self.transfers_strip_shown(id).then(|| {
+            div()
+                .id("files.transfers")
+                .flex()
+                .flex_col()
+                .flex_none()
+                .max_h(metrics.scale(180.0))
+                .overflow_y_scroll()
+                .px(metrics.scale(spacing::BASE))
+                .py(metrics.scale(spacing::TIGHT))
+                .bg(theme::swatch(palette::SURFACE))
+                .border_t_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .child(self.transfers_panel(id, cx))
+        });
 
         div()
             .id("files.panes")
@@ -6578,9 +6694,70 @@ impl ShelluneView {
             .min_h(px(0.0))
             .overflow_hidden()
             .bg(theme::swatch(palette::CANVAS))
-            .child(toolbar)
+            .children(toolbar)
             .child(panes)
-            .child(transfers)
+            .children(transfers)
+    }
+
+    /// "Upload" or "Download" in the interface language.
+    fn direction_label(&self, direction: TransferDirection) -> &'static str {
+        let strings = self.strings();
+        match direction {
+            TransferDirection::Upload => strings.transfers_upload,
+            TransferDirection::Download => strings.transfers_download,
+        }
+    }
+
+    /// Uploads files dropped from the system onto the server side, into the
+    /// folder it shows.
+    fn files_upload_paths(
+        &mut self,
+        id: SessionId,
+        paths: &[std::path::PathBuf],
+        cx: &mut Context<Self>,
+    ) {
+        let directory = self
+            .files
+            .browser(id)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned);
+        let files: Vec<String> = paths
+            .iter()
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        if files.is_empty() {
+            self.toast(Tone::Warning, copy::ux().drop_folders_unsupported, None, cx);
+            return;
+        }
+        let mut started = 0;
+        for local in &files {
+            match self.transfers.upload(id, local, directory.as_deref()) {
+                Ok(_) => started += 1,
+                Err(problem) => {
+                    self.transfer_problem = Some((id, problem));
+                }
+            }
+        }
+        if started > 0 {
+            self.watch_files(cx);
+            let title = copy::fill(
+                copy::ux().drop_uploading_files,
+                &[("count", &started.to_string())],
+            );
+            self.toast(Tone::Accent, title, directory, cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether the file view shows its transfer strip: while the session has a
+    /// transfer, or a transfer that could not start.
+    pub(crate) fn transfers_strip_shown(&self, id: SessionId) -> bool {
+        self.transfers.for_session(id).next().is_some()
+            || self
+                .transfer_problem
+                .as_ref()
+                .is_some_and(|(session, _)| *session == id)
     }
 
     /// Whether this computer and the server fit side by side.
@@ -6971,6 +7148,45 @@ impl ShelluneView {
     /// A failure here touches the file view only: the session keeps its own state, so
     /// a server whose files cannot be read is never reported as a terminal that
     /// ended.
+    /// Announces each change that newly succeeded. A change that failed in part
+    /// stays beside its list instead, item by item, until the next change.
+    fn announce_file_changes(
+        &mut self,
+        before: &[(
+            (SessionId, FileSource),
+            Option<shellune_core::MutationOutcome>,
+        )],
+        cx: &mut Context<Self>,
+    ) {
+        let mut done = Vec::new();
+        for ((id, source), previous) in before {
+            let Some(outcome) = self.files.outcome_in(*id, *source) else {
+                continue;
+            };
+            if previous.as_ref() == Some(outcome) || !outcome.succeeded() {
+                continue;
+            }
+            let strings = self.strings();
+            let title = match source {
+                FileSource::Local => strings.files_change_done_local,
+                FileSource::Remote => strings.files_change_done,
+            };
+            let detail = match outcome.steps() {
+                [one] => one.path().to_owned(),
+                steps => format!(
+                    "{} {}/{}",
+                    strings.files_change_changed,
+                    outcome.changed(),
+                    steps.len()
+                ),
+            };
+            done.push((title, detail));
+        }
+        for (title, detail) in done {
+            self.toast(Tone::Positive, title, Some(detail), cx);
+        }
+    }
+
     fn pump_files(&mut self, cx: &mut Context<Self>) -> bool {
         let done_before: Vec<shellune_core::TransferId> = self
             .transfers
@@ -6979,9 +7195,36 @@ impl ShelluneView {
             .filter(|task| task.state().is_success())
             .map(|task| task.id())
             .collect();
+        // The change results before this tick, so a new success can be announced.
+        let sessions: Vec<SessionId> = self.panes.iter().map(|open| open.tag.session).collect();
+        let outcomes_before: Vec<_> = sessions
+            .iter()
+            .flat_map(|id| {
+                [FileSource::Remote, FileSource::Local]
+                    .map(|source| ((*id, source), self.files.outcome_in(*id, source).cloned()))
+            })
+            .collect();
         let listed = self.files.pump();
+        if listed {
+            self.announce_file_changes(&outcomes_before, cx);
+        }
         let transferred = self.transfers.pump();
         if transferred {
+            let mut finished = Vec::new();
+            for task in self.transfers.transfers() {
+                if !task.state().is_success() || done_before.contains(&task.id()) {
+                    continue;
+                }
+                finished.push((task.direction(), task.destination().to_owned()));
+            }
+            for (direction, destination) in finished {
+                let ux = copy::ux();
+                let title = match direction {
+                    TransferDirection::Upload => ux.toast_uploaded,
+                    TransferDirection::Download => ux.toast_downloaded,
+                };
+                self.toast(Tone::Positive, title, Some(destination), cx);
+            }
             for task in self.transfers.transfers() {
                 if !task.state().is_success() || done_before.contains(&task.id()) {
                     continue;
@@ -7530,6 +7773,10 @@ impl ShelluneView {
                         let list_id = list_id.clone();
                         move || list_id.to_string()
                     })
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        self.files_blank_menu_listener(id, source, cx),
+                    )
                     .child(
                         div()
                             .flex()
@@ -7605,6 +7852,22 @@ impl ShelluneView {
             .on_drop(cx.listener(move |view, drag: &FileDrag, _window, cx| {
                 view.files_accept_drop(id, source, drag, cx);
             }))
+            // Files from the system's file manager upload to the folder the server
+            // side shows.
+            .drag_over::<gpui::ExternalPaths>(move |style, _paths, _window, _cx| {
+                if source == FileSource::Remote {
+                    style.bg(theme::swatch(palette::ACCENT_TINT))
+                } else {
+                    style
+                }
+            })
+            .on_drop(
+                cx.listener(move |view, paths: &gpui::ExternalPaths, _window, cx| {
+                    if source == FileSource::Remote {
+                        view.files_upload_paths(id, paths.paths(), cx);
+                    }
+                }),
+            )
             .child(header)
             .child(crumb_row);
         if let Some(question) = self.files_question(id, source, cx) {
@@ -7977,7 +8240,7 @@ impl ShelluneView {
                             .debug_selector(move || format!("transfers.name.{index}"))
                             .child(SharedString::from(format!(
                                 "{} · {} · {} → {}",
-                                theme::transfer_direction_label(task.direction()),
+                                self.direction_label(task.direction()),
                                 self.transfer_host_label(task),
                                 task.source(),
                                 task.destination()
@@ -8212,9 +8475,13 @@ impl ShelluneView {
             FileSource::Remote => self.files.outcome(id)?,
             FileSource::Local => self.files.outcome_in(id, source)?,
         };
+        let done = outcome.succeeded();
+        // A change that worked is announced in the corner and needs no room here.
+        if done {
+            return None;
+        }
         let metrics = self.metrics();
         let strings = self.strings();
-        let done = outcome.succeeded();
         let heading = match (source, done) {
             (FileSource::Local, true) => strings.files_change_done_local,
             (FileSource::Local, false) => strings.files_change_failed_local,
@@ -8483,9 +8750,32 @@ impl ShelluneView {
         let hover = theme::swatch(palette::SURFACE_HOVER);
         let row_selector = format!("{prefix}.row.{index}");
         let selected = self.files.selected(id, source) == Some(name);
+        // The row's buttons show under the pointer and on the selected row; the
+        // rest of the list stays quiet. The same actions are on the right click.
+        let row_group = SharedString::from(format!("{prefix}.group.{index}"));
+        let actions = if selected {
+            actions
+        } else {
+            actions
+                .opacity(0.0)
+                .group_hover(row_group.clone(), |style| style.opacity(1.0))
+        };
+        let menu_entry = files_menu::MenuEntry {
+            name: name.to_owned(),
+            kind,
+            folder: openable,
+        };
         div()
             .id(SharedString::from(row_selector.clone()))
             .debug_selector(move || row_selector.clone())
+            .group(row_group)
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |view, event: &gpui::MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    view.open_files_menu(id, source, Some(menu_entry.clone()), event.position, cx);
+                }),
+            )
             .flex()
             .items_center()
             .flex_none()
@@ -9390,7 +9680,7 @@ impl ShelluneView {
                             .min_w(px(0.0))
                             .child(components::status_dot(tone, metrics))
                             .child(components::kind_badge(
-                                theme::transfer_direction_label(transfer.direction()),
+                                self.direction_label(transfer.direction()),
                                 false,
                                 metrics,
                             ))
@@ -9429,7 +9719,7 @@ impl ShelluneView {
     fn transfer_center_text(&self, transfer: &Transfer) -> String {
         format!(
             "{} · {} {} · {} → {} · {}",
-            theme::transfer_direction_label(transfer.direction()),
+            self.direction_label(transfer.direction()),
             self.strings().transfers_host,
             self.transfer_host_label(transfer),
             transfer.source(),
@@ -9748,9 +10038,11 @@ impl Render for ShelluneView {
             .children(self.host_dialog_overlay(window, cx))
             .children(self.custom_shell_overlay(window, cx))
             .children(self.shell_menu_overlay(window, cx))
+            .children(self.files_menu_overlay(window, cx))
             .children(self.tab_menu_overlay(window, cx))
             .children(self.session_menu_overlay(window, cx))
             .children(self.palette_overlay(window, cx))
+            .children(self.toast_stack(cx))
     }
 }
 

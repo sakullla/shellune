@@ -13,7 +13,7 @@
 //!   per view.
 
 use gpui::{FontWeight, Pixels, Rgba, px, rgb};
-use shellune_core::{SessionFailure, SessionKind, SessionState, TransferDirection, TransferState};
+use shellune_core::{SessionFailure, SessionKind, SessionState, TransferState};
 
 /// Raw colour tokens as 24-bit sRGB values.
 ///
@@ -673,11 +673,6 @@ pub fn session_kind_label(kind: &SessionKind, shell_fallback: &str) -> String {
 /// Text for a session failure, kept free of secrets because the domain type is.
 pub fn session_failure_text(failure: &SessionFailure) -> String {
     failure.to_string()
-}
-
-/// Short label for a transfer direction.
-pub fn transfer_direction_label(direction: TransferDirection) -> &'static str {
-    direction.label()
 }
 
 /// Minimum contrast for body text (WCAG AA).

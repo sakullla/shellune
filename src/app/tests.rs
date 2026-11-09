@@ -6188,9 +6188,15 @@ async fn a_new_folder_is_asked_for_and_the_result_is_the_servers_next_listing(
         ],
         "the list after the change is the one the server reported"
     );
-    assert!(
-        cx.debug_bounds("files.report").is_some(),
-        "what the server did is stated"
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).toast_titles()),
+        vec![
+            crate::app::copy::Locale::English
+                .strings()
+                .files_change_done
+                .to_owned()
+        ],
+        "what the server did is announced in the corner, not left in the list"
     );
     assert!(
         !cx.update(|_window, app| view
@@ -6425,8 +6431,13 @@ async fn a_rename_sends_both_names_and_the_list_follows_the_server(cx: &mut Test
         "the list after the rename is the server's own answer"
     );
     assert!(
-        cx.debug_bounds("files.report").is_some(),
-        "the report of what the server did is still there"
+        cx.update(|_window, app| view.read(app).toast_titles())
+            .iter()
+            .any(|title| title
+                == crate::app::copy::Locale::English
+                    .strings()
+                    .files_change_done),
+        "the change the server applied is announced"
     );
 }
 
@@ -7159,12 +7170,8 @@ async fn an_upload_asks_for_the_file_and_then_reports_the_task_it_started(cx: &m
     let (_files, transfers) = open_transfers(cx, &view, id);
 
     assert!(
-        cx.debug_bounds("transfers.panel").is_some(),
-        "the transfer list belongs to the file view"
-    );
-    assert!(
-        cx.debug_bounds("transfers.empty").is_some(),
-        "nothing was transferred yet, and that is said instead of implied"
+        !cx.update(|_window, app| view.read(app).transfers_strip_shown(id)),
+        "with nothing transferred the strip takes no room"
     );
 
     // The question is asked before anything is sent.
@@ -10970,5 +10977,107 @@ async fn frame_lines_and_wide_characters_keep_the_columns_after_them(cx: &mut Te
     assert!(
         at(after, 4.0),
         "the x after the rule is on column 4: {after:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_program_that_asks_for_the_mouse_receives_clicks_and_the_wheel(cx: &mut TestAppContext) {
+    // htop, vim, tmux: DECSET 1000 + 1006 asks for clicks in SGR form.
+    let (pane, cx) = pane_with("\x1b[?1000h\x1b[?1006h", cx);
+    let origin = bounds_of(cx, "terminal.row.0").origin;
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    let at = point(
+        origin.x + px(cell.width * 2.5),
+        origin.y + px(cell.height * 1.5),
+    );
+    cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::default());
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Lines(point(0.0, 1.0)),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let sent =
+        cx.update(|_window, app| String::from_utf8_lossy(pane.read(app).sent()).into_owned());
+    assert!(
+        sent.contains("\x1b[<0;3;2M"),
+        "the press names column 3, row 2: {sent:?}"
+    );
+    assert!(sent.contains("\x1b[<0;3;2m"), "and the release: {sent:?}");
+    assert!(
+        sent.contains("\x1b[<64;3;2M"),
+        "the wheel is a button press: {sent:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_wheel_scrolls_a_full_screen_program_that_did_not_ask_for_the_mouse(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("\x1b[?1049h", cx);
+    let at = bounds_of(cx, "terminal.row.0").center();
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Lines(point(0.0, -2.0)),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let sent =
+        cx.update(|_window, app| String::from_utf8_lossy(pane.read(app).sent()).into_owned());
+    assert_eq!(sent, "\x1b[B\x1b[B", "two lines down are two cursor-downs");
+}
+
+#[gpui::test]
+async fn a_right_click_in_the_terminal_offers_copy_and_paste(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello\r\n", cx);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasted".to_owned()));
+    right_click(cx, "terminal.row.0");
+    assert!(cx.debug_bounds("terminal.menu").is_some(), "the menu opens");
+    click(cx, "terminal.menu.paste");
+    let sent =
+        cx.update(|_window, app| String::from_utf8_lossy(pane.read(app).sent()).into_owned());
+    assert!(
+        sent.contains("pasted"),
+        "the clipboard went to the shell: {sent:?}"
+    );
+}
+
+#[gpui::test]
+async fn an_image_pasted_into_a_local_terminal_is_left_to_the_program(cx: &mut TestAppContext) {
+    // Command-line tools that take images read the clipboard themselves on Ctrl+V.
+    let (pane, cx) = pane_with("", cx);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        vec![0x89, b'P', b'N', b'G'],
+    )));
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+    let sent = cx.update(|_window, app| pane.read(app).sent().to_vec());
+    assert_eq!(sent, vec![0x16], "the program is sent Ctrl+V");
+}
+
+#[gpui::test]
+async fn a_right_click_on_a_file_offers_its_actions_and_copies_its_path(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let _answers = open_files(cx, &view, id);
+    // Row 1 is notes.txt, a file on the server.
+    right_click(cx, "files.row.1");
+    assert!(
+        cx.debug_bounds("files.menu").is_some(),
+        "the menu opens on the item"
+    );
+    assert!(cx.debug_bounds("files.menu.to_local").is_some());
+    assert!(cx.debug_bounds("files.menu.delete").is_some());
+    click(cx, "files.menu.copy_path");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("/home/deploy/notes.txt".to_owned())
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).toast_titles()),
+        vec![crate::app::copy::ux().toast_path_copied.to_owned()],
+        "the copy is confirmed in the corner"
     );
 }

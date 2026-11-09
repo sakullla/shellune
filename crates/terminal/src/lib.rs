@@ -8,6 +8,7 @@
 //! * [`core`] owns the grid and turns bytes into a snapshot a view can draw;
 //! * [`blocks`] records command blocks from OSC 133 / OSC 633 markers only;
 //! * [`input`] turns keys and pasted text into the bytes a program reads;
+//! * [`mouse`] turns pointer events into the reports a program asked for;
 //! * [`metrics`] decides how many cells fit in an area and how large the font may be;
 //! * [`palette`] resolves named, indexed and direct colours;
 //! * [`pty`] starts a real shell and reports its output, its size changes and its
@@ -21,6 +22,7 @@ pub mod blocks;
 pub mod core;
 pub mod input;
 pub mod metrics;
+pub mod mouse;
 pub mod palette;
 pub mod pty;
 pub mod shell;
@@ -40,6 +42,10 @@ pub use input::{
 pub use metrics::{
     CellSize, DEFAULT_FONT_SIZE, FONT_SIZE_STEP, GridSize, LINE_HEIGHT_RATIO, MAX_FONT_SIZE,
     MIN_FONT_SIZE, MONOSPACE_ADVANCE_RATIO, grid_for, sanitize_font_size, step_font_size,
+};
+pub use mouse::{
+    MouseAction, MouseButton, MouseModifiers, encode_alternate_scroll, encode_mouse,
+    mouse_reporting,
 };
 pub use palette::{ANSI, BACKGROUND, CURSOR, FOREGROUND, indexed, named_color, resolve, to_hex};
 pub use pty::{ExitReport, LocalSession, PtyEvent, ShellLaunchError, TERM_VALUE};

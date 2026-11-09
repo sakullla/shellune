@@ -32,10 +32,11 @@ use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession};
 use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
-    GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, PtyEvent, RenderedCell, Rgb,
-    SelectionType, Snapshot, TermMode, TerminalCore, TerminalEffects, encode_key, encode_paste,
-    encode_text, grid_for, palette, paste_needs_confirmation, paste_preview, sanitize_font_size,
-    step_font_size,
+    GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, MouseAction,
+    MouseButton as TerminalMouseButton, MouseModifiers, PtyEvent, RenderedCell, Rgb, SelectionType,
+    Snapshot, TermMode, TerminalCore, TerminalEffects, encode_alternate_scroll, encode_key,
+    encode_mouse, encode_paste, encode_text, grid_for, mouse_reporting, palette,
+    paste_needs_confirmation, paste_preview, sanitize_font_size, step_font_size,
 };
 
 use crate::app::components;
@@ -292,6 +293,19 @@ impl PaneOrigin {
 }
 
 /// One terminal view backed by a local shell or a remote session.
+/// What a pane asks of the window, for what it cannot do alone.
+#[derive(Clone, Debug)]
+pub enum PaneRequest {
+    /// Files were dropped on a remote terminal: upload them, then type where
+    /// they went.
+    UploadFiles(Vec<std::path::PathBuf>),
+    /// An image was pasted into a remote terminal: the server cannot read this
+    /// computer's clipboard, so save it, upload it, then type where it went.
+    PasteImage(gpui::Image),
+}
+
+impl gpui::EventEmitter<PaneRequest> for TerminalPane {}
+
 pub struct TerminalPane {
     /// Which session process this pane shows.
     ///
@@ -323,6 +337,16 @@ pub struct TerminalPane {
     /// button went down on selected nothing, and copying there would replace the
     /// user's clipboard with a single character they never chose.
     press: Option<(usize, usize)>,
+    /// The selection came from a double or triple click (a word or a line), so
+    /// releasing on the same cell keeps and copies it.
+    press_selects: bool,
+    /// The button a program is being told is held, while it asked for the mouse.
+    mouse_held: Option<TerminalMouseButton>,
+    /// The cell the last motion report named, so moving inside one cell does not
+    /// report it again.
+    last_report_cell: Option<(usize, usize)>,
+    /// Where the right-click menu is open.
+    menu: Option<gpui::Point<Pixels>>,
     marked: Option<String>,
     last_copy: Option<String>,
     locale: Locale,
@@ -386,6 +410,10 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             dragging: false,
             press: None,
+            press_selects: false,
+            mouse_held: None,
+            last_report_cell: None,
+            menu: None,
             marked: None,
             last_copy: None,
             locale,
@@ -435,6 +463,10 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             dragging: false,
             press: None,
+            press_selects: false,
+            mouse_held: None,
+            last_report_cell: None,
+            menu: None,
             marked: None,
             last_copy: None,
             locale,
@@ -483,6 +515,10 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             dragging: false,
             press: None,
+            press_selects: false,
+            mouse_held: None,
+            last_report_cell: None,
+            menu: None,
             marked: None,
             last_copy: None,
             locale,
@@ -547,6 +583,10 @@ impl TerminalPane {
             focus: cx.focus_handle(),
             dragging: false,
             press: None,
+            press_selects: false,
+            mouse_held: None,
+            last_report_cell: None,
+            menu: None,
             marked: None,
             last_copy: None,
             locale,
@@ -771,6 +811,11 @@ impl TerminalPane {
 
     /// Sends what a key press means, or scrolls for the view-only combinations.
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.is_some() && event.keystroke.key == "escape" {
+            self.menu = None;
+            cx.notify();
+            return;
+        }
         let keystroke = &event.keystroke;
         let modifiers = KeyModifiers {
             shift: keystroke.modifiers.shift,
@@ -885,10 +930,53 @@ impl TerminalPane {
     /// Holding it writes nothing. Confirmation encodes with the mode the program
     /// has set at confirm time, and only into this pane.
     fn paste(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        self.stage_paste(&text, cx);
+        if let Some(text) = item.text().filter(|text| !text.is_empty()) {
+            self.stage_paste(&text, cx);
+            return;
+        }
+        // An image. A program here (an AI command line, an editor) reads the
+        // clipboard itself when it sees Ctrl+V, as in other terminals; a server
+        // cannot, so the window uploads the image and types its path.
+        let image = item.into_entries().find_map(|entry| match entry {
+            gpui::ClipboardEntry::Image(image) => Some(image),
+            _ => None,
+        });
+        let Some(image) = image else {
+            return;
+        };
+        match self.origin {
+            PaneOrigin::Local(_) => self.write(&[0x16], cx),
+            PaneOrigin::Remote { .. } => cx.emit(PaneRequest::PasteImage(image)),
+        }
+    }
+
+    /// Files dropped on the terminal: their paths, quoted, at the prompt here; on
+    /// a server, uploaded first.
+    fn drop_paths(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        window.focus(&self.focus);
+        match self.origin {
+            PaneOrigin::Local(_) => {
+                let mut text = paths
+                    .iter()
+                    .map(|path| quote_local_path(&path.to_string_lossy()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                text.push(' ');
+                self.type_text(&text, cx);
+            }
+            PaneOrigin::Remote { .. } => cx.emit(PaneRequest::UploadFiles(paths.to_vec())),
+        }
     }
 
     /// The presentation the user chose.
@@ -1123,6 +1211,43 @@ impl TerminalPane {
         Some((row, column))
     }
 
+    /// Tells the program about a pointer event, when it asked for the mouse.
+    ///
+    /// Returns whether the event belongs to the program. Holding Shift keeps the
+    /// pointer for the terminal itself, so text can still be selected and copied
+    /// inside a program that took the mouse, as in other terminals.
+    fn report_mouse(
+        &mut self,
+        button: TerminalMouseButton,
+        action: MouseAction,
+        position: gpui::Point<Pixels>,
+        modifiers: &gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mode = self.core.mode();
+        if !mouse_reporting(mode) || modifiers.shift {
+            return false;
+        }
+        let Some((row, column)) = self.cell_at(position) else {
+            return true;
+        };
+        if action == MouseAction::Motion {
+            if self.last_report_cell == Some((row, column)) {
+                return true;
+            }
+            self.last_report_cell = Some((row, column));
+        }
+        let held = MouseModifiers {
+            shift: false,
+            alt: modifiers.alt,
+            control: modifiers.control,
+        };
+        if let Some(bytes) = encode_mouse(button, action, row, column, held, mode) {
+            self.write(&bytes, cx);
+        }
+        true
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -1131,18 +1256,108 @@ impl TerminalPane {
     ) {
         window.focus(&self.focus);
         self.search_focused = false;
+        self.menu = None;
+        if self.report_mouse(
+            TerminalMouseButton::Left,
+            MouseAction::Press,
+            event.position,
+            &event.modifiers,
+            cx,
+        ) {
+            self.mouse_held = Some(TerminalMouseButton::Left);
+            self.last_report_cell = self.cell_at(event.position);
+            return;
+        }
         let Some((row, column)) = self.cell_at(event.position) else {
             return;
         };
+        // A double click selects a word, a triple click the line.
+        let kind = match event.click_count {
+            2 => SelectionType::Semantic,
+            count if count >= 3 => SelectionType::Lines,
+            _ => SelectionType::Simple,
+        };
         self.dragging = true;
         self.press = Some((row, column));
-        self.core
-            .begin_selection(row, column, SelectionType::Simple);
+        self.press_selects = kind != SelectionType::Simple;
+        self.core.begin_selection(row, column, kind);
         cx.notify();
+    }
+
+    /// The middle button pastes, unless the program took the mouse.
+    fn on_middle_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus);
+        if self.report_mouse(
+            TerminalMouseButton::Middle,
+            MouseAction::Press,
+            event.position,
+            &event.modifiers,
+            cx,
+        ) {
+            self.mouse_held = Some(TerminalMouseButton::Middle);
+            return;
+        }
+        self.paste(window, cx);
+    }
+
+    /// The right button opens the terminal's menu, unless the program took the
+    /// mouse.
+    fn on_right_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus);
+        if self.report_mouse(
+            TerminalMouseButton::Right,
+            MouseAction::Press,
+            event.position,
+            &event.modifiers,
+            cx,
+        ) {
+            self.mouse_held = Some(TerminalMouseButton::Right);
+            return;
+        }
+        self.menu = Some(event.position);
+        cx.notify();
+    }
+
+    /// Ends a press the program was told about.
+    fn release_reported(
+        &mut self,
+        button: TerminalMouseButton,
+        event: &MouseUpEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.mouse_held != Some(button) {
+            return false;
+        }
+        self.mouse_held = None;
+        self.last_report_cell = None;
+        // The release is reported even with Shift now held: the program saw the
+        // press and must not be left with a button it thinks is down.
+        let mut modifiers = event.modifiers;
+        modifiers.shift = false;
+        self.report_mouse(button, MouseAction::Release, event.position, &modifiers, cx);
+        true
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if !self.dragging {
+            let button = self.mouse_held.unwrap_or(TerminalMouseButton::None);
+            self.report_mouse(
+                button,
+                MouseAction::Motion,
+                event.position,
+                &event.modifiers,
+                cx,
+            );
             return;
         }
         let Some((row, column)) = self.cell_at(event.position) else {
@@ -1153,6 +1368,9 @@ impl TerminalPane {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.release_reported(TerminalMouseButton::Left, event, cx) {
+            return;
+        }
         if !self.dragging {
             return;
         }
@@ -1166,13 +1384,13 @@ impl TerminalPane {
         // click, and copying it would replace whatever the user had on the
         // clipboard with one character they did not select. A release outside the
         // grid counts as movement, because the pointer really did leave the cell
-        // the button went down on.
+        // the button went down on. A double or triple click did choose something.
         let moved = match (press, released) {
             (Some(press), Some(released)) => press != released,
             (Some(_), None) => true,
             (None, _) => false,
         };
-        if moved {
+        if moved || std::mem::take(&mut self.press_selects) {
             // Copying on release is what makes "select with the mouse, paste" work
             // without a second step; the copy button stays for a repeat.
             self.copy_selection(cx);
@@ -1193,9 +1411,167 @@ impl TerminalPane {
             lines.signum() * 1.0
         } else {
             lines.trunc()
-        };
-        self.core.scroll(lines as i32);
+        } as i32;
+        if lines == 0 {
+            return;
+        }
+        let mode = self.core.mode();
+        // A program that took the mouse gets the wheel as button presses.
+        if mouse_reporting(mode) && !event.modifiers.shift {
+            let button = if lines > 0 {
+                TerminalMouseButton::WheelUp
+            } else {
+                TerminalMouseButton::WheelDown
+            };
+            for _ in 0..lines.unsigned_abs().min(10) {
+                self.report_mouse(
+                    button,
+                    MouseAction::Press,
+                    event.position,
+                    &event.modifiers,
+                    cx,
+                );
+            }
+            return;
+        }
+        // A full-screen program that did not gets it as the arrow keys, so `less`,
+        // `man` and editors scroll; the history only scrolls on the main screen.
+        if self.core.display_offset() == 0
+            && let Some(bytes) = encode_alternate_scroll(lines.clamp(-10, 10), mode)
+        {
+            self.write(&bytes, cx);
+            return;
+        }
+        self.core.scroll(lines);
         cx.notify();
+    }
+
+    /// The right-click menu: copy, paste and find.
+    fn context_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let position = self.menu?;
+        let metrics = Metrics::default();
+        let strings = self.locale.strings();
+        let viewport = window.viewport_size();
+        let can_copy = self.core.has_selection();
+        let can_paste = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .is_some_and(|text| !text.is_empty());
+        let mac = crate::app::nav::Platform::current() == crate::app::nav::Platform::MacOs;
+        let item =
+            |label: &'static str, shortcut: &'static str, enabled: bool, id: &'static str| {
+                let hover = theme::swatch(shell_palette::SURFACE_HOVER);
+                div()
+                    .id(id)
+                    .debug_selector(move || id.to_owned())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(metrics.scale(spacing::LOOSE))
+                    .h(metrics.scale(28.0))
+                    .px(metrics.scale(spacing::TIGHT + 2.0))
+                    .rounded(px(theme::radius::MEDIUM))
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(if enabled {
+                        shell_palette::TEXT_PRIMARY
+                    } else {
+                        shell_palette::TEXT_MUTED
+                    }))
+                    .when(enabled, |item| {
+                        item.cursor_pointer().hover(move |style| style.bg(hover))
+                    })
+                    .child(label)
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                            .child(shortcut),
+                    )
+            };
+        let menu = div()
+            .flex()
+            .flex_col()
+            .min_w(metrics.scale(200.0))
+            .p(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(theme::radius::LARGE))
+            .bg(theme::swatch(shell_palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(shell_palette::BORDER_STRONG))
+            .shadow_lg()
+            .debug_selector(|| "terminal.menu".to_owned())
+            .child(
+                item(
+                    strings.field_copy,
+                    if mac { "\u{2318}C" } else { "Ctrl+Shift+C" },
+                    can_copy,
+                    "terminal.menu.copy",
+                )
+                .when(can_copy, |item| {
+                    item.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.copy_selection(cx);
+                        this.menu = None;
+                        cx.notify();
+                    }))
+                }),
+            )
+            .child(
+                item(
+                    strings.field_paste,
+                    if mac { "\u{2318}V" } else { "Ctrl+Shift+V" },
+                    can_paste,
+                    "terminal.menu.paste",
+                )
+                .when(can_paste, |item| {
+                    item.on_click(cx.listener(|this, _event, window, cx| {
+                        this.menu = None;
+                        this.paste(window, cx);
+                        cx.notify();
+                    }))
+                }),
+            )
+            .child(
+                div()
+                    .h(px(1.0))
+                    .mx(metrics.scale(spacing::HAIRLINE))
+                    .my(metrics.scale(2.0))
+                    .bg(theme::swatch(shell_palette::BORDER)),
+            )
+            .child(
+                item(strings.terminal_search, "", true, "terminal.menu.search").on_click(
+                    cx.listener(|this, _event, _window, cx| {
+                        this.menu = None;
+                        this.toggle_search(cx);
+                    }),
+                ),
+            );
+        Some(
+            gpui::deferred(
+                gpui::anchored().position(gpui::Point::default()).child(
+                    div()
+                        .relative()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .child(
+                            div()
+                                .id("terminal.menu.backdrop")
+                                .absolute()
+                                .inset_0()
+                                .occlude()
+                                .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
+                                    this.menu = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            gpui::anchored()
+                                .position(position)
+                                .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                                .child(div().occlude().child(menu)),
+                        ),
+                ),
+            )
+            .with_priority(3),
+        )
     }
 
     /// The status line under the grid: the program, its state and the view controls.
@@ -1943,12 +2319,73 @@ impl TerminalPane {
                     this.on_mouse_up(event, cx);
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.on_middle_down(event, window, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.release_reported(TerminalMouseButton::Middle, event, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.on_right_down(event, window, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.release_reported(TerminalMouseButton::Right, event, cx);
+                }),
+            )
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.drop_paths(paths.paths(), window, cx);
+                }),
+            )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                 this.on_scroll(event, cx);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx);
             }))
+    }
+}
+
+/// A path as this computer's shell reads it: bare when it is plain, quoted when
+/// it holds spaces or characters the shell would act on.
+fn quote_local_path(path: &str) -> String {
+    if cfg!(target_os = "windows") {
+        if path
+            .chars()
+            .any(|c| c.is_whitespace() || "&()[]{}^=;!'+,`~%$@#".contains(c))
+        {
+            format!("\"{path}\"")
+        } else {
+            path.to_owned()
+        }
+    } else {
+        quote_posix_path(path)
+    }
+}
+
+/// A path as a POSIX shell reads it, in single quotes when it needs them.
+#[must_use]
+pub fn quote_posix_path(path: &str) -> String {
+    let plain = !path.is_empty()
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:,@%=~".contains(c));
+    if plain {
+        path.to_owned()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
     }
 }
 
@@ -2369,7 +2806,12 @@ impl Render for TerminalPane {
         let show_blocks =
             !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks());
         let show_paste = self.pending_paste.is_some();
-        div()
+        // The pane's own chrome - the status line, the find bar, the paste prompt,
+        // the menu - is drawn in the terminal's palette, so a dark terminal in a
+        // light window is dark to its edges. The window's palette comes back after.
+        let window_appearance = theme::appearance();
+        theme::set_appearance(theme::terminal_appearance());
+        let pane = div()
             .flex()
             .flex_col()
             .size_full()
@@ -2396,6 +2838,9 @@ impl Render for TerminalPane {
             .when(show_blocks, |column| {
                 column.child(self.block_overlay(metrics, cx))
             })
+            .children(self.context_menu(window, cx));
+        theme::set_appearance(window_appearance);
+        pane
     }
 }
 
@@ -2580,6 +3025,18 @@ mod ink_tests {
         let dim = ink(rgb(0xe6e9f0), canvas, true);
         assert!(contrast(dim, canvas) < contrast(regular, canvas));
         assert!(contrast(dim, canvas) >= 1.99);
+    }
+
+    #[test]
+    fn paths_are_quoted_only_when_the_shell_would_act_on_them() {
+        use super::quote_posix_path;
+        assert_eq!(quote_posix_path("/home/me/a.txt"), "/home/me/a.txt");
+        assert_eq!(
+            quote_posix_path("/home/me/my file.txt"),
+            "'/home/me/my file.txt'"
+        );
+        assert_eq!(quote_posix_path("it's"), "'it'\\''s'");
+        assert_eq!(quote_posix_path("~/下载/x"), "'~/下载/x'");
     }
 
     #[test]
