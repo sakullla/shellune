@@ -781,6 +781,10 @@ pub struct Strings {
     pub terminal_search_regex: &'static str,
     /// Closes the history search.
     pub terminal_search_close: &'static str,
+    /// The keys the bar answers while it holds the keyboard.
+    pub terminal_search_keys: &'static str,
+    /// Shown while the bar is open but the terminal has the keyboard again.
+    pub terminal_search_keyboard_terminal: &'static str,
     /// Title of the paste confirmation.
     pub terminal_paste_title: &'static str,
     /// Label for the session a paste would be sent to.
@@ -1207,6 +1211,8 @@ pub static ENGLISH: Strings = Strings {
     terminal_search_case: "Match case",
     terminal_search_regex: "Regular expression",
     terminal_search_close: "Close search",
+    terminal_search_keys: "Enter next · Shift+Enter previous · Alt+C case · Alt+R expression · Esc close",
+    terminal_search_keyboard_terminal: "Keys go to the terminal",
     terminal_paste_title: "Confirm paste",
     terminal_paste_target: "Target session",
     terminal_paste_confirm: "Paste into this session",
@@ -1597,6 +1603,8 @@ pub static CHINESE: Strings = Strings {
     terminal_search_case: "区分大小写",
     terminal_search_regex: "正则表达式",
     terminal_search_close: "关闭搜索",
+    terminal_search_keys: "Enter 下一个 · Shift+Enter 上一个 · Alt+C 大小写 · Alt+R 正则 · Esc 关闭",
+    terminal_search_keyboard_terminal: "键盘已回到终端",
     terminal_paste_title: "确认粘贴",
     terminal_paste_target: "目标会话",
     terminal_paste_confirm: "粘贴到这个会话",

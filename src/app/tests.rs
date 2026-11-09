@@ -997,6 +997,8 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_search_case,
             terminal_search_regex,
             terminal_search_close,
+            terminal_search_keys,
+            terminal_search_keyboard_terminal,
             terminal_paste_title,
             terminal_paste_target,
             terminal_paste_confirm,
@@ -2028,10 +2030,17 @@ async fn the_case_and_expression_switches_narrow_the_same_query(cx: &mut TestApp
         },
         "literal text folds case by default"
     );
+    assert!(
+        cx.debug_bounds("terminal.search.keys").is_some(),
+        "the bar names the keys that set the search up while it has the keyboard"
+    );
 
-    click(cx, "terminal.search.case");
+    // Both switches are reachable from the keyboard, which is what lets a search be
+    // set up without a pointer (R1, R4).
+    cx.simulate_keystrokes("alt-c");
+    cx.run_until_parked();
     let exact = search_state_of(&pane, cx);
-    assert!(exact.case_sensitive, "the switch is on: {exact:?}");
+    assert!(exact.case_sensitive, "Alt+C turns the switch on: {exact:?}");
     assert_eq!(
         exact.note,
         SearchNote::Position {
@@ -2040,13 +2049,15 @@ async fn the_case_and_expression_switches_narrow_the_same_query(cx: &mut TestApp
         },
         "only the line spelled the same way matches"
     );
-    click(cx, "terminal.search.case");
+    cx.simulate_keystrokes("alt-c");
+    cx.run_until_parked();
     assert_eq!(
         search_state_of(&pane, cx).note,
         SearchNote::Position {
             position: 1,
             total: 2
-        }
+        },
+        "Alt+C turns it off again"
     );
 
     for _ in 0.."needle".len() {
@@ -2060,9 +2071,13 @@ async fn the_case_and_expression_switches_narrow_the_same_query(cx: &mut TestApp
         "literal text is not read as an expression"
     );
 
-    click(cx, "terminal.search.regex");
+    cx.simulate_keystrokes("alt-r");
+    cx.run_until_parked();
     let expression = search_state_of(&pane, cx);
-    assert!(expression.regex, "the switch is on: {expression:?}");
+    assert!(
+        expression.regex,
+        "Alt+R turns the switch on: {expression:?}"
+    );
     assert_eq!(
         expression.note,
         SearchNote::Position {
@@ -2132,7 +2147,7 @@ async fn an_empty_query_an_empty_result_and_a_broken_expression_stay_apart(
     for _ in 0.."absent".len() {
         cx.simulate_keystrokes("backspace");
     }
-    click(cx, "terminal.search.regex");
+    cx.simulate_keystrokes("alt-r");
     cx.run_until_parked();
     cx.simulate_input("need(le");
     cx.run_until_parked();
@@ -2184,7 +2199,7 @@ async fn the_find_bar_narrows_the_command_blocks_with_the_same_switches(cx: &mut
         "the block list folds case the way the scrollback does"
     );
 
-    click(cx, "terminal.search.case");
+    cx.simulate_keystrokes("alt-c");
     cx.run_until_parked();
     assert_eq!(
         search_state_of(&pane, cx).blocks,
@@ -2193,8 +2208,10 @@ async fn the_find_bar_narrows_the_command_blocks_with_the_same_switches(cx: &mut
         search_state_of(&pane, cx)
     );
 
+    // The buttons still do the same thing for a pointer, and the switches keep their
+    // state between them.
     click(cx, "terminal.search.case");
-    click(cx, "terminal.search.regex");
+    cx.simulate_keystrokes("alt-r");
     cx.run_until_parked();
     assert_eq!(
         search_state_of(&pane, cx).blocks,
@@ -2292,6 +2309,180 @@ async fn a_full_screen_program_hides_the_bar_and_gives_it_back(cx: &mut TestAppC
             total: 1
         },
         "leaving the full-screen program finds the earlier history again"
+    );
+}
+
+#[gpui::test]
+async fn the_two_switches_take_their_keys_only_while_the_bar_holds_them(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("needle", cx);
+    click(cx, "terminal.search");
+    cx.simulate_input("needle");
+    cx.simulate_keystrokes("alt-c");
+    let held = search_state_of(&pane, cx);
+    assert!(
+        held.case_sensitive,
+        "Alt+C is the bar's while it has the keys"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        Vec::<u8>::new(),
+        "a bar key never reaches the shell"
+    );
+
+    cx.simulate_keystrokes("escape");
+    assert!(!search_state_of(&pane, cx).open, "Escape closed the bar");
+
+    // With the bar closed the same combinations belong to the program again: these
+    // are the bytes a shell reads as Alt+C and Alt+R, not a shortcut.
+    cx.simulate_keystrokes("alt-c");
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"\x1bc\x1br".to_vec(),
+        "closing the bar hands Alt+C and Alt+R back to the terminal"
+    );
+    assert!(
+        !search_state_of(&pane, cx).open,
+        "a program key does not reopen the bar"
+    );
+}
+
+#[gpui::test]
+async fn the_bar_says_which_of_the_two_has_the_keys(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("needle\r\nneedle", cx);
+    click(cx, "terminal.search");
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+
+    let held = search_state_of(&pane, cx);
+    assert!(held.focused, "the bar holds the keyboard: {held:?}");
+    assert!(
+        cx.debug_bounds("terminal.search.keyboard.bar").is_some(),
+        "the query field is drawn as the one with the keyboard"
+    );
+    assert!(
+        cx.debug_bounds("terminal.search.keys.terminal").is_none(),
+        "nothing claims the terminal has the keys while the bar does"
+    );
+    assert_eq!(
+        held.note,
+        SearchNote::Position {
+            position: 1,
+            total: 2
+        }
+    );
+
+    // The line naming the keys and the switches themselves stay inside the smallest
+    // window, where the bar has the least room.
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    let small = cx.update(|window, _app| window.viewport_size());
+    assert_fits_inside(
+        bounds_of(cx, "terminal.search.keys"),
+        small,
+        "the find bar's key hint",
+    );
+    assert_fits_inside(
+        bounds_of(cx, "terminal.search.case"),
+        small,
+        "the case switch",
+    );
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    // Clicking the grid hands the keys back to the shell and leaves the bar open: the
+    // reader has to be able to tell the two states apart, so the field turns neutral
+    // and the bar says where the keys go.
+    click(cx, "terminal.viewport");
+    let back = search_state_of(&pane, cx);
+    assert!(!back.focused, "the terminal has the keys again: {back:?}");
+    assert_eq!(back.query, "needle", "the query is still on the bar");
+    assert!(
+        cx.debug_bounds("terminal.search.keyboard.terminal")
+            .is_some(),
+        "the query field is drawn as the one without the keyboard"
+    );
+    assert!(
+        cx.debug_bounds("terminal.search.keys.terminal").is_some(),
+        "the bar says the keys go to the terminal"
+    );
+    assert_eq!(
+        back.note,
+        SearchNote::Position {
+            position: 1,
+            total: 2
+        },
+        "the count keeps showing while the terminal has the keys"
+    );
+    // And the keys are the shell's now, exactly as the line above says: the bar's
+    // switches do not change behind the reader's back.
+    cx.simulate_keystrokes("alt-c");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"\x1bc".to_vec(),
+        "with the terminal holding the keys, Alt+C reaches the program"
+    );
+    assert!(
+        !search_state_of(&pane, cx).case_sensitive,
+        "the case switch did not turn over while the keys were the shell's"
+    );
+}
+
+#[gpui::test]
+async fn a_resize_recounts_the_matches_on_the_new_wrap(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    // The narrow width comes first, so the text is written at the width it is wrapped
+    // at and the match below straddles a break rather than having to find one.
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    let narrow = cx.update(|_window, app| pane.read(app).grid());
+    assert!(narrow.cols > 8, "the narrow grid still has columns");
+    let mut line = "x".repeat(narrow.cols - 3);
+    line.push_str("needle");
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.feed_for_test(line.as_bytes(), cx));
+    });
+    cx.run_until_parked();
+
+    click(cx, "terminal.search");
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Empty,
+        "at this width the word is split by the wrap, so nothing matches: {:?}",
+        search_state_of(&pane, cx)
+    );
+
+    // A wider grid joins the two rows again. The count and the places it steps
+    // through follow the new layout instead of the numbers from before it.
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let wide = cx.update(|_window, app| pane.read(app).grid());
+    assert!(wide.cols > narrow.cols, "the window really got wider");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        },
+        "the match the narrower grid split is counted again: {:?}",
+        search_state_of(&pane, cx)
+    );
+    assert!(
+        cx.debug_bounds("terminal.search.position").is_some(),
+        "the reopened count is drawn"
+    );
+    // Stepping still lands on a line of the new layout, and there is one place, so it
+    // wraps to itself.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        },
+        "stepping through the recounted places works after the resize"
     );
 }
 

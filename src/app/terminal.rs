@@ -21,10 +21,10 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
-    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, UTF16Selection, Window, canvas, div,
-    px,
+    App, Bounds, BoxShadow, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
+    FocusHandle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size,
+    UTF16Selection, Window, canvas, div, point, px,
 };
 use std::ops::Range;
 
@@ -45,7 +45,7 @@ use crate::app::components;
 use crate::app::copy::Locale;
 use crate::app::glyphs;
 use crate::app::icons::Icon;
-use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, spacing};
+use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, spacing};
 
 /// How often the pane looks for output from the shell.
 ///
@@ -941,9 +941,16 @@ impl TerminalPane {
 
         // While the find bar holds the keyboard, the keys that edit and leave it are
         // the bar's: Escape closes it and hands the terminal back, Enter steps to the
-        // next match and Shift+Enter to the previous one, so a search can be run
-        // without a pointer (R1, R4). None of these reaches the shell.
+        // next match and Shift+Enter to the previous one, Alt+C turns the case switch
+        // over and Alt+R the expression switch, so a complete search — including its
+        // two switches — can be run without a pointer (R1, R4). None of these reaches
+        // the shell. They are the bar's only while it holds the keyboard: the terminal
+        // keeps Alt+C and Alt+R whenever the keys are its own.
         if self.search_focused && self.search_open && !self.alternate_screen() {
+            // Alt alone, without Ctrl or ⌘, is a bar key rather than a program
+            // combination. Shift is left to the program so the pairs other programs
+            // read stay intact.
+            let bar_alt = modifiers.alt && !modifiers.control && !modifiers.platform;
             match keystroke.key.as_str() {
                 "escape" if plain => {
                     self.close_search(window, cx);
@@ -964,6 +971,16 @@ impl TerminalPane {
                     self.refresh_search(true);
                     cx.stop_propagation();
                     cx.notify();
+                    return;
+                }
+                "c" if bar_alt && !modifiers.shift => {
+                    self.toggle_case_sensitive(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "r" if bar_alt && !modifiers.shift => {
+                    self.toggle_regex(cx);
+                    cx.stop_propagation();
                     return;
                 }
                 _ => {}
@@ -1366,6 +1383,17 @@ impl TerminalPane {
         self.refresh_search(self.alternate_screen() != was_alternate);
     }
 
+    /// Counts the matches again after the grid was re-wrapped by a resize.
+    ///
+    /// The viewport stays where the reader put it: a resize changes where the lines
+    /// break, not where the person is looking.
+    fn recount_after_layout(&mut self) {
+        if !self.search_open {
+            return;
+        }
+        self.refresh_search(false);
+    }
+
     fn next_search_hit(&mut self, cx: &mut Context<Self>) {
         self.step_search(1, cx);
     }
@@ -1480,6 +1508,10 @@ impl TerminalPane {
         }
         self.grid = grid;
         self.core.resize(grid);
+        // A narrower or wider grid re-wraps the primary screen, so rows the find bar
+        // counted are split or joined: the count and the places it steps through are
+        // counted again, without moving the reader (R1).
+        self.recount_after_layout();
         if let Some(source) = self.source.as_mut()
             && let Err(_reason) = source.resize(grid)
         {
@@ -2479,27 +2511,90 @@ impl TerminalPane {
             ),
         };
 
+        let focused = self.search_focused;
+        let accent = theme::swatch(shell_palette::ACCENT);
         let mut bar = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "terminal.search.bar".to_owned())
+            // The field the keys are going to says so, and says it twice: an accent
+            // border with a soft ring while the bar holds the keyboard, a neutral one
+            // once the terminal has it back, and the hint beside it names where the
+            // keys go in words as well (R4).
             .child(
                 div()
+                    .flex()
+                    .items_center()
                     .flex_1()
                     .min_w(px(80.0))
-                    .truncate()
-                    .debug_selector(|| "terminal.search.query".to_owned())
-                    .font_family(monospace_family())
-                    .text_size(metrics.caption_size())
-                    .text_color(if empty_query {
-                        theme::swatch(shell_palette::TEXT_MUTED)
+                    .rounded(px(radius::SMALL))
+                    .border_1()
+                    .border_color(if focused {
+                        accent
                     } else {
-                        theme::swatch(shell_palette::TEXT_PRIMARY)
+                        theme::swatch(shell_palette::BORDER_STRONG)
                     })
-                    .child(SharedString::from(query)),
+                    .when(focused, |field| {
+                        field.shadow(vec![BoxShadow {
+                            color: theme::faded(accent, 0.22).into(),
+                            offset: point(px(0.0), px(0.0)),
+                            blur_radius: px(0.0),
+                            spread_radius: px(2.0),
+                        }])
+                    })
+                    .px(metrics.scale(spacing::HAIRLINE))
+                    .debug_selector(move || {
+                        if focused {
+                            "terminal.search.keyboard.bar".to_owned()
+                        } else {
+                            "terminal.search.keyboard.terminal".to_owned()
+                        }
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .debug_selector(|| "terminal.search.query".to_owned())
+                            .font_family(monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(if empty_query {
+                                theme::swatch(shell_palette::TEXT_MUTED)
+                            } else {
+                                theme::swatch(shell_palette::TEXT_PRIMARY)
+                            })
+                            .child(SharedString::from(query)),
+                    ),
             );
+        // Which keys do what, or — once the terminal has the keyboard again — the one
+        // thing the reader needs to know before typing: their keys go to the shell.
+        bar = bar.child(
+            div()
+                .flex_none()
+                .debug_selector(move || {
+                    if focused {
+                        "terminal.search.keys".to_owned()
+                    } else {
+                        "terminal.search.keys.terminal".to_owned()
+                    }
+                })
+                .text_size(metrics.caption_size())
+                .text_color(if focused {
+                    theme::swatch(shell_palette::TEXT_MUTED)
+                } else {
+                    theme::swatch(shell_palette::TEXT_SECONDARY)
+                })
+                .child(SharedString::from(
+                    if focused {
+                        strings.terminal_search_keys
+                    } else {
+                        strings.terminal_search_keyboard_terminal
+                    }
+                    .to_owned(),
+                )),
+        );
         if let Some(note) = note {
             bar = bar.child(note);
         }
