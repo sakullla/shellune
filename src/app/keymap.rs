@@ -138,6 +138,8 @@ pub enum DefaultKey {
     Palette,
     /// The platform's close-session shortcut.
     CloseSession,
+    /// The platform's in-terminal search shortcut.
+    Search,
     /// The platform's next and previous tab shortcuts.
     NextTab,
     PreviousTab,
@@ -156,6 +158,7 @@ impl DefaultKey {
             Self::NewShell => vec![platform.new_shell_keystroke().to_owned()],
             Self::Palette => vec![platform.palette_keystroke().to_owned()],
             Self::CloseSession => vec![platform.close_tab_keystroke().to_owned()],
+            Self::Search => vec![platform.search_keystroke().to_owned()],
             Self::NextTab => vec![platform.tab_cycle_keystrokes().0.to_owned()],
             Self::PreviousTab => vec![platform.tab_cycle_keystrokes().1.to_owned()],
             Self::TabJump(number) => vec![format!("{}-{number}", platform.tab_jump_modifier())],
@@ -492,7 +495,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         context: Context::Terminal,
         name_en: "Search this terminal",
         name_zh: "搜索当前终端",
-        defaults: &[DefaultKey::Modifier("shift-f")],
+        defaults: &[DefaultKey::Search],
     },
     ActionSpec {
         id: "terminal.copy",
@@ -767,9 +770,14 @@ impl Keymap {
     }
 
     /// The saved form of the changes made to the defaults, for this platform.
+    ///
+    /// One preferences file serves every platform the shell runs on, and this build
+    /// only writes its own section. The sections it does not own are carried over from
+    /// `saved`, which is what was read: writing a fresh document would erase what a
+    /// macOS or Linux build saved. `None` writes a file that holds this platform only.
     #[must_use]
-    pub fn to_preferences(&self) -> KeymapPreferences {
-        let mut preferences = KeymapPreferences::default();
+    pub fn to_preferences(&self, saved: Option<&KeymapPreferences>) -> KeymapPreferences {
+        let mut preferences = saved.cloned().unwrap_or_default();
         preferences.set_for_platform(self.platform.id(), self.overrides());
         preferences
     }
@@ -1229,7 +1237,7 @@ mod tests {
         assert!(!keymap.is_default("palette.open"));
         assert_eq!(keymap.custom_count(), 1);
 
-        let saved = keymap.to_preferences();
+        let saved = keymap.to_preferences(None);
         let (restored, problem) = Keymap::resolve(Platform::Windows, Some(&saved));
         assert_eq!(problem, None);
         assert_eq!(restored, keymap, "a restart keeps the change");
@@ -1247,7 +1255,7 @@ mod tests {
         keymap
             .set("palette.open", "cmd-alt-p")
             .expect("a free combination");
-        let saved = keymap.to_preferences();
+        let saved = keymap.to_preferences(None);
         let (windows, problem) = Keymap::resolve(Platform::Windows, Some(&saved));
         assert_eq!(problem, None);
         assert_eq!(windows, Keymap::defaults(Platform::Windows));
@@ -1261,7 +1269,7 @@ mod tests {
         assert_eq!(keymap.keystroke("terminal.copy"), None);
         assert_eq!(keymap.label("terminal.copy"), None);
 
-        let saved = keymap.to_preferences();
+        let saved = keymap.to_preferences(None);
         assert_eq!(
             saved.windows.len(),
             1,
@@ -1399,6 +1407,56 @@ mod tests {
         let (keymap, problem) = Keymap::resolve(Platform::Windows, Some(&saved));
         assert_eq!(keymap, Keymap::defaults(Platform::Windows));
         assert!(matches!(problem, Some(Problem::Conflict { .. })));
+    }
+
+    #[test]
+    fn the_search_shortcut_is_the_one_each_platform_writes_it() {
+        // R1 asks for Ctrl+Shift+F on Windows and Linux and Cmd+F on macOS: Ctrl+F
+        // moves the cursor in a shell, and ⌘F is the find key a Mac user knows.
+        for platform in [Platform::Windows, Platform::Linux] {
+            let keymap = Keymap::defaults(platform);
+            assert_eq!(
+                keymap.keystroke("terminal.search"),
+                Some("ctrl-shift-f"),
+                "{platform:?}"
+            );
+            assert_eq!(
+                keymap.label("terminal.search").as_deref(),
+                Some("Ctrl+Shift+F")
+            );
+        }
+        let macos = Keymap::defaults(Platform::MacOs);
+        assert_eq!(macos.keystroke("terminal.search"), Some("cmd-f"));
+        assert_eq!(macos.label("terminal.search").as_deref(), Some("\u{2318}F"));
+    }
+
+    #[test]
+    fn saving_one_platform_keeps_what_another_platform_saved() {
+        let mut saved = KeymapPreferences::default();
+        saved.set_for_platform(
+            "macos",
+            vec![KeymapEntry::new(
+                "terminal.copy",
+                "terminal",
+                Some("cmd-alt-c".to_owned()),
+            )],
+        );
+        let mut keymap = Keymap::defaults(Platform::Windows);
+        keymap
+            .set("palette.open", "ctrl-alt-p")
+            .expect("a free combination");
+        let written = keymap.to_preferences(Some(&saved));
+        assert_eq!(
+            written.for_platform("macos").len(),
+            1,
+            "the macOS section is still in the file"
+        );
+        assert_eq!(written.for_platform("windows").len(), 1);
+        assert_eq!(
+            written.for_platform("windows")[0].action,
+            "palette.open",
+            "this platform's own changes are what it writes"
+        );
     }
 
     #[test]

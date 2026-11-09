@@ -95,6 +95,18 @@ impl Platform {
         }
     }
 
+    /// Keystroke that searches the pane that has the keyboard (R1).
+    ///
+    /// ⌘F is the find shortcut a macOS user already knows and no shell program reads
+    /// it. Ctrl+F moves the cursor forward in a shell, so Windows and Linux take the
+    /// shifted form, as their other terminals do.
+    pub fn search_keystroke(self) -> &'static str {
+        match self {
+            Self::MacOs => "cmd-f",
+            Self::Windows | Self::Linux => "ctrl-shift-f",
+        }
+    }
+
     /// Modifier of the shortcuts that jump straight to tab 1-9.
     ///
     /// The command key already selects a page on macOS, and Ctrl+digit does on

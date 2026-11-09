@@ -174,8 +174,9 @@ impl ShelluneView {
                     .child(
                         components::icon_only_button(Icon::Close, metrics)
                             .flex_none()
-                            .size(metrics.scale(22.0))
+                            .size(metrics.hit_target())
                             .id(("toast.close", id as usize))
+                            .debug_selector(move || format!("toast.close.{index}"))
                             .on_click(cx.listener(move |view, _event, _window, cx| {
                                 view.dismiss_toast(id, cx);
                             })),

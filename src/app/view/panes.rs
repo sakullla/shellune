@@ -867,7 +867,7 @@ impl ShelluneView {
         }
         let pane = self.workspace.layout().active_pane()?;
         let strings = self.strings();
-        let control = self.metrics().compact_control_height();
+        let control = self.metrics().hit_target();
         Some(
             div()
                 .flex()
@@ -910,8 +910,10 @@ impl ShelluneView {
         let metrics = self.metrics();
         let selector = format!("pane.{name}");
         crate::app::components::icon_only_button(icon, metrics)
-            .w(metrics.scale(20.0))
-            .h(metrics.scale(20.0))
+            // The pane header is 28px tall; the button keeps the 24x24 minimum so a
+            // reduced text size cannot shrink the target (R4).
+            .w(metrics.hit_target())
+            .h(metrics.hit_target())
             .id(SharedString::from(format!("pane.{name}.{pane}")))
             .debug_selector(move || selector.clone())
             .tooltip(crate::app::components::tooltip(label))
@@ -1069,8 +1071,8 @@ impl ShelluneView {
         ))))
         .child(
             crate::app::components::icon_only_button(Icon::Close, metrics)
-                .w(metrics.scale(20.0))
-                .h(metrics.scale(20.0))
+                .w(metrics.hit_target())
+                .h(metrics.hit_target())
                 .id(("session.tab.close", index))
                 .debug_selector({
                     let selector = format!("session.tab.close.{index}");

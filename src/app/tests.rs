@@ -39,10 +39,11 @@ use crate::app::layout::Direction;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
-use crate::app::terminal::{PaneState, SourceEvent, TerminalPane};
+use crate::app::terminal::{PaneState, SourceEvent, TerminalPane, TerminalShortcuts};
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
 };
+use crate::app::view::KeyRowControl;
 use crate::app::workspace::{Failure, PrimaryOutcome, Recovery, Section, SectionState, Workspace};
 use crate::app::{DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ShelluneView, key_bindings};
 
@@ -11335,8 +11336,35 @@ async fn icon_controls_keep_a_24_by_24_pointer_target_at_the_smallest_text_size(
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(minimum_window());
-    focus_root(&view, cx);
-    // The smallest text size is the tightest the metrics ever get.
+    smallest_text_size(&view, cx);
+    click(cx, "nav.settings");
+    for selector in [
+        "settings.font.less",
+        "settings.font.more",
+        "palette.open",
+        // The header's split "new shell / pick a shell" control: the chevron is a
+        // target of its own, not a 18px drawing.
+        "shell.menu",
+    ] {
+        assert_pointer_target(cx, selector);
+    }
+
+    // The terminal's own controls follow the same rule.
+    let (_pane, cx) = pane_with("", cx);
+    for selector in [
+        "terminal.mode",
+        "terminal.search",
+        "terminal.copy",
+        "terminal.font.increase",
+        "terminal.font.decrease",
+    ] {
+        assert_pointer_target(cx, selector);
+    }
+}
+
+/// Sets the interface text size to the smallest step, the tightest metrics ever get.
+fn smallest_text_size(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) {
+    focus_root(view, cx);
     for _ in 0..Zoom::ALL.len() {
         if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Compact {
             break;
@@ -11348,29 +11376,115 @@ async fn icon_controls_keep_a_24_by_24_pointer_target_at_the_smallest_text_size(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Compact
     );
-    click(cx, "nav.settings");
-    for selector in ["settings.font.less", "settings.font.more", "palette.open"] {
-        let bounds = bounds_of(cx, selector);
-        assert!(
-            bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
-            "{selector} is a pointer target smaller than 24x24: {bounds:?}"
-        );
+}
+
+fn assert_pointer_target(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = bounds_of(cx, selector);
+    assert!(
+        bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
+        "{selector} is a pointer target smaller than 24x24: {bounds:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_session_bar_and_file_row_controls_are_pointer_targets_too(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    smallest_text_size(&view, cx);
+    // The session bar: closing the session, splitting the pane it shows, and the tab
+    // that holds it.
+    for selector in [
+        "session.close",
+        "session.tab.close.0",
+        "pane.split.right",
+        "pane.split.down",
+    ] {
+        assert_pointer_target(cx, selector);
     }
 
-    // The terminal's own controls follow the same rule.
-    let (_pane, cx) = pane_with("", cx);
+    // The file list: downloading, sending back and the two row actions.
+    let _answers = open_files(cx, &view, id);
     for selector in [
-        "terminal.search",
-        "terminal.copy",
-        "terminal.font.increase",
-        "terminal.font.decrease",
+        "files.download.1",
+        "files.to_local.1",
+        "files.rename.1",
+        "files.delete.1",
     ] {
-        let bounds = bounds_of(cx, selector);
+        assert_pointer_target(cx, selector);
+    }
+
+    // A toast's close button is a target too; copying a path puts one on screen.
+    right_click(cx, "files.row.1");
+    click(cx, "files.menu.copy_path");
+    assert_pointer_target(cx, "toast.close.0");
+}
+
+#[test]
+fn the_terminal_toolbar_and_menu_read_the_bindings_in_force() {
+    let mut keymap = Keymap::defaults(Platform::current());
+    let defaults = TerminalShortcuts::of(&keymap);
+    assert_eq!(
+        defaults.search.as_deref(),
+        Some(
+            crate::app::keymap::keystroke_label(
+                Platform::current().search_keystroke(),
+                Platform::current()
+            )
+            .as_str()
+        ),
+        "the search hint names the platform's own key"
+    );
+    assert!(defaults.copy.is_some() && defaults.paste.is_some());
+
+    keymap.unbind("terminal.copy");
+    keymap
+        .set("terminal.paste", "ctrl-alt-v")
+        .expect("a free combination");
+    let changed = TerminalShortcuts::of(&keymap);
+    assert_eq!(changed.copy, None, "an unbound action names no key");
+    assert_eq!(changed.paste.as_deref(), Some("Ctrl+Alt+V"));
+}
+
+#[gpui::test]
+async fn the_terminal_menu_names_the_shortcuts_in_force(cx: &mut TestAppContext) {
+    let (_pane, cx) = pane_with("", cx);
+    right_click(cx, "terminal.viewport");
+    assert!(
+        cx.debug_bounds("terminal.menu").is_some(),
+        "the right-click menu opens on the grid"
+    );
+    for selector in [
+        "terminal.menu.copy.shortcut",
+        "terminal.menu.paste.shortcut",
+        "terminal.menu.search.shortcut",
+    ] {
         assert!(
-            bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
-            "{selector} is a pointer target smaller than 24x24: {bounds:?}"
+            cx.debug_bounds(selector).is_some(),
+            "{selector} names the binding in force instead of a literal"
         );
     }
+}
+
+#[gpui::test]
+async fn an_unbound_shortcut_is_not_named_in_the_terminal_menu(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    let mut keymap = Keymap::defaults(Platform::current());
+    keymap.unbind("terminal.copy");
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.set_shortcuts(TerminalShortcuts::of(&keymap), cx);
+        });
+    });
+    cx.run_until_parked();
+    right_click(cx, "terminal.viewport");
+    assert!(
+        cx.debug_bounds("terminal.menu.copy.shortcut").is_none(),
+        "a key the window no longer answers is not offered in the menu"
+    );
+    assert!(
+        cx.debug_bounds("terminal.menu.paste.shortcut").is_some(),
+        "the actions still bound keep their hint"
+    );
 }
 
 #[gpui::test]
@@ -11417,6 +11531,74 @@ async fn a_shortcut_can_be_changed_with_the_keyboard_alone(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+async fn a_shortcut_can_be_unbound_and_restored_with_the_keyboard_alone(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    let settings = Keymap::defaults(Platform::current())
+        .keystroke("nav.settings")
+        .expect("the settings shortcut")
+        .to_owned();
+    cx.simulate_keystrokes(&settings);
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Settings);
+
+    // One row, so the arrow keys and Enter are the only inputs this test needs.
+    type_into(cx, "settings.keys.search", "copy");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .keymap()
+            .matching("copy", copy::Locale::English)
+            .len()),
+        1,
+        "the search leaves the copy action as the only row"
+    );
+
+    // ↓ takes the keyboard into the list and onto the row's first control.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).key_row_control(app)),
+        Some(KeyRowControl::Change)
+    );
+
+    // → steps to Unbind, and Enter hands the keys back to the program.
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).key_row_control(app)),
+        Some(KeyRowControl::Unbind)
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).keymap().is_unbound("terminal.copy")),
+        "Enter on Unbind leaves the action without a shortcut"
+    );
+
+    // An unbound row still offers Restore, which Enter runs: the cursor is on the
+    // row's last control, so the same key puts the default back.
+    assert!(
+        cx.debug_bounds("settings.keys.reset.terminal.copy")
+            .is_some(),
+        "an unbound action can be restored without reaching for the pointer"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).key_row_control(app)),
+        Some(KeyRowControl::Reset)
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).keymap().is_default("terminal.copy")),
+        "Enter on Restore puts the default binding back"
+    );
+}
+
+#[gpui::test]
 async fn two_hundred_percent_chinese_settings_shortcuts_stay_inside_the_window(
     cx: &mut TestAppContext,
 ) {
@@ -11457,7 +11639,7 @@ fn a_rebound_action_survives_a_restart_through_the_preferences_file() {
         .set("terminal.search", "ctrl-alt-y")
         .expect("a free combination");
     keymap.unbind("terminal.paste");
-    let saved = keymap.to_preferences();
+    let saved = keymap.to_preferences(None);
     store
         .save(&shellune_storage::Preferences {
             keymap: Some(saved),

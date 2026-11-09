@@ -267,7 +267,8 @@ impl ShelluneView {
             )
             .child(
                 components::icon_only_button(Icon::ChevronDown, metrics)
-                    .w(metrics.scale(18.0))
+                    // Its own width, but never narrower than a pointer target (R4).
+                    .w(metrics.hit_target())
                     .h(size)
                     .rounded_r(px(radius::MEDIUM))
                     .rounded_l(px(0.0))
@@ -943,11 +944,9 @@ impl ShelluneView {
             .id("content.scroll")
             .debug_selector(|| "content".to_owned())
             .track_focus(self.destination_focus(Destination::Settings))
-            .on_key_down(
-                cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
-                    this.settings_page_key(event, cx);
-                }),
-            )
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.settings_page_key(event, window, cx);
+            }))
             .flex()
             .flex_col()
             .flex_1()
@@ -963,10 +962,16 @@ impl ShelluneView {
 
     /// Keys the settings page reads before anything else does.
     ///
-    /// The arrow keys choose a shortcut row and Enter opens it for capture, so a
-    /// binding can be changed with the keyboard alone (R4). Modifier combinations are
-    /// left to the action catalogue.
-    pub(super) fn settings_page_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+    /// The arrow keys choose a shortcut row and then one of its controls, and Enter
+    /// runs the control the cursor is on, so a binding can be changed, unbound or
+    /// restored with the keyboard alone (R4, R5). Modifier combinations are left to
+    /// the action catalogue.
+    pub(super) fn settings_page_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.key_capture.is_some() {
             return;
         }
@@ -977,15 +982,14 @@ impl ShelluneView {
         match event.keystroke.key.as_str() {
             "down" => self.step_key_row(1, cx),
             "up" => self.step_key_row(-1, cx),
-            "enter" => match self.selected_key_row(cx) {
-                Some(spec) => {
-                    let action = spec.id;
-                    self.keys_capture_start(action, cx);
-                }
-                None => return,
-            },
+            "right" => self.step_key_control(1, cx),
+            "left" => self.step_key_control(-1, cx),
+            "enter" => self.run_key_row_control(cx),
             _ => return,
         }
+        // Stepping into the list takes the keyboard off the search field, so the
+        // following ←/→ choose a control instead of moving a caret.
+        window.focus(self.destination_focus(Destination::Settings));
         cx.stop_propagation();
     }
 
@@ -1102,6 +1106,13 @@ impl ShelluneView {
         let action = spec.id;
         let selector = format!("settings.keys.row.{action}");
         let ringed = !self.pointer_input && index == selected;
+        // The controls this row offers, in the order the keyboard steps through them:
+        // an unbound action cannot be unbound again, and one at its default has
+        // nothing to restore (R5).
+        let controls = super::key_row_controls(bound, default);
+        let cursor = self.keys_control.min(controls.len().saturating_sub(1));
+        let focus = theme::swatch(palette::ACCENT);
+        let focus_fill = theme::swatch(palette::SURFACE_SELECTED);
 
         let keys = if bound {
             div()
@@ -1162,51 +1173,38 @@ impl ShelluneView {
                             ))),
                     ),
             )
-            .child(
-                div()
+            .child({
+                let mut group = div()
                     .flex()
                     .items_center()
                     .flex_wrap()
                     .gap(metrics.scale(spacing::TIGHT))
-                    .child(keys)
-                    .child(
-                        components::compact_button(ux.keys_change, Variant::Secondary, metrics)
-                            .id(SharedString::from(format!("settings.keys.change.{action}")))
-                            .debug_selector({
-                                let selector = format!("settings.keys.change.{action}");
-                                move || selector.clone()
-                            })
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.keys_capture_start(action, cx);
-                            })),
-                    )
-                    .when(bound, |row| {
-                        row.child(
-                            components::compact_button(ux.keys_unbind, Variant::Ghost, metrics)
-                                .id(SharedString::from(format!("settings.keys.unbind.{action}")))
-                                .debug_selector({
-                                    let selector = format!("settings.keys.unbind.{action}");
-                                    move || selector.clone()
-                                })
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    this.keys_unbind(action, cx);
-                                })),
-                        )
-                    })
-                    .when(bound && !default, |row| {
-                        row.child(
-                            components::compact_button(ux.keys_reset, Variant::Ghost, metrics)
-                                .id(SharedString::from(format!("settings.keys.reset.{action}")))
-                                .debug_selector({
-                                    let selector = format!("settings.keys.reset.{action}");
-                                    move || selector.clone()
-                                })
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    this.keys_reset(action, cx);
-                                })),
-                        )
-                    }),
-            )
+                    .child(keys);
+                for (position, control) in controls.iter().copied().enumerate() {
+                    let (name, label, variant) = match control {
+                        super::KeyRowControl::Change => {
+                            ("change", ux.keys_change, Variant::Secondary)
+                        }
+                        super::KeyRowControl::Unbind => ("unbind", ux.keys_unbind, Variant::Ghost),
+                        super::KeyRowControl::Reset => ("reset", ux.keys_reset, Variant::Ghost),
+                    };
+                    // The control the keyboard's cursor is on carries the accent ring,
+                    // so the step between Change, Unbind and Restore is visible (R4).
+                    let focused = ringed && position == cursor;
+                    let selector = format!("settings.keys.{name}.{action}");
+                    let button = components::compact_button(label, variant, metrics)
+                        .id(SharedString::from(selector.clone()))
+                        .debug_selector(move || selector.clone())
+                        .when(focused, |button| button.border_color(focus).bg(focus_fill))
+                        .on_click(cx.listener(move |this, _event, _window, cx| match control {
+                            super::KeyRowControl::Change => this.keys_capture_start(action, cx),
+                            super::KeyRowControl::Unbind => this.keys_unbind(action, cx),
+                            super::KeyRowControl::Reset => this.keys_reset(action, cx),
+                        }));
+                    group = group.child(button);
+                }
+                group
+            })
     }
 
     /// The end of the shortcut card: how many actions differ from their defaults, and

@@ -372,14 +372,16 @@ pub struct TerminalPane {
 }
 
 /// What a terminal's copy, paste and search controls answer, written the way a
-/// person reads a shortcut. `None` means the action is unbound, so the tooltip says
-/// nothing rather than naming a key the window would not take.
+/// person reads a shortcut. `None` means the action is unbound, so the tooltip and the
+/// menu say nothing rather than naming a key the window would not take.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalShortcuts {
-    /// The search action, `Ctrl+Shift+F` by default.
+    /// The search action, `Ctrl+Shift+F` or `⌘F` by default.
     pub search: Option<String>,
-    /// The copy action, `Ctrl+Shift+C` by default.
+    /// The copy action, `Ctrl+Shift+C` or `⌘⇧C` by default.
     pub copy: Option<String>,
+    /// The paste action, `Ctrl+Shift+V` or `⌘⇧V` by default.
+    pub paste: Option<String>,
 }
 
 impl TerminalShortcuts {
@@ -389,6 +391,7 @@ impl TerminalShortcuts {
         Self {
             search: keymap.label("terminal.search"),
             copy: keymap.label("terminal.copy"),
+            paste: keymap.label("terminal.paste"),
         }
     }
 
@@ -1498,9 +1501,11 @@ impl TerminalPane {
             .read_from_clipboard()
             .and_then(|item| item.text())
             .is_some_and(|text| !text.is_empty());
-        let mac = crate::app::nav::Platform::current() == crate::app::nav::Platform::MacOs;
+        // The hint names the binding in force, like the tooltips do: a rebound key, or
+        // an unbinding that handed the combination back to the program, is described as
+        // it really is (R5).
         let item =
-            |label: &'static str, shortcut: &'static str, enabled: bool, id: &'static str| {
+            |label: &'static str, shortcut: &Option<String>, enabled: bool, id: &'static str| {
                 let hover = theme::swatch(shell_palette::SURFACE_HOVER);
                 div()
                     .id(id)
@@ -1522,12 +1527,15 @@ impl TerminalPane {
                         item.cursor_pointer().hover(move |style| style.bg(hover))
                     })
                     .child(label)
-                    .child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(shell_palette::TEXT_MUTED))
-                            .child(shortcut),
-                    )
+                    .when_some(shortcut.clone(), |item, shortcut| {
+                        item.child(
+                            div()
+                                .debug_selector(move || format!("{id}.shortcut"))
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                                .child(SharedString::from(shortcut)),
+                        )
+                    })
             };
         let menu = div()
             .flex()
@@ -1543,7 +1551,7 @@ impl TerminalPane {
             .child(
                 item(
                     strings.field_copy,
-                    if mac { "\u{2318}C" } else { "Ctrl+Shift+C" },
+                    &self.shortcuts.copy,
                     can_copy,
                     "terminal.menu.copy",
                 )
@@ -1558,7 +1566,7 @@ impl TerminalPane {
             .child(
                 item(
                     strings.field_paste,
-                    if mac { "\u{2318}V" } else { "Ctrl+Shift+V" },
+                    &self.shortcuts.paste,
                     can_paste,
                     "terminal.menu.paste",
                 )
@@ -1578,12 +1586,16 @@ impl TerminalPane {
                     .bg(theme::swatch(shell_palette::BORDER)),
             )
             .child(
-                item(strings.terminal_search, "", true, "terminal.menu.search").on_click(
-                    cx.listener(|this, _event, _window, cx| {
-                        this.menu = None;
-                        this.toggle_search(cx);
-                    }),
-                ),
+                item(
+                    strings.terminal_search,
+                    &self.shortcuts.search,
+                    true,
+                    "terminal.menu.search",
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.menu = None;
+                    this.toggle_search(cx);
+                })),
             );
         Some(
             gpui::deferred(
@@ -1962,8 +1974,10 @@ impl TerminalPane {
             strings.terminal_mode_classic
         };
         components::icon_only_button(Icon::Layers, metrics)
-            .h(metrics.scale(22.0))
-            .w(metrics.scale(24.0))
+            // The bar is 36px tall; the button keeps the pointer-target minimum rather
+            // than a smaller drawing at a reduced text size (R4).
+            .h(metrics.hit_target())
+            .w(metrics.hit_target())
             .when(integrated, |button| {
                 button.bg(theme::swatch(shell_palette::ACCENT_TINT))
             })

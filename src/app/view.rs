@@ -457,9 +457,13 @@ pub struct ShelluneView {
     keys_search: Entity<TextField>,
     /// The shortcut row the keyboard is on, which Enter opens for capture.
     ///
-    /// The page is navigable with the arrow keys so a binding can be changed without
-    /// a pointer (R4); the row the keyboard is on is the one the ring is drawn on.
+    /// The page is navigable with the arrow keys so a binding can be changed, unbound
+    /// or restored without a pointer (R4, R5); the row the keyboard is on is the one
+    /// the ring is drawn on.
     keys_selected: usize,
+    /// Which of that row's controls the keyboard is on: they are the same three the
+    /// pointer sees, in the order [`key_row_controls`] gives them.
+    keys_control: usize,
     /// Whether the window already tells this view when the system palette changes.
     watching_appearance: bool,
     /// Whether the host dialog's first field takes the keyboard on the next draw.
@@ -488,6 +492,33 @@ struct QuickSaveNotice {
 struct KeyCapture {
     action: &'static str,
     problem: Option<Problem>,
+}
+
+/// One control of a shortcut row.
+///
+/// The row offers the same three controls to the pointer and to the keyboard, and
+/// which ones exist depends on the action: an unbound action cannot be unbound again,
+/// and an action at its default has nothing to restore (R5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyRowControl {
+    /// Open the capture layer and take the next combination.
+    Change,
+    /// Hand the keys back to whatever has the keyboard.
+    Unbind,
+    /// Put the action back on its default bindings.
+    Reset,
+}
+
+/// The controls a shortcut row offers, in the order they are drawn and stepped.
+pub(crate) fn key_row_controls(bound: bool, default: bool) -> Vec<KeyRowControl> {
+    let mut controls = vec![KeyRowControl::Change];
+    if bound {
+        controls.push(KeyRowControl::Unbind);
+    }
+    if !default {
+        controls.push(KeyRowControl::Reset);
+    }
+    controls
 }
 
 /// The three credential fields of the remote form.
@@ -713,6 +744,7 @@ impl ShelluneView {
             keymap_save_error: None,
             keys_search,
             keys_selected: 0,
+            keys_control: 0,
             watching_appearance: false,
             layout_persist: false,
             layout_error: None,
@@ -849,8 +881,13 @@ impl ShelluneView {
             keymap: {
                 // An untouched key map stays out of the file: the catalogue's defaults
                 // are the truth, and writing them down would freeze this build's
-                // choices into the user's data.
-                let keymap = self.keymap.to_preferences();
+                // choices into the user's data. Another platform's bindings are kept:
+                // this build only writes its own section of the shared file.
+                let saved = self
+                    .saved_preferences
+                    .as_ref()
+                    .and_then(|saved| saved.keymap.as_ref());
+                let keymap = self.keymap.to_preferences(saved);
                 (!keymap.is_empty()).then_some(keymap)
             },
         }
@@ -1055,7 +1092,65 @@ impl ShelluneView {
         let query = self.keys_search.read(cx).text().to_owned();
         let count = self.keymap.matching(&query, self.workspace.locale()).len();
         self.keys_selected = crate::app::palette::step(self.keys_selected, delta, count);
+        // The row that is now under the ring may offer fewer controls than the one
+        // before it; the cursor stays on the last one it has.
+        let controls = self.selected_key_row_controls(cx).len();
+        self.keys_control = self.keys_control.min(controls.saturating_sub(1));
         cx.notify();
+    }
+
+    /// The controls the row under the keyboard offers, in the order the pointer shows
+    /// them: the same list the row is drawn from.
+    fn selected_key_row_controls(&self, cx: &gpui::App) -> Vec<KeyRowControl> {
+        let Some(spec) = self.selected_key_row(cx) else {
+            return Vec::new();
+        };
+        let bound = !self.keymap.is_unbound(spec.id);
+        let default = self.keymap.is_default(spec.id);
+        key_row_controls(bound, default)
+    }
+
+    /// Which control of the row under the keyboard has the keyboard's cursor.
+    #[cfg(test)]
+    #[must_use]
+    pub fn key_row_control(&self, cx: &gpui::App) -> Option<KeyRowControl> {
+        let controls = self.selected_key_row_controls(cx);
+        controls
+            .get(self.keys_control.min(controls.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// Moves the keyboard's cursor along the controls of the row it is on.
+    fn step_key_control(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.selected_key_row_controls(cx).len();
+        if count == 0 {
+            return;
+        }
+        let current = self.keys_control.min(count - 1);
+        self.keys_control = crate::app::palette::step(current, delta, count);
+        cx.notify();
+    }
+
+    /// Runs the control the keyboard's cursor is on: change, unbind or restore.
+    ///
+    /// This is the keyboard path through the settings page (R4, R5): the arrow keys
+    /// choose a row and then one of its controls, and Enter does what a click on that
+    /// control does.
+    fn run_key_row_control(&mut self, cx: &mut Context<Self>) {
+        let Some(spec) = self.selected_key_row(cx) else {
+            return;
+        };
+        let controls = self.selected_key_row_controls(cx);
+        let control = controls
+            .get(self.keys_control.min(controls.len().saturating_sub(1)))
+            .copied();
+        let action = spec.id;
+        match control {
+            Some(KeyRowControl::Change) => self.keys_capture_start(action, cx),
+            Some(KeyRowControl::Unbind) => self.keys_unbind(action, cx),
+            Some(KeyRowControl::Reset) => self.keys_reset(action, cx),
+            None => (),
+        }
     }
 
     /// Ends every session when the window that shows them closes (R7).
@@ -9074,7 +9169,7 @@ impl ShelluneView {
     ) -> Stateful<Div> {
         let metrics = self.metrics();
         self.row_icon_button(id, icon, label, danger, cx, click)
-            .size(metrics.scale(22.0))
+            .size(metrics.hit_target())
     }
 
     /// own channel here.
