@@ -159,7 +159,6 @@ mod win32 {
     #[cfg(target_os = "windows")]
     mod imp {
         use gpui::Window;
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         use windows_sys::Win32::Foundation::{HWND, POINT};
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -167,7 +166,16 @@ mod win32 {
             SC_RESTORE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
         };
 
+        /// None in tests: gpui's test windows have no system window, and asking one
+        /// for its handle panics.
+        #[cfg(test)]
+        fn hwnd(_window: &Window) -> Option<HWND> {
+            None
+        }
+
+        #[cfg(not(test))]
         fn hwnd(window: &Window) -> Option<HWND> {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             // The trait's handle, not gpui's own `Window::window_handle`.
             match HasWindowHandle::window_handle(window).ok()?.as_raw() {
                 RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
