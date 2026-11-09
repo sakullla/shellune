@@ -273,6 +273,10 @@ impl ShelluneView {
             && self.pane_for(id).is_some()
         {
             self.showing_connection_form = false;
+            // Moving the keyboard to a pane is looking at that pane's tab, so whatever
+            // the tab was marked for has been seen — also when the tab was already on
+            // screen and only the focused pane changed (R7).
+            self.clear_viewed_attention(cx);
             let handle = self.pane_for(id).unwrap().read(cx).focus_handle().clone();
             window.focus(&handle);
             cx.notify();
@@ -285,6 +289,7 @@ impl ShelluneView {
             return;
         }
         self.showing_connection_form = false;
+        self.clear_viewed_attention(cx);
         let handle = self.destination_focus(self.workspace.destination()).clone();
         window.focus(&handle);
         cx.notify();

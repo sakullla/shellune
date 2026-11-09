@@ -4989,6 +4989,10 @@ impl ShelluneView {
     /// raised, so the terminal the user is typing into is not interrupted. The mark
     /// says which of the two happened; it carries no output, command line or credential
     /// text, because the terminal only keeps those two flags.
+    ///
+    /// "On screen" is the tab, not the focused pane: a split tab shows every one of its
+    /// panes at once, so a bell in the pane next to the one being typed into is news
+    /// the user is already looking at.
     fn collect_attention(
         &mut self,
         id: SessionId,
@@ -4999,8 +5003,9 @@ impl ShelluneView {
             return;
         }
         if self.is_viewing_session(id) {
-            // The user is looking at that terminal, so there is nothing to remind them
-            // of; a mark left over from a moment ago would claim news they have seen.
+            // The user is looking at that tab, so there is nothing to remind them of; a
+            // mark left over from a moment ago would claim news they have seen. The whole
+            // tab is cleared, not one kind: a split tab is looked at all at once.
             if self.workspace.clear_session_attention(id) {
                 cx.notify();
             }
@@ -5020,11 +5025,21 @@ impl ShelluneView {
         }
     }
 
-    /// Whether one session's terminal is the one on screen.
+    /// Whether one session's terminal is on screen.
+    ///
+    /// This asks about the tab, not about the one focused pane: a tab that is split
+    /// shows all of its panes at once, so every session the layout says is on screen is
+    /// being watched. The focused pane only decides where typed input goes (R7).
     fn is_viewing_session(&self, id: SessionId) -> bool {
-        self.active == Some(id)
-            && self.workspace.tab_of_session(id) == self.workspace.layout().active_tab_id()
-            && self.session_terminal
+        self.terminal_on_screen() && self.workspace.layout().sessions_on_screen().contains(&id)
+    }
+
+    /// Whether the terminals of the tab on screen are the ones being drawn.
+    ///
+    /// A page other than the workspace hides them, and so does a connection form while
+    /// it is the surface the user is filling in.
+    fn terminal_on_screen(&self) -> bool {
+        self.session_terminal
             && !self.showing_connection_form
             && self.shows_terminal(self.workspace.destination())
     }
@@ -5033,12 +5048,17 @@ impl ShelluneView {
     ///
     /// Looking at a tab is what clears its bell and command-end marks; a disconnect is
     /// not one of these marks, so it keeps showing its state and reason until the
-    /// session reconnects, closes or the user confirms it.
+    /// session reconnects, closes or the user confirms it. The tab is read from the
+    /// layout rather than from the focused session, so a split tab is cleared as a whole
+    /// as soon as it is on screen.
     fn clear_viewed_attention(&mut self, cx: &mut Context<Self>) {
-        let cleared = self
-            .active
-            .is_some_and(|id| self.workspace.clear_session_attention(id));
-        if cleared {
+        if !self.terminal_on_screen() {
+            return;
+        }
+        let Some(tab) = self.workspace.layout().active_tab_id() else {
+            return;
+        };
+        if self.workspace.clear_attention(tab) {
             cx.notify();
         }
     }

@@ -13889,3 +13889,181 @@ async fn a_mark_is_still_drawn_when_motion_is_reduced(cx: &mut TestAppContext) {
     );
     assert!(unread_of(cx, &view, background).bell);
 }
+
+/// One shell, split sideways, so one tab holds two panes at once (R4, R7).
+///
+/// Returns the sessions of the two panes in tree order and the one that receives input,
+/// or `None` when the machine has no shell to start.
+fn split_tab(
+    cx: &mut TestAppContext,
+) -> Option<(
+    Entity<ShelluneView>,
+    &mut VisualTestContext,
+    SessionId,
+    SessionId,
+)> {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return None;
+    }
+    click(cx, "header.primary");
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.split_active_for_test(SplitAxis::LeftRight, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let sessions: Vec<SessionId> = cx
+        .update(|_window, app| view.read(app).active_leaf_sessions_for_test())
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(sessions.len(), 2, "the tab holds two started panes");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs().len()),
+        1,
+        "the split is still one tab"
+    );
+    let (left, right) = (sessions[0], sessions[1]);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(right),
+        "the newest pane is the one that receives input"
+    );
+    Some((view, cx, left, right))
+}
+
+#[gpui::test]
+async fn a_bell_or_a_reported_end_in_a_split_pane_on_screen_marks_nothing(cx: &mut TestAppContext) {
+    let Some((view, cx, unfocused, focused)) = split_tab(cx) else {
+        return;
+    };
+
+    // The unfocused pane is on screen beside the one being typed into, so its bell is
+    // news the user is already looking at: it marks nothing, on this tab or any other.
+    feed_session(cx, &view, unfocused, b"\x07");
+    assert!(
+        unread_of(cx, &view, unfocused).is_empty(),
+        "a bell in the visible pane of the tab on screen is not a background notice"
+    );
+    assert!(unread_of(cx, &view, focused).is_empty());
+    assert!(
+        cx.debug_bounds("session.tab.mark.bell.0").is_none(),
+        "the tab on screen carries no bell mark"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(focused),
+        "the bell moved no focus"
+    );
+
+    // The same holds for a command end the shell itself reported there.
+    feed_session(cx, &view, unfocused, REPORTED_COMMAND);
+    assert!(
+        unread_of(cx, &view, unfocused).is_empty(),
+        "a reported end in the visible pane marks nothing either"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.mark.finished.0").is_none(),
+        "the tab on screen carries no command-end mark"
+    );
+    // The block is still recorded: the reminder is what is absent, not the record.
+    let blocks = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(unfocused)
+            .map(|pane| pane.read(app).command_block_count_for_test())
+    });
+    assert_eq!(blocks, Some(1), "the shell's command block is still kept");
+
+    // A bell in the pane that has the keyboard is not a reminder at all.
+    feed_session(cx, &view, focused, b"\x07");
+    feed_session(cx, &view, focused, REPORTED_COMMAND);
+    assert!(
+        unread_of(cx, &view, focused).is_empty(),
+        "the pane being typed into never marks its own tab"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.mark.bell.0").is_none()
+            && cx.debug_bounds("session.tab.mark.finished.0").is_none(),
+        "a split tab on screen stays unmarked"
+    );
+}
+
+#[gpui::test]
+async fn a_marked_split_tab_is_cleared_when_it_is_looked_at(cx: &mut TestAppContext) {
+    let Some((view, cx, unfocused, focused)) = split_tab(cx) else {
+        return;
+    };
+    // A second tab takes the screen, so the first one is now in the background.
+    click(cx, "header.primary");
+    let other = cx
+        .update(|_window, app| view.read(app).active_session())
+        .filter(|id| *id != unfocused && *id != focused)
+        .expect("the new shell is the tab on screen");
+
+    // Both panes of the background tab are in that background tab, so each kind of news
+    // from either of them marks that tab and only that tab (R7).
+    feed_session(cx, &view, unfocused, b"\x07");
+    feed_session(cx, &view, focused, REPORTED_COMMAND);
+    assert!(
+        unread_of(cx, &view, unfocused).bell,
+        "the bell marks the tab it happened in"
+    );
+    assert!(
+        unread_of(cx, &view, focused).finished,
+        "and the reported end marks the same tab, whichever pane it came from"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(other),
+        "a background mark takes no focus and switches no tab"
+    );
+    assert!(
+        unread_of(cx, &view, other).is_empty(),
+        "the tab on screen is not marked for another tab's news"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.mark.bell.0").is_some()
+            && cx.debug_bounds("session.tab.mark.finished.0").is_some(),
+        "the strip says what the background tab is carrying"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.mark.bell.1").is_none(),
+        "the tab on screen stays unmarked"
+    );
+
+    // Looking at the marked tab clears both marks, and the pane with the keyboard in it
+    // is the one the layout calls active, whether or not it was the pane that rang.
+    click(cx, "session.tab.0");
+    assert!(
+        unread_of(cx, &view, unfocused).is_empty() && unread_of(cx, &view, focused).is_empty(),
+        "viewing the tab cleared what it was carrying"
+    );
+
+    // Moving focus to the other pane of the same tab keeps it clear: the tab is being
+    // looked at as a whole, and switching panes inside it is not new news.
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.focus_direction_for_test(Direction::Left, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(unfocused),
+        "the keyboard moved to the other pane"
+    );
+    assert!(
+        unread_of(cx, &view, unfocused).is_empty() && unread_of(cx, &view, focused).is_empty(),
+        "a focus change inside the tab leaves no mark behind"
+    );
+    feed_session(cx, &view, focused, b"\x07");
+    feed_session(cx, &view, focused, REPORTED_COMMAND);
+    assert!(
+        unread_of(cx, &view, focused).is_empty(),
+        "the panes beside the focused one are seen, so they still mark nothing"
+    );
+}

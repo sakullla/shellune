@@ -386,6 +386,25 @@ impl SessionLayout {
         tab.active.filter(|id| contains(&tab.root, *id))
     }
 
+    /// The sessions whose terminals the tab on screen is showing, in tree order.
+    ///
+    /// A tab is drawn as one thing: every started leaf it holds is on screen together,
+    /// so this is the set of terminals being watched — not only the pane that has the
+    /// keyboard. [`Self::active_session`] is the single pane that receives input and is
+    /// the wrong question to ask about whether news has been seen (R7): in a split tab
+    /// the user looks at both panes while typing into one.
+    ///
+    /// Zooming one pane draws it alone, but its neighbours are still part of the same
+    /// tab and of the same look, so they stay in this set: a background mark belongs to
+    /// a tab that is *not* on screen, and a mark on the tab the user is already in would
+    /// point at no other tab and be cleared by no later look.
+    #[must_use]
+    pub fn sessions_on_screen(&self) -> Vec<SessionId> {
+        self.active_tab()
+            .map(|tab| sessions_of(&tab.root))
+            .unwrap_or_default()
+    }
+
     /// The presentation stored for the leaf that shows `session`.
     #[must_use]
     pub fn session_mode(&self, session: SessionId) -> TerminalMode {
