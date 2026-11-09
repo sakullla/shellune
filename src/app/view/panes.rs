@@ -523,10 +523,15 @@ impl ShelluneView {
         } else {
             Direction::Up
         };
-        let selector = format!("pane.divider.{id}");
+        // The band keeps its 12 thickness: it is a continuous drag strip, not a
+        // button, and a wider strip would take the space of the panes on both sides.
+        // The two nudge buttons it carries are pointer targets in their own right and
+        // are drawn over the neighbouring pane's edge instead (R4).
         div()
             .id(SharedString::from(format!("pane.divider.{id}")))
-            .debug_selector(move || selector.clone())
+            // The id is per split; the debug name stays one string so a test can
+            // measure the band without knowing which split it belongs to.
+            .debug_selector(|| "pane.divider".to_owned())
             .flex()
             .flex_none()
             .items_center()
@@ -574,9 +579,12 @@ impl ShelluneView {
             Direction::Up => Icon::ChevronUp,
             Direction::Down => Icon::ChevronDown,
         };
+        // The whole band stays 12 thick, so this target is wider than the band it sits
+        // in and is drawn over the neighbouring pane's edge instead of being shrunk:
+        // the size comes from `icon_only_button` (`Metrics::hit_target()`), never from a
+        // local override, because 24×24 is what the pointer can hit (R4). The band left
+        // above and below the two buttons stays draggable.
         crate::app::components::icon_only_button(icon, metrics)
-            .w(metrics.scale(12.0))
-            .h(metrics.scale(12.0))
             .id(SharedString::from(format!("pane.resize.{split}.{name}")))
             .debug_selector(move || selector.clone())
             .tooltip(crate::app::components::tooltip(label))

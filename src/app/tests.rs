@@ -11386,6 +11386,42 @@ fn assert_pointer_target(cx: &mut VisualTestContext, selector: &'static str) {
     );
 }
 
+/// One file row's four actions, measured against the row they belong to.
+///
+/// Each is a 24×24 target of its own, they sit right of the entry column (which carries
+/// the size) in the order they are drawn, and the last one stays inside the row: a
+/// column that is too narrow would push them over the entry, and a target covers its
+/// neighbour as soon as it is enlarged without room (R4).
+fn assert_file_actions_keep_their_column(cx: &mut VisualTestContext) {
+    let row = bounds_of(cx, "files.row.1");
+    let entry = bounds_of(cx, "files.entry.1");
+    let mut previous: Option<gpui::Bounds<Pixels>> = None;
+    for selector in [
+        "files.download.1",
+        "files.to_local.1",
+        "files.rename.1",
+        "files.delete.1",
+    ] {
+        assert_pointer_target(cx, selector);
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.origin.x >= entry.origin.x + entry.size.width - px(0.5),
+            "{selector} starts over the entry column: {bounds:?} vs {entry:?}"
+        );
+        assert!(
+            bounds.origin.x + bounds.size.width <= row.origin.x + row.size.width + px(0.5),
+            "{selector} leaves the row it belongs to: {bounds:?} in {row:?}"
+        );
+        if let Some(previous) = previous {
+            assert!(
+                bounds.origin.x >= previous.origin.x + previous.size.width - px(0.5),
+                "{selector} overlaps the button before it: {bounds:?} after {previous:?}"
+            );
+        }
+        previous = Some(bounds);
+    }
+}
+
 #[gpui::test]
 async fn the_session_bar_and_file_row_controls_are_pointer_targets_too(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
@@ -11402,21 +11438,161 @@ async fn the_session_bar_and_file_row_controls_are_pointer_targets_too(cx: &mut 
         assert_pointer_target(cx, selector);
     }
 
-    // The file list: downloading, sending back and the two row actions.
+    // The file list: downloading, sending back and the two row actions, in a column
+    // that is as wide as the four of them need.
     let _answers = open_files(cx, &view, id);
-    for selector in [
-        "files.download.1",
-        "files.to_local.1",
-        "files.rename.1",
-        "files.delete.1",
-    ] {
-        assert_pointer_target(cx, selector);
-    }
+    assert_file_actions_keep_their_column(cx);
 
     // A toast's close button is a target too; copying a path puts one on screen.
     right_click(cx, "files.row.1");
     click(cx, "files.menu.copy_path");
     assert_pointer_target(cx, "toast.close.0");
+
+    // The largest text doubles the buttons, so the column has to follow them there
+    // too: this is where a fixed width would have left the entry covered.
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest,
+        "the file row is measured at 200% text"
+    );
+    assert_file_actions_keep_their_column(cx);
+
+    // And at the smallest window with that text, where the row has the least room to
+    // give: the four targets still fit inside it.
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    assert_file_actions_keep_their_column(cx);
+}
+
+#[gpui::test]
+async fn the_split_nudge_buttons_are_targets_larger_than_the_band_they_sit_in(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    live_remote(cx, &view);
+    smallest_text_size(&view, cx);
+    click(cx, "pane.split.right");
+    assert_nudges_of_one_split(cx, &view);
+}
+
+#[gpui::test]
+async fn the_stacked_split_nudges_are_targets_too(cx: &mut TestAppContext) {
+    // The same two buttons on a divider that runs the other way: here they take the
+    // band's height instead of its width.
+    let (view, cx) = remote_view(cx);
+    live_remote(cx, &view);
+    smallest_text_size(&view, cx);
+    click(cx, "pane.split.down");
+    assert_nudges_of_one_split(cx, &view);
+}
+
+/// Checks the divider of the one split on screen, whichever way it runs.
+///
+/// The band keeps its 12 thickness; the nudge buttons it carries are pointer targets in
+/// their own right and are drawn over the neighbouring pane's edge instead of being
+/// squeezed to the band (R4).
+fn assert_nudges_of_one_split(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) {
+    let band = bounds_of(cx, "pane.divider");
+    let across = band.size.height > band.size.width;
+    let normal = if across {
+        band.size.width
+    } else {
+        band.size.height
+    };
+    assert!(
+        normal < px(24.0),
+        "the divider is still a thin drag strip: {band:?}"
+    );
+    let less = bounds_of(cx, "pane.resize.less");
+    let more = bounds_of(cx, "pane.resize.more");
+    for (selector, bounds) in [("pane.resize.less", less), ("pane.resize.more", more)] {
+        assert!(
+            bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
+            "{selector} is a pointer target smaller than 24x24: {bounds:?}"
+        );
+        let along_normal = if across {
+            bounds.size.width
+        } else {
+            bounds.size.height
+        };
+        assert!(
+            along_normal > normal,
+            "{selector} was squeezed into the {band:?} band instead of keeping its own size"
+        );
+        // It overhangs the band the same amount on both sides, so it covers neither
+        // neighbour more than the other.
+        let under = if across {
+            bounds.center().x - band.center().x
+        } else {
+            bounds.center().y - band.center().y
+        };
+        assert!(
+            under.abs() <= px(1.0),
+            "{selector} overhangs the band on one side only: {bounds:?} in {band:?}"
+        );
+    }
+    // The buttons sit in the middle of the band, side by side, so their hit areas do
+    // not overlap and each stays inside the window.
+    let (less_end, more_start) = if across {
+        (less.origin.y + less.size.height, more.origin.y)
+    } else {
+        (less.origin.x + less.size.width, more.origin.x)
+    };
+    assert!(
+        more_start >= less_end - px(0.5),
+        "the two nudge targets overlap: {less:?} and {more:?}"
+    );
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert_fits_inside(less, viewport, "pane.resize.less");
+    assert_fits_inside(more, viewport, "pane.resize.more");
+
+    // Both buttons still nudge the split.
+    let start = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    click(cx, "pane.resize.more");
+    let grown = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    assert!(
+        grown[0].1 > start[0].1,
+        "the nudge button moved the divider: {start:?} then {grown:?}"
+    );
+    click(cx, "pane.resize.less");
+    let back = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    assert_eq!(
+        back[0], start[0],
+        "the other button nudges the other way: {grown:?} then {back:?}"
+    );
+
+    // The band left outside the buttons is still a drag strip: the buttons cover the
+    // middle of the band, not all of it.
+    let grab = if across {
+        point(more.center().x, less.origin.y - px(10.0))
+    } else {
+        point(less.origin.x - px(10.0), more.center().y)
+    };
+    cx.simulate_mouse_move(grab, None, Modifiers::default());
+    cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let released = if across {
+        point(grab.x + px(80.0), grab.y)
+    } else {
+        point(grab.x, grab.y + px(80.0))
+    };
+    cx.simulate_mouse_move(released, Some(MouseButton::Left), Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_mouse_up(released, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let dragged = cx.update(|_window, app| view.read(app).layout_ratios_for_test());
+    assert!(
+        dragged[0].1 > back[0].1,
+        "a press on the band outside the buttons still drags the divider: {back:?} then {dragged:?}"
+    );
 }
 
 #[test]

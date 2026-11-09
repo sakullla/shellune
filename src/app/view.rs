@@ -152,6 +152,25 @@ impl Render for FileDragLabel {
     }
 }
 
+/// Width of a file row's action column: one square per action that source offers,
+/// plus the gaps between them.
+///
+/// The column used to be a fixed 96 wide, which no longer holds four 24×24 targets:
+/// the row's buttons would spill out of it and cover the size next to them (R4). The
+/// header uses the same width, so the size column lines up down the list.
+fn files_actions_width(metrics: Metrics, source: FileSource) -> gpui::Pixels {
+    // A remote file shows download, send back, rename and delete; a local file shows
+    // send, rename and delete. A folder shows only the last two, and keeps the slots
+    // of the wider rows so the columns stay in one place.
+    let slots = match source {
+        FileSource::Remote => 4.0,
+        FileSource::Local => 3.0,
+    };
+    let slot = f32::from(metrics.hit_target());
+    let gap = f32::from(metrics.scale(1.0));
+    px(slot * slots + gap * (slots - 1.0))
+}
+
 /// A debug id for one file source. The remote column keeps the ids the file view
 /// already used; the local column is a different object and does not reuse them.
 fn files_element_id(source: FileSource, suffix: &str) -> SharedString {
@@ -8155,7 +8174,7 @@ impl ShelluneView {
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(div().flex_1().child(ux.files_name))
                             .child(div().w(metrics.scale(80.0)).child(ux.files_size))
-                            .child(div().w(metrics.scale(96.0))),
+                            .child(div().w(files_actions_width(metrics, source))),
                     );
                 if path.as_deref().is_some_and(|path| path != "/") {
                     list = list.child(self.files_parent_row(id, source, cx));
@@ -9055,7 +9074,7 @@ impl ShelluneView {
             .flex_none()
             .items_center()
             .justify_end()
-            .w(metrics.scale(96.0))
+            .w(files_actions_width(metrics, source))
             .gap(metrics.scale(1.0));
         // Only a file has content to copy; a folder button would promise a transfer
         // the connection cannot do. Dragging a file does the same.
