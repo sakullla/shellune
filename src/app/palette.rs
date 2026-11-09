@@ -35,8 +35,12 @@ pub enum Command {
     CloseTab(SessionId),
     /// Gives the tab of an open session a name of its own.
     RenameTab(SessionId),
+    /// Drops the name of an open session's tab and shows its automatic title again.
+    RestoreTabTitle(SessionId),
     /// Steps the distinguishing colour of an open session's tab.
     CycleTabAccent(SessionId),
+    /// Clears the distinguishing colour of an open session's tab.
+    ClearTabAccent(SessionId),
     /// Switches the interface language.
     ToggleLanguage,
     /// Steps the interface text size.

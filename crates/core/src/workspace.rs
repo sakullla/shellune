@@ -18,9 +18,25 @@ pub const WORKSPACE_FORMAT_VERSION: u32 = 1;
 
 /// The longest name a user can give one tab, in characters.
 ///
-/// The limit keeps a tab strip readable and the snapshot bounded; a longer name is
-/// cut here rather than refused, so a name the user typed is never lost silently.
+/// The limit keeps a tab strip readable and the snapshot bounded. A longer name is
+/// cut here rather than refused, so the name is still applied; the cut is not silent,
+/// because the dialog that sets the name says so before saving and again when it
+/// saved a shortened name.
 pub const MAX_TAB_NAME_CHARS: usize = 64;
+
+/// The name a tab stores for what was typed: trimmed, and cut to
+/// [`MAX_TAB_NAME_CHARS`].
+///
+/// The model and the dialog that asks for the name both call this, so the name the
+/// dialog shows after saving is exactly the name the tab kept.
+#[must_use]
+pub fn tab_name_in_limits(title: &str) -> String {
+    title
+        .trim()
+        .chars()
+        .take(MAX_TAB_NAME_CHARS)
+        .collect::<String>()
+}
 
 /// A colour a user can give a tab to tell it apart from its neighbours.
 ///
@@ -423,18 +439,13 @@ impl WorkspaceTab {
 
     /// Names the tab, or returns it to its automatic title when given `None`.
     ///
-    /// The name is trimmed and cut to [`MAX_TAB_NAME_CHARS`]. Returns whether the
-    /// stored name changed, so a caller only writes the snapshot when it did.
+    /// The name is trimmed and cut to [`MAX_TAB_NAME_CHARS`] (see
+    /// [`tab_name_in_limits`]). Returns whether the stored name changed, so a caller
+    /// only writes the snapshot when it did.
     pub fn set_custom_title(&mut self, title: Option<impl Into<String>>) -> bool {
         let next = title
             .map(Into::into)
-            .map(|title| {
-                title
-                    .trim()
-                    .chars()
-                    .take(MAX_TAB_NAME_CHARS)
-                    .collect::<String>()
-            })
+            .map(|title| tab_name_in_limits(&title))
             .filter(|title| !title.is_empty());
         if self.custom_title == next {
             return false;
@@ -1087,10 +1098,22 @@ mod tests {
         assert!(!tab.set_custom_title(Option::<String>::None));
 
         let long = "名".repeat(MAX_TAB_NAME_CHARS + 10);
-        assert!(tab.set_custom_title(Some(long)));
+        assert!(tab.set_custom_title(Some(long.clone())));
         assert_eq!(
             tab.custom_title().map(|title| title.chars().count()),
             Some(MAX_TAB_NAME_CHARS)
+        );
+        // The rule is one function, so the name a dialog shows as kept is exactly the
+        // name the tab stored.
+        assert_eq!(
+            tab.custom_title(),
+            Some(tab_name_in_limits(&long).as_str()),
+            "the stored name is the one tab_name_in_limits gives"
+        );
+        assert_eq!(
+            tab_name_in_limits("  deploy box  "),
+            "deploy box",
+            "and it trims the same way"
         );
     }
 

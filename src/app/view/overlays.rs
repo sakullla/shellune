@@ -6,12 +6,18 @@
 
 use gpui::prelude::*;
 use gpui::{
-    Context, Div, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
+    App, Context, Div, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
     SharedString, Stateful, Window, div, px,
 };
-use shellune_core::{HostConfig, LocalShell, PaneTarget, SessionId, SessionKind, TabAccent, TabId};
+use shellune_core::{
+    HostConfig, LocalShell, MAX_TAB_NAME_CHARS, PaneTarget, SessionId, SessionKind, TabAccent,
+    TabId, tab_name_in_limits,
+};
 
-use super::{PaneKind, ShelluneView, destination_icon, program_label, session_target};
+use super::{
+    AccentRow, PaneKind, ShelluneView, TabRenameLimit, destination_icon, program_label,
+    session_target,
+};
 use crate::app::components::{self, Variant};
 use crate::app::copy;
 use crate::app::icons::{self, Icon};
@@ -309,6 +315,31 @@ impl ShelluneView {
                 icon: Icon::Layers,
                 current: false,
             });
+            // Stepping through the colours cannot get back to none of them, and a name
+            // can only be cleared from a control; both are here so the keyboard alone
+            // can undo them as well as apply them (R2, R4).
+            entries.push(Entry {
+                command: Command::RestoreTabTitle(id),
+                group: Group::Actions,
+                title: strings.palette_restore_tab_title.to_owned(),
+                detail: self.tab_title(id),
+                shortcut: None,
+                icon: Icon::Pencil,
+                current: false,
+            });
+            entries.push(Entry {
+                command: Command::ClearTabAccent(id),
+                group: Group::Actions,
+                title: strings.palette_clear_tab_accent.to_owned(),
+                detail: accent
+                    .map_or(strings.tab_accent_none, |accent| {
+                        copy::tab_accent_label(accent, locale)
+                    })
+                    .to_owned(),
+                shortcut: None,
+                icon: Icon::Layers,
+                current: false,
+            });
         }
         entries.push(Entry {
             command: Command::QuickConnect,
@@ -482,6 +513,16 @@ impl ShelluneView {
                             .map_or(TabAccent::ALL[0], TabAccent::next),
                     );
                     self.set_tab_accent(tab, next, cx);
+                }
+            }
+            Command::RestoreTabTitle(id) => {
+                if let Some(tab) = self.workspace.tab_of_session(id) {
+                    self.restore_tab_title(tab, cx);
+                }
+            }
+            Command::ClearTabAccent(id) => {
+                if let Some(tab) = self.workspace.tab_of_session(id) {
+                    self.set_tab_accent(tab, None, cx);
                 }
             }
             Command::ToggleLanguage => self.toggle_locale(cx),
@@ -777,6 +818,7 @@ impl ShelluneView {
     ) {
         self.shell_menu_open = false;
         self.remember_focus(window, cx);
+        self.accent_hover = None;
         self.tab_menu = Some((id, event.position));
         window.focus(&self.root_focus.clone());
         cx.notify();
@@ -799,6 +841,7 @@ impl ShelluneView {
     /// Closes the tab menu and gives the keyboard back to what was on screen.
     pub(super) fn close_tab_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_menu.take().is_some() {
+            self.accent_hover = None;
             self.restore_overlay_focus(window, cx);
             cx.notify();
         }
@@ -964,7 +1007,7 @@ impl ShelluneView {
                 }),
             )
             .child(divider())
-            .children(tab.map(|tab| self.tab_accent_choices(tab, "tab.menu", cx)))
+            .children(tab.map(|tab| self.tab_accent_choices(tab, AccentRow::Menu, cx)))
             .child(divider())
             .child(
                 item(
@@ -1104,12 +1147,17 @@ impl ShelluneView {
     /// is set without relying on the mark on the tab being visible. Choosing a colour
     /// changes the mark at once and nothing else: the state, the target and the name of
     /// every tab stay what they are.
-    fn tab_accent_choices(&self, tab: TabId, prefix: &'static str, cx: &mut Context<Self>) -> Div {
+    ///
+    /// A swatch is a control like the button beside it, so it answers the pointer the
+    /// same way: the fill and ring of a hovered or pressed swatch come from
+    /// [`theme::accent_swatch_face`], and the chosen one keeps its ring in every state.
+    fn tab_accent_choices(&self, tab: TabId, row: AccentRow, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let locale = self.workspace.locale();
         let chosen = self.workspace.tab_accent(tab);
-        let mut row = div()
+        let prefix = row.selector();
+        let mut swatches = div()
             .flex()
             .flex_wrap()
             .items_center()
@@ -1118,7 +1166,7 @@ impl ShelluneView {
             .py(metrics.scale(2.0))
             .debug_selector(move || format!("{prefix}.accents"));
         let none_selector = format!("{prefix}.accent.none");
-        row = row.child(
+        swatches = swatches.child(
             components::compact_button(strings.tab_accent_none, Variant::Ghost, metrics)
                 .id(SharedString::from(none_selector.clone()))
                 .debug_selector({
@@ -1135,7 +1183,9 @@ impl ShelluneView {
         for accent in TabAccent::ALL {
             let selector = format!("{prefix}.accent.{}", accent_selector(accent));
             let selected = chosen == Some(accent);
-            row = row.child(
+            let face = self.accent_face(row, accent, chosen);
+            let pressed = theme::accent_swatch_face(selected, theme::SwatchState::Pressed);
+            swatches = swatches.child(
                 div()
                     .id(SharedString::from(selector.clone()))
                     .debug_selector({
@@ -1148,13 +1198,27 @@ impl ShelluneView {
                     .justify_center()
                     .size(metrics.hit_target())
                     .rounded(px(radius::SMALL))
+                    .bg(face.fill_color())
                     .border_1()
-                    .border_color(if selected {
-                        theme::swatch(colors::TEXT_PRIMARY)
-                    } else {
-                        theme::clear()
-                    })
+                    .border_color(face.ring_color())
                     .cursor_pointer()
+                    .active(move |style| {
+                        style
+                            .bg(pressed.fill_color())
+                            .border_color(pressed.ring_color())
+                    })
+                    // The pointer's own position is what the row draws from, so the
+                    // hover a person sees and the hover a test reads are one value.
+                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                        let on_this_swatch = Some((row, accent));
+                        if *hovered && this.accent_hover != on_this_swatch {
+                            this.accent_hover = on_this_swatch;
+                            cx.notify();
+                        } else if !*hovered && this.accent_hover == on_this_swatch {
+                            this.accent_hover = None;
+                            cx.notify();
+                        }
+                    }))
                     .tooltip(components::tooltip(copy::tab_accent_label(accent, locale)))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         this.set_tab_accent(tab, Some(accent), cx);
@@ -1179,7 +1243,44 @@ impl ShelluneView {
                     .text_color(theme::swatch(colors::TEXT_MUTED))
                     .child(strings.tab_accent_label),
             )
-            .child(row)
+            .child(swatches)
+    }
+
+    /// The face one swatch of `row` draws for `accent`.
+    ///
+    /// The drawing and the tests that check the hover and press feedback read this one
+    /// place, so what a test asserts is what the swatch is painted with.
+    fn accent_face(
+        &self,
+        row: AccentRow,
+        accent: TabAccent,
+        chosen: Option<TabAccent>,
+    ) -> theme::SwatchFace {
+        let state = if self.accent_hover == Some((row, accent)) {
+            theme::SwatchState::Hovered
+        } else {
+            theme::SwatchState::Resting
+        };
+        theme::accent_swatch_face(chosen == Some(accent), state)
+    }
+
+    /// The row and colour the pointer is on, for the tests that check both rows answer
+    /// it.
+    #[cfg(test)]
+    pub fn accent_hover_for_test(&self) -> Option<(AccentRow, TabAccent)> {
+        self.accent_hover
+    }
+
+    /// The face the swatch of `accent` in `row` is drawn with now, for the tests that
+    /// check the drawing follows the pointer.
+    #[cfg(test)]
+    pub fn accent_face_for_test(
+        &self,
+        row: AccentRow,
+        tab: TabId,
+        accent: TabAccent,
+    ) -> theme::SwatchFace {
+        self.accent_face(row, accent, self.workspace.tab_accent(tab))
     }
 
     /// Drops the tab layers whose tab is gone.
@@ -1254,11 +1355,13 @@ impl ShelluneView {
             .find(|id| self.workspace.tab_of_session(*id) == Some(tab));
         self.remember_focus(window, cx);
         window.focus(field.read(cx).focus_handle());
+        self.accent_hover = None;
         self.tab_rename = Some(super::TabRename {
             tab,
             session,
             field,
             problem: None,
+            shortened: false,
         });
         cx.notify();
     }
@@ -1266,6 +1369,7 @@ impl ShelluneView {
     /// Closes the name dialog and gives the keyboard back to what was on screen.
     pub(super) fn close_tab_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_rename.take().is_some() {
+            self.accent_hover = None;
             self.restore_overlay_focus(window, cx);
             cx.notify();
         }
@@ -1275,18 +1379,25 @@ impl ShelluneView {
     /// on the next frame.
     fn close_tab_rename_pending(&mut self, cx: &mut Context<Self>) {
         if self.tab_rename.take().is_some() {
+            self.accent_hover = None;
             self.restore_focus_pending = true;
             cx.notify();
         }
     }
 
     /// Names the tab the dialog is about, or says why the name cannot be used.
+    ///
+    /// A name longer than [`MAX_TAB_NAME_CHARS`] is not refused. The tab keeps the
+    /// first [`MAX_TAB_NAME_CHARS`] characters, and the dialog stays open on that name
+    /// with a line saying what was kept and how to change it, so the shortening is
+    /// never the quiet difference between what was typed and what the tab says.
     fn submit_tab_rename(&mut self, cx: &mut Context<Self>) {
         let Some(dialog) = self.tab_rename.as_ref() else {
             return;
         };
         let tab = dialog.tab;
-        let entered = dialog.field.read(cx).text().to_owned();
+        let field = dialog.field.clone();
+        let entered = field.read(cx).text().to_owned();
         let name = entered.trim().to_owned();
         if name.is_empty() {
             let reason = self.strings().tab_rename_empty.to_owned();
@@ -1296,10 +1407,53 @@ impl ShelluneView {
             cx.notify();
             return;
         }
-        if self.workspace.rename_tab(tab, Some(name)) {
+        let kept = tab_name_in_limits(&name);
+        let cut = kept.chars().count() < name.chars().count();
+        if self.workspace.rename_tab(tab, Some(kept.clone())) {
             self.checkpoint_layout();
         }
-        self.close_tab_rename_pending(cx);
+        if !cut {
+            self.close_tab_rename_pending(cx);
+            return;
+        }
+        // The dialog stays open, holding the name the tab kept, so the line about the
+        // cut sits beside what was saved instead of closing over it.
+        field.update(cx, |field, cx| field.set_text(kept, cx));
+        if let Some(dialog) = self.tab_rename.as_mut() {
+            dialog.problem = None;
+            dialog.shortened = true;
+        }
+        cx.notify();
+    }
+
+    /// One line of the name dialog about the length limit, with its own selector so a
+    /// test can tell the line shown while typing from the one shown after saving.
+    fn tab_rename_notice(&self, selector: &'static str, template: &'static str) -> Div {
+        let metrics = self.metrics();
+        let text = copy::fill(template, &[("max", &MAX_TAB_NAME_CHARS.to_string())]);
+        components::banner(Tone::Warning, metrics)
+            .debug_selector(move || selector.to_owned())
+            .text_color(theme::swatch(colors::TEXT_PRIMARY))
+            .child(SharedString::from(text))
+    }
+
+    /// Which line the name dialog shows about the length limit, if any.
+    ///
+    /// The drawing and the tests read this one place, so the line a person sees and the
+    /// line a test expects cannot drift apart.
+    fn tab_rename_limit(&self, cx: &App) -> Option<TabRenameLimit> {
+        let dialog = self.tab_rename.as_ref()?;
+        if dialog.field.read(cx).text().trim().chars().count() > MAX_TAB_NAME_CHARS {
+            return Some(TabRenameLimit::Typing);
+        }
+        dialog.shortened.then_some(TabRenameLimit::Saved)
+    }
+
+    /// Which line the name dialog shows about the length limit, for the tests that
+    /// check the cut is never silent.
+    #[cfg(test)]
+    pub fn tab_rename_limit_for_test(&self, cx: &App) -> Option<TabRenameLimit> {
+        self.tab_rename_limit(cx)
     }
 
     /// Returns one tab to its automatic title, keeping its colour and its panes.
@@ -1584,6 +1738,9 @@ impl ShelluneView {
         });
         let has_name = self.workspace.tab_custom_title(tab).is_some();
         let tab_for_auto = tab;
+        // What the field holds now: a name past the limit says so before it is saved,
+        // so the cut is visible while the user can still shorten it by hand.
+        let limit = self.tab_rename_limit(cx);
         let header = self.modal_header(
             Some(Icon::Pencil),
             strings.tab_rename_title.to_owned(),
@@ -1619,13 +1776,23 @@ impl ShelluneView {
                     ))
                     .child(dialog.field.clone()),
             )
-            .child(self.tab_accent_choices(tab, "tab.rename", cx))
+            // What the dialog says about the name sits right under the name, above the
+            // colours, so it is next to the field it is about and high in the body that
+            // scrolls at large text.
             .children(
                 dialog
                     .problem
                     .as_ref()
                     .map(|problem| self.notice_line(problem.clone(), Tone::Danger)),
             )
+            .children(limit.map(|limit| {
+                let (selector, template) = match limit {
+                    TabRenameLimit::Typing => ("tab.rename.limit", strings.tab_rename_limit),
+                    TabRenameLimit::Saved => ("tab.rename.shortened", strings.tab_rename_shortened),
+                };
+                self.tab_rename_notice(selector, template)
+            }))
+            .child(self.tab_accent_choices(tab, AccentRow::Rename, cx))
             .into_any_element();
         let footer = div()
             .flex()

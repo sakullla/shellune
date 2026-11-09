@@ -43,7 +43,7 @@ use crate::app::terminal::{PaneState, SearchNote, SourceEvent, TerminalPane, Ter
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
 };
-use crate::app::view::KeyRowControl;
+use crate::app::view::{AccentRow, KeyRowControl};
 use crate::app::workspace::{Failure, PrimaryOutcome, Recovery, Section, SectionState, Workspace};
 use crate::app::{DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ShelluneView, key_bindings};
 
@@ -888,6 +888,8 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             palette_close_tab,
             palette_language,
             palette_text_size,
+            palette_restore_tab_title,
+            palette_clear_tab_accent,
             palette_current,
             palette_key_move,
             palette_key_run,
@@ -1056,6 +1058,8 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             tab_rename_save,
             tab_rename_empty,
             tab_rename_auto,
+            tab_rename_limit,
+            tab_rename_shortened,
             tab_accent_label,
             tab_accent_none,
             tab_accent_iris,
@@ -3571,6 +3575,14 @@ fn right_click(cx: &mut VisualTestContext, selector: &'static str) {
         MouseButton::Right,
         Modifiers::default(),
     );
+    cx.run_until_parked();
+}
+
+/// Moves the pointer onto the centre of a rendered element, the way a person does
+/// before clicking it.
+fn hover(cx: &mut VisualTestContext, selector: &'static str) {
+    let center = bounds_of(cx, selector).center();
+    cx.simulate_mouse_move(point(center.x, center.y), None, Modifiers::default());
     cx.run_until_parked();
 }
 
@@ -9429,6 +9441,352 @@ async fn a_tab_colour_is_chosen_and_cleared_without_touching_its_state(cx: &mut 
         )
     });
     assert!(!labels.0.is_empty() && !labels.1.is_empty());
+}
+
+#[gpui::test]
+async fn a_colour_swatch_answers_the_pointer_in_both_rows(cx: &mut TestAppContext) {
+    // A swatch is a control, so it has to look like one under the pointer, in the tab
+    // menu and in the name dialog alike (R2, R3). The drawing reads the same value the
+    // pointer sets, so this checks the appearance, not just that the swatch is clickable.
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let second = tabs[1];
+    let tab = cx
+        .update(|_window, app| view.read(app).workspace().tab_of_session(second))
+        .expect("the session has a tab");
+    let face = |cx: &mut VisualTestContext, row: AccentRow, accent| {
+        cx.update(|_window, app| view.read(app).accent_face_for_test(row, tab, accent))
+    };
+    let hovered = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).accent_hover_for_test())
+    };
+
+    // The tab menu's row.
+    right_click(cx, "session.tab.1");
+    assert_eq!(
+        hovered(cx),
+        None,
+        "nothing is hovered until the pointer moves"
+    );
+    let resting = face(cx, AccentRow::Menu, shellune_core::TabAccent::Teal);
+    assert_eq!(
+        resting,
+        theme::accent_swatch_face(false, theme::SwatchState::Resting)
+    );
+    assert_eq!(
+        resting.fill, None,
+        "a swatch at rest has no fill of its own"
+    );
+
+    hover(cx, "tab.menu.accent.teal");
+    assert_eq!(
+        hovered(cx),
+        Some((AccentRow::Menu, shellune_core::TabAccent::Teal)),
+        "the swatch under the pointer takes the hover"
+    );
+    let pointed = face(cx, AccentRow::Menu, shellune_core::TabAccent::Teal);
+    assert_ne!(pointed, resting, "hovering changes how the swatch is drawn");
+    assert_eq!(
+        pointed.fill,
+        Some(palette::SURFACE_HOVER),
+        "the fill under the pointer is the surface the other controls use"
+    );
+    assert_eq!(
+        pointed.ring,
+        Some(palette::BORDER_STRONG),
+        "and its ring is the hover border"
+    );
+    assert_eq!(
+        face(cx, AccentRow::Menu, shellune_core::TabAccent::Lime),
+        resting,
+        "only the swatch under the pointer is drawn as hovered"
+    );
+
+    hover(cx, "tab.menu.rename");
+    assert_eq!(hovered(cx), None, "leaving the swatch ends its hover");
+
+    // The chosen colour keeps its ring while the pointer is on another swatch. Choosing
+    // a colour leaves the menu open, so the row can be used again straight away.
+    click(cx, "tab.menu.accent.teal");
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_menu_open()),
+        "choosing a colour does not close the menu"
+    );
+    assert_eq!(
+        face(cx, AccentRow::Menu, shellune_core::TabAccent::Teal).ring,
+        Some(palette::TEXT_PRIMARY),
+        "the chosen swatch keeps its ring at rest"
+    );
+    hover(cx, "tab.menu.accent.lime");
+    assert_eq!(
+        face(cx, AccentRow::Menu, shellune_core::TabAccent::Teal).ring,
+        Some(palette::TEXT_PRIMARY),
+        "and keeps it while the pointer rests on a neighbour"
+    );
+    assert_eq!(
+        face(cx, AccentRow::Menu, shellune_core::TabAccent::Lime).fill,
+        Some(palette::SURFACE_HOVER),
+        "while the neighbour answers the pointer"
+    );
+
+    // The same row in the name dialog.
+    click(cx, "tab.menu.rename");
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_rename_open()),
+        "the menu's own row opens the name dialog"
+    );
+    assert!(
+        cx.debug_bounds("tab.rename.accent.teal").is_some(),
+        "the dialog offers the colours"
+    );
+    let dialog_resting = face(cx, AccentRow::Rename, shellune_core::TabAccent::Orchid);
+    hover(cx, "tab.rename.accent.orchid");
+    assert_eq!(
+        hovered(cx),
+        Some((AccentRow::Rename, shellune_core::TabAccent::Orchid)),
+        "the dialog's swatch answers the pointer too"
+    );
+    let dialog_pointed = face(cx, AccentRow::Rename, shellune_core::TabAccent::Orchid);
+    assert_ne!(
+        dialog_pointed, dialog_resting,
+        "and changes how it is drawn, exactly like the menu's"
+    );
+    assert_eq!(dialog_pointed.fill, Some(palette::SURFACE_HOVER));
+    assert_eq!(
+        hovered(cx),
+        Some((AccentRow::Rename, shellune_core::TabAccent::Orchid)),
+        "the dialog's hover is the dialog's, not the menu's"
+    );
+}
+
+#[test]
+fn a_pressed_swatch_is_drawn_between_the_resting_and_the_pressed_surfaces() {
+    // The pointer's press is a GPUI pseudo-state the test window cannot paint, so the
+    // face it draws is checked on the tokens the view paints it with.
+    for chosen in [false, true] {
+        let resting = theme::accent_swatch_face(chosen, theme::SwatchState::Resting);
+        let hovered = theme::accent_swatch_face(chosen, theme::SwatchState::Hovered);
+        let pressed = theme::accent_swatch_face(chosen, theme::SwatchState::Pressed);
+        assert_eq!(
+            pressed.fill,
+            Some(palette::SURFACE_SELECTED),
+            "press goes one step past hover"
+        );
+        assert_ne!(pressed.fill, hovered.fill, "a press is not a hover");
+        assert_ne!(
+            pressed.fill, resting.fill,
+            "and not a resting swatch either"
+        );
+        assert!(
+            pressed.ring.is_some(),
+            "a pressed swatch still has a ring, so it never looks unfinished"
+        );
+        if chosen {
+            for face in [resting, hovered, pressed] {
+                assert_eq!(
+                    face.ring,
+                    Some(palette::TEXT_PRIMARY),
+                    "the chosen colour keeps its own ring in every state"
+                );
+            }
+        } else {
+            assert_ne!(
+                pressed.ring, hovered.ring,
+                "an unchosen swatch says the press in its ring as well"
+            );
+        }
+    }
+}
+
+#[gpui::test]
+async fn a_name_past_the_limit_says_what_it_keeps(cx: &mut TestAppContext) {
+    // The limit stays, but it is not silent: the dialog says so while the name can
+    // still be shortened, and again when it saved a shortened one (R2, R3).
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let first = tabs[0];
+    let tab = cx
+        .update(|_window, app| view.read(app).workspace().tab_of_session(first))
+        .expect("the session has a tab");
+    let automatic = cx.update(|_window, app| view.read(app).tab_label_for_test(first));
+
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.rename");
+    cx.simulate_input("deploy");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_rename_limit_for_test(app)),
+        None,
+        "a name inside the limit says nothing about it"
+    );
+
+    // Ten characters short of twice the limit: too long, and said so before saving.
+    let long: String = "abcdefghij".repeat(8);
+    cx.simulate_input(&long);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_rename_limit_for_test(app)),
+        Some(crate::app::view::TabRenameLimit::Typing),
+        "the dialog says the name is too long before it is saved"
+    );
+    assert!(
+        cx.debug_bounds("tab.rename.limit").is_some(),
+        "and that line is drawn in the dialog"
+    );
+    assert_fits_inside(
+        bounds_of(cx, "tab.rename.limit"),
+        design_window(),
+        "the length notice",
+    );
+
+    click(cx, "tab.rename.save");
+    let kept: String = format!("deploy{long}")
+        .chars()
+        .take(shellune_core::MAX_TAB_NAME_CHARS)
+        .collect();
+    assert_eq!(
+        kept.chars().count(),
+        shellune_core::MAX_TAB_NAME_CHARS,
+        "the name really was longer than a tab can hold"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .tab_custom_title(tab)
+            .map(str::to_owned)),
+        Some(kept.clone()),
+        "the tab kept the first characters of what was typed"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(first)),
+        kept,
+        "the strip shows what was kept, never the longer name that was typed"
+    );
+    assert!(
+        cx.debug_bounds("tab.rename.shortened").is_some(),
+        "and the dialog says what it kept"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_rename_limit_for_test(app)),
+        Some(crate::app::view::TabRenameLimit::Saved),
+        "the field now holds a name inside the limit, so the warning about typing is \
+         replaced by the line about what was kept"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_rename_open()),
+        "the dialog stays open on the name that was kept instead of closing over it"
+    );
+
+    // A second save has nothing left to shorten, so it closes the dialog.
+    click(cx, "tab.rename.save");
+    assert!(!cx.update(|_window, app| view.read(app).tab_rename_open()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(first)),
+        kept,
+        "saving again keeps the same name"
+    );
+
+    // The automatic title is still behind the name, so restoring it is one control away.
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.rename");
+    click(cx, "tab.rename.auto");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(first)),
+        automatic,
+        "restoring the automatic title still works after a shortened name"
+    );
+}
+
+#[gpui::test]
+async fn the_palette_restores_the_title_and_clears_the_colour_without_a_pointer(
+    cx: &mut TestAppContext,
+) {
+    // Stepping the colours never comes back to none, and a name is only cleared from a
+    // control. Both are in the palette, so the keyboard alone can undo them (R2, R4).
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let active = tabs[1];
+    let tab = cx
+        .update(|_window, app| view.read(app).workspace().tab_of_session(active))
+        .expect("the session has a tab");
+    let automatic = cx.update(|_window, app| view.read(app).tab_label_for_test(active));
+
+    // Set up with the pointer, because the point of the test is undoing it by keyboard.
+    right_click(cx, "session.tab.1");
+    click(cx, "tab.menu.accent.orchid");
+    click(cx, "tab.menu.rename");
+    cx.simulate_input("deploy");
+    cx.run_until_parked();
+    click(cx, "tab.rename.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(active)),
+        "deploy"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().tab_accent(tab)),
+        Some(shellune_core::TabAccent::Orchid)
+    );
+
+    // The automatic title, from the palette and nothing else.
+    cx.simulate_keystrokes(palette_keystroke());
+    cx.simulate_input("automatic");
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert_eq!(
+        titles.first().map(String::as_str),
+        Some(ENGLISH.palette_restore_tab_title),
+        "the palette offers the automatic title first, got {titles:?}"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(active)),
+        automatic,
+        "the tab shows its automatic title again"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().tab_accent(tab)),
+        Some(shellune_core::TabAccent::Orchid),
+        "restoring the title keeps the colour"
+    );
+
+    // No colour, also from the palette alone.
+    cx.simulate_keystrokes(palette_keystroke());
+    cx.simulate_input("clear");
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert_eq!(
+        titles.first().map(String::as_str),
+        Some(ENGLISH.palette_clear_tab_accent),
+        "the palette offers clearing the colour first, got {titles:?}"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().tab_accent(tab)),
+        None,
+        "the tab has no distinguishing colour again"
+    );
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(active)
+            .is_some_and(|session| matches!(session.state(), SessionState::Connected))),
+        "neither command touches what the session is doing"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(active)),
+        automatic,
+        "and clearing the colour leaves the name alone"
+    );
 }
 
 #[gpui::test]

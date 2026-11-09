@@ -535,6 +535,10 @@ pub struct Strings {
     pub palette_language: &'static str,
     /// Palette action: step the text size.
     pub palette_text_size: &'static str,
+    /// Palette action: drop the current tab's name and go back to its automatic title.
+    pub palette_restore_tab_title: &'static str,
+    /// Palette action: clear the current tab's distinguishing colour.
+    pub palette_clear_tab_accent: &'static str,
     /// Marks the session already on screen.
     pub palette_current: &'static str,
     /// Footer hint: arrow keys.
@@ -753,6 +757,10 @@ pub struct Strings {
     pub tab_rename_empty: &'static str,
     /// Clears the model name and goes back to the automatic title.
     pub tab_rename_auto: &'static str,
+    /// Says, while the name is too long, that saving keeps the first `{max}` characters.
+    pub tab_rename_limit: &'static str,
+    /// Says, after such a save, what was kept and how to change it.
+    pub tab_rename_shortened: &'static str,
     /// Heading above the colour choices of one tab.
     pub tab_accent_label: &'static str,
     /// No colour chosen for this tab.
@@ -1122,6 +1130,8 @@ pub static ENGLISH: Strings = Strings {
     palette_close_tab: "Close current session",
     palette_language: "Switch interface language",
     palette_text_size: "Change text size",
+    palette_restore_tab_title: "Use the automatic tab title",
+    palette_clear_tab_accent: "Clear the tab colour",
     palette_current: "Current",
     palette_key_move: "Select",
     palette_key_run: "Open",
@@ -1231,6 +1241,8 @@ pub static ENGLISH: Strings = Strings {
     tab_rename_save: "Save name",
     tab_rename_empty: "A tab needs a name here. Choose \u{201c}Use automatic title\u{201d} to clear it.",
     tab_rename_auto: "Use automatic title",
+    tab_rename_limit: "A tab name holds {max} characters. Saving keeps the first {max} and drops the rest.",
+    tab_rename_shortened: "Saved the first {max} characters. Edit the name and save again to change it.",
     tab_accent_label: "Tab colour",
     tab_accent_none: "No colour",
     tab_accent_iris: "Iris",
@@ -1531,6 +1543,8 @@ pub static CHINESE: Strings = Strings {
     palette_close_tab: "关闭当前会话",
     palette_language: "切换界面语言",
     palette_text_size: "调整文字大小",
+    palette_restore_tab_title: "恢复标签自动标题",
+    palette_clear_tab_accent: "不设标签辨识色",
     palette_current: "当前",
     palette_key_move: "选择",
     palette_key_run: "打开",
@@ -1640,6 +1654,8 @@ pub static CHINESE: Strings = Strings {
     tab_rename_save: "保存名称",
     tab_rename_empty: "这里需要一个名称；要清除请用「恢复自动标题」。",
     tab_rename_auto: "恢复自动标题",
+    tab_rename_limit: "标签名称最多 {max} 个字符；保存时只保留前 {max} 个，其余不保存。",
+    tab_rename_shortened: "已保存前 {max} 个字符；修改名称后再次保存可更新。",
     tab_accent_label: "标签辨识色",
     tab_accent_none: "不设颜色",
     tab_accent_iris: "鸢尾蓝",

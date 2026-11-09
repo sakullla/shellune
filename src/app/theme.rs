@@ -113,6 +113,70 @@ pub fn tab_accent_color(accent: TabAccent) -> Rgba {
     swatch(tab_accent_token(accent))
 }
 
+/// What the pointer is doing to a control, for the states that answer it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwatchState {
+    /// Nothing points at the control.
+    Resting,
+    /// The pointer is on it.
+    Hovered,
+    /// It is being pressed.
+    Pressed,
+}
+
+/// The two surfaces one colour swatch draws, as palette tokens.
+///
+/// The values are tokens rather than resolved colours, so the same face is checked
+/// in both palettes without a window in the way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwatchFace {
+    /// The fill behind the colour, when this state paints one.
+    pub fill: Option<u32>,
+    /// The ring around the colour, when this state draws one.
+    pub ring: Option<u32>,
+}
+
+impl SwatchFace {
+    /// The fill in the palette being drawn.
+    #[must_use]
+    pub fn fill_color(self) -> Rgba {
+        self.fill.map_or_else(clear, swatch)
+    }
+
+    /// The ring in the palette being drawn.
+    #[must_use]
+    pub fn ring_color(self) -> Rgba {
+        self.ring.map_or_else(clear, swatch)
+    }
+}
+
+/// The face of a tab-colour swatch.
+///
+/// A swatch answers the pointer the way the buttons beside it do: a `SURFACE_HOVER`
+/// fill with a `BORDER_STRONG` ring under the pointer, and one step further to
+/// `SURFACE_SELECTED` with the accent ring while it is pressed. The chosen colour
+/// keeps its `TEXT_PRIMARY` ring in every state, so the row still says which colour
+/// is set while the pointer rests on another one. Neither value is a status: the ring
+/// marks a choice and the fill marks the pointer, never the session.
+#[must_use]
+pub fn accent_swatch_face(chosen: bool, state: SwatchState) -> SwatchFace {
+    let ring_when_chosen = chosen.then_some(palette::TEXT_PRIMARY);
+    match state {
+        SwatchState::Resting => SwatchFace {
+            fill: None,
+            ring: ring_when_chosen,
+        },
+        SwatchState::Hovered => SwatchFace {
+            fill: Some(palette::SURFACE_HOVER),
+            ring: Some(ring_when_chosen.unwrap_or(palette::BORDER_STRONG)),
+        },
+        SwatchState::Pressed => SwatchFace {
+            fill: Some(palette::SURFACE_SELECTED),
+            ring: Some(ring_when_chosen.unwrap_or(palette::ACCENT)),
+        },
+    }
+}
+
 /// Spacing scale in logical pixels before zoom is applied.
 pub mod spacing {
     /// 4px — icon to label.

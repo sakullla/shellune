@@ -54,5 +54,5 @@ pub use workspace::{
     MAX_TAB_NAME_CHARS, PaneNode, PaneTarget, PanelConfig, PanelSection, PendingConnection,
     PendingPane, RestoredNode, RestoredTab, RestoredWorkspace, SplitAxis, SplitRatio, TabAccent,
     TerminalMode, WORKSPACE_FORMAT_VERSION, WorkspaceBuildError, WorkspaceIssue, WorkspaceSnapshot,
-    WorkspaceTab,
+    WorkspaceTab, tab_name_in_limits,
 };

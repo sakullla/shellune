@@ -5,9 +5,9 @@
 //! forward is created here. Closing one leaf leaves every other leaf in place.
 
 use shellune_core::{
-    HostId, MAX_TAB_NAME_CHARS, PaneId, PaneNode, PaneTarget, PanelConfig, PendingConnection,
-    RestoredNode, RestoredWorkspace, SessionId, SplitAxis, TabAccent, TabId, TerminalMode,
-    WorkspaceBuildError, WorkspaceIssue, WorkspaceSnapshot, WorkspaceTab,
+    HostId, PaneId, PaneNode, PaneTarget, PanelConfig, PendingConnection, RestoredNode,
+    RestoredWorkspace, SessionId, SplitAxis, TabAccent, TabId, TerminalMode, WorkspaceBuildError,
+    WorkspaceIssue, WorkspaceSnapshot, WorkspaceTab, tab_name_in_limits,
 };
 
 /// Which way a pane moves or grows.
@@ -316,16 +316,13 @@ impl SessionLayout {
     /// Names one tab, or returns it to its automatic title when given `None`.
     ///
     /// Returns whether the name changed. The panes, the sessions and the order are
-    /// untouched: this is a label, not a connection.
+    /// untouched: this is a label, not a connection. The name is trimmed and cut to the
+    /// length a tab keeps by the same rule the snapshot uses
+    /// ([`tab_name_in_limits`]), so a name cannot survive a save and change length on
+    /// the way back.
     pub fn set_custom_title(&mut self, id: TabId, title: Option<String>) -> bool {
         let next = title
-            .map(|title| {
-                title
-                    .trim()
-                    .chars()
-                    .take(MAX_TAB_NAME_CHARS)
-                    .collect::<String>()
-            })
+            .map(|title| tab_name_in_limits(&title))
             .filter(|title| !title.is_empty());
         match self.tab_mut(id) {
             Some(tab) if tab.custom_title != next => {

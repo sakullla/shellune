@@ -437,6 +437,11 @@ pub struct ShelluneView {
     tab_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// The tab whose name is being edited, while that dialog is open.
     tab_rename: Option<TabRename>,
+    /// The colour swatch the pointer is on, and which of the two rows it is in.
+    ///
+    /// The swatches draw their hover and press states from this, so the same value
+    /// the pointer sets is the one the drawing reads — and the one a test can see.
+    accent_hover: Option<(AccentRow, TabAccent)>,
     /// Whether the list of every open tab is open.
     tab_list_open: bool,
     /// Whether a user edit may be written. Window close turns this off first.
@@ -532,6 +537,47 @@ struct TabRename {
     field: Entity<TextField>,
     /// Why the entered name could not be used, when it could not.
     problem: Option<String>,
+    /// Whether the last save cut the name to the length a tab can hold.
+    ///
+    /// The dialog stays open in that case, holding the name that was kept, so the
+    /// shortening is read rather than missed between a keystroke and a closed window.
+    shortened: bool,
+}
+
+/// One of the two rows of colour swatches a tab can be coloured from.
+///
+/// Both rows draw the same swatches and answer the pointer the same way; the row only
+/// names which surface a hovered swatch belongs to, so the state a test reads and the
+/// debug selector agree with the row on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccentRow {
+    /// The swatches in the tab's own menu.
+    Menu,
+    /// The swatches in the tab-name dialog.
+    Rename,
+}
+
+impl AccentRow {
+    /// The prefix of the debug selectors of this row's swatches.
+    #[must_use]
+    pub(crate) fn selector(self) -> &'static str {
+        match self {
+            Self::Menu => "tab.menu",
+            Self::Rename => "tab.rename",
+        }
+    }
+}
+
+/// Which line the tab-name dialog carries about the length a tab can hold.
+///
+/// A name past the limit is cut rather than refused, so the dialog says so: while the
+/// field holds too much, and again when a save kept only the first characters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabRenameLimit {
+    /// The field holds a name longer than a tab keeps.
+    Typing,
+    /// The last save kept only the first characters of the name.
+    Saved,
 }
 
 /// One control of a shortcut row.
@@ -770,6 +816,7 @@ impl ShelluneView {
             palette_scroll: gpui::ScrollHandle::new(),
             tab_menu: None,
             tab_rename: None,
+            accent_hover: None,
             tab_list_open: false,
             session_menu: None,
             focus_host_dialog: false,
