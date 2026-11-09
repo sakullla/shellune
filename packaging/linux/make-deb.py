@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -40,11 +41,18 @@ def run(command):
 
 
 def shlib_depends(binary):
+    # dpkg-shlibdeps reads debian/control from the directory it runs in, which a
+    # package built outside a source tree does not have; an empty one is enough.
+    work = tempfile.mkdtemp(prefix="shellune-shlibdeps-")
+    os.makedirs(os.path.join(work, "debian"))
+    open(os.path.join(work, "debian", "control"), "w").close()
     try:
         proc = subprocess.run(["dpkg-shlibdeps", "-O", binary],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, cwd=work)
     except FileNotFoundError:
         sys.exit("dpkg-shlibdeps not found; install dpkg-dev (Linux only)")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     if proc.returncode != 0:
         sys.exit("dpkg-shlibdeps failed on " + binary + ":\n" + proc.stderr)
     for line in proc.stdout.splitlines():

@@ -153,6 +153,7 @@ impl ShelluneView {
 /// Off Windows the caption and buttons are the system's, so these do the closest
 /// portable thing or nothing.
 mod win32 {
+    #[cfg(not(target_os = "windows"))]
     use gpui::Window;
 
     #[cfg(target_os = "windows")]
@@ -167,7 +168,8 @@ mod win32 {
         };
 
         fn hwnd(window: &Window) -> Option<HWND> {
-            match window.window_handle().ok()?.as_raw() {
+            // The trait's handle, not gpui's own `Window::window_handle`.
+            match HasWindowHandle::window_handle(window).ok()?.as_raw() {
                 RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),
                 _ => None,
             }
