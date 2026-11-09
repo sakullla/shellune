@@ -4,8 +4,8 @@
 ; verification run: NSIS is not installed there. It is the reviewed packaging
 ; definition, not evidence that an installer was produced. Compile it with:
 ;
-;     makensis /DVERSION=0.3.0 /DBINARY=..\..\target\release\shellune.exe ^
-;              /DOUTFILE=dist\Shellune-0.3.0-setup.exe packaging\windows\shellune.nsi
+;     makensis /DVERSION=0.3.1 /DBINARY=..\..\target\release\shellune.exe ^
+;              /DOUTFILE=dist\Shellune-0.3.1-setup.exe packaging\windows\shellune.nsi
 ;
 ; Optional code signing (only when a certificate exists):
 ;
@@ -20,7 +20,7 @@ Unicode true
 !define MUI_UNICON "..\..\assets\icons\shellune.ico"
 
 !ifndef VERSION
-  !define VERSION "0.3.0"
+  !define VERSION "0.3.1"
 !endif
 !ifndef BINARY
   !define BINARY "..\..\target\release\shellune.exe"
