@@ -14,6 +14,7 @@ use crate::auth::AuthMethodKind;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::HostId;
+use crate::task::TransferProtocol;
 
 /// Port used when the user does not specify one.
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -135,6 +136,14 @@ pub struct HostConfig {
     /// password: there is still no secret field beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proxy_command: Option<String>,
+    /// Which file-copy protocol this host's transfers use by default (R10).
+    ///
+    /// Absent means the SFTP default a record written before the choice existed meant,
+    /// so an older file stays byte-identical. The choice is a preference, not a
+    /// fallback: a transfer started over SCP reports an SCP failure and never silently
+    /// becomes an SFTP one, and the reverse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transfer_protocol: Option<TransferProtocol>,
 }
 
 /// The stored shape of a host.
@@ -168,6 +177,9 @@ struct HostConfigWire {
     /// Absent in files written before ProxyCommand was stored.
     #[serde(default)]
     proxy_command: Option<String>,
+    /// Absent in files written before the default copy protocol was stored.
+    #[serde(default)]
+    transfer_protocol: Option<TransferProtocol>,
 }
 
 impl TryFrom<HostConfigWire> for HostConfig {
@@ -196,6 +208,9 @@ impl TryFrom<HostConfigWire> for HostConfig {
             startup_command: normalize_command(wire.startup_command),
             jumps: wire.jumps,
             proxy_command: normalize_proxy_command(wire.proxy_command),
+            transfer_protocol: wire
+                .transfer_protocol
+                .filter(|protocol| *protocol != TransferProtocol::Sftp),
         })
     }
 }
@@ -253,6 +268,7 @@ impl HostConfig {
             startup_command: None,
             jumps: Vec::new(),
             proxy_command: None,
+            transfer_protocol: None,
         })
     }
 
@@ -337,6 +353,16 @@ impl HostConfig {
     #[must_use]
     pub fn proxy_command(&self) -> Option<&str> {
         self.proxy_command.as_deref()
+    }
+
+    /// The file-copy protocol this host's transfers start with (R10).
+    ///
+    /// SFTP unless the user chose otherwise, so a host saved before the choice existed
+    /// answers the same thing it always did. A single transfer may still choose the
+    /// other protocol, which is a choice for that task and not a change to this host.
+    #[must_use]
+    pub fn transfer_protocol(&self) -> TransferProtocol {
+        self.transfer_protocol.unwrap_or_default()
     }
 
     /// `user@address:port`, the form used in confirmation prompts.
@@ -434,6 +460,15 @@ impl HostConfig {
     /// Sets or clears the ProxyCommand. A blank command clears it and nothing is run.
     pub fn set_proxy_command(&mut self, command: Option<impl Into<String>>) {
         self.proxy_command = normalize_proxy_command(command.map(Into::into));
+    }
+
+    /// Chooses the protocol this host's transfers start with.
+    ///
+    /// The SFTP default is stored as "nothing", so choosing it again leaves a record
+    /// written by an older build byte-identical instead of growing a field that says
+    /// the same thing.
+    pub fn set_transfer_protocol(&mut self, protocol: TransferProtocol) {
+        self.transfer_protocol = (protocol != TransferProtocol::Sftp).then_some(protocol);
     }
 }
 
@@ -881,6 +916,7 @@ mod sign_in_tests {
             "startup_command",
             "jumps",
             "proxy_command",
+            "transfer_protocol",
         ] {
             assert!(
                 !json.contains(field),
@@ -889,6 +925,38 @@ mod sign_in_tests {
         }
         let back: HostConfig = serde_json::from_str(&json).expect("reads");
         assert_eq!(back, host);
+    }
+
+    #[test]
+    fn the_copy_protocol_is_sftp_unless_the_host_says_otherwise() {
+        let mut host = host();
+        assert_eq!(
+            host.transfer_protocol(),
+            TransferProtocol::Sftp,
+            "a host saved before the choice existed copies over SFTP"
+        );
+        assert!(
+            !serde_json::to_string(&host)
+                .expect("serializes")
+                .contains("transfer_protocol"),
+            "the default is not written as a field"
+        );
+
+        host.set_transfer_protocol(TransferProtocol::Scp);
+        let json = serde_json::to_string(&host).expect("serializes");
+        assert!(json.contains("\"transfer_protocol\":\"Scp\""), "{json}");
+        let back: HostConfig = serde_json::from_str(&json).expect("reads");
+        assert_eq!(back.transfer_protocol(), TransferProtocol::Scp);
+
+        // Choosing the default again is the absence of a choice, not a second encoding
+        // of it: the record shrinks back to what an older build wrote.
+        host.set_transfer_protocol(TransferProtocol::Sftp);
+        assert!(
+            !serde_json::to_string(&host)
+                .expect("serializes")
+                .contains("transfer_protocol"),
+            "the default is stored as nothing at all"
+        );
     }
 
     #[test]

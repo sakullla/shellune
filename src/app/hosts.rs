@@ -12,7 +12,7 @@
 //! * a message says what really happened. "Saved" never implies a connection was
 //!   opened, and a failure keeps the reason the storage layer produced.
 
-use shellune_core::{AuthMethodKind, HostConfig, HostId, Port};
+use shellune_core::{AuthMethodKind, HostConfig, HostId, Port, TransferProtocol};
 use shellune_storage::{
     DEFAULT_CONFIG_TEXT, Group, HostBook, HostEdit, ImportOutcome, ImportPlan, ImportPreview,
     RecentHost, host_matches,
@@ -156,6 +156,11 @@ pub struct HostDraft {
     jumps: Vec<HostId>,
     /// ProxyCommand template. Blank clears it and nothing is executed.
     proxy: String,
+    /// The protocol this host's transfers start with (R10).
+    ///
+    /// SFTP unless changed here. A single transfer may still choose the other one; that
+    /// choice belongs to the task and does not change this host.
+    protocol: TransferProtocol,
 }
 
 impl HostDraft {
@@ -177,6 +182,7 @@ impl HostDraft {
             startup: String::new(),
             jumps: Vec::new(),
             proxy: String::new(),
+            protocol: TransferProtocol::Sftp,
         }
     }
 
@@ -204,7 +210,21 @@ impl HostDraft {
             startup: host.startup_command().unwrap_or_default().to_owned(),
             jumps: host.jumps().to_vec(),
             proxy: host.proxy_command().unwrap_or_default().to_owned(),
+            protocol: host.transfer_protocol(),
         }
+    }
+
+    /// The protocol this host's transfers start with.
+    #[must_use]
+    pub fn protocol(&self) -> TransferProtocol {
+        self.protocol
+    }
+
+    /// Chooses the protocol this host's transfers start with, returning whether it changed.
+    pub fn set_protocol(&mut self, protocol: TransferProtocol) -> bool {
+        let changed = self.protocol != protocol;
+        self.protocol = protocol;
+        changed
     }
 
     /// How the host signs in.
@@ -395,10 +415,14 @@ impl HostDraft {
         !self.jumps.is_empty() && !self.proxy.trim().is_empty()
     }
 
-    /// Writes the jump chain and the ProxyCommand. A blank command clears it.
+    /// Writes the jump chain, the ProxyCommand and the copy protocol.
+    ///
+    /// A blank command clears it, and the SFTP default is stored as no choice at all, so
+    /// a host that was never changed around these fields keeps the record it had.
     fn apply_route(&self, host: &mut HostConfig) {
         host.set_jumps(self.jumps.iter().copied());
         host.set_proxy_command(Some(self.proxy.clone()));
+        host.set_transfer_protocol(self.protocol);
     }
 
     /// The key path to store: kept only for a method that reads a key file.
@@ -837,6 +861,50 @@ mod tests {
         let mut host = HostConfig::new(name, address, port, user).expect("a valid host");
         host.set_group(group);
         host
+    }
+
+    #[test]
+    fn the_copy_protocol_belongs_to_the_host_and_defaults_to_sftp() {
+        let mut draft = HostDraft::create();
+        assert_eq!(
+            draft.protocol(),
+            TransferProtocol::Sftp,
+            "a new host copies over SFTP"
+        );
+        draft.set_text(HostField::Name, "web");
+        draft.set_text(HostField::Address, "10.0.0.5");
+        draft.set_text(HostField::User, "deploy");
+        let edit = draft.build(None).expect("a valid host");
+        assert_eq!(edit.host().transfer_protocol(), TransferProtocol::Sftp);
+        assert!(
+            !serde_json::to_string(edit.host())
+                .expect("the host serializes")
+                .contains("transfer_protocol"),
+            "the default is not stored as a field, so an older record stays byte-identical"
+        );
+
+        // Choosing SCP travels with the host, so the next connection starts there.
+        draft.set_protocol(TransferProtocol::Scp);
+        let edit = draft.build(None).expect("a valid host");
+        assert_eq!(edit.host().transfer_protocol(), TransferProtocol::Scp);
+        let reopened = HostDraft::edit(edit.host());
+        assert_eq!(
+            reopened.protocol(),
+            TransferProtocol::Scp,
+            "editing a host shows the protocol it will copy with"
+        );
+
+        // Choosing the default again removes the field instead of encoding it twice.
+        let mut reopened = reopened;
+        assert!(reopened.set_protocol(TransferProtocol::Sftp));
+        assert!(!reopened.set_protocol(TransferProtocol::Sftp));
+        let saved = reopened.build(None).expect("a valid host");
+        assert_eq!(saved.host().transfer_protocol(), TransferProtocol::Sftp);
+        assert!(
+            !serde_json::to_string(saved.host())
+                .expect("the host serializes")
+                .contains("transfer_protocol")
+        );
     }
 
     #[test]

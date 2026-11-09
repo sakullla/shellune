@@ -487,6 +487,26 @@ pub struct Strings {
     pub transfers_problem_no_directory: &'static str,
     /// Reason: the connection cannot take the command.
     pub transfers_problem_no_connection: &'static str,
+    /// Reason: the source is a directory and recursion was not chosen.
+    pub transfers_problem_needs_recursion: &'static str,
+    /// Label of the protocol switch in a transfer question.
+    pub transfers_protocol: &'static str,
+    /// Protocol name of the SFTP subsystem.
+    pub transfers_protocol_sftp: &'static str,
+    /// Protocol name of the traditional SCP protocol.
+    pub transfers_protocol_scp: &'static str,
+    /// The sentence that says what choosing SCP changes.
+    pub transfers_protocol_note: &'static str,
+    /// Label of the toggle that copies a directory with its contents.
+    pub transfers_recursive: &'static str,
+    /// Label of the remote directory an upload would land in.
+    pub transfers_remote_directory: &'static str,
+    /// Label of the remote path a download would copy.
+    pub transfers_remote_path: &'static str,
+    /// Word before the protocol of one transfer in the list.
+    pub transfers_protocol_label: &'static str,
+    /// Why directory browsing failing does not stop a copy over SCP.
+    pub files_sftp_scp_hint: &'static str,
     /// Question asked before a session with running transfers is closed.
     pub transfers_close_question: &'static str,
     /// Answer that keeps a session open.
@@ -1118,6 +1138,16 @@ pub static ENGLISH: Strings = Strings {
     transfers_problem_no_source: "The source names no file.",
     transfers_problem_no_directory: "Open a directory first.",
     transfers_problem_no_connection: "The connection cannot take a transfer right now.",
+    transfers_problem_needs_recursion: "The source is a directory: choose the recursive copy first.",
+    transfers_protocol: "Protocol",
+    transfers_protocol_sftp: "SFTP",
+    transfers_protocol_scp: "SCP",
+    transfers_protocol_note: "SCP copies one file or, when chosen, one directory with the server's own scp program. It has no resume and no directory listing.",
+    transfers_recursive: "Copy the directory and everything in it",
+    transfers_remote_directory: "Remote directory",
+    transfers_remote_path: "Remote path",
+    transfers_protocol_label: "Protocol",
+    files_sftp_scp_hint: "Listing and managing a directory need SFTP. Copying a file still works with SCP: open Upload, type the remote directory and choose SCP.",
     transfers_close_question: "Closing this session cancels its transfers",
     transfers_close_cancel: "Keep the session open",
     transfers_close_confirm: "Close and cancel",
@@ -1537,6 +1567,16 @@ pub static CHINESE: Strings = Strings {
     transfers_problem_no_source: "源路径没有文件名。",
     transfers_problem_no_directory: "请先打开一个目录。",
     transfers_problem_no_connection: "连接当前无法接受传输。",
+    transfers_problem_needs_recursion: "源是一个目录：请先选择递归复制。",
+    transfers_protocol: "协议",
+    transfers_protocol_sftp: "SFTP",
+    transfers_protocol_scp: "SCP",
+    transfers_protocol_note: "SCP 用服务器自带的 scp 程序复制一个文件，或在你选择时复制整个目录；它不支持续传，也不提供目录列表。",
+    transfers_recursive: "复制整个目录及其内容",
+    transfers_remote_directory: "远端目录",
+    transfers_remote_path: "远端路径",
+    transfers_protocol_label: "协议",
+    files_sftp_scp_hint: "目录列表与管理需要 SFTP。复制文件仍可用 SCP：打开“上传”，输入远端目录并选择 SCP。",
     transfers_close_question: "关闭这个会话会取消它的传输",
     transfers_close_cancel: "保持会话打开",
     transfers_close_confirm: "关闭并取消",

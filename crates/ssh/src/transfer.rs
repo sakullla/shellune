@@ -35,13 +35,14 @@ use russh_sftp::protocol::{OpenFlags, StatusCode};
 use sha2::{Digest, Sha256};
 use shellune_core::{
     OverwriteChoice, PartialRecord, ResumeHint, ResumeRefusal, Transfer, TransferDirection,
-    TransferEvent, TransferFailure, TransferId, TransferUpdate, parent_path,
+    TransferEvent, TransferFailure, TransferId, TransferProtocol, TransferUpdate, parent_path,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
+use crate::scp;
 use crate::session::Command;
 use crate::sftp::{ChannelFailure, REQUEST_TIMEOUT_SECS};
 
@@ -63,7 +64,7 @@ const CHUNK: usize = 64 * 1024;
 ///
 /// The view needs a number that moves, not one update per chunk: an unbounded stream of
 /// reports would spend the window's time drawing bytes nobody can read.
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
+pub(crate) const PROGRESS_INTERVAL: Duration = Duration::from_millis(80);
 
 /// One transfer the application asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +79,13 @@ pub struct TransferRequest {
     pub destination: String,
     /// A checkpoint to re-check before continuing. `None` starts at the first byte.
     pub resume: Option<ResumeHint>,
+    /// Which protocol moves the bytes: the one the user chose for the host, or for this
+    /// one task. A failure of that protocol is reported as that protocol's failure and
+    /// is never retried over the other one.
+    pub protocol: TransferProtocol,
+    /// Whether a directory source is copied with its contents, which is only ever true
+    /// because the user asked for it.
+    pub recursive: bool,
 }
 
 impl TransferRequest {
@@ -90,6 +98,8 @@ impl TransferRequest {
             source: transfer.source().to_owned(),
             destination: transfer.destination().to_owned(),
             resume: transfer.resume_hint().cloned(),
+            protocol: transfer.protocol(),
+            recursive: transfer.is_recursive(),
         }
     }
 }
@@ -240,7 +250,7 @@ pub(crate) async fn serve(wiring: Wiring, commands: UnboundedSender<Command>) {
 }
 
 /// What one task ended with.
-enum End {
+pub(crate) enum End {
     /// The target holds the transferred content.
     Completed(u64),
     /// The transfer stopped. The path is a partial file that stayed, and the hint is
@@ -258,7 +268,7 @@ enum Decision {
 }
 
 /// What an existing target produced.
-enum Question {
+pub(crate) enum Question {
     /// The target may be replaced.
     Replace,
     /// The transfer must not write the target.
@@ -266,21 +276,21 @@ enum Question {
 }
 
 /// One running task and the ways it can be interrupted.
-struct Job {
+pub(crate) struct Job {
     id: TransferId,
     events: UnboundedSender<TransferEvent>,
     messages: UnboundedReceiver<TaskMessage>,
 }
 
 impl Job {
-    fn report(&self, update: TransferUpdate) {
+    pub(crate) fn report(&self, update: TransferUpdate) {
         let _ = self.events.send(TransferEvent {
             transfer: self.id,
             update,
         });
     }
 
-    fn progress(&self, transferred: u64, total: Option<u64>) {
+    pub(crate) fn progress(&self, transferred: u64, total: Option<u64>) {
         self.report(TransferUpdate::Progress { transferred, total });
     }
 
@@ -309,7 +319,7 @@ impl Job {
     ///
     /// It is asked between chunks rather than by racing the write, so a chunk that is
     /// already in flight is never abandoned half-sent.
-    fn interrupted(&mut self) -> bool {
+    pub(crate) fn interrupted(&mut self) -> bool {
         loop {
             match self.messages.try_recv() {
                 Ok(TaskMessage::Cancel) | Err(TryRecvError::Disconnected) => return true,
@@ -323,6 +333,11 @@ impl Job {
 }
 
 /// Runs one transfer to its end and reports it.
+///
+/// Which protocol moves the bytes is the request's own decision. A failure of that
+/// protocol is reported as it is: nothing here tries the other one behind the user's
+/// back, because "the copy failed" and "the copy silently used another protocol" are
+/// different outcomes and only the first one is honest.
 async fn run(
     request: TransferRequest,
     commands: UnboundedSender<Command>,
@@ -334,20 +349,9 @@ async fn run(
         events,
         messages,
     };
-    let session = match open(&commands).await {
-        Ok(session) => session,
-        Err(failure) => {
-            job.report(TransferUpdate::Failed {
-                failure,
-                residue: None,
-                resume: None,
-            });
-            return;
-        }
-    };
-    let end = match request.direction {
-        TransferDirection::Upload => upload(&session, &request, &mut job).await,
-        TransferDirection::Download => download(&session, &request, &mut job).await,
+    let end = match request.protocol {
+        TransferProtocol::Scp => scp_transfer(&commands, &request, &mut job).await,
+        TransferProtocol::Sftp => sftp_transfer(&commands, &request, &mut job).await,
     };
     match end {
         End::Completed(bytes) => job.report(TransferUpdate::Completed { bytes }),
@@ -362,7 +366,44 @@ async fn run(
             job.report(TransferUpdate::Cancelled { residue, resume });
         }
     }
+}
+
+/// Copies one entry with the traditional SCP protocol (R10).
+///
+/// SCP has no resume and no directory management: a checkpoint that reached this path is
+/// refused before anything is written, and the only directory it touches is the tree the
+/// user explicitly asked to copy.
+async fn scp_transfer(
+    commands: &UnboundedSender<Command>,
+    request: &TransferRequest,
+    job: &mut Job,
+) -> End {
+    if let Some(failure) = scp::refuse_resume(request) {
+        return End::Failed(failure, None, None);
+    }
+    match request.direction {
+        TransferDirection::Upload => scp::upload(commands, request, job).await,
+        TransferDirection::Download => scp::download(commands, request, job).await,
+    }
+}
+
+/// Copies one entry over the SFTP subsystem, which is also the only protocol that
+/// browses and resumes.
+async fn sftp_transfer(
+    commands: &UnboundedSender<Command>,
+    request: &TransferRequest,
+    job: &mut Job,
+) -> End {
+    let session = match open(commands).await {
+        Ok(session) => session,
+        Err(failure) => return End::Failed(failure, None, None),
+    };
+    let end = match request.direction {
+        TransferDirection::Upload => upload(&session, request, job).await,
+        TransferDirection::Download => download(&session, request, job).await,
+    };
     let _ = session.close().await;
+    end
 }
 
 /// Opens the transfer's own SFTP channel on the live connection.
@@ -763,7 +804,11 @@ async fn download(session: &SftpSession, request: &TransferRequest, job: &mut Jo
 }
 
 /// Asks about an existing target when there is one, and reports the start otherwise.
-async fn ask_about_target(existing: bool, total: Option<u64>, job: &mut Job) -> Question {
+pub(crate) async fn ask_about_target(
+    existing: bool,
+    total: Option<u64>,
+    job: &mut Job,
+) -> Question {
     if !existing {
         job.report(TransferUpdate::Started);
         return Question::Replace;
@@ -1457,6 +1502,8 @@ mod tests {
             source: "a.txt".to_owned(),
             destination: "/home/deploy/a.txt".to_owned(),
             resume: None,
+            protocol: TransferProtocol::Sftp,
+            recursive: false,
         })));
         link.close();
         assert!(link.is_closed());
@@ -1548,6 +1595,8 @@ mod tests {
             source: record.source.clone(),
             destination: record.destination.clone(),
             resume: Some(hint_for(record)),
+            protocol: TransferProtocol::Sftp,
+            recursive: false,
         }
     }
 

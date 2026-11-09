@@ -24,6 +24,12 @@
 //! hint when one was recorded, and the worker must still re-check the bytes before it
 //! may continue. [`TransferQueue::restart`] never carries a hint: a transfer that
 //! cannot resume starts again at zero, and the failed task stays in the list.
+//!
+//! A task also names its protocol ([`TransferProtocol`]). SFTP is the default and the
+//! only one that browses and resumes; traditional SCP copies a file, or one explicitly
+//! chosen directory, over a real remote `scp` and has no checkpoint at all. Which of the
+//! two moves a task's bytes is chosen by the user - on the host, or for the one transfer -
+//! and is never decided by falling back after a failure.
 
 use std::path::Path;
 
@@ -49,6 +55,65 @@ impl TransferDirection {
             Self::Upload => "Upload",
             Self::Download => "Download",
         }
+    }
+}
+
+/// Which file-copy protocol a task uses (R10).
+///
+/// SFTP is the default and the only one that browses, resumes and checks a confirmed
+/// prefix. Traditional SCP is the explicit alternative for a server that offers no SFTP
+/// subsystem: it copies one file or, when the user chose it, one whole directory, and it
+/// has none of the other properties. The difference is stated as a method here rather
+/// than as an `if` in the view, so "SCP has no resume" cannot be answered differently in
+/// two places:
+///
+/// * [`Self::resumes`] - false for SCP, which is why its tasks never carry a checkpoint
+///   and the list never offers a resume or an offset for them;
+/// * [`Self::browses`] - false for SCP: listing, creating, renaming and deleting stay
+///   SFTP operations, and a window must not claim SCP did them;
+/// * [`Self::copies_directories`] - true for SCP, where copying a directory is an
+///   explicit choice the user makes, never something a file copy silently does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferProtocol {
+    /// The SFTP subsystem: browse, resume, copy files.
+    #[default]
+    Sftp,
+    /// The traditional SCP protocol: copy files and, when chosen, whole directories.
+    Scp,
+}
+
+impl TransferProtocol {
+    /// Short label used in the transfer list and the protocol switch.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sftp => "SFTP",
+            Self::Scp => "SCP",
+        }
+    }
+
+    /// Whether a task of this protocol can continue a confirmed prefix.
+    #[must_use]
+    pub fn resumes(self) -> bool {
+        matches!(self, Self::Sftp)
+    }
+
+    /// Whether this protocol can list, create, rename or delete.
+    #[must_use]
+    pub fn browses(self) -> bool {
+        matches!(self, Self::Sftp)
+    }
+
+    /// Whether a directory can be copied as a whole, and only when asked.
+    #[must_use]
+    pub fn copies_directories(self) -> bool {
+        matches!(self, Self::Scp)
+    }
+}
+
+impl std::fmt::Display for TransferProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 
@@ -534,6 +599,16 @@ pub struct Transfer {
     direction: TransferDirection,
     source: String,
     destination: String,
+    /// Which protocol moves the bytes. Absent in records written before the choice
+    /// existed, which is the SFTP default a saved record meant.
+    #[serde(default)]
+    protocol: TransferProtocol,
+    /// Whether a directory source is copied as a whole, with its contents.
+    ///
+    /// Only ever true because the user asked for it: a copy of a directory that was
+    /// not explicitly marked recursive is refused, never expanded into a tree.
+    #[serde(default)]
+    recursive: bool,
     state: TransferState,
     /// Last durable checkpoint reported while the task was running.
     ///
@@ -544,10 +619,28 @@ pub struct Transfer {
 }
 
 impl Transfer {
-    /// Creates a queued transfer.
+    /// Creates a queued transfer over the default protocol (SFTP).
     #[must_use]
     pub fn queued(
         session: SessionId,
+        direction: TransferDirection,
+        source: impl Into<String>,
+        destination: impl Into<String>,
+    ) -> Self {
+        Self::queued_over(
+            session,
+            TransferProtocol::Sftp,
+            direction,
+            source,
+            destination,
+        )
+    }
+
+    /// Creates a queued transfer over one explicitly chosen protocol.
+    #[must_use]
+    pub fn queued_over(
+        session: SessionId,
+        protocol: TransferProtocol,
         direction: TransferDirection,
         source: impl Into<String>,
         destination: impl Into<String>,
@@ -558,9 +651,33 @@ impl Transfer {
             direction,
             source: source.into(),
             destination: destination.into(),
+            protocol,
+            recursive: false,
             state: TransferState::Queued,
             checkpoint: None,
         }
+    }
+
+    /// The same task, copied as a directory with its contents.
+    ///
+    /// Set only after the user chose recursion; the worker refuses a directory source
+    /// without it instead of copying a tree nobody asked for.
+    #[must_use]
+    pub fn with_recursive(mut self, recursive: bool) -> Self {
+        self.recursive = recursive && self.protocol.copies_directories();
+        self
+    }
+
+    /// Which protocol moves the bytes.
+    #[must_use]
+    pub fn protocol(&self) -> TransferProtocol {
+        self.protocol
+    }
+
+    /// Whether the source directory is copied as a whole.
+    #[must_use]
+    pub fn is_recursive(&self) -> bool {
+        self.recursive
     }
 
     /// Identifier that tags every event of this task.
@@ -607,24 +724,39 @@ impl Transfer {
     ///
     /// A running task's checkpoint and a finished task's recorded hint are the same
     /// fact: bytes already confirmed. Neither one is a claim that the target is complete.
+    /// A protocol that does not resume answers `None` even if a record from elsewhere
+    /// still carries a hint, so no resume entry can appear for it.
     #[must_use]
     pub fn resume_hint(&self) -> Option<&ResumeHint> {
+        if !self.protocol.resumes() {
+            return None;
+        }
         self.state.resume().or(self.checkpoint.as_ref())
     }
 
     /// The partial file this task may have left on disk when its connection ended.
     ///
-    /// Only a task that was running can have created a temporary file: a queued task
-    /// has not been started, and one waiting for an answer about an existing target has
+    /// Only a task that was running can have created a partial file: a queued task has
+    /// not been started, and one waiting for an answer about an existing target has
     /// written nothing at all, so neither names a residue. A resume writes the partial
-    /// file named by its checkpoint, which belongs to the attempt that started that
-    /// file, not the id of the attempt that is continuing it. A first transfer has no
-    /// such checkpoint yet, so the name is the temporary file derived from this task.
+    /// file named by its checkpoint, which belongs to the attempt that started that file,
+    /// not the id of the attempt that is continuing it. A first transfer has no such
+    /// checkpoint yet, so the name is the temporary file derived from this task.
+    ///
+    /// The two protocols write into different files, and the difference is stated here
+    /// rather than guessed by the view: SFTP writes a temporary file beside the target,
+    /// while a traditional SCP upload writes into the target's own name - the protocol
+    /// has no rename - so its residue *is* the target. An SCP download still writes a
+    /// local temporary file first, because renaming is a local operation.
+    ///
     /// The path is where the bytes were going, not a file this crate has looked at.
     #[must_use]
     pub fn residue_on_loss(&self) -> Option<String> {
         match self.state {
-            TransferState::Running { .. } => Some(self.writing_partial()),
+            TransferState::Running { .. } => Some(match (self.protocol, self.direction) {
+                (TransferProtocol::Scp, TransferDirection::Upload) => self.destination.clone(),
+                _ => self.writing_partial(),
+            }),
             _ => None,
         }
     }
@@ -1106,22 +1238,29 @@ impl TransferQueue {
             .collect()
     }
 
-    /// Starts a new task for the same two paths.
+    /// Starts a new task for the same two paths, over the same protocol.
     ///
     /// The returned task has its own [`TransferId`] and stays queued. When the failed
     /// task recorded a checkpoint, the new task carries that hint so the worker can
     /// re-check it; the hint is not progress. Without a hint the new task has nothing
-    /// to continue, which is a transfer from the first byte.
+    /// to continue, which is a transfer from the first byte. A protocol that has no
+    /// resume - SCP - never carries one, so a retry of it is a transfer again in full.
     #[must_use]
     pub fn retry(&self, id: TransferId) -> Option<Transfer> {
         self.get(id).map(|failed| {
-            let mut next = Transfer::queued(
+            let mut next = Transfer::queued_over(
                 failed.session(),
+                failed.protocol(),
                 failed.direction(),
                 failed.source(),
                 failed.destination(),
-            );
-            next.checkpoint = failed.state().resume().cloned();
+            )
+            .with_recursive(failed.is_recursive());
+            next.checkpoint = failed
+                .protocol()
+                .resumes()
+                .then(|| failed.state().resume().cloned())
+                .flatten();
             next
         })
     }
@@ -1135,12 +1274,14 @@ impl TransferQueue {
         self.get(id)
             .filter(|failed| !failed.state().is_success())
             .map(|failed| {
-                Transfer::queued(
+                Transfer::queued_over(
                     failed.session(),
+                    failed.protocol(),
                     failed.direction(),
                     failed.source(),
                     failed.destination(),
                 )
+                .with_recursive(failed.is_recursive())
             })
     }
 
@@ -2055,5 +2196,137 @@ mod tests {
             queue.get(id).expect("the task stays listed").state(),
             TransferState::Failed { .. }
         ));
+    }
+
+    /// A queued SCP upload of one file.
+    fn scp_upload(recursive: bool) -> Transfer {
+        Transfer::queued_over(
+            SessionId::new(),
+            TransferProtocol::Scp,
+            TransferDirection::Upload,
+            "C:/work/report.txt",
+            "/home/deploy/report.txt",
+        )
+        .with_recursive(recursive)
+    }
+
+    #[test]
+    fn a_task_names_its_protocol_and_only_sftp_browses_or_resumes() {
+        assert_eq!(TransferProtocol::default(), TransferProtocol::Sftp);
+        assert!(TransferProtocol::Sftp.resumes());
+        assert!(TransferProtocol::Sftp.browses());
+        assert!(!TransferProtocol::Sftp.copies_directories());
+        assert!(!TransferProtocol::Scp.resumes());
+        assert!(
+            !TransferProtocol::Scp.browses(),
+            "SCP copies files; listing and managing a directory stay SFTP operations"
+        );
+        assert!(TransferProtocol::Scp.copies_directories());
+        assert_eq!(TransferProtocol::Sftp.label(), "SFTP");
+        assert_eq!(TransferProtocol::Scp.to_string(), "SCP");
+
+        let task = scp_upload(false);
+        assert_eq!(task.protocol(), TransferProtocol::Scp);
+        assert!(!task.is_recursive(), "a directory is never copied unasked");
+        assert!(
+            scp_upload(true).is_recursive(),
+            "recursion is recorded when it was chosen"
+        );
+        assert!(
+            upload().protocol() == TransferProtocol::Sftp,
+            "an ordinary task is an SFTP task"
+        );
+    }
+
+    #[test]
+    fn recursion_is_a_choice_scp_can_offer_and_sftp_cannot() {
+        let sftp = upload().with_recursive(true);
+        assert!(
+            !sftp.is_recursive(),
+            "SFTP copies a file; a directory is not part of that task"
+        );
+    }
+
+    #[test]
+    fn an_scp_task_never_reports_a_checkpoint_or_a_resume_entry() {
+        let mut task = scp_upload(false);
+        let id = task.id();
+        task.apply(TransferEvent::started(id))
+            .expect("start applies");
+        task.apply(TransferEvent {
+            transfer: id,
+            update: TransferUpdate::Checkpoint(hint(1024)),
+        })
+        .expect("the checkpoint applies to the state");
+        assert!(
+            task.resume_hint().is_none(),
+            "SCP has no resume, so nothing may offer one"
+        );
+        task.fail(TransferFailure::ConnectionLost)
+            .expect("failure applies");
+        let mut queue = TransferQueue::new();
+        let failed = queue.add(task);
+        let retried = queue.retry(failed).expect("a failure can be repeated");
+        assert_eq!(retried.protocol(), TransferProtocol::Scp);
+        assert!(
+            retried.resume_hint().is_none(),
+            "a repeated SCP copy starts from the first byte and asks about the target again"
+        );
+        assert_eq!(retried.state(), &TransferState::Queued);
+    }
+
+    #[test]
+    fn a_retry_and_a_restart_keep_the_protocol_and_the_recursive_choice() {
+        let mut queue = TransferQueue::new();
+        let id = queue.add(scp_upload(true));
+        queue.apply(&TransferEvent::started(id));
+        queue.fail_session(
+            queue.get(id).expect("the task is listed").session(),
+            TransferFailure::ConnectionLost,
+        );
+        let retried = queue.retry(id).expect("a failure can be repeated");
+        assert_eq!(retried.protocol(), TransferProtocol::Scp);
+        assert!(retried.is_recursive(), "the chosen tree is still chosen");
+        let restarted = queue.restart(id).expect("a failure can start over");
+        assert_eq!(restarted.protocol(), TransferProtocol::Scp);
+        assert!(restarted.is_recursive());
+    }
+
+    #[test]
+    fn a_lost_scp_upload_names_the_target_it_was_writing() {
+        let mut queue = TransferQueue::new();
+        let id = queue.add(scp_upload(false));
+        queue.apply(&TransferEvent::started(id));
+        let session = queue.get(id).expect("the task is listed").session();
+        queue.fail_session(session, TransferFailure::ConnectionLost);
+        let failed = queue.get(id).expect("the task stays listed");
+        assert_eq!(
+            failed.state().residue(),
+            Some("/home/deploy/report.txt"),
+            "SCP writes into the target's own name, so that is the file that holds part of it"
+        );
+
+        // A download writes a local temporary file first and renames it, so the residue
+        // is that file and never the target.
+        let download = Transfer::queued_over(
+            SessionId::new(),
+            TransferProtocol::Scp,
+            TransferDirection::Download,
+            "/home/deploy/report.txt",
+            "C:/work/report.txt",
+        );
+        let expected = download.partial_path();
+        let id = queue.add(download);
+        queue.apply(&TransferEvent::started(id));
+        let session = queue.get(id).expect("the task is listed").session();
+        queue.fail_session(session, TransferFailure::ConnectionLost);
+        assert_eq!(
+            queue
+                .get(id)
+                .expect("the task stays listed")
+                .state()
+                .residue(),
+            Some(expected.as_str())
+        );
     }
 }

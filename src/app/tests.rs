@@ -7976,6 +7976,242 @@ async fn an_upload_asks_for_the_file_and_then_reports_the_task_it_started(cx: &m
 }
 
 #[gpui::test]
+async fn a_transfer_question_copies_over_the_chosen_protocol_and_only_a_chosen_directory(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    // The remote side is a field of its own and both protocols are offered.
+    assert!(
+        cx.debug_bounds("files.question.remote").is_some(),
+        "the remote directory can be typed, which is what a server without SFTP needs"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_protocol()),
+        Some(shellune_core::TransferProtocol::Sftp),
+        "a host without a choice copies over SFTP"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
+        Some("/home/deploy".to_owned()),
+        "the question starts at the directory on screen"
+    );
+    assert!(
+        cx.debug_bounds("files.question.recursive").is_none(),
+        "SFTP copies a file, so it has no directory to offer"
+    );
+
+    // Switching to SCP is a decision about this task, and it sends nothing.
+    click(cx, "files.question.protocol.scp");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_protocol()),
+        Some(shellune_core::TransferProtocol::Scp)
+    );
+    assert!(
+        cx.debug_bounds("files.question.recursive").is_some(),
+        "SCP can copy a directory, so it offers the choice"
+    );
+    assert!(
+        cx.debug_bounds("files.question.protocol.note").is_some(),
+        "the question says what choosing SCP changes"
+    );
+    assert!(
+        transfers.starts().is_empty(),
+        "switching protocols starts nothing"
+    );
+
+    // A directory named without the recursive choice is refused before a task exists.
+    let directory = std::env::temp_dir().join(format!("shellune-question-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("a scratch directory can be made");
+    let directory = directory.to_string_lossy().into_owned();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test(&directory);
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        transfers.starts().is_empty(),
+        "a directory is not copied as a whole unless that was chosen"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_text().map(str::to_owned)),
+        Some(directory.clone()),
+        "the path that was refused stays in the field"
+    );
+
+    // Choosing recursion copies the tree, over the protocol the question carries.
+    click(cx, "files.question.recursive");
+    assert!(cx.update(|_window, app| view.read(app).files_question_recursive()));
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test(&directory);
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 1, "the chosen copy started: {starts:?}");
+    assert_eq!(starts[0].protocol, shellune_core::TransferProtocol::Scp);
+    assert!(starts[0].recursive, "the tree was the choice");
+    assert!(
+        starts[0].destination.starts_with("/home/deploy/"),
+        "the file lands in the remote directory the question named: {}",
+        starts[0].destination
+    );
+
+    // The remote directory is the one that was typed, not the one on screen.
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_remote_for_test("/srv/uploads");
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let starts = transfers.starts();
+    assert_eq!(
+        starts.last().map(|start| start.destination.as_str()),
+        Some("/srv/uploads/report.txt"),
+        "the typed directory is where the file goes"
+    );
+}
+
+#[gpui::test]
+async fn a_host_saved_with_scp_starts_its_transfers_with_scp(cx: &mut TestAppContext) {
+    let dir = TempDir::new("scp-default");
+    let mut seeded = stored_host("legacy", "10.0.0.9", 22, "deploy", None);
+    seeded.set_transfer_protocol(shellune_core::TransferProtocol::Scp);
+    seed(&dir.store(), vec![seeded]);
+    let workspace = Workspace::new();
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_protocol()),
+        Some(shellune_core::TransferProtocol::Scp),
+        "the host's own choice is what the question starts with"
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 1, "the copy started: {starts:?}");
+    assert_eq!(starts[0].protocol, shellune_core::TransferProtocol::Scp);
+    assert!(
+        !starts[0].resume.is_some(),
+        "SCP starts from the first byte: there is nothing to continue"
+    );
+
+    // A finished SCP task offers no resume entry, even when a checkpoint from elsewhere
+    // names an offset: the protocol cannot continue one, so it must not promise to.
+    let task = starts[0].transfer;
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Failed {
+            failure: shellune_core::TransferFailure::ConnectionLost,
+            residue: None,
+            resume: Some(shellune_core::ResumeHint {
+                partial: "/home/deploy/.shellune-part-kept".to_owned(),
+                record: "C:/temp/kept.json".to_owned(),
+                offset: 4096,
+                generation: 1,
+            }),
+        },
+    });
+    pump_files(cx, &view);
+    assert!(
+        cx.debug_bounds("transfers.resume.0").is_none(),
+        "an SCP task has no resume button"
+    );
+    assert!(
+        cx.debug_bounds("transfers.retry.0").is_some()
+            || cx.debug_bounds("transfers.restart.0").is_some(),
+        "it can be copied again from the first byte"
+    );
+
+    // And the other protocol is still one task away, not a change to the host.
+    click(cx, "files.upload");
+    click(cx, "files.question.protocol.sftp");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let starts = transfers.starts();
+    assert_eq!(
+        starts.last().map(|start| start.protocol),
+        Some(shellune_core::TransferProtocol::Sftp),
+        "a single transfer may choose the other protocol"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .book()
+            .hosts()
+            .first()
+            .map(HostConfig::transfer_protocol)),
+        Some(shellune_core::TransferProtocol::Scp),
+        "that choice did not change the saved host"
+    );
+}
+
+#[gpui::test]
+async fn a_server_without_sftp_says_so_and_offers_the_scp_copy_it_still_has(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    let channel = files.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(id, "web", "deploy@10.0.0.5:22", Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+    files.fail(
+        1,
+        shellune_core::BrowseFailure::Unavailable {
+            reason: "the server refused the sftp subsystem".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+
+    assert!(
+        cx.debug_bounds("files.failure.reason").is_some(),
+        "the server really has no SFTP, so no listing is invented"
+    );
+    assert!(
+        cx.debug_bounds("files.failure.scp.hint").is_some(),
+        "the next step names the protocol that still copies files"
+    );
+    // The upload question is still reachable, and it is where the remote path is typed.
+    click(cx, "files.upload");
+    assert!(cx.debug_bounds("files.question.remote").is_some());
+}
+
+#[gpui::test]
 async fn an_existing_target_is_asked_about_and_keeping_it_writes_nothing(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use shellune_core::{
     OverwriteChoice, SessionId, Transfer, TransferDirection, TransferEvent, TransferFailure,
-    TransferId, TransferQueue, TransferUpdate, join_path,
+    TransferId, TransferProtocol, TransferQueue, TransferUpdate, join_path,
 };
 use shellune_ssh::{TransferCommand, TransferLink, TransferRequest};
 
@@ -67,6 +67,11 @@ pub enum TransferProblem {
     DirectoryUnknown,
     /// The connection cannot take the command, so no task was created.
     CommandRefused,
+    /// The source is a directory and copying it as a whole was not chosen.
+    ///
+    /// A directory is never expanded into a tree behind the user's back: the choice is
+    /// explicit, and a task without it would copy nothing meaningful.
+    DirectoryNeedsRecursion,
 }
 
 /// Why a download or upload could not be offered at all.
@@ -80,6 +85,8 @@ pub enum PathProblem {
     Empty,
     /// The path names no file, only a directory or nothing at all.
     NoName,
+    /// The path names a directory and copying it whole was not chosen.
+    NeedsRecursion,
 }
 
 /// The transfers of every session this window can move files on.
@@ -165,39 +172,105 @@ impl TransferViews {
         !self.queue.transfers().is_empty()
     }
 
-    /// Starts an upload of one local file into a remote directory.
+    /// Starts an upload of one local file into a remote directory over SFTP.
     ///
     /// The remote name is the local file's own name, exactly as it is: a file called
     /// `报告 终稿.txt` arrives under that name, and the directory string is used as the
-    /// user typed it.
+    /// user typed it. The window always picks a protocol explicitly
+    /// ([`Self::upload_over`]); this is the shorthand the module's own tests use.
     ///
     /// # Errors
     ///
     /// Returns [`TransferProblem`] when there is no file name, no directory or no
     /// connection; in each case no task exists afterwards.
+    #[cfg(test)]
     pub fn upload(
         &mut self,
         session: SessionId,
         local: &str,
         directory: Option<&str>,
     ) -> Result<TransferId, TransferProblem> {
-        let name = file_name(local).ok_or(TransferProblem::SourceNamesNoFile)?;
-        let directory = directory.ok_or(TransferProblem::DirectoryUnknown)?;
-        let target = join_path(directory, name);
-        self.start(session, TransferDirection::Upload, local.to_owned(), target)
+        self.upload_over(session, local, directory, TransferProtocol::Sftp, false)
     }
 
-    /// Starts a download of one remote file into a local directory.
+    /// Starts an upload over one chosen protocol, and as a tree when that was chosen.
+    ///
+    /// The protocol is the task's own: it never falls back to the other one, and a
+    /// directory is copied only when `recursive` says the user asked for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferProblem`] when there is no file name, no directory, no
+    /// connection, or when the source is a directory that would not be copied whole.
+    pub fn upload_over(
+        &mut self,
+        session: SessionId,
+        local: &str,
+        directory: Option<&str>,
+        protocol: TransferProtocol,
+        recursive: bool,
+    ) -> Result<TransferId, TransferProblem> {
+        let name = file_name(local).ok_or(TransferProblem::SourceNamesNoFile)?;
+        let directory = directory.ok_or(TransferProblem::DirectoryUnknown)?;
+        if !protocol.copies_directories() && is_directory(Path::new(local.trim())) {
+            // SFTP copies a file; a directory source would be refused by the worker
+            // anyway, so the window says so before a task is created.
+            return Err(TransferProblem::SourceNamesNoFile);
+        }
+        if !recursive && is_directory(Path::new(local.trim())) {
+            return Err(TransferProblem::DirectoryNeedsRecursion);
+        }
+        let target = join_path(directory, name);
+        let task = Transfer::queued_over(
+            session,
+            protocol,
+            TransferDirection::Upload,
+            local.to_owned(),
+            target,
+        )
+        .with_recursive(recursive);
+        self.start(session, task)
+    }
+
+    /// Starts a download of one remote file into a local directory over SFTP.
+    ///
+    /// [`Self::download_over`] is the same task with a protocol the caller chose.
     ///
     /// # Errors
     ///
     /// Returns [`TransferProblem`] when either path names no file, when no local
     /// directory was given, or when the connection cannot take the command.
+    #[cfg(test)]
     pub fn download(
         &mut self,
         session: SessionId,
         remote: &str,
         local_directory: &str,
+    ) -> Result<TransferId, TransferProblem> {
+        self.download_over(
+            session,
+            remote,
+            local_directory,
+            TransferProtocol::Sftp,
+            false,
+        )
+    }
+
+    /// Starts a download over one chosen protocol, and of a whole tree when chosen.
+    ///
+    /// Unlike an upload, whether the remote path is a directory is not known here: the
+    /// worker asks the server, and refuses a directory when recursion was not chosen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferProblem`] for the same reasons [`Self::download`] does.
+    pub fn download_over(
+        &mut self,
+        session: SessionId,
+        remote: &str,
+        local_directory: &str,
+        protocol: TransferProtocol,
+        recursive: bool,
     ) -> Result<TransferId, TransferProblem> {
         let name = file_name(remote).ok_or(TransferProblem::SourceNamesNoFile)?;
         if local_directory.trim().is_empty() {
@@ -206,26 +279,26 @@ impl TransferViews {
         let target = local_path(Path::new(local_directory.trim()), name)
             .to_string_lossy()
             .into_owned();
-        self.start(
+        let task = Transfer::queued_over(
             session,
+            protocol,
             TransferDirection::Download,
             remote.to_owned(),
             target,
         )
+        .with_recursive(recursive);
+        self.start(session, task)
     }
 
     /// Creates the task and hands it to the session's connection.
     fn start(
         &mut self,
         session: SessionId,
-        direction: TransferDirection,
-        source: String,
-        destination: String,
+        transfer: Transfer,
     ) -> Result<TransferId, TransferProblem> {
         if !self.can_transfer(session) {
             return Err(TransferProblem::CommandRefused);
         }
-        let transfer = Transfer::queued(session, direction, source, destination);
         let id = self.queue.add(transfer.clone());
         if self.dispatch(
             session,
@@ -467,6 +540,14 @@ pub fn file_name(path: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+/// Whether a local path is a directory.
+///
+/// It is a question about this computer, so it is answered here and not by the worker:
+/// a directory that would not be copied as a whole is refused before a task exists.
+fn is_directory(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
 /// One name inside a local directory, as a path of this platform.

@@ -8,7 +8,7 @@
 
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, SharedString, Stateful, Window, div, px};
-use shellune_core::{AuthMethodKind, HostId};
+use shellune_core::{AuthMethodKind, HostId, TransferProtocol};
 
 use super::{HostFields, ShelluneView};
 use crate::app::components::{self, Variant};
@@ -381,7 +381,74 @@ impl ShelluneView {
         column
     }
 
+    /// The choice of the protocol this host's transfers start with (R10).
+    ///
+    /// SFTP stays the default; SCP is the explicit alternative for a server without an
+    /// SFTP subsystem. The switch changes this host's record only - a transfer started
+    /// from it may still choose the other protocol for that one task.
+    fn copy_protocol_section(
+        &self,
+        draft: &HostDraft,
+        metrics: Metrics,
+        strings: &'static crate::app::copy::Strings,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let chosen = draft.protocol();
+        let mut row =
+            components::segmented(metrics).debug_selector(|| "hosts.editor.protocol".to_owned());
+        for (protocol, label, selector) in [
+            (
+                TransferProtocol::Sftp,
+                strings.transfers_protocol_sftp,
+                "hosts.editor.protocol.sftp",
+            ),
+            (
+                TransferProtocol::Scp,
+                strings.transfers_protocol_scp,
+                "hosts.editor.protocol.scp",
+            ),
+        ] {
+            row = row.child(
+                components::segment(label, protocol == chosen, metrics)
+                    .id(selector)
+                    .debug_selector(move || selector.to_owned())
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        if let Some(draft) = view.hosts.draft_mut() {
+                            draft.set_protocol(protocol);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .child(
+                div()
+                    .pt(metrics.scale(spacing::HAIRLINE))
+                    .text_size(metrics.caption_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.transfers_protocol),
+            )
+            .child(row)
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.transfers_protocol_note),
+            )
+    }
+
     /// The dialog over a dimmed window, while a host is being created or edited.
+    ///
+    /// # The copy protocol
+    ///
+    /// The protocol a host's transfers start with is part of the host, not of a single
+    /// transfer: a server that offers no SFTP subsystem is asked for SCP once and keeps
+    /// it. It is a preference with a consequence, so the note beside the switch says what
+    /// choosing SCP changes - no directory listing and no resume.
     pub(super) fn host_dialog_overlay(
         &self,
         window: &Window,
@@ -434,6 +501,8 @@ impl ShelluneView {
             .child(self.sign_in_fields(fields, &draft, cx))
             .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
             .child(self.jump_section(fields, &draft, cx))
+            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
+            .child(self.copy_protocol_section(&draft, metrics, strings, cx))
             .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
             .child(section(strings.host_startup_label))
             .child(

@@ -233,6 +233,17 @@ pub(crate) enum Command {
     /// connection handle; the answer is dropped unanswered when the loop ends, which
     /// is how a browser waiting for it learns the connection is gone.
     Sftp(oneshot::Sender<Result<Channel<client::Msg>, ChannelFailure>>),
+    /// Open a session channel that runs one remote command.
+    ///
+    /// The traditional SCP copy needs this: the server runs its own `scp` and the
+    /// channel carries that program's control records. The command text is built and
+    /// quoted where the paths are known, and nothing else is ever run through it.
+    Exec {
+        /// The one command line, already quoted for the remote shell.
+        command: String,
+        /// Where the opened channel is sent.
+        reply: oneshot::Sender<Result<Channel<client::Msg>, ChannelFailure>>,
+    },
     /// Start or stop one forwarding rule on this connection.
     Forward(forwarding::ForwardCommand),
     /// Open one `direct-tcpip` channel for a listener that is already up.
@@ -645,6 +656,9 @@ async fn connect_and_shell(
                             // where the connection handle is, and this is the only owner.
                             let _ = reply.send(open_sftp_channel(&handle).await);
                         }
+                        Command::Exec { command, reply } => {
+                            let _ = reply.send(open_exec_channel(&handle, &command).await);
+                        }
                         Command::Resize(next) => {
                             if let Err(error) = write_half
                                 .window_change(next.cols, next.rows, 0, 0)
@@ -713,6 +727,9 @@ async fn connect_and_shell(
                     Command::Sftp(reply) => {
                         let _ = reply.send(open_sftp_channel(&handle).await);
                     }
+                    Command::Exec { command, reply } => {
+                        let _ = reply.send(open_exec_channel(&handle, &command).await);
+                    }
                     // A pure forward has no shell to write to or resize.
                     Command::Write(_) | Command::Resize(_) | Command::Forward(_) | Command::DirectTcp { .. } => {}
                 }
@@ -746,6 +763,32 @@ pub(crate) async fn open_sftp_channel<H: client::Handler>(
             other => ChannelFailure::Lost {
                 reason: other.to_string(),
             },
+        })?;
+    Ok(channel)
+}
+
+/// Opens a session channel and asks the server to run one command on it.
+///
+/// This is what the traditional SCP copy needs: the server runs its own copy program,
+/// and the channel is the pipe that program speaks its control records on. The text is
+/// the caller's, already quoted; a server that refuses the request answers on the
+/// channel itself, which is why an accepted request is not the same as a started
+/// program.
+pub(crate) async fn open_exec_channel<H: client::Handler>(
+    handle: &client::Handle<H>,
+    command: &str,
+) -> Result<Channel<client::Msg>, ChannelFailure> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| ChannelFailure::Lost {
+            reason: error.to_string(),
+        })?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|error| ChannelFailure::Lost {
+            reason: error.to_string(),
         })?;
     Ok(channel)
 }

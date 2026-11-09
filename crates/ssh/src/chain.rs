@@ -32,7 +32,7 @@ use crate::forwarding::{self, ForwardLink};
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 use crate::session::{
     self, Command, DialFailure, HandshakeProgress, HandshakeStage, KEEPALIVE_INTERVAL, Material,
-    PtySize, TERM_VALUE, authenticate, finish_dial, open_sftp_channel,
+    PtySize, TERM_VALUE, authenticate, finish_dial, open_exec_channel, open_sftp_channel,
 };
 use crate::sftp::{self, FileLink};
 use crate::transfer::{self, TransferLink};
@@ -1241,6 +1241,9 @@ async fn drive_shell(
                         Command::Sftp(reply) => {
                             let _ = reply.send(open_sftp_channel(handle).await);
                         }
+                        Command::Exec { command, reply } => {
+                            let _ = reply.send(open_exec_channel(handle, &command).await);
+                        }
                         Command::Resize(next) => {
                             if let Err(error) = write_half.window_change(next.cols, next.rows, 0, 0).await {
                                 forwards.shutdown(handle).await;
@@ -1319,6 +1322,9 @@ async fn drive_shell(
                     }
                     Command::Sftp(reply) => {
                         let _ = reply.send(open_sftp_channel(handle).await);
+                    }
+                    Command::Exec { command, reply } => {
+                        let _ = reply.send(open_exec_channel(handle, &command).await);
                     }
                     Command::Write(_) | Command::Resize(_) | Command::Forward(_) | Command::DirectTcp { .. } => {}
                 }

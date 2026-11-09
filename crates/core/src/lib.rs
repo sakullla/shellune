@@ -52,8 +52,8 @@ pub use snippet::{
 };
 pub use task::{
     OverwriteChoice, PARTIAL_PREFIX, PartialRecord, ResumeHint, ResumeRefusal, Transfer,
-    TransferDirection, TransferEvent, TransferFailure, TransferQueue, TransferState,
-    TransferUpdate, TransferUpdateError, partial_path,
+    TransferDirection, TransferEvent, TransferFailure, TransferProtocol, TransferQueue,
+    TransferState, TransferUpdate, TransferUpdateError, partial_path,
 };
 pub use workspace::{
     MAX_TAB_NAME_CHARS, PaneNode, PaneTarget, PanelConfig, PanelSection, PendingConnection,

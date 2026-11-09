@@ -17,6 +17,8 @@
 //!   ProxyCommand all become after the chain has decided to open them;
 //! * [sftp] browses directories over the connection the shell already authenticated;
 //! * [transfer] moves file contents over that same connection, under a temporary name;
+//! * [scp] copies a file or one chosen directory with the traditional SCP protocol, for
+//!   a server that offers no SFTP subsystem;
 //! * [forwarding] binds local and dynamic listeners and asks the server for remote
 //!   ones, on the connection that is already authenticated;
 //! * [error] keeps every failure free of credentials.
@@ -27,6 +29,7 @@ mod chain;
 pub mod error;
 pub mod forwarding;
 pub mod hostkey;
+mod scp;
 pub mod session;
 pub mod sftp;
 pub mod transfer;

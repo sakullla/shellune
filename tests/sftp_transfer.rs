@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 
 use shellune_core::{
     AuthMethod, OverwriteChoice, PARTIAL_PREFIX, PartialRecord, ResumeHint, SessionId, Transfer,
-    TransferDirection, TransferEvent, TransferFailure, TransferId, TransferQueue, TransferUpdate,
+    TransferDirection, TransferEvent, TransferFailure, TransferId, TransferProtocol, TransferQueue,
+    TransferUpdate,
 };
 use shellune_ssh::testserver::Harness;
 use shellune_ssh::{
@@ -304,6 +305,9 @@ fn start_from(
             source: source.to_owned(),
             destination: destination.to_owned(),
             resume,
+            // This file is about the SFTP path; the SCP protocol has its own binary.
+            protocol: TransferProtocol::Sftp,
+            recursive: false,
         })),
         "the transfer reaches the connection"
     );

@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 use shellune_core::{
     BrowseFailure, BrowseRequest, BrowseResponse, FileBrowser, FileKind, MutationAction,
-    MutationOutcome, MutationStep, NameProblem, SessionId, join_path, normalize_path, parent_path,
+    MutationOutcome, MutationStep, NameProblem, SessionId, TransferProtocol, join_path,
+    normalize_path, parent_path,
 };
 use shellune_ssh::FileLink;
 
@@ -984,10 +985,18 @@ pub enum FilesDialog {
         session: SessionId,
         /// The source that would receive the file. An upload is always remote.
         source: FileSource,
-        /// The directory on screen, which is where the file would land.
+        /// The remote directory the file would land in.
+        ///
+        /// It starts at the directory on screen and is editable, because a server
+        /// without an SFTP subsystem has no directory on screen and a traditional SCP
+        /// copy is still allowed there - the user types the path instead.
         directory: String,
         /// The local path the user typed.
         text: String,
+        /// Which protocol would copy it, chosen for this task.
+        protocol: TransferProtocol,
+        /// Whether a directory source would be copied with its contents.
+        recursive: bool,
         /// Why the last attempt could not start, when it could not.
         problem: Option<PathProblem>,
     },
@@ -997,10 +1006,15 @@ pub enum FilesDialog {
         session: SessionId,
         /// The source the entry is copied from. A download is always remote.
         source: FileSource,
-        /// The remote path of the entry.
+        /// The remote path of the entry, editable for the same reason an upload's
+        /// directory is.
         remote: String,
         /// The local directory the user typed.
         text: String,
+        /// Which protocol would copy it, chosen for this task.
+        protocol: TransferProtocol,
+        /// Whether a remote directory would be copied with its contents.
+        recursive: bool,
         /// Why the last attempt could not start, when it could not.
         problem: Option<PathProblem>,
     },
@@ -1059,6 +1073,109 @@ impl FilesDialog {
         }
     }
 
+    /// Replaces the remote path of a transfer question and forgets the last refusal.
+    ///
+    /// The remote side of an upload is the directory its file would land in; the remote
+    /// side of a download is the entry itself. Either way it is the path the user typed,
+    /// so a server that offers no directory listing is still usable.
+    pub fn set_remote(&mut self, typed: String) {
+        match self {
+            Self::Upload {
+                directory, problem, ..
+            } => {
+                *directory = typed;
+                *problem = None;
+            }
+            Self::Download {
+                remote, problem, ..
+            } => {
+                *remote = typed;
+                *problem = None;
+            }
+            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => {}
+        }
+    }
+
+    /// The remote path of a transfer question, when it has one.
+    #[must_use]
+    pub fn remote(&self) -> Option<&str> {
+        match self {
+            Self::Upload { directory, .. } => Some(directory),
+            Self::Download { remote, .. } => Some(remote),
+            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => None,
+        }
+    }
+
+    /// Which protocol this question would copy with, when it is a transfer question.
+    #[must_use]
+    pub fn protocol(&self) -> Option<TransferProtocol> {
+        match self {
+            Self::Upload { protocol, .. } | Self::Download { protocol, .. } => Some(*protocol),
+            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => None,
+        }
+    }
+
+    /// Chooses the protocol for this one transfer.
+    ///
+    /// The choice starts at the host's default and belongs to this task: it never
+    /// changes the host, and a failure of the chosen protocol is reported as that
+    /// protocol's failure instead of being retried over the other one.
+    pub fn set_protocol(&mut self, chosen: TransferProtocol) {
+        match self {
+            Self::Upload {
+                protocol,
+                recursive,
+                problem,
+                ..
+            }
+            | Self::Download {
+                protocol,
+                recursive,
+                problem,
+                ..
+            } => {
+                *protocol = chosen;
+                if !chosen.copies_directories() {
+                    // Only SCP copies a directory, and only when it was asked to.
+                    *recursive = false;
+                }
+                *problem = None;
+            }
+            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => {}
+        }
+    }
+
+    /// Whether this question would copy a directory with its contents.
+    #[must_use]
+    pub fn recursive(&self) -> bool {
+        match self {
+            Self::Upload { recursive, .. } | Self::Download { recursive, .. } => *recursive,
+            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => false,
+        }
+    }
+
+    /// Turns the explicit recursive choice on or off.
+    pub fn set_recursive(&mut self, recursive: bool) {
+        match self {
+            Self::Upload {
+                recursive: current,
+                protocol,
+                problem,
+                ..
+            }
+            | Self::Download {
+                recursive: current,
+                protocol,
+                problem,
+                ..
+            } => {
+                *current = recursive && protocol.copies_directories();
+                *problem = None;
+            }
+            Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => {}
+        }
+    }
+
     /// States why the text cannot be sent, keeping the text in front of the user.
     pub fn fail(&mut self, failure: NameProblem) {
         match self {
@@ -1112,6 +1229,7 @@ pub fn path_problem_text(problem: &PathProblem, strings: &Strings) -> &'static s
     match problem {
         PathProblem::Empty => strings.transfers_problem_empty_path,
         PathProblem::NoName => strings.transfers_problem_no_name,
+        PathProblem::NeedsRecursion => strings.transfers_problem_needs_recursion,
     }
 }
 
@@ -1122,6 +1240,7 @@ pub fn transfer_problem_text(problem: &TransferProblem, strings: &Strings) -> &'
         TransferProblem::SourceNamesNoFile => strings.transfers_problem_no_source,
         TransferProblem::DirectoryUnknown => strings.transfers_problem_no_directory,
         TransferProblem::CommandRefused => strings.transfers_problem_no_connection,
+        TransferProblem::DirectoryNeedsRecursion => strings.transfers_problem_needs_recursion,
     }
 }
 

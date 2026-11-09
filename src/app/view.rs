@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use shellune_core::{
     BrowseFailure, BrowseState, EventTag, FileKind, ForwardId, ForwardRule, HostConfig, HostId,
     HostValidationError, LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState,
-    SplitAxis, TabAccent, TabId, Transfer, TransferDirection, join_path,
+    SplitAxis, TabAccent, TabId, Transfer, TransferDirection, TransferProtocol, join_path,
 };
 use shellune_ssh::PtySize;
 #[cfg(test)]
@@ -436,6 +436,8 @@ pub struct ShelluneView {
     files_dialog: Option<FilesDialog>,
     /// The field of that question, present only while it has one.
     files_field: Option<Entity<TextField>>,
+    /// The remote path field of a transfer question, when it has one (R10).
+    files_remote_field: Option<Entity<TextField>>,
     /// Focus of the local column, so its keys are not the terminal's keys.
     files_local_focus: FocusHandle,
     /// Focus of the remote column.
@@ -843,6 +845,7 @@ impl ShelluneView {
             files_polling: false,
             files_dialog: None,
             files_field: None,
+            files_remote_field: None,
             files_local_focus: cx.focus_handle(),
             files_remote_focus: cx.focus_handle(),
             viewport_width: px(crate::app::DEFAULT_WINDOW_SIZE.0),
@@ -1656,11 +1659,15 @@ impl ShelluneView {
             .and_then(|browser| browser.current_directory())
             .map(str::to_owned);
         let mut typed = Vec::new();
+        let protocol = self.session_protocol(id);
         for local in &locals {
-            match self
-                .transfers
-                .upload(id, local, Some(directory.as_deref().unwrap_or(".")))
-            {
+            match self.transfers.upload_over(
+                id,
+                local,
+                Some(directory.as_deref().unwrap_or(".")),
+                protocol,
+                false,
+            ) {
                 Ok(_) => {
                     let name = std::path::Path::new(local)
                         .file_name()
@@ -1677,17 +1684,7 @@ impl ShelluneView {
                     });
                 }
                 Err(problem) => {
-                    let reason = match problem {
-                        TransferProblem::SourceNamesNoFile => {
-                            self.strings().transfers_problem_no_name
-                        }
-                        TransferProblem::DirectoryUnknown => {
-                            self.strings().transfers_problem_no_directory
-                        }
-                        TransferProblem::CommandRefused => {
-                            self.strings().transfers_problem_no_connection
-                        }
-                    };
+                    let reason = transfer_problem_text(&problem, self.strings());
                     let title = copy::ux().drop_upload_failed;
                     self.toast(Tone::Danger, title, Some(format!("{local} · {reason}")), cx);
                 }
@@ -1873,42 +1870,49 @@ impl ShelluneView {
     // Transfers (R10, R17)
     // -----------------------------------------------------------------------
 
-    /// Asks for the local file to upload into the directory on screen (R10).
+    /// Asks for the local file to upload into a remote directory (R10).
     ///
-    /// The question names the directory, so where the file would land is visible before
-    /// anything is sent; the field is where the local path is typed.
+    /// Two things are visible before anything is sent: the remote directory the file
+    /// would land in - editable, because a server without SFTP has no listing to pick
+    /// one from - and the protocol that would copy it, which starts at the host's own
+    /// choice and can be changed for this one transfer.
     fn files_ask_upload(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(directory) = self
+        let directory = self
             .files
             .browser(id)
             .and_then(|browser| browser.current_directory())
             .map(str::to_owned)
-        else {
-            return;
-        };
+            .unwrap_or_else(|| "~".to_owned());
+        let protocol = self.session_protocol(id);
         let placeholder = self.strings().transfers_upload_placeholder;
         let field = cx.new(|cx| {
             let mut field = TextField::new(placeholder, cx);
             field.set_browse(Browse::File, cx);
             field
         });
-        self.open_files_dialog(
+        let remote_placeholder = self.strings().transfers_remote_directory;
+        let remote = cx.new(|cx| TextField::with_text(remote_placeholder, &directory, cx));
+        self.open_files_dialog_with(
             FilesDialog::Upload {
                 session: id,
                 source: FileSource::Remote,
                 directory,
                 text: String::new(),
+                protocol,
+                recursive: false,
                 problem: None,
             },
             field,
+            Some(remote),
             cx,
         );
     }
 
     /// Asks where one remote entry should be downloaded to (R10).
     ///
-    /// The folder starts at this account's home directory: a real place on this machine
-    /// that the user can correct, instead of an empty field with no hint.
+    /// The remote path is editable for the same reason an upload's directory is, and the
+    /// folder starts at this account's home directory: a real place on this machine that
+    /// the user can correct, instead of an empty field with no hint.
     fn files_ask_download(&mut self, id: SessionId, name: &str, cx: &mut Context<Self>) {
         let Some(directory) = self
             .files
@@ -1919,6 +1923,7 @@ impl ShelluneView {
             return;
         };
         let remote = join_path(&directory, name);
+        let protocol = self.session_protocol(id);
         let placeholder = self.strings().transfers_download_placeholder;
         let suggested = default_download_directory();
         let field = cx.new(|cx| {
@@ -1926,27 +1931,41 @@ impl ShelluneView {
             field.set_browse(Browse::Directory, cx);
             field
         });
-        self.open_files_dialog(
+        let remote_placeholder = self.strings().transfers_remote_path;
+        let remote_field = cx.new(|cx| TextField::with_text(remote_placeholder, &remote, cx));
+        self.open_files_dialog_with(
             FilesDialog::Download {
                 session: id,
                 source: FileSource::Remote,
                 remote,
                 text: suggested,
+                protocol,
+                recursive: false,
                 problem: None,
             },
             field,
+            Some(remote_field),
             cx,
         );
     }
 
     /// Starts the upload the question described, or says why it cannot start.
+    ///
+    /// Two ways reach this: the question's confirm button, whose three choices it reads,
+    /// and a row button or a drop, which has no question and therefore uses the directory
+    /// on screen and the host's own protocol.
     fn start_upload(&mut self, id: SessionId, local: &str, cx: &mut Context<Self>) {
-        let directory = self
-            .files
-            .browser(id)
-            .and_then(|browser| browser.current_directory())
-            .map(str::to_owned);
-        let started = self.transfers.upload(id, local, directory.as_deref());
+        let (directory, protocol, recursive) =
+            self.transfer_question_for(id).unwrap_or_else(|| {
+                (
+                    self.on_screen_remote_directory(id),
+                    self.session_protocol(id),
+                    false,
+                )
+            });
+        let started =
+            self.transfers
+                .upload_over(id, local, directory.as_deref(), protocol, recursive);
         self.finish_transfer_question(id, started, cx);
     }
 
@@ -1958,8 +1977,58 @@ impl ShelluneView {
         folder: &str,
         cx: &mut Context<Self>,
     ) {
-        let started = self.transfers.download(id, remote, folder);
+        let (_, protocol, recursive) = self
+            .transfer_question_for(id)
+            .unwrap_or_else(|| (None, self.session_protocol(id), false));
+        let started = self
+            .transfers
+            .download_over(id, remote, folder, protocol, recursive);
         self.finish_transfer_question(id, started, cx);
+    }
+
+    /// The remote directory the file view of this session is showing.
+    fn on_screen_remote_directory(&self, id: SessionId) -> Option<String> {
+        self.files
+            .browser(id)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned)
+    }
+
+    /// The remote path, protocol and recursive choice the open question carries.
+    ///
+    /// `None` means no transfer question is open for this session. The question is the
+    /// one place these three were chosen, so a task started from it is built from it and
+    /// not from a second opinion about the same facts.
+    fn transfer_question_for(
+        &self,
+        id: SessionId,
+    ) -> Option<(Option<String>, TransferProtocol, bool)> {
+        let dialog = self
+            .files_dialog
+            .as_ref()
+            .filter(|dialog| dialog.session() == id)?;
+        Some((
+            dialog.remote().map(str::to_owned),
+            dialog.protocol()?,
+            dialog.recursive(),
+        ))
+    }
+
+    /// The protocol this session starts a transfer with (R10).
+    ///
+    /// It is the choice saved on the host the session was opened from, so a server
+    /// without an SFTP subsystem does not need the protocol picked again for every file.
+    /// A session that was opened without a saved host starts from the SFTP default.
+    fn session_protocol(&self, id: SessionId) -> TransferProtocol {
+        self.workspace
+            .session(id)
+            .and_then(|session| match session.kind() {
+                SessionKind::Remote { host } => {
+                    self.book.host(*host).map(HostConfig::transfer_protocol)
+                }
+                SessionKind::Local { .. } => None,
+            })
+            .unwrap_or_default()
     }
 
     /// Closes a transfer question and refreshes the window, or keeps it open with the
@@ -1973,7 +2042,7 @@ impl ShelluneView {
         match started {
             Ok(_) => {
                 self.files_dialog = None;
-                self.files_field = None;
+                self.clear_files_fields();
                 self.transfer_problem = None;
                 self.watch_files(cx);
             }
@@ -1985,12 +2054,16 @@ impl ShelluneView {
                     TransferProblem::SourceNamesNoFile => Some(PathProblem::NoName),
                     TransferProblem::DirectoryUnknown => Some(PathProblem::Empty),
                     TransferProblem::CommandRefused => None,
+                    // A directory named without the recursive choice is a mistake in what
+                    // was typed, so the field says so; a connection that could not take
+                    // the command is not, and is reported beside the list instead.
+                    TransferProblem::DirectoryNeedsRecursion => Some(PathProblem::NeedsRecursion),
                 };
                 match (field_problem, self.files_dialog.as_mut()) {
                     (Some(field_problem), Some(dialog)) => dialog.fail_path(field_problem),
                     _ => {
                         self.files_dialog = None;
-                        self.files_field = None;
+                        self.clear_files_fields();
                         // Nothing was typed wrongly here: the connection could not take
                         // the command, so the reason is reported beside the list.
                         self.transfer_problem = Some((id, problem));
@@ -7387,7 +7460,13 @@ impl ShelluneView {
         }
         let mut started = 0;
         for local in &files {
-            match self.transfers.upload(id, local, directory.as_deref()) {
+            match self.transfers.upload_over(
+                id,
+                local,
+                directory.as_deref(),
+                self.session_protocol(id),
+                false,
+            ) {
                 Ok(_) => started += 1,
                 Err(problem) => {
                     self.transfer_problem = Some((id, problem));
@@ -7499,7 +7578,7 @@ impl ShelluneView {
             .is_some_and(|dialog| dialog.session() == id)
         {
             self.files_dialog = None;
-            self.files_field = None;
+            self.clear_files_fields();
         }
     }
 
@@ -7511,7 +7590,7 @@ impl ShelluneView {
             .is_some_and(|dialog| dialog.session() == id && dialog.source() == source)
         {
             self.files_dialog = None;
-            self.files_field = None;
+            self.clear_files_fields();
         }
     }
 
@@ -7603,8 +7682,17 @@ impl ShelluneView {
             kind,
             problem: None,
         });
-        self.files_field = None;
+        self.clear_files_fields();
         cx.notify();
+    }
+
+    /// Forgets both fields of a question that is being closed.
+    ///
+    /// A field left over from a closed question would stay bound to a dialog that no
+    /// longer exists, and editing it would rewrite the next question's path.
+    fn clear_files_fields(&mut self) {
+        self.files_field = None;
+        self.files_remote_field = None;
     }
 
     /// Shows a question and binds its field, sending nothing.
@@ -7612,6 +7700,17 @@ impl ShelluneView {
         &mut self,
         dialog: FilesDialog,
         field: Entity<TextField>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_files_dialog_with(dialog, field, None, cx);
+    }
+
+    /// Shows a question with an optional second field for its remote path.
+    fn open_files_dialog_with(
+        &mut self,
+        dialog: FilesDialog,
+        field: Entity<TextField>,
+        remote: Option<Entity<TextField>>,
         cx: &mut Context<Self>,
     ) {
         self.files_dialog = Some(dialog);
@@ -7635,11 +7734,26 @@ impl ShelluneView {
             cx.notify();
         })
         .detach();
+        if let Some(remote) = &remote {
+            // The remote path is bound the same way as the local one: what the user
+            // types is what the task would use, and typing again clears the last reason
+            // an attempt could not start.
+            let remote = remote.clone();
+            cx.observe(&remote, move |view, text_field, cx| {
+                let text = text_field.read(cx).text().to_owned();
+                if let Some(dialog) = view.files_dialog.as_mut() {
+                    dialog.set_remote(text);
+                }
+                cx.notify();
+            })
+            .detach();
+        }
         let handle = field.read(cx).focus_handle().clone();
         if let Some(window) = cx.active_window() {
             let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
         }
         self.files_field = Some(field);
+        self.files_remote_field = remote;
         cx.notify();
     }
 
@@ -7688,7 +7802,7 @@ impl ShelluneView {
     /// this process, so there is nothing on the server to undo.
     fn files_cancel_change(&mut self, cx: &mut Context<Self>) {
         self.files_dialog = None;
-        self.files_field = None;
+        self.clear_files_fields();
         cx.notify();
     }
 
@@ -7766,7 +7880,7 @@ impl ShelluneView {
             Ok(()) => {
                 // The question is answered: the report and the next listing say the rest.
                 self.files_dialog = None;
-                self.files_field = None;
+                self.clear_files_fields();
                 self.watch_files(cx);
             }
             Err(problem) => {
@@ -8177,6 +8291,20 @@ impl ShelluneView {
                     .child(SharedString::from(strings.files_terminal_note)),
             )
             .child(actions);
+        // A server without an SFTP subsystem cannot be browsed, but its own `scp` can
+        // still copy a file. The reason and the next step are both stated, because "the
+        // directory cannot be listed" is not the same answer as "nothing can be copied",
+        // and only the first one is true.
+        if source == FileSource::Remote && matches!(failure, BrowseFailure::Unavailable { .. }) {
+            let hint_id = files_element_id(source, "failure.scp.hint");
+            card = card.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(move || hint_id.to_string())
+                    .child(SharedString::from(strings.files_sftp_scp_hint)),
+            );
+        }
         // The terminal still owns the connection, so Refresh is the action that
         // reads this source again. A session reconnect button would return immediately.
         if failure.is_connection_lost()
@@ -8725,7 +8853,7 @@ impl ShelluneView {
         if let Some(residue) = task.state().residue() {
             detail.push_str(&format!(" · {}: {residue}", strings.transfers_residue));
         }
-        if let Some(hint) = task.state().resume() {
+        if let Some(hint) = task.resume_hint() {
             detail.push_str(&format!(
                 " · {} {}",
                 strings.transfers_resume_from, hint.offset
@@ -8770,7 +8898,10 @@ impl ShelluneView {
     ) -> Div {
         let strings = self.strings();
         let id = task.id();
-        let resumable = task.state().resume().is_some();
+        // The checkpoint the task may really continue, which is what a resume button
+        // promises. A protocol without resume answers nothing here even when a record
+        // from elsewhere still names an offset, so SCP never offers such an entry.
+        let resumable = task.resume_hint().is_some();
         let refused = matches!(
             task.state().failure(),
             Some(shellune_core::TransferFailure::ResumeRefused { .. })
@@ -8900,6 +9031,21 @@ impl ShelluneView {
                                 task.source(),
                                 task.destination()
                             ))),
+                    )
+                    .child(
+                        // Which protocol moved these bytes: a task copied with SCP must
+                        // not be read as one that used the SFTP subsystem, and the other
+                        // way round.
+                        components::chip(
+                            SharedString::from(format!(
+                                "{} {}",
+                                self.strings().transfers_protocol_label,
+                                task.protocol().label()
+                            )),
+                            Tone::Neutral,
+                            metrics,
+                        )
+                        .debug_selector(move || format!("transfers.protocol.{index}")),
                     ),
             )
             .child(
@@ -8909,6 +9055,51 @@ impl ShelluneView {
                     .child(SharedString::from(detail)),
             )
             .child(actions)
+    }
+
+    /// The switch that chooses this one transfer's protocol (R10).
+    ///
+    /// It starts at the host's own choice and belongs to this task: a failure of the
+    /// chosen protocol is reported as that protocol's failure, so the switch is a
+    /// decision rather than a preference the window may overrule.
+    fn transfer_protocol_choice(
+        &self,
+        chosen: TransferProtocol,
+        metrics: Metrics,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut row = components::segmented(metrics)
+            .debug_selector(|| "files.question.protocol".to_owned())
+            .child(
+                div()
+                    .flex_none()
+                    .px(metrics.scale(spacing::HAIRLINE))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(SharedString::from(strings.transfers_protocol)),
+            );
+        for (protocol, label) in [
+            (TransferProtocol::Sftp, strings.transfers_protocol_sftp),
+            (TransferProtocol::Scp, strings.transfers_protocol_scp),
+        ] {
+            let selector = match protocol {
+                TransferProtocol::Sftp => "files.question.protocol.sftp",
+                TransferProtocol::Scp => "files.question.protocol.scp",
+            };
+            row = row.child(
+                components::segment(label, protocol == chosen, metrics)
+                    .id(selector)
+                    .debug_selector(move || selector.to_owned())
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        if let Some(dialog) = view.files_dialog.as_mut() {
+                            dialog.set_protocol(protocol);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        row
     }
 
     /// The question about a change, when one is being asked for this session (R11).
@@ -8978,6 +9169,33 @@ impl ShelluneView {
                     FilesDialog::Download { remote, .. } => remote.clone(),
                     _ => directory.clone().unwrap_or_default(),
                 };
+                // A transfer question shows the remote side as a field of its own: a
+                // server without an SFTP subsystem has no listing to pick a directory
+                // from, and typing the path is what makes SCP possible there at all.
+                if let (Some(label), Some(field)) = (
+                    match dialog {
+                        FilesDialog::Upload { .. } => Some(strings.transfers_remote_directory),
+                        FilesDialog::Download { .. } => Some(strings.transfers_remote_path),
+                        _ => None,
+                    },
+                    &self.files_remote_field,
+                ) {
+                    card = card.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .gap(metrics.scale(2.0))
+                            .debug_selector(|| "files.question.remote".to_owned())
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(SharedString::from(label)),
+                            )
+                            .child(div().flex_none().child(field.clone())),
+                    );
+                }
                 card = card.child(
                     div()
                         .flex_1()
@@ -8994,6 +9212,40 @@ impl ShelluneView {
                             .debug_selector(|| "files.question.input".to_owned())
                             .child(field.clone()),
                     );
+                }
+                if let Some(chosen) = dialog.protocol() {
+                    card = card.child(self.transfer_protocol_choice(chosen, metrics, strings, cx));
+                    if chosen == TransferProtocol::Scp {
+                        card = card.child(
+                            div()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .debug_selector(|| "files.question.protocol.note".to_owned())
+                                .child(SharedString::from(strings.transfers_protocol_note)),
+                        );
+                        card = card.child(
+                            components::segment(
+                                format!(
+                                    "{} {}",
+                                    if dialog.recursive() { "[x]" } else { "[ ]" },
+                                    strings.transfers_recursive
+                                ),
+                                dialog.recursive(),
+                                metrics,
+                            )
+                            .id("files.question.recursive")
+                            .debug_selector(|| "files.question.recursive".to_owned())
+                            .on_click(cx.listener(
+                                |view, _event, _window, cx| {
+                                    if let Some(dialog) = view.files_dialog.as_mut() {
+                                        let next = !dialog.recursive();
+                                        dialog.set_recursive(next);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        );
+                    }
                 }
                 if let Some(problem) = dialog.problem() {
                     card = card.child(
@@ -9504,6 +9756,34 @@ impl ShelluneView {
         if let Some(dialog) = self.files_dialog.as_mut() {
             dialog.set_text(text.to_owned());
         }
+    }
+
+    /// Replaces the remote path of the open transfer question, for a test.
+    #[cfg(test)]
+    pub fn files_question_set_remote_for_test(&mut self, remote: &str) {
+        if let Some(dialog) = self.files_dialog.as_mut() {
+            dialog.set_remote(remote.to_owned());
+        }
+    }
+
+    /// The remote path the open transfer question carries, for a test.
+    #[cfg(test)]
+    pub fn files_question_remote(&self) -> Option<&str> {
+        self.files_dialog.as_ref().and_then(FilesDialog::remote)
+    }
+
+    /// The protocol the open transfer question would copy with, for a test.
+    #[cfg(test)]
+    pub fn files_question_protocol(&self) -> Option<TransferProtocol> {
+        self.files_dialog.as_ref().and_then(FilesDialog::protocol)
+    }
+
+    /// Whether the open transfer question would copy a whole directory, for a test.
+    #[cfg(test)]
+    pub fn files_question_recursive(&self) -> bool {
+        self.files_dialog
+            .as_ref()
+            .is_some_and(FilesDialog::recursive)
     }
 
     /// Sends the open question, for a test that cannot press the confirm button.
