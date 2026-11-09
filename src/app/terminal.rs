@@ -32,13 +32,15 @@ use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession};
 use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
-    GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, PtyEvent, Rgb, SelectionType,
-    Snapshot, TermMode, TerminalCore, TerminalEffects, encode_key, encode_paste, encode_text,
-    grid_for, palette, paste_needs_confirmation, paste_preview, sanitize_font_size, step_font_size,
+    GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, PtyEvent, RenderedCell, Rgb,
+    SelectionType, Snapshot, TermMode, TerminalCore, TerminalEffects, encode_key, encode_paste,
+    encode_text, grid_for, palette, paste_needs_confirmation, paste_preview, sanitize_font_size,
+    step_font_size,
 };
 
 use crate::app::components;
 use crate::app::copy::Locale;
+use crate::app::glyphs;
 use crate::app::icons::Icon;
 use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, spacing};
 
@@ -1328,77 +1330,184 @@ impl TerminalPane {
             )
     }
 
-    fn row(&self, index: usize, snapshot: &Snapshot) -> gpui::Div {
+    /// One row of the grid, drawn in three layers, every piece at its own column:
+    /// the backgrounds, the cursor, then the text and the drawn shapes on top.
+    ///
+    /// Positions come from the column, never from the width of the glyphs drawn
+    /// before: a character from a fallback face (a frame line, an icon, a CJK
+    /// character) is drawn in its cell and cannot push the rest of the row off its
+    /// columns.
+    fn row(&self, index: usize, snapshot: &Snapshot, focused: bool) -> gpui::Div {
         let cell = self.cell.sanitized();
-        let default_background = color_of(palette::BACKGROUND);
+        let (width, height) = (cell.width, cell.height);
         let mut element = div()
-            .flex()
-            .flex_none()
-            .items_start()
             .relative()
+            .flex_none()
             .w_full()
-            .h(px(cell.height))
+            .h(px(height))
             .whitespace_nowrap()
             .debug_selector(move || format!("terminal.row.{index}"));
-
         let Some(row) = snapshot.rows.get(index) else {
             return element;
         };
+        let canvas_color = color_of(palette::BACKGROUND);
+        let cursor_color = color_of(palette::CURSOR);
+        let cursor = snapshot
+            .cursor
+            .filter(|cursor| cursor.row == index && cursor.shape != CursorShape::Hidden);
+        // A focused block cursor is solid, and the character under it is drawn in
+        // the canvas colour so it stays legible.
+        let solid_cursor = cursor
+            .filter(|cursor| focused && cursor.shape == CursorShape::Block)
+            .map(|cursor| cursor.column);
+        let x = |column: usize| px(column as f32 * width);
 
-        let mut run = String::new();
-        let mut style: Option<(gpui::Rgba, gpui::Rgba, bool, bool, bool)> = None;
+        // Backgrounds: one rectangle per stretch of cells with the same colour.
+        let mut column = 0;
+        let mut stretch: Option<(usize, usize, gpui::Rgba)> = None;
+        let mut backgrounds = Vec::new();
         for rendered in &row.cells {
-            let key = (
-                color_of(rendered.foreground),
-                color_of(rendered.background),
-                rendered.attributes.bold,
-                rendered.attributes.underline,
-                rendered.selected,
-            );
-            if style != Some(key) {
-                element = append_run(
-                    element,
-                    std::mem::take(&mut run),
-                    style,
-                    default_background,
-                    cell,
-                    self.font_size,
-                );
-                style = Some(key);
+            let span = rendered.width.max(1);
+            let background = cell_background(rendered, canvas_color);
+            match (&mut stretch, background) {
+                (Some((_, end, color)), Some(next)) if *color == next && *end == column => {
+                    *end = column + span;
+                }
+                (_, next) => {
+                    backgrounds.extend(stretch.take());
+                    stretch = next.map(|color| (column, column + span, color));
+                }
             }
-            // A wide character already covers the following column, so only its
-            // own glyph is written and the spacer stays out of the row.
-            run.push_str(&rendered.text);
+            column += span;
         }
-        element = append_run(
-            element,
-            run,
-            style,
-            default_background,
-            cell,
-            self.font_size,
-        );
-
-        if let Some(cursor) = snapshot.cursor
-            && cursor.row == index
-        {
-            let (width, height, top) = match cursor.shape {
-                CursorShape::Beam => (CARET_WIDTH, cell.height, 0.0),
-                CursorShape::Underline => (cell.width, CARET_WIDTH, cell.height - CARET_WIDTH),
-                _ => (CARET_WIDTH, cell.height, 0.0),
-            };
+        backgrounds.extend(stretch);
+        for (start, end, color) in backgrounds {
             element = element.child(
                 div()
                     .absolute()
-                    .left(px(cursor.column as f32 * cell.width))
-                    .top(px(top))
-                    .w(px(width))
+                    .top_0()
+                    .left(x(start))
+                    .w(x(end - start))
                     .h(px(height))
-                    .bg(theme::swatch(shell_palette::ACCENT)),
+                    .bg(color),
             );
         }
 
-        element
+        if let Some(cursor) = cursor {
+            let left = x(cursor.column);
+            let caret = px(CARET_WIDTH);
+            let mark = div()
+                .absolute()
+                .left(left)
+                .debug_selector(|| "terminal.cursor".to_owned());
+            element = element.child(match cursor.shape {
+                CursorShape::Beam => mark.top_0().w(caret).h(px(height)).bg(cursor_color),
+                CursorShape::Underline => mark
+                    .top(px(height - CARET_WIDTH))
+                    .w(px(width))
+                    .h(caret)
+                    .bg(cursor_color),
+                CursorShape::Block if focused => {
+                    mark.top_0().w(px(width)).h(px(height)).bg(cursor_color)
+                }
+                // Unfocused, or asked for: an outline, so the text stays readable
+                // and the pane shows it does not have the keyboard.
+                _ => mark
+                    .top_0()
+                    .w(px(width))
+                    .h(px(height))
+                    .border_1()
+                    .border_color(cursor_color),
+            });
+        }
+
+        // Text and shapes.
+        let stroke = (self.font_size / 13.0).round().max(1.0);
+        let mut column = 0;
+        let mut run: Option<TextRun> = None;
+        let mut shapes: Option<ShapeRun> = None;
+        let mut pieces: Vec<gpui::Div> = Vec::new();
+        for rendered in &row.cells {
+            let span = rendered.width.max(1);
+            let background = cell_background(rendered, canvas_color).unwrap_or(canvas_color);
+            let ink = if solid_cursor == Some(column) {
+                canvas_color
+            } else {
+                ink(
+                    color_of(rendered.foreground),
+                    background,
+                    rendered.attributes.dim,
+                )
+            };
+            let style = TextStyle {
+                ink,
+                bold: rendered.attributes.bold,
+                italic: rendered.attributes.italic,
+                underline: rendered.attributes.underline,
+                strike: rendered.attributes.strikethrough,
+            };
+            let mut characters = rendered.text.chars();
+            let first = characters.next().unwrap_or(' ');
+            let single = characters.next().is_none();
+            let drawn = if single { glyphs::shape(first) } else { None };
+
+            if let Some(shape) = drawn {
+                flush_text(&mut run, &mut pieces, cell, self.font_size, index);
+                let joins = shapes.as_ref().is_some_and(|current| {
+                    current.character == first
+                        && current.ink == ink
+                        && current.end == column
+                        && shape.tiles_horizontally()
+                });
+                if joins {
+                    if let Some(current) = shapes.as_mut() {
+                        current.end = column + span;
+                    }
+                } else {
+                    flush_shapes(&mut shapes, &mut pieces, cell, stroke, index);
+                    shapes = Some(ShapeRun {
+                        character: first,
+                        shape,
+                        ink,
+                        start: column,
+                        end: column + span,
+                    });
+                }
+            } else {
+                flush_shapes(&mut shapes, &mut pieces, cell, stroke, index);
+                let blank = rendered.text.trim().is_empty();
+                // Plain ASCII shares the grid font's advance, so a run of it can be
+                // drawn as one piece; anything else is drawn alone in its cells.
+                let plain = single && first.is_ascii() && span == 1;
+                let continues = run.as_ref().is_some_and(|current| {
+                    current.plain && current.style == style && current.end == column
+                });
+                if plain && continues {
+                    if let Some(current) = run.as_mut() {
+                        current.text.push_str(&rendered.text);
+                        current.end = column + span;
+                    }
+                } else if blank && !(style.underline || style.strike) {
+                    flush_text(&mut run, &mut pieces, cell, self.font_size, index);
+                } else {
+                    flush_text(&mut run, &mut pieces, cell, self.font_size, index);
+                    run = Some(TextRun {
+                        text: rendered.text.clone(),
+                        style,
+                        plain,
+                        start: column,
+                        end: column + span,
+                    });
+                    if !plain {
+                        flush_text(&mut run, &mut pieces, cell, self.font_size, index);
+                    }
+                }
+            }
+            column += span;
+        }
+        flush_text(&mut run, &mut pieces, cell, self.font_size, index);
+        flush_shapes(&mut shapes, &mut pieces, cell, stroke, index);
+        element.children(pieces)
     }
 
     fn composition_overlay(&self, snapshot: &Snapshot) -> Option<gpui::Div> {
@@ -1429,14 +1538,22 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let integrated = self.core.presentation() == TerminalMode::Integrated;
+        // An icon that is lit while command blocks are on; the tooltip names the
+        // view it is in.
         let label = if integrated {
             strings.terminal_mode_blocks
         } else {
             strings.terminal_mode_classic
         };
-        components::compact_button(label, components::Variant::Ghost, metrics)
+        components::icon_only_button(Icon::Layers, metrics)
+            .h(metrics.scale(22.0))
+            .w(metrics.scale(24.0))
+            .when(integrated, |button| {
+                button.bg(theme::swatch(shell_palette::ACCENT_TINT))
+            })
             .id("terminal.mode")
             .debug_selector(|| "terminal.mode".to_owned())
+            .tooltip(components::tooltip(label))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 let next = if integrated {
                     TerminalMode::Classic
@@ -1760,8 +1877,9 @@ impl TerminalPane {
             )
     }
 
-    fn viewport(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+    fn viewport(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let snapshot = self.core.snapshot();
+        let focused = self.focus.is_focused(window);
         let weak = cx.entity().downgrade();
         let entity = cx.entity();
         let focus = self.focus.clone();
@@ -1781,7 +1899,7 @@ impl TerminalPane {
             .font_family(monospace_family())
             .debug_selector(|| "terminal.viewport".to_owned());
         for index in 0..snapshot.rows.len() {
-            rows = rows.child(self.row(index, &snapshot));
+            rows = rows.child(self.row(index, &snapshot, focused));
         }
         if let Some(overlay) = self.composition_overlay(&snapshot) {
             rows = rows.child(overlay);
@@ -1839,49 +1957,406 @@ fn color_of(color: Rgb) -> gpui::Rgba {
     gpui::rgb(theme::terminal_color(value))
 }
 
-fn append_run(
-    element: gpui::Div,
-    run: String,
-    style: Option<(gpui::Rgba, gpui::Rgba, bool, bool, bool)>,
-    default_background: gpui::Rgba,
-    cell: CellSize,
-    font_size: f32,
-) -> gpui::Div {
-    if run.is_empty() {
-        return element;
-    }
-    let Some((foreground, background, bold, underline, selected)) = style else {
-        return element;
-    };
-    let background = if selected {
-        gpui::rgba(match theme::appearance() {
+/// The background a cell paints over the canvas, or `None` when it shows the canvas.
+fn cell_background(cell: &RenderedCell, canvas: gpui::Rgba) -> Option<gpui::Rgba> {
+    if cell.selected {
+        return Some(gpui::rgba(match theme::terminal_appearance() {
             theme::Appearance::Dark => SELECTION_BACKGROUND,
             theme::Appearance::Light => SELECTION_BACKGROUND_LIGHT,
-        })
-    } else {
-        background
-    };
+        }));
+    }
+    let background = color_of(cell.background);
+    (background != canvas).then_some(background)
+}
 
-    let mut span = div()
-        .flex_none()
-        .h_full()
+/// The least contrast text keeps against its background, and dimmed text.
+const TEXT_CONTRAST_FLOOR: f32 = 3.0;
+const DIM_CONTRAST_FLOOR: f32 = 2.0;
+
+/// The colour a character is drawn in.
+///
+/// Dim text is mixed towards its background. Then, like the minimum-contrast
+/// option of other terminals, a colour too close to its background is moved away
+/// from it until it reads: programs choose colours for one kind of terminal, and a
+/// grey meant for a dark one vanishes on a light one. A colour equal to its
+/// background is left alone, since a program that hides text on purpose does so.
+fn ink(foreground: gpui::Rgba, background: gpui::Rgba, dim: bool) -> gpui::Rgba {
+    if foreground == background {
+        return foreground;
+    }
+    let foreground = if dim {
+        mix(foreground, background, 0.4)
+    } else {
+        foreground
+    };
+    let floor = if dim {
+        DIM_CONTRAST_FLOOR
+    } else {
+        TEXT_CONTRAST_FLOOR
+    };
+    if contrast(foreground, background) >= floor {
+        return foreground;
+    }
+    // Towards black on a light background, towards white on a dark one.
+    let target = if luminance(background) > 0.4 {
+        gpui::Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        }
+    } else {
+        gpui::Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        }
+    };
+    let (mut low, mut high) = (0.0_f32, 1.0_f32);
+    for _ in 0..12 {
+        let middle = (low + high) / 2.0;
+        if contrast(mix(foreground, target, middle), background) >= floor {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    mix(foreground, target, high)
+}
+
+/// `from` moved `amount` of the way to `to`.
+fn mix(from: gpui::Rgba, to: gpui::Rgba, amount: f32) -> gpui::Rgba {
+    let blend = |a: f32, b: f32| a + (b - a) * amount;
+    gpui::Rgba {
+        r: blend(from.r, to.r),
+        g: blend(from.g, to.g),
+        b: blend(from.b, to.b),
+        a: from.a,
+    }
+}
+
+/// WCAG relative luminance.
+fn luminance(color: gpui::Rgba) -> f32 {
+    let channel = |value: f32| {
+        if value <= 0.039_28 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+}
+
+/// WCAG contrast ratio, from 1 to 21.
+fn contrast(a: gpui::Rgba, b: gpui::Rgba) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    let (light, dark) = if a > b { (a, b) } else { (b, a) };
+    (light + 0.05) / (dark + 0.05)
+}
+
+/// How a stretch of text is drawn.
+#[derive(Clone, Copy, PartialEq)]
+struct TextStyle {
+    ink: gpui::Rgba,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strike: bool,
+}
+
+/// Text waiting to be drawn from `start`.
+struct TextRun {
+    text: String,
+    style: TextStyle,
+    /// Plain ASCII, which may take more characters; anything else is one cell.
+    plain: bool,
+    start: usize,
+    end: usize,
+}
+
+/// Cells of one drawn shape waiting to be drawn, as one piece when they tile.
+struct ShapeRun {
+    character: char,
+    shape: glyphs::Shape,
+    ink: gpui::Rgba,
+    start: usize,
+    end: usize,
+}
+
+fn flush_text(
+    run: &mut Option<TextRun>,
+    pieces: &mut Vec<gpui::Div>,
+    cell: CellSize,
+    font_size: f32,
+    row: usize,
+) {
+    let Some(run) = run.take() else {
+        return;
+    };
+    let style = run.style;
+    let start = run.start;
+    let mut piece = div()
+        .debug_selector(move || format!("terminal.text.{row}.{start}"))
+        .absolute()
+        .top_0()
+        .left(px(run.start as f32 * cell.width))
+        .h(px(cell.height))
         .text_size(px(font_size))
         .line_height(px(cell.height))
-        .text_color(foreground)
-        .font_weight(if bold {
+        .text_color(style.ink)
+        .font_weight(if style.bold {
             FontWeight::BOLD
         } else {
             FontWeight::NORMAL
         });
-    if underline {
-        span = span.underline();
+    if !run.plain {
+        // A character from another face is centred in its cells; it may overhang
+        // them, as in other terminals, but never moves its neighbours.
+        piece = piece
+            .w(px((run.end - run.start) as f32 * cell.width))
+            .flex()
+            .justify_center();
     }
-    if background != default_background {
-        // The viewport already paints the default background, so a run only needs
-        // its own when the program asked for a different one.
-        span = span.bg(background);
+    if style.italic {
+        piece = piece.italic();
     }
-    element.child(span.child(SharedString::from(run)))
+    if style.underline {
+        piece = piece.underline();
+    }
+    if style.strike {
+        piece = piece.line_through();
+    }
+    pieces.push(piece.child(SharedString::from(run.text)));
+}
+
+fn flush_shapes(
+    run: &mut Option<ShapeRun>,
+    pieces: &mut Vec<gpui::Div>,
+    cell: CellSize,
+    stroke: f32,
+    row: usize,
+) {
+    let Some(run) = run.take() else {
+        return;
+    };
+    let start = run.start;
+    let left = run.start as f32 * cell.width;
+    let width = (run.end - run.start) as f32 * cell.width;
+    let height = cell.height;
+    let ink = run.ink;
+    let rect = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        let (x0, y0, x1, y1) = (x0.round(), y0.round(), x1.round(), y1.round());
+        div()
+            .debug_selector(move || format!("terminal.shape.{row}.{start}"))
+            .absolute()
+            .left(px(x0))
+            .top(px(y0))
+            .w(px((x1 - x0).max(1.0)))
+            .h(px((y1 - y0).max(1.0)))
+            .bg(ink)
+    };
+    match run.shape {
+        glyphs::Shape::Fill { rects, alpha } => {
+            for part in rects.into_iter().flatten() {
+                pieces.push(
+                    rect(
+                        left + part.left * width,
+                        part.top * height,
+                        left + part.right * width,
+                        part.bottom * height,
+                    )
+                    .opacity(alpha),
+                );
+            }
+        }
+        glyphs::Shape::Lines(arms) => {
+            // The centre of the cell; for a joined run, of its first and last cells.
+            let centre_x = (left + cell.width / 2.0).round();
+            let last_centre_x = (left + width - cell.width / 2.0).round();
+            let centre_y = (height / 2.0).round();
+            let thickness = |weight: glyphs::Weight| match weight {
+                glyphs::Weight::Heavy => stroke * 2.0,
+                _ => stroke,
+            };
+            // A double arm is two lines `gap` either side of the centre. Where
+            // double arms meet, each line stops at the line it joins instead of
+            // crossing it, as a drawn frame would: the outer lines meet at the
+            // outer corner and the inner ones at the inner corner.
+            let gap = stroke * 1.5;
+            let double = |weight: glyphs::Weight| weight == glyphs::Weight::Double;
+            let vertical_double = double(arms.up) || double(arms.down);
+            let horizontal_double = double(arms.left) || double(arms.right);
+            // Left arm: from the left edge to the centre.
+            match arms.left {
+                glyphs::Weight::None => {}
+                glyphs::Weight::Double => {
+                    for (y, joins_double) in [
+                        (centre_y - gap, double(arms.up)),
+                        (centre_y + gap, double(arms.down)),
+                    ] {
+                        let end = if joins_double {
+                            last_centre_x - gap
+                        } else {
+                            last_centre_x + gap
+                        };
+                        pieces.push(rect(
+                            left,
+                            y - stroke / 2.0,
+                            end + stroke / 2.0,
+                            y + stroke / 2.0,
+                        ));
+                    }
+                }
+                weight => {
+                    let t = thickness(weight);
+                    let end = if vertical_double {
+                        last_centre_x - gap
+                    } else {
+                        last_centre_x
+                    } + t / 2.0;
+                    pieces.push(rect(left, centre_y - t / 2.0, end, centre_y + t / 2.0));
+                }
+            }
+            // Right arm: from the centre to the right edge.
+            match arms.right {
+                glyphs::Weight::None => {}
+                glyphs::Weight::Double => {
+                    for (y, joins_double) in [
+                        (centre_y - gap, double(arms.up)),
+                        (centre_y + gap, double(arms.down)),
+                    ] {
+                        let start = if joins_double {
+                            centre_x + gap
+                        } else {
+                            centre_x - gap
+                        };
+                        pieces.push(rect(
+                            start - stroke / 2.0,
+                            y - stroke / 2.0,
+                            left + width,
+                            y + stroke / 2.0,
+                        ));
+                    }
+                }
+                weight => {
+                    let t = thickness(weight);
+                    let start = if vertical_double {
+                        centre_x + gap
+                    } else {
+                        centre_x
+                    } - t / 2.0;
+                    pieces.push(rect(
+                        start,
+                        centre_y - t / 2.0,
+                        left + width,
+                        centre_y + t / 2.0,
+                    ));
+                }
+            }
+            // Up arm: from the top edge to the centre.
+            match arms.up {
+                glyphs::Weight::None => {}
+                glyphs::Weight::Double => {
+                    for (x, joins_double) in [
+                        (centre_x - gap, double(arms.left)),
+                        (centre_x + gap, double(arms.right)),
+                    ] {
+                        let end = if joins_double {
+                            centre_y - gap
+                        } else {
+                            centre_y + gap
+                        };
+                        pieces.push(rect(
+                            x - stroke / 2.0,
+                            0.0,
+                            x + stroke / 2.0,
+                            end + stroke / 2.0,
+                        ));
+                    }
+                }
+                weight => {
+                    let t = thickness(weight);
+                    let end = if horizontal_double {
+                        centre_y - gap
+                    } else {
+                        centre_y
+                    } + t / 2.0;
+                    pieces.push(rect(centre_x - t / 2.0, 0.0, centre_x + t / 2.0, end));
+                }
+            }
+            // Down arm: from the centre to the bottom edge.
+            match arms.down {
+                glyphs::Weight::None => {}
+                glyphs::Weight::Double => {
+                    for (x, joins_double) in [
+                        (centre_x - gap, double(arms.left)),
+                        (centre_x + gap, double(arms.right)),
+                    ] {
+                        let start = if joins_double {
+                            centre_y + gap
+                        } else {
+                            centre_y - gap
+                        };
+                        pieces.push(rect(
+                            x - stroke / 2.0,
+                            start - stroke / 2.0,
+                            x + stroke / 2.0,
+                            height,
+                        ));
+                    }
+                }
+                weight => {
+                    let t = thickness(weight);
+                    let start = if horizontal_double {
+                        centre_y + gap
+                    } else {
+                        centre_y
+                    } - t / 2.0;
+                    pieces.push(rect(centre_x - t / 2.0, start, centre_x + t / 2.0, height));
+                }
+            }
+        }
+        glyphs::Shape::Arc(arc) => {
+            let centre_x = (left + cell.width / 2.0).round();
+            let centre_y = (height / 2.0).round();
+            let half = stroke / 2.0;
+            let right_edge = left + width;
+            let radius = px((cell.width / 2.0).min(height / 2.0));
+            let border = px(stroke);
+            let corner = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                div()
+                    .absolute()
+                    .left(px(x0.round()))
+                    .top(px(y0.round()))
+                    .w(px((x1 - x0).round().max(1.0)))
+                    .h(px((y1 - y0).round().max(1.0)))
+                    .border_color(ink)
+            };
+            pieces.push(match arc {
+                glyphs::Arc::DownRight => {
+                    corner(centre_x - half, centre_y - half, right_edge, height + half)
+                        .border_t(border)
+                        .border_l(border)
+                        .rounded_tl(radius)
+                }
+                glyphs::Arc::DownLeft => {
+                    corner(left - half, centre_y - half, centre_x + half, height + half)
+                        .border_t(border)
+                        .border_r(border)
+                        .rounded_tr(radius)
+                }
+                glyphs::Arc::UpLeft => corner(left - half, -half, centre_x + half, centre_y + half)
+                    .border_b(border)
+                    .border_r(border)
+                    .rounded_br(radius),
+                glyphs::Arc::UpRight => corner(centre_x - half, -half, right_edge, centre_y + half)
+                    .border_b(border)
+                    .border_l(border)
+                    .rounded_bl(radius),
+            });
+        }
+    }
 }
 
 impl Render for TerminalPane {
@@ -2068,5 +2543,47 @@ impl EntityInputHandler for TerminalPane {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod ink_tests {
+    use super::{contrast, ink};
+
+    fn rgb(hex: u32) -> gpui::Rgba {
+        gpui::rgb(hex)
+    }
+
+    #[test]
+    fn a_pale_colour_on_a_light_canvas_is_made_legible() {
+        // A grey chosen for a dark terminal, on the light one.
+        let drawn = ink(rgb(0xe6e6e6), rgb(0xfcfcfd), false);
+        assert!(contrast(drawn, rgb(0xfcfcfd)) >= 2.99);
+    }
+
+    #[test]
+    fn a_dark_colour_on_a_dark_canvas_is_made_legible() {
+        let drawn = ink(rgb(0x1a1c22), rgb(0x0b0c10), false);
+        assert!(contrast(drawn, rgb(0x0b0c10)) >= 2.99);
+    }
+
+    #[test]
+    fn readable_colours_are_left_as_they_are() {
+        assert_eq!(ink(rgb(0x1f2329), rgb(0xfcfcfd), false), rgb(0x1f2329));
+        assert_eq!(ink(rgb(0xe6e9f0), rgb(0x0b0c10), false), rgb(0xe6e9f0));
+    }
+
+    #[test]
+    fn dim_text_is_dimmer_yet_still_readable() {
+        let canvas = rgb(0x0b0c10);
+        let regular = ink(rgb(0xe6e9f0), canvas, false);
+        let dim = ink(rgb(0xe6e9f0), canvas, true);
+        assert!(contrast(dim, canvas) < contrast(regular, canvas));
+        assert!(contrast(dim, canvas) >= 1.99);
+    }
+
+    #[test]
+    fn text_hidden_on_purpose_stays_hidden() {
+        assert_eq!(ink(rgb(0x334455), rgb(0x334455), false), rgb(0x334455));
     }
 }

@@ -41,6 +41,9 @@ pub struct Preferences {
     /// Terminal font size in points.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_font_size: Option<f32>,
+    /// The terminal's palette: `app`, `dark` or `light`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_scheme: Option<String>,
 }
 
 /// A preferences file at a known location.
@@ -123,6 +126,7 @@ mod tests {
             motion: Some("reduced".to_owned()),
             sidebar_collapsed: Some(true),
             terminal_font_size: Some(15.0),
+            terminal_scheme: Some("dark".to_owned()),
         };
         store.save(&preferences).expect("saves");
         assert_eq!(store.load(), preferences);

@@ -2201,7 +2201,8 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
         "the first terminal must really be open for this case to mean anything"
     );
 
-    // With a terminal on screen the shell choices live in the header's menu.
+    // With a terminal on screen the shell choices live in the header's menu, and
+    // the custom path opens as a dialog.
     let bounds = bounds_of(cx, "shell.menu");
     let center = bounds.center();
     cx.simulate_click(point(center.x, center.y), Modifiers::default());
@@ -2233,6 +2234,11 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
         "the field stays open because nothing started from it"
     );
 
+    // The dialog is modal; Escape closes it and gives the keyboard back.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).custom_shell_open()));
+
     // The failed launch is local. The shell that is already open, the navigation and
     // the command palette keep working.
     let open = cx
@@ -2243,8 +2249,6 @@ async fn a_custom_shell_that_fails_keeps_its_text_while_another_terminal_is_open
         sent.contains("after-failed-launch"),
         "the open shell still takes input: {sent:?}"
     );
-    // The open shell menu covers the window, so the first press only dismisses it.
-    click(cx, "nav.hosts");
     click(cx, "nav.hosts");
     assert_eq!(destination_of(&view, cx), Destination::Hosts);
     go(cx, crate::app::actions::GoToLocalShells);
@@ -10884,5 +10888,87 @@ async fn the_tunnel_form_names_its_fields_and_says_what_it_will_do(cx: &mut Test
     assert_eq!(
         cx.update(|_window, app| view.read(app).forward_editor_kind_for_test()),
         Some(shellune_core::ForwardKind::Dynamic)
+    );
+}
+
+#[gpui::test]
+async fn a_right_click_in_the_host_dialog_opens_the_field_menu(cx: &mut TestAppContext) {
+    let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "hosts.new");
+    right_click(cx, "hosts.field.address");
+    assert!(
+        cx.debug_bounds("field.menu").is_some(),
+        "a right click opens the field's menu"
+    );
+}
+
+#[gpui::test]
+async fn a_right_click_in_the_palette_opens_the_field_menu(cx: &mut TestAppContext) {
+    // The palette floats over the window too; its search field's menu must open
+    // on top of it rather than take the window down.
+    let (_view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    go(cx, crate::app::actions::OpenPalette);
+    right_click(cx, "palette.field");
+    assert!(cx.debug_bounds("field.menu").is_some());
+}
+
+#[gpui::test]
+async fn the_new_tab_menu_hangs_from_its_control(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let control = bounds_of(cx, "shell.menu");
+    click(cx, "shell.menu");
+    let menu = bounds_of(cx, "shell.picker");
+    assert!(
+        menu.top() >= control.bottom() && menu.top() - control.bottom() < px(16.0),
+        "the menu opens just under the control: {control:?} {menu:?}"
+    );
+    assert!(
+        menu.left() <= control.right() && menu.right() >= control.left(),
+        "the menu lines up with the control"
+    );
+
+    // The custom path is a dialog of its own, not a field squeezed into the menu.
+    click(cx, "shell.custom");
+    assert!(!cx.update(|_window, app| view.read(app).shell_menu_open()));
+    assert!(cx.debug_bounds("shell.custom.dialog").is_some());
+    right_click(cx, "shell.path");
+    assert!(
+        cx.debug_bounds("field.menu").is_some(),
+        "its field has a menu too"
+    );
+}
+
+#[gpui::test]
+async fn frame_lines_and_wide_characters_keep_the_columns_after_them(cx: &mut TestAppContext) {
+    // A frame line, a CJK character and an icon come from other faces at their own
+    // widths. Each is drawn in its own cells, so the text after them still starts
+    // on its column.
+    let (pane, cx) = pane_with("│中─x\r\n", cx);
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    let row = bounds_of(cx, "terminal.row.0");
+    let wide = bounds_of(cx, "terminal.text.0.1");
+    let after = bounds_of(cx, "terminal.text.0.4");
+    // Positions are rounded to whole pixels when laid out, so half a pixel is
+    // the tolerance.
+    let at = |bounds: gpui::Bounds<Pixels>, column: f32| {
+        (bounds.left() - row.left() - px(column * cell.width)).abs() <= px(0.5)
+    };
+    assert!(
+        at(wide, 1.0),
+        "the wide character sits on column 1: {wide:?}"
+    );
+    assert!(
+        (wide.size.width - px(cell.width * 2.0)).abs() <= px(0.5),
+        "and fills its two cells: {wide:?}"
+    );
+    assert!(
+        at(after, 4.0),
+        "the x after the rule is on column 4: {after:?}"
     );
 }

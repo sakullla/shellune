@@ -205,10 +205,40 @@ impl ThemeChoice {
     }
 }
 
+/// The terminal's own palette, which may differ from the window's: many programs
+/// are written for a dark terminal, and some people want one in a light window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalScheme {
+    /// The same palette as the window.
+    #[default]
+    FollowApp,
+    /// Always the dark terminal palette.
+    Dark,
+    /// Always the light terminal palette.
+    Light,
+}
+
+impl TerminalScheme {
+    /// Every choice, in the order the settings show them.
+    pub const ALL: [Self; 3] = [Self::FollowApp, Self::Dark, Self::Light];
+
+    /// The palette the terminal is drawn in, given the window's.
+    #[must_use]
+    pub fn appearance(self, window: Appearance) -> Appearance {
+        match self {
+            Self::FollowApp => window,
+            Self::Dark => Appearance::Dark,
+            Self::Light => Appearance::Light,
+        }
+    }
+}
+
 thread_local! {
     /// The palette the window is being drawn in; per thread, so tests that each run a
     /// window on their own thread never see another test's choice.
     static APPEARANCE: std::cell::Cell<Appearance> = const { std::cell::Cell::new(Appearance::Dark) };
+    /// The palette the terminal grid is drawn in.
+    static TERMINAL_APPEARANCE: std::cell::Cell<Appearance> = const { std::cell::Cell::new(Appearance::Dark) };
     /// The motion preference of the window being drawn. Not read from the OS.
     static MOTION: std::cell::Cell<Motion> = const { std::cell::Cell::new(Motion::Full) };
 }
@@ -222,6 +252,18 @@ pub fn appearance() -> Appearance {
 /// Sets the palette the next draws use; the window calls it before drawing.
 pub fn set_appearance(appearance: Appearance) {
     APPEARANCE.with(|current| current.set(appearance));
+}
+
+/// The palette the terminal grid is drawn in now.
+#[must_use]
+pub fn terminal_appearance() -> Appearance {
+    TERMINAL_APPEARANCE.with(std::cell::Cell::get)
+}
+
+/// Sets the palette the terminal grid is drawn in; the window calls it before
+/// drawing.
+pub fn set_terminal_appearance(appearance: Appearance) {
+    TERMINAL_APPEARANCE.with(|current| current.set(appearance));
 }
 
 /// Whether the window being drawn may play short motion.
@@ -328,7 +370,7 @@ pub mod light {
 /// A terminal colour in the current palette.
 #[must_use]
 pub fn terminal_color(color: u32) -> u32 {
-    match appearance() {
+    match terminal_appearance() {
         Appearance::Dark => color,
         Appearance::Light => light::TERMINAL
             .iter()

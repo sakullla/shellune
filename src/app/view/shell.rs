@@ -9,8 +9,7 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, FontWeight, MouseButton, Point, SharedString, Stateful, Window, div,
-    px,
+    AnyElement, Context, Div, FontWeight, MouseButton, SharedString, Stateful, Window, div, px,
 };
 
 use super::{ELLIPSIS, ShelluneView, brand_mark, host_avatar, program_label};
@@ -132,7 +131,7 @@ impl ShelluneView {
             .debug_selector(|| "topbar".to_owned())
             .child(brand)
             .child(tabs)
-            .child(self.new_tab_control(window, cx))
+            .child(self.new_tab_control(cx))
             .child(
                 self.drag_area("header.drag")
                     .flex_1()
@@ -227,13 +226,13 @@ impl ShelluneView {
 
     /// "+" opens the default shell in a new tab; the chevron lists every shell, quick
     /// connect and the saved hosts.
-    fn new_tab_control(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    fn new_tab_control(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
         let platform = Platform::current();
         let open = self.shell_menu_open;
         let size = metrics.scale(28.0);
-        let mut control = div()
+        let control = div()
             .relative()
             .flex()
             .flex_none()
@@ -274,10 +273,16 @@ impl ShelluneView {
                         cx.notify();
                     })),
             );
-        if open {
-            control = control.child(self.shell_menu(window, cx));
-        }
-        control
+        // Records where the control is drawn, for the menu that hangs from it.
+        let anchor = self.shell_menu_anchor.clone();
+        control.child(
+            gpui::canvas(
+                move |bounds, _window, _cx| anchor.set(bounds),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -456,7 +461,7 @@ impl ShelluneView {
             .id("shell.custom")
             .debug_selector(|| "shell.custom".to_owned())
             .on_click(cx.listener(|this, _event, window, cx| {
-                this.toggle_custom_shell(window, cx);
+                this.open_custom_shell(window, cx);
             })),
         );
         let mut section = div()
@@ -471,17 +476,7 @@ impl ShelluneView {
                     .child(strings.shell_none_found),
             );
         }
-        section = section.child(tiles);
-        if self.custom_shell_open {
-            section = section.child(
-                div()
-                    .w_full()
-                    .max_w(metrics.scale(520.0))
-                    .debug_selector(|| "shell.path".to_owned())
-                    .child(self.shell_path.clone()),
-            );
-        }
-        section
+        section.child(tiles)
     }
 
     /// One card of the home page: an icon tile, a name, a detail line and an
@@ -695,6 +690,25 @@ impl ShelluneView {
             cx,
             |view, index, cx| view.set_theme(ThemeChoice::ALL[index], cx),
         );
+        let scheme = self.terminal_scheme();
+        let scheme_control = self.segments(
+            "settings.scheme",
+            crate::app::theme::TerminalScheme::ALL
+                .iter()
+                .map(|choice| {
+                    let label = match choice {
+                        crate::app::theme::TerminalScheme::FollowApp => ux.settings_scheme_app,
+                        crate::app::theme::TerminalScheme::Dark => strings.theme_dark,
+                        crate::app::theme::TerminalScheme::Light => strings.theme_light,
+                    };
+                    (label.to_owned(), *choice == scheme)
+                })
+                .collect(),
+            cx,
+            |view, index, cx| {
+                view.set_terminal_scheme(crate::app::theme::TerminalScheme::ALL[index], cx);
+            },
+        );
         let locale = self.workspace.locale();
         let language_control = self.segments(
             "settings.language",
@@ -846,6 +860,7 @@ impl ShelluneView {
             .child(self.settings_group(
                 ux.settings_terminal,
                 vec![
+                    self.settings_row(ux.settings_scheme, ux.settings_scheme_hint, scheme_control),
                     self.settings_row(
                         ux.settings_font_size,
                         ux.settings_font_size_hint,
@@ -1081,31 +1096,26 @@ impl ShelluneView {
                     .child(body),
             )
             .children(footer);
-        div().child(
-            gpui::deferred(
-                gpui::anchored().position(Point::default()).child(
+        super::overlay_layer().child(
+            div()
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(viewport.width)
+                .h(viewport.height)
+                .child(
                     div()
-                        .relative()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(viewport.width)
-                        .h(viewport.height)
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("{id}.backdrop")))
-                                .absolute()
-                                .inset_0()
-                                .bg(gpui::rgba(0x0000_0080))
-                                .occlude()
-                                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                    cx.stop_propagation();
-                                }),
-                        )
-                        .child(dialog),
-                ),
-            )
-            .with_priority(1),
+                        .id(SharedString::from(format!("{id}.backdrop")))
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::rgba(0x0000_0080))
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        }),
+                )
+                .child(dialog),
         )
     }
 
@@ -1309,6 +1319,108 @@ impl ShelluneView {
             .child(self.import_panel(cx))
             .into_any_element();
         Some(self.modal(window, "hosts.import.dialog", 720.0, header, body, None))
+    }
+
+    /// Starting any program by its path: a field, one line on what it takes, and
+    /// the reason when the last try did not start.
+    pub(super) fn custom_shell_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if !self.custom_shell_open {
+            return None;
+        }
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let header = self.modal_header(
+            Some(Icon::FolderOpen),
+            ux.custom_shell_title.to_owned(),
+            None,
+            "shell.custom.close",
+            cx,
+            |this, cx| {
+                this.custom_shell_open = false;
+                this.restore_focus_pending = true;
+                cx.notify();
+            },
+        );
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .pb(metrics.scale(spacing::LOOSE))
+            .child(
+                div()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(ux.custom_shell_body),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "shell.path".to_owned())
+                    // Escape closes the dialog; without this the field would take it
+                    // to empty itself, and the path just typed would be lost.
+                    .capture_key_down(cx.listener(
+                        |this, event: &gpui::KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                this.close_custom_shell(window, cx);
+                            }
+                        },
+                    ))
+                    .child(self.shell_path.clone()),
+            )
+            .children(
+                self.local_error
+                    .as_ref()
+                    .map(|reason| self.notice_line(reason.clone(), Tone::Danger)),
+            )
+            .into_any_element();
+        let can_run = !self.shell_path.read(cx).text().trim().is_empty();
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::SNUG))
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .child(self.text_button(
+                SharedString::from("shell.custom.cancel"),
+                ux.fwd_cancel,
+                Variant::Ghost,
+                cx,
+                |this, cx| {
+                    this.custom_shell_open = false;
+                    this.restore_focus_pending = true;
+                    cx.notify();
+                },
+            ))
+            .child(
+                components::button(ux.custom_shell_run, Variant::Primary, metrics)
+                    .id("shell.custom.run")
+                    .debug_selector(|| "shell.custom.run".to_owned())
+                    .when(!can_run, |button| button.opacity(0.5))
+                    .when(can_run, |button| {
+                        button.on_click(cx.listener(|this, _event, window, cx| {
+                            let text = this.shell_path.read(cx).text().to_owned();
+                            if this.start_custom_shell(text, window, cx) {
+                                this.shell_path
+                                    .update(cx, |field, cx| field.set_text("", cx));
+                            }
+                        }))
+                    }),
+            );
+        Some(self.modal(
+            window,
+            "shell.custom.dialog",
+            520.0,
+            header,
+            body,
+            Some(footer),
+        ))
     }
 
     /// Port forwarding or transfers, opened from a host or a session.

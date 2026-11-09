@@ -16,3 +16,6 @@ Thumbs.db
 __pycache__/
 docs/requirements/
 docs/sakullla-workflow/
+
+# Pasted screenshots from the chat client
+.cliora/

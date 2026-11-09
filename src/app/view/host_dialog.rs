@@ -7,7 +7,7 @@
 //! fields are asked for.
 
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, MouseButton, Point, SharedString, Stateful, Window, div, px};
+use gpui::{Context, Div, FontWeight, MouseButton, SharedString, Stateful, Window, div, px};
 use shellune_core::{AuthMethodKind, HostId};
 
 use super::{HostFields, ShelluneView};
@@ -567,33 +567,28 @@ impl ShelluneView {
             .child(footer);
 
         Some(
-            div().child(
-                gpui::deferred(
-                    gpui::anchored().position(Point::default()).child(
+            super::overlay_layer().child(
+                div()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .child(
                         div()
-                            .relative()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(viewport.width)
-                            .h(viewport.height)
-                            .child(
-                                div()
-                                    .id("hosts.editor.backdrop")
-                                    .absolute()
-                                    .inset_0()
-                                    .bg(gpui::rgba(0x0000_0080))
-                                    .occlude()
-                                    // A press on the dimmed window does not discard what
-                                    // was typed; the dialog closes with its buttons or Esc.
-                                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                        cx.stop_propagation();
-                                    }),
-                            )
-                            .child(dialog),
-                    ),
-                )
-                .with_priority(1),
+                            .id("hosts.editor.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .bg(gpui::rgba(0x0000_0080))
+                            .occlude()
+                            // A press on the dimmed window does not discard what
+                            // was typed; the dialog closes with its buttons or Esc.
+                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                    )
+                    .child(dialog),
             ),
         )
     }

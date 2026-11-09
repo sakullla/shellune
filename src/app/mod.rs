@@ -17,6 +17,7 @@ pub mod components;
 pub mod copy;
 pub mod files;
 pub mod forwarding;
+pub mod glyphs;
 pub mod hosts;
 pub mod icons;
 pub mod layout;

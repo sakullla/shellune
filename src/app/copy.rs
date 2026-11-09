@@ -156,7 +156,6 @@ pub struct Strings {
     /// Tooltip of the button that makes the terminal text larger.
     pub terminal_larger: &'static str,
     /// Heading above the shell tiles and the shell menu.
-    pub shell_launch_title: &'static str,
     /// The mark on the launcher tile the main button opens.
     pub shell_default: &'static str,
     /// The second line of the custom-path launcher tile.
@@ -887,7 +886,6 @@ pub static ENGLISH: Strings = Strings {
     terminal_copy: "Copy",
     terminal_smaller: "Smaller text",
     terminal_larger: "Larger text",
-    shell_launch_title: "Start a shell",
     shell_default: "Default",
     shell_custom_hint: "Any program, by path",
     hosts_search_placeholder: "Search name, address, user or group",
@@ -1273,7 +1271,6 @@ pub static CHINESE: Strings = Strings {
     terminal_copy: "复制",
     terminal_smaller: "缩小字号",
     terminal_larger: "放大字号",
-    shell_launch_title: "启动一个 Shell",
     shell_default: "默认",
     shell_custom_hint: "本机上的任意程序",
     hosts_search_placeholder: "搜索名称、地址、用户名或分组",
@@ -1876,6 +1873,12 @@ pub struct UxStrings {
     pub files_folder: &'static str,
     /// Ports
     pub session_forwards: &'static str,
+    pub custom_shell_title: &'static str,
+    pub settings_scheme: &'static str,
+    pub settings_scheme_hint: &'static str,
+    pub settings_scheme_app: &'static str,
+    pub custom_shell_body: &'static str,
+    pub custom_shell_run: &'static str,
 }
 
 impl UxStrings {
@@ -1956,6 +1959,12 @@ impl UxStrings {
             self.files_hint,
             self.files_folder,
             self.session_forwards,
+            self.custom_shell_title,
+            self.settings_scheme,
+            self.settings_scheme_hint,
+            self.settings_scheme_app,
+            self.custom_shell_body,
+            self.custom_shell_run,
         ]
     }
 }
@@ -2034,6 +2043,12 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     files_hint: "Click a folder to open it. Drag a file to the other side, or use its arrow, to copy it.",
     files_folder: "Folder",
     session_forwards: "Ports",
+    custom_shell_title: "Open a program",
+    settings_scheme: "Terminal colours",
+    settings_scheme_hint: "Many command-line programs are made for a dark terminal. Text too close to its background is always made legible.",
+    settings_scheme_app: "Match app",
+    custom_shell_body: "Any program on this computer that runs in a terminal, by name or full path. It opens in a new tab.",
+    custom_shell_run: "Open",
 };
 
 /// Simplified Chinese.
@@ -2110,6 +2125,12 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     files_hint: "单击文件夹打开；把文件拖到另一侧，或点它的箭头，即可复制过去。",
     files_folder: "文件夹",
     session_forwards: "端口转发",
+    custom_shell_title: "打开程序",
+    settings_scheme: "终端配色",
+    settings_scheme_hint: "很多命令行程序按深色终端设计。与背景过于接近的文字始终会自动调整到可读。",
+    settings_scheme_app: "跟随应用",
+    custom_shell_body: "本机上任何可以在终端里运行的程序，填名称或完整路径，会在新标签里打开。",
+    custom_shell_run: "打开",
 };
 
 /// The redesigned-shell strings of the current language.

@@ -563,31 +563,26 @@ impl ShelluneView {
             );
 
         Some(
-            div().child(
-                gpui::deferred(
-                    gpui::anchored().position(Point::default()).child(
+            super::overlay_layer().child(
+                div()
+                    .relative()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .child(
                         div()
-                            .relative()
-                            .w(viewport.width)
-                            .h(viewport.height)
-                            .child(
-                                div()
-                                    .id("palette.backdrop")
-                                    .absolute()
-                                    .inset_0()
-                                    .bg(gpui::rgba(0x0000_0080))
-                                    .occlude()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _event, window, cx| {
-                                            this.close_palette(window, cx);
-                                        }),
-                                    ),
-                            )
-                            .child(panel),
-                    ),
-                )
-                .with_priority(2),
+                            .id("palette.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .bg(gpui::rgba(0x0000_0080))
+                            .occlude()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, window, cx| {
+                                    this.close_palette(window, cx);
+                                }),
+                            ),
+                    )
+                    .child(panel),
             ),
         )
     }
@@ -956,37 +951,32 @@ impl ShelluneView {
             );
 
         Some(
-            div().child(
-                gpui::deferred(
-                    gpui::anchored().position(Point::default()).child(
+            super::overlay_layer().child(
+                div()
+                    .relative()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .child(
                         div()
-                            .relative()
-                            .w(viewport.width)
-                            .h(viewport.height)
-                            .child(
-                                div()
-                                    .id("tab.menu.backdrop")
-                                    .absolute()
-                                    .inset_0()
-                                    .occlude()
-                                    .on_any_mouse_down(cx.listener(|this, _event, window, cx| {
-                                        this.close_tab_menu(window, cx);
-                                    })),
-                            )
-                            .child(
-                                gpui::anchored()
-                                    .position(clamp_menu(
-                                        position,
-                                        viewport,
-                                        metrics.scale(230.0),
-                                        metrics.header_height() + metrics.scale(2.0),
-                                    ))
-                                    .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                                    .child(div().occlude().child(menu)),
-                            ),
+                            .id("tab.menu.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .on_any_mouse_down(cx.listener(|this, _event, window, cx| {
+                                this.close_tab_menu(window, cx);
+                            })),
+                    )
+                    .child(
+                        gpui::anchored()
+                            .position(clamp_menu(
+                                position,
+                                viewport,
+                                metrics.scale(230.0),
+                                metrics.header_height() + metrics.scale(2.0),
+                            ))
+                            .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                            .child(div().occlude().child(menu)),
                     ),
-                )
-                .with_priority(2),
             ),
         )
     }

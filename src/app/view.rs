@@ -274,6 +274,8 @@ pub struct ShelluneView {
     /// The menu is how another shell is started while a terminal fills the panel; the
     /// empty destination shows the same choices as tiles instead.
     shell_menu_open: bool,
+    /// Where the header's "▾" was last drawn, so its menu can hang from it.
+    shell_menu_anchor: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     store: HostStore,
     /// What that file really held the last time it was read or written.
     book: HostBook,
@@ -418,6 +420,8 @@ pub struct ShelluneView {
     rail_collapsed: bool,
     /// What the user chose for the palette.
     theme_choice: theme::ThemeChoice,
+    /// The terminal's palette: the window's, or always dark or light.
+    terminal_scheme: theme::TerminalScheme,
     /// The preferences last written (or read), so a draw only writes a change.
     /// `None` while preferences are not kept, as in the unit tests, which share
     /// one scratch directory per process.
@@ -580,6 +584,7 @@ impl ShelluneView {
             shell_path,
             custom_shell_open: false,
             shell_menu_open: false,
+            shell_menu_anchor: std::rc::Rc::default(),
             store,
             book: HostBook::new(),
             hosts: HostsPanel::new(),
@@ -653,6 +658,7 @@ impl ShelluneView {
             restore_focus_pending: false,
             rail_collapsed: false,
             theme_choice: theme::ThemeChoice::default(),
+            terminal_scheme: theme::TerminalScheme::default(),
             saved_preferences: None,
             watching_appearance: false,
             layout_persist: false,
@@ -712,6 +718,18 @@ impl ShelluneView {
         }) {
             self.workspace.set_motion(motion);
         }
+        if let Some(scheme) = saved
+            .terminal_scheme
+            .as_deref()
+            .and_then(|value| match value {
+                "app" => Some(theme::TerminalScheme::FollowApp),
+                "dark" => Some(theme::TerminalScheme::Dark),
+                "light" => Some(theme::TerminalScheme::Light),
+                _ => None,
+            })
+        {
+            self.terminal_scheme = scheme;
+        }
         if let Some(collapsed) = saved.sidebar_collapsed {
             self.rail_collapsed = collapsed;
         }
@@ -753,6 +771,14 @@ impl ShelluneView {
             ),
             sidebar_collapsed: Some(self.rail_collapsed),
             terminal_font_size: Some(self.workspace.local_font_size()),
+            terminal_scheme: Some(
+                match self.terminal_scheme {
+                    theme::TerminalScheme::FollowApp => "app",
+                    theme::TerminalScheme::Dark => "dark",
+                    theme::TerminalScheme::Light => "light",
+                }
+                .to_owned(),
+            ),
         }
     }
 
@@ -5823,6 +5849,22 @@ impl ShelluneView {
         self.theme_choice
     }
 
+    /// The terminal's palette choice.
+    pub fn terminal_scheme(&self) -> theme::TerminalScheme {
+        self.terminal_scheme
+    }
+
+    /// Changes the terminal's palette and redraws every open terminal in it.
+    pub(super) fn set_terminal_scheme(
+        &mut self,
+        scheme: theme::TerminalScheme,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_scheme = scheme;
+        self.repaint_terminals(cx);
+        cx.notify();
+    }
+
     /// Whether `handle` is the window or a page, rather than a field or a terminal.
     fn is_page_focus(&self, handle: &FocusHandle) -> bool {
         handle == &self.root_focus || self.destination_focus.iter().any(|item| item == handle)
@@ -5933,34 +5975,54 @@ impl ShelluneView {
         )
     }
 
-    /// The menu under the header's shell control: every shell, and a typed path.
+    /// The menu under the header's "▾": the local shells first, then the ways to
+    /// reach a server.
     ///
     /// Picking a shell opens it in a new tab at once, which is what the control is
-    /// for; the choice is also remembered as the one the main button opens next. A
-    /// transparent layer behind the menu closes it on any click outside.
-    fn shell_menu(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// for; the choice is also remembered as the one "+" opens next, and is marked
+    /// with a check. A transparent layer behind the menu closes it on any press
+    /// outside. The menu hangs from the control, whose bounds the top bar records as
+    /// it draws.
+    fn shell_menu_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.shell_menu_open {
+            return None;
+        }
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
         let viewport = window.viewport_size();
+        let anchor = self.shell_menu_anchor.get();
+
+        let section = |label: &'static str| {
+            div()
+                .px(metrics.scale(spacing::TIGHT))
+                .pt(metrics.scale(spacing::HAIRLINE + 2.0))
+                .pb(metrics.scale(2.0))
+                .text_size(metrics.caption_size())
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(label)
+        };
+        let divider = || {
+            div()
+                .h(px(1.0))
+                .mx(metrics.scale(spacing::HAIRLINE))
+                .my(metrics.scale(spacing::HAIRLINE))
+                .bg(theme::swatch(palette::BORDER))
+        };
 
         let mut menu = div()
             .flex()
             .flex_col()
-            .w(metrics.scale(300.0))
+            .w(metrics.scale(320.0))
             .p(metrics.scale(spacing::HAIRLINE + 1.0))
-            .gap(metrics.scale(2.0))
             .rounded(px(radius::LARGE))
             .bg(theme::swatch(palette::SURFACE_RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
             .shadow_lg()
             .debug_selector(|| "shell.picker".to_owned())
-            .child(
-                components::section_label(strings.shell_launch_title, metrics)
-                    .px(metrics.scale(spacing::TIGHT))
-                    .pt(metrics.scale(spacing::HAIRLINE))
-                    .pb(metrics.scale(2.0)),
-            );
+            .child(section(ux.home_local_section));
 
         if self.workspace.shells().is_empty() {
             menu = menu.child(
@@ -5976,6 +6038,8 @@ impl ShelluneView {
             let selected = index == self.workspace.shell_choice();
             menu = menu.child(
                 self.menu_item(
+                    Icon::Terminal,
+                    true,
                     shell.name().to_owned(),
                     Some(program_label(shell.program())),
                     selected,
@@ -5989,28 +6053,28 @@ impl ShelluneView {
         }
         menu = menu
             .child(
-                div()
-                    .h(px(1.0))
-                    .mx(metrics.scale(spacing::HAIRLINE))
-                    .my(metrics.scale(spacing::HAIRLINE))
-                    .bg(theme::swatch(palette::BORDER)),
-            )
-            .child(
                 self.menu_item(
+                    Icon::FolderOpen,
+                    false,
                     format!("{}{ELLIPSIS}", strings.shell_custom_button),
                     None,
-                    self.custom_shell_open,
+                    false,
                 )
                 .id("shell.custom")
                 .debug_selector(|| "shell.custom".to_owned())
                 .on_click(cx.listener(|this, _event, window, cx| {
-                    this.toggle_custom_shell(window, cx);
+                    this.shell_menu_open = false;
+                    this.open_custom_shell(window, cx);
                 })),
             )
+            .child(divider())
+            .child(section(ux.home_hosts_section))
             .child(
                 self.menu_item(
+                    Icon::Plug,
+                    false,
                     strings.quick_connect.to_owned(),
-                    Some(strings.quick_connect_hint.to_owned()),
+                    None,
                     false,
                 )
                 .id("menu.quick")
@@ -6020,72 +6084,79 @@ impl ShelluneView {
                 })),
             )
             .child(
-                self.menu_item(strings.primary_hosts.to_owned(), None, false)
-                    .id("menu.new_host")
-                    .debug_selector(|| "menu.new_host".to_owned())
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.shell_menu_open = false;
-                        this.select(Destination::Hosts, window, cx);
-                        this.open_create_host(cx);
-                    })),
+                self.menu_item(
+                    Icon::Plus,
+                    false,
+                    strings.primary_hosts.to_owned(),
+                    None,
+                    false,
+                )
+                .id("menu.new_host")
+                .debug_selector(|| "menu.new_host".to_owned())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.shell_menu_open = false;
+                    this.select(Destination::Hosts, window, cx);
+                    this.open_create_host(cx);
+                })),
             )
             .child(
-                self.menu_item(strings.import_open.to_owned(), None, false)
-                    .id("menu.import")
-                    .debug_selector(|| "menu.import".to_owned())
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.shell_menu_open = false;
-                        this.select(Destination::Hosts, window, cx);
-                        this.open_import(cx);
-                    })),
+                self.menu_item(
+                    Icon::Import,
+                    false,
+                    strings.import_open.to_owned(),
+                    None,
+                    false,
+                )
+                .id("menu.import")
+                .debug_selector(|| "menu.import".to_owned())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.shell_menu_open = false;
+                    this.select(Destination::Hosts, window, cx);
+                    this.open_import(cx);
+                })),
             );
-        if self.custom_shell_open {
-            menu = menu.child(
-                div()
-                    .p(metrics.scale(spacing::HAIRLINE))
-                    .debug_selector(|| "shell.path".to_owned())
-                    .child(self.shell_path.clone()),
-            );
-        }
 
-        div()
-            .child(gpui::deferred(
-                gpui::anchored().position(gpui::Point::default()).child(
-                    div()
-                        .id("shell.menu.backdrop")
-                        .w(viewport.width)
-                        .h(viewport.height)
-                        .occlude()
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(|this, _event, _window, cx| {
-                                this.close_shell_menu(cx);
-                            }),
-                        ),
-                ),
-            ))
-            .child(
+        Some(
+            overlay_layer().child(
                 div()
-                    .absolute()
-                    .top(metrics.control_height() + metrics.scale(spacing::HAIRLINE + 2.0))
-                    .right(px(0.0))
+                    .relative()
+                    .w(viewport.width)
+                    .h(viewport.height)
                     .child(
-                        gpui::deferred(
-                            gpui::anchored()
-                                .anchor(gpui::Corner::TopRight)
-                                .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                                .child(div().occlude().child(menu)),
-                        )
-                        .with_priority(1),
+                        div()
+                            .id("shell.menu.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
+                                this.close_shell_menu(cx);
+                            })),
+                    )
+                    .child(
+                        gpui::anchored()
+                            .position(gpui::point(
+                                anchor.left(),
+                                anchor.bottom() + metrics.scale(spacing::HAIRLINE + 2.0),
+                            ))
+                            .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                            .child(div().occlude().child(menu)),
                     ),
-            )
+            ),
+        )
     }
 
-    /// One line of a menu: a name, an optional detail and whether it is the current one.
-    fn menu_item(&self, label: String, detail: Option<String>, selected: bool) -> Div {
+    /// One line of a menu: an icon, a name, an optional detail on the right and,
+    /// for the current choice, a check.
+    fn menu_item(
+        &self,
+        icon: Icon,
+        accent: bool,
+        label: String,
+        detail: Option<String>,
+        selected: bool,
+    ) -> Div {
         let metrics = self.metrics();
         let hover = theme::swatch(palette::SURFACE_HOVER);
-        let custom = detail.is_none();
         div()
             .flex()
             .items_center()
@@ -6096,9 +6167,6 @@ impl ShelluneView {
             .text_size(metrics.label_size())
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .cursor_pointer()
-            .when(selected, |item| {
-                item.bg(theme::swatch(palette::SURFACE_HOVER))
-            })
             .hover(move |style| style.bg(hover))
             .child(
                 div()
@@ -6106,41 +6174,55 @@ impl ShelluneView {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .w(metrics.scale(24.0))
-                    .h(metrics.scale(24.0))
+                    .size(metrics.scale(24.0))
                     .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(if custom {
-                        palette::SURFACE_SELECTED
-                    } else {
+                    .bg(theme::swatch(if accent {
                         palette::ACCENT_TINT
+                    } else {
+                        palette::SURFACE_SELECTED
                     }))
                     .child(icons::icon(
-                        if custom { Icon::Search } else { Icon::Terminal },
+                        icon,
                         metrics.small_icon_size(),
-                        theme::swatch(if custom {
-                            palette::TEXT_SECONDARY
-                        } else {
+                        theme::swatch(if accent {
                             palette::ACCENT
+                        } else {
+                            palette::TEXT_SECONDARY
                         }),
                     )),
             )
             .child(
                 div()
-                    .flex_none()
-                    .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
                     .child(SharedString::from(label)),
             )
             .children(detail.map(|detail| {
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
+                    .flex_none()
+                    .max_w(metrics.scale(130.0))
                     .truncate()
-                    .text_right()
                     .font_family(terminal::monospace_family())
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(SharedString::from(detail))
             }))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(metrics.scale(16.0))
+                    .when(selected, |slot| {
+                        slot.child(icons::icon(
+                            Icon::Check,
+                            metrics.small_icon_size(),
+                            theme::swatch(palette::ACCENT),
+                        ))
+                    }),
+            )
     }
 
     /// Closes the shell menu, and with it the path field inside it.
@@ -6152,13 +6234,22 @@ impl ShelluneView {
     }
 
     /// Opens or closes the typed-path field, giving it the keyboard when it opens.
-    fn toggle_custom_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.custom_shell_open = !self.custom_shell_open;
-        if self.custom_shell_open {
-            let handle = self.shell_path.read(cx).focus_handle().clone();
-            window.focus(&handle);
-        }
+    /// Opens the dialog that starts any program by its path, with the keyboard in
+    /// the path field.
+    fn open_custom_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.custom_shell_open = true;
+        let handle = self.shell_path.read(cx).focus_handle().clone();
+        window.focus(&handle);
         cx.notify();
+    }
+
+    /// Closes the custom shell dialog without starting anything.
+    pub(super) fn close_custom_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.custom_shell_open {
+            self.custom_shell_open = false;
+            self.restore_focus(window, cx);
+            cx.notify();
+        }
     }
 
     /// Remembers one shell as the default and opens it in a new tab.
@@ -8896,6 +8987,9 @@ impl ShelluneView {
             PaneKind::Local => strings.session_kind_local,
             PaneKind::Remote => strings.session_kind_remote,
         };
+        // A live session is the normal case, and its tab already shows the green
+        // dot; the bar only speaks up while connecting, or once it failed or ended.
+        let live = matches!(session.state(), SessionState::Connected);
         let target = match session.kind() {
             SessionKind::Local { .. } => program_label(&self.target_of(session)),
             SessionKind::Remote { .. } => self.target_of(session),
@@ -8984,11 +9078,27 @@ impl ShelluneView {
                         .items_center()
                         .gap(metrics.scale(spacing::TIGHT))
                         .min_w(px(0.0))
-                        .child(components::kind_badge(
-                            kind_label,
-                            kind == PaneKind::Remote,
-                            metrics,
-                        ))
+                        .child(
+                            div()
+                                .id("session.kind")
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(metrics.scale(22.0))
+                                .rounded(px(radius::SMALL))
+                                .bg(theme::swatch(palette::ACCENT_TINT))
+                                .tooltip(components::tooltip(kind_label))
+                                .child(icons::icon(
+                                    if kind == PaneKind::Remote {
+                                        Icon::Server
+                                    } else {
+                                        Icon::Terminal
+                                    },
+                                    metrics.small_icon_size(),
+                                    theme::swatch(palette::ACCENT),
+                                )),
+                        )
                         .child(
                             div()
                                 .flex_none()
@@ -9015,7 +9125,9 @@ impl ShelluneView {
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
                                 .child(SharedString::from(target))
                         }))
-                        .child(components::chip(state_label, tone, metrics))
+                        .when(!live, |row| {
+                            row.child(components::chip(state_label, tone, metrics))
+                        })
                         .children(self.unsaved.iter().find(|(session, _)| *session == id).map(
                             |_| {
                                 div()
@@ -9073,14 +9185,15 @@ impl ShelluneView {
                                 ))
                             },
                         )
-                        .child(self.icon_text_button(
-                            SharedString::from("session.close"),
-                            Icon::Close,
-                            strings.session_close,
-                            Variant::Ghost,
-                            cx,
-                            move |view, cx| view.request_close_session(id, cx),
-                        )),
+                        .child(
+                            components::icon_only_button(Icon::Close, metrics)
+                                .id("session.close")
+                                .debug_selector(|| "session.close".to_owned())
+                                .tooltip(components::tooltip(strings.session_close))
+                                .on_click(cx.listener(move |view, _event, _window, cx| {
+                                    view.request_close_session(id, cx);
+                                })),
+                        ),
                 );
         let notice = self.quick_save_notice.clone();
         div()
@@ -9384,7 +9497,9 @@ impl Render for ShelluneView {
             window.appearance(),
             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
         );
-        theme::set_appearance(self.theme_choice.appearance(system_dark));
+        let appearance = self.theme_choice.appearance(system_dark);
+        theme::set_appearance(appearance);
+        theme::set_terminal_appearance(self.terminal_scheme.appearance(appearance));
         theme::set_motion(self.workspace.motion());
         // A field's focus is noted before a click can blur it. Opening an overlay then
         // still knows which field to restore, even when the click already moved focus.
@@ -9424,6 +9539,7 @@ impl Render for ShelluneView {
 
         div()
             .id("shellune.root")
+            .relative()
             .flex()
             .size_full()
             .bg(theme::swatch(palette::CANVAS))
@@ -9480,6 +9596,10 @@ impl Render for ShelluneView {
                 // notice.
                 if this.palette.is_some() {
                     this.close_palette(window, cx);
+                    return;
+                }
+                if this.custom_shell_open {
+                    this.close_custom_shell(window, cx);
                     return;
                 }
                 if this.host_fields.is_some() {
@@ -9605,13 +9725,6 @@ impl Render for ShelluneView {
                 let last = this.workspace.layout().tabs().len().saturating_sub(1);
                 this.select_tab(last, window, cx);
             }))
-            .children(self.palette_overlay(window, cx))
-            .children(self.tab_menu_overlay(window, cx))
-            .children(self.session_menu_overlay(window, cx))
-            .children(self.host_dialog_overlay(window, cx))
-            .children(self.connection_overlay(window, cx))
-            .children(self.import_overlay(window, cx))
-            .children(self.tool_overlay(window, cx))
             .child(
                 div()
                     .flex()
@@ -9625,7 +9738,25 @@ impl Render for ShelluneView {
                     .children(self.close_app_question(cx))
                     .child(self.destination_panel(cx)),
             )
+            // Floating layers, drawn after the page and so above it, the later the
+            // higher. They are plain layers rather than deferred draws, so a field
+            // inside one can still defer its own right-click menu: gpui refuses a
+            // deferred draw inside another.
+            .children(self.connection_overlay(window, cx))
+            .children(self.import_overlay(window, cx))
+            .children(self.tool_overlay(window, cx))
+            .children(self.host_dialog_overlay(window, cx))
+            .children(self.custom_shell_overlay(window, cx))
+            .children(self.shell_menu_overlay(window, cx))
+            .children(self.tab_menu_overlay(window, cx))
+            .children(self.session_menu_overlay(window, cx))
+            .children(self.palette_overlay(window, cx))
     }
+}
+
+/// A window-sized layer at the top-left of the root, for a dialog or a menu.
+fn overlay_layer() -> Div {
+    div().absolute().top_0().left_0()
 }
 
 /// Why a port the quick form cannot dial, naming the field to change.
