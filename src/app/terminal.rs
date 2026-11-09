@@ -308,6 +308,34 @@ pub enum PaneRequest {
 
 impl gpui::EventEmitter<PaneRequest> for TerminalPane {}
 
+/// The background notices one terminal produced, without a trace of its text (R7).
+///
+/// Exactly two things are noticed: the program rang the bell, and a command block the
+/// shell reported moved from running to ended. Neither carries a command line, output
+/// or anything else the session printed, so a mark on a tab can never repeat what ran,
+/// and a reminder that is switched off changes nothing about the bytes or the blocks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalAttention {
+    /// The program rang the bell.
+    pub bell: bool,
+    /// A command ended, because the shell said so with an end marker.
+    pub finished: bool,
+}
+
+impl TerminalAttention {
+    /// Whether nothing is waiting to be collected.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        !self.bell && !self.finished
+    }
+
+    /// Adds another set of notices. Nothing is ever cleared by a merge.
+    pub fn absorb(&mut self, other: Self) {
+        self.bell |= other.bell;
+        self.finished |= other.finished;
+    }
+}
+
 pub struct TerminalPane {
     /// Which session process this pane shows.
     ///
@@ -381,6 +409,11 @@ pub struct TerminalPane {
     /// The shortcuts the pane's own controls answer, as the bindings in force show
     /// them (R5). The view keeps this in step with the settings page.
     shortcuts: TerminalShortcuts,
+    /// Background notices the window has not collected yet (R7).
+    ///
+    /// They are taken by the window, which knows which tab is on screen; this pane only
+    /// remembers that something happened, never what it was.
+    attention: TerminalAttention,
 }
 
 /// What a terminal's copy, paste and search controls answer, written the way a
@@ -523,6 +556,7 @@ impl TerminalPane {
             search_scroll: None,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
+            attention: TerminalAttention::default(),
         };
         pane.start_polling(cx);
         pane
@@ -580,6 +614,7 @@ impl TerminalPane {
             search_scroll: None,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
+            attention: TerminalAttention::default(),
         };
         pane.start_polling(cx);
         pane
@@ -636,6 +671,7 @@ impl TerminalPane {
             search_scroll: None,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
+            attention: TerminalAttention::default(),
         };
         pane.start_polling(cx);
         pane
@@ -708,6 +744,7 @@ impl TerminalPane {
             search_scroll: None,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
+            attention: TerminalAttention::default(),
         }
     }
 
@@ -895,6 +932,12 @@ impl TerminalPane {
     }
 
     fn apply_effects(&mut self, effects: TerminalEffects, cx: &mut Context<Self>) {
+        // Read the background flags before the clipboard text is moved out: the notice
+        // is two booleans and never anything the terminal printed (R7).
+        let notices = TerminalAttention {
+            bell: effects.bell,
+            finished: effects.commands_finished > 0,
+        };
         if !effects.writes.is_empty() {
             // A device-attribute query has to be answered or the program that asked
             // waits for ever; the answer goes back through the same PTY.
@@ -903,6 +946,26 @@ impl TerminalPane {
         if let Some(text) = effects.clipboard {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        if !notices.is_empty() {
+            // A bell byte and a command end the shell reported are remembered for the
+            // window, which marks the tab only when it is not the one on screen (R7).
+            self.attention.absorb(notices);
+        }
+    }
+
+    /// Takes the background notices this terminal produced since the last call.
+    ///
+    /// The window collects them, so the same bell is never marked twice. Reading them
+    /// does not touch the grid, the blocks or the session state.
+    pub fn take_attention(&mut self) -> TerminalAttention {
+        std::mem::take(&mut self.attention)
+    }
+
+    /// The notices waiting to be collected, for the tests that check a tab mark.
+    #[cfg(test)]
+    #[must_use]
+    pub fn pending_attention_for_test(&self) -> TerminalAttention {
+        self.attention
     }
 
     fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -1262,6 +1325,14 @@ impl TerminalPane {
     #[must_use]
     pub fn shows_blocks_for_test(&self) -> bool {
         !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks())
+    }
+
+    /// How many command blocks this terminal has recorded, for the tests that check a
+    /// switched-off reminder leaves the blocks alone (R7).
+    #[cfg(test)]
+    #[must_use]
+    pub fn command_block_count_for_test(&self) -> usize {
+        self.core.command_blocks().len()
     }
 
     /// Opens or closes the find bar (R1).

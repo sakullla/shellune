@@ -25,7 +25,48 @@ use crate::app::layout::Node;
 use crate::app::nav::Destination;
 use crate::app::palette::{self, Command, Entry, Group};
 use crate::app::text_field::TextField;
-use crate::app::theme::{self, Tone, palette as colors, radius, spacing};
+use crate::app::theme::{self, Metrics, Tone, palette as colors, radius, spacing};
+use crate::app::workspace::UnreadNotices;
+
+/// The background marks of one tab, in the all-tabs list (R7).
+///
+/// The strip has room for one word, so the list writes the whole story: a chip per kind
+/// with its tooltip saying what happened and that opening the tab clears it. Each chip
+/// is a word, so the list is readable in both themes and needs no animation.
+fn attention_rows(
+    unread: UnreadNotices,
+    strings: &copy::Strings,
+    metrics: Metrics,
+    index: usize,
+) -> Vec<Stateful<Div>> {
+    let kinds = [
+        (
+            unread.bell,
+            strings.tab_mark_bell,
+            strings.tab_mark_bell_hint,
+            "bell",
+        ),
+        (
+            unread.finished,
+            strings.tab_mark_finished,
+            strings.tab_mark_finished_hint,
+            "finished",
+        ),
+    ];
+    let mut marks = Vec::new();
+    for (present, label, hint, name) in kinds {
+        if !present {
+            continue;
+        }
+        marks.push(
+            components::chip(label, Tone::Accent, metrics)
+                .id(SharedString::from(format!("tabs.list.mark.{name}.{index}")))
+                .debug_selector(move || format!("tabs.list.mark.{name}.{index}"))
+                .tooltip(components::tooltip(hint)),
+        );
+    }
+    marks
+}
 
 /// How a host is described in the palette: its target, then a jump or ProxyCommand.
 fn host_palette_detail(host: &HostConfig) -> String {
@@ -1603,6 +1644,11 @@ impl ShelluneView {
             let accent = tab.accent();
             let selector = format!("tabs.list.row.{index}");
             let current = active == Some(tab_id);
+            // What this tab is carrying from the background, spelled out: the strip has
+            // room for one word, the list says which news it was and what clears it
+            // (R7). Choosing the row shows the tab, which clears the marks.
+            let unread = self.workspace.unread(tab_id);
+            let marks = attention_rows(unread, strings, metrics, index);
             let hover = theme::swatch(colors::SURFACE_HOVER);
             let rename = tab_id;
             let row = div()
@@ -1684,6 +1730,7 @@ impl ShelluneView {
                         metrics,
                     ))
                 })
+                .children(marks)
                 .child(
                     components::icon_only_button(Icon::Pencil, metrics)
                         .id(SharedString::from(format!("tabs.list.rename.{index}")))

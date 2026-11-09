@@ -18,6 +18,8 @@ use shellune_core::{
     Transfer, WorkspaceSnapshot,
 };
 
+use std::collections::BTreeMap;
+
 use crate::app::layout::SessionLayout;
 
 use crate::app::copy::{Locale, Strings};
@@ -225,6 +227,99 @@ pub enum PrimaryOutcome {
     Delegated,
 }
 
+/// Which background notices may mark a tab (R7).
+///
+/// The two are switched independently: a bell and a command end the shell reported are
+/// different news, and someone who wants to know a long command finished may not want
+/// their background shells' bells to mark anything. Both start on; switching one off
+/// stops that mark only, and leaves the bell byte, the command blocks, the session
+/// state and a disconnect reason exactly as they were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttentionSettings {
+    /// A bell in a tab that is not on screen marks it.
+    pub bell: bool,
+    /// A command end the shell reported in a tab that is not on screen marks it.
+    pub finished: bool,
+}
+
+impl Default for AttentionSettings {
+    fn default() -> Self {
+        Self {
+            bell: true,
+            finished: true,
+        }
+    }
+}
+
+impl AttentionSettings {
+    /// Whether this kind of news is allowed to mark a tab.
+    #[must_use]
+    pub fn allows(self, kind: AttentionKind) -> bool {
+        match kind {
+            AttentionKind::Bell => self.bell,
+            AttentionKind::CommandFinished => self.finished,
+        }
+    }
+
+    /// Switches one kind on or off, and says whether it changed.
+    pub fn set(&mut self, kind: AttentionKind, on: bool) -> bool {
+        let slot = match kind {
+            AttentionKind::Bell => &mut self.bell,
+            AttentionKind::CommandFinished => &mut self.finished,
+        };
+        if *slot == on {
+            return false;
+        }
+        *slot = on;
+        true
+    }
+}
+
+/// The two background events a tab can be marked for (R7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionKind {
+    /// The program rang the bell.
+    Bell,
+    /// A command block ended because the shell reported it.
+    CommandFinished,
+}
+
+/// What one tab is carrying until the user looks at it again (R7).
+///
+/// The mark says which kind of news arrived and nothing else: no command line, no
+/// output and no credential ever reaches it, so a mark cannot leak what a session did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnreadNotices {
+    /// A bell rang while this tab was not on screen.
+    pub bell: bool,
+    /// A command ended while this tab was not on screen.
+    pub finished: bool,
+}
+
+impl UnreadNotices {
+    /// Whether anything is waiting to be seen.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        !self.bell && !self.finished
+    }
+
+    /// Adds one kind of news.
+    fn record(&mut self, kind: AttentionKind) {
+        match kind {
+            AttentionKind::Bell => self.bell = true,
+            AttentionKind::CommandFinished => self.finished = true,
+        }
+    }
+
+    /// Forgets one kind, when its reminder is switched off.
+    fn clear(&mut self, kind: AttentionKind) {
+        match kind {
+            AttentionKind::Bell => self.bell = false,
+            AttentionKind::CommandFinished => self.finished = false,
+        }
+    }
+}
+
 /// The whole shell state.
 #[derive(Debug)]
 pub struct Workspace {
@@ -244,6 +339,14 @@ pub struct Workspace {
     context: PanelSection,
     /// Tabs and the pane tree. Leaves name sessions; they do not own a second copy.
     layout: SessionLayout,
+    /// Which background notices may mark a tab (R7).
+    attention: AttentionSettings,
+    /// The background notices each tab is carrying until it is seen (R7).
+    ///
+    /// This is a reminder about something that happened while the window was open, not
+    /// a record: it is deliberately not saved, and nothing about it is restored on the
+    /// next start.
+    unread: BTreeMap<TabId, UnreadNotices>,
 }
 
 impl Default for Workspace {
@@ -282,6 +385,8 @@ impl Workspace {
             notice: None,
             context: PanelSection::None,
             layout: SessionLayout::new(),
+            attention: AttentionSettings::default(),
+            unread: BTreeMap::new(),
         }
     }
 
@@ -367,6 +472,88 @@ impl Workspace {
     /// Clearing the colour changes nothing else: no state is read from it.
     pub fn recolor_tab(&mut self, tab: TabId, accent: Option<TabAccent>) -> bool {
         self.layout.set_accent(tab, accent)
+    }
+
+    /// Which background notices may mark a tab (R7).
+    #[must_use]
+    pub fn attention_settings(&self) -> AttentionSettings {
+        self.attention
+    }
+
+    /// Switches one kind of background reminder on or off.
+    ///
+    /// Returns whether it changed. Marks already carried for that kind are dropped with
+    /// it: a reminder the user turned off must not keep marking a tab. What happened —
+    /// the bell byte, the command block, the disconnect reason — is untouched.
+    pub fn set_attention(&mut self, kind: AttentionKind, on: bool) -> bool {
+        if !self.attention.set(kind, on) {
+            return false;
+        }
+        if !on {
+            for notices in self.unread.values_mut() {
+                notices.clear(kind);
+            }
+            self.unread.retain(|_, notices| !notices.is_empty());
+        }
+        true
+    }
+
+    /// Records that a background notice came from one session's tab.
+    ///
+    /// Returns whether a tab was marked. Nothing is marked when the reminder is
+    /// switched off, or when the session is not in a tab: a mark belongs to a tab the
+    /// user can go back to. The caller decides what is "already seen", because only the
+    /// view knows which tab is on screen.
+    pub fn note_attention(&mut self, session: SessionId, kind: AttentionKind) -> bool {
+        if !self.attention.allows(kind) {
+            return false;
+        }
+        let Some(tab) = self.tab_of_session(session) else {
+            return false;
+        };
+        self.unread.entry(tab).or_default().record(kind);
+        true
+    }
+
+    /// The background notices one tab is carrying.
+    #[must_use]
+    pub fn unread(&self, tab: TabId) -> UnreadNotices {
+        self.unread.get(&tab).copied().unwrap_or_default()
+    }
+
+    /// The background notices one session's tab is carrying.
+    #[must_use]
+    pub fn session_unread(&self, session: SessionId) -> UnreadNotices {
+        self.tab_of_session(session)
+            .map(|tab| self.unread(tab))
+            .unwrap_or_default()
+    }
+
+    /// Clears the notices of one tab, because the user is looking at it.
+    ///
+    /// Returns whether anything was cleared, which is what tells the caller whether the
+    /// marks on screen changed.
+    pub fn clear_attention(&mut self, tab: TabId) -> bool {
+        self.unread
+            .remove(&tab)
+            .is_some_and(|notices| !notices.is_empty())
+    }
+
+    /// Clears the notices of the tab one session lives in.
+    pub fn clear_session_attention(&mut self, session: SessionId) -> bool {
+        match self.tab_of_session(session) {
+            Some(tab) => self.clear_attention(tab),
+            None => false,
+        }
+    }
+
+    /// Drops notices of tabs that are no longer there.
+    ///
+    /// A tab id is never reused, so an entry left behind could only make the map grow
+    /// while the window stays open.
+    fn prune_unread(&mut self) {
+        let layout = &self.layout;
+        self.unread.retain(|tab, _| layout.tab(*tab).is_some());
     }
 
     /// The next session splits the active pane instead of opening a tab.
@@ -749,6 +936,7 @@ impl Workspace {
         let closed = self.transition(id, |session| session.close().is_ok());
         if closed {
             self.layout.detach_session(id);
+            self.prune_unread();
         }
         closed
     }
@@ -808,6 +996,7 @@ impl Workspace {
     /// Only an attempt that never became live may be forgotten this way.
     pub fn session_forgotten(&mut self, id: SessionId) {
         self.layout.detach_session(id);
+        self.prune_unread();
         self.forget_session_record(id);
     }
 

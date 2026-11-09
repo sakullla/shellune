@@ -53,13 +53,31 @@ pub struct TerminalEffects {
     pub clipboard: Option<String>,
     /// Whether the program rang the bell.
     pub bell: bool,
+    /// How many command blocks ended because the shell said so, during this chunk.
+    ///
+    /// Only an explicit `D` marker in the shell integration counts: a prompt that
+    /// arrived without one, a process that exited, or a block closed by an
+    /// integration failure is not a reported end. The count is all that crosses this
+    /// boundary — no command line and no output — so a caller that marks a background
+    /// tab cannot repeat what ran (R7).
+    pub commands_finished: usize,
 }
 
 impl TerminalEffects {
     /// Whether nothing was requested.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.writes.is_empty() && self.title.is_none() && self.clipboard.is_none() && !self.bell
+        self.writes.is_empty()
+            && self.title.is_none()
+            && self.clipboard.is_none()
+            && !self.bell
+            && self.commands_finished == 0
+    }
+
+    /// Whether a background event happened that a tab may mark, without any of its text.
+    #[must_use]
+    pub fn has_background_notice(&self) -> bool {
+        self.bell || self.commands_finished > 0
     }
 }
 
@@ -384,7 +402,11 @@ impl TerminalCore {
                 }
                 Segment::Event(event) => {
                     self.note_history();
-                    self.apply_integration(event);
+                    // A block can only finish because the shell said it did; the
+                    // count is a background notice, never a command line (R7).
+                    if self.apply_integration(event) {
+                        effects.commands_finished += 1;
+                    }
                 }
             }
         }
@@ -736,7 +758,12 @@ impl TerminalCore {
         viewport_to_point(self.display_offset(), Point::new(row, Column(column)))
     }
 
-    fn apply_integration(&mut self, event: IntegrationEvent) {
+    /// Applies one shell-integration marker.
+    ///
+    /// Returns whether the marker ended a command block, which is the only case the
+    /// caller reports as a background notice (R7). An end marker with no block open,
+    /// a prompt, and an input or output start all return `false`.
+    fn apply_integration(&mut self, event: IntegrationEvent) -> bool {
         let now = Instant::now();
         match event {
             IntegrationEvent::PromptStart => {
@@ -755,9 +782,16 @@ impl TerminalCore {
                     }
                 }
                 self.blocks.prompt_start();
+                false
             }
-            IntegrationEvent::InputStart => self.blocks.input_start(self.anchor_now()),
-            IntegrationEvent::CommandText(command) => self.blocks.set_explicit_command(command),
+            IntegrationEvent::InputStart => {
+                self.blocks.input_start(self.anchor_now());
+                false
+            }
+            IntegrationEvent::CommandText(command) => {
+                self.blocks.set_explicit_command(command);
+                false
+            }
             IntegrationEvent::OutputStart => {
                 let scraped = if self.on_alternate_screen() {
                     None
@@ -767,6 +801,7 @@ impl TerminalCore {
                         .and_then(|anchor| self.text_between(anchor, self.anchor_now()))
                 };
                 self.blocks.output_start(scraped, self.anchor_now(), now);
+                false
             }
             IntegrationEvent::CommandFinished { exit } => {
                 let output = if self.on_alternate_screen() {
@@ -776,7 +811,7 @@ impl TerminalCore {
                         .output_anchor()
                         .and_then(|anchor| self.text_between(anchor, self.anchor_now()))
                 };
-                self.blocks.finish(output, exit, now);
+                self.blocks.finish(output, exit, now)
             }
         }
     }
@@ -859,6 +894,7 @@ fn merge_effects(into: &mut TerminalEffects, next: TerminalEffects) {
         into.clipboard = next.clipboard;
     }
     into.bell |= next.bell;
+    into.commands_finished += next.commands_finished;
 }
 
 #[cfg(test)]
@@ -1092,6 +1128,59 @@ mod tests {
         let mut terminal = core();
         let effects = terminal.feed(b"\x1b]52;c;SGVsbG8=\x07");
         assert_eq!(effects.clipboard.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn a_ring_and_a_reported_command_end_are_the_only_background_notices() {
+        let mut terminal = core();
+
+        // A bell is a real bell byte, and it is not also a command end.
+        let effects = terminal.feed(b"\x07");
+        assert!(effects.bell);
+        assert_eq!(effects.commands_finished, 0);
+        assert!(effects.has_background_notice());
+
+        // Plain output says nothing about a command ending.
+        let effects = terminal.feed(b"just output\r\n");
+        assert!(!effects.has_background_notice());
+
+        // The chunk that carries the end marker reports the finished command.
+        terminal.feed(&osc("133;A"));
+        terminal.feed(&osc("133;B"));
+        terminal.feed(&osc("133;C"));
+        let effects = terminal.feed(&osc("133;D;0"));
+        assert_eq!(effects.commands_finished, 1);
+        assert!(!effects.bell, "an end marker is not a bell byte");
+
+        // An end marker without an exit code is still a reported end, not success.
+        terminal.feed(&osc("133;A"));
+        terminal.feed(&osc("133;B"));
+        terminal.feed(&osc("133;C"));
+        let effects = terminal.feed(&osc("133;D"));
+        assert_eq!(effects.commands_finished, 1);
+        assert_eq!(
+            terminal.command_blocks().last().map(|block| block.status),
+            Some(BlockStatus::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_prompt_without_an_end_marker_is_not_a_finished_command() {
+        let mut terminal = core();
+        terminal.feed(&osc("133;A"));
+        terminal.feed(&osc("133;B"));
+        terminal.feed(&osc("133;C"));
+        // No shell integration marker ended the command: a new prompt is not one.
+        let effects = terminal.feed(&osc("133;A"));
+        assert_eq!(
+            effects.commands_finished, 0,
+            "an end the shell never reported must not be invented"
+        );
+        assert!(!effects.has_background_notice());
+
+        // An end marker with nothing running invents nothing either.
+        let effects = terminal.feed(&osc("133;D;0"));
+        assert_eq!(effects.commands_finished, 0);
     }
 
     #[test]

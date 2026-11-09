@@ -139,6 +139,13 @@ pub struct Preferences {
     /// uses the catalogue's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keymap: Option<KeymapPreferences>,
+    /// Whether a bell in a background tab marks it (R7). Absent means on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bell_notice: Option<bool>,
+    /// Whether a command end the shell reported in a background tab marks it (R7).
+    /// Absent means on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_notice: Option<bool>,
 }
 
 /// A preferences file at a known location.
@@ -244,6 +251,8 @@ mod tests {
                 macos: Vec::new(),
                 linux: Vec::new(),
             }),
+            bell_notice: Some(false),
+            command_notice: Some(true),
         };
         store.save(&preferences).expect("saves");
         assert_eq!(store.load(), preferences);

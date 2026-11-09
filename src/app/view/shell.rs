@@ -18,7 +18,7 @@ use crate::app::copy::{self, Locale};
 use crate::app::icons::{self, Icon};
 use crate::app::nav::{Destination, Platform};
 use crate::app::theme::{self, Motion, ThemeChoice, Tone, Zoom, palette, radius, spacing};
-use crate::app::workspace::SectionState;
+use crate::app::workspace::{AttentionKind, SectionState};
 
 /// A tool of a host or session that opens over the page instead of being a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -779,6 +779,40 @@ impl ShelluneView {
                 cx.notify();
             },
         );
+        // The two background reminders are switched one by one (R7): knowing that a long
+        // command in another tab ended is not the same wish as hearing about every bell.
+        // Both only decide whether a tab is marked, so turning one off leaves the bell
+        // byte, the command blocks and every disconnect reason exactly as they were.
+        let notifications = self.workspace.attention_settings();
+        let notices_label = |on: bool| if on { ux.notice_on } else { ux.notice_off }.to_owned();
+        let bell_control = self.segments(
+            "settings.notice.bell",
+            vec![
+                (notices_label(notifications.bell), notifications.bell),
+                (notices_label(!notifications.bell), !notifications.bell),
+            ],
+            cx,
+            |view, index, cx| {
+                view.set_attention_notice(AttentionKind::Bell, index == 0, cx);
+            },
+        );
+        let finished_control = self.segments(
+            "settings.notice.finished",
+            vec![
+                (
+                    notices_label(notifications.finished),
+                    notifications.finished,
+                ),
+                (
+                    notices_label(!notifications.finished),
+                    !notifications.finished,
+                ),
+            ],
+            cx,
+            |view, index, cx| {
+                view.set_attention_notice(AttentionKind::CommandFinished, index == 0, cx);
+            },
+        );
         let font = self.workspace.local_font_size();
         let font_control = div()
             .flex()
@@ -885,6 +919,21 @@ impl ShelluneView {
                         ux.settings_default_shell,
                         ux.settings_default_shell_hint,
                         shell_control,
+                    ),
+                ],
+            ))
+            .child(self.settings_group(
+                ux.settings_notices,
+                vec![
+                    self.settings_row(
+                        ux.settings_bell_notice,
+                        ux.settings_bell_notice_hint,
+                        bell_control,
+                    ),
+                    self.settings_row(
+                        ux.settings_finished_notice,
+                        ux.settings_finished_notice_hint,
+                        finished_control,
                     ),
                 ],
             ))
@@ -1462,6 +1511,24 @@ impl ShelluneView {
         let panes: Vec<_> = self.panes.iter().map(|open| open.pane.clone()).collect();
         for pane in panes {
             pane.update(cx, |pane, cx| pane.set_font_size(size, cx));
+        }
+        cx.notify();
+    }
+
+    /// Switches one background reminder on or off (R7).
+    ///
+    /// The choice is written with the other preferences on the next draw, so it
+    /// survives a restart. Turning a reminder off drops the marks it already made and
+    /// touches nothing else: no bell byte is eaten, no block is rewritten and no reason
+    /// for a disconnect is hidden.
+    pub(super) fn set_attention_notice(
+        &mut self,
+        kind: AttentionKind,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.set_attention(kind, on) {
+            self.persist_preferences();
         }
         cx.notify();
     }

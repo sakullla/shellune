@@ -553,15 +553,28 @@ impl BlockBook {
         open.started = Some(now);
     }
 
-    pub(crate) fn finish(&mut self, output: Option<String>, exit: ExitCodeField, now: Instant) {
+    /// Closes the running block because the shell reported a command end.
+    ///
+    /// Returns whether a command was really ended. An end marker that arrives while
+    /// no command had started - at a prompt, or with no block open at all - records
+    /// nothing that could be called a finished command, so a caller that marks a
+    /// background tab is not told a command ended when none ran (R7).
+    pub(crate) fn finish(
+        &mut self,
+        output: Option<String>,
+        exit: ExitCodeField,
+        now: Instant,
+    ) -> bool {
         self.seen = true;
         if matches!(exit, ExitCodeField::Unreadable) {
             self.failed = true;
         }
         let Some(mut open) = self.open.take() else {
             // An end marker with no command does not invent a successful block.
-            return;
+            return false;
         };
+        // A block that never left the prompt has no command to report as ended.
+        let ended_a_command = open.phase != Phase::Prompt || !open.command.is_empty();
         if let Some(output) = output {
             open.output = tidy_output(&output);
         }
@@ -573,6 +586,7 @@ impl BlockBook {
             ExitCodeField::Known(code) => BlockStatus::Exited(code),
         };
         self.finished.push(open.close(status, duration));
+        ended_a_command
     }
 
     /// Finished blocks, then the running one when a command has actually started.
@@ -744,5 +758,45 @@ mod tests {
         assert!(!BlockFilter::ExitedZero.matches(BlockStatus::Unknown));
         assert!(!BlockFilter::ExitedZero.matches(BlockStatus::Running));
         assert!(BlockFilter::ExitedZero.matches(BlockStatus::Exited(0)));
+    }
+
+    #[test]
+    fn only_an_end_marker_that_closes_a_command_reports_one() {
+        let mut book = BlockBook::new();
+        let now = Instant::now();
+        let anchor = GridAnchor {
+            stable: 0,
+            column: 0,
+        };
+        // Nothing was running, so an end marker reports no completion.
+        assert!(!book.finish(None, ExitCodeField::Known(0), now));
+
+        book.prompt_start();
+        book.input_start(anchor);
+        book.set_explicit_command("true".to_owned());
+        book.output_start(None, anchor, now);
+        assert!(
+            book.finish(None, ExitCodeField::Known(0), now),
+            "a running command the shell ended is one reported completion"
+        );
+
+        // A new prompt without an end marker closes the block as unknown, and that is
+        // not something the shell reported as ended.
+        book.prompt_start();
+        book.input_start(anchor);
+        book.set_explicit_command("sleep 5".to_owned());
+        book.output_start(None, anchor, now);
+        book.prompt_start();
+        // Nor is an end marker that arrives at a bare prompt: no command ran.
+        assert!(!book.finish(None, ExitCodeField::Missing, now));
+        assert_eq!(
+            book.blocks()
+                .into_iter()
+                .filter(|block| !block.command.is_empty())
+                .map(|block| block.status)
+                .collect::<Vec<_>>(),
+            vec![BlockStatus::Exited(0), BlockStatus::Unknown],
+            "the reported end kept its code, and the interrupted command stayed unknown"
+        );
     }
 }

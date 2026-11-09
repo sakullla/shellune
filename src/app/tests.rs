@@ -39,12 +39,17 @@ use crate::app::layout::Direction;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
-use crate::app::terminal::{PaneState, SearchNote, SourceEvent, TerminalPane, TerminalShortcuts};
+use crate::app::terminal::{
+    PaneState, SearchNote, SourceEvent, TerminalAttention, TerminalPane, TerminalShortcuts,
+};
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
 };
 use crate::app::view::{AccentRow, KeyRowControl};
-use crate::app::workspace::{Failure, PrimaryOutcome, Recovery, Section, SectionState, Workspace};
+use crate::app::workspace::{
+    AttentionKind, AttentionSettings, Failure, PrimaryOutcome, Recovery, Section, SectionState,
+    Workspace,
+};
 use crate::app::{DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ShelluneView, key_bindings};
 
 fn design_window() -> Size<Pixels> {
@@ -13384,4 +13389,503 @@ fn a_rebound_action_survives_a_restart_through_the_preferences_file() {
         "the actions the user did not touch keep their defaults"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Background notices (R7)
+// ---------------------------------------------------------------------------
+
+/// Sends bytes to one session's terminal as if its program had written them.
+fn feed_session(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+    bytes: &[u8],
+) {
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the session has a terminal");
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.feed_for_test(bytes, cx));
+    });
+    cx.run_until_parked();
+}
+
+/// The background marks one session's tab is carrying.
+fn unread_of(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+) -> crate::app::workspace::UnreadNotices {
+    cx.update(|_window, app| view.read(app).workspace().session_unread(id))
+}
+
+/// A command the shell reports from start to end, as its integration markers do.
+const REPORTED_COMMAND: &[u8] =
+    b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07secret output\r\n\x1b]133;D;0\x07";
+
+#[gpui::test]
+async fn a_bell_in_a_background_tab_marks_it_without_taking_the_screen(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let (background, foreground) = (tabs[0], tabs[1]);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(foreground),
+        "the newest shell is the one on screen"
+    );
+
+    feed_session(cx, &view, background, b"\x07");
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(foreground),
+        "a bell in another tab must not switch the tab or move the keyboard"
+    );
+    assert!(
+        unread_of(cx, &view, background).bell,
+        "the tab the bell rang in is marked"
+    );
+    assert!(
+        !unread_of(cx, &view, background).finished,
+        "a ring is not a command end"
+    );
+    assert!(
+        unread_of(cx, &view, foreground).is_empty(),
+        "the tab on screen is not marked for another tab's bell"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.mark.bell.0").is_some(),
+        "the strip marks that tab in words, not only in colour"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.mark.bell.1").is_none(),
+        "the tab on screen carries no mark"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).toast_titles())
+            .is_empty(),
+        "a background bell is not a toast that disappears on its own"
+    );
+
+    // Choosing the mark is choosing that tab: it shows the tab and the pane that rang,
+    // which is what clears the mark.
+    click(cx, "session.tab.mark.bell.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(background)
+    );
+    assert!(
+        unread_of(cx, &view, background).is_empty(),
+        "viewing the tab cleared its mark"
+    );
+    // The strip draws from exactly this state, so a cleared tab has nothing to draw.
+    // (The test window keeps a selector's last bounds, so absence is read from the
+    // model the strip renders rather than from a selector that once existed.)
+    assert!(cx.debug_bounds("session.tab.mark.bell.1").is_none());
+}
+
+#[gpui::test]
+async fn only_a_shell_reported_command_end_marks_a_background_tab(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let background = tabs[0];
+
+    // Output on its own says nothing about a command ending.
+    feed_session(cx, &view, background, b"just output\r\n");
+    assert!(
+        unread_of(cx, &view, background).is_empty(),
+        "output alone must not claim a command ended"
+    );
+
+    // A prompt that arrived without an end marker is not one either: this is the
+    // shell-without-integration case, and it must not produce a made-up reminder.
+    feed_session(
+        cx,
+        &view,
+        background,
+        b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;A\x07",
+    );
+    assert!(
+        unread_of(cx, &view, background).is_empty(),
+        "without an end marker the shell never reported one"
+    );
+
+    // The shell reporting the end marks the tab, and the mark is one fixed word.
+    feed_session(cx, &view, background, REPORTED_COMMAND);
+    let unread = unread_of(cx, &view, background);
+    assert!(
+        unread.finished,
+        "the reported end marks the tab it happened in"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[1]),
+        "the mark does not switch the tab"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.mark.finished.0").is_some(),
+        "the strip says a command ended"
+    );
+    let label = cx.update(|_window, app| view.read(app).tab_label_for_test(background));
+    assert!(
+        !label.contains("secret output"),
+        "the mark repeats no output, got {label:?}"
+    );
+    let strings = &ENGLISH;
+    assert_eq!(
+        strings.tab_mark_finished, "Ended",
+        "the mark is a fixed word, so it cannot carry what ran"
+    );
+
+    // The mark clears when the tab is seen again, and the strip draws only that state.
+    click(cx, "session.tab.0");
+    assert!(
+        unread_of(cx, &view, background).is_empty(),
+        "viewing the tab cleared the command-end mark"
+    );
+    assert!(
+        cx.debug_bounds("session.tab.mark.finished.1").is_none(),
+        "the other tab never carried one"
+    );
+}
+
+#[gpui::test]
+async fn the_tab_list_shows_the_marks_a_tab_carries(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let background = cx.update(|_window, app| view.read(app).open_tabs())[0];
+    feed_session(cx, &view, background, b"\x07");
+    feed_session(cx, &view, background, REPORTED_COMMAND);
+
+    click(cx, "tabs.list.open");
+    assert!(
+        cx.debug_bounds("tabs.list.mark.bell.0").is_some(),
+        "the list spells out the bell it is carrying"
+    );
+    assert!(
+        cx.debug_bounds("tabs.list.mark.finished.0").is_some(),
+        "and the command end"
+    );
+    // Choosing the row shows that tab, which is also what clears its marks.
+    click(cx, "tabs.list.row.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(background)
+    );
+    assert!(unread_of(cx, &view, background).is_empty());
+}
+
+#[gpui::test]
+async fn the_two_reminders_switch_separately_and_are_written_down(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let background = tabs[0];
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    assert!(
+        cx.debug_bounds("settings.notice.bell").is_some(),
+        "the settings page offers the bell reminder"
+    );
+    assert!(
+        cx.debug_bounds("settings.notice.finished").is_some(),
+        "and the command-end reminder separately"
+    );
+
+    // Both start on; switching the bell off leaves the command one alone.
+    click(cx, "settings.notice.bell.1");
+    let settings = cx.update(|_window, app| view.read(app).workspace().attention_settings());
+    assert!(!settings.bell, "the bell reminder is off");
+    assert!(settings.finished, "the command reminder is untouched");
+
+    // The choice is what the window would write, so a restart can read it back.
+    let written = cx.update(|_window, app| view.read(app).current_preferences_for_test());
+    assert_eq!(written.bell_notice, Some(false));
+    assert_eq!(written.command_notice, Some(true));
+
+    // Back to the terminal: a bell is no longer marked, a reported end still is.
+    click(cx, "session.tab.1");
+    feed_session(cx, &view, background, b"\x07");
+    assert!(
+        unread_of(cx, &view, background).is_empty(),
+        "a switched-off reminder marks nothing"
+    );
+    feed_session(cx, &view, background, REPORTED_COMMAND);
+    assert!(
+        unread_of(cx, &view, background).finished,
+        "the other reminder still works on its own"
+    );
+    // Switching a reminder off leaves the blocks the shell reported as they are.
+    let blocks = cx.update(|_window, app| {
+        let pane = view.read(app).pane_of(background).cloned();
+        pane.map(|pane| pane.read(app).command_block_count_for_test())
+    });
+    assert_eq!(
+        blocks,
+        Some(1),
+        "the command-end reminder is a mark, not the record of the block"
+    );
+
+    // And switching it off removes the mark it already made.
+    click(cx, "nav.settings");
+    click(cx, "settings.notice.finished.1");
+    assert!(
+        unread_of(cx, &view, background).is_empty(),
+        "no mark of a kind whose reminder is off is left behind"
+    );
+}
+
+#[test]
+fn the_reminders_survive_a_restart_through_the_preferences_file() {
+    let dir = std::env::temp_dir().join(format!("shellune-notices-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let store = shellune_storage::PreferencesStore::at(&dir);
+    store
+        .save(&shellune_storage::Preferences {
+            bell_notice: Some(false),
+            command_notice: Some(true),
+            ..Default::default()
+        })
+        .expect("the preferences are written");
+
+    // What a restart does: read the file, then apply it to a new window.
+    let (read, problem) = store.load_reported();
+    assert_eq!(problem, None);
+    assert_eq!(read.bell_notice, Some(false));
+    assert_eq!(read.command_notice, Some(true));
+
+    // A file written before these fields existed keeps both reminders on.
+    let older: shellune_storage::Preferences =
+        serde_json::from_str(r#"{"theme":"dark"}"#).expect("an older file still reads");
+    assert_eq!(older.bell_notice, None);
+    assert_eq!(older.command_notice, None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
+async fn a_saved_choice_of_reminders_is_applied_on_the_next_start(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.run_until_parked();
+    let saved = shellune_storage::Preferences {
+        bell_notice: Some(false),
+        command_notice: Some(true),
+        ..Default::default()
+    };
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.use_saved_preferences_for_test(&saved, cx);
+        });
+    });
+    cx.run_until_parked();
+    let settings = cx.update(|_window, app| view.read(app).workspace().attention_settings());
+    assert!(
+        !settings.bell,
+        "the saved choice is what the window starts with"
+    );
+    assert!(settings.finished);
+}
+
+#[test]
+fn the_workspace_marks_and_clears_one_tab_and_respects_each_switch() {
+    let shells = shellune_terminal::discover();
+    let Some(shell) = shells.first() else {
+        return;
+    };
+    let mut workspace = Workspace::new();
+    let first = workspace.register_local_session(shell);
+    let second = workspace.register_local_session(shell);
+
+    // Both reminders start on, and a mark belongs to the tab the news came from.
+    assert_eq!(workspace.attention_settings(), AttentionSettings::default());
+    assert!(workspace.attention_settings().bell && workspace.attention_settings().finished);
+    assert!(workspace.note_attention(first.id(), AttentionKind::Bell));
+    assert!(workspace.session_unread(first.id()).bell);
+    assert!(
+        workspace.session_unread(second.id()).is_empty(),
+        "another session's tab is not marked"
+    );
+
+    // A switched-off kind marks nothing, and drops what it had already marked.
+    assert!(workspace.set_attention(AttentionKind::Bell, false));
+    assert!(
+        !workspace.session_unread(first.id()).bell,
+        "the mark that was already there is dropped with the reminder"
+    );
+    assert!(workspace.session_unread(first.id()).is_empty());
+    assert!(!workspace.note_attention(first.id(), AttentionKind::Bell));
+    assert!(workspace.note_attention(first.id(), AttentionKind::CommandFinished));
+
+    // Looking at the tab clears it.
+    assert!(workspace.clear_session_attention(first.id()));
+    assert!(workspace.session_unread(first.id()).is_empty());
+
+    // Closing the session takes the mark's tab with it.
+    assert!(
+        workspace.set_attention(AttentionKind::Bell, true),
+        "a reminder can be switched back on"
+    );
+    assert!(
+        !workspace.set_attention(AttentionKind::Bell, true),
+        "switching it to what it already is changes nothing"
+    );
+    assert!(workspace.note_attention(second.id(), AttentionKind::Bell));
+    assert!(workspace.session_closed(second.id()));
+    assert!(workspace.session_unread(second.id()).is_empty());
+}
+
+#[gpui::test]
+async fn a_pane_keeps_a_background_notice_until_it_is_collected(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.feed_for_test(b"\x07", cx));
+    });
+    let pending = cx.update(|_window, app| pane.read(app).pending_attention_for_test());
+    assert_eq!(
+        pending,
+        TerminalAttention {
+            bell: true,
+            finished: false
+        }
+    );
+
+    // The window collects it, and the same bell is never marked twice.
+    let taken = cx.update(|_window, app| pane.update(app, |pane, _cx| pane.take_attention()));
+    assert_eq!(taken, pending);
+    assert!(
+        cx.update(|_window, app| pane.read(app).pending_attention_for_test())
+            .is_empty(),
+        "the notice is taken once, not repeated"
+    );
+    // Plain output still says nothing about a command ending.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.feed_for_test(b"plain output\r\n", cx));
+    });
+    assert!(
+        cx.update(|_window, app| pane.read(app).pending_attention_for_test())
+            .is_empty()
+    );
+}
+
+#[gpui::test]
+async fn a_background_session_that_ends_keeps_its_reason_and_the_others_work(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let (ended, kept) = (tabs[0], tabs[1]);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(ended).cloned())
+        .expect("the background session has a terminal");
+
+    // Leave that shell the way a user does, while the other tab is on screen.
+    type_into_pane(cx, &pane, "exit\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut exited = false;
+    while std::time::Instant::now() < deadline {
+        cx.update(|_window, app| {
+            pane.update(app, |pane, cx| {
+                pane.pump_once(cx);
+            });
+        });
+        exited =
+            cx.update(|_window, app| matches!(pane.read(app).state(), PaneState::Exited { .. }));
+        if exited {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(exited, "the shell exit was never noticed by the pane");
+    cx.run_until_parked();
+
+    // The tab that ended states what happened, and the session on screen is untouched.
+    let state = session_state(cx, &view, ended);
+    let reason = match &state {
+        Some(SessionState::Disconnected(failure)) | Some(SessionState::Failed(failure)) => {
+            Some(failure.to_string())
+        }
+        _ => None,
+    };
+    assert!(
+        reason.is_some(),
+        "a session that ended keeps a reason, got {state:?}"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(kept),
+        "a background session ending does not move the user to it"
+    );
+    assert_eq!(
+        session_state(cx, &view, kept),
+        Some(SessionState::Connected),
+        "the other session keeps working"
+    );
+    // A disconnect is a state with a reason, not a toast that disappears on its own.
+    assert!(
+        cx.update(|_window, app| view.read(app).toast_titles())
+            .is_empty(),
+        "the reason is not left to a toast"
+    );
+    // While the ended tab is in the background, its banner is not what the window shows.
+    assert!(
+        cx.debug_bounds("terminal.failure").is_none(),
+        "another tab's terminal is still the one on screen"
+    );
+
+    // Choosing the tab shows the reason and the next step, and they stay there.
+    click(cx, "session.tab.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(ended)
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure").is_some(),
+        "the reason the session ended is visible on its own tab"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure.next").is_some(),
+        "and the step that can follow it"
+    );
+    assert_eq!(
+        session_state(cx, &view, ended),
+        state,
+        "looking at the tab does not clear the reason"
+    );
+}
+
+#[gpui::test]
+async fn a_mark_is_still_drawn_when_motion_is_reduced(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let background = cx.update(|_window, app| view.read(app).open_tabs())[0];
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    click(cx, "settings.motion.1");
+    assert!(
+        !cx.update(|_window, app| view.read(app).workspace().motion())
+            .allows_animation(),
+        "reduced motion is on"
+    );
+
+    click(cx, "session.tab.1");
+    feed_session(cx, &view, background, b"\x07");
+    // The mark is a static word: there is no motion to suppress, so it is drawn whole
+    // the moment the news arrives, and it never blinks (R7).
+    assert!(
+        cx.debug_bounds("session.tab.mark.bell.0").is_some(),
+        "a reduced-motion window still says what happened"
+    );
+    assert!(unread_of(cx, &view, background).bell);
 }

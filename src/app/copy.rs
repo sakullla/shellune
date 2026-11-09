@@ -781,6 +781,14 @@ pub struct Strings {
     pub tab_list_title: &'static str,
     /// Explains the tab list: strip order, and choosing one shows it.
     pub tab_list_hint: &'static str,
+    /// Mark on a tab whose shell rang the bell in the background.
+    pub tab_mark_bell: &'static str,
+    /// Mark on a tab where a shell-reported command ended in the background.
+    pub tab_mark_finished: &'static str,
+    /// Tooltip of the bell mark: what it means and that viewing clears it.
+    pub tab_mark_bell_hint: &'static str,
+    /// Tooltip of the command-end mark: what it means and that viewing clears it.
+    pub tab_mark_finished_hint: &'static str,
     /// A host id in a pane is not in the saved book.
     pub pane_missing_host: &'static str,
     /// What to do about a pane whose host is missing.
@@ -1253,6 +1261,10 @@ pub static ENGLISH: Strings = Strings {
     tab_accent_clay: "Clay",
     tab_list_title: "All tabs",
     tab_list_hint: "Every open tab, in strip order. Choosing one shows it.",
+    tab_mark_bell: "Bell",
+    tab_mark_finished: "Ended",
+    tab_mark_bell_hint: "A background shell rang the bell. Open this tab to clear the mark; the bell byte still reached its program.",
+    tab_mark_finished_hint: "The shell reported that a background command ended. Open this tab to clear the mark.",
     pane_missing_host: "This host is not saved",
     pane_missing_next: "Fix the host or remove the pane. Nothing was connected.",
     workspace_dangling_tab: "The saved active tab is not in this workspace. Choose a tab. The others were kept.",
@@ -1666,6 +1678,10 @@ pub static CHINESE: Strings = Strings {
     tab_accent_clay: "陶土",
     tab_list_title: "全部标签",
     tab_list_hint: "按顶栏顺序列出全部标签，选择即切换。",
+    tab_mark_bell: "响铃",
+    tab_mark_finished: "结束",
+    tab_mark_bell_hint: "后台 Shell 响铃了。打开这个标签即清除标记；响铃字节照常送到了它的程序。",
+    tab_mark_finished_hint: "Shell 报告后台的一条命令已结束。打开这个标签即清除标记。",
     pane_missing_host: "这台主机没有保存",
     pane_missing_next: "修复主机或移除这个窗格。没有建立连接。",
     workspace_dangling_tab: "保存的活动标签不在这个工作区里。请另选一个标签，其余标签已保留。",
@@ -1889,6 +1905,20 @@ pub struct UxStrings {
     pub settings_motion: &'static str,
     /// Reduced skips short fades; nothing else changes
     pub settings_motion_hint: &'static str,
+    /// Notifications about the tabs that are not on screen
+    pub settings_notices: &'static str,
+    /// Bell reminder
+    pub settings_bell_notice: &'static str,
+    /// Marks the tab; the bell byte still reaches the program
+    pub settings_bell_notice_hint: &'static str,
+    /// Command-end reminder
+    pub settings_finished_notice: &'static str,
+    /// Marks the tab only when the shell reports the end
+    pub settings_finished_notice_hint: &'static str,
+    /// A reminder that is on
+    pub notice_on: &'static str,
+    /// A reminder that is off
+    pub notice_off: &'static str,
     /// Terminal
     pub settings_terminal: &'static str,
     /// Font size
@@ -2049,6 +2079,13 @@ impl UxStrings {
             self.settings_text_size_hint,
             self.settings_motion,
             self.settings_motion_hint,
+            self.settings_notices,
+            self.settings_bell_notice,
+            self.settings_bell_notice_hint,
+            self.settings_finished_notice,
+            self.settings_finished_notice_hint,
+            self.notice_on,
+            self.notice_off,
             self.settings_terminal,
             self.settings_font_size,
             self.settings_font_size_hint,
@@ -2158,6 +2195,13 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_text_size_hint: "Scales every label, button and list",
     settings_motion: "Motion",
     settings_motion_hint: "Reduced skips short fades; nothing else changes",
+    settings_notices: "Background notices",
+    settings_bell_notice: "Bell",
+    settings_bell_notice_hint: "Marks the tab of a shell that rang while you were elsewhere; the bell byte still reaches the program",
+    settings_finished_notice: "Command ended",
+    settings_finished_notice_hint: "Marks the tab only when the shell itself reports the end; a shell without integration never marks one",
+    notice_on: "On",
+    notice_off: "Off",
     settings_terminal: "Terminal",
     settings_font_size: "Font size",
     settings_font_size_hint: "Used by new terminals and the open ones",
@@ -2265,6 +2309,13 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_text_size_hint: "缩放所有文字、按钮和列表",
     settings_motion: "动态效果",
     settings_motion_hint: "“减少”会跳过短暂的淡入效果，其他不变",
+    settings_notices: "后台提醒",
+    settings_bell_notice: "响铃",
+    settings_bell_notice_hint: "你在别处时响铃的 Shell，其标签会被标记；响铃字节仍照常送到程序",
+    settings_finished_notice: "命令结束",
+    settings_finished_notice_hint: "只有 Shell 自己报告命令结束时才标记标签；没有 Shell 集成不会产生该标记",
+    notice_on: "开",
+    notice_off: "关",
     settings_terminal: "终端",
     settings_font_size: "字号",
     settings_font_size_hint: "新终端和已打开的终端都会使用",

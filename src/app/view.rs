@@ -61,7 +61,7 @@ use crate::app::remote::{
     self, AttemptLink, ChainDraft, LinkEvent, MethodChoice, RemoteFailure, RemotePanel,
     RemoteStatus,
 };
-use crate::app::terminal::{self, PaneState, SourceEvent, TerminalPane};
+use crate::app::terminal::{self, PaneState, SourceEvent, TerminalAttention, TerminalPane};
 use crate::app::text_field::{Browse, TextField};
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
 #[cfg(test)]
@@ -69,7 +69,9 @@ use crate::app::transfers::TransferChannel;
 use crate::app::transfers::{
     PathProblem, TransferProblem, TransferViews, default_download_directory, file_name,
 };
-use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Workspace};
+use crate::app::workspace::{
+    AttentionKind, Failure, Recovery, SectionState, SectionStatus, UnreadNotices, Workspace,
+};
 use crate::app::{components, theme::radius};
 #[cfg(test)]
 use shellune_storage::KeymapPreferences;
@@ -868,6 +870,19 @@ impl ShelluneView {
             return;
         }
         let (saved, problem) = PreferencesStore::at(self.store.root()).load_reported();
+        self.apply_preferences(saved, problem, cx);
+    }
+
+    /// Applies a preferences document to the running window.
+    ///
+    /// The reader and the tests' own restart both come through here, so what a test
+    /// checks after a "restart" is the same code a real start runs.
+    fn apply_preferences(
+        &mut self,
+        saved: shellune_storage::Preferences,
+        problem: Option<PreferencesProblem>,
+        cx: &mut Context<Self>,
+    ) {
         let platform = Platform::current();
         let (keymap, keymap_problem) = Keymap::resolve(platform, saved.keymap.as_ref());
         let keymap_problem = match problem {
@@ -927,6 +942,15 @@ impl ShelluneView {
         {
             self.workspace.set_local_font_size(size);
         }
+        // A reminders file written before these fields existed keeps both on, which is
+        // what the defaults say; a file that names one applies it (R7).
+        if let Some(bell) = saved.bell_notice {
+            self.workspace.set_attention(AttentionKind::Bell, bell);
+        }
+        if let Some(command) = saved.command_notice {
+            self.workspace
+                .set_attention(AttentionKind::CommandFinished, command);
+        }
         self.saved_preferences = Some(self.current_preferences());
     }
 
@@ -979,6 +1003,10 @@ impl ShelluneView {
                 let keymap = self.keymap.to_preferences(saved);
                 (!keymap.is_empty()).then_some(keymap)
             },
+            // Both reminders are written even when they are on, so a file says what the
+            // user chose rather than leaving the next start to assume (R7).
+            bell_notice: Some(self.workspace.attention_settings().bell),
+            command_notice: Some(self.workspace.attention_settings().finished),
         }
     }
 
@@ -1162,6 +1190,26 @@ impl ShelluneView {
         self.keymap_problem = problem;
         crate::app::apply_keymap(cx, &self.keymap);
         cx.notify();
+    }
+
+    /// Applies a preferences document as a start would read it, for the tests that
+    /// check a choice survives a restart.
+    #[cfg(test)]
+    pub fn use_saved_preferences_for_test(
+        &mut self,
+        saved: &shellune_storage::Preferences,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_preferences(saved.clone(), None, cx);
+        cx.notify();
+    }
+
+    /// The preferences this window would write now, for the tests that check a choice
+    /// is recorded rather than merely applied.
+    #[cfg(test)]
+    #[must_use]
+    pub fn current_preferences_for_test(&self) -> shellune_storage::Preferences {
+        self.current_preferences()
     }
 
     /// The row the keyboard is on among the shortcut rows listed now.
@@ -1659,6 +1707,8 @@ impl ShelluneView {
                 .set_context(shellune_core::PanelSection::None);
         }
         self.focus_pane(id, cx);
+        // Choosing a tab is looking at it: whatever it was marked for has been seen.
+        self.clear_viewed_attention(cx);
         cx.notify();
     }
 
@@ -2440,6 +2490,8 @@ impl ShelluneView {
         {
             let handle = pane.read(cx).focus_handle().clone();
             window.focus(&handle);
+            // The terminal is on screen again, so its tab's background marks are seen.
+            self.clear_viewed_attention(cx);
             cx.notify();
             return;
         }
@@ -4884,6 +4936,11 @@ impl ShelluneView {
         if !self.workspace.session_accepts_event(tag) {
             return;
         }
+        // The terminal keeps nothing about *what* happened, only that a bell rang or a
+        // shell-reported command ended (R7). The window is what knows which tab is on
+        // screen, so it decides here whether the news marks a tab or was already seen.
+        let notices = pane.update(cx, |pane, _cx| pane.take_attention());
+        self.collect_attention(id, notices, cx);
         let state = pane.read(cx).state().clone();
         let presentation = pane.read(cx).presentation();
         if self
@@ -4922,6 +4979,68 @@ impl ShelluneView {
             }
         }
         cx.notify();
+    }
+
+    /// Records a terminal's background notices on its tab, unless that tab is on
+    /// screen (R7).
+    ///
+    /// A bell in a background shell, or a command end the shell reported there, marks
+    /// that tab and nothing else: no tab is switched, no focus moves and no toast is
+    /// raised, so the terminal the user is typing into is not interrupted. The mark
+    /// says which of the two happened; it carries no output, command line or credential
+    /// text, because the terminal only keeps those two flags.
+    fn collect_attention(
+        &mut self,
+        id: SessionId,
+        notices: TerminalAttention,
+        cx: &mut Context<Self>,
+    ) {
+        if notices.is_empty() {
+            return;
+        }
+        if self.is_viewing_session(id) {
+            // The user is looking at that terminal, so there is nothing to remind them
+            // of; a mark left over from a moment ago would claim news they have seen.
+            if self.workspace.clear_session_attention(id) {
+                cx.notify();
+            }
+            return;
+        }
+        let mut marked = false;
+        for (kind, present) in [
+            (AttentionKind::Bell, notices.bell),
+            (AttentionKind::CommandFinished, notices.finished),
+        ] {
+            if present && self.workspace.note_attention(id, kind) {
+                marked = true;
+            }
+        }
+        if marked {
+            cx.notify();
+        }
+    }
+
+    /// Whether one session's terminal is the one on screen.
+    fn is_viewing_session(&self, id: SessionId) -> bool {
+        self.active == Some(id)
+            && self.workspace.tab_of_session(id) == self.workspace.layout().active_tab_id()
+            && self.session_terminal
+            && !self.showing_connection_form
+            && self.shows_terminal(self.workspace.destination())
+    }
+
+    /// Clears the background marks of the tab the user is looking at (R7).
+    ///
+    /// Looking at a tab is what clears its bell and command-end marks; a disconnect is
+    /// not one of these marks, so it keeps showing its state and reason until the
+    /// session reconnects, closes or the user confirms it.
+    fn clear_viewed_attention(&mut self, cx: &mut Context<Self>) {
+        let cleared = self
+            .active
+            .is_some_and(|id| self.workspace.clear_session_attention(id));
+        if cleared {
+            cx.notify();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -9576,10 +9695,14 @@ impl ShelluneView {
         } else {
             String::new()
         };
+        // What this tab is carrying from the background (R7): a bell or a command end,
+        // in words, so the mark is read and not only coloured.
+        let unread = self.workspace.session_unread(id);
         let tooltip = format!(
-            "{} · {kind_label} · {} · {state_label}{jump}",
+            "{} · {kind_label} · {} · {state_label}{jump}{marked}",
             self.tab_title(id),
-            self.target_of(session)
+            self.target_of(session),
+            marked = tab_attention_summary(unread, strings)
         );
         let selector = format!("session.tab.{index}");
         let hover = theme::swatch(palette::SURFACE_HOVER);
@@ -9674,6 +9797,10 @@ impl ShelluneView {
                         .child(SharedString::from(state_label)),
                 )
             })
+            // The background marks sit inside the tab's own target, so choosing the
+            // mark is choosing the tab: it shows that tab and its pane, which is also
+            // what clears the mark (R7).
+            .children(tab_attention_marks(unread, strings, metrics, index))
             .child(
                 components::icon_only_button(Icon::Close, metrics)
                     // A pointer target, not a 20px drawing: the smallest size R4
@@ -10566,6 +10693,60 @@ fn tab_accent_mark(accent: TabAccent, metrics: Metrics, selector: String) -> Div
         .rounded_full()
         .bg(theme::tab_accent_color(accent))
         .debug_selector(move || selector.clone())
+}
+
+/// The background marks one tab carries until it is looked at (R7).
+///
+/// Each mark is a word: "Bell" and "Ended" say what happened without a colour and
+/// without an icon the reader has to learn. Nothing here animates, so switching reduced
+/// motion has nothing to suppress and a mark never blinks. The mark carries no command
+/// line, output or credential — the terminal only reports that one of the two events
+/// happened.
+fn tab_attention_marks(
+    unread: UnreadNotices,
+    strings: &Strings,
+    metrics: Metrics,
+    index: usize,
+) -> Vec<Div> {
+    let mut marks = Vec::new();
+    let kinds = [
+        (unread.bell, strings.tab_mark_bell, "bell"),
+        (unread.finished, strings.tab_mark_finished, "finished"),
+    ];
+    for (present, label, name) in kinds {
+        if !present {
+            continue;
+        }
+        let selector = format!("session.tab.mark.{name}.{index}");
+        marks.push(
+            div()
+                .flex_none()
+                .text_size(metrics.caption_size())
+                .font_weight(FontWeight::MEDIUM)
+                // The accent says "new", never which kind: the word already does, and a
+                // status hue here would compete with the connection state beside it.
+                .text_color(Tone::Accent.text())
+                .debug_selector(move || selector.clone())
+                .child(SharedString::from(label)),
+        );
+    }
+    marks
+}
+
+/// The words a tab's tooltip adds for the marks it is carrying (R7).
+fn tab_attention_summary(unread: UnreadNotices, strings: &Strings) -> String {
+    let mut parts: Vec<&'static str> = Vec::new();
+    if unread.bell {
+        parts.push(strings.tab_mark_bell);
+    }
+    if unread.finished {
+        parts.push(strings.tab_mark_finished);
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    }
 }
 
 /// Why a port the quick form cannot dial, naming the field to change.
