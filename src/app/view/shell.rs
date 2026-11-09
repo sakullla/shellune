@@ -99,7 +99,10 @@ impl ShelluneView {
                 self.bar_icon(
                     "palette.open",
                     Icon::Search,
-                    format!("{} ({})", ux.search, platform.palette_label()),
+                    match self.keymap.label("palette.open") {
+                        Some(shortcut) => format!("{} ({shortcut})", ux.search),
+                        None => ux.search.to_owned(),
+                    },
                     false,
                 )
                 .on_click(cx.listener(|this, _event, window, cx| {
@@ -110,7 +113,12 @@ impl ShelluneView {
                 self.bar_icon(
                     "nav.settings",
                     Icon::Settings,
-                    ux.settings_title.to_owned(),
+                    match crate::app::keymap::page_action(Destination::Settings)
+                        .and_then(|spec| self.keymap.label(spec.id))
+                    {
+                        Some(shortcut) => format!("{} ({shortcut})", ux.settings_title),
+                        None => ux.settings_title.to_owned(),
+                    },
                     self.workspace.destination() == Destination::Settings,
                 )
                 .on_click(cx.listener(|this, _event, window, cx| {
@@ -170,11 +178,14 @@ impl ShelluneView {
         let selected = self.home_is_shown();
         let hover = theme::swatch(palette::SURFACE_HOVER);
         let count = self.book.hosts().len();
-        let tooltip = format!(
-            "{} · {}",
-            strings.nav_hosts,
-            Destination::Hosts.shortcut_label(Platform::current())
-        );
+        // The hint reads the binding in force, so a rebound or unbound shortcut is
+        // described as it really is (R5).
+        let shortcut = crate::app::keymap::page_action(Destination::Hosts)
+            .and_then(|spec| self.keymap.label(spec.id));
+        let tooltip = match shortcut {
+            Some(shortcut) => format!("{} · {shortcut}", strings.nav_hosts),
+            None => strings.nav_hosts.to_owned(),
+        };
         let mut tab = div()
             .id("nav.hosts")
             .debug_selector(|| "nav.hosts".to_owned())
@@ -229,9 +240,13 @@ impl ShelluneView {
     fn new_tab_control(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
-        let platform = Platform::current();
         let open = self.shell_menu_open;
         let size = metrics.scale(28.0);
+        let new_shell = self.keymap.label("shell.new");
+        let tooltip = match new_shell {
+            Some(shortcut) => format!("{} ({shortcut})", ux.new_tab),
+            None => ux.new_tab.to_owned(),
+        };
         let control = div()
             .relative()
             .flex()
@@ -245,11 +260,7 @@ impl ShelluneView {
                     .rounded_r(px(0.0))
                     .id("header.primary")
                     .debug_selector(|| "header.primary".to_owned())
-                    .tooltip(components::tooltip(SharedString::from(format!(
-                        "{} ({})",
-                        ux.new_tab,
-                        super::new_shell_shortcut_label(platform)
-                    ))))
+                    .tooltip(components::tooltip(SharedString::from(tooltip)))
                     .on_click(cx.listener(|this, _event, window, cx| {
                         this.new_local_shell(window, cx);
                     })),
@@ -873,6 +884,7 @@ impl ShelluneView {
                     ),
                 ],
             ))
+            .child(self.settings_keys_group(cx))
             .child(self.settings_group(
                 ux.settings_data,
                 vec![
@@ -931,6 +943,11 @@ impl ShelluneView {
             .id("content.scroll")
             .debug_selector(|| "content".to_owned())
             .track_focus(self.destination_focus(Destination::Settings))
+            .on_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+                    this.settings_page_key(event, cx);
+                }),
+            )
             .flex()
             .flex_col()
             .flex_1()
@@ -938,6 +955,405 @@ impl ShelluneView {
             .overflow_y_scroll()
             .bg(theme::swatch(palette::CANVAS))
             .child(page)
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyboard shortcuts (R5)
+    // -----------------------------------------------------------------------
+
+    /// Keys the settings page reads before anything else does.
+    ///
+    /// The arrow keys choose a shortcut row and Enter opens it for capture, so a
+    /// binding can be changed with the keyboard alone (R4). Modifier combinations are
+    /// left to the action catalogue.
+    pub(super) fn settings_page_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if self.key_capture.is_some() {
+            return;
+        }
+        let modifiers = &event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "down" => self.step_key_row(1, cx),
+            "up" => self.step_key_row(-1, cx),
+            "enter" => match self.selected_key_row(cx) {
+                Some(spec) => {
+                    let action = spec.id;
+                    self.keys_capture_start(action, cx);
+                }
+                None => return,
+            },
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    /// The shortcut group: a search over the action catalogue and one row per action
+    /// with the keys in force, the way to change them, to unbind them and to restore
+    /// the default.
+    pub(super) fn settings_keys_group(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let locale = self.workspace.locale();
+        let platform = self.keymap.platform();
+        let query = self.keys_search.read(cx).text().to_owned();
+        let matches = self.keymap.matching(&query, locale);
+
+        let mut rows: Vec<Div> = Vec::new();
+        if let Some(problem) = &self.keymap_problem {
+            rows.push(self.settings_keys_banner(
+                Tone::Warning,
+                problem.text(locale, platform),
+                ux.keys_problem_hint,
+            ));
+        }
+        if let Some(reason) = &self.keymap_save_error {
+            rows.push(self.settings_keys_banner(
+                Tone::Danger,
+                format!("{} {reason}", ux.keys_save_failed),
+                ux.keys_save_failed_next,
+            ));
+        }
+        rows.push(
+            div()
+                .px(metrics.scale(spacing::BASE))
+                .py(metrics.scale(spacing::TIGHT))
+                .debug_selector(|| "settings.keys.search".to_owned())
+                .child(self.keys_search.clone()),
+        );
+        for (index, spec) in matches.iter().enumerate() {
+            let selected = self.keys_selected.min(matches.len().saturating_sub(1));
+            rows.push(self.settings_keys_row(spec, index, selected, cx));
+        }
+        if matches.is_empty() {
+            rows.push(
+                div()
+                    .px(metrics.scale(spacing::BASE))
+                    .py(metrics.scale(spacing::SNUG))
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "settings.keys.empty".to_owned())
+                    .child(ux.keys_no_match),
+            );
+        }
+        rows.push(self.settings_keys_footer(cx));
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "settings.keys".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(ux.settings_keys_hint),
+            )
+            .child(self.settings_group(ux.settings_keys, rows))
+    }
+
+    /// A tone-carrying line inside the shortcut card: why the saved keys were not
+    /// applied, or why a change could not be written.
+    fn settings_keys_banner(&self, tone: Tone, reason: String, next: &'static str) -> Div {
+        let metrics = self.metrics();
+        div()
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "settings.keys.banner".to_owned())
+            .child(
+                components::banner(tone, metrics)
+                    .child(SharedString::from(reason))
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(next),
+                    ),
+            )
+    }
+
+    /// One action: its name, where the shortcut applies, the keys in force and the
+    /// three ways to change them.
+    ///
+    /// The row the keyboard is on carries the focus ring, so the page can be worked
+    /// without a pointer: the arrow keys move between rows and Enter opens the one
+    /// under the ring for capture.
+    fn settings_keys_row(
+        &self,
+        spec: &'static crate::app::keymap::ActionSpec,
+        index: usize,
+        selected: usize,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let locale = self.workspace.locale();
+        let labels = self.keymap.labels(spec.id);
+        let bound = !self.keymap.is_unbound(spec.id);
+        let default = self.keymap.is_default(spec.id);
+        let state = if !bound {
+            ux.keys_unbound
+        } else if default {
+            ux.keys_default
+        } else {
+            ux.keys_changed
+        };
+        let action = spec.id;
+        let selector = format!("settings.keys.row.{action}");
+        let ringed = !self.pointer_input && index == selected;
+
+        let keys = if bound {
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .children(
+                    labels
+                        .into_iter()
+                        .map(|label| components::keycap(SharedString::from(label), metrics)),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .child(ux.keys_unbound)
+                .into_any_element()
+        };
+
+        div()
+            .debug_selector(move || selector.clone())
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::BASE))
+            .py(metrics.scale(spacing::TIGHT))
+            .border_1()
+            .border_color(if ringed {
+                theme::swatch(palette::ACCENT)
+            } else {
+                theme::clear()
+            })
+            .rounded(px(radius::SMALL))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(metrics.scale(180.0))
+                    .gap(metrics.scale(2.0))
+                    .child(
+                        div()
+                            .text_size(metrics.body_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(spec.name(locale)),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(format!(
+                                "{} · {state}",
+                                spec.context.label(locale)
+                            ))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(keys)
+                    .child(
+                        components::compact_button(ux.keys_change, Variant::Secondary, metrics)
+                            .id(SharedString::from(format!("settings.keys.change.{action}")))
+                            .debug_selector({
+                                let selector = format!("settings.keys.change.{action}");
+                                move || selector.clone()
+                            })
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.keys_capture_start(action, cx);
+                            })),
+                    )
+                    .when(bound, |row| {
+                        row.child(
+                            components::compact_button(ux.keys_unbind, Variant::Ghost, metrics)
+                                .id(SharedString::from(format!("settings.keys.unbind.{action}")))
+                                .debug_selector({
+                                    let selector = format!("settings.keys.unbind.{action}");
+                                    move || selector.clone()
+                                })
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.keys_unbind(action, cx);
+                                })),
+                        )
+                    })
+                    .when(bound && !default, |row| {
+                        row.child(
+                            components::compact_button(ux.keys_reset, Variant::Ghost, metrics)
+                                .id(SharedString::from(format!("settings.keys.reset.{action}")))
+                                .debug_selector({
+                                    let selector = format!("settings.keys.reset.{action}");
+                                    move || selector.clone()
+                                })
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.keys_reset(action, cx);
+                                })),
+                        )
+                    }),
+            )
+    }
+
+    /// The end of the shortcut card: how many actions differ from their defaults, and
+    /// the one control that puts every one of them back.
+    fn settings_keys_footer(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let count = self.keymap.custom_count();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::BASE))
+            .py(metrics.scale(spacing::TIGHT))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "settings.keys.count".to_owned())
+                    .child(SharedString::from(
+                        ux.keys_custom_summary.replace("{}", &count.to_string()),
+                    )),
+            )
+            .child(
+                components::compact_button(ux.keys_reset_all, Variant::Secondary, metrics)
+                    .id("settings.keys.reset_all")
+                    .debug_selector(|| "settings.keys.reset_all".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.keys_reset_all(cx);
+                    })),
+            )
+    }
+
+    /// The capture layer: what the next combination pressed will be bound to.
+    ///
+    /// It sits over the window and reads the keyboard through an interceptor, so the
+    /// combination is seen before any action it is already bound to runs.
+    pub(super) fn key_capture_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let capture = self.key_capture.as_ref()?;
+        let spec = crate::app::keymap::action(capture.action)?;
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let locale = self.workspace.locale();
+        let platform = self.keymap.platform();
+        let viewport = window.viewport_size();
+        let width = px(460.0).min(viewport.width - metrics.scale(spacing::LOOSE) * 2.0);
+
+        let current = self.keymap.label(spec.id);
+        let card = div()
+            .occlude()
+            .flex()
+            .flex_col()
+            .w(width)
+            .gap(metrics.scale(spacing::SNUG))
+            .p(metrics.scale(spacing::LOOSE))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .shadow_lg()
+            .debug_selector(|| "keys.capture".to_owned())
+            .child(
+                div()
+                    .text_size(metrics.title_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(ux.keys_capture_title),
+            )
+            .child(
+                div()
+                    .text_size(metrics.body_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(SharedString::from(spec.name(locale))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(
+                                current
+                                    .clone()
+                                    .unwrap_or_else(|| ux.keys_unbound.to_owned()),
+                            )),
+                    ),
+            )
+            .when_some(capture.problem.as_ref(), |card, problem| {
+                card.child(
+                    components::banner(Tone::Danger, metrics)
+                        .debug_selector(|| "keys.capture.error".to_owned())
+                        .child(SharedString::from(problem.text(locale, platform))),
+                )
+            })
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(ux.keys_capture_hint),
+            )
+            .child(
+                div().flex().justify_end().child(
+                    components::compact_button(ux.keys_capture_cancel, Variant::Ghost, metrics)
+                        .id("keys.capture.cancel")
+                        .debug_selector(|| "keys.capture.cancel".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.keys_capture_cancel(cx);
+                        })),
+                ),
+            );
+
+        Some(
+            super::overlay_layer().child(
+                div()
+                    .relative()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .child(
+                        div()
+                            .id("keys.capture.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
+                                this.keys_capture_cancel(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(card),
+                    ),
+            ),
+        )
     }
 
     /// A titled group of settings rows inside one card.

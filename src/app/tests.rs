@@ -23,8 +23,8 @@ use shellune_core::{
     TerminalMode, Transfer, TransferDirection, WorkspaceSnapshot, WorkspaceTab,
 };
 use shellune_storage::{
-    ForwardStore, HostBook, HostEdit, HostKey, HostStore, TrustStore, WORKSPACE_FILE_NAME,
-    WorkspaceStore,
+    ForwardStore, HostBook, HostEdit, HostKey, HostStore, KeymapPreferences, TrustStore,
+    WORKSPACE_FILE_NAME, WorkspaceStore,
 };
 use shellune_terminal::{BlockStatus, GridSize, TermMode, encode_paste};
 
@@ -32,8 +32,9 @@ use crate::app::actions::{
     CycleTextSize, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
     ToggleLanguage,
 };
-use crate::app::copy::{CHINESE, ENGLISH, Locale, Strings};
+use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
 use crate::app::hosts::HostView;
+use crate::app::keymap::Keymap;
 use crate::app::layout::Direction;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
@@ -51,6 +52,14 @@ fn design_window() -> Size<Pixels> {
 
 fn minimum_window() -> Size<Pixels> {
     size(px(MIN_WINDOW_SIZE.0), px(MIN_WINDOW_SIZE.1))
+}
+
+/// A window tall enough to show the whole settings page at once.
+///
+/// The shortcut rows sit below the fold of the 720×480 minimum window, where a user
+/// reaches them by scrolling; a test that clicks them uses this instead.
+fn tall_window() -> Size<Pixels> {
+    size(px(DEFAULT_WINDOW_SIZE.0), px(2400.0))
 }
 
 fn assert_within_width(bounds: gpui::Bounds<Pixels>, viewport: Size<Pixels>, what: &str) {
@@ -771,6 +780,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_terminated,
             terminal_copy,
             hosts_search_placeholder,
+            keys_search_placeholder,
             hosts_view_all,
             hosts_view_groups,
             hosts_view_recent,
@@ -1081,16 +1091,32 @@ fn locale_for_tagline() -> (&'static str, &'static str) {
 
 #[test]
 fn shortcuts_follow_each_platform_convention() {
-    // Only the three pages have a number: hosts, terminals, settings.
+    // Only the three pages have a number: hosts, terminals, settings. The readable
+    // label comes from the catalogue, which is the one place a shortcut is written
+    // down (R5).
+    let windows = Keymap::defaults(Platform::Windows);
+    let macos = Keymap::defaults(Platform::MacOs);
+    let linux = Keymap::defaults(Platform::Linux);
+    assert_eq!(windows.label("nav.hosts").as_deref(), Some("Ctrl+1"));
+    assert_eq!(linux.label("nav.local").as_deref(), Some("Ctrl+2"));
+    assert_eq!(macos.label("nav.settings").as_deref(), Some("⌘3"));
     assert_eq!(
-        Destination::Hosts.shortcut_label(Platform::Windows),
-        "Ctrl+1"
+        windows.label("nav.settings").as_deref(),
+        Some("Ctrl+3"),
+        "the first default is the one a hint shows; the comma alias is still bound"
     );
+    assert_eq!(windows.keystrokes("nav.settings").len(), 2);
     assert_eq!(
-        Destination::LocalShells.shortcut_label(Platform::Linux),
-        "Ctrl+2"
+        windows.label("tab.select.1").as_deref(),
+        Some("Alt+1"),
+        "tab jumps take the next free modifier"
     );
-    assert_eq!(Destination::Settings.shortcut_label(Platform::MacOs), "⌘3");
+    assert_eq!(macos.label("tab.select.1").as_deref(), Some("⌃1"));
+    assert_eq!(
+        macos.label("palette.open").as_deref(),
+        Some("⇧⌘P"),
+        "the macOS label puts the symbols in the order users read them"
+    );
     assert_eq!(Destination::Hosts.keystroke(Platform::Windows), "ctrl-1");
     assert_eq!(Destination::Settings.keystroke(Platform::MacOs), "cmd-3");
     assert_eq!(Destination::Hosts.next(), Destination::LocalShells);
@@ -1111,11 +1137,23 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
     let bindings = key_bindings(Platform::current());
     assert_eq!(
         bindings.len(),
-        Destination::PAGES.len() + 1 + 6 + 4 + crate::app::TAB_JUMP_COUNT + 2 + 1 + 4 + 4 + 4 + 2,
+        Destination::PAGES.len()
+            + 1
+            + 6
+            + 4
+            + crate::app::TAB_JUMP_COUNT
+            + 2
+            + 1
+            + 4
+            + 4
+            + 4
+            + 2
+            + 3,
         "three pages and the settings comma, next and previous, zoom, new shell, language \
          and dismiss; the palette, close tab, next and previous tab; one jump per \
          tab digit; split right and split down, zoom pane, focus, resize and move in \
-         four directions, and move tab left and right"
+         four directions, move tab left and right; and the three terminal actions \
+         (search, copy, paste)"
     );
 }
 
@@ -11080,4 +11118,364 @@ async fn a_right_click_on_a_file_offers_its_actions_and_copies_its_path(cx: &mut
         vec![crate::app::copy::ux().toast_path_copied.to_owned()],
         "the copy is confirmed in the corner"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Configurable shortcuts, rebound and unbound (R5)
+// ---------------------------------------------------------------------------
+
+/// A saved set for whichever platform the test runs on.
+fn saved_for_this_platform(entries: Vec<shellune_storage::KeymapEntry>) -> KeymapPreferences {
+    let mut saved = KeymapPreferences::default();
+    saved.set_for_platform(Platform::current().id(), entries);
+    saved
+}
+
+#[gpui::test]
+async fn the_settings_page_lists_every_action_and_narrows_them_by_search(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+
+    assert!(
+        cx.debug_bounds("settings.keys").is_some(),
+        "the settings page has a shortcut group"
+    );
+    assert!(cx.debug_bounds("settings.keys.row.palette.open").is_some());
+    assert!(cx.debug_bounds("settings.keys.row.terminal.copy").is_some());
+    assert!(
+        cx.debug_bounds("settings.keys.change.palette.open")
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds("settings.keys.unbind.palette.open")
+            .is_some()
+    );
+    assert!(cx.debug_bounds("settings.keys.count").is_some());
+
+    // The search narrows the list: a phrase nothing matches brings the empty state,
+    // which is not drawn while every action is listed.
+    type_into(cx, "settings.keys.search", "zzq");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).keys_query(app)),
+        "zzq",
+        "the field took the query"
+    );
+    assert!(cx.debug_bounds("settings.keys.empty").is_some());
+}
+
+#[gpui::test]
+async fn changing_a_shortcut_applies_at_once_and_the_palette_shows_it(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    click(cx, "settings.keys.change.nav.settings");
+    assert!(
+        cx.debug_bounds("keys.capture").is_some(),
+        "the capture layer opens"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).capturing_for()),
+        Some("nav.settings")
+    );
+
+    cx.simulate_keystrokes("ctrl-alt-s");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).capturing_for()),
+        None,
+        "a usable combination closes the layer"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .keymap()
+            .keystroke("nav.settings")
+            .map(str::to_owned)),
+        Some("ctrl-alt-s".to_owned())
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).keymap().label("nav.settings")),
+        Some("Ctrl+Alt+S".to_owned())
+    );
+    // The command palette reads the same configuration, so its hint changed too.
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).palette_shortcut(copy::ux().settings_title)),
+        Some("Ctrl+Alt+S".to_owned()),
+        "the palette shows the binding in force"
+    );
+
+    // The old combination no longer goes to the settings, the new one does.
+    click(cx, "nav.hosts");
+    let old = Keymap::defaults(Platform::current())
+        .keystroke("nav.settings")
+        .expect("the default settings shortcut")
+        .to_owned();
+    cx.simulate_keystrokes(&old);
+    cx.run_until_parked();
+    assert_eq!(
+        destination_of(&view, cx),
+        Destination::Hosts,
+        "the replaced combination no longer reaches the settings"
+    );
+    cx.simulate_keystrokes("ctrl-alt-s");
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Settings);
+}
+
+#[gpui::test]
+async fn a_conflicting_shortcut_is_refused_and_names_both_actions(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    click(cx, "settings.keys.change.nav.hosts");
+
+    // Ctrl+Shift+W already closes the current session in the same context.
+    cx.simulate_keystrokes("ctrl-shift-w");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).capturing_for()),
+        Some("nav.hosts"),
+        "the layer stays open so the answer can be corrected"
+    );
+    assert!(
+        cx.debug_bounds("keys.capture.error").is_some(),
+        "the conflict is shown instead of being saved"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .keymap()
+            .keystroke("nav.hosts")
+            .map(str::to_owned)),
+        Keymap::defaults(Platform::current())
+            .keystroke("nav.hosts")
+            .map(str::to_owned),
+        "the refused change did not touch the binding"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).capturing_for()),
+        None
+    );
+}
+
+#[gpui::test]
+async fn a_saved_keymap_that_cannot_be_used_is_reported_and_the_defaults_answer(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    let saved = saved_for_this_platform(vec![shellune_storage::KeymapEntry::new(
+        "future.action",
+        "shell",
+        Some("ctrl-alt-k".to_owned()),
+    )]);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.use_saved_keymap_for_test(&saved, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_window, app| view.read(app).keymap_problem().is_some()),
+        "the reason is kept for the page to show"
+    );
+    assert!(
+        cx.debug_bounds("settings.keys.banner").is_some(),
+        "the settings page says the saved shortcuts were not applied"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).keymap().clone()),
+        Keymap::defaults(Platform::current()),
+        "the defaults are in force, so navigation still works"
+    );
+}
+
+#[gpui::test]
+async fn unbinding_a_terminal_shortcut_hands_the_key_back_to_the_program(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.write_to_clipboard(ClipboardItem::new_string("pasted".to_owned()));
+
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"pasted".to_vec(),
+        "with the action bound, the combination pastes"
+    );
+
+    // Unbind it: the same combination is now the program's own key.
+    let mut keymap = Keymap::defaults(Platform::current());
+    keymap.unbind("terminal.paste");
+    cx.update(|_window, app| crate::app::apply_keymap(app, &keymap));
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"pasted\x16".to_vec(),
+        "an unbound shortcut reaches the shell as the program's key"
+    );
+}
+
+#[gpui::test]
+async fn icon_controls_keep_a_24_by_24_pointer_target_at_the_smallest_text_size(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    // The smallest text size is the tightest the metrics ever get.
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Compact {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Compact
+    );
+    click(cx, "nav.settings");
+    for selector in ["settings.font.less", "settings.font.more", "palette.open"] {
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
+            "{selector} is a pointer target smaller than 24x24: {bounds:?}"
+        );
+    }
+
+    // The terminal's own controls follow the same rule.
+    let (_pane, cx) = pane_with("", cx);
+    for selector in [
+        "terminal.search",
+        "terminal.copy",
+        "terminal.font.increase",
+        "terminal.font.decrease",
+    ] {
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
+            "{selector} is a pointer target smaller than 24x24: {bounds:?}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn a_shortcut_can_be_changed_with_the_keyboard_alone(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    // Going to the settings with the shortcut leaves the keyboard on the page.
+    let settings = Keymap::defaults(Platform::current())
+        .keystroke("nav.settings")
+        .expect("the settings shortcut")
+        .to_owned();
+    cx.simulate_keystrokes(&settings);
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Settings);
+
+    // The arrow keys pick a row and Enter opens it: no pointer is used here.
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let capturing = cx.update(|_window, app| view.read(app).capturing_for());
+    assert!(
+        capturing.is_some(),
+        "Enter opens the row the keyboard is on"
+    );
+    cx.simulate_keystrokes("ctrl-alt-j");
+    cx.run_until_parked();
+    let capturing = capturing.expect("the row that was captured");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).capturing_for()),
+        None
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .keymap()
+            .keystroke(capturing)
+            .map(str::to_owned)),
+        Some("ctrl-alt-j".to_owned()),
+        "the keyboard alone changed the binding"
+    );
+}
+
+#[gpui::test]
+async fn two_hundred_percent_chinese_settings_shortcuts_stay_inside_the_window(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    // The minimum width, with the room the rows need to be laid out: the point is
+    // that nothing is wider than the window, not how far the page scrolls.
+    cx.simulate_resize(size(px(MIN_WINDOW_SIZE.0), px(2400.0)));
+    focus_root(&view, cx);
+    cx.dispatch_action(ToggleLanguage);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    cx.dispatch_action(crate::app::actions::GoToSettings);
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Settings);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    for selector in [
+        "settings.keys",
+        "settings.keys.row.palette.open",
+        "settings.keys.reset_all",
+    ] {
+        assert_within_width(bounds_of(cx, selector), viewport, selector);
+    }
+}
+
+#[test]
+fn a_rebound_action_survives_a_restart_through_the_preferences_file() {
+    let dir = std::env::temp_dir().join(format!("shellune-keymap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let store = shellune_storage::PreferencesStore::at(&dir);
+    let mut keymap = Keymap::defaults(Platform::current());
+    keymap
+        .set("terminal.search", "ctrl-alt-y")
+        .expect("a free combination");
+    keymap.unbind("terminal.paste");
+    let saved = keymap.to_preferences();
+    store
+        .save(&shellune_storage::Preferences {
+            keymap: Some(saved),
+            ..Default::default()
+        })
+        .expect("the preferences are written");
+
+    // What a restart does: read the file and resolve the bindings.
+    let (read, problem) = store.load_reported();
+    assert_eq!(problem, None);
+    let (restored, keymap_problem) = Keymap::resolve(Platform::current(), read.keymap.as_ref());
+    assert_eq!(keymap_problem, None);
+    assert_eq!(restored.keystroke("terminal.search"), Some("ctrl-alt-y"));
+    assert!(restored.is_unbound("terminal.paste"));
+    assert_eq!(
+        restored.keystroke("terminal.copy"),
+        Keymap::defaults(Platform::current()).keystroke("terminal.copy"),
+        "the actions the user did not touch keep their defaults"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

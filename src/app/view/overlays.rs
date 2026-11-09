@@ -15,7 +15,7 @@ use super::{PaneKind, ShelluneView, destination_icon, program_label, session_tar
 use crate::app::components;
 use crate::app::copy;
 use crate::app::icons::{self, Icon};
-use crate::app::nav::{Destination, Platform};
+use crate::app::nav::Destination;
 use crate::app::palette::{self, Command, Entry, Group};
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Tone, palette as colors, radius, spacing};
@@ -165,9 +165,11 @@ impl ShelluneView {
     }
 
     /// Every entry the palette can offer right now.
+    ///
+    /// Shortcuts come from the bindings in force, not from the catalogue's defaults,
+    /// so a rebound or unbound action is shown as it really is (R5).
     fn palette_entries(&self) -> Vec<Entry> {
         let strings = self.strings();
-        let platform = Platform::current();
         let locale = self.workspace.locale();
         let mut entries = Vec::new();
 
@@ -193,7 +195,9 @@ impl ShelluneView {
                     copy::session_state_label(session.state(), locale)
                 ),
                 shortcut: (index < crate::app::TAB_JUMP_COUNT)
-                    .then(|| platform.tab_jump_label(index + 1)),
+                    .then(|| crate::app::keymap::tab_jump_action(index + 1))
+                    .flatten()
+                    .and_then(|spec| self.keymap.label(spec.id)),
                 icon: match kind {
                     PaneKind::Local => Icon::Terminal,
                     PaneKind::Remote => Icon::Server,
@@ -209,7 +213,9 @@ impl ShelluneView {
                 group: Group::Shells,
                 title: shell.name().to_owned(),
                 detail: program_label(shell.program()),
-                shortcut: (index == default_shell).then(|| platform.new_shell_label().to_owned()),
+                shortcut: (index == default_shell)
+                    .then(|| self.keymap.label("shell.new"))
+                    .flatten(),
                 icon: Icon::Terminal,
                 current: false,
             });
@@ -250,14 +256,13 @@ impl ShelluneView {
                 group: Group::Navigate,
                 title: destination.label(strings).to_owned(),
                 detail: destination.summary(strings).to_owned(),
-                shortcut: Some(destination.shortcut_label(platform)),
+                shortcut: crate::app::keymap::page_action(destination)
+                    .and_then(|spec| self.keymap.label(spec.id)),
                 icon: destination_icon(destination),
                 current: false,
             });
         }
 
-        let modifier = platform.shortcut_modifier();
-        let joiner = if platform == Platform::MacOs { "" } else { "+" };
         if let Some(id) = self.active {
             entries.push(Entry {
                 command: Command::CloseTab(id),
@@ -268,7 +273,7 @@ impl ShelluneView {
                     .session(id)
                     .map(|session| session.title().to_owned())
                     .unwrap_or_default(),
-                shortcut: Some(platform.close_tab_label().to_owned()),
+                shortcut: self.keymap.label("tab.close"),
                 icon: Icon::Close,
                 current: false,
             });
@@ -305,7 +310,7 @@ impl ShelluneView {
             group: Group::Actions,
             title: strings.palette_language.to_owned(),
             detail: format!("{} → {}", locale.endonym(), locale.toggle().endonym()),
-            shortcut: Some(format!("{modifier}{joiner}L")),
+            shortcut: self.keymap.label("language.toggle"),
             icon: Icon::Globe,
             current: false,
         });
@@ -332,7 +337,7 @@ impl ShelluneView {
             group: Group::Actions,
             title: strings.palette_text_size.to_owned(),
             detail: self.workspace.zoom().label().to_owned(),
-            shortcut: Some(format!("{modifier}{joiner}=")),
+            shortcut: self.keymap.label("text.size"),
             icon: Icon::TextSize,
             current: false,
         });
@@ -351,6 +356,16 @@ impl ShelluneView {
             .into_iter()
             .map(|entry| entry.title)
             .collect()
+    }
+
+    /// The shortcut the palette lists for one entry, for the tests that check the
+    /// palette reads the bindings in force rather than a copy of the defaults (R5).
+    #[cfg(test)]
+    pub fn palette_shortcut(&self, title: &str) -> Option<String> {
+        self.palette_entries()
+            .into_iter()
+            .find(|entry| entry.title == title)
+            .and_then(|entry| entry.shortcut)
     }
 
     /// Moves the highlight and keeps it in view.
@@ -816,11 +831,9 @@ impl ShelluneView {
         let tab_count = self.workspace.layout().tabs().len();
         let index =
             (0..tab_count).find(|index| self.workspace.layout().anchor_of(*index) == Some(id))?;
-        let platform = Platform::current();
-
         let item = |label: &'static str,
                     selector: &'static str,
-                    shortcut: Option<&'static str>,
+                    shortcut: Option<String>,
                     enabled: bool| {
             let hover = theme::swatch(colors::SURFACE_HOVER);
             div()
@@ -913,7 +926,7 @@ impl ShelluneView {
                 item(
                     strings.tab_menu_close,
                     "tab.menu.close",
-                    Some(platform.close_tab_label()),
+                    self.keymap.label("tab.close"),
                     true,
                 )
                 .on_click(cx.listener(move |this, _event, window, cx| {

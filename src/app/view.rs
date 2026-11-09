@@ -28,7 +28,7 @@ use shellune_ssh::PtySize;
 use shellune_ssh::RemoteEvent;
 use shellune_storage::{
     BookError, ForwardStore, HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview,
-    ImportedHost, PreferencesStore, SecretStore, StorageError, TrustStore,
+    ImportedHost, PreferencesProblem, PreferencesStore, SecretStore, StorageError, TrustStore,
 };
 use shellune_terminal::GridSize;
 
@@ -55,6 +55,7 @@ use crate::app::hosts::{
     import_message, unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
+use crate::app::keymap::{self, Keymap, Problem};
 use crate::app::nav::{Destination, Platform};
 use crate::app::remote::{
     self, AttemptLink, ChainDraft, LinkEvent, MethodChoice, RemoteFailure, RemotePanel,
@@ -70,6 +71,8 @@ use crate::app::transfers::{
 };
 use crate::app::workspace::{Failure, Recovery, SectionState, SectionStatus, Workspace};
 use crate::app::{components, theme::radius};
+#[cfg(test)]
+use shellune_storage::KeymapPreferences;
 
 mod files_menu;
 mod forwarding;
@@ -435,6 +438,28 @@ pub struct ShelluneView {
     /// `None` while preferences are not kept, as in the unit tests, which share
     /// one scratch directory per process.
     saved_preferences: Option<shellune_storage::Preferences>,
+    /// The key bindings in force: the catalogue's defaults with the user's changes
+    /// (R5). The command palette and every hint read their shortcut from here.
+    keymap: Keymap,
+    /// Why the saved bindings were not applied. The settings page says so instead of
+    /// letting the user believe the defaults are their own choice.
+    keymap_problem: Option<Problem>,
+    /// The action whose new shortcut is being captured, while the layer is open.
+    key_capture: Option<KeyCapture>,
+    /// The keystroke interceptor that reads a captured shortcut before anything else
+    /// resolves it. Dropped when the layer closes.
+    capture_watch: Option<gpui::Subscription>,
+    /// Why the last shortcut change could not be written to the preferences file. The
+    /// change still holds for this run; the settings page says it may not survive a
+    /// restart rather than pretending it was saved.
+    keymap_save_error: Option<String>,
+    /// The settings page's action search field.
+    keys_search: Entity<TextField>,
+    /// The shortcut row the keyboard is on, which Enter opens for capture.
+    ///
+    /// The page is navigable with the arrow keys so a binding can be changed without
+    /// a pointer (R4); the row the keyboard is on is the one the ring is drawn on.
+    keys_selected: usize,
     /// Whether the window already tells this view when the system palette changes.
     watching_appearance: bool,
     /// Whether the host dialog's first field takes the keyboard on the next draw.
@@ -456,6 +481,13 @@ struct QuickSaveNotice {
     failed: bool,
     reason: String,
     next: String,
+}
+
+/// The shortcut capture layer: which action is waiting for a key, and why the last
+/// key it saw was refused.
+struct KeyCapture {
+    action: &'static str,
+    problem: Option<Problem>,
 }
 
 /// The three credential fields of the remote form.
@@ -531,6 +563,7 @@ impl ShelluneView {
             field
         });
         let hosts_search = cx.new(|cx| TextField::new(search_placeholder, cx));
+        let keys_search = cx.new(|cx| TextField::new(strings.keys_search_placeholder, cx));
 
         // The credentials fields are created once and reused: a field that is
         // recreated per attempt would lose the caret on every keystroke that
@@ -673,6 +706,13 @@ impl ShelluneView {
             theme_choice: theme::ThemeChoice::default(),
             terminal_scheme: theme::TerminalScheme::default(),
             saved_preferences: None,
+            keymap: Keymap::defaults(Platform::current()),
+            keymap_problem: None,
+            key_capture: None,
+            capture_watch: None,
+            keymap_save_error: None,
+            keys_search,
+            keys_selected: 0,
             watching_appearance: false,
             layout_persist: false,
             layout_error: None,
@@ -684,24 +724,38 @@ impl ShelluneView {
         view.bind_cleanup(cx);
         view.bind_shell_path(cx);
         view.bind_host_search(cx);
+        view.bind_keys_search(cx);
         view.bind_remote_fields(cx);
         view.restore_hosts(cx);
         view.restore_trust();
         view.reload_forwards();
         view.restore_workspace_layout();
-        view.restore_preferences();
+        view.restore_preferences(cx);
         view.relabel_fields(cx);
         view
     }
 
-    /// Applies the saved theme, language, text size, motion, sidebar and terminal
-    /// font size. Unit tests keep the defaults, so one test's choice cannot leak
-    /// into the next.
-    fn restore_preferences(&mut self) {
+    /// Applies the saved theme, language, text size, motion, sidebar, terminal font
+    /// size and key bindings. Unit tests keep the defaults, so one test's choice
+    /// cannot leak into the next.
+    ///
+    /// The key bindings are applied to the window here, before the first frame: a
+    /// saved change has to be in force from the start, not after the user touches the
+    /// settings page again.
+    fn restore_preferences(&mut self, cx: &mut Context<Self>) {
         if cfg!(test) {
             return;
         }
-        let saved = PreferencesStore::at(self.store.root()).load();
+        let (saved, problem) = PreferencesStore::at(self.store.root()).load_reported();
+        let platform = Platform::current();
+        let (keymap, keymap_problem) = Keymap::resolve(platform, saved.keymap.as_ref());
+        let keymap_problem = match problem {
+            Some(PreferencesProblem::Unreadable) => Some(Problem::UnreadablePreferences),
+            None => keymap_problem,
+        };
+        self.keymap = keymap;
+        self.keymap_problem = keymap_problem;
+        crate::app::apply_keymap(cx, &self.keymap);
         if let Some(choice) = saved.theme.as_deref().and_then(|value| match value {
             "system" => Some(theme::ThemeChoice::System),
             "light" => Some(theme::ThemeChoice::Light),
@@ -792,13 +846,20 @@ impl ShelluneView {
                 }
                 .to_owned(),
             ),
+            keymap: {
+                // An untouched key map stays out of the file: the catalogue's defaults
+                // are the truth, and writing them down would freeze this build's
+                // choices into the user's data.
+                let keymap = self.keymap.to_preferences();
+                (!keymap.is_empty()).then_some(keymap)
+            },
         }
     }
 
     /// Writes the preferences when one changed since the last write. Called from
-    /// every draw, so the sidebar, the palette and the shortcuts all persist
-    /// through one path. A failed write is not worth a banner: the choice still
-    /// holds for this run, and the next change tries again.
+    /// every draw, so the sidebar, the palette, the shortcuts and the key bindings
+    /// all persist through one path. A failed write is not worth a banner: the
+    /// choice still holds for this run, and the next change tries again.
     fn persist_preferences(&mut self) {
         let Some(saved) = &self.saved_preferences else {
             return;
@@ -809,6 +870,192 @@ impl ShelluneView {
         }
         let _ = PreferencesStore::at(self.store.root()).save(&now);
         self.saved_preferences = Some(now);
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyboard shortcuts (R5)
+    // -----------------------------------------------------------------------
+
+    /// The bindings in force. The palette, the hints and the settings page read their
+    /// shortcut from here, so they can never disagree with what the window answers.
+    #[cfg(test)]
+    #[must_use]
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    /// The settings page's action search, for the tests that check the list narrows.
+    #[cfg(test)]
+    #[must_use]
+    pub fn keys_query(&self, cx: &gpui::App) -> String {
+        self.keys_search.read(cx).text().to_owned()
+    }
+
+    /// Why the saved bindings were not applied; `None` when they were.
+    #[cfg(test)]
+    #[must_use]
+    pub fn keymap_problem(&self) -> Option<&Problem> {
+        self.keymap_problem.as_ref()
+    }
+
+    /// Whether the capture layer is open, and for which action.
+    #[cfg(test)]
+    #[must_use]
+    pub fn capturing_for(&self) -> Option<&'static str> {
+        self.key_capture.as_ref().map(|capture| capture.action)
+    }
+
+    /// Opens the capture layer for one action: the next combination pressed becomes
+    /// its shortcut.
+    fn keys_capture_start(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        // Interception, not a key listener: a combination already bound to another
+        // action has to be seen here first, otherwise it would run that action and
+        // the capture layer would never learn what was pressed.
+        let watch = cx.intercept_keystrokes(move |event, _window, app| {
+            let keystroke = event.keystroke.clone();
+            let taken = view
+                .update(app, |view, cx| view.keys_capture_key(&keystroke, cx))
+                .unwrap_or(false);
+            if taken {
+                app.stop_propagation();
+            }
+        });
+        self.key_capture = Some(KeyCapture {
+            action,
+            problem: None,
+        });
+        self.capture_watch = Some(watch);
+        cx.notify();
+    }
+
+    /// Closes the capture layer without changing anything.
+    fn keys_capture_cancel(&mut self, cx: &mut Context<Self>) {
+        self.key_capture = None;
+        self.capture_watch = None;
+        cx.notify();
+    }
+
+    /// Reads one keystroke while the capture layer is open. Returns whether it was
+    /// consumed.
+    fn keys_capture_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+        let Some(capture) = self.key_capture.as_ref() else {
+            return false;
+        };
+        let action = capture.action;
+        if keystroke.key == "escape" && keystroke.modifiers.number_of_modifiers() == 0 {
+            self.keys_capture_cancel(cx);
+            return true;
+        }
+        // A modifier on its own is not a shortcut yet: keep waiting for the key that
+        // is pressed with it.
+        if matches!(
+            keystroke.key.as_str(),
+            "shift" | "control" | "alt" | "platform" | "super" | "cmd" | "function" | "win"
+        ) {
+            return true;
+        }
+        let candidate = keystroke.unparse();
+        match self.keymap.set(action, &candidate) {
+            Ok(()) => {
+                self.key_capture = None;
+                self.capture_watch = None;
+                self.keymap_changed(cx);
+            }
+            Err(problem) => {
+                if let Some(capture) = self.key_capture.as_mut() {
+                    capture.problem = Some(problem);
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    /// Hands one action's keys back to whatever has the keyboard: with no binding the
+    /// combination reaches the terminal program (R5).
+    fn keys_unbind(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        self.keymap.unbind(action);
+        if let Some(capture) = self.key_capture.as_mut() {
+            capture.problem = None;
+        }
+        self.keymap_changed(cx);
+    }
+
+    /// Returns one action to its default shortcut.
+    fn keys_reset(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        self.keymap.reset(action);
+        if let Some(capture) = self.key_capture.as_mut() {
+            capture.problem = None;
+        }
+        self.keymap_changed(cx);
+    }
+
+    /// Returns every action to its default shortcut.
+    fn keys_reset_all(&mut self, cx: &mut Context<Self>) {
+        self.keymap.reset_all();
+        self.keymap_problem = None;
+        self.keymap_changed(cx);
+    }
+
+    /// Applies a changed key map to the window and writes it down.
+    ///
+    /// The bindings are rebuilt from the map, so an unbound action really stops
+    /// answering. A write that fails is kept visible instead of being reported as a
+    /// saved preference: the change holds for this run, the file on disk does not have
+    /// it, and the settings page says so.
+    fn keymap_changed(&mut self, cx: &mut Context<Self>) {
+        self.keymap_problem = None;
+        crate::app::apply_keymap(cx, &self.keymap);
+        // The terminals' own toolbars name the shortcuts, so they follow the change.
+        let shortcuts = terminal::TerminalShortcuts::of(&self.keymap);
+        for open in &self.panes {
+            let shortcuts = shortcuts.clone();
+            open.pane
+                .update(cx, |pane, cx| pane.set_shortcuts(shortcuts, cx));
+        }
+        if self.saved_preferences.is_some() {
+            let now = self.current_preferences();
+            match PreferencesStore::at(self.store.root()).save(&now) {
+                Ok(()) => {
+                    self.saved_preferences = Some(now);
+                    self.keymap_save_error = None;
+                }
+                Err(error) => self.keymap_save_error = Some(error.to_string()),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reads a saved key map as if it had just been loaded, for the tests that observe
+    /// what a damaged file looks like on the settings page.
+    #[cfg(test)]
+    pub fn use_saved_keymap_for_test(&mut self, saved: &KeymapPreferences, cx: &mut Context<Self>) {
+        let (keymap, problem) = Keymap::resolve(Platform::current(), Some(saved));
+        self.keymap = keymap;
+        self.keymap_problem = problem;
+        crate::app::apply_keymap(cx, &self.keymap);
+        cx.notify();
+    }
+
+    /// The row the keyboard is on among the shortcut rows listed now.
+    fn selected_key_row(&self, cx: &gpui::App) -> Option<&'static keymap::ActionSpec> {
+        let query = self.keys_search.read(cx).text().to_owned();
+        let matching = self.keymap.matching(&query, self.workspace.locale());
+        if matching.is_empty() {
+            return None;
+        }
+        matching
+            .get(self.keys_selected.min(matching.len() - 1))
+            .copied()
+    }
+
+    /// Moves the keyboard's row and keeps the highlight on a row that exists.
+    fn step_key_row(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let query = self.keys_search.read(cx).text().to_owned();
+        let count = self.keymap.matching(&query, self.workspace.locale()).len();
+        self.keys_selected = crate::app::palette::step(self.keys_selected, delta, count);
+        cx.notify();
     }
 
     /// Ends every session when the window that shows them closes (R7).
@@ -984,6 +1231,7 @@ impl ShelluneView {
         let labels = [
             (&self.shell_path, strings.shell_custom_placeholder),
             (&self.hosts_search, strings.hosts_search_placeholder),
+            (&self.keys_search, strings.keys_search_placeholder),
             (&self.remote_fields.password, strings.auth_password),
             (&self.remote_fields.key_path, strings.auth_key),
             (&self.remote_fields.passphrase, strings.auth_key_passphrase),
@@ -1054,6 +1302,10 @@ impl ShelluneView {
             },
         )
         .detach();
+        // The pane's toolbar names the shortcuts in force, so a rebound action is
+        // described by the key the window really answers (R5).
+        let shortcuts = terminal::TerminalShortcuts::of(&self.keymap);
+        pane.update(cx, |pane, cx| pane.set_shortcuts(shortcuts, cx));
         self.panes.push(OpenPane { tag, pane });
         if focus {
             // A terminal that just opened is what the user asked for: show it, from
@@ -1963,6 +2215,11 @@ impl ShelluneView {
     /// on screen. A host list that is still loading does not get in the way: the
     /// destination changes either way.
     fn select(&mut self, destination: Destination, window: &mut Window, cx: &mut Context<Self>) {
+        // A capture layer that is still open belongs to the page that opened it; leaving
+        // it behind would keep taking every key.
+        if self.key_capture.is_some() {
+            self.keys_capture_cancel(cx);
+        }
         // Transfers and forwards are tools over the page, not pages; the old session
         // list is the terminal tabs.
         let destination = match destination {
@@ -2038,6 +2295,18 @@ impl ShelluneView {
                 view.hosts.set_search(phrase);
                 cx.notify();
             }
+        })
+        .detach();
+    }
+
+    /// Redraws the settings page as the shortcut search is typed into.
+    ///
+    /// The filter is read from the field while the page draws, so nothing has to be
+    /// copied; the subscription exists only to make the page draw again.
+    fn bind_keys_search(&mut self, cx: &mut Context<Self>) {
+        let search = self.keys_search.clone();
+        cx.observe(&search, |_view, _field, cx| {
+            cx.notify();
         })
         .detach();
     }
@@ -9113,7 +9382,10 @@ impl ShelluneView {
             PaneKind::Remote => strings.session_kind_remote,
         };
         let jump = if index < crate::app::TAB_JUMP_COUNT {
-            format!(" ({})", Platform::current().tab_jump_label(index + 1))
+            keymap::tab_jump_action(index + 1)
+                .and_then(|spec| self.keymap.label(spec.id))
+                .map(|label| format!(" ({label})"))
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -9207,8 +9479,10 @@ impl ShelluneView {
             })
             .child(
                 components::icon_only_button(Icon::Close, metrics)
-                    .w(metrics.scale(20.0))
-                    .h(metrics.scale(20.0))
+                    // A pointer target, not a 20px drawing: the smallest size R4
+                    // allows, so closing a tab never needs a careful aim.
+                    .w(metrics.hit_target())
+                    .h(metrics.hit_target())
                     .id(("session.tab.close", index))
                     .debug_selector({
                         let selector = format!("session.tab.close.{index}");
@@ -10042,6 +10316,7 @@ impl Render for ShelluneView {
             .children(self.tab_menu_overlay(window, cx))
             .children(self.session_menu_overlay(window, cx))
             .children(self.palette_overlay(window, cx))
+            .children(self.key_capture_overlay(window, cx))
             .children(self.toast_stack(cx))
     }
 }
@@ -10173,11 +10448,6 @@ fn home_relative(path: &str) -> String {
 /// "C:\\Windows\\System32\\cmd.exe" reads as "cmd.exe"; a bare name stays as it is.
 fn program_label(program: &str) -> String {
     file_name(program).unwrap_or(program).to_owned()
-}
-
-/// The shortcut label of "new local shell" on one platform.
-fn new_shell_shortcut_label(platform: Platform) -> &'static str {
-    platform.new_shell_label()
 }
 
 /// The tone that carries a session state.

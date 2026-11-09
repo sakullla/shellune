@@ -9,6 +9,9 @@
 //!   jump chain and a ProxyCommand; those are references and command text.
 //! * `ForwardStore` — saved local, remote and dynamic forwarding rules.
 //! * `WorkspaceStore` — the workspace snapshot: tabs, pane tree and panel.
+//! * `PreferencesStore` — the interface choices and the custom key bindings, per
+//!   platform, with a reporting reader so a damaged file is never mistaken for a
+//!   default the user chose.
 //! * `StoreEvent` — the closed set of log lines the host store emits, so the
 //!   logging path can be tested for the absence of secrets instead of being trusted.
 //! * `ImportPreview` — what one SSH configuration file would contribute, read
@@ -43,7 +46,10 @@ pub use book::{
 pub use credentials::{MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
 pub use error::{BookError, PersistError, StorageError};
 pub use forwarding::{FILE_NAME as FORWARD_FILE_NAME, ForwardStore};
-pub use preferences::{FILE_NAME as PREFERENCES_FILE_NAME, Preferences, PreferencesStore};
+pub use preferences::{
+    FILE_NAME as PREFERENCES_FILE_NAME, KeymapEntry, KeymapPreferences, Preferences,
+    PreferencesProblem, PreferencesStore,
+};
 pub use ssh_config::{
     DEFAULT_CONFIG_TEXT, ImportError, ImportLimits, ImportNote, ImportOutcome, ImportPlan,
     ImportPreview, ImportedForward, ImportedHost, JumpSpec, NoteKind, PlannedForward, SkippedHost,

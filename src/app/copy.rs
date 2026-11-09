@@ -162,6 +162,8 @@ pub struct Strings {
     pub shell_custom_hint: &'static str,
     /// Placeholder in the host search field.
     pub hosts_search_placeholder: &'static str,
+    /// Placeholder in the settings page's action search.
+    pub keys_search_placeholder: &'static str,
     /// Host list view: every saved host.
     pub hosts_view_all: &'static str,
     /// Host list view: hosts grouped by their group label.
@@ -889,6 +891,7 @@ pub static ENGLISH: Strings = Strings {
     shell_default: "Default",
     shell_custom_hint: "Any program, by path",
     hosts_search_placeholder: "Search name, address, user or group",
+    keys_search_placeholder: "Search actions or shortcuts",
     hosts_view_all: "All hosts",
     hosts_view_groups: "Groups",
     hosts_view_recent: "Recent connections",
@@ -1274,6 +1277,7 @@ pub static CHINESE: Strings = Strings {
     shell_default: "默认",
     shell_custom_hint: "本机上的任意程序",
     hosts_search_placeholder: "搜索名称、地址、用户名或分组",
+    keys_search_placeholder: "搜索动作或快捷键",
     hosts_view_all: "全部主机",
     hosts_view_groups: "按分组",
     hosts_view_recent: "最近连接",
@@ -1887,6 +1891,24 @@ pub struct UxStrings {
     pub settings_scheme_app: &'static str,
     pub custom_shell_body: &'static str,
     pub custom_shell_run: &'static str,
+    /// Keyboard shortcuts group of the settings page
+    pub settings_keys: &'static str,
+    pub settings_keys_hint: &'static str,
+    pub keys_change: &'static str,
+    pub keys_unbind: &'static str,
+    pub keys_reset: &'static str,
+    pub keys_reset_all: &'static str,
+    pub keys_unbound: &'static str,
+    pub keys_changed: &'static str,
+    pub keys_default: &'static str,
+    pub keys_capture_title: &'static str,
+    pub keys_capture_hint: &'static str,
+    pub keys_capture_cancel: &'static str,
+    pub keys_no_match: &'static str,
+    pub keys_custom_summary: &'static str,
+    pub keys_problem_hint: &'static str,
+    pub keys_save_failed: &'static str,
+    pub keys_save_failed_next: &'static str,
 }
 
 impl UxStrings {
@@ -1981,6 +2003,23 @@ impl UxStrings {
             self.settings_scheme_app,
             self.custom_shell_body,
             self.custom_shell_run,
+            self.settings_keys,
+            self.settings_keys_hint,
+            self.keys_change,
+            self.keys_unbind,
+            self.keys_reset,
+            self.keys_reset_all,
+            self.keys_unbound,
+            self.keys_changed,
+            self.keys_default,
+            self.keys_capture_title,
+            self.keys_capture_hint,
+            self.keys_capture_cancel,
+            self.keys_no_match,
+            self.keys_custom_summary,
+            self.keys_problem_hint,
+            self.keys_save_failed,
+            self.keys_save_failed_next,
         ]
     }
 }
@@ -2073,6 +2112,23 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_scheme_app: "Match app",
     custom_shell_body: "Any program on this computer that runs in a terminal, by name or full path. It opens in a new tab.",
     custom_shell_run: "Open",
+    settings_keys: "Keyboard shortcuts",
+    settings_keys_hint: "Every action the window offers. Unbinding one hands its key back to the terminal program.",
+    keys_change: "Change",
+    keys_unbind: "Unbind",
+    keys_reset: "Restore",
+    keys_reset_all: "Restore every shortcut",
+    keys_unbound: "Unbound",
+    keys_changed: "Changed",
+    keys_default: "Default",
+    keys_capture_title: "Press the new shortcut",
+    keys_capture_hint: "Esc cancels. The combination needs Ctrl, Alt or ⌘ so the terminal keeps its own keys.",
+    keys_capture_cancel: "Cancel",
+    keys_no_match: "No action matches that search",
+    keys_custom_summary: "{} changed",
+    keys_problem_hint: "Saved shortcuts were not applied; every action is at its default.",
+    keys_save_failed: "This shortcut works for now but could not be written to the preferences file.",
+    keys_save_failed_next: "The next change tries again; a restart shows what was saved.",
 };
 
 /// Simplified Chinese.
@@ -2163,6 +2219,23 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_scheme_app: "跟随应用",
     custom_shell_body: "本机上任何可以在终端里运行的程序，填名称或完整路径，会在新标签里打开。",
     custom_shell_run: "打开",
+    settings_keys: "键盘快捷键",
+    settings_keys_hint: "窗口提供的全部动作。解除绑定后，该组合键会交还给终端程序。",
+    keys_change: "修改",
+    keys_unbind: "解除绑定",
+    keys_reset: "恢复默认",
+    keys_reset_all: "恢复全部快捷键",
+    keys_unbound: "未绑定",
+    keys_changed: "已修改",
+    keys_default: "默认",
+    keys_capture_title: "按下新的组合键",
+    keys_capture_hint: "Esc 取消。组合键需要带上 Ctrl、Alt 或 ⌘，否则终端就收不到自己的按键。",
+    keys_capture_cancel: "取消",
+    keys_no_match: "没有匹配的动作",
+    keys_custom_summary: "已修改 {} 项",
+    keys_problem_hint: "保存的快捷键未生效；所有动作已回到默认键位。",
+    keys_save_failed: "快捷键本次已生效，但没能写入偏好文件。",
+    keys_save_failed_next: "再改一次会重试；重启后显示的是已保存的状态。",
 };
 
 /// The redesigned-shell strings of the current language.

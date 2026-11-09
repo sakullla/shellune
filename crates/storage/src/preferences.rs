@@ -1,10 +1,14 @@
-//! The interface preferences: theme, language, text size, motion, sidebar and
-//! terminal font size.
+//! The interface preferences: theme, language, text size, motion, sidebar,
+//! terminal font size and the custom key bindings.
 //!
 //! These are conveniences, not records. A missing, damaged or newer file yields
 //! the defaults instead of an error, and the next change writes a fresh file, so a
 //! bad preferences file can never keep the application from starting. Every field
 //! is optional: a value this build does not know is ignored and the default used.
+//!
+//! Because a damaged file is silently replaced by defaults, the reader also has a
+//! reporting form ([`PreferencesStore::load_reported`]): the shell shows that the
+//! saved choices were not applied instead of pretending they were read.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +21,93 @@ use crate::store::save_versioned;
 pub const FILE_NAME: &str = "preferences.json";
 
 const LABEL: &str = "preferences";
+
+/// One saved key binding: which action, in which input context, on which platform.
+///
+/// The action identifier and the context are written down next to the keystroke so
+/// that a record this build does not know - a renamed action, a context that moved -
+/// can be recognised and reported instead of being applied to the wrong thing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeymapEntry {
+    /// Catalogue identifier of the action, such as `palette.open`.
+    pub action: String,
+    /// Input context the binding applies in, such as `shell`.
+    pub context: String,
+    /// The keystroke in the GPUI keymap syntax; absent means the action is unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keystroke: Option<String>,
+}
+
+impl KeymapEntry {
+    /// A binding record for one action.
+    #[must_use]
+    pub fn new(
+        action: impl Into<String>,
+        context: impl Into<String>,
+        keystroke: Option<String>,
+    ) -> Self {
+        Self {
+            action: action.into(),
+            context: context.into(),
+            keystroke,
+        }
+    }
+}
+
+/// The user's own key bindings, one list per platform.
+///
+/// Bindings are per platform on purpose: Ctrl and Cmd are different keys, and a
+/// combination that is free on Windows may be the system's on macOS. An action that
+/// is absent from a list keeps its default; an action present with no keystroke is
+/// unbound, which is how a shortcut is handed back to the terminal program.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeymapPreferences {
+    /// Bindings made on Windows.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<KeymapEntry>,
+    /// Bindings made on macOS.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub macos: Vec<KeymapEntry>,
+    /// Bindings made on Linux.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linux: Vec<KeymapEntry>,
+}
+
+impl KeymapPreferences {
+    /// The bindings saved for one platform, by [`KeymapPreferences::set_for_platform`] name.
+    #[must_use]
+    pub fn for_platform(&self, platform: &str) -> &[KeymapEntry] {
+        match platform {
+            "macos" => &self.macos,
+            "linux" => &self.linux,
+            _ => &self.windows,
+        }
+    }
+
+    /// Replaces the bindings saved for one platform.
+    pub fn set_for_platform(&mut self, platform: &str, entries: Vec<KeymapEntry>) {
+        match platform {
+            "macos" => self.macos = entries,
+            "linux" => self.linux = entries,
+            _ => self.windows = entries,
+        }
+    }
+
+    /// Whether no binding was ever changed on any platform.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty() && self.macos.is_empty() && self.linux.is_empty()
+    }
+}
+
+/// Why a preferences file could not be used as it stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreferencesProblem {
+    /// The file exists but is not the document this build writes. The defaults are
+    /// in use and the next change replaces the file.
+    Unreadable,
+}
 
 /// The saved interface preferences, as plain values the application maps back to
 /// its own types.
@@ -44,6 +135,10 @@ pub struct Preferences {
     /// The terminal's palette: `app`, `dark` or `light`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_scheme: Option<String>,
+    /// The shortcuts the user changed, per platform. Absent means every action
+    /// uses the catalogue's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keymap: Option<KeymapPreferences>,
 }
 
 /// A preferences file at a known location.
@@ -74,10 +169,24 @@ impl PreferencesStore {
     /// Reads the preferences. Anything unreadable gives the defaults.
     #[must_use]
     pub fn load(&self) -> Preferences {
-        std::fs::read(self.path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        self.load_reported().0
+    }
+
+    /// Reads the preferences and says whether the saved document could be used.
+    ///
+    /// A missing file is not a problem: it is simply nothing saved yet. A file that
+    /// cannot be parsed is reported with the defaults, so the caller can tell the
+    /// user that their choices were not applied rather than let them believe the
+    /// defaults are what they chose.
+    #[must_use]
+    pub fn load_reported(&self) -> (Preferences, Option<PreferencesProblem>) {
+        match std::fs::read(self.path()) {
+            Err(_) => (Preferences::default(), None),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(preferences) => (preferences, None),
+                Err(_) => (Preferences::default(), Some(PreferencesProblem::Unreadable)),
+            },
+        }
     }
 
     /// Writes the preferences atomically.
@@ -127,6 +236,14 @@ mod tests {
             sidebar_collapsed: Some(true),
             terminal_font_size: Some(15.0),
             terminal_scheme: Some("dark".to_owned()),
+            keymap: Some(KeymapPreferences {
+                windows: vec![
+                    KeymapEntry::new("palette.open", "shell", Some("ctrl-alt-p".to_owned())),
+                    KeymapEntry::new("terminal.copy", "terminal", None),
+                ],
+                macos: Vec::new(),
+                linux: Vec::new(),
+            }),
         };
         store.save(&preferences).expect("saves");
         assert_eq!(store.load(), preferences);
@@ -140,8 +257,68 @@ mod tests {
         let store = PreferencesStore::at(&dir);
         std::fs::write(store.path(), b"{not json").expect("write");
         assert_eq!(store.load(), Preferences::default());
+        let (damaged, problem) = store.load_reported();
+        assert_eq!(damaged, Preferences::default());
+        assert_eq!(problem, Some(PreferencesProblem::Unreadable));
         std::fs::write(store.path(), br#"{"theme":"dark","future":1}"#).expect("write");
-        assert_eq!(store.load().theme.as_deref(), Some("dark"));
+        let (unknown, problem) = store.load_reported();
+        assert_eq!(unknown.theme.as_deref(), Some("dark"));
+        assert_eq!(
+            problem, None,
+            "a field this build does not know is not damage"
+        );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_file_is_not_reported_as_a_problem() {
+        let store = PreferencesStore::at(scratch("absent"));
+        let (preferences, problem) = store.load_reported();
+        assert_eq!(preferences, Preferences::default());
+        assert_eq!(problem, None);
+    }
+
+    #[test]
+    fn a_keymap_of_the_wrong_shape_is_reported_rather_than_guessed_at() {
+        let dir = scratch("keymap-damaged");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let store = PreferencesStore::at(&dir);
+        std::fs::write(
+            store.path(),
+            br#"{"theme":"light","keymap":{"windows":[{"action":7}]}}"#,
+        )
+        .expect("write");
+        let (preferences, problem) = store.load_reported();
+        assert_eq!(problem, Some(PreferencesProblem::Unreadable));
+        assert_eq!(preferences, Preferences::default());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keymaps_are_kept_per_platform() {
+        let mut keymap = KeymapPreferences::default();
+        assert!(keymap.is_empty());
+        keymap.set_for_platform(
+            "macos",
+            vec![KeymapEntry::new(
+                "palette.open",
+                "shell",
+                Some("cmd-shift-k".to_owned()),
+            )],
+        );
+        keymap.set_for_platform("linux", Vec::new());
+        assert!(!keymap.is_empty());
+        assert_eq!(keymap.for_platform("macos").len(), 1);
+        assert_eq!(
+            keymap.for_platform("macos")[0].keystroke.as_deref(),
+            Some("cmd-shift-k")
+        );
+        assert!(keymap.for_platform("linux").is_empty());
+        assert!(
+            keymap.for_platform("windows").is_empty(),
+            "another platform's bindings are not leaked"
+        );
+        keymap.set_for_platform("macos", Vec::new());
+        assert!(keymap.is_empty());
     }
 }

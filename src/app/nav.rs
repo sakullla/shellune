@@ -35,11 +35,15 @@ impl Platform {
         }
     }
 
-    /// Symbol or word used in front of a digit in a shortcut label.
-    pub fn shortcut_modifier(self) -> &'static str {
+    /// Stable identifier of the platform, written next to saved key bindings.
+    ///
+    /// Bindings are kept per platform because Ctrl and Cmd are different keys: a
+    /// combination that is free on Windows may belong to the system on macOS.
+    pub fn id(self) -> &'static str {
         match self {
-            Self::MacOs => "⌘",
-            Self::Windows | Self::Linux => "Ctrl",
+            Self::Windows => "windows",
+            Self::MacOs => "macos",
+            Self::Linux => "linux",
         }
     }
 
@@ -62,14 +66,6 @@ impl Platform {
         }
     }
 
-    /// Label of [`Platform::new_shell_keystroke`].
-    pub fn new_shell_label(self) -> &'static str {
-        match self {
-            Self::MacOs => "\u{2318}T",
-            Self::Windows | Self::Linux => "Ctrl+Shift+T",
-        }
-    }
-
     /// Keystroke that opens the command palette.
     ///
     /// Shifted on every platform: Ctrl+P is the shell's "previous command".
@@ -77,14 +73,6 @@ impl Platform {
         match self {
             Self::MacOs => "cmd-shift-p",
             Self::Windows | Self::Linux => "ctrl-shift-p",
-        }
-    }
-
-    /// Label of [`Platform::palette_keystroke`].
-    pub fn palette_label(self) -> &'static str {
-        match self {
-            Self::MacOs => "\u{21e7}\u{2318}P",
-            Self::Windows | Self::Linux => "Ctrl+Shift+P",
         }
     }
 
@@ -96,14 +84,6 @@ impl Platform {
         match self {
             Self::MacOs => "cmd-w",
             Self::Windows | Self::Linux => "ctrl-shift-w",
-        }
-    }
-
-    /// Label of [`Platform::close_tab_keystroke`].
-    pub fn close_tab_label(self) -> &'static str {
-        match self {
-            Self::MacOs => "\u{2318}W",
-            Self::Windows | Self::Linux => "Ctrl+Shift+W",
         }
     }
 
@@ -123,14 +103,6 @@ impl Platform {
         match self {
             Self::MacOs => "ctrl",
             Self::Windows | Self::Linux => "alt",
-        }
-    }
-
-    /// Label of the tab jump shortcut for tab `number`.
-    pub fn tab_jump_label(self, number: usize) -> String {
-        match self {
-            Self::MacOs => format!("\u{2303}{number}"),
-            Self::Windows | Self::Linux => format!("Alt+{number}"),
         }
     }
 }
@@ -229,17 +201,10 @@ impl Destination {
             .map_or(0, |index| index + 1)
     }
 
-    /// Shortcut label for the given platform, for example "Ctrl+1" or "⌘1".
-    pub fn shortcut_label(self, platform: Platform) -> String {
-        match platform {
-            Platform::MacOs => format!("{}{}", platform.shortcut_modifier(), self.shortcut_digit()),
-            Platform::Windows | Platform::Linux => {
-                format!("{}+{}", platform.shortcut_modifier(), self.shortcut_digit())
-            }
-        }
-    }
-
     /// Keystroke string accepted by [`gpui::KeyBinding::new`].
+    ///
+    /// The readable label of the same shortcut is the key map's job: it knows the
+    /// binding in force, which may no longer be this default (R5).
     pub fn keystroke(self, platform: Platform) -> String {
         format!(
             "{}-{}",

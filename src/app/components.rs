@@ -227,7 +227,7 @@ fn icon_only_button_hover(
     hover: gpui::Rgba,
     hover_text: gpui::Rgba,
 ) -> Div {
-    let size = metrics.compact_control_height();
+    let size = metrics.hit_target();
     div()
         .group(ICON_GROUP)
         .flex()
@@ -274,7 +274,7 @@ pub fn compact_button(label: impl Into<SharedString>, variant: Variant, metrics:
 
 /// A square button that holds a short glyph such as "A+" or "×".
 pub fn icon_button(glyph: impl Into<SharedString>, metrics: Metrics) -> Div {
-    let size = metrics.compact_control_height();
+    let size = metrics.hit_target();
     style_variant(
         div()
             .flex()

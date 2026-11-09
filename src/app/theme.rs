@@ -559,6 +559,12 @@ pub struct Metrics {
     zoom: Zoom,
 }
 
+/// Smallest edge a primary pointer target may have, in logical pixels (R4).
+///
+/// A target is not allowed to shrink below this when the text size is reduced: the
+/// point of the minimum is the pointer, which does not scale with the interface.
+pub const HIT_TARGET: f32 = 24.0;
+
 impl Metrics {
     /// Metrics for a zoom level.
     pub fn new(zoom: Zoom) -> Self {
@@ -608,6 +614,15 @@ impl Metrics {
     /// Height of a compact control inside a toolbar.
     pub fn compact_control_height(self) -> Pixels {
         self.scale(26.0)
+    }
+
+    /// Edge length of a square icon control.
+    ///
+    /// It follows the text size upwards but never below [`HIT_TARGET`]: an icon
+    /// button is a pointer target before it is a drawing, and 24×24 is the smallest
+    /// that stays comfortable to hit (R4).
+    pub fn hit_target(self) -> Pixels {
+        self.compact_control_height().max(px(HIT_TARGET))
     }
 
     /// Height of one session tab.

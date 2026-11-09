@@ -39,6 +39,7 @@ use shellune_terminal::{
     paste_needs_confirmation, paste_preview, sanitize_font_size, step_font_size,
 };
 
+use crate::app::actions::{TerminalCopy, TerminalPaste, TerminalSearch};
 use crate::app::components;
 use crate::app::copy::Locale;
 use crate::app::glyphs;
@@ -365,6 +366,40 @@ pub struct TerminalPane {
     search_hits: Vec<HistoryMatch>,
     search_at: usize,
     block_filter: BlockFilter,
+    /// The shortcuts the pane's own controls answer, as the bindings in force show
+    /// them (R5). The view keeps this in step with the settings page.
+    shortcuts: TerminalShortcuts,
+}
+
+/// What a terminal's copy, paste and search controls answer, written the way a
+/// person reads a shortcut. `None` means the action is unbound, so the tooltip says
+/// nothing rather than naming a key the window would not take.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalShortcuts {
+    /// The search action, `Ctrl+Shift+F` by default.
+    pub search: Option<String>,
+    /// The copy action, `Ctrl+Shift+C` by default.
+    pub copy: Option<String>,
+}
+
+impl TerminalShortcuts {
+    /// The labels of the bindings in force.
+    #[must_use]
+    pub fn of(keymap: &crate::app::keymap::Keymap) -> Self {
+        Self {
+            search: keymap.label("terminal.search"),
+            copy: keymap.label("terminal.copy"),
+        }
+    }
+
+    /// The default catalogue labels, which a pane starts with before the view hands
+    /// it the bindings really in force.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self::of(&crate::app::keymap::Keymap::defaults(
+            crate::app::nav::Platform::current(),
+        ))
+    }
 }
 
 /// A paste held until the user confirms the session it names.
@@ -425,6 +460,7 @@ impl TerminalPane {
             search_hits: Vec::new(),
             search_at: 0,
             block_filter: BlockFilter::All,
+            shortcuts: TerminalShortcuts::defaults(),
         };
         pane.start_polling(cx);
         pane
@@ -478,6 +514,7 @@ impl TerminalPane {
             search_hits: Vec::new(),
             search_at: 0,
             block_filter: BlockFilter::All,
+            shortcuts: TerminalShortcuts::defaults(),
         };
         pane.start_polling(cx);
         pane
@@ -530,6 +567,7 @@ impl TerminalPane {
             search_hits: Vec::new(),
             search_at: 0,
             block_filter: BlockFilter::All,
+            shortcuts: TerminalShortcuts::defaults(),
         };
         pane.start_polling(cx);
         pane
@@ -598,6 +636,7 @@ impl TerminalPane {
             search_hits: Vec::new(),
             search_at: 0,
             block_filter: BlockFilter::All,
+            shortcuts: TerminalShortcuts::defaults(),
         }
     }
 
@@ -810,7 +849,7 @@ impl TerminalPane {
     }
 
     /// Sends what a key press means, or scrolls for the view-only combinations.
-    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() && event.keystroke.key == "escape" {
             self.menu = None;
             cx.notify();
@@ -824,22 +863,12 @@ impl TerminalPane {
             platform: keystroke.modifiers.platform,
         };
 
-        // The terminal's own clipboard shortcuts come first: they must not reach
-        // the shell, where Ctrl+C means "interrupt".
+        // The terminal's own clipboard and search keys arrive as actions, so the
+        // settings page can rebind or unbind them (R5). These two confirm or cancel a
+        // paste and step through search hits; they are not Escape, Ctrl+L or Ctrl+C,
+        // which stay program input below.
         if modifiers.control && modifiers.shift {
             match keystroke.key.as_str() {
-                "c" => {
-                    self.copy_selection(cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                "v" => {
-                    self.paste(window, cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                // These confirm or cancel a paste, or drive search. They are not
-                // Escape, Ctrl+L or Ctrl+C, which stay program input below.
                 "enter" if self.pending_paste.is_some() => {
                     self.confirm_paste(cx);
                     cx.stop_propagation();
@@ -847,11 +876,6 @@ impl TerminalPane {
                 }
                 "backspace" if self.pending_paste.is_some() => {
                     self.cancel_paste(cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                "f" if !self.alternate_screen() => {
-                    self.toggle_search(cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -913,6 +937,23 @@ impl TerminalPane {
     /// Sends text to the program as if it had been typed.
     pub fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.write(text.as_bytes(), cx);
+    }
+
+    /// Takes the shortcuts in force, so the toolbar describes the keys the window
+    /// really answers (R5).
+    pub fn set_shortcuts(&mut self, shortcuts: TerminalShortcuts, cx: &mut Context<Self>) {
+        if self.shortcuts != shortcuts {
+            self.shortcuts = shortcuts;
+            cx.notify();
+        }
+    }
+
+    /// A tooltip line naming the shortcut, or just the action when it is unbound.
+    fn with_shortcut(label: &str, shortcut: &Option<String>) -> String {
+        match shortcut {
+            Some(shortcut) => format!("{label} ({shortcut})"),
+            None => label.to_owned(),
+        }
     }
 
     /// Puts the selection on the clipboard.
@@ -1657,14 +1698,13 @@ impl TerminalPane {
                     .child(self.search_button(metrics, strings, cx))
                     .child(
                         components::icon_only_button(Icon::Copy, metrics)
-                            .h(metrics.scale(22.0))
-                            .w(metrics.scale(24.0))
+                            .w(metrics.hit_target())
+                            .h(metrics.hit_target())
                             .id("terminal.copy")
                             .debug_selector(|| "terminal.copy".to_owned())
-                            .tooltip(components::tooltip(SharedString::from(format!(
-                                "{} (Ctrl+Shift+C)",
-                                strings.terminal_copy
-                            ))))
+                            .tooltip(components::tooltip(SharedString::from(
+                                Self::with_shortcut(strings.terminal_copy, &self.shortcuts.copy),
+                            )))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.copy_selection(cx);
                             })),
@@ -1676,8 +1716,8 @@ impl TerminalPane {
                     )
                     .child(
                         components::icon_button("A\u{2212}", metrics)
-                            .h(metrics.scale(22.0))
-                            .min_w(metrics.scale(24.0))
+                            .w(metrics.hit_target())
+                            .h(metrics.hit_target())
                             .id("terminal.font.decrease")
                             .debug_selector(|| "terminal.font.decrease".to_owned())
                             .tooltip(components::tooltip(strings.terminal_smaller))
@@ -1694,8 +1734,8 @@ impl TerminalPane {
                     )
                     .child(
                         components::icon_button("A+", metrics)
-                            .h(metrics.scale(22.0))
-                            .min_w(metrics.scale(24.0))
+                            .w(metrics.hit_target())
+                            .h(metrics.hit_target())
                             .id("terminal.font.increase")
                             .debug_selector(|| "terminal.font.increase".to_owned())
                             .tooltip(components::tooltip(strings.terminal_larger))
@@ -1947,11 +1987,13 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         components::icon_only_button(Icon::Search, metrics)
-            .h(metrics.scale(22.0))
-            .w(metrics.scale(24.0))
+            .w(metrics.hit_target())
+            .h(metrics.hit_target())
             .id("terminal.search")
             .debug_selector(|| "terminal.search".to_owned())
-            .tooltip(components::tooltip(strings.terminal_search))
+            .tooltip(components::tooltip(SharedString::from(
+                Self::with_shortcut(strings.terminal_search, &self.shortcuts.search),
+            )))
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.toggle_search(cx);
             }))
@@ -2354,6 +2396,25 @@ impl TerminalPane {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx);
+            }))
+            // The clipboard and search shortcuts are actions rather than key
+            // branches, so the settings page can rebind or unbind them: an unbound
+            // combination falls through to the program below.
+            .on_action(cx.listener(|this, _: &TerminalSearch, _window, cx| {
+                // A full-screen program owns the screen: its contents are not history
+                // and must not be searched (R1).
+                if !this.alternate_screen() {
+                    this.toggle_search(cx);
+                }
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &TerminalCopy, _window, cx| {
+                this.copy_selection(cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &TerminalPaste, window, cx| {
+                this.paste(window, cx);
+                cx.stop_propagation();
             }))
     }
 }
