@@ -982,6 +982,34 @@ fn read_authority(authority: &Path) -> Result<Vec<u8>, X11Failure> {
     })
 }
 
+/// Reads a pipe to the end, or nothing when the program was started without one.
+fn read_pipe(pipe: Option<impl io::Read>) -> Vec<u8> {
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    let _ = io::Read::read_to_end(&mut pipe, &mut buf);
+    buf
+}
+
+/// Stops a cookie program that did not exit, including the processes it started.
+///
+/// On Windows the program is a stand-in that starts another process. Killing only the
+/// parent leaves that child running, and the next attempt then waits behind it.
+fn stop_generate(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Runs the one `xauth` command that registers an untrusted cookie.
 ///
 /// The command is the one OpenSSH's own client uses for `ssh -X`: the display it talks
@@ -1017,16 +1045,23 @@ fn run_generate(
         .map_err(|error| X11Failure::NoUntrustedCookie {
             detail: format!("{} could not be run: {error}", program.display()),
         })?;
+    // The pipes have to be read while the program runs. Leaving them full stops it,
+    // and a program stopped that way is not a display that refused its cookie.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || read_pipe(stdout));
+    let stderr_thread = std::thread::spawn(move || read_pipe(stderr));
     let deadline = Instant::now() + XAUTH_PATIENCE;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_generate(&mut child);
+                drop(stdout_thread);
+                drop(stderr_thread);
                 return Err(X11Failure::NoUntrustedCookie {
                     detail: format!(
                         "{display} did not answer within {}s",
@@ -1035,17 +1070,20 @@ fn run_generate(
                 });
             }
             Err(error) => {
+                stop_generate(&mut child);
+                drop(stdout_thread);
+                drop(stderr_thread);
                 return Err(X11Failure::NoUntrustedCookie {
                     detail: format!("{} could not be waited for: {error}", program.display()),
                 });
             }
         }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| X11Failure::NoUntrustedCookie {
-            detail: format!("{} left no result: {error}", program.display()),
-        })?;
+    };
+    let output = std::process::Output {
+        status,
+        stdout: stdout_thread.join().unwrap_or_default(),
+        stderr: stderr_thread.join().unwrap_or_default(),
+    };
     if output.status.success() {
         return Ok(());
     }

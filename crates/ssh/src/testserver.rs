@@ -264,10 +264,20 @@ impl DisplayServer {
         // of the script, so it cannot be used to find a place next to the script.
         let capture = directory.join("last-issued");
         #[cfg(windows)]
-        write_batch(
-            &directory.join("xauth.cmd"),
-            &XAUTH_SCRIPT.replace("@CAPTURE@", &capture.display().to_string()),
-        );
+        {
+            // One WSL process translates both paths and runs xauth. Three separate
+            // `wsl.exe` startups (two `wslpath`, then `xauth`) were killed by the
+            // product's 10s wait while a workspace run had the distro busy, so the
+            // display's refusal of the cookie it had just issued was never observed.
+            let bridge = directory.join("xauth-bridge.sh");
+            std::fs::write(&bridge, XAUTH_BRIDGE).expect("the xauth bridge is written");
+            write_batch(
+                &directory.join("xauth.cmd"),
+                &XAUTH_SCRIPT
+                    .replace("@CAPTURE@", &capture.display().to_string())
+                    .replace("@BRIDGE@", &linux_path(&bridge)),
+            );
+        }
         // On Linux the product finds a program named `xauth`. The stand-in runs the real
         // one and keeps the entry it wrote, because the product removes that file again.
         #[cfg(not(windows))]
@@ -697,6 +707,9 @@ impl Drop for DisplayServer {
 #[cfg(windows)]
 const XAUTH_SCRIPT: &str = r#"@echo off
 rem Runs the real xauth of the disposable display for one invocation (R11).
+rem Path translation and xauth share one wsl.exe: a separate process per step does not
+rem finish while other tests are also starting WSL, and the product then reports that
+rem the display did not answer.
 setlocal enabledelayedexpansion
 set "FILE="
 set "REST="
@@ -712,16 +725,22 @@ shift
 shift
 goto arguments
 :translate
-for /f "usebackq delims=" %%p in (`wsl.exe -d Debian -u root -- wslpath -u "!FILE!"`) do set "ISSUED=%%p"
-for /f "usebackq delims=" %%p in (`wsl.exe -d Debian -u root -- wslpath -u "%XAUTHORITY%"`) do set "TRUSTED=%%p"
-rem The entry goes where -f says; the display is reached with the machine's own authority.
-wsl.exe -d Debian -u root -- env XAUTHORITY="!TRUSTED!" /usr/bin/xauth -f "!ISSUED!"!REST!
+wsl.exe -d Debian -u root -- bash "@BRIDGE@" "!FILE!" "%XAUTHORITY%"!REST!
 set "STATUS=!ERRORLEVEL!"
 rem The product removes its private file again, so the entry the display issued is copied
 rem out for the test that reads it, to the path the harness wrote into this file.
 if exist "!FILE!" copy /y "!FILE!" "@CAPTURE@" >nul 2>&1
 exit /b !STATUS!
 "#;
+
+/// The Linux side of the Windows stand-in: both Windows paths, then `xauth`'s own arguments.
+#[cfg(windows)]
+const XAUTH_BRIDGE: &str = "#!/bin/bash\n\
+set -u\n\
+file=$(wslpath -u \"$1\") || exit 1\n\
+trusted=$(wslpath -u \"$2\") || exit 1\n\
+shift 2\n\
+exec env XAUTHORITY=\"$trusted\" /usr/bin/xauth -f \"$file\" \"$@\"\n";
 
 /// The stand-in `xauth` on Linux, where the product and the display are the same machine.
 ///
