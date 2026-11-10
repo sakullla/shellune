@@ -14,9 +14,11 @@
 //! direct-tcpip channel through it. Starting, stopping or rotating the server
 //! never runs a ProxyCommand.
 
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// The passphrase the harness gives the second copy of the client key.
 pub const KEY_PASSPHRASE: &str = "shellune-key-passphrase";
@@ -65,6 +67,11 @@ impl X11Server {
 /// really presented the right cookie: a bridge that dropped or reused the wrong one
 /// would be refused by the server instead of quietly passing.
 ///
+/// The one entry of that file is made by the real `xauth` (`xauth add :N …`), so its key
+/// is the ordinary one a local display has: this machine's name and the display number,
+/// FamilyLocal. That is also the key an entry issued by `xauth generate … untrusted` is
+/// written under, which is what makes a mode that wrote into this file visible here.
+///
 /// Nothing here is installed automatically. A machine without Xvfb reports that it
 /// cannot run the test rather than pretending the test passed.
 pub struct DisplayServer {
@@ -109,9 +116,6 @@ impl DisplayServer {
             if display_taken(number) {
                 continue;
             }
-            let authority = dir.join(format!("Xauthority.{number}"));
-            std::fs::write(&authority, wildcard_authority(&random_cookie()))
-                .map_err(|error| error.to_string())?;
             let mut display = Self {
                 number,
                 dir: dir.clone(),
@@ -137,13 +141,21 @@ impl DisplayServer {
     /// lives inside the Linux environment the harness runs - so the stand-in passes the
     /// one command the restricted mode sends to that `xauth`. What it starts is the real
     /// /usr/bin/xauth of that environment, talking to the same display over the same
-    /// TCP port, reading the same authority file through the shared drive.
+    /// TCP port, with the authority file reached through the shared drive. What it
+    /// leaves behind is `last-issued`: the entry the display issued, copied out of the
+    /// private file the product gave it before that file is removed.
     #[must_use]
     pub fn xauth_path(&self) -> PathBuf {
         let directory = self.dir.join("xauth-path");
         std::fs::create_dir_all(&directory).expect("a directory for the stand-in xauth");
-        std::fs::write(directory.join("xauth.cmd"), XAUTH_SCRIPT)
-            .expect("the stand-in xauth is written");
+        // The path the issued entry is copied to is written into the script: `%~dp0` is
+        // the working directory of whoever started the batch file and not the directory
+        // of the script, so it cannot be used to find a place next to the script.
+        let capture = directory.join("last-issued");
+        write_batch(
+            &directory.join("xauth.cmd"),
+            &XAUTH_SCRIPT.replace("@CAPTURE@", &capture.display().to_string()),
+        );
         directory
     }
 
@@ -156,11 +168,10 @@ impl DisplayServer {
     pub fn broken_xauth_path(&self) -> PathBuf {
         let directory = self.dir.join("xauth-broken");
         std::fs::create_dir_all(&directory).expect("a directory for the failing xauth");
-        std::fs::write(
-            directory.join("xauth.cmd"),
-            "@echo off\r\necho xauth: the display cannot issue an untrusted cookie 1>&2\r\nexit /b 1\r\n",
-        )
-        .expect("the failing stand-in is written");
+        write_batch(
+            &directory.join("xauth.cmd"),
+            "@echo off\necho xauth: the display cannot issue an untrusted cookie 1>&2\nexit /b 1\n",
+        );
         directory
     }
 
@@ -201,18 +212,26 @@ impl DisplayServer {
         self.dir.join(format!("Xauthority.{}", self.number))
     }
 
-    /// The cookie of this display, hex encoded, as this machine's own file holds it.
+    /// The record of this display's authority file, as the product reads one.
     ///
-    /// A forwarding test compares it with what the server was given: the real cookie
-    /// must never be the one that travelled over SSH.
+    /// This is the entry this machine's own programs authenticate with. A restricted
+    /// session must leave it exactly as it is; a session that wrote into this file would
+    /// be caught here.
     #[must_use]
-    pub fn cookie_hex(&self) -> String {
-        let bytes = std::fs::read(self.authority()).unwrap_or_default();
-        // One wildcard record: family, address length, number length, name length and
-        // the name itself, then the length and the bytes of the cookie.
-        let start = 2 + 2 + 2 + 2 + crate::x11::AUTH_NAME.len() + 2;
-        let cookie = bytes.get(start..start + 16).unwrap_or_default();
-        cookie.iter().map(|byte| format!("{byte:02x}")).collect()
+    pub fn authority_record(&self) -> AuthorityRecord {
+        read_record(&std::fs::read(self.authority()).unwrap_or_default())
+            .unwrap_or_else(|| panic!("{} holds no authority entry", self.authority().display()))
+    }
+
+    /// The entry the display issued for the last restricted session, if it issued one.
+    ///
+    /// The product removes the private file it read the entry from, so the stand-in
+    /// `xauth` keeps a copy of what the display wrote. `None` means no restricted
+    /// session asked this display for an untrusted cookie.
+    #[must_use]
+    pub fn issued_record(&self) -> Option<AuthorityRecord> {
+        let copy = self.dir.join("xauth-path").join("last-issued");
+        read_record(&std::fs::read(copy).ok()?)
     }
 
     /// The TCP port the server listens on.
@@ -262,6 +281,11 @@ impl DisplayServer {
     /// re-quotes what it is given, and a command with quotes of its own arrives at bash
     /// mangled. The same rule is why scripts/ssh-test-server.sh exists.
     fn run(&self, action: &str) -> Result<String, String> {
+        self.run_with(action, &self.extra)
+    }
+
+    /// The same, with the fifth argument the action needs.
+    fn run_with(&self, action: &str, extra: &str) -> Result<String, String> {
         let script = self.dir.join("x11-display.sh");
         let output = Command::new("wsl.exe")
             .args(["-d", "Debian", "-u", "root", "--", "bash"])
@@ -270,7 +294,7 @@ impl DisplayServer {
             .arg(wsl_path(&self.dir))
             .arg(self.number.to_string())
             .arg(self.port().to_string())
-            .arg(&self.extra)
+            .arg(extra)
             .output()
             .map_err(|error| format!("wsl.exe could not be run: {error}"))?;
         if !output.status.success() {
@@ -281,6 +305,47 @@ impl DisplayServer {
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Whether this display server honours an authorization it issued as untrusted.
+    ///
+    /// A restricted session forwards with exactly such an authorization, so a server
+    /// that refuses it refuses every remote program as well. The question is put to the
+    /// server itself and not through the product: one untrusted authorization is issued
+    /// into a private file of this test, its cookie is read back, and one raw
+    /// `MIT-MAGIC-COOKIE-1` connection is opened with it.
+    ///
+    /// Debian's Xvfb 21.1.16 answers `xauth generate` with an authorization id and then
+    /// refuses that cookie - only entries in the server's own `-auth` file are accepted
+    /// there - and this reports exactly that instead of letting a test claim either way.
+    #[must_use]
+    pub fn honours_issued_cookies(&self) -> bool {
+        let private = self.dir.join(format!("issued-{}.private", self.number));
+        let _ = std::fs::remove_file(&private);
+        if self.run_with("issue", &wsl_path(&private)).is_err() {
+            return false;
+        }
+        let Some(cookie) = std::fs::read(&private)
+            .ok()
+            .and_then(|bytes| read_record(&bytes))
+            .map(|record| hex_bytes(&record.cookie_hex))
+        else {
+            return false;
+        };
+        let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.port()));
+        let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        if stream.write_all(&setup_request(&cookie)).is_err() {
+            return false;
+        }
+        let mut answer = [0u8; 1];
+        match stream.read_exact(&mut answer) {
+            Ok(()) => answer[0] == 1,
+            Err(_) => false,
+        }
     }
 
     fn launch(&mut self) -> Result<(), String> {
@@ -322,6 +387,7 @@ const DISPLAY_SCRIPT: &str = r#"#!/usr/bin/env bash
 #   x11-display.sh stop  <work-dir> <display-number> <port>
 #   x11-display.sh windows     <work-dir> <display-number> <port>
 #   x11-display.sh connections <work-dir> <display-number> <port>
+#   x11-display.sh issue       <work-dir> <display-number> <port> <private file>
 #
 # The server is started with an authority file, so a program that reaches it has really
 # presented the right cookie; the forwarding tests depend on that. Everything it owns
@@ -344,7 +410,18 @@ start)
     # anchored so this script's own command line cannot match it.
     pkill -f "^Xvfb :$NUMBER " 2>/dev/null || true
     chmod 1777 /tmp/.X11-unix 2>/dev/null || true
-    rm -f "$LOG" "$PIDFILE"
+    rm -f "$LOG" "$PIDFILE" "$AUTH"
+    # The entry this machine's own programs authenticate with, made the way an ordinary
+    # session makes it: `xauth add :NUMBER . cookie` normalises to the key `xauth` writes
+    # for a local display (the machine name and the display number, FamilyLocal), which
+    # is the same key a restricted session's untrusted entry would carry. Keeping that
+    # shape is the point: a mode that wrote into this file would replace this entry, and
+    # the test that reads it afterwards would see it.
+    cookie="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    if ! XAUTHORITY="$AUTH" xauth -q add ":$NUMBER" . "$cookie" 2>/dev/null; then
+        echo "the authority file for :$NUMBER could not be written" >&2
+        exit 1
+    fi
     # shellcheck disable=SC2086 # the extra words are a command line of their own
     setsid Xvfb ":$NUMBER" -screen 0 800x600x24 -listen tcp -auth "$AUTH" $EXTRA \
         </dev/null >"$LOG" 2>&1 &
@@ -378,6 +455,14 @@ connections)
     # Clients connected to this display right now.
     ss -Htn state established "sport = :$PORT" 2>/dev/null | wc -l
     ;;
+issue)
+    # One untrusted authorization for this display, written to the private file the
+    # caller names. This is what the restricted mode asks for, done here without the
+    # product so a test can find out whether this display server honours what it issues.
+    PRIVATE="${5:?the file the entry goes to is required}"
+    XAUTHORITY="$AUTH" xauth -f "$PRIVATE" generate "127.0.0.1:$NUMBER" \
+        MIT-MAGIC-COOKIE-1 untrusted
+    ;;
 *)
     echo "unknown action: $ACTION" >&2
     exit 2
@@ -396,9 +481,12 @@ impl Drop for DisplayServer {
 /// The restricted mode of the product looks for `xauth` the way a machine with the X
 /// tools installed provides it. On this host the display belongs to the Linux
 /// environment, so the stand-in hands the one command the product sends to that
-/// environment's real `/usr/bin/xauth`, with the authority file's path translated. The
-/// cookie it writes therefore comes from a real `xauth` and a real display, and the
-/// product reads it back from the file it named.
+/// environment's real `/usr/bin/xauth`, with both paths translated: the file `-f` names,
+/// where the issued entry is written, and the authority file `XAUTHORITY` names, which
+/// is the one the program authenticates to the display with. The two are different files
+/// on purpose, and this stand-in keeps them apart: it only ever writes the first, and it
+/// records what was written there so a test can read the entry the display issued even
+/// though the product removes its private file again.
 const XAUTH_SCRIPT: &str = r#"@echo off
 rem Runs the real xauth of the disposable display for one invocation (R11).
 setlocal enabledelayedexpansion
@@ -416,12 +504,26 @@ shift
 shift
 goto arguments
 :translate
-for /f "usebackq delims=" %%p in (`wsl.exe -d Debian -u root -- wslpath -u "!FILE!"`) do set "LINUX=%%p"
-rem The cookie has to be found where the program looks for it as well as where it is
-rem told to write: both are the one file this invocation was given.
-wsl.exe -d Debian -u root -- env XAUTHORITY="!LINUX!" /usr/bin/xauth -f "!LINUX!"!REST!
-exit /b !ERRORLEVEL!
+for /f "usebackq delims=" %%p in (`wsl.exe -d Debian -u root -- wslpath -u "!FILE!"`) do set "ISSUED=%%p"
+for /f "usebackq delims=" %%p in (`wsl.exe -d Debian -u root -- wslpath -u "%XAUTHORITY%"`) do set "TRUSTED=%%p"
+rem The entry goes where -f says; the display is reached with the machine's own authority.
+wsl.exe -d Debian -u root -- env XAUTHORITY="!TRUSTED!" /usr/bin/xauth -f "!ISSUED!"!REST!
+set "STATUS=!ERRORLEVEL!"
+rem The product removes its private file again, so the entry the display issued is copied
+rem out for the test that reads it, to the path the harness wrote into this file.
+if exist "!FILE!" copy /y "!FILE!" "@CAPTURE@" >nul 2>&1
+exit /b !STATUS!
 "#;
+
+/// Writes a batch file the way `cmd.exe` expects it.
+///
+/// A `.cmd` file with bare line feeds is read by `cmd.exe` one byte stream at a time, and
+/// a line that redirects output after a `for /f` loop is then not run at all - measured
+/// here, and the reason this helper exists instead of a plain write.
+fn write_batch(path: &Path, script: &str) {
+    let text = script.replace("\r\n", "\n").replace('\n', "\r\n");
+    std::fs::write(path, text).expect("the stand-in xauth is written");
+}
 
 /// Starts an OpenSSH server that has no usable `xauth` (R11).
 ///
@@ -463,26 +565,78 @@ fn display_taken(number: u32) -> bool {
     .is_ok()
 }
 
-/// A random cookie for the headless display.
-fn random_cookie() -> [u8; 16] {
-    uuid::Uuid::new_v4().into_bytes()
+/// One record of an authority file, read the way the product reads one (R11).
+///
+/// A test compares the key (family, address and display number) and the cookie of the
+/// entry this machine's own programs use with the entry a restricted session had the
+/// display issue, and checks that the first one is still exactly what it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityRecord {
+    /// The address family: 256 is FamilyLocal, which a local display is named by.
+    pub family: u16,
+    /// The address of the family: the machine's own name for FamilyLocal.
+    pub address: String,
+    /// The display number, without the screen.
+    pub number: String,
+    /// The authentication protocol, `MIT-MAGIC-COOKIE-1` for this product.
+    pub name: String,
+    /// The cookie, hex encoded, so two of them cannot be confused by eye.
+    pub cookie_hex: String,
 }
 
-/// An authority file whose single entry matches any client address.
-///
-/// A wildcard entry is what lets the test process - running on the Windows side and
-/// reaching the server over TCP through WSL's forwarding - authenticate with the one
-/// cookie the file holds.
-fn wildcard_authority(cookie: &[u8; 16]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&65535u16.to_be_bytes());
-    for field in [&b""[..], &b""[..], crate::x11::AUTH_NAME.as_bytes()] {
-        out.extend_from_slice(&u16::try_from(field.len()).unwrap_or(0).to_be_bytes());
-        out.extend_from_slice(field);
+impl AuthorityRecord {
+    /// The key two records share when one would replace the other.
+    ///
+    /// `xauth` replaces an entry whose family, address, number and protocol all match,
+    /// which is why a test compares these and not only the cookie.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.family, self.address, self.number, self.name
+        )
     }
-    out.extend_from_slice(&16u16.to_be_bytes());
-    out.extend_from_slice(cookie);
-    out
+}
+
+/// The first record of an authority file, in the shape the product reads.
+fn read_record(bytes: &[u8]) -> Option<AuthorityRecord> {
+    let entry = crate::x11::parse_authority(bytes).into_iter().next()?;
+    Some(AuthorityRecord {
+        family: entry.family,
+        address: String::from_utf8_lossy(&entry.address).into_owned(),
+        number: entry.number,
+        name: entry.name,
+        cookie_hex: entry
+            .data
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    })
+}
+
+/// The bytes of a hex string, as an authority file holds them.
+fn hex_bytes(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .filter_map(|at| u8::from_str_radix(text.get(at..at + 2)?, 16).ok())
+        .collect()
+}
+
+/// One client's `MIT-MAGIC-COOKIE-1` setup request, the way the bridge sends it.
+fn setup_request(cookie: &[u8]) -> Vec<u8> {
+    let name = crate::x11::AUTH_NAME.as_bytes();
+    let padding = |length: usize| (4 - length % 4) % 4;
+    let mut request = vec![b'l', 0];
+    request.extend_from_slice(&11u16.to_le_bytes());
+    request.extend_from_slice(&0u16.to_le_bytes());
+    request.extend_from_slice(&u16::try_from(name.len()).unwrap_or(0).to_le_bytes());
+    request.extend_from_slice(&u16::try_from(cookie.len()).unwrap_or(0).to_le_bytes());
+    request.extend_from_slice(&[0, 0]);
+    request.extend_from_slice(name);
+    request.extend(std::iter::repeat_n(0u8, padding(name.len())));
+    request.extend_from_slice(cookie);
+    request.extend(std::iter::repeat_n(0u8, padding(cookie.len())));
+    request
 }
 
 /// A running disposable OpenSSH server.

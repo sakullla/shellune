@@ -10,8 +10,17 @@
 //! The restricted mode is exercised with the same `xauth` command OpenSSH's client uses
 //! (`xauth generate <display> MIT-MAGIC-COOKIE-1 untrusted`), through a stand-in on
 //! `PATH` that runs the real `xauth` of the Linux environment the display belongs to.
-//! The trusted mode is exercised without any `xauth` at all, which is the difference
-//! between the two credentials.
+//! The entry it issues goes into a private file of the session, and what that test checks
+//! is the issuance, the key the entry is written under, and that the authority file of
+//! this machine is left byte for byte as it was. The trusted mode is exercised without
+//! any `xauth` at all, which is the difference between the two credentials.
+//!
+//! A display server that answers `xauth generate` and then refuses the authorization it
+//! issued cannot complete the restricted path: no remote program authenticates through
+//! it. Debian's Xvfb 21.1.16 is such a server (only what is in its own `-auth` file is
+//! accepted), so the restricted test asks the server first and prints that gap instead of
+//! claiming either way; the programs-reach-the-display check runs where the display does
+//! honour what it issues, and over the trusted credential here.
 //!
 //! The disposable server, the display server and the environment variables the product
 //! reads (`DISPLAY`, `XAUTHORITY`, `PATH`) belong to the whole process, so the tests of
@@ -286,7 +295,7 @@ fn wait_for_no_connections(display: &DisplayServer) -> usize {
 }
 
 #[test]
-fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_login() {
+fn remote_programs_reach_this_machines_display_over_one_authenticated_connection() {
     let _serial = gate();
     if skip("X11 forwarding to a local display", true) {
         return;
@@ -303,13 +312,11 @@ fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_logi
     // The log holds every run of this harness; the count that matters is the one this
     // session adds.
     let logins_before = accepted_logins(&server);
-    // The entry this machine's own programs authenticate with, read before the session
-    // adds anything to the file.
-    let own_cookie_hex = display.cookie_hex();
-    let own_cookie = hex_bytes(&own_cookie_hex);
+    // The entry this machine's own programs authenticate with, and the file it lives in.
+    let own = display.authority_record();
     let authority_before = std::fs::read(display.authority()).expect("the authority file");
 
-    let mut session = connect(&server, X11Forwarding::Restricted);
+    let mut session = connect(&server, X11Forwarding::Trusted);
     let started = wait_connected(&mut session);
     let status = wait_x11(&mut session, started.x11);
     assert!(
@@ -318,7 +325,7 @@ fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_logi
     );
 
     // The first remote program: its own connection to the display, through the
-    // session's X11 channel and the restricted credential this machine obtained.
+    // session's X11 channel and the credential of this machine.
     write(&mut session, "xdpyinfo 2>&1 | head -2");
     let output = wait_for_output(&mut session, "version number", &started.output);
     assert!(
@@ -349,7 +356,7 @@ fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_logi
     write(&mut session, "xauth list 2>/dev/null");
     let listed = wait_for_output(&mut session, "MIT-MAGIC-COOKIE-1", &output);
     assert!(
-        !listed.contains(&own_cookie_hex),
+        !listed.contains(&own.cookie_hex),
         "the remote authority file must not hold this machine's cookie"
     );
 
@@ -378,28 +385,156 @@ fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_logi
         0,
         "a closed session left no display connection behind"
     );
-    // The restricted mode asked the display for an untrusted cookie, as `ssh -X` does,
-    // and that entry is what the file now holds in addition. The entry this machine's
-    // own programs use is untouched, so their access to the display did not change.
-    let authority_after = std::fs::read(display.authority()).expect("the authority file");
-    assert_ne!(
-        authority_after, authority_before,
-        "the restricted mode must have obtained an untrusted entry from the display"
+    // A session that only reads the authority file leaves it exactly as it was.
+    assert_eq!(
+        std::fs::read(display.authority()).expect("the authority file"),
+        authority_before,
+        "a forwarded session must not write to this machine's authority file"
     );
-    assert!(
-        authority_after
-            .windows(own_cookie.len())
-            .any(|window| window == own_cookie),
-        "the display's own entry was left as it was"
-    );
+    assert_eq!(display.authority_record(), own);
 }
 
-/// The bytes of a hex string, as an authority file holds them.
-fn hex_bytes(text: &str) -> Vec<u8> {
-    (0..text.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("a hex byte"))
-        .collect()
+#[test]
+fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_authority_file() {
+    let _serial = gate();
+    if skip("restricted X11 forwarding to a local display", true) {
+        return;
+    }
+    let server =
+        Harness::start_with_x11("x11-restricted", Harness::free_port(), X11Server::Enabled)
+            .expect("the disposable server starts");
+    let display = DisplayServer::start("x11-restricted").expect("the display server starts");
+    let xauth = display.xauth_path();
+    // Whether this display server honours what it issues is a property of the server, so
+    // it is asked of the server before the product is involved.
+    let honoured = display.honours_issued_cookies();
+    let _env = DisplayEnv::set(
+        Some(&display.display()),
+        Some(&display.authority()),
+        Some(&xauth),
+    );
+    // The entry this machine's own programs authenticate with, read before the session
+    // touches anything. Its key is the ordinary one of a local display, which is also
+    // the key an untrusted entry is written under: a mode that wrote into this file
+    // would replace it, and that is what this test is looking for.
+    let own = display.authority_record();
+    let authority_before = std::fs::read(display.authority()).expect("the authority file");
+
+    let mut session = connect(&server, X11Forwarding::Restricted);
+    let started = wait_connected(&mut session);
+    let status = wait_x11(&mut session, started.x11);
+    assert!(
+        matches!(status, X11Status::Ready { .. }),
+        "a server that allows X11 and a display that answers must end as ready, got {status:?}"
+    );
+
+    // The credential the local display issued is never the one the server is told: the
+    // remote programs get this session's own cookie and the bridge translates it.
+    write(&mut session, "xauth list 2>/dev/null");
+    let listed = wait_for_output(&mut session, "MIT-MAGIC-COOKIE-1", &started.output);
+    assert!(
+        !listed.contains(&own.cookie_hex),
+        "the remote authority file must not hold this machine's cookie"
+    );
+
+    if honoured {
+        // The display accepts what it issues, so a remote program must reach it through
+        // the restricted credential.
+        write(&mut session, "xdpyinfo 2>&1 | head -2");
+        let output = wait_for_output(&mut session, "version number", &listed);
+        assert!(
+            output.contains("version number"),
+            "the remote program reached the display through the issued cookie: {output:?}"
+        );
+    } else {
+        eprintln!(
+            "GAP restricted X11 forwarding: this display server answers `xauth generate … \
+             untrusted` and then refuses the authorization it issued (measured on Debian's Xvfb \
+             21.1.16: the cookie works only once it is in the server's own -auth file), so no \
+             remote program can authenticate through the restricted mode on this server. What \
+             is checked here is the issuance, the key it is written under and the untouched \
+             authority file; a program reaching the display under the restricted mode is not \
+             claimed on this server."
+        );
+    }
+
+    session.close();
+    assert_eq!(
+        wait_for_no_connections(&display),
+        0,
+        "a closed session left no display connection behind"
+    );
+
+    // The restricted mode asked the display for an untrusted cookie, and that cookie is
+    // the credential it forwards with: a different one from this machine's own, written
+    // under the same key, which is why writing it to the authority file would have taken
+    // this machine's own entry away.
+    let issued = display
+        .issued_record()
+        .expect("the restricted mode asked the display for an untrusted cookie");
+    assert_eq!(
+        issued.key(),
+        own.key(),
+        "the issued entry is written under the key of the display's own entry, so it can only be kept apart in a file of its own"
+    );
+    assert_ne!(
+        issued.cookie_hex, own.cookie_hex,
+        "the restricted mode must forward with a cookie the display issued, not with this machine's own"
+    );
+
+    // And the file this machine's own programs use is byte for byte what it was: no entry
+    // was added, replaced or rewritten, so nothing about their access changed.
+    assert_eq!(
+        std::fs::read(display.authority()).expect("the authority file"),
+        authority_before,
+        "a restricted session must leave the authority file of this machine untouched"
+    );
+    assert_eq!(
+        display.authority_record(),
+        own,
+        "the display's own trusted entry is still there, unchanged"
+    );
+
+    // A trusted session on the same display afterwards presents the trusted cookie: it
+    // needs no xauth at all, and the file it reads that cookie from is still the file the
+    // restricted session did not touch.
+    {
+        let broken = display.broken_xauth_path();
+        let _env = DisplayEnv::set(
+            Some(&display.display()),
+            Some(&display.authority()),
+            Some(&broken),
+        );
+        let mut trusted = connect(&server, X11Forwarding::Trusted);
+        let started = wait_connected(&mut trusted);
+        let status = wait_x11(&mut trusted, started.x11);
+        assert!(
+            matches!(status, X11Status::Ready { .. }),
+            "the trusted mode after a restricted session needs no issued cookie, got {status:?}"
+        );
+        write(&mut trusted, "xdpyinfo 2>&1 | head -2");
+        let output = wait_for_output(&mut trusted, "version number", &started.output);
+        assert!(
+            output.contains("version number"),
+            "the trusted session reached the display with the trusted cookie: {output:?}"
+        );
+        trusted.close();
+        assert_eq!(
+            wait_for_no_connections(&display),
+            0,
+            "the trusted session's bridge was dropped"
+        );
+        assert_eq!(
+            std::fs::read(display.authority()).expect("the authority file"),
+            authority_before,
+            "a trusted session reads the authority file and writes nothing to it"
+        );
+        assert_eq!(
+            display.authority_record(),
+            own,
+            "the trusted session used the display's own entry, not one issued earlier"
+        );
+    }
 }
 
 #[test]

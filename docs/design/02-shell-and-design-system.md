@@ -262,11 +262,19 @@ X11 转发让服务器上的图形程序显示在这台电脑上。三个模式�
   保持原样）。回答前一个字节都不发：没有任何连接被拨出。风险文字说明它会去掉 X11 SECURITY 扩展，服务器上的
   程序因此可能读取同一显示上其它窗口的按键输入。
 - **两种模式用的凭据不同，而且都是真的不同**（`Prepared::credential`）：
-  - 受限模式先向本机显示申请一个**不受信任**的 cookie，用的就是 `ssh -X` 的那条命令
-    （`xauth -f <authority> generate <display> MIT-MAGIC-COOKIE-1 untrusted`，`xauth` 按 `PATH` 查找）。
+  - 受限模式先向本机显示申请一个**不受信任**的 cookie，用的就是 `ssh -X` 的那条命令：
+    `xauth -f <本会话的私有文件> generate <display> MIT-MAGIC-COOKIE-1 untrusted`（`xauth` 按 `PATH` 查找）。
+    `-f` 指向本会话自己的私有目录（权限 0700）里的一个文件，`XAUTHORITY` 仍然是这台电脑自己的 authority
+    文件——`xauth` 用它去和显示服务认证，只把新条目写进私有文件；读回那个 cookie 后私有文件立刻删除。
+    这与 OpenSSH 的 `client_x11_get_proto` 一致，而且必须一致：`xauth generate` 会**替换**同一个
+    (family, address, display, protocol) 键的条目，而显示自己的条目正好是这个键，条目写进 authority 文件就会把
+    用户自己程序的受信 cookie 换成 untrusted 的。所以这台电脑的 authority 文件**只被读取、从不写入**，会话结束后
+    逐字节不变，权限模式与信任模式的凭据也各自独立。
     X 服务器因此把经这条授权连上来的远程程序当作不受信任的客户端，SECURITY 扩展才有东西可限制。
-    生成的条目和 OpenSSH 一样写在这台电脑的 authority 文件里——显示服务只承认它自己那边有记录的授权；
-    文件里原有的条目（用户自己程序的授权）原封不动。
+  - 有一类显示服务会登记 SECURITY 扩展、对 `xauth generate` 返回授权 id，却不接受它自己签发的这条授权
+    （例如 Debian 的 Xvfb 21.1.16：只有写进它自己的 `-auth` 文件里的条目才会被接受）。在这种显示服务上受限模式
+    能申请到 cookie，但远程程序连本机显示会被拒（终端里是 X 服务器的 `Invalid MIT-MAGIC-COOKIE-1 key`）；
+    产品既不退回受信 cookie，也不去改写用户文件。这是显示服务的能力缺口，交付证据里如实记录，不算受限模式通过。
   - 信任模式直接用 `XAUTHORITY` 里这个显示自己的 cookie，不申请、也不改写任何东西，所以它不需要 `xauth`。
   - 受限模式拿不到不受信任的 cookie 时（本机没有 `xauth`、`xauth` 失败或超时、显示服务不支持 SECURITY 扩展）
     给出**独立失败原因**（`X11Failure::NoUntrustedCookie`）与下一步（装 `xauth`／换支持 SECURITY 的显示服务／

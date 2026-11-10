@@ -12,7 +12,9 @@
 //! * the credential this bridge presents to the local display is the one the mode
 //!   promises. [`X11Forwarding::Restricted`] has a cookie the display itself issued as
 //!   *untrusted* (the same thing `xauth generate … untrusted` does for `ssh -X`), so
-//!   the X11 SECURITY extension is what limits a remote program;
+//!   the X11 SECURITY extension is what limits a remote program; that cookie is read
+//!   from a private file of this session and the authority file of this machine is
+//!   never written to;
 //!   [`X11Forwarding::Trusted`] presents the display's own cookie and therefore lifts
 //!   those limits, which is why the connection form asks again before each attempt;
 //! * every inbound `x11` channel is bridged to the local display separately, so a
@@ -313,8 +315,11 @@ pub(crate) struct Prepared {
     target: DisplayTarget,
     screen: u32,
     display: String,
-    /// The authority file this machine's own cookie was read from, which is also the
-    /// entry a restricted session needs to be able to reach the display once.
+    /// The authority file this machine's own cookie was read from.
+    ///
+    /// A restricted session also hands it to the program that asks the display for an
+    /// untrusted cookie, which needs it to reach the display once. It is only ever read
+    /// from, both here and there: the entry the display issues goes into a private file.
     authority: PathBuf,
     /// The cookie this bridge presents to the local display.
     ///
@@ -544,12 +549,15 @@ fn local_target(number: u32) -> Result<DisplayTarget, X11Failure> {
 // ---------------------------------------------------------------------------
 
 /// One record of an X authority file.
-struct AuthorityEntry {
-    family: u16,
-    address: Vec<u8>,
-    number: String,
-    name: String,
-    data: Vec<u8>,
+///
+/// Visible in this crate so the end-to-end harness reads an authority file the same way
+/// the product does, instead of a second parser that could drift from this one.
+pub(crate) struct AuthorityEntry {
+    pub(crate) family: u16,
+    pub(crate) address: Vec<u8>,
+    pub(crate) number: String,
+    pub(crate) name: String,
+    pub(crate) data: Vec<u8>,
 }
 
 /// Reads the cookie for a display out of the authority file it came from.
@@ -661,7 +669,7 @@ fn is_loopback(address: &str) -> bool {
 ///
 /// A record whose length fields run past the end of the file is ignored with the rest
 /// of the file: a truncated write must not produce a cookie that belongs to nothing.
-fn parse_authority(bytes: &[u8]) -> Vec<AuthorityEntry> {
+pub(crate) fn parse_authority(bytes: &[u8]) -> Vec<AuthorityEntry> {
     let mut entries = Vec::new();
     let mut rest = bytes;
     while let Some((entry, used)) = read_entry(rest) {
@@ -751,10 +759,14 @@ fn issue_untrusted_cookie(display: &str, authority: &Path) -> Result<Vec<u8>, X1
 /// `None` means this machine has no program that could issue the cookie, which is a
 /// reason of its own: the restricted mode cannot be honoured by guessing.
 ///
-/// The entry is written into the authority file itself, exactly as `ssh -X` does: an
-/// authorization the display was never told about is one it will not accept, and the
-/// file is where the requesting client and the display agree on it. The entries that
-/// were already there belong to this machine's own programs and are left as they are.
+/// The entry is written into a private file of this session, which is what OpenSSH's
+/// client does for `ssh -X` (`client_x11_get_proto` makes a temporary directory, writes
+/// the issued entry there, reads it back and removes it). The authority file of this
+/// machine is named in `XAUTHORITY` so the program can reach the display, and is never
+/// written to: `xauth generate` replaces the entry whose key matches the display, and
+/// that entry is this machine's own credential. Both files carry the same key for a
+/// local display, so writing in place would take the trusted cookie of the display away
+/// from every other program that uses the same file.
 fn issue_with(
     program: Option<&Path>,
     display: &str,
@@ -768,29 +780,101 @@ fn issue_with(
             ),
         });
     };
-    let before = parse_authority(&read_authority(authority)?);
-    run_generate(program, authority, display)?;
-    let after = parse_authority(&read_authority(authority)?);
-    let added = new_records(&before, &after);
-    match added.as_slice() {
-        [only] => Ok(only.data.clone()),
-        [] => Err(X11Failure::NoUntrustedCookie {
+    let issued = IssuedFile::create()?;
+    run_generate(program, issued.path(), display, authority)?;
+    let entries = parse_authority(&read_authority(issued.path())?);
+    match the_one_cookie(&entries) {
+        Issued::One(cookie) => Ok(cookie),
+        Issued::None => Err(X11Failure::NoUntrustedCookie {
             detail: format!(
-                "{} exited successfully but added no entry for {display} to {}",
-                program.display(),
-                authority.display()
+                "{} exited successfully but wrote no {AUTH_NAME} entry for {display}",
+                program.display()
             ),
         }),
-        // Two entries would mean two programs wrote to this file at the same time, and
-        // the trusted one of them is not a credential this mode may forward with. Saying
-        // so is the only safe answer.
-        many => Err(X11Failure::NoUntrustedCookie {
+        // Two entries in a file this session alone writes means the display answered
+        // twice or the program did something unexpected. Which of them belongs to this
+        // session cannot be told, and guessing is not worth a credential.
+        Issued::Many(count) => Err(X11Failure::NoUntrustedCookie {
             detail: format!(
-                "{} added {} entries for {display}, so which of them belongs to this session cannot be told",
-                program.display(),
-                many.len()
+                "{} wrote {count} {AUTH_NAME} entries for {display}, so which of them belongs to this session cannot be told",
+                program.display()
             ),
         }),
+    }
+}
+
+/// What the file the program was given holds.
+enum Issued {
+    /// Exactly one cookie: the one the display issued for this session.
+    One(Vec<u8>),
+    /// Nothing that could be presented.
+    None,
+    /// More than one cookie, which the session must refuse rather than guess between.
+    Many(usize),
+}
+
+/// The one `MIT-MAGIC-COOKIE-1` cookie of the file the program wrote.
+///
+/// The file belongs to this session alone, so anything but one entry is an answer this
+/// bridge cannot use: a session without a credential, or one that cannot tell which
+/// entry is its own.
+fn the_one_cookie(entries: &[AuthorityEntry]) -> Issued {
+    let mut cookies = entries
+        .iter()
+        .filter(|entry| entry.name == AUTH_NAME)
+        .map(|entry| entry.data.clone());
+    match (cookies.next(), cookies.next()) {
+        (None, _) => Issued::None,
+        (Some(only), None) => Issued::One(only),
+        (Some(_), Some(_)) => Issued::Many(2 + cookies.count()),
+    }
+}
+
+/// The private file a restricted session's cookie is written to.
+///
+/// A directory of this session only, made as private as the platform allows
+/// (`0700` where there are permission bits), holding one file. It is removed when the
+/// session stops asking, whatever the answer was: what the display issued is a
+/// credential, and a file left behind would be one more copy of it. Nothing of this
+/// machine's own authority file is copied here.
+struct IssuedFile {
+    directory: PathBuf,
+    file: PathBuf,
+}
+
+impl IssuedFile {
+    /// Creates an empty private directory for one cookie.
+    fn create() -> Result<Self, X11Failure> {
+        let directory = std::env::temp_dir().join(format!("shellune-x11-{}", uuid::Uuid::new_v4()));
+        #[allow(unused_mut)]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&directory)
+            .map_err(|error| X11Failure::NoUntrustedCookie {
+                detail: format!(
+                    "a private directory for the restricted cookie could not be made in {}: {error}",
+                    std::env::temp_dir().display()
+                ),
+            })?;
+        let file = directory.join("xauthfile");
+        Ok(Self { directory, file })
+    }
+
+    /// The file the program writes the entry to.
+    fn path(&self) -> &Path {
+        &self.file
+    }
+}
+
+impl Drop for IssuedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.file);
+        let _ = std::fs::remove_dir(&self.directory);
     }
 }
 
@@ -808,7 +892,17 @@ fn read_authority(authority: &Path) -> Result<Vec<u8>, X11Failure> {
 /// makes the X server's SECURITY extension restrict what a client of that cookie may
 /// do. A program that fails, or that does not answer, is a failure to report and never
 /// a reason to forward with the trusted cookie instead.
-fn run_generate(program: &Path, file: &Path, display: &str) -> Result<(), X11Failure> {
+///
+/// `-f` is where the entry is written; `XAUTHORITY` stays on this machine's own
+/// authority file, which is the one the program reads to authenticate to the display.
+/// The two are deliberately different files: `xauth` writes - and on a local display
+/// replaces - the entry named there, and that entry is not this session's to take.
+fn run_generate(
+    program: &Path,
+    file: &Path,
+    display: &str,
+    authority: &Path,
+) -> Result<(), X11Failure> {
     let mut child = Command::new(program)
         .arg("-f")
         .arg(file)
@@ -816,9 +910,9 @@ fn run_generate(program: &Path, file: &Path, display: &str) -> Result<(), X11Fai
         .arg(display)
         .arg(AUTH_NAME)
         .arg("untrusted")
-        // The file the program was given is the one it must read and write; naming it
-        // in the environment as well keeps the two from disagreeing.
-        .env("XAUTHORITY", file)
+        // The file the program has to reach the display with, named in the environment
+        // as well: `-f` only says where the answer goes.
+        .env("XAUTHORITY", authority)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -881,31 +975,6 @@ fn run_generate(program: &Path, file: &Path, display: &str) -> Result<(), X11Fai
             )
         },
     })
-}
-
-/// The records the display added to the authority file, in file order.
-///
-/// The file is compared before and after rather than read for the "best" entry: the
-/// entry the program adds is the untrusted one, and an entry that was already there
-/// belongs to something else.
-fn new_records<'a>(
-    before: &[AuthorityEntry],
-    after: &'a [AuthorityEntry],
-) -> Vec<&'a AuthorityEntry> {
-    after
-        .iter()
-        .filter(|candidate| {
-            candidate.name == AUTH_NAME && !before.iter().any(|entry| same_record(entry, candidate))
-        })
-        .collect()
-}
-
-fn same_record(left: &AuthorityEntry, right: &AuthorityEntry) -> bool {
-    left.family == right.family
-        && left.address == right.address
-        && left.number == right.number
-        && left.name == right.name
-        && left.data == right.data
 }
 
 // ---------------------------------------------------------------------------
@@ -1819,45 +1888,88 @@ mod tests {
     }
 
     #[test]
-    fn an_untrusted_cookie_is_taken_from_the_record_the_display_added() {
-        let trusted = entry(65535, "", "", AUTH_NAME, &[1u8; 16]);
-        let first = [2u8; 16];
-        let second = [3u8; 16];
-        let mut with_first = trusted.clone();
-        with_first.extend_from_slice(&entry(256, "testhost", "99", AUTH_NAME, &first));
-        let mut with_second = trusted.clone();
-        with_second.extend_from_slice(&entry(256, "testhost", "99", AUTH_NAME, &second));
+    fn an_untrusted_cookie_is_the_one_entry_of_this_sessions_own_file() {
+        // What the display writes for `generate <display> untrusted`: one entry, keyed
+        // the same way this machine's own entry for that display is keyed.
+        let mut issued = entry(256, "testhost", "99", AUTH_NAME, &[2u8; 16]);
+        let entries = parse_authority(&issued);
+        assert!(
+            matches!(&the_one_cookie(&entries), Issued::One(cookie) if cookie == &vec![2u8; 16]),
+            "the one entry is the credential of the session"
+        );
 
-        let before = parse_authority(&trusted);
-        let after = parse_authority(&with_first);
-        assert_eq!(
-            new_records(&before, &after)
-                .iter()
-                .map(|entry| entry.data.clone())
-                .collect::<Vec<_>>(),
-            vec![first.to_vec()],
-            "the entry that was not there before is the one the display added"
+        // A program that exits without writing anything leaves nothing to present.
+        assert!(matches!(the_one_cookie(&[]), Issued::None));
+        // A file holding another protocol only is the same: this bridge speaks one.
+        assert!(matches!(
+            the_one_cookie(&parse_authority(&entry(
+                256,
+                "testhost",
+                "99",
+                "XDM-AUTHORIZATION-1",
+                &[7u8; 24]
+            ))),
+            Issued::None
+        ));
+
+        // Two entries cannot be told apart, and the session refuses to guess which one
+        // the display issued for it.
+        issued.extend_from_slice(&entry(256, "otherhost", "99", AUTH_NAME, &[4u8; 16]));
+        let entries = parse_authority(&issued);
+        assert!(
+            matches!(the_one_cookie(&entries), Issued::Many(2)),
+            "an ambiguous answer is visible as two entries"
         );
-        // A program that exits without writing anything adds no entry.
-        assert!(new_records(&before, &before).is_empty());
-        // The second request for one display replaces the first entry, which makes the
-        // replacement the record this session uses.
-        assert_eq!(
-            new_records(&after, &parse_authority(&with_second))
-                .iter()
-                .map(|entry| entry.data.clone())
-                .collect::<Vec<_>>(),
-            vec![second.to_vec()]
+    }
+
+    #[test]
+    fn the_issued_cookie_lives_in_a_private_file_that_is_removed_again() {
+        let issued = IssuedFile::create().expect("a private directory");
+        let path = issued.path().to_path_buf();
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "the file lives where temporary files live: {}",
+            path.display()
         );
-        // Two additions at once cannot be told apart, and the caller refuses rather than
-        // guessing which of them is the restricted one.
-        let mut with_both = with_first.clone();
-        with_both.extend_from_slice(&entry(256, "otherhost", "99", AUTH_NAME, &[4u8; 16]));
-        assert_eq!(
-            new_records(&before, &parse_authority(&with_both)).len(),
-            2,
-            "an ambiguous answer is visible as two records"
+        assert!(!path.exists(), "nothing is in it before the program ran");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path.parent().expect("a directory"))
+                .expect("the directory")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "only this user may read the cookie");
+        }
+        std::fs::write(&path, entry(256, "testhost", "99", AUTH_NAME, &[2u8; 16]))
+            .expect("what the display issued");
+        drop(issued);
+        assert!(
+            !path.exists(),
+            "the cookie is removed with the file that held it"
         );
+        assert!(
+            !path.parent().expect("a directory").exists(),
+            "the private directory goes with it"
+        );
+    }
+
+    #[test]
+    fn a_program_that_cannot_be_run_leaves_the_authority_file_alone() {
+        let authority = Authority::holding(&[0xABu8; 16]);
+        let missing = authority.dir.join("no-such-xauth");
+        let failure = issue_with(Some(&missing), "127.0.0.1:99", &authority.path)
+            .expect_err("a program that cannot be run issues no cookie");
+        match &failure {
+            X11Failure::NoUntrustedCookie { detail } => {
+                assert!(detail.contains("no-such-xauth"), "{detail}");
+            }
+            other => panic!("the failure must name the program, got {other:?}"),
+        }
+        // The one file this machine's own programs authenticate with is untouched: the
+        // restricted mode never writes to it, so a failed attempt cannot damage it.
+        let bytes = std::fs::read(&authority.path).expect("the authority file");
+        assert_eq!(bytes, entry(65535, "", "", AUTH_NAME, &[0xABu8; 16]));
     }
 
     #[test]
