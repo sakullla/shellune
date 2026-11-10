@@ -80,6 +80,14 @@ pub struct DisplayServer {
     running: bool,
     /// Extra command-line words for Xvfb, such as taking an extension away.
     extra: String,
+    /// A display this machine already runs. Nothing here starts or stops it.
+    existing: Option<ExistingDisplay>,
+}
+
+/// A display the machine was already running when the test started.
+struct ExistingDisplay {
+    name: String,
+    authority: PathBuf,
 }
 
 impl DisplayServer {
@@ -121,6 +129,7 @@ impl DisplayServer {
                 dir: dir.clone(),
                 running: false,
                 extra: extra.join(" "),
+                existing: None,
             };
             match display.launch() {
                 Ok(()) => return Ok(display),
@@ -132,6 +141,108 @@ impl DisplayServer {
         } else {
             last
         })
+    }
+
+    /// Uses a display this machine already runs when `SHELLUNE_X11_DISPLAY` names one.
+    ///
+    /// The harness's own Xvfb answers `xauth generate` and then refuses the cookie it
+    /// issued, so the restricted path cannot be completed against it. Naming the real
+    /// display (and `SHELLUNE_X11_AUTHORITY`, when the file is not the usual one) runs
+    /// that path there. The display is only read: this value does not start or stop it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason that display could not be used, or the reason a fresh Xvfb
+    /// could not be started when no display was named.
+    pub fn forwarding_display(name: &str) -> Result<Self, String> {
+        match std::env::var("SHELLUNE_X11_DISPLAY") {
+            Ok(display) if !display.trim().is_empty() => Self::attach(name, display.trim()),
+            _ => Self::start(name),
+        }
+    }
+
+    /// Attaches to a display that is already running.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the display could not be read, including a name that is not a
+    /// display and a server that does not answer with the authority file.
+    pub fn attach(name: &str, display: &str) -> Result<Self, String> {
+        let number = display_number(display)?;
+        let authority = authority_path_from_env()?;
+        if !authority.is_file() {
+            return Err(format!(
+                "{} is not an authority file for {display}",
+                authority.display()
+            ));
+        }
+        let dir = harness_root().join(name).join("x11");
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let server = Self {
+            number,
+            dir,
+            running: false,
+            extra: String::new(),
+            existing: Some(ExistingDisplay {
+                name: display.to_owned(),
+                authority,
+            }),
+        };
+        let probe = in_linux([
+            "env",
+            &format!("DISPLAY={}", server.display()),
+            &format!("XAUTHORITY={}", linux_path(&server.authority())),
+            "xdpyinfo",
+        ])
+        .output()
+        .map_err(|error| format!("xdpyinfo could not be run: {error}"))?;
+        if !probe.status.success() {
+            return Err(format!(
+                "display {display} did not answer: {}{}",
+                String::from_utf8_lossy(&probe.stdout),
+                String::from_utf8_lossy(&probe.stderr)
+            ));
+        }
+        Ok(server)
+    }
+
+    /// A line `xdpyinfo` prints for this display, so a remote program can be checked
+    /// against this server and not merely against some display.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the display could not be asked, or that it named no version.
+    pub fn server_version_line(&self) -> Result<String, String> {
+        let output = in_linux([
+            "env",
+            &format!("DISPLAY={}", self.display()),
+            &format!("XAUTHORITY={}", linux_path(&self.authority())),
+            "xdpyinfo",
+        ])
+        .output()
+        .map_err(|error| format!("xdpyinfo could not be run: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "xdpyinfo failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines()
+            .find(|line| line.contains("X.Org version"))
+            .map(|line| line.trim().to_owned())
+            .ok_or_else(|| format!("xdpyinfo named no X.Org version: {text}"))
+    }
+
+    /// Whether clients that were already on this display have to be left alone.
+    ///
+    /// A display the harness started has none. A display the machine was already
+    /// running still has its own, and a closed session is finished when the count is
+    /// back to that, not when the display has no client at all.
+    #[must_use]
+    pub fn keeps_other_clients(&self) -> bool {
+        self.existing.is_some()
     }
 
     /// A directory to put in front of `PATH`, holding a stand-in `xauth`.
@@ -152,9 +263,17 @@ impl DisplayServer {
         // the working directory of whoever started the batch file and not the directory
         // of the script, so it cannot be used to find a place next to the script.
         let capture = directory.join("last-issued");
+        #[cfg(windows)]
         write_batch(
             &directory.join("xauth.cmd"),
             &XAUTH_SCRIPT.replace("@CAPTURE@", &capture.display().to_string()),
+        );
+        // On Linux the product finds a program named `xauth`. The stand-in runs the real
+        // one and keeps the entry it wrote, because the product removes that file again.
+        #[cfg(not(windows))]
+        write_executable(
+            &directory.join("xauth"),
+            &UNIX_XAUTH_SCRIPT.replace("@CAPTURE@", &capture.display().to_string()),
         );
         directory
     }
@@ -168,35 +287,44 @@ impl DisplayServer {
     pub fn broken_xauth_path(&self) -> PathBuf {
         let directory = self.dir.join("xauth-broken");
         std::fs::create_dir_all(&directory).expect("a directory for the failing xauth");
+        #[cfg(windows)]
         write_batch(
             &directory.join("xauth.cmd"),
             "@echo off\necho xauth: the display cannot issue an untrusted cookie 1>&2\nexit /b 1\n",
+        );
+        #[cfg(not(windows))]
+        write_executable(
+            &directory.join("xauth"),
+            "#!/bin/sh\necho 'xauth: the display cannot issue an untrusted cookie' 1>&2\nexit 1\n",
         );
         directory
     }
 
     /// Whether this machine can run a headless X server at all.
     pub fn is_available() -> bool {
-        Harness::is_available()
-            && Command::new("wsl.exe")
-                .args([
-                    "-d",
-                    "Debian",
-                    "-u",
-                    "root",
-                    "--",
-                    "test",
-                    "-x",
-                    "/usr/bin/Xvfb",
-                ])
+        if !Harness::is_available() {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            return in_linux(["test", "-x", "/usr/bin/Xvfb"])
                 .status()
                 .map(|status| status.success())
-                .unwrap_or(false)
+                .unwrap_or(false);
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::var_os("SHELLUNE_X11_DISPLAY").is_some()
+                || Path::new("/usr/bin/Xvfb").is_file()
+        }
     }
 
     /// The display as this machine names it, which is what the product reads.
     #[must_use]
     pub fn display(&self) -> String {
+        if let Some(existing) = &self.existing {
+            return existing.name.clone();
+        }
         format!("127.0.0.1:{}", self.number)
     }
 
@@ -209,6 +337,9 @@ impl DisplayServer {
     /// The authority file holding this display's cookie.
     #[must_use]
     pub fn authority(&self) -> PathBuf {
+        if let Some(existing) = &self.existing {
+            return existing.authority.clone();
+        }
         self.dir.join(format!("Xauthority.{}", self.number))
     }
 
@@ -219,8 +350,34 @@ impl DisplayServer {
     /// be caught here.
     #[must_use]
     pub fn authority_record(&self) -> AuthorityRecord {
-        read_record(&std::fs::read(self.authority()).unwrap_or_default())
-            .unwrap_or_else(|| panic!("{} holds no authority entry", self.authority().display()))
+        let bytes = std::fs::read(self.authority()).unwrap_or_default();
+        let entries = crate::x11::parse_authority(&bytes);
+        let number = self.number.to_string();
+        // The entry `xauth generate` writes for this display is the local one, under the
+        // same key as the cookie this machine's own programs use. A file can also hold an
+        // internet entry for the same number; that one is not the key a local display
+        // replaces, so it is not the record a test compares.
+        let entry = entries
+            .iter()
+            .filter(|entry| entry.name == crate::x11::AUTH_NAME && entry.number == number)
+            .max_by_key(|entry| u8::from(entry.family == 256))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.name == crate::x11::AUTH_NAME)
+            })
+            .unwrap_or_else(|| panic!("{} holds no authority entry", self.authority().display()));
+        AuthorityRecord {
+            family: entry.family,
+            address: String::from_utf8_lossy(&entry.address).into_owned(),
+            number: entry.number.clone(),
+            name: entry.name.clone(),
+            cookie_hex: entry
+                .data
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        }
     }
 
     /// The entry the display issued for the last restricted session, if it issued one.
@@ -249,6 +406,9 @@ impl DisplayServer {
     ///
     /// Returns the reason the server could not be asked.
     pub fn window_count(&self) -> Result<usize, String> {
+        if self.existing.is_some() {
+            return count_windows(self);
+        }
         let out = self.run("windows")?;
         Ok(out.trim().parse::<usize>().unwrap_or(0))
     }
@@ -262,13 +422,17 @@ impl DisplayServer {
     ///
     /// Returns the reason the server could not be asked.
     pub fn connections(&self) -> Result<usize, String> {
+        if self.existing.is_some() {
+            return unix_clients(self.number);
+        }
         let out = self.run("connections")?;
         Ok(out.trim().parse::<usize>().unwrap_or(0))
     }
 
     /// Stops the server and leaves nothing listening.
     pub fn stop(&mut self) {
-        if !self.running {
+        if self.existing.is_some() || !self.running {
+            self.running = false;
             return;
         }
         self.running = false;
@@ -287,16 +451,19 @@ impl DisplayServer {
     /// The same, with the fifth argument the action needs.
     fn run_with(&self, action: &str, extra: &str) -> Result<String, String> {
         let script = self.dir.join("x11-display.sh");
-        let output = Command::new("wsl.exe")
-            .args(["-d", "Debian", "-u", "root", "--", "bash"])
-            .arg(wsl_path(&script))
-            .arg(action)
-            .arg(wsl_path(&self.dir))
-            .arg(self.number.to_string())
-            .arg(self.port().to_string())
-            .arg(extra)
-            .output()
-            .map_err(|error| format!("wsl.exe could not be run: {error}"))?;
+        let number = self.number.to_string();
+        let port = self.port().to_string();
+        let output = in_linux([
+            "bash",
+            &linux_path(&script),
+            action,
+            &linux_path(&self.dir),
+            &number,
+            &port,
+            extra,
+        ])
+        .output()
+        .map_err(|error| format!("the display server could not be run: {error}"))?;
         if !output.status.success() {
             return Err(format!(
                 "the display server's {action} failed: {}{}",
@@ -322,7 +489,10 @@ impl DisplayServer {
     pub fn honours_issued_cookies(&self) -> bool {
         let private = self.dir.join(format!("issued-{}.private", self.number));
         let _ = std::fs::remove_file(&private);
-        if self.run_with("issue", &wsl_path(&private)).is_err() {
+        if self.existing.is_some() {
+            return self.issued_cookie_reaches_display();
+        }
+        if self.run_with("issue", &linux_path(&private)).is_err() {
             return false;
         }
         let Some(cookie) = std::fs::read(&private)
@@ -346,6 +516,43 @@ impl DisplayServer {
             Ok(()) => answer[0] == 1,
             Err(_) => false,
         }
+    }
+
+    /// Whether an untrusted cookie this display issues is accepted back by it.
+    ///
+    /// The check is the same one a person runs by hand: `xauth generate … untrusted`
+    /// into a private file, then `xdpyinfo` with only that file. A TCP probe would miss
+    /// a server that listens on its unix socket and not on port 6000+N.
+    fn issued_cookie_reaches_display(&self) -> bool {
+        let private = self.dir.join(format!("issued-{}.private", self.number));
+        let _ = std::fs::remove_file(&private);
+        let private_text = linux_path(&private);
+        let display = self.display();
+        let authority = linux_path(&self.authority());
+        let generated = in_linux([
+            "env",
+            &format!("XAUTHORITY={authority}"),
+            "xauth",
+            "-f",
+            &private_text,
+            "generate",
+            &display,
+            "MIT-MAGIC-COOKIE-1",
+            "untrusted",
+        ])
+        .status();
+        if !generated.map(|status| status.success()).unwrap_or(false) {
+            return false;
+        }
+        in_linux([
+            "env",
+            &format!("XAUTHORITY={private_text}"),
+            &format!("DISPLAY={display}"),
+            "xdpyinfo",
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
     }
 
     fn launch(&mut self) -> Result<(), String> {
@@ -487,6 +694,7 @@ impl Drop for DisplayServer {
 /// on purpose, and this stand-in keeps them apart: it only ever writes the first, and it
 /// records what was written there so a test can read the entry the display issued even
 /// though the product removes its private file again.
+#[cfg(windows)]
 const XAUTH_SCRIPT: &str = r#"@echo off
 rem Runs the real xauth of the disposable display for one invocation (R11).
 setlocal enabledelayedexpansion
@@ -515,14 +723,49 @@ if exist "!FILE!" copy /y "!FILE!" "@CAPTURE@" >nul 2>&1
 exit /b !STATUS!
 "#;
 
+/// The stand-in `xauth` on Linux, where the product and the display are the same machine.
+///
+/// It runs the real `xauth` unchanged and copies the file `-f` names. The product removes
+/// that file, and the copy is what the test reads back as the entry the display issued.
+#[cfg(not(windows))]
+const UNIX_XAUTH_SCRIPT: &str = r#"#!/bin/sh
+file=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "-f" ]; then
+        file="$arg"
+    fi
+    prev="$arg"
+done
+/usr/bin/xauth "$@"
+status=$?
+if [ -n "$file" ] && [ -f "$file" ]; then
+    cp -f "$file" "@CAPTURE@"
+fi
+exit $status
+"#;
+
 /// Writes a batch file the way `cmd.exe` expects it.
 ///
 /// A `.cmd` file with bare line feeds is read by `cmd.exe` one byte stream at a time, and
 /// a line that redirects output after a `for /f` loop is then not run at all - measured
 /// here, and the reason this helper exists instead of a plain write.
+#[cfg(windows)]
 fn write_batch(path: &Path, script: &str) {
     let text = script.replace("\r\n", "\n").replace('\n', "\r\n");
     std::fs::write(path, text).expect("the stand-in xauth is written");
+}
+
+/// Writes an executable script, which is how Linux finds the stand-in on `PATH`.
+#[cfg(not(windows))]
+fn write_executable(path: &Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, script).expect("the stand-in xauth is written");
+    let mut permissions = std::fs::metadata(path)
+        .expect("the stand-in xauth was written")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("the stand-in xauth is executable");
 }
 
 /// Starts an OpenSSH server that has no usable `xauth` (R11).
@@ -555,6 +798,11 @@ mount --bind "$SHELLUNE_XAUTH_MASK" /usr/bin/xauth
 
 /// Whether a display number is already served on this machine.
 fn display_taken(number: u32) -> bool {
+    // A server that only has its unix socket, which is the usual Xorg, is taken even
+    // though nothing is listening on 6000+N.
+    if Path::new(&format!("/tmp/.X11-unix/X{number}")).exists() {
+        return true;
+    }
     let Ok(number) = u16::try_from(number) else {
         return true;
     };
@@ -563,6 +811,80 @@ fn display_taken(number: u32) -> bool {
         std::time::Duration::from_millis(250),
     )
     .is_ok()
+}
+
+/// The display number in `:1` or `:1.0`.
+fn display_number(display: &str) -> Result<u32, String> {
+    let Some((_, rest)) = display.rsplit_once(':') else {
+        return Err(format!("{display} is not an X display name"));
+    };
+    let number = rest
+        .split_once('.')
+        .map(|(number, _)| number)
+        .unwrap_or(rest);
+    number
+        .parse()
+        .map_err(|_| format!("{display} does not name a display number"))
+}
+
+/// The authority file a named display should be read with.
+fn authority_path_from_env() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("SHELLUNE_X11_AUTHORITY") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("XAUTHORITY") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        "SHELLUNE_X11_AUTHORITY, XAUTHORITY and HOME are unset, so no authority file can be found"
+            .to_owned()
+    })?;
+    Ok(PathBuf::from(home).join(".Xauthority"))
+}
+
+/// Clients connected to a display's unix socket, filesystem or abstract.
+fn unix_clients(number: u32) -> Result<usize, String> {
+    let mut total = 0usize;
+    for name in [
+        format!("@/tmp/.X11-unix/X{number}"),
+        format!("/tmp/.X11-unix/X{number}"),
+    ] {
+        let output = in_linux(["ss", "-H", "-x", "src", &name])
+            .output()
+            .map_err(|error| format!("ss could not be run: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ss failed for {name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        total += text.lines().filter(|line| line.contains("ESTAB")).count();
+    }
+    Ok(total)
+}
+
+/// Top-level windows of a display the harness did not start.
+fn count_windows(display: &DisplayServer) -> Result<usize, String> {
+    let output = in_linux([
+        "env",
+        &format!("DISPLAY={}", display.display()),
+        &format!("XAUTHORITY={}", linux_path(&display.authority())),
+        "xwininfo",
+        "-root",
+        "-children",
+    ])
+    .output()
+    .map_err(|error| format!("xwininfo could not be run: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "xwininfo failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.lines().filter(|line| line.contains("0x")).count())
 }
 
 /// One record of an authority file, read the way the product reads one (R11).
@@ -755,7 +1077,7 @@ impl Harness {
 SHELLUNE_EOF
 chmod 755 '{file}'
 runuser -u '{user}' -- bash '{file}'",
-            file = wsl_path(&file),
+            file = linux_path(&file),
             user = self.user,
         );
         self.wsl(&["bash", "-c", &command])
@@ -784,17 +1106,31 @@ runuser -u '{user}' -- bash '{file}'",
     ///
     /// Returns the reason the log could not be read.
     pub fn log(&self) -> Result<String, String> {
-        let file = wsl_path(&self.dir.join("sshd.log"));
+        let file = linux_path(&self.dir.join("sshd.log"));
         self.wsl(&["bash", "-c", &format!("cat '{file}'")])
     }
 
     /// Whether this machine can run a disposable server at all.
     pub fn is_available() -> bool {
-        Command::new("wsl.exe")
-            .args(["-d", "Debian", "-u", "root", "--", "true"])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        #[cfg(windows)]
+        {
+            return in_linux(["true"])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+        }
+        // The harness adds a throw-away user, which a disposable sshd needs root for.
+        #[cfg(not(windows))]
+        {
+            Path::new("/usr/sbin/sshd").is_file()
+                && Command::new("id")
+                    .arg("-u")
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .is_some_and(|uid| uid.trim() == "0")
+        }
     }
 
     /// A port nothing is listening on, asked for and then released.
@@ -871,7 +1207,7 @@ runuser -u '{user}' -- bash '{file}'",
     /// `x11-req`.
     fn write_config(&self, port: u16, allow: bool, x11: X11Server) -> Result<(), String> {
         let allow = if allow { "yes" } else { "no" };
-        let work = wsl_path(&self.dir);
+        let work = linux_path(&self.dir);
         let config = format!(
             "Port {port}\n\
              ListenAddress 0.0.0.0\n\
@@ -898,8 +1234,8 @@ runuser -u '{user}' -- bash '{file}'",
             x11.config_lines()
         );
         std::fs::write(self.dir.join("sshd_config"), config).map_err(|error| error.to_string())?;
-        let config = wsl_path(&self.dir.join("sshd_config"));
-        let log = wsl_path(&self.dir.join("sshd.log"));
+        let config = linux_path(&self.dir.join("sshd_config"));
+        let log = linux_path(&self.dir.join("sshd.log"));
         // A server without xauth is a server whose own `xauth` cannot run. The program
         // is masked by a bind mount inside the namespace sshd is started in, so the
         // machine keeps its xauth and this server really has none: the account's own
@@ -909,7 +1245,7 @@ runuser -u '{user}' -- bash '{file}'",
         let start = if x11.hides_xauth() {
             let script = self.dir.join("sshd-without-xauth.sh");
             std::fs::write(&script, MASKED_SSH_SCRIPT).map_err(|error| error.to_string())?;
-            format!("bash '{}' '{config}' '{log}'", wsl_path(&script))
+            format!("bash '{}' '{config}' '{log}'", linux_path(&script))
         } else {
             format!("/usr/sbin/sshd -t -f '{config}' && /usr/sbin/sshd -f '{config}' -E '{log}'")
         };
@@ -931,11 +1267,9 @@ runuser -u '{user}' -- bash '{file}'",
 
     /// Runs one command as root inside the disposable server's environment.
     fn wsl(&self, args: &[&str]) -> Result<String, String> {
-        let output = Command::new("wsl.exe")
-            .args(["-d", "Debian", "-u", "root", "--"])
-            .args(args)
+        let output = in_linux(args)
             .output()
-            .map_err(|error| format!("wsl.exe could not be run: {error}"))?;
+            .map_err(|error| format!("the server environment could not be run: {error}"))?;
         if !output.status.success() {
             return Err(format!(
                 "{}: {}{}",
@@ -950,14 +1284,16 @@ runuser -u '{user}' -- bash '{file}'",
     /// Runs one harness action and adopts the identity block it reports.
     fn run(&mut self, action: &str) -> Result<(), String> {
         let script = repo_root().join("scripts").join("ssh-test-server.sh");
-        let output = Command::new("wsl.exe")
-            .args(["-d", "Debian", "-u", "root", "--", "bash"])
-            .arg(wsl_path(&script))
-            .arg(action)
-            .arg(wsl_path(&self.dir))
-            .arg(self.port.to_string())
-            .output()
-            .map_err(|error| format!("wsl.exe could not be run: {error}"))?;
+        let port = self.port.to_string();
+        let output = in_linux([
+            "bash",
+            &linux_path(&script),
+            action,
+            &linux_path(&self.dir),
+            &port,
+        ])
+        .output()
+        .map_err(|error| format!("the server environment could not be run: {error}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
             return Err(format!(
@@ -998,7 +1334,45 @@ fn harness_root() -> PathBuf {
     repo_root().join("target").join("ssh-harness")
 }
 
+/// The path a command inside the Linux environment uses for a file.
+fn linux_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        wsl_path(path)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// Runs a command in the Linux environment the harness owns.
+///
+/// On Windows that environment is Debian under WSL. On Linux it is this machine.
+fn in_linux<I, S>(args: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("wsl.exe");
+        command.args(["-d", "Debian", "-u", "root", "--"]);
+        command.args(args);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut args = args.into_iter();
+        let program = args.next().expect("a linux command");
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    }
+}
+
 /// Converts a Windows path into the path WSL sees.
+#[cfg(windows)]
 fn wsl_path(path: &Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
     let bytes = text.as_bytes();

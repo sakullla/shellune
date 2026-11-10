@@ -346,19 +346,33 @@ X11 转发让服务器上的图形程序显示在这台电脑上。三个模式�
   与传输列表同一套 `max_h` + `overflow_y_scroll` 写法）：原因与下一步都随文字大小放大，720×480 加 200% 文字时
   两者加起来比整个窗口还高，按内容自然高度绘制会把终端压到零高、并把最后一行画到窗口外。**下一步排在原因之前**
   （`session.x11.next` 是框内第一段、用主文本色，`session.x11.reason` 用次要色跟在后面）：框内滚动只有滚轮，
-  纯键盘用户读到的就是首屏那一段，所以首屏给的是"能做什么"而不是诊断。720×480 加 200% 文字下下一步至少有一整行
-  在框内、原因随后滚轮可达，终端与关闭按钮留在窗口内（R4）；普通窗口里这段文本仍按内容高度整段显示，不出现滚动。
+  纯键盘用户读到的就是首屏那一段，所以首屏给的是"能做什么"而不是诊断。720×480 加 200% 文字下首屏是下一步的**开头**：
+  这段动作文本本身约五行高（实测 `session.x11.next` 194px，框高 168px），首屏放下约四行，剩下的它与原因一样靠滚轮
+  到达；框高上限不变，终端与关闭按钮留在窗口内（R4）。普通窗口里这段文本仍按内容高度整段显示，不出现滚动。
   tooltip 里仍是原因在前、下一步在后，因为它没有首屏限制。
-- **受限模式的交付状态（如实记录，不算通过）**：受限模式要求本机显示服务**真正执行 X11 SECURITY 扩展**，即接受
-  并强制它自己经 `xauth generate … untrusted` 签发的授权。本环境唯一的两种显示服务都不满足：Debian 的
-  Xvfb 21.1.16 登记 SECURITY、接受 `xauth generate … untrusted`，却拒绝自己签发的这份凭据（只有写进它自己
-  `-auth` 文件的条目才被接受，Owner 已独立复现）；WSLg 的 Xwayland `:0` 没有 SECURITY 扩展。因此当前交付验证
-  能证明的只有：受限模式在这样的显示上**不冒充可用**（`X11Failure::RestrictedUnsupportedByDisplay` + 下一步，
-  SSH 会话照常可用），以及信任模式（`ssh -Y`，经风险确认）在同一台机器与本机显示之间端到端可用。**受限模式的
-  显示端到端（远程程序自动获得 `DISPLAY`、窗口出现在本机、同一会话第二个程序免二次认证）在本环境未通过、也没有
-  证据**，恢复条件是换到会执行 SECURITY 的显示服务（Xorg／XWayland／XQuartz）并在那里补证；在此之前不得把该
-  验收计为通过，也不得用信任模式或"显示拒绝受限授权"的失败分支替代它。这是环境能力缺口，不是代码缺陷：
-  客户端把受限凭据、`x11-req` 与桥接都按 `ssh -X` 的形状做对了。
+- **受限模式的交付状态**：受限模式要求本机显示服务**真正执行 X11 SECURITY 扩展**，即接受并强制它自己经
+  `xauth generate … untrusted` 签发的授权。Windows 侧的两种显示服务都不满足：Debian 的 Xvfb 21.1.16 登记
+  SECURITY、接受 `xauth generate … untrusted`，却拒绝自己签发的这份凭据（只有写进它自己 `-auth` 文件的条目才被
+  接受，Owner 已独立复现）；WSLg 的 Xwayland `:0` 没有 SECURITY 扩展。所以 Windows 侧能证明的只有：受限模式在
+  这样的显示上**不冒充可用**（`X11Failure::RestrictedUnsupportedByDisplay` + 下一步，SSH 会话照常可用），以及
+  信任模式（`ssh -Y`，经风险确认）在同一台机器与本机显示之间端到端可用。
+- 受限模式的显示端到端在 `192.168.0.109`（Debian 13）的 `:1` 上跑过（2026-11-10）。该显示的 `xdpyinfo` 报
+  `X.Org version: 21.1.16`，进程是 `Xtigervnc`（不是另起的 Xvfb），登记并执行 SECURITY：
+  `xauth generate :1 MIT-MAGIC-COOKIE-1 untrusted` 签发的 cookie 能连上。
+  `SHELLUNE_X11_DISPLAY=:1`、`SHELLUNE_X11_AUTHORITY=/root/.Xauthority` 下，产品测试
+  `cargo test --test ssh_x11 --all-features -- --include-ignored --nocapture` 为 9 passed、0 failed，没有 SKIP，也没有
+  受限路径的 GAP。受限用例走 honoured 分支：`X11Status::Ready { display: ":1" }`，同一会话里第二个程序仍只有一次
+  SSH 认证，`xlogo` 使本机窗口数从 22 增到 23，会话结束后显示上的客户端数回到接入前的 11。
+  `/root/.Xauthority` 的 md5 在整组测试前后都是 `98dbe6df6de7b4ec4950f77524d1240c`，`/tmp` 下没有留下
+  `shellune-x11-*` 凭据目录。这台机器上用来编译的是已安装的 stable（rustc 1.99.0）；仓库钉的 1.99.1 工具链当时不完整。
+- 同一次 Linux 构建修掉了一个只有 Linux 才会编译到的缺陷：abstract-socket 分支（`cfg(target_os = "linux")`，见
+  `crates/ssh/src/x11.rs` 的 `connect_abstract`）原来把 `std::os::unix::net::SocketAddr` 传给只接受
+  `tokio::net::unix::SocketAddr` 的 `tokio::net::UnixStream::connect_addr`，Linux 上整个 crate 编译失败；现在先用
+  `std::os::unix::net::UnixStream::connect_addr` 连接，再 `set_nonblocking(true)` 后交给
+  `tokio::net::UnixStream::from_std`，失败仍按原来的"显示连不上"报出。Windows 与 macOS 不编译该分支，所以此前
+  的本地构建看不到它。`a_linux_abstract_display_name_becomes_an_address_and_an_unserved_one_fails` 在该机上通过，
+  覆盖抽象地址的构造与"无人监听即失败"。
+
 - 关闭会话先停止接受新通道，再关掉既有桥接：不留下监听，也不留下仍在转发到本机显示的连接。
 - 对话框里的控件复用同一套分段与横幅；连接表单里的 X11 选择是一行（标签 + 三个分段，说明在 tooltip 里），
   因为同一个对话框下方还有其它正在进行的连接，长段落会把它们挤出小窗口。主机表单整页可滚动，X11 分段与确定

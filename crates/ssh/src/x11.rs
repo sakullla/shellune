@@ -1248,6 +1248,32 @@ impl AsyncWrite for DisplaySocket {
     }
 }
 
+/// The address of a Linux abstract socket, built from the name a display gives.
+///
+/// An abstract name has no file behind it, so this address is the only way to say which
+/// socket is meant. Building it reaches no server and reads nothing: what a name turns
+/// into is decided here alone.
+#[cfg(target_os = "linux")]
+fn abstract_address(name: &str) -> io::Result<std::os::unix::net::SocketAddr> {
+    use std::os::linux::net::SocketAddrExt;
+    std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+}
+
+/// Connects to a Linux abstract socket and hands the open socket to the runtime.
+///
+/// `tokio`'s own address type is the one `UnixStream::connect_addr` takes, and it cannot
+/// be built from an abstract name. So the connection is opened through std and handed
+/// over: a socket made non-blocking and given to the runtime is a runtime socket, which
+/// is all `from_std` asks for. A local X socket answers or refuses at once, so opening it
+/// waits on nothing that would hold the runtime's thread.
+#[cfg(target_os = "linux")]
+fn connect_abstract(name: &str) -> io::Result<tokio::net::UnixStream> {
+    let address = abstract_address(name)?;
+    let stream = std::os::unix::net::UnixStream::connect_addr(&address)?;
+    stream.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(stream)
+}
+
 /// Connects to the local X server of a display.
 async fn open_display(target: &DisplayTarget) -> io::Result<DisplaySocket> {
     match target {
@@ -1263,11 +1289,7 @@ async fn open_display(target: &DisplayTarget) -> io::Result<DisplaySocket> {
             // the X11 directory; trying it is what makes such a server reachable.
             #[cfg(target_os = "linux")]
             {
-                use std::os::linux::net::SocketAddrExt;
-                if let Ok(address) =
-                    std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes())
-                    && let Ok(stream) = tokio::net::UnixStream::connect_addr(&address).await
-                {
+                if let Ok(stream) = connect_abstract(abstract_name) {
                     return Ok(DisplaySocket::Unix(stream));
                 }
             }
@@ -1825,7 +1847,15 @@ mod tests {
         match parsed.target {
             #[cfg(unix)]
             DisplayTarget::Unix { path, .. } => {
-                assert!(path.ends_with("X11-unix/X99"), "{}", path.display());
+                // The socket of display 99, in the directory X servers keep theirs in.
+                // `Path::ends_with` compares whole components, so the leading dot of
+                // `.X11-unix` is part of the name a suffix has to spell.
+                assert_eq!(
+                    path,
+                    PathBuf::from("/tmp/.X11-unix/X99"),
+                    "{}",
+                    path.display()
+                );
             }
             DisplayTarget::Tcp { host, port } => {
                 assert_eq!(host, "127.0.0.1");
@@ -2257,6 +2287,35 @@ mod tests {
             ),
             other => panic!("a quartz display is a socket, not a machine: {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_linux_abstract_display_name_becomes_an_address_and_an_unserved_one_fails() {
+        use std::os::linux::net::SocketAddrExt as _;
+
+        // An abstract socket has no file, so the name is all there is: it turns into an
+        // address without a server behind it, which is what lets the branch be tried on
+        // a machine whose X server only registered the abstract name.
+        let address = abstract_address("/tmp/.X11-unix/X99").expect("an abstract address");
+        assert_eq!(
+            address.as_abstract_name(),
+            Some("/tmp/.X11-unix/X99".as_bytes()),
+            "the address names the socket the display registered"
+        );
+
+        // A name no display listens on fails instead of producing a socket: that failure
+        // is what keeps `open_display` reporting the display as unreachable instead of
+        // handing the session a connection nothing would answer.
+        let error = connect_abstract("/tmp/.X11-unix/X99-shellune-no-such-display")
+            .expect_err("no display listens on this abstract socket");
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ),
+            "a socket nothing listens on is refused, not reported as open: {error}"
+        );
     }
 
     #[test]

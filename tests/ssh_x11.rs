@@ -20,10 +20,13 @@
 //! it. Debian's Xvfb 21.1.16 is such a server (only what is in its own `-auth` file is
 //! accepted). The display is asked about that itself before the product is involved, and
 //! the two answers have to agree: where the display honours what it issues the restricted
-//! session must end as ready and a remote program must reach the display; where it does
-//! not, the product must report that refusal and must not claim a display it cannot
-//! forward to. The second case is what this host can measure; a restricted session that
-//! really shows a remote program therefore stays a printed gap here, never a pass.
+//! session must end as ready, a remote program must reach that display, and a second
+//! program in the same session must not authenticate again; where it does not, the
+//! product must report that refusal and must not claim a display it cannot forward to.
+//! The refusal is a printed gap, not a pass. `SHELLUNE_X11_DISPLAY` names a display the
+//! machine is already running (with `SHELLUNE_X11_AUTHORITY` when that file is not the
+//! usual one) so the honoured path can be run against a server that enforces SECURITY,
+//! instead of against the harness's Xvfb.
 //!
 //! The disposable server, the display server and the environment variables the product
 //! reads (`DISPLAY`, `XAUTHORITY`, `PATH`) belong to the whole process, so the tests of
@@ -285,11 +288,16 @@ fn accepted_logins(server: &Harness) -> usize {
 
 /// Waits until the display has no client left, or reports how many are still there.
 fn wait_for_no_connections(display: &DisplayServer) -> usize {
+    wait_for_connection_count(display, 0)
+}
+
+/// Waits until the display reports `target` clients, or reports how many are still there.
+fn wait_for_connection_count(display: &DisplayServer, target: usize) -> usize {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut open = usize::MAX;
     while Instant::now() < deadline {
-        open = display.connections().unwrap_or(0);
-        if open == 0 {
+        open = display.connections().unwrap_or(usize::MAX);
+        if open == target {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -406,11 +414,18 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
     let server =
         Harness::start_with_x11("x11-restricted", Harness::free_port(), X11Server::Enabled)
             .expect("the disposable server starts");
-    let display = DisplayServer::start("x11-restricted").expect("the display server starts");
+    // `SHELLUNE_X11_DISPLAY` selects a server that already enforces SECURITY. The
+    // harness's own Xvfb does not, and a pass on that server would be the refusal path.
+    let display =
+        DisplayServer::forwarding_display("x11-restricted").expect("the display server starts");
     let xauth = display.xauth_path();
     // Whether this display server honours what it issues is a property of the server, so
     // it is asked of the server before the product is involved.
     let honoured = display.honours_issued_cookies();
+    eprintln!(
+        "restricted display {} honoured={honoured}",
+        display.display()
+    );
     let _env = DisplayEnv::set(
         Some(&display.display()),
         Some(&display.authority()),
@@ -422,17 +437,41 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
     // would replace it, and that is what this test is looking for.
     let own = display.authority_record();
     let authority_before = std::fs::read(display.authority()).expect("the authority file");
+    eprintln!(
+        "AUTHORITY path={} bytes={}",
+        display.authority().display(),
+        authority_before.len()
+    );
+    // Clients the display already had, and logins the server already accepted. A second
+    // program has to leave both of those where they are: one more login, no more clients
+    // once the session is gone.
+    let clients_before = if display.keeps_other_clients() {
+        display
+            .connections()
+            .expect("the display reports its clients")
+    } else {
+        0
+    };
+    let logins_before = accepted_logins(&server);
+    eprintln!("DISPLAY_CLIENTS before={clients_before}");
 
     let mut session = connect(&server, X11Forwarding::Restricted);
     let started = wait_connected(&mut session);
     let status = wait_x11(&mut session, started.x11);
+    eprintln!("restricted status={status:?}");
     if honoured {
         // The display accepts what it issues, so the session forwards: ready, and the
         // remote program really reaches the display through the restricted credential.
-        assert!(
-            matches!(status, X11Status::Ready { .. }),
-            "a server that allows X11 and a display that honours its own cookie must end as ready, got {status:?}"
-        );
+        match &status {
+            X11Status::Ready { display: ready } => assert_eq!(
+                ready,
+                &display.display(),
+                "the session must bridge to this machine's display, got {status:?}"
+            ),
+            _ => panic!(
+                "a server that allows X11 and a display that honours its own cookie must end as ready, got {status:?}"
+            ),
+        }
 
         // The credential the local display issued is never the one the server is told: the
         // remote programs get this session's own cookie and the bridge translates it.
@@ -443,12 +482,58 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
             "the remote authority file must not hold this machine's cookie"
         );
 
-        write(&mut session, "xdpyinfo 2>&1 | head -2");
-        let output = wait_for_output(&mut session, "version number", &listed);
+        let version = display
+            .server_version_line()
+            .expect("the local display names its X.Org version");
+        write(&mut session, "xdpyinfo 2>&1");
+        let output = wait_for_output(&mut session, &version, &listed);
         assert!(
-            output.contains("version number"),
-            "the remote program reached the display through the issued cookie: {output:?}"
+            output.contains(&version),
+            "the remote program reached this machine's display ({version}): {output:?}"
         );
+        assert!(
+            output.contains("name of display"),
+            "the remote program named the display it reached: {output:?}"
+        );
+
+        // The second program, in the same session: another X11 channel, and no second
+        // authentication. The server's log is the evidence for that.
+        write(
+            &mut session,
+            "xdpyinfo >/dev/null 2>&1 && echo SECOND-$((2 + 2))",
+        );
+        let output = wait_for_output(&mut session, "SECOND-4", &output);
+        assert!(
+            output.contains("SECOND-4"),
+            "the second program reached the display: {output:?}"
+        );
+        assert_eq!(
+            accepted_logins(&server),
+            logins_before + 1,
+            "two programs in one restricted session must share one authenticated connection: {}",
+            server.log().unwrap_or_default()
+        );
+        eprintln!(
+            "SECOND_PROGRAM reached the display on one login (logins now {})",
+            logins_before + 1
+        );
+
+        let windows_before = display.window_count().unwrap_or(0);
+        write(&mut session, "xlogo >/dev/null 2>&1 &");
+        let deadline = Instant::now() + PATIENCE;
+        let mut windows = windows_before;
+        while Instant::now() < deadline {
+            windows = display.window_count().unwrap_or(0);
+            if windows > windows_before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(
+            windows > windows_before,
+            "the remote program's window is in this machine's display: {windows_before} then {windows}"
+        );
+        eprintln!("REMOTE_WINDOW {windows_before} -> {windows}");
     } else {
         // The display answers `xauth generate` and then refuses the authorization: the
         // product has to say exactly that. Reporting a display that no remote program can
@@ -504,10 +589,15 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
     }
 
     session.close();
+    let clients_after = if display.keeps_other_clients() {
+        clients_before
+    } else {
+        0
+    };
     assert_eq!(
-        wait_for_no_connections(&display),
-        0,
-        "a closed session left no display connection behind"
+        wait_for_connection_count(&display, clients_after),
+        clients_after,
+        "a closed session left no display connection of its own behind"
     );
 
     // The restricted mode asked the display for an untrusted cookie, and that cookie is
@@ -565,8 +655,8 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
         );
         trusted.close();
         assert_eq!(
-            wait_for_no_connections(&display),
-            0,
+            wait_for_connection_count(&display, clients_before),
+            clients_before,
             "the trusted session's bridge was dropped"
         );
         assert_eq!(

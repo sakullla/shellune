@@ -17517,11 +17517,16 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
         "the notice took more than its share of the window: {boxed:?} in {viewport:?}"
     );
     // The next step opens the box, so it is the text this window shows before anyone
-    // scrolls — and this test never moved the pointer, so it is also the text a keyboard
-    // user reads. Scrolling this box takes a pointer, which is why the actionable text,
-    // not the diagnosis, is what the first screen holds (R4, R11).
+    // scrolls — and this test never moved the pointer, so its opening is also what a
+    // keyboard user reads. Scrolling this box takes a pointer, which is why the actionable
+    // text, not the diagnosis, is what the first screen holds (R4, R11).
     let next = bounds_of(cx, "session.x11.next");
     assert_inside_box(next, boxed, "the next step");
+    // The whole direction does not fit this box at this size, and that is the contract and
+    // not an oversight: the box is capped at `X11_NOTICE_SHARE` of the window, so the first
+    // screen holds its opening and the rest of it, like the reason behind it, is reached by
+    // scrolling. `assert_inside_box` only compares the width; the height a reader gets
+    // before scrolling is what `first_screen` below measures.
     let one_line = Metrics::new(Zoom::Largest).label_size();
     // The banner's own padding is the only thing above it, so the next step is the first
     // text in the box rather than something the reason was put in front of.
@@ -17536,8 +17541,9 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
     );
     let first_screen = (boxed.origin.y + boxed.size.height).min(next.origin.y + next.size.height)
         - next.origin.y.max(boxed.origin.y);
-    // What the direction itself costs is two or three lines; the first screen has to hold
-    // that much for the ordering to mean anything to a reader who cannot scroll.
+    // The first screen has to hold a usable opening of the direction — four of its lines at
+    // this size, which is more than the single line a one-line direction needs — for putting
+    // it first to mean anything to a reader who cannot scroll.
     assert!(
         first_screen >= one_line * 4.0,
         "the next step shows too little before any scrolling: \
