@@ -15282,6 +15282,168 @@ async fn a_marked_split_tab_is_cleared_when_it_is_looked_at(cx: &mut TestAppCont
     );
 }
 
+/// Asserts a measured box stays inside another box, on both axes.
+///
+/// A tab draws its marks and its close button inside its own box; anything measured
+/// outside it would be drawn over the neighbouring tab, and a pointer landing there
+/// would act on that neighbour instead (R4, R7).
+fn assert_stays_inside_box(inner: gpui::Bounds<Pixels>, outer: gpui::Bounds<Pixels>, what: &str) {
+    assert!(
+        inner.size.width > px(0.0) && inner.size.height > px(0.0),
+        "{what} was measured with an empty box: {inner:?}"
+    );
+    assert!(
+        inner.origin.x >= outer.origin.x - px(0.5)
+            && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + px(0.5),
+        "{what} leaves its box sideways: {inner:?} in {outer:?}"
+    );
+    assert!(
+        inner.origin.y >= outer.origin.y - px(0.5)
+            && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + px(0.5),
+        "{what} leaves its box vertically: {inner:?} in {outer:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_marked_tab_keeps_its_marks_and_close_button_inside_itself(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    // Enough tabs that the strip cannot give any of them more than its minimum: the
+    // state in which a tab's own content used to be squeezed outward.
+    for _ in 0..6 {
+        click(cx, "header.primary");
+    }
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    assert_eq!(
+        tabs.len(),
+        8,
+        "the strip is crowded enough to shrink every tab"
+    );
+    let marked = tabs[1];
+    feed_session(cx, &view, marked, b"\x07");
+    feed_session(cx, &view, marked, REPORTED_COMMAND);
+    assert!(
+        unread_of(cx, &view, marked).bell && unread_of(cx, &view, marked).finished,
+        "the background tab carries both marks"
+    );
+
+    // The marked tab is wider than a bare one, because its two words need the room;
+    // they are not squeezed into a title's width.
+    let tab = bounds_of(cx, "session.tab.1");
+    let bare = bounds_of(cx, "session.tab.2");
+    assert!(
+        tab.size.width > bare.size.width,
+        "the marked tab reserves room for its words: {tab:?} against {bare:?}"
+    );
+
+    // Every part of the tab stays inside the tab, so nothing is drawn over the next
+    // tab, and the close button is the one the pointer finds inside this tab.
+    for selector in [
+        "session.tab.mark.bell.1",
+        "session.tab.mark.finished.1",
+        "session.tab.close.1",
+    ] {
+        assert_stays_inside_box(bounds_of(cx, selector), tab, selector);
+    }
+    assert_pointer_target(cx, "session.tab.close.1");
+    assert!(
+        bare.origin.x >= tab.origin.x + tab.size.width - px(0.5),
+        "the next tab starts after the marked one: {tab:?} then {bare:?}"
+    );
+
+    // Choosing the close button of the marked tab closes that tab and only it.
+    click(cx, "session.tab.close.1");
+    let mut expected = tabs;
+    expected.remove(1);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        expected,
+        "the close button belongs to the tab it is drawn in, not to its neighbour"
+    );
+}
+
+#[gpui::test]
+async fn the_tab_list_keeps_the_marks_readable_in_the_smallest_window_at_large_text(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let background = cx.update(|_window, app| view.read(app).open_tabs())[0];
+    let viewport = minimum_window();
+    cx.simulate_resize(viewport);
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    feed_session(cx, &view, background, b"\x07");
+    feed_session(cx, &view, background, REPORTED_COMMAND);
+
+    // The strip has no room for a tab at this size, so its marks are clipped with the
+    // tab they belong to (R4 allows the strip to fall back); inside the tab's own box
+    // they still stay put rather than sliding over the neighbouring tab.
+    let tab = bounds_of(cx, "session.tab.0");
+    for selector in [
+        "session.tab.mark.bell.0",
+        "session.tab.mark.finished.0",
+        "session.tab.close.0",
+    ] {
+        assert_stays_inside_box(bounds_of(cx, selector), tab, selector);
+    }
+    assert_pointer_target(cx, "session.tab.close.0");
+
+    // The same holds in Chinese, where the two words are two full-width characters.
+    cx.dispatch_action(ToggleLanguage);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese,
+        "the marks are measured in Chinese too"
+    );
+    let tab = bounds_of(cx, "session.tab.0");
+    for selector in [
+        "session.tab.mark.bell.0",
+        "session.tab.mark.finished.0",
+        "session.tab.close.0",
+    ] {
+        assert_stays_inside_box(bounds_of(cx, selector), tab, selector);
+    }
+
+    // The list of every tab is the way to read the marks here: it fits the window and
+    // writes each mark out in full.
+    assert_fits_inside(
+        bounds_of(cx, "tabs.list.open"),
+        viewport,
+        "the all-tabs control",
+    );
+    assert_pointer_target(cx, "tabs.list.open");
+    click(cx, "tabs.list.open");
+    assert_fits_inside(bounds_of(cx, "tabs.list.dialog"), viewport, "the tab list");
+    let row = bounds_of(cx, "tabs.list.row.0");
+    assert_fits_inside(row, viewport, "the row of the marked tab");
+    for selector in ["tabs.list.mark.bell.0", "tabs.list.mark.finished.0"] {
+        assert_stays_inside_box(bounds_of(cx, selector), row, selector);
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+    }
+    assert_pointer_target(cx, "tabs.list.rename.0");
+
+    // Choosing the row shows that tab and clears what it was carrying (R7).
+    click(cx, "tabs.list.row.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(background)
+    );
+    assert!(
+        unread_of(cx, &view, background).is_empty(),
+        "looking at the tab cleared the marks the list showed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Saved shortcut commands (R6)
 // ---------------------------------------------------------------------------

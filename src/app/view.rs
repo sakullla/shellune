@@ -10369,6 +10369,11 @@ impl ShelluneView {
         let selector = format!("session.tab.{index}");
         let hover = theme::swatch(palette::SURFACE_HOVER);
         let hover_text = theme::swatch(palette::TEXT_PRIMARY);
+        // The marks are words that cannot shrink, so the tab's own minimum grows by
+        // their room: a narrow strip then clips a whole tab rather than letting one
+        // tab's marks and close button slide over its neighbour (R4, R7).
+        let marks = tab_attention_marks(unread, strings, metrics, index);
+        let mark_room = attention_mark_room(unread, metrics);
 
         let mut tab = div()
             .id(("session.tab", index))
@@ -10377,7 +10382,7 @@ impl ShelluneView {
             .flex()
             .items_center()
             .flex_shrink()
-            .min_w(metrics.scale(84.0))
+            .min_w(metrics.scale(84.0) + mark_room)
             .max_w(metrics.scale(220.0))
             .gap(metrics.scale(spacing::TIGHT - 1.0))
             .h(metrics.tab_height())
@@ -10418,7 +10423,19 @@ impl ShelluneView {
                 .hover(move |style| style.bg(hover).text_color(hover_text))
         };
 
-        tab.child(components::status_dot(tone, metrics))
+        // Everything between the tab's edge and its close button sits in one row that
+        // may be clipped: a tab narrowed by a crowded strip then cuts its own title and
+        // marks at its own edge, instead of drawing them over the next tab and over that
+        // tab's close button. The close button stays outside this row, so it is always
+        // the one the pointer finds inside the tab it belongs to (R4).
+        let body = div()
+            .flex()
+            .flex_1()
+            .items_center()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .gap(metrics.scale(spacing::TIGHT - 1.0))
+            .child(components::status_dot(tone, metrics))
             .children(
                 self.workspace
                     .layout()
@@ -10450,8 +10467,8 @@ impl ShelluneView {
                     .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
                     .child(SharedString::from(self.tab_title(id))),
             )
-            .when(!live, |tab| {
-                tab.child(
+            .when(!live, |body| {
+                body.child(
                     div()
                         .flex_none()
                         .text_size(metrics.caption_size())
@@ -10462,23 +10479,24 @@ impl ShelluneView {
             // The background marks sit inside the tab's own target, so choosing the
             // mark is choosing the tab: it shows that tab and its pane, which is also
             // what clears the mark (R7).
-            .children(tab_attention_marks(unread, strings, metrics, index))
-            .child(
-                components::icon_only_button(Icon::Close, metrics)
-                    // A pointer target, not a 20px drawing: the smallest size R4
-                    // allows, so closing a tab never needs a careful aim.
-                    .w(metrics.hit_target())
-                    .h(metrics.hit_target())
-                    .id(("session.tab.close", index))
-                    .debug_selector({
-                        let selector = format!("session.tab.close.{index}");
-                        move || selector.clone()
-                    })
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        cx.stop_propagation();
-                        this.request_close_tab_anchor(id, cx);
-                    })),
-            )
+            .children(marks);
+
+        tab.child(body).child(
+            components::icon_only_button(Icon::Close, metrics)
+                // A pointer target, not a 20px drawing: the smallest size R4
+                // allows, so closing a tab never needs a careful aim.
+                .w(metrics.hit_target())
+                .h(metrics.hit_target())
+                .id(("session.tab.close", index))
+                .debug_selector({
+                    let selector = format!("session.tab.close.{index}");
+                    move || selector.clone()
+                })
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.request_close_tab_anchor(id, cx);
+                })),
+        )
     }
 
     /// The label of one tab: the user's own name, or the session's title numbered
@@ -11467,6 +11485,26 @@ fn tab_accent_mark(accent: TabAccent, metrics: Metrics, selector: String) -> Div
         .rounded_full()
         .bg(theme::tab_accent_color(accent))
         .debug_selector(move || selector.clone())
+}
+
+/// The width a tab's background marks need beside its title (R4, R7).
+///
+/// A mark is a word, and words do not shrink: a tab whose minimum only accounted for
+/// its title would push the words (and the close button behind them) over the next tab
+/// as soon as the strip is crowded or the text is large. Each kind therefore reserves
+/// one caption-sized word plus its gap. The bound holds for both languages: "Ended" is
+/// five Latin characters at roughly 0.6 em each and "结束" two full-width ones, both
+/// under the three em reserved here.
+fn attention_mark_room(unread: UnreadNotices, metrics: Metrics) -> gpui::Pixels {
+    let word = metrics.caption_size() * 3.0 + metrics.scale(spacing::TIGHT - 1.0);
+    let mut room = px(0.0);
+    if unread.bell {
+        room += word;
+    }
+    if unread.finished {
+        room += word;
+    }
+    room
 }
 
 /// The background marks one tab carries until it is looked at (R7).
