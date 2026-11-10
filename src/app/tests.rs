@@ -11777,12 +11777,19 @@ async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_t
     );
     // The name dialog keeps its field and its buttons on screen; the colours sit in
     // its scrolling body, so they are reached by scrolling rather than being cut off.
+    // Cancel and "restore the automatic title" are the other footer actions, so they
+    // are measured the same way as save rather than assumed to follow it (R4).
     assert_fits_inside(
         bounds_of(cx, "tab.rename.dialog"),
         viewport,
         "the name dialog",
     );
-    for selector in ["tab.rename.field", "tab.rename.save"] {
+    for selector in [
+        "tab.rename.field",
+        "tab.rename.save",
+        "tab.rename.cancel",
+        "tab.rename.auto",
+    ] {
         assert_fits_inside(bounds_of(cx, selector), viewport, selector);
     }
     for selector in ["tab.rename.accent.teal", "tab.rename.accent.none"] {
