@@ -20,8 +20,9 @@ use gpui::{
 use shellune_core::{
     Endpoint, EventTag, ForwardBook, ForwardRule, HostConfig, LocalShell, PaneNode, PaneTarget,
     PanelConfig, PanelSection, Session, SessionId, SessionKind, SessionState, SplitAxis,
-    TerminalMode, Transfer, TransferDirection, WorkspaceSnapshot, WorkspaceTab,
+    TerminalMode, Transfer, TransferDirection, WorkspaceSnapshot, WorkspaceTab, X11Forwarding,
 };
+use shellune_ssh::X11Status;
 use shellune_storage::{
     ForwardStore, HostBook, HostEdit, HostKey, HostStore, KeymapPreferences, TrustStore,
     WORKSPACE_FILE_NAME, WorkspaceStore,
@@ -14198,6 +14199,50 @@ fn the_workspace_marks_and_clears_one_tab_and_respects_each_switch() {
 }
 
 #[gpui::test]
+async fn a_pane_holds_the_display_status_until_the_window_takes_it(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+    let ready = X11Status::Ready {
+        display: ":96".to_owned(),
+    };
+    assert!(
+        cx.update(
+            |_window, app| pane.update(app, |pane, cx| pane.adopt_events(
+                tag,
+                vec![SourceEvent::X11(ready.clone())],
+                cx
+            ))
+        ),
+        "the status belongs to this pane"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.update(app, |pane, _cx| pane.take_x11_status())),
+        Some(ready),
+        "the window reads what the session reported"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.update(app, |pane, _cx| pane.take_x11_status())),
+        None,
+        "the status is news once, not a value on every frame"
+    );
+    // A display that failed is a status, not the end of the terminal.
+    let pane_state = cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::X11(X11Status::Failed {
+                    reason: "no local X display is available".to_owned(),
+                    next_step: "Start an X server.".to_owned(),
+                })],
+                cx,
+            );
+            pane.state().clone()
+        })
+    });
+    assert_eq!(pane_state, PaneState::Live);
+}
+
+#[gpui::test]
 async fn a_pane_keeps_a_background_notice_until_it_is_collected(cx: &mut TestAppContext) {
     let (pane, cx) = pane_with("", cx);
     cx.update(|_window, app| {
@@ -15253,5 +15298,247 @@ async fn a_terminal_whose_shell_ended_reports_that_instead_of_a_command_being_in
             .iter()
             .all(|title| title != copy::ENGLISH_UX.snippet_inserted),
         "nothing is reported as inserted: {toasts:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_host_dialog_saves_the_chosen_x11_mode(cx: &mut TestAppContext) {
+    let (view, cx, dir) = dialog_view(cx, vec![stored_host("web", "127.0.0.1", 1, "deploy", None)]);
+    // The host form is taller than the design window, and a test clicks what a user
+    // reaches by scrolling.
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "hosts.edit.0");
+    assert!(
+        cx.debug_bounds("hosts.editor.x11").is_some(),
+        "the X11 mode is part of the host form"
+    );
+    click(cx, "hosts.editor.x11.restricted");
+    assert!(
+        cx.debug_bounds("hosts.editor.x11.warning").is_none(),
+        "the restricted mode carries no risk sentence"
+    );
+    click(cx, "hosts.save");
+
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host was saved");
+    assert_eq!(
+        host.x11(),
+        X11Forwarding::Restricted,
+        "the chosen mode is part of the saved host"
+    );
+    let file = std::fs::read_to_string(dir.path().join(shellune_storage::FILE_NAME))
+        .expect("the host file was written");
+    assert!(
+        file.contains("Restricted"),
+        "the saved mode reaches the host file: {file}"
+    );
+
+    // The trusted mode says what it allows before it is chosen, and off is the
+    // default that is not written as a field at all.
+    click(cx, "hosts.edit.0");
+    click(cx, "hosts.editor.x11.trusted");
+    assert!(
+        cx.debug_bounds("hosts.editor.x11.warning").is_some(),
+        "the trusted mode shows the risk it carries"
+    );
+    click(cx, "hosts.save");
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host was saved");
+    assert_eq!(host.x11(), X11Forwarding::Trusted);
+
+    click(cx, "hosts.edit.0");
+    click(cx, "hosts.editor.x11.off");
+    click(cx, "hosts.save");
+    let host = cx
+        .update(|_window, app| view.read(app).book().hosts().first().cloned())
+        .expect("the host was saved");
+    assert_eq!(
+        host.x11(),
+        X11Forwarding::Off,
+        "choosing off again is what a host without a choice means"
+    );
+    let file = std::fs::read_to_string(dir.path().join(shellune_storage::FILE_NAME))
+        .expect("the host file was written");
+    assert!(
+        !file.contains("\"x11\""),
+        "the default is not stored as a field: {file}"
+    );
+}
+
+#[gpui::test]
+async fn a_trusted_x11_connection_asks_before_it_dials(cx: &mut TestAppContext) {
+    let (view, cx, _dir) =
+        dialog_view(cx, vec![stored_host("web", "127.0.0.1", 1, "deploy", None)]);
+    // The connection dialog has to show its whole form for a test to click the parts
+    // of it that a small window puts below the fold.
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "hosts.connect.0");
+    let mode = cx.update(|_window, app| {
+        view.read(app)
+            .remote_state()
+            .expect("the form is open")
+            .x11()
+    });
+    assert_eq!(
+        mode,
+        X11Forwarding::Off,
+        "a host saved without a choice forwards nothing"
+    );
+
+    // Changing the mode here is for this connection only.
+    click(cx, "remote.x11.trusted");
+    assert!(
+        cx.debug_bounds("remote.x11.warning").is_some(),
+        "the form says what the trusted mode allows"
+    );
+    type_into(cx, "remote.password", "hunter2");
+    click(cx, "remote.connect");
+    assert!(
+        cx.debug_bounds("remote.x11").is_some(),
+        "the risks are asked about before anything is dialled"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "nothing is connected until the question is answered"
+    );
+
+    // Closing the question connects nothing and keeps the mode out of the record.
+    click(cx, "remote.x11.answer.cancel");
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .remote_state()
+            .is_some_and(|panel| panel.status().x11_question().is_none())),
+        "the question is gone once it was answered"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts()[0].x11()),
+        X11Forwarding::Off,
+        "a per-connection choice does not change the saved host"
+    );
+
+    // The question comes back for the next attempt; accepting it dials once.
+    type_into(cx, "remote.password", "hunter2");
+    click(cx, "remote.connect");
+    assert!(
+        cx.debug_bounds("remote.x11").is_some(),
+        "every trusted attempt asks again"
+    );
+    click(cx, "remote.x11.answer.trusted");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        1,
+        "accepting the risks starts the attempt that uses them"
+    );
+    // Closing the dialog ends that attempt, as closing any connecting form does.
+    click(cx, "remote.close");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0
+    );
+}
+
+#[gpui::test]
+async fn the_session_bar_says_what_x11_forwarding_is_doing(cx: &mut TestAppContext) {
+    let (view, cx, _dir) =
+        dialog_view(cx, vec![stored_host("web", "127.0.0.1", 1, "deploy", None)]);
+
+    // A session that forwards: the bar says it is ready, and only then does it say
+    // that a remote program can reach this display.
+    click(cx, "hosts.connect.0");
+    type_into(cx, "remote.password", "hunter2");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::X11(X11Status::Enabling),
+                    shellune_ssh::RemoteEvent::X11(X11Status::Ready {
+                        display: ":96".to_owned(),
+                    }),
+                    shellune_ssh::RemoteEvent::Connected,
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.x11.ready").is_some(),
+        "the bar reports a display that is available"
+    );
+    assert!(
+        cx.debug_bounds("session.x11.enabling").is_none(),
+        "the newest status is the one on the bar"
+    );
+
+    // A second session whose bridge failed keeps its shell and says why the display
+    // is not available.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connect.0");
+    type_into(cx, "remote.password", "hunter2");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::X11(X11Status::Failed {
+                        reason: "no local X display is available: DISPLAY is not set".to_owned(),
+                        next_step: "Start an X server for this computer.".to_owned(),
+                    }),
+                    shellune_ssh::RemoteEvent::Connected,
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.x11.failed").is_some(),
+        "the bar reports a display that could not be used"
+    );
+    assert_eq!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .filter(|session| matches!(session.state(), SessionState::Connected))
+                .count()
+        }),
+        2,
+        "a failed display bridge leaves both shells connected"
+    );
+
+    // A session that forwards nothing says that as well: the bar does not leave the
+    // reader guessing whether a display channel was asked for.
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connect.0");
+    type_into(cx, "remote.password", "hunter2");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::X11(X11Status::Off),
+                    shellune_ssh::RemoteEvent::Connected,
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.x11.off").is_some(),
+        "the bar says that this session forwards nothing"
     );
 }

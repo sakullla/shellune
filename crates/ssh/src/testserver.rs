@@ -21,6 +21,342 @@ use std::process::Command;
 /// The passphrase the harness gives the second copy of the client key.
 pub const KEY_PASSPHRASE: &str = "shellune-key-passphrase";
 
+/// What a disposable server does with an `x11-req` (R11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X11Server {
+    /// Forwarding allowed, with the system `xauth`.
+    Enabled,
+    /// Forwarding turned off, as a server that was configured that way.
+    Disabled,
+    /// Forwarding allowed but no `xauth` to prepare the remote display with.
+    WithoutXauth,
+}
+
+impl X11Server {
+    /// The lines that decide the behaviour, appended to the configuration.
+    fn config_lines(self) -> String {
+        match self {
+            Self::Enabled => "X11Forwarding yes\nXAuthLocation /usr/bin/xauth\n".to_owned(),
+            Self::Disabled => "X11Forwarding no\nXAuthLocation /usr/bin/xauth\n".to_owned(),
+            // A path that does not exist is how a server without xauth behaves: the
+            // request is refused because the display cannot be prepared, not because
+            // forwarding is off, which is a different reason to show the user.
+            Self::WithoutXauth => {
+                "X11Forwarding yes\nXAuthLocation /nonexistent/shellune-xauth\n".to_owned()
+            }
+        }
+    }
+}
+
+/// A headless X server inside the same environment, for the display tests (R11).
+///
+/// It is Xvfb with a cookie-enforcing authority file, so a program that reaches it has
+/// really presented the right cookie: a bridge that dropped or reused the wrong one
+/// would be refused by the server instead of quietly passing.
+///
+/// Nothing here is installed automatically. A machine without Xvfb reports that it
+/// cannot run the test rather than pretending the test passed.
+pub struct DisplayServer {
+    number: u32,
+    dir: PathBuf,
+    running: bool,
+}
+
+impl DisplayServer {
+    /// Starts Xvfb on a display nothing else is using.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the display could not be started, which includes "this host
+    /// has no Xvfb".
+    pub fn start(name: &str) -> Result<Self, String> {
+        let dir = harness_root().join(name).join("x11");
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        std::fs::write(dir.join("x11-display.sh"), DISPLAY_SCRIPT)
+            .map_err(|error| error.to_string())?;
+        let mut last = String::new();
+        for number in 96..=99u32 {
+            if display_taken(number) {
+                continue;
+            }
+            let authority = dir.join(format!("Xauthority.{number}"));
+            std::fs::write(&authority, wildcard_authority(&random_cookie()))
+                .map_err(|error| error.to_string())?;
+            let mut display = Self {
+                number,
+                dir: dir.clone(),
+                running: false,
+            };
+            match display.launch() {
+                Ok(()) => return Ok(display),
+                Err(reason) => last = reason,
+            }
+        }
+        Err(if last.is_empty() {
+            "every display number the harness uses is already taken".to_owned()
+        } else {
+            last
+        })
+    }
+
+    /// Whether this machine can run a headless X server at all.
+    pub fn is_available() -> bool {
+        Harness::is_available()
+            && Command::new("wsl.exe")
+                .args([
+                    "-d",
+                    "Debian",
+                    "-u",
+                    "root",
+                    "--",
+                    "test",
+                    "-x",
+                    "/usr/bin/Xvfb",
+                ])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+    }
+
+    /// The display as this machine names it, which is what the product reads.
+    #[must_use]
+    pub fn display(&self) -> String {
+        format!("127.0.0.1:{}", self.number)
+    }
+
+    /// The display number, for the `:N` form and for a socket name.
+    #[must_use]
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+
+    /// The authority file holding this display's cookie.
+    #[must_use]
+    pub fn authority(&self) -> PathBuf {
+        self.dir.join(format!("Xauthority.{}", self.number))
+    }
+
+    /// The cookie of this display, hex encoded, as this machine's own file holds it.
+    ///
+    /// A forwarding test compares it with what the server was given: the real cookie
+    /// must never be the one that travelled over SSH.
+    #[must_use]
+    pub fn cookie_hex(&self) -> String {
+        let bytes = std::fs::read(self.authority()).unwrap_or_default();
+        // One wildcard record: family, address length, number length, name length and
+        // the name itself, then the length and the bytes of the cookie.
+        let start = 2 + 2 + 2 + 2 + crate::x11::AUTH_NAME.len() + 2;
+        let cookie = bytes.get(start..start + 16).unwrap_or_default();
+        cookie.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The TCP port the server listens on.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        6000 + u16::try_from(self.number).unwrap_or(0)
+    }
+
+    /// The number of top-level windows the X server has.
+    ///
+    /// Used to show that a remote program really opened a window in this display and
+    /// not only that its connection was accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the server could not be asked.
+    pub fn window_count(&self) -> Result<usize, String> {
+        let out = self.run("windows")?;
+        Ok(out.trim().parse::<usize>().unwrap_or(0))
+    }
+
+    /// How many clients are connected to the X server right now.
+    ///
+    /// The display tests read it after a session was closed: a bridge that outlived
+    /// the session would keep a connection here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the server could not be asked.
+    pub fn connections(&self) -> Result<usize, String> {
+        let out = self.run("connections")?;
+        Ok(out.trim().parse::<usize>().unwrap_or(0))
+    }
+
+    /// Stops the server and leaves nothing listening.
+    pub fn stop(&mut self) {
+        if !self.running {
+            return;
+        }
+        self.running = false;
+        let _ = self.run("stop");
+    }
+
+    /// Runs one step of the harness script for this display.
+    ///
+    /// The script is a file on the Linux side rather than a `bash -c` argument: wsl.exe
+    /// re-quotes what it is given, and a command with quotes of its own arrives at bash
+    /// mangled. The same rule is why scripts/ssh-test-server.sh exists.
+    fn run(&self, action: &str) -> Result<String, String> {
+        let script = self.dir.join("x11-display.sh");
+        let output = Command::new("wsl.exe")
+            .args(["-d", "Debian", "-u", "root", "--", "bash"])
+            .arg(wsl_path(&script))
+            .arg(action)
+            .arg(wsl_path(&self.dir))
+            .arg(self.number.to_string())
+            .arg(self.port().to_string())
+            .output()
+            .map_err(|error| format!("wsl.exe could not be run: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "the display server's {action} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn launch(&mut self) -> Result<(), String> {
+        self.run("start")?;
+        // The script reports the server as listening inside the environment; this
+        // side confirms the port is reachable from the machine the product runs on,
+        // which is what the bridge will really use.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], self.port())),
+                std::time::Duration::from_millis(200),
+            )
+            .is_ok()
+            {
+                self.running = true;
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let log_text = std::fs::read_to_string(self.dir.join(format!("xvfb-{}.log", self.number)))
+            .unwrap_or_default();
+        Err(format!(
+            "Xvfb :{} is not reachable on port {}: {log_text}",
+            self.number,
+            self.port()
+        ))
+    }
+}
+/// The script that owns the headless display on the Linux side.
+///
+/// It is a file rather than a `bash -c` argument because wsl.exe re-quotes what it is
+/// given: a command that carries quotes of its own reaches bash mangled, which is the
+/// same reason scripts/ssh-test-server.sh exists.
+const DISPLAY_SCRIPT: &str = r#"#!/usr/bin/env bash
+# A disposable headless X server for Shellune's X11 forwarding tests (R11).
+#
+#   x11-display.sh start <work-dir> <display-number> <port>
+#   x11-display.sh stop  <work-dir> <display-number> <port>
+#   x11-display.sh windows     <work-dir> <display-number> <port>
+#   x11-display.sh connections <work-dir> <display-number> <port>
+#
+# The server is started with an authority file, so a program that reaches it has really
+# presented the right cookie; the forwarding tests depend on that. Everything it owns
+# lives in the work directory and nothing outside it is touched.
+set -uo pipefail
+
+ACTION="${1:-start}"
+WORK="${2:?the work directory is required}"
+NUMBER="${3:-96}"
+PORT="${4:-6096}"
+AUTH="$WORK/Xauthority.$NUMBER"
+LOG="$WORK/xvfb-$NUMBER.log"
+PIDFILE="$WORK/xvfb-$NUMBER.pid"
+
+case "$ACTION" in
+start)
+    # An interrupted earlier run can leave its own Xvfb behind; starting over it would
+    # fail with "server already active" for a display nobody is using. The pattern is
+    # anchored so this script's own command line cannot match it.
+    pkill -f "^Xvfb :$NUMBER " 2>/dev/null || true
+    chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+    rm -f "$LOG" "$PIDFILE"
+    setsid Xvfb ":$NUMBER" -screen 0 800x600x24 -listen tcp -auth "$AUTH" \
+        </dev/null >"$LOG" 2>&1 &
+    echo $! >"$PIDFILE"
+    # The launcher stays alive until the server listens: a session that ends in the
+    # same breath as it started is torn down with the child it left behind.
+    for _ in $(seq 1 100); do
+        if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+            echo "listening on :$NUMBER"
+            exit 0
+        fi
+        sleep 0.1
+    done
+    echo "Xvfb :$NUMBER did not listen on $PORT" >&2
+    cat "$LOG" >&2 || true
+    exit 1
+    ;;
+stop)
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+    fi
+    pkill -f "^Xvfb :$NUMBER " 2>/dev/null || true
+    ;;
+windows)
+    # Top-level windows the display has, read with this display's own cookie.
+    XAUTHORITY="$AUTH" DISPLAY=":$NUMBER" xwininfo -root -children 2>/dev/null \
+        | grep -c '0x' || true
+    ;;
+connections)
+    # Clients connected to this display right now.
+    ss -Htn state established "sport = :$PORT" 2>/dev/null | wc -l
+    ;;
+*)
+    echo "unknown action: $ACTION" >&2
+    exit 2
+    ;;
+esac
+"#;
+
+impl Drop for DisplayServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Whether a display number is already served on this machine.
+fn display_taken(number: u32) -> bool {
+    let Ok(number) = u16::try_from(number) else {
+        return true;
+    };
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 6000 + number)),
+        std::time::Duration::from_millis(250),
+    )
+    .is_ok()
+}
+
+/// A random cookie for the headless display.
+fn random_cookie() -> [u8; 16] {
+    uuid::Uuid::new_v4().into_bytes()
+}
+
+/// An authority file whose single entry matches any client address.
+///
+/// A wildcard entry is what lets the test process - running on the Windows side and
+/// reaching the server over TCP through WSL's forwarding - authenticate with the one
+/// cookie the file holds.
+fn wildcard_authority(cookie: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&65535u16.to_be_bytes());
+    for field in [&b""[..], &b""[..], crate::x11::AUTH_NAME.as_bytes()] {
+        out.extend_from_slice(&u16::try_from(field.len()).unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    out.extend_from_slice(&16u16.to_be_bytes());
+    out.extend_from_slice(cookie);
+    out
+}
+
 /// A running disposable OpenSSH server.
 #[derive(Clone, Debug)]
 pub struct Harness {
@@ -81,7 +417,7 @@ impl Harness {
     pub fn start_without_forwarding(name: &str, port: u16) -> Result<Self, String> {
         let mut harness = Self::start(name, Self::free_port())?;
         harness.run("stop")?;
-        harness.write_config_forwarding(port, false)?;
+        harness.write_config(port, false, X11Server::Enabled)?;
         harness.port = port;
         Ok(harness)
     }
@@ -92,7 +428,23 @@ impl Harness {
         // offer.
         let mut harness = Self::start(name, Self::free_port())?;
         harness.run("stop")?;
-        harness.write_config_forwarding(port, true)?;
+        harness.write_config(port, true, X11Server::Disabled)?;
+        harness.port = port;
+        Ok(harness)
+    }
+
+    /// Starts a server with a chosen X11 forwarding behaviour (R11).
+    ///
+    /// The account and host key are the ordinary ones, so a refusal is the server's
+    /// configuration and not a broken fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the server could not be started.
+    pub fn start_with_x11(name: &str, port: u16, x11: X11Server) -> Result<Self, String> {
+        let mut harness = Self::start(name, Self::free_port())?;
+        harness.run("stop")?;
+        harness.write_config(port, true, x11)?;
         harness.port = port;
         Ok(harness)
     }
@@ -233,8 +585,9 @@ runuser -u '{user}' -- bash '{file}'",
     /// The configuration is written from here rather than by a shell script on the
     /// Linux side: a heredoc would have to travel as one command-line argument, and
     /// wsl.exe expands command substitutions inside those before bash ever sees them.
-    /// This configuration has no SFTP subsystem. `allow` is `AllowTcpForwarding`.
-    fn write_config_forwarding(&self, port: u16, allow: bool) -> Result<(), String> {
+    /// `allow` is `AllowTcpForwarding`, and `x11` decides what the server does with an
+    /// `x11-req`.
+    fn write_config(&self, port: u16, allow: bool, x11: X11Server) -> Result<(), String> {
         let allow = if allow { "yes" } else { "no" };
         let work = wsl_path(&self.dir);
         let config = format!(
@@ -257,8 +610,10 @@ runuser -u '{user}' -- bash '{file}'",
              MaxSessions 50\n\
              MaxStartups 50:30:200\n\
              PerSourcePenalties no\n\
-             LogLevel VERBOSE\n",
-            self.user
+             LogLevel DEBUG\n\
+             {}",
+            self.user,
+            x11.config_lines()
         );
         std::fs::write(self.dir.join("sshd_config"), config).map_err(|error| error.to_string())?;
         let config = wsl_path(&self.dir.join("sshd_config"));

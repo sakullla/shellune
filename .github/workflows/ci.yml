@@ -38,6 +38,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev \
             libxcb1-dev pkg-config cmake
+          # The X11 forwarding tests need a display server to forward to and a client
+          # that opens a window; the tests themselves skip when neither is available
+          # and say so, so a missing package is reported as a gap and not as a pass.
+          sudo apt-get install -y --no-install-recommends xvfb x11-utils x11-apps xauth openssh-server
 
       - uses: dtolnay/rust-toolchain@stable
         with:

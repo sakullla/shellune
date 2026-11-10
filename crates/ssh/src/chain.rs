@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use russh::client::{self, Handler};
 use russh::{Channel, ChannelMsg, Disconnect};
-use shellune_core::{AuthMethod, HostConfig, HostId, connection_jump_fault};
+use shellune_core::{AuthMethod, HostConfig, HostId, X11Forwarding, connection_jump_fault};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{oneshot, watch};
 
@@ -37,6 +37,7 @@ use crate::session::{
 use crate::sftp::{self, FileLink};
 use crate::transfer::{self, TransferLink};
 use crate::transport::{self, Cancel, IoStream, ProxyProcess};
+use crate::x11::{self, X11Gate, X11Status};
 
 /// Credentials and the stored trust decision for one hop.
 ///
@@ -97,6 +98,16 @@ pub enum ChainEvent {
         /// Exit status, when the server reported one.
         code: Option<u32>,
     },
+    /// What the target's X11 forwarding is doing (R11).
+    ///
+    /// A failure here is not a session failure: the terminal keeps working, and the
+    /// status says why no remote program can reach the local display.
+    X11 {
+        /// The target hop whose session it belongs to.
+        hop: HopLocation,
+        /// Off, enabling, ready or failed.
+        status: X11Status,
+    },
     /// The attempt failed, or a live chain stopped.
     Failed(ChainFailure),
 }
@@ -113,6 +124,8 @@ pub struct ChainRequest {
     size: PtySize,
     connect_timeout: Duration,
     open_shell: bool,
+    /// How this attempt forwards X11, chosen for this connection (R11).
+    x11: X11Forwarding,
 }
 
 impl ChainRequest {
@@ -126,7 +139,20 @@ impl ChainRequest {
             size,
             connect_timeout: session::CONNECT_TIMEOUT,
             open_shell: true,
+            x11: X11Forwarding::Off,
         }
+    }
+
+    /// The same chain, asking the target for X11 forwarding.
+    ///
+    /// The mode belongs to this attempt alone: the host's saved default only decided
+    /// what the connection form started with. Everything else - trust, authentication,
+    /// jumps - stays as it was, because forwarding runs on the connection the shell
+    /// already authenticated.
+    #[must_use]
+    pub fn with_x11(mut self, mode: X11Forwarding) -> Self {
+        self.x11 = mode;
+        self
     }
 
     /// The same chain without a shell on the target.
@@ -188,6 +214,10 @@ impl ChainSession {
             events: transfer_events,
         };
         let (forward_link, forward_events, forward_gate) = forwarding::channel(commands.clone());
+        // The X11 side of this attempt exists from the start: the target's handler has
+        // to know it before the connection is made, because the server may open its
+        // first `x11` channel the moment the request is accepted.
+        let (x11_gate, x11_events) = X11Gate::channel(request.x11);
         let size = request.size;
         let open_commands = commands.clone();
         let failure_sender = events_tx.clone();
@@ -200,6 +230,7 @@ impl ChainSession {
             size,
             timeout: request.connect_timeout,
             open_shell: request.open_shell,
+            x11: x11_gate,
         };
 
         thread::Builder::new()
@@ -224,6 +255,7 @@ impl ChainSession {
                     transfers,
                     forward_events,
                     forward_gate,
+                    x11_events,
                 ));
             })
             .expect("the SSH chain thread can be created");
@@ -455,6 +487,9 @@ struct HopHandler {
     progress: Arc<HandshakeProgress>,
     recorded: Arc<Mutex<Option<ConnectError>>>,
     gate: std::sync::Arc<forwarding::ForwardGate>,
+    /// Where this hop's `x11` channels are bridged. A hop in front of the target gets
+    /// a gate that refuses them.
+    x11: Arc<X11Gate>,
 }
 
 impl HopHandler {
@@ -520,6 +555,44 @@ impl Handler for HopHandler {
             reply,
         )
         .await;
+        Ok(())
+    }
+
+    /// A server opened an `x11` channel for a remote program.
+    ///
+    /// Only the target's gate has a display to bridge to, so a jump host's channel is
+    /// refused instead of being sent to this machine's X server.
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.x11.open_inbound(channel, reply).await;
+        Ok(())
+    }
+
+    /// The server accepted a channel request. The order of the answers is the order of
+    /// the requests, which is how the answer to `x11-req` is recognised.
+    async fn channel_success(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.x11.on_channel_reply(channel.number(), true);
+        Ok(())
+    }
+
+    /// The server refused a channel request, which for `x11-req` is a refusal to
+    /// forward at all.
+    async fn channel_failure(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.x11.on_channel_reply(channel.number(), false);
         Ok(())
     }
 
@@ -590,8 +663,11 @@ struct Attempt {
     size: PtySize,
     timeout: Duration,
     open_shell: bool,
+    /// The target's X11 forwarding, shared with its handler.
+    x11: Arc<X11Gate>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_chain(
     request: ChainRequest,
     mut commands: UnboundedReceiver<Command>,
@@ -600,8 +676,9 @@ async fn run_chain(
     transfers: transfer::Wiring,
     forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
     gate: Arc<forwarding::ForwardGate>,
+    x11_events: UnboundedReceiver<X11Status>,
 ) {
-    if let Err(error) = connect_chain(
+    let result = connect_chain(
         request,
         &mut commands,
         &attempt,
@@ -609,13 +686,18 @@ async fn run_chain(
         transfers,
         forwards,
         gate,
+        x11_events,
     )
-    .await
-    {
+    .await;
+    // Whatever ended the attempt, no bridge may stay open once it is over: closing
+    // stops accepting new `x11` channels before the open ones are dropped.
+    attempt.x11.close();
+    if let Err(error) = result {
         let _ = attempt.events.send(ChainEvent::Failed(error));
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_chain(
     request: ChainRequest,
     commands: &mut UnboundedReceiver<Command>,
@@ -624,6 +706,7 @@ async fn connect_chain(
     transfers: transfer::Wiring,
     forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
     gate: Arc<forwarding::ForwardGate>,
+    mut x11_events: UnboundedReceiver<X11Status>,
 ) -> Result<(), ChainFailure> {
     let cancel = &attempt.cancel;
     let planned = plan_chain(&request.hosts, request.target, request.auth)?;
@@ -642,17 +725,30 @@ async fn connect_chain(
         } else {
             forwarding::ForwardGate::reject_all()
         };
-        let opened = match open_hop(hop, index > 0, live.last_mut(), attempt, hop_gate).await {
-            Ok(opened) => opened,
-            Err(error) => {
-                cleanup(&mut live).await;
-                return Err(error);
-            }
+        let hop_x11 = if index + 1 == count {
+            Arc::clone(&attempt.x11)
+        } else {
+            X11Gate::rejecting()
         };
+        let opened =
+            match open_hop(hop, index > 0, live.last_mut(), attempt, hop_gate, hop_x11).await {
+                Ok(opened) => opened,
+                Err(error) => {
+                    cleanup(&mut live).await;
+                    return Err(error);
+                }
+            };
         live.push(opened);
         if index + 1 == count {
             let result = drive_shell(
-                &mut live, commands, attempt, files, transfers, forwards, gate,
+                &mut live,
+                commands,
+                attempt,
+                files,
+                transfers,
+                forwards,
+                gate,
+                &mut x11_events,
             )
             .await;
             cleanup(&mut live).await;
@@ -789,6 +885,7 @@ async fn open_hop(
     previous: Option<&mut LiveHop>,
     attempt: &Attempt,
     gate: Arc<forwarding::ForwardGate>,
+    x11: Arc<X11Gate>,
 ) -> Result<LiveHop, ChainFailure> {
     let events = &attempt.events;
     let trust = &attempt.trust;
@@ -849,6 +946,7 @@ async fn open_hop(
         progress: Arc::clone(&progress),
         recorded: Arc::clone(&recorded),
         gate,
+        x11,
     };
     let config = Arc::new(client::Config {
         nodelay: true,
@@ -1109,6 +1207,7 @@ fn take_recorded(recorded: &Mutex<Option<ConnectError>>) -> Option<ConnectError>
     recorded.lock().ok().and_then(|mut slot| slot.take())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_shell(
     live: &mut [LiveHop],
     commands: &mut UnboundedReceiver<Command>,
@@ -1117,6 +1216,7 @@ async fn drive_shell(
     transfers: transfer::Wiring,
     forward_events: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
     gate: Arc<forwarding::ForwardGate>,
+    x11_events: &mut UnboundedReceiver<X11Status>,
 ) -> Result<(), ChainFailure> {
     let events = &attempt.events;
     let cancel = &attempt.cancel;
@@ -1129,8 +1229,45 @@ async fn drive_shell(
     let handle = &mut target.handle;
     let mut carrier_lost = gate.subscribe_lost();
     let mut forwards = forwarding::ForwardLoop::new(forward_events, gate, open_commands.clone());
+    let report_x11 = |status: X11Status| {
+        let _ = events.send(ChainEvent::X11 {
+            hop: location.clone(),
+            status,
+        });
+    };
 
     let shell = if attempt.open_shell {
+        // The local display is checked before the request is sent, so a machine with
+        // no X server says so at once instead of leaving a remote program to fail on
+        // its own. Either way the shell below is opened as it always was.
+        if !attempt.x11.mode().is_enabled() {
+            // A session that forwards nothing says so: the bar states the mode rather
+            // than leaving the reader to guess whether a display was requested.
+            report_x11(X11Status::Off);
+        }
+        let prepared = if attempt.x11.mode().is_enabled() {
+            match x11::prepare(attempt.x11.mode()) {
+                Ok(prepared) => match prepared.reachable().await {
+                    Ok(()) => Some(prepared),
+                    Err(failure) => {
+                        report_x11(X11Status::Failed {
+                            reason: failure.to_string(),
+                            next_step: failure.next_step(),
+                        });
+                        None
+                    }
+                },
+                Err(failure) => {
+                    report_x11(X11Status::Failed {
+                        reason: failure.to_string(),
+                        next_step: failure.next_step(),
+                    });
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let channel = handle
             .channel_open_session()
             .await
@@ -1157,6 +1294,41 @@ async fn drive_shell(
                     reason: error.to_string(),
                 }),
             })?;
+        // The request has to precede the shell: a server sets `DISPLAY` and writes the
+        // authority file while it prepares the session's environment, which happens
+        // before the shell starts.
+        let requested = if let Some(prepared) = prepared {
+            let requested = channel
+                .request_x11(
+                    true,
+                    false,
+                    x11::AUTH_NAME,
+                    prepared.request_cookie(),
+                    prepared.screen(),
+                )
+                .await;
+            match requested {
+                Ok(()) => {
+                    attempt.x11.announce(&prepared);
+                    true
+                }
+                Err(error) => {
+                    let failure = x11::X11Failure::Lost {
+                        detail: error.to_string(),
+                    };
+                    report_x11(X11Status::Failed {
+                        reason: failure.to_string(),
+                        next_step: failure.next_step(),
+                    });
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        // The channel's answers are counted from here: the pseudo-terminal's, the X11
+        // request's when one was sent, and then the shell's.
+        attempt.x11.shell_requests(channel.id().number(), requested);
         channel
             .request_shell(true)
             .await
@@ -1186,6 +1358,7 @@ async fn drive_shell(
 
     if let Some((mut read_half, write_half)) = shell {
         let mut exit_code: Option<u32> = None;
+        let mut x11_open = true;
         loop {
             tokio::select! {
                 biased;
@@ -1209,6 +1382,17 @@ async fn drive_shell(
                     forwards.shutdown(handle).await;
                     let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                     return Ok(());
+                }
+                status = x11_events.recv(), if x11_open => {
+                    match status {
+                        Some(status) => {
+                            let _ = events.send(ChainEvent::X11 {
+                                hop: location.clone(),
+                                status,
+                            });
+                        }
+                        None => x11_open = false,
+                    }
                 }
                 command = commands.recv() => {
                     let Some(command) = command else {
@@ -1286,6 +1470,7 @@ async fn drive_shell(
         }
     }
 
+    let mut x11_open = true;
     loop {
         tokio::select! {
             biased;
@@ -1304,6 +1489,17 @@ async fn drive_shell(
                 forwards.shutdown(handle).await;
                 let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                 return Ok(());
+            }
+            status = x11_events.recv(), if x11_open => {
+                match status {
+                    Some(status) => {
+                        let _ = events.send(ChainEvent::X11 {
+                            hop: location.clone(),
+                            status,
+                        });
+                    }
+                    None => x11_open = false,
+                }
             }
             command = commands.recv() => {
                 let Some(command) = command else {

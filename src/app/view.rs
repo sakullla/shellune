@@ -18,14 +18,15 @@ use gpui::{
 };
 use std::collections::HashMap;
 
+use shellune_core::X11Forwarding;
 use shellune_core::{
     BrowseFailure, BrowseState, EventTag, FileKind, ForwardId, ForwardRule, HostConfig, HostId,
     HostValidationError, LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState,
     SplitAxis, TabAccent, TabId, Transfer, TransferDirection, TransferProtocol, join_path,
 };
-use shellune_ssh::PtySize;
 #[cfg(test)]
 use shellune_ssh::RemoteEvent;
+use shellune_ssh::{PtySize, X11Status};
 use shellune_storage::{
     BookError, ForwardStore, HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview,
     ImportedHost, PreferencesProblem, PreferencesStore, SecretStore, SnippetStore, StorageError,
@@ -60,7 +61,7 @@ use crate::app::keymap::{self, Keymap, Problem};
 use crate::app::nav::{Destination, Platform};
 use crate::app::remote::{
     self, AttemptLink, ChainDraft, LinkEvent, MethodChoice, RemoteFailure, RemotePanel,
-    RemoteStatus,
+    RemoteStatus, X11Answer,
 };
 use crate::app::snippets::{SnippetLibrary, SnippetsPanel};
 use crate::app::terminal::{self, PaneState, SourceEvent, TerminalAttention, TerminalPane};
@@ -537,6 +538,11 @@ pub struct ShelluneView {
     restore_focus_pending: bool,
     /// The session row whose menu is open, and where it was opened.
     session_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
+    /// What X11 forwarding each session last reported (R11).
+    ///
+    /// Kept beside the session, not in its record: a display bridge ends with the
+    /// connection, and a restarted connection asks again.
+    x11: HashMap<SessionId, X11Status>,
     /// Attempts a test scripted, kept so their answers can be inspected.
     #[cfg(test)]
     scripted: Vec<(SessionId, shellune_ssh::ScriptedSession)>,
@@ -810,6 +816,7 @@ impl ShelluneView {
             pending_ephemeral: None,
             unsaved: Vec::new(),
             quick_save_notice: None,
+            x11: HashMap::new(),
             showing_connection_form: false,
             reconnect: None,
             remote_fields: RemoteFields {
@@ -1829,6 +1836,8 @@ impl ShelluneView {
         }
         self.forwards.detach(id);
         self.discard_attempt(id);
+        // The display bridge ends with the connection, so the bar stops claiming one.
+        self.x11.remove(&id);
         self.unsaved.retain(|(session, _)| *session != id);
         self.drop_pane(id, cx);
         self.workspace.session_closed(id);
@@ -3916,7 +3925,8 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// Dials the chain. A ProxyCommand stays unstarted until the user confirms it.
+    /// Dials the chain. A ProxyCommand stays unstarted until the user confirms it, and
+    /// a trusted display channel is asked for only after its risks were accepted.
     fn dial_chain(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.reconnect
             && !self.workspace.session_reconnecting(id)
@@ -3930,6 +3940,22 @@ impl ShelluneView {
             self.chain = Some(draft);
             return;
         };
+        // A trusted display channel is a decision with consequences for the whole
+        // desktop, so it is asked about before anything is dialled - every time.
+        if self
+            .remote
+            .as_ref()
+            .is_some_and(RemotePanel::needs_x11_confirmation)
+            && let Some(mode) = self.remote.as_ref().map(RemotePanel::x11)
+        {
+            self.chain = Some(draft);
+            if let Some(panel) = self.remote.as_mut() {
+                panel.set_status(RemoteStatus::ConfirmingX11 { mode });
+            }
+            self.showing_connection_form = true;
+            cx.notify();
+            return;
+        }
         let Some(mut request) = draft.into_request(PtySize::new(100, 30)) else {
             return;
         };
@@ -3944,9 +3970,34 @@ impl ShelluneView {
         } else {
             Vec::new()
         };
+        // The mode belongs to this attempt; a pure forward has no shell channel to ask
+        // on, so it forwards nothing.
+        let x11 = if forward_only {
+            X11Forwarding::Off
+        } else {
+            self.remote
+                .as_ref()
+                .map(RemotePanel::x11)
+                .unwrap_or(target_host.x11())
+        };
+        // The bar states the mode this attempt was dialled with, including the
+        // default: a session that forwards nothing says so instead of leaving the
+        // question open.
+        self.x11.insert(
+            id,
+            if x11.is_enabled() {
+                X11Status::Enabling
+            } else {
+                X11Status::Off
+            },
+        );
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Connecting);
+            // A confirmation covers the attempt it was given for; the next one asks
+            // again.
+            panel.forget_x11_acceptance();
         }
+        request = request.with_x11(x11);
         let ephemeral = self
             .pending_ephemeral
             .take()
@@ -4053,6 +4104,7 @@ impl ShelluneView {
         let mut connected = false;
         let mut failed_remote = None;
         let mut failed_chain = None;
+        let mut x11: Option<X11Status> = None;
         for event in events {
             match event {
                 LinkEvent::HostKey {
@@ -4075,6 +4127,14 @@ impl ShelluneView {
                     }
                 }
                 LinkEvent::HopReady(hop) => ready.push(hop),
+                LinkEvent::X11 { host_id, status } => {
+                    // Only the target's session has a display request; a status from any
+                    // other hop would describe a connection this session is not using.
+                    let target = self.attempts[index].target.id();
+                    if host_id.is_none_or(|hop| hop == target) {
+                        x11 = Some(status);
+                    }
+                }
                 LinkEvent::Connected => connected = true,
                 LinkEvent::FailedRemote(error) => {
                     if connected {
@@ -4110,6 +4170,12 @@ impl ShelluneView {
             }
         }
 
+        if let Some(status) = x11 {
+            // The display bridge is news about the session, not about whether it is
+            // connected: a failed one keeps the attempt on its way to a terminal.
+            self.x11.insert(id, status);
+            cx.notify();
+        }
         if let Some((host_id, prompt)) = prompt {
             if let Some(attempt) = self.attempts.iter_mut().find(|attempt| attempt.id == id) {
                 attempt.asking_hop = host_id;
@@ -4373,6 +4439,8 @@ impl ShelluneView {
         error: &shellune_ssh::ConnectError,
         cx: &mut Context<Self>,
     ) {
+        // An attempt that never connected has no bridge, so the bar must not claim one.
+        self.x11.remove(&id);
         let failure = RemoteFailure::from_error(error);
         if let Some(panel) = self.panel_for_mut(id) {
             panel.fail(failure);
@@ -4388,6 +4456,7 @@ impl ShelluneView {
         failure: &shellune_ssh::ChainFailure,
         cx: &mut Context<Self>,
     ) {
+        self.x11.remove(&id);
         if let Some(panel) = self.panel_for_mut(id) {
             panel.fail(RemoteFailure::from_chain(failure));
         }
@@ -4485,6 +4554,46 @@ impl ShelluneView {
             panel.set_status(RemoteStatus::Connecting);
         }
         cx.notify();
+    }
+
+    /// Answers the trusted-X11 question, and either dials or does not.
+    ///
+    /// Accepting turns the trusted mode on for this attempt only. Choosing the
+    /// restricted mode keeps forwarding without lifting the SECURITY extension limits.
+    /// Closing the question connects nothing at all: the form stays as it was, so the
+    /// host record and the typed credentials are untouched.
+    fn answer_x11(&mut self, answer: X11Answer, cx: &mut Context<Self>) {
+        let Some(mode) = self
+            .remote
+            .as_ref()
+            .and_then(|panel| panel.status().x11_question())
+        else {
+            return;
+        };
+        match answer {
+            X11Answer::Trusted => {
+                if let Some(panel) = self.remote.as_mut() {
+                    panel.set_x11(mode);
+                    panel.accept_x11();
+                }
+                self.dial_chain(cx);
+            }
+            X11Answer::Restricted => {
+                if let Some(panel) = self.remote.as_mut() {
+                    panel.set_x11(X11Forwarding::Restricted);
+                    panel.accept_x11();
+                }
+                self.dial_chain(cx);
+            }
+            X11Answer::Cancel => {
+                if let Some(panel) = self.remote.as_mut() {
+                    panel.set_status(RemoteStatus::Idle);
+                }
+                // The draft was parked while the question was open; keeping it means
+                // pressing connect again asks the same question again.
+                cx.notify();
+            }
+        }
     }
 
     /// Answers the question about an unknown server identity.
@@ -5086,6 +5195,12 @@ impl ShelluneView {
         // screen, so it decides here whether the news marks a tab or was already seen.
         let notices = pane.update(cx, |pane, _cx| pane.take_attention());
         self.collect_attention(id, notices, cx);
+        // X11 forwarding reports through the same pane, and the bar it belongs to is
+        // this window's to draw (R11).
+        if let Some(status) = pane.update(cx, |pane, _cx| pane.take_x11_status()) {
+            self.x11.insert(id, status);
+            cx.notify();
+        }
         let state = pane.read(cx).state().clone();
         let presentation = pane.read(cx).presentation();
         if self
@@ -5114,6 +5229,9 @@ impl ShelluneView {
                     .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
                 self.forwards.detach(id);
                 self.end_files(id);
+                // The display bridge ended with the connection; a bar that kept
+                // claiming it is available would describe a session that is gone.
+                self.x11.remove(&id);
             }
             PaneState::Failed(failure) => {
                 self.workspace.session_failed(id, failure);
@@ -5121,6 +5239,9 @@ impl ShelluneView {
                     .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
                 self.forwards.detach(id);
                 self.end_files(id);
+                // The display bridge ended with the connection; a bar that kept
+                // claiming it is available would describe a session that is gone.
+                self.x11.remove(&id);
             }
         }
         cx.notify();
@@ -5520,6 +5641,56 @@ impl ShelluneView {
             );
         }
 
+        if let Some(_mode) = status.x11_question() {
+            column = column.child(
+                components::banner(Tone::Warning, metrics)
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .py(metrics.scale(spacing::SNUG))
+                    .debug_selector(|| "remote.x11".to_owned())
+                    .child(
+                        div()
+                            .text_size(metrics.body_size())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(strings.x11_trusted_title),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "remote.x11.body".to_owned())
+                            .child(strings.x11_trusted_body),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .child(self.text_button(
+                                SharedString::from("remote.x11.answer.trusted"),
+                                strings.x11_trusted_confirm,
+                                Variant::Danger,
+                                cx,
+                                |view, cx| view.answer_x11(X11Answer::Trusted, cx),
+                            ))
+                            .child(self.text_button(
+                                SharedString::from("remote.x11.answer.restricted"),
+                                strings.x11_trusted_restricted,
+                                Variant::Primary,
+                                cx,
+                                |view, cx| view.answer_x11(X11Answer::Restricted, cx),
+                            ))
+                            .child(self.text_button(
+                                SharedString::from("remote.x11.answer.cancel"),
+                                strings.x11_trusted_cancel,
+                                Variant::Ghost,
+                                cx,
+                                |view, cx| view.answer_x11(X11Answer::Cancel, cx),
+                            )),
+                    ),
+            );
+        }
+
         if let Some(failure) = status.failure() {
             let reason = failure.reason().to_owned();
             let next_step =
@@ -5708,6 +5879,70 @@ impl ShelluneView {
                     .debug_selector(|| "remote.form.error".to_owned())
                     .child(SharedString::from(reason.to_owned())),
             );
+        }
+
+        // The X11 mode is part of this attempt, so it is chosen here as well as in the
+        // host dialog: a saved default decides what the form starts with, not what this
+        // connection has to use (R11).
+        if !busy {
+            let chosen = panel.x11();
+            let mut modes =
+                components::segmented(metrics).debug_selector(|| "remote.x11.mode".to_owned());
+            for (mode, label, selector) in [
+                (X11Forwarding::Off, strings.x11_off_label, "remote.x11.off"),
+                (
+                    X11Forwarding::Restricted,
+                    strings.x11_restricted_label,
+                    "remote.x11.restricted",
+                ),
+                (
+                    X11Forwarding::Trusted,
+                    strings.x11_trusted_label,
+                    "remote.x11.trusted",
+                ),
+            ] {
+                modes = modes.child(
+                    components::segment(label, mode == chosen, metrics)
+                        .id(selector)
+                        .debug_selector(move || selector.to_owned())
+                        .on_click(cx.listener(move |view, _event, _window, cx| {
+                            if let Some(panel) = view.remote.as_mut() {
+                                panel.set_x11(mode);
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            // One compact line: the dialog's body also holds the other attempts, and a
+            // paragraph here would push them out of a small window (R4, R11). What the
+            // three modes mean is in the tooltip; the risk sentence appears only when
+            // the mode that carries the risk is chosen.
+            form = form.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .id("remote.x11.label")
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .tooltip(components::tooltip(strings.x11_note))
+                            .debug_selector(|| "remote.x11.label".to_owned())
+                            .child(strings.x11_connect_label),
+                    )
+                    .child(modes),
+            );
+            if chosen.needs_risk_confirmation() {
+                form = form.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(Tone::Warning.text())
+                        .debug_selector(|| "remote.x11.warning".to_owned())
+                        .child(strings.x11_trusted_body),
+                );
+            }
         }
 
         if busy {
@@ -10463,6 +10698,9 @@ impl ShelluneView {
                         .when(!live, |row| {
                             row.child(components::chip(state_label, tone, metrics))
                         })
+                        .when_some(self.x11.get(&id).cloned(), |row, status| {
+                            row.child(self.x11_chip(&status, metrics))
+                        })
                         .children(self.unsaved.iter().find(|(session, _)| *session == id).map(
                             |_| {
                                 div()
@@ -10538,6 +10776,49 @@ impl ShelluneView {
             .w_full()
             .child(row)
             .children(notice.map(|notice| self.quick_save_banner(&notice)))
+    }
+
+    /// What X11 forwarding of this session is doing, on its session bar (R11).
+    ///
+    /// The chip is the state, not a decoration: off says nothing was requested,
+    /// "starting" says the request is on its way, "X11" says a remote program can reach
+    /// this machine's display, and "failed" says why it cannot. The reason and the next
+    /// step are in the tooltip, because the bar has no room for them and a session that
+    /// failed to forward is still a working session.
+    fn x11_chip(&self, status: &X11Status, metrics: Metrics) -> gpui::Stateful<Div> {
+        let strings = self.strings();
+        let selector = match status {
+            X11Status::Off => "session.x11.off",
+            X11Status::Enabling => "session.x11.enabling",
+            X11Status::Ready { .. } => "session.x11.ready",
+            X11Status::Failed { .. } => "session.x11.failed",
+        };
+        let (label, tone, detail) = match status {
+            X11Status::Off => (
+                strings.x11_bar_off,
+                Tone::Neutral,
+                strings.x11_note.to_owned(),
+            ),
+            X11Status::Enabling => (
+                strings.x11_bar_enabling,
+                Tone::Warning,
+                strings.x11_note.to_owned(),
+            ),
+            X11Status::Ready { display } => (
+                strings.x11_bar_ready,
+                Tone::Positive,
+                format!("{}: {display}", strings.x11_label),
+            ),
+            X11Status::Failed { reason, next_step } => (
+                strings.x11_bar_failed,
+                Tone::Danger,
+                format!("{reason}\n{}: {next_step}", strings.next_step),
+            ),
+        };
+        components::chip(label, tone, metrics)
+            .id(selector)
+            .debug_selector(move || selector.to_owned())
+            .tooltip(components::tooltip(detail))
     }
 
     /// The save result, on the session bar that holds the save button.
@@ -11458,6 +11739,7 @@ fn remote_status_label(status: &RemoteStatus, strings: &Strings) -> (&'static st
         RemoteStatus::Connecting => (strings.remote_connecting, Tone::Warning),
         RemoteStatus::VerifyingHost(_) => (strings.remote_verifying, Tone::Warning),
         RemoteStatus::ConfirmingProxy { .. } => (strings.remote_proxy_title, Tone::Warning),
+        RemoteStatus::ConfirmingX11 { .. } => (strings.x11_trusted_title, Tone::Warning),
         RemoteStatus::Live => (strings.remote_live, Tone::Positive),
         RemoteStatus::Failed(_) => (strings.remote_failed, Tone::Danger),
     }

@@ -6086,6 +6086,7 @@ dependencies = [
  "shellune-core",
  "ssh-key",
  "tokio",
+ "uuid",
  "zeroize",
 ]
 

@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 
 use shellune_core::{
     DEFAULT_SSH_PORT, Endpoint, ForwardBuildError, ForwardKind, ForwardRule, HostConfig, HostId,
+    X11Forwarding,
 };
 
 use crate::book::{HostBook, HostEdit};
@@ -366,6 +367,15 @@ pub struct ImportedHost {
     /// True once a ProxyCommand line, including `none`, has been taken.
     proxy_set: bool,
     forwards: Vec<ImportedForward>,
+    /// The X11 mode the file's ForwardX11/ForwardX11Trusted lines add up to (R11).
+    x11: Option<X11Forwarding>,
+    /// The first ForwardX11 value the file set, kept so the trusted line can be read
+    /// in its context: a trusted yes enables forwarding even without ForwardX11 yes.
+    forward_x11: Option<bool>,
+    /// The first ForwardX11Trusted value the file set.
+    forward_x11_trusted: Option<bool>,
+    /// The line of the first X11 directive, for a note about a bad value.
+    x11_line: usize,
     /// The network fields must be shown and must not be written.
     withhold: bool,
     outcome: ImportOutcome,
@@ -424,6 +434,16 @@ impl ImportedHost {
         &self.forwards
     }
 
+    /// The X11 mode the file asks for, when it asks for one (R11).
+    ///
+    /// None means the file says nothing about X11, which is the off default. The
+    /// trusted mode is what ForwardX11Trusted yes means and still needs the risk
+    /// confirmation before a connection uses it.
+    #[must_use]
+    pub fn x11(&self) -> Option<X11Forwarding> {
+        self.x11
+    }
+
     /// How this host would be imported.
     #[must_use]
     pub fn outcome(&self) -> ImportOutcome {
@@ -477,6 +497,12 @@ impl ImportedHost {
         if !self.forwards.is_empty() {
             summary.push_str(" · ");
             summary.push_str(&format!("{} forward", self.forwards.len()));
+        }
+        match self.x11 {
+            Some(X11Forwarding::Off) => summary.push_str(" · X11 off"),
+            Some(X11Forwarding::Restricted) => summary.push_str(" · X11"),
+            Some(X11Forwarding::Trusted) => summary.push_str(" · X11 trusted"),
+            None => {}
         }
         summary
     }
@@ -810,6 +836,9 @@ impl ImportPreview {
             };
             record.set_identity_file(host.identity_file());
             record.set_proxy_command(host.proxy_command());
+            if let Some(mode) = host.x11() {
+                record.set_x11(mode);
+            }
             created.insert(name.clone(), record.id());
             taken.insert(name);
             edits.push(HostEdit::create(record));
@@ -1293,6 +1322,8 @@ enum Directive {
     IdentityFile,
     Proxy,
     Forwarding,
+    /// ForwardX11 and ForwardX11Trusted (R11).
+    X11,
     Include,
     Ignored,
 }
@@ -1309,6 +1340,7 @@ fn classify(keyword: &str) -> Directive {
         "identityfile" => Directive::IdentityFile,
         "proxyjump" | "proxycommand" => Directive::Proxy,
         "localforward" | "remoteforward" | "dynamicforward" => Directive::Forwarding,
+        "forwardx11" | "forwardx11trusted" => Directive::X11,
         "include" => Directive::Include,
         _ => Directive::Ignored,
     }
@@ -1349,6 +1381,10 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
         proxy_command: None,
         proxy_set: false,
         forwards: Vec::new(),
+        x11: None,
+        forward_x11: None,
+        forward_x11_trusted: None,
+        x11_line: 0,
         withhold: false,
         outcome: ImportOutcome::Ready,
         notes: Vec::new(),
@@ -1391,6 +1427,10 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
                         );
                     }
                     Directive::Include | Directive::Ignored => {}
+                    // Whether a Match block applies is not evaluated, so its X11
+                    // preference is unknown: applying it could turn forwarding on
+                    // behind the user's back.
+                    Directive::X11 => unknown.push(&setting.keyword),
                     Directive::HostName
                     | Directive::User
                     | Directive::Port
@@ -1455,6 +1495,9 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
                 Directive::Forwarding => {
                     apply_forward(&mut host, setting, &mut review, &mut reported);
                 }
+                Directive::X11 => {
+                    apply_x11(&mut host, setting, &mut review, &mut reported);
+                }
                 Directive::Include => {
                     review = true;
                     push_once(
@@ -1509,6 +1552,7 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
             ),
         );
     }
+    host.x11 = settle_x11(&host);
     if host.user.is_none() {
         review = true;
         host.notes.push(ImportNote::new(
@@ -1671,6 +1715,85 @@ fn apply_port(
                 ),
             );
         }
+    }
+}
+
+/// Applies one `ForwardX11` or `ForwardX11Trusted`, keeping the first obtained value.
+///
+/// Both take `yes` or `no`, and the two are read separately: a later
+/// `ForwardX11Trusted yes` does not rewrite the `ForwardX11` line that came before it.
+/// What the pair adds up to is decided by [`settle_x11`] once every block is read.
+fn apply_x11(
+    host: &mut ImportedHost,
+    setting: &Setting,
+    review: &mut bool,
+    reported: &mut HashSet<(NoteKind, String)>,
+) {
+    let parsed = match setting.value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "true" | "1" => Some(true),
+        "no" | "false" | "0" => Some(false),
+        _ => None,
+    };
+    let Some(value) = parsed else {
+        *review = true;
+        push_once(
+            &mut host.notes,
+            reported,
+            ImportNote::new(
+                setting.line,
+                &setting.keyword,
+                NoteKind::InvalidValue,
+                format!(
+                    "line {}: {} takes yes or no, so \"{}\" was not applied and the X11 mode is unknown",
+                    setting.line, setting.keyword, setting.value
+                ),
+            ),
+        );
+        return;
+    };
+    let trusted = setting.lower == "forwardx11trusted";
+    let slot = if trusted {
+        &mut host.forward_x11_trusted
+    } else {
+        &mut host.forward_x11
+    };
+    if let Some(existing) = *slot {
+        if existing != value {
+            push_once(
+                &mut host.notes,
+                reported,
+                ImportNote::new(
+                    setting.line,
+                    &setting.keyword,
+                    NoteKind::Superseded,
+                    format!(
+                        "line {}: {} {} was ignored because an earlier line already set it to {}",
+                        setting.line,
+                        setting.keyword,
+                        setting.value,
+                        if existing { "yes" } else { "no" }
+                    ),
+                ),
+            );
+        }
+        return;
+    }
+    *slot = Some(value);
+    host.x11_line = setting.line;
+}
+
+/// What a host's `ForwardX11` and `ForwardX11Trusted` lines add up to.
+///
+/// The result is the three-value mode OpenSSH names on its command line: a trusted
+/// `yes` is `-Y` (and enables forwarding on its own, as ssh does), a plain `ForwardX11
+/// yes` is `-X`, and anything else that was set is off. A file that sets neither says
+/// nothing, which is the off default and not a claim about the file.
+fn settle_x11(host: &ImportedHost) -> Option<X11Forwarding> {
+    match (host.forward_x11, host.forward_x11_trusted) {
+        (None, None) => None,
+        (_, Some(true)) => Some(X11Forwarding::Trusted),
+        (Some(true), _) => Some(X11Forwarding::Restricted),
+        _ => Some(X11Forwarding::Off),
     }
 }
 
@@ -2270,6 +2393,151 @@ host db
         assert!(
             !preview.is_partial(),
             "nothing was skipped, so nothing is partial"
+        );
+    }
+
+    #[test]
+    fn x11_forwarding_is_read_from_the_two_directives_and_stays_off_by_default() {
+        let preview = parse_preview(
+            "\
+Host restricted
+    HostName r.example.org
+    User deploy
+    ForwardX11 yes
+
+Host trusted
+    HostName t.example.org
+    User deploy
+    ForwardX11Trusted yes
+
+Host off
+    HostName o.example.org
+    User deploy
+    ForwardX11 no
+
+Host silent
+    HostName s.example.org
+    User deploy
+",
+        );
+        assert_eq!(
+            host(&preview, "restricted").x11(),
+            Some(X11Forwarding::Restricted),
+            "ForwardX11 yes is the restricted mode of ssh -X"
+        );
+        assert_eq!(
+            host(&preview, "trusted").x11(),
+            Some(X11Forwarding::Trusted),
+            "ForwardX11Trusted yes enables forwarding and lifts the security limits"
+        );
+        assert_eq!(host(&preview, "off").x11(), Some(X11Forwarding::Off));
+        assert_eq!(
+            host(&preview, "silent").x11(),
+            None,
+            "a file that says nothing about X11 does not turn it on"
+        );
+        assert!(
+            !host(&preview, "silent").summary().contains("X11"),
+            "an X11 mode that was not set is not in the summary"
+        );
+        assert!(
+            host(&preview, "trusted").summary().contains("X11 trusted"),
+            "{}",
+            host(&preview, "trusted").summary()
+        );
+    }
+
+    #[test]
+    fn the_plan_carries_the_x11_mode_and_a_later_line_does_not_override_the_first() {
+        let preview = parse_preview(
+            "\
+Host web
+    HostName web.example.org
+    User deploy
+    ForwardX11 no
+    ForwardX11 yes
+    ForwardX11Trusted no
+",
+        );
+        let web = host(&preview, "web");
+        assert_eq!(
+            web.x11(),
+            Some(X11Forwarding::Off),
+            "the first ForwardX11 line is the one that counts"
+        );
+        assert!(
+            web.notes()
+                .iter()
+                .any(|note| note.kind() == NoteKind::Superseded && note.keyword() == "ForwardX11"),
+            "a superseded X11 line is reported: {:?}",
+            web.notes()
+        );
+
+        let book = HostBook::default();
+        let plan = preview.plan(&book);
+        let record = plan
+            .edits()
+            .iter()
+            .find(|edit| edit.host().name() == "web")
+            .expect("the host is planned")
+            .host();
+        assert_eq!(record.x11(), X11Forwarding::Off);
+    }
+
+    #[test]
+    fn a_value_forwardx11_cannot_use_is_reported_and_does_not_turn_forwarding_on() {
+        let preview = parse_preview(
+            "\
+Host web
+    HostName web.example.org
+    User deploy
+    ForwardX11 maybe
+",
+        );
+        let web = host(&preview, "web");
+        assert_eq!(
+            web.x11(),
+            None,
+            "a value that was not applied sets no mode, so forwarding stays off"
+        );
+        assert_eq!(
+            web.outcome(),
+            ImportOutcome::NeedsReview,
+            "a value that was not applied needs a look"
+        );
+        assert!(
+            web.notes().iter().any(|note| {
+                note.kind() == NoteKind::InvalidValue && note.keyword() == "ForwardX11"
+            }),
+            "{:?}",
+            web.notes()
+        );
+    }
+
+    #[test]
+    fn an_x11_line_inside_a_match_block_is_not_applied_behind_the_users_back() {
+        let preview = parse_preview(
+            "\
+Match host web
+    ForwardX11Trusted yes
+
+Host web
+    HostName web.example.org
+    User deploy
+",
+        );
+        let web = host(&preview, "web");
+        assert_eq!(
+            web.x11(),
+            None,
+            "an X11 mode from a Match block this importer does not evaluate is unknown"
+        );
+        assert!(
+            web.notes()
+                .iter()
+                .any(|note| note.kind() == NoteKind::Match),
+            "{:?}",
+            web.notes()
         );
     }
 

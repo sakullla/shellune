@@ -19,6 +19,57 @@ use crate::task::TransferProtocol;
 /// Port used when the user does not specify one.
 pub const DEFAULT_SSH_PORT: u16 = 22;
 
+/// How much an SSH session may forward X11 to the local display (R11).
+///
+/// The three values are the ones OpenSSH names on its command line: `-X` is
+/// [`Self::Restricted`], `-Y` is [`Self::Trusted`], and no flag is [`Self::Off`].
+/// They are not three spellings of "on": the trusted mode lets the server reach the
+/// local display without the X11 SECURITY extension restrictions, so a remote program
+/// can read the keystrokes of other windows of that display. That is why the default
+/// is off and why a trusted connection asks again every time.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum X11Forwarding {
+    /// No forwarding. No request is sent and no remote `DISPLAY` is set.
+    #[default]
+    Off,
+    /// Forwarding limited by the X11 SECURITY extension, like `ssh -X`.
+    Restricted,
+    /// Forwarding without those limits, like `ssh -Y`.
+    Trusted,
+}
+
+impl X11Forwarding {
+    /// Every mode, in the order a chooser shows them.
+    pub const ALL: [Self; 3] = [Self::Off, Self::Restricted, Self::Trusted];
+
+    /// Whether this mode asks the server for a channel at all.
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Whether this mode needs the per-connection risk confirmation.
+    ///
+    /// Only the trusted mode does: it is the one that lifts the SECURITY extension
+    /// limits on what the remote programs may do with the local display.
+    #[must_use]
+    pub fn needs_risk_confirmation(self) -> bool {
+        self == Self::Trusted
+    }
+}
+
+impl std::fmt::Display for X11Forwarding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "off",
+            Self::Restricted => "restricted",
+            Self::Trusted => "trusted",
+        })
+    }
+}
+
 /// A TCP port that is known to be usable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -144,6 +195,15 @@ pub struct HostConfig {
     /// becomes an SFTP one, and the reverse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transfer_protocol: Option<TransferProtocol>,
+    /// How an SSH session to this host may forward X11, when the user chose (R11).
+    ///
+    /// Absent means [`X11Forwarding::Off`], which is also what a record written before
+    /// the choice existed means, so an older file stays byte-identical and no session
+    /// starts asking a server for a display channel without the user saying so. A
+    /// single connection may choose another mode from this host's default; that choice
+    /// belongs to the attempt and does not change this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x11: Option<X11Forwarding>,
 }
 
 /// The stored shape of a host.
@@ -180,6 +240,9 @@ struct HostConfigWire {
     /// Absent in files written before the default copy protocol was stored.
     #[serde(default)]
     transfer_protocol: Option<TransferProtocol>,
+    /// Absent in files written before an X11 mode was stored.
+    #[serde(default)]
+    x11: Option<X11Forwarding>,
 }
 
 impl TryFrom<HostConfigWire> for HostConfig {
@@ -211,6 +274,9 @@ impl TryFrom<HostConfigWire> for HostConfig {
             transfer_protocol: wire
                 .transfer_protocol
                 .filter(|protocol| *protocol != TransferProtocol::Sftp),
+            // The off default is stored as no choice at all, so a record that never
+            // asked for X11 keeps the shape an older build wrote.
+            x11: wire.x11.filter(|mode| *mode != X11Forwarding::Off),
         })
     }
 }
@@ -269,6 +335,7 @@ impl HostConfig {
             jumps: Vec::new(),
             proxy_command: None,
             transfer_protocol: None,
+            x11: None,
         })
     }
 
@@ -363,6 +430,17 @@ impl HostConfig {
     #[must_use]
     pub fn transfer_protocol(&self) -> TransferProtocol {
         self.transfer_protocol.unwrap_or_default()
+    }
+
+    /// How a session to this host forwards X11 unless the connection form says
+    /// otherwise (R11).
+    ///
+    /// [`X11Forwarding::Off`] unless the user chose a mode, so a host saved before the
+    /// choice existed never asks a server for a display channel. The value is a
+    /// default for new connections; it does not change a session that is already live.
+    #[must_use]
+    pub fn x11(&self) -> X11Forwarding {
+        self.x11.unwrap_or_default()
     }
 
     /// `user@address:port`, the form used in confirmation prompts.
@@ -469,6 +547,16 @@ impl HostConfig {
     /// the same thing.
     pub fn set_transfer_protocol(&mut self, protocol: TransferProtocol) {
         self.transfer_protocol = (protocol != TransferProtocol::Sftp).then_some(protocol);
+    }
+
+    /// Chooses how new sessions to this host forward X11.
+    ///
+    /// The off default is stored as "nothing", so choosing it again leaves a record
+    /// written by an older build byte-identical instead of growing a field that says
+    /// the same thing. A live session is not changed by this: the mode belongs to the
+    /// connection it was dialled with.
+    pub fn set_x11(&mut self, mode: X11Forwarding) {
+        self.x11 = (mode != X11Forwarding::Off).then_some(mode);
     }
 }
 
@@ -917,6 +1005,7 @@ mod sign_in_tests {
             "jumps",
             "proxy_command",
             "transfer_protocol",
+            "x11",
         ] {
             assert!(
                 !json.contains(field),
@@ -991,6 +1080,60 @@ mod sign_in_tests {
         );
         host.set_startup_command(Some("   "));
         assert_eq!(host.startup_command(), None);
+    }
+
+    #[test]
+    fn x11_forwarding_is_off_unless_the_host_was_told_otherwise() {
+        let mut host = host();
+        assert_eq!(
+            host.x11(),
+            X11Forwarding::Off,
+            "a host saved before the choice existed forwards no display"
+        );
+        assert_eq!(X11Forwarding::default(), X11Forwarding::Off);
+        assert!(
+            !serde_json::to_string(&host)
+                .expect("serializes")
+                .contains("\"x11\""),
+            "the off default is not written as a field"
+        );
+        assert!(!X11Forwarding::Off.is_enabled());
+        assert!(!X11Forwarding::Off.needs_risk_confirmation());
+
+        host.set_x11(X11Forwarding::Restricted);
+        let json = serde_json::to_string(&host).expect("serializes");
+        assert!(json.contains("\"x11\":\"Restricted\""), "{json}");
+        let back: HostConfig = serde_json::from_str(&json).expect("reads");
+        assert_eq!(back.x11(), X11Forwarding::Restricted);
+        assert!(X11Forwarding::Restricted.is_enabled());
+        assert!(
+            !X11Forwarding::Restricted.needs_risk_confirmation(),
+            "the restricted mode is the one that needs no risk prompt"
+        );
+
+        host.set_x11(X11Forwarding::Trusted);
+        let back: HostConfig =
+            serde_json::from_str(&serde_json::to_string(&host).expect("serializes"))
+                .expect("reads");
+        assert_eq!(back.x11(), X11Forwarding::Trusted);
+        assert!(X11Forwarding::Trusted.needs_risk_confirmation());
+
+        // Choosing the default again is the absence of a choice, not a second
+        // encoding of it: the record shrinks back to what an older build wrote.
+        host.set_x11(X11Forwarding::Off);
+        assert!(
+            !serde_json::to_string(&host)
+                .expect("serializes")
+                .contains("\"x11\""),
+            "the default is stored as nothing at all"
+        );
+    }
+
+    #[test]
+    fn every_x11_mode_is_a_distinct_value_a_chooser_can_show() {
+        let rendered: Vec<String> = X11Forwarding::ALL.iter().map(ToString::to_string).collect();
+        assert_eq!(rendered, ["off", "restricted", "trusted"]);
+        assert_eq!(X11Forwarding::ALL.len(), 3);
     }
 }
 

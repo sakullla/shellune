@@ -57,6 +57,11 @@ PrintLastLog no
 AllowTcpForwarding yes
 PermitOpen any
 PermitListen any
+# X11 forwarding: the display tests ask this server for a channel back to the
+# client, so the server itself has to allow it and to have xauth to prepare the
+# remote DISPLAY. A distro default of "no" would otherwise look like a client bug.
+X11Forwarding yes
+XAuthLocation /usr/bin/xauth
 MaxSessions 50
 MaxStartups 50:30:200
 # A test deliberately tries a wrong password and then the right key on the same

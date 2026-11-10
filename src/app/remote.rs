@@ -16,11 +16,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 
 use shellune_core::{
-    AgentKind, AuthMethod, AuthMethodKind, HostConfig, HostId, SecretString, connection_jump_fault,
+    AgentKind, AuthMethod, AuthMethodKind, HostConfig, HostId, SecretString, X11Forwarding,
+    connection_jump_fault,
 };
 use shellune_ssh::{
     ChainEvent, ChainFailure, ChainRequest, ChainSession, ConnectError, FileLink, HopAuth,
-    HostKeyPrompt, KnownHostKey, PtySize, RemoteEvent, RemoteSession, TransferLink,
+    HostKeyPrompt, KnownHostKey, PtySize, RemoteEvent, RemoteSession, TransferLink, X11Status,
 };
 use shellune_storage::{HostKey, HostTrust, TrustEntry, TrustError};
 
@@ -207,6 +208,17 @@ impl RemoteFailure {
     }
 }
 
+/// What the user answered when asked to accept the risks of trusted X11 forwarding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X11Answer {
+    /// Trusted forwarding, for this connection only.
+    Trusted,
+    /// Keep forwarding, but with the SECURITY extension limits (`ssh -X`).
+    Restricted,
+    /// Connect nothing at all; the form stays as it was.
+    Cancel,
+}
+
 /// Where an attempt currently is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteStatus {
@@ -225,6 +237,14 @@ pub enum RemoteStatus {
         /// The expanded command. Nothing has been started.
         command: String,
     },
+    /// Trusted X11 forwarding is chosen and waitng for the user to accept its risks.
+    ///
+    /// Nothing has been dialled: a trusted display channel is only asked for after
+    /// this question was answered, every time a connection uses it.
+    ConfirmingX11 {
+        /// The mode that was chosen and needs the answer.
+        mode: X11Forwarding,
+    },
     /// The remote shell is live.
     Live,
     /// The attempt ended, with the reason.
@@ -235,13 +255,28 @@ impl RemoteStatus {
     /// Whether an attempt is in flight.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        matches!(self, Self::Connecting | Self::ConfirmingProxy { .. })
+        matches!(
+            self,
+            Self::Connecting | Self::ConfirmingProxy { .. } | Self::ConfirmingX11 { .. }
+        )
     }
 
     /// Whether the user is being asked about the server identity or a ProxyCommand.
     #[must_use]
     pub fn is_asking(&self) -> bool {
-        matches!(self, Self::VerifyingHost(_) | Self::ConfirmingProxy { .. })
+        matches!(
+            self,
+            Self::VerifyingHost(_) | Self::ConfirmingProxy { .. } | Self::ConfirmingX11 { .. }
+        )
+    }
+
+    /// The X11 mode waiting for its risk confirmation, when one is.
+    #[must_use]
+    pub fn x11_question(&self) -> Option<X11Forwarding> {
+        match self {
+            Self::ConfirmingX11 { mode } => Some(*mode),
+            _ => None,
+        }
     }
 
     /// The prompt, when there is one.
@@ -288,6 +323,15 @@ pub struct RemotePanel {
     form_error: Option<String>,
     /// Names the hop this form is collecting credentials for, when it is not obvious.
     hop_label: Option<String>,
+    /// How this connection forwards X11, starting from the host's default (R11).
+    ///
+    /// It belongs to this attempt: choosing another mode here does not change the
+    /// saved host, which is what the host dialog is for.
+    x11: X11Forwarding,
+    /// Whether the trusted mode's risks were accepted for this attempt.
+    ///
+    /// Cleared for every new attempt, because the confirmation is per connection.
+    x11_accepted: bool,
 }
 
 impl RemotePanel {
@@ -314,6 +358,8 @@ impl RemotePanel {
             status: RemoteStatus::Idle,
             form_error: None,
             hop_label: None,
+            x11: host.x11(),
+            x11_accepted: false,
         }
     }
 
@@ -333,6 +379,50 @@ impl RemotePanel {
     #[must_use]
     pub fn host(&self) -> &HostConfig {
         &self.host
+    }
+
+    /// How this connection forwards X11, as the form is set now (R11).
+    #[must_use]
+    pub fn x11(&self) -> X11Forwarding {
+        self.x11
+    }
+
+    /// Chooses the X11 mode for this attempt, returning whether it changed.
+    ///
+    /// The mode is not written to the host record: it applies to this connection, and
+    /// the host dialog is where a default is saved.
+    pub fn set_x11(&mut self, mode: X11Forwarding) -> bool {
+        let changed = self.x11 != mode;
+        self.x11 = mode;
+        if changed {
+            // A different mode is a different question, so an earlier answer no longer
+            // describes what the form is asking for.
+            self.x11_accepted = false;
+        }
+        changed
+    }
+
+    /// Whether the trusted mode of this form was accepted for this attempt.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn x11_accepted(&self) -> bool {
+        self.x11_accepted
+    }
+
+    /// Records that the risks of trusted forwarding were accepted.
+    pub fn accept_x11(&mut self) {
+        self.x11_accepted = true;
+    }
+
+    /// Asks again before the next attempt: the confirmation is per connection.
+    pub fn forget_x11_acceptance(&mut self) {
+        self.x11_accepted = false;
+    }
+
+    /// Whether this form asks for a risk confirmation before it may dial.
+    #[must_use]
+    pub fn needs_x11_confirmation(&self) -> bool {
+        self.x11.needs_risk_confirmation() && !self.x11_accepted
     }
 
     /// The chosen method.
@@ -744,6 +834,15 @@ pub enum LinkEvent {
     },
     /// A direct session failed.
     FailedRemote(ConnectError),
+    /// What X11 forwarding of this attempt is doing (R11).
+    ///
+    /// Not a connection outcome: a failed display bridge leaves the shell working.
+    X11 {
+        /// The hop whose session it belongs to, when the event names one.
+        host_id: Option<HostId>,
+        /// Off, enabling, ready or failed.
+        status: X11Status,
+    },
     /// A chain failed. The display text names the hop.
     FailedChain(ChainFailure),
 }
@@ -784,6 +883,10 @@ impl AttemptLink {
                         prompt,
                     },
                     RemoteEvent::Connected => LinkEvent::Connected,
+                    RemoteEvent::X11(status) => LinkEvent::X11 {
+                        host_id: None,
+                        status,
+                    },
                     RemoteEvent::Data(bytes) => LinkEvent::Data(bytes),
                     RemoteEvent::Exited { code } => LinkEvent::Exited { code },
                     RemoteEvent::Failed(error) => LinkEvent::FailedRemote(error),
@@ -805,6 +908,10 @@ impl AttemptLink {
                     }),
                     ChainEvent::HopReady(hop) => Some(LinkEvent::HopReady(hop.host_id)),
                     ChainEvent::Connected { .. } => Some(LinkEvent::Connected),
+                    ChainEvent::X11 { hop, status } => Some(LinkEvent::X11 {
+                        host_id: Some(hop.host_id),
+                        status,
+                    }),
                     ChainEvent::Data(bytes) => Some(LinkEvent::Data(bytes)),
                     ChainEvent::Exited { code } => Some(LinkEvent::Exited { code }),
                     ChainEvent::Failed(failure) => Some(LinkEvent::FailedChain(failure)),

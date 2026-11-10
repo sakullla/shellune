@@ -21,6 +21,8 @@
 //!   a server that offers no SFTP subsystem;
 //! * [forwarding] binds local and dynamic listeners and asks the server for remote
 //!   ones, on the connection that is already authenticated;
+//! * [x11] bridges the X11 channels a server opens for a session to the local display,
+//!   with a cookie of its own so the real one never leaves this machine;
 //! * [error] keeps every failure free of credentials.
 
 pub mod agent;
@@ -34,6 +36,7 @@ pub mod session;
 pub mod sftp;
 pub mod transfer;
 mod transport;
+pub mod x11;
 
 /// A disposable OpenSSH server, for the tests that need a real one.
 #[cfg(any(test, feature = "test-support"))]
@@ -52,3 +55,5 @@ pub use session::{
 };
 pub use sftp::FileLink;
 pub use transfer::{TransferCommand, TransferLink, TransferRequest};
+/// What a session's X11 forwarding is doing, and why it is not (R11).
+pub use x11::{X11Failure, X11Status};

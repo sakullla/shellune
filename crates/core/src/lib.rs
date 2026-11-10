@@ -38,8 +38,8 @@ pub use forward::{
     ForwardBuildError, ForwardFault, ForwardKind, ForwardRule,
 };
 pub use host::{
-    DEFAULT_SSH_PORT, HostConfig, HostValidationError, JumpFault, Port, connection_jump_fault,
-    jump_faults,
+    DEFAULT_SSH_PORT, HostConfig, HostValidationError, JumpFault, Port, X11Forwarding,
+    connection_jump_fault, jump_faults,
 };
 pub use ids::{ForwardId, HostId, PaneId, SessionId, TabId, TransferId};
 pub use session::{

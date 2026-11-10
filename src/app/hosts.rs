@@ -12,7 +12,7 @@
 //! * a message says what really happened. "Saved" never implies a connection was
 //!   opened, and a failure keeps the reason the storage layer produced.
 
-use shellune_core::{AuthMethodKind, HostConfig, HostId, Port, TransferProtocol};
+use shellune_core::{AuthMethodKind, HostConfig, HostId, Port, TransferProtocol, X11Forwarding};
 use shellune_storage::{
     DEFAULT_CONFIG_TEXT, Group, HostBook, HostEdit, ImportOutcome, ImportPlan, ImportPreview,
     RecentHost, host_matches,
@@ -161,6 +161,11 @@ pub struct HostDraft {
     /// SFTP unless changed here. A single transfer may still choose the other one; that
     /// choice belongs to the task and does not change this host.
     protocol: TransferProtocol,
+    /// How new sessions to this host forward X11 (R11).
+    ///
+    /// Off unless chosen here. A single connection may still choose another mode; that
+    /// choice belongs to the attempt and does not change this host.
+    x11: X11Forwarding,
 }
 
 impl HostDraft {
@@ -183,6 +188,7 @@ impl HostDraft {
             jumps: Vec::new(),
             proxy: String::new(),
             protocol: TransferProtocol::Sftp,
+            x11: X11Forwarding::Off,
         }
     }
 
@@ -211,6 +217,7 @@ impl HostDraft {
             jumps: host.jumps().to_vec(),
             proxy: host.proxy_command().unwrap_or_default().to_owned(),
             protocol: host.transfer_protocol(),
+            x11: host.x11(),
         }
     }
 
@@ -224,6 +231,19 @@ impl HostDraft {
     pub fn set_protocol(&mut self, protocol: TransferProtocol) -> bool {
         let changed = self.protocol != protocol;
         self.protocol = protocol;
+        changed
+    }
+
+    /// How new sessions to this host forward X11.
+    #[must_use]
+    pub fn x11(&self) -> X11Forwarding {
+        self.x11
+    }
+
+    /// Chooses the X11 mode of new sessions, returning whether it changed.
+    pub fn set_x11(&mut self, mode: X11Forwarding) -> bool {
+        let changed = self.x11 != mode;
+        self.x11 = mode;
         changed
     }
 
@@ -415,7 +435,7 @@ impl HostDraft {
         !self.jumps.is_empty() && !self.proxy.trim().is_empty()
     }
 
-    /// Writes the jump chain, the ProxyCommand and the copy protocol.
+    /// Writes the jump chain, the ProxyCommand, the copy protocol and the X11 mode.
     ///
     /// A blank command clears it, and the SFTP default is stored as no choice at all, so
     /// a host that was never changed around these fields keeps the record it had.
@@ -423,6 +443,7 @@ impl HostDraft {
         host.set_jumps(self.jumps.iter().copied());
         host.set_proxy_command(Some(self.proxy.clone()));
         host.set_transfer_protocol(self.protocol);
+        host.set_x11(self.x11);
     }
 
     /// The key path to store: kept only for a method that reads a key file.

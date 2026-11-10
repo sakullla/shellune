@@ -515,3 +515,92 @@ Host files
         "planning and saving do not run or rewrite the source"
     );
 }
+
+#[test]
+fn x11_forwarding_from_the_file_reaches_the_saved_host_without_touching_the_source() {
+    let dir = TempDir::new("x11");
+    let config = dir.write_config(
+        "\
+Host restricted
+    HostName r.example.org
+    User deploy
+    ForwardX11 yes
+
+Host trusted
+    HostName t.example.org
+    User deploy
+    ForwardX11Trusted yes
+
+Host plain
+    HostName p.example.org
+    User deploy
+",
+    );
+    let before = std::fs::read(&config).expect("the configuration is readable");
+    let preview = ImportPreview::from_file(&config).expect("the configuration parses");
+
+    assert_eq!(
+        preview
+            .hosts()
+            .iter()
+            .find(|host| host.alias() == "restricted")
+            .expect("restricted is previewed")
+            .x11(),
+        Some(shellune_core::X11Forwarding::Restricted),
+        "ForwardX11 yes is the restricted mode"
+    );
+    let trusted = preview
+        .hosts()
+        .iter()
+        .find(|host| host.alias() == "trusted")
+        .expect("trusted is previewed");
+    assert_eq!(
+        trusted.x11(),
+        Some(shellune_core::X11Forwarding::Trusted),
+        "ForwardX11Trusted yes is the trusted mode"
+    );
+    assert!(
+        trusted.summary().contains("X11"),
+        "the preview row says the host forwards a display: {}",
+        trusted.summary()
+    );
+    assert_eq!(
+        preview
+            .hosts()
+            .iter()
+            .find(|host| host.alias() == "plain")
+            .expect("plain is previewed")
+            .x11(),
+        None,
+        "a host the file says nothing about forwards nothing"
+    );
+
+    let store = dir.store();
+    let mut book = store.load().expect("a first run is not a failure");
+    let plan = preview.plan(&book);
+    plan.apply(&mut book).expect("the hosts are added");
+    store.save(&book).expect("the book saves");
+
+    let saved = |name: &str| {
+        book.hosts()
+            .iter()
+            .find(|host| host.name() == name)
+            .expect("the host is saved")
+            .x11()
+    };
+    assert_eq!(
+        saved("restricted"),
+        shellune_core::X11Forwarding::Restricted
+    );
+    assert_eq!(saved("trusted"), shellune_core::X11Forwarding::Trusted);
+    assert_eq!(
+        saved("plain"),
+        shellune_core::X11Forwarding::Off,
+        "a host saved from a file that says nothing forwards nothing"
+    );
+    assert_eq!(
+        std::fs::read(&config).expect("the configuration is readable"),
+        before,
+        "the import never writes to the client's own configuration"
+    );
+}

@@ -27,7 +27,7 @@ use std::time::Duration;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg, Disconnect};
-use shellune_core::{AgentKind, AuthMethod};
+use shellune_core::{AgentKind, AuthMethod, X11Forwarding};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
@@ -38,6 +38,7 @@ use crate::forwarding::{self, ForwardLink};
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 use crate::sftp::{self, ChannelFailure, FileLink};
 use crate::transfer::{self, TransferLink};
+use crate::x11::{self, X11Gate, X11Status};
 
 /// Value of the TERM variable the remote shell is told about.
 ///
@@ -154,6 +155,11 @@ pub struct ConnectRequest {
     pub connect_timeout: Duration,
     /// Whether this connection opens a shell. A pure forward leaves it false.
     open_shell: bool,
+    /// How this attempt forwards X11 to the local display (R11).
+    ///
+    /// Off unless the caller says otherwise: an attempt that never asked for a
+    /// display channel is what every session did before X11 forwarding existed.
+    x11: X11Forwarding,
 }
 
 impl ConnectRequest {
@@ -176,6 +182,7 @@ impl ConnectRequest {
             known,
             connect_timeout: CONNECT_TIMEOUT,
             open_shell: true,
+            x11: X11Forwarding::Off,
         }
     }
 
@@ -187,6 +194,15 @@ impl ConnectRequest {
     #[must_use]
     pub fn without_shell(mut self) -> Self {
         self.open_shell = false;
+        self
+    }
+
+    /// The same request, asking the server for X11 forwarding.
+    ///
+    /// The mode belongs to this attempt alone and is not stored on a host record.
+    #[must_use]
+    pub fn with_x11(mut self, mode: X11Forwarding) -> Self {
+        self.x11 = mode;
         self
     }
 
@@ -218,6 +234,11 @@ pub enum RemoteEvent {
         /// Exit status, when the server reported one.
         code: Option<u32>,
     },
+    /// What this session's X11 forwarding is doing (R11).
+    ///
+    /// A failure here is a status, not a session failure: the shell keeps working
+    /// without a forwarded display.
+    X11(X11Status),
     /// The attempt failed, or a live session stopped.
     Failed(ConnectError),
 }
@@ -310,6 +331,9 @@ impl RemoteSession {
             events: transfer_events,
         };
         let (forward_link, forward_events, forward_gate) = forwarding::channel(commands.clone());
+        // The X11 side exists before the connection does: the handler has to know it
+        // before a server can open the first display channel.
+        let (x11_gate, x11_events) = X11Gate::channel(request.x11);
         let size = request.size;
         // The file browser asks the loop for its channel through the same command
         // channel the terminal uses, so it needs a sender of its own.
@@ -340,6 +364,8 @@ impl RemoteSession {
                         transfers,
                         forwards: forward_events,
                         gate: forward_gate,
+                        x11: x11_gate,
+                        x11_events,
                         open: open_commands,
                     },
                 ));
@@ -495,13 +521,21 @@ struct Channels {
     transfers: transfer::Wiring,
     forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
     gate: std::sync::Arc<forwarding::ForwardGate>,
+    /// This session's X11 forwarding, shared with the handler.
+    x11: Arc<X11Gate>,
+    x11_events: tokio::sync::mpsc::UnboundedReceiver<X11Status>,
     open: UnboundedSender<Command>,
 }
 
 /// Runs one attempt to completion, reporting everything through the event channel.
 async fn run(request: ConnectRequest, channels: Channels) {
     let events = channels.events.clone();
-    if let Err(error) = connect_and_shell(request, channels).await {
+    let gate = Arc::clone(&channels.x11);
+    let result = connect_and_shell(request, channels).await;
+    // Whatever ended the session, no bridge may stay open: closing stops accepting
+    // new display channels before the open ones are dropped.
+    gate.close();
+    if let Err(error) = result {
         let _ = events.send(RemoteEvent::Failed(error));
     }
 }
@@ -519,10 +553,13 @@ async fn connect_and_shell(
         transfers,
         forwards: forward_events,
         gate,
+        x11: x11_gate,
+        mut x11_events,
         open: open_commands,
     } = channels;
     let target = request.target();
     let open_shell = request.open_shell;
+    let x11_mode = request.x11;
     let material = Material::resolve(request.auth).await?;
 
     let config = Arc::new(client::Config {
@@ -543,6 +580,7 @@ async fn connect_and_shell(
         progress: Arc::clone(&progress),
         recorded: Arc::clone(&recorded),
         gate: Arc::clone(&gate),
+        x11: Arc::clone(&x11_gate),
     };
 
     let mut handle = match dial(
@@ -590,6 +628,69 @@ async fn connect_and_shell(
             .map_err(|error| ConnectError::PtyRejected {
                 reason: error.to_string(),
             })?;
+        // A display server that is not there is reported before the request is sent,
+        // and never as a reason to stop the connection: the shell below is opened
+        // exactly as it would have been.
+        if !x11_mode.is_enabled() {
+            // A session that forwards nothing says so, instead of leaving the reader to
+            // guess whether a display channel was requested.
+            let _ = events.send(RemoteEvent::X11(X11Status::Off));
+        }
+        let prepared = if x11_mode.is_enabled() {
+            match x11::prepare(x11_mode) {
+                Ok(prepared) => match prepared.reachable().await {
+                    Ok(()) => Some(prepared),
+                    Err(failure) => {
+                        let _ = events.send(RemoteEvent::X11(X11Status::Failed {
+                            reason: failure.to_string(),
+                            next_step: failure.next_step(),
+                        }));
+                        None
+                    }
+                },
+                Err(failure) => {
+                    let _ = events.send(RemoteEvent::X11(X11Status::Failed {
+                        reason: failure.to_string(),
+                        next_step: failure.next_step(),
+                    }));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let requested = if let Some(prepared) = prepared {
+            let requested = channel
+                .request_x11(
+                    true,
+                    false,
+                    x11::AUTH_NAME,
+                    prepared.request_cookie(),
+                    prepared.screen(),
+                )
+                .await;
+            match requested {
+                Ok(()) => {
+                    x11_gate.announce(&prepared);
+                    true
+                }
+                Err(error) => {
+                    let failure = x11::X11Failure::Lost {
+                        detail: error.to_string(),
+                    };
+                    let _ = events.send(RemoteEvent::X11(X11Status::Failed {
+                        reason: failure.to_string(),
+                        next_step: failure.next_step(),
+                    }));
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        // The answers to the pseudo-terminal, the X11 request and the shell request
+        // arrive in that order, which is how the X11 one is recognised.
+        x11_gate.shell_requests(channel.id().number(), requested);
         channel
             .request_shell(true)
             .await
@@ -613,6 +714,7 @@ async fn connect_and_shell(
 
     if let Some((mut read_half, write_half)) = shell {
         let mut exit_code: Option<u32> = None;
+        let mut x11_open = true;
         loop {
             tokio::select! {
                 biased;
@@ -622,6 +724,17 @@ async fn connect_and_shell(
                         return Err(ConnectError::Disconnected {
                             reason: "the SSH connection closed".to_owned(),
                         });
+                    }
+                }
+                status = x11_events.recv(), if x11_open => {
+                    match status {
+                        Some(status) => {
+                            if events.send(RemoteEvent::X11(status)).is_err() {
+                                forwards.shutdown(&handle).await;
+                                return Ok(());
+                            }
+                        }
+                        None => x11_open = false,
                     }
                 }
                 command = commands.recv() => {
@@ -972,6 +1085,8 @@ struct ClientHandler {
     progress: Arc<HandshakeProgress>,
     recorded: Arc<Mutex<Option<ConnectError>>>,
     gate: Arc<forwarding::ForwardGate>,
+    /// This session's X11 forwarding: inbound display channels are bridged here.
+    x11: Arc<X11Gate>,
 }
 
 impl ClientHandler {
@@ -1079,6 +1194,43 @@ impl client::Handler for ClientHandler {
             reply,
         )
         .await;
+        Ok(())
+    }
+
+    /// A server opened an x11 channel for a program of this session.
+    ///
+    /// It is bridged to this machine's display, with this machine's cookie; a session
+    /// that never asked for forwarding refuses the channel.
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.x11.open_inbound(channel, reply).await;
+        Ok(())
+    }
+
+    /// The server accepted a channel request; the answers arrive in request order.
+    async fn channel_success(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.x11.on_channel_reply(channel.number(), true);
+        Ok(())
+    }
+
+    /// The server refused a channel request, which for x11-req is a refusal to
+    /// forward at all.
+    async fn channel_failure(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.x11.on_channel_reply(channel.number(), false);
         Ok(())
     }
 

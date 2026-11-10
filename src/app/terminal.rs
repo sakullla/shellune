@@ -29,7 +29,7 @@ use gpui::{
 use std::ops::Range;
 
 use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
-use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession};
+use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession, X11Status};
 use shellune_terminal::core::SearchOptions;
 use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
@@ -154,6 +154,11 @@ pub enum SourceEvent {
     Exited(ExitReport),
     /// The source stopped for a reason worth stating.
     Lost(String),
+    /// What X11 forwarding of this session is doing (R11).
+    ///
+    /// Not output: it says whether a remote program can reach this machine's
+    /// display, and is reported to the window the pane belongs to.
+    X11(X11Status),
 }
 
 impl SourceEvent {
@@ -175,6 +180,7 @@ impl SourceEvent {
             // attempt until the terminal exists; reaching a pane with one would mean
             // two owners, so it is ignored rather than drawn as output.
             RemoteEvent::HostKeyPrompt(_) | RemoteEvent::Connected => None,
+            RemoteEvent::X11(status) => Some(Self::X11(status)),
             RemoteEvent::Failed(error) => Some(Self::Lost(error.to_string())),
         }
     }
@@ -227,6 +233,7 @@ impl PaneSource {
                     // The chain's own text names the hop. Mapping through
                     // session_failure would turn a disconnect into "the server".
                     ChainEvent::Failed(failure) => Some(SourceEvent::Lost(failure.to_string())),
+                    ChainEvent::X11 { status, .. } => Some(SourceEvent::X11(status)),
                     ChainEvent::HopStarted(_)
                     | ChainEvent::HostKeyPrompt { .. }
                     | ChainEvent::ProxyConfirmation { .. }
@@ -430,6 +437,11 @@ pub struct TerminalPane {
     /// They are taken by the window, which knows which tab is on screen; this pane only
     /// remembers that something happened, never what it was.
     attention: TerminalAttention,
+    /// What X11 forwarding of this session reported last (R11).
+    ///
+    /// Taken by the window like the background notices are: the pane only holds
+    /// what arrived since the last look.
+    x11: Option<X11Status>,
 }
 
 /// What a terminal's copy, paste and search controls answer, written the way a
@@ -579,6 +591,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            x11: None,
         };
         pane.start_polling(cx);
         pane
@@ -637,6 +650,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            x11: None,
         };
         pane.start_polling(cx);
         pane
@@ -694,6 +708,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            x11: None,
         };
         pane.start_polling(cx);
         pane
@@ -767,6 +782,7 @@ impl TerminalPane {
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
+            x11: None,
         }
     }
 
@@ -950,6 +966,12 @@ impl TerminalPane {
                 self.state = PaneState::Failed(self.origin.lost_failure(reason));
                 false
             }
+            SourceEvent::X11(status) => {
+                // A display that failed does not end the session: the shell keeps
+                // working and the status is news for the session bar (R11).
+                self.x11 = Some(status);
+                self.state.accepts_input()
+            }
         }
     }
 
@@ -981,6 +1003,15 @@ impl TerminalPane {
     /// does not touch the grid, the blocks or the session state.
     pub fn take_attention(&mut self) -> TerminalAttention {
         std::mem::take(&mut self.attention)
+    }
+
+    /// Takes what X11 forwarding reported since the last call (R11).
+    ///
+    /// The window keeps it beside the session, because the session bar is where a
+    /// remote program's access to this machine's display is stated. Reading it does
+    /// not touch the grid or the session state.
+    pub fn take_x11_status(&mut self) -> Option<X11Status> {
+        self.x11.take()
     }
 
     /// The notices waiting to be collected, for the tests that check a tab mark.

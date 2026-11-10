@@ -8,7 +8,7 @@
 
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, SharedString, Stateful, Window, div, px};
-use shellune_core::{AuthMethodKind, HostId, TransferProtocol};
+use shellune_core::{AuthMethodKind, HostId, TransferProtocol, X11Forwarding};
 
 use super::{HostFields, ShelluneView};
 use crate::app::components::{self, Variant};
@@ -441,6 +441,82 @@ impl ShelluneView {
             )
     }
 
+    /// The host's default X11 forwarding mode (R11).
+    ///
+    /// Off stays the default: asking a server for a display channel is a decision with
+    /// consequences for this desktop, so it is made here, saved with the host, and can
+    /// still be changed for one connection in the connection form. The trusted mode is
+    /// not treated as an ordinary preference: its risk sentence is drawn beside it, and
+    /// the connection form asks again before every attempt that would use it.
+    fn x11_section(
+        &self,
+        draft: &HostDraft,
+        metrics: Metrics,
+        strings: &'static crate::app::copy::Strings,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let chosen = draft.x11();
+        let mut row =
+            components::segmented(metrics).debug_selector(|| "hosts.editor.x11".to_owned());
+        for (mode, label, selector) in [
+            (
+                X11Forwarding::Off,
+                strings.x11_off_label,
+                "hosts.editor.x11.off",
+            ),
+            (
+                X11Forwarding::Restricted,
+                strings.x11_restricted_label,
+                "hosts.editor.x11.restricted",
+            ),
+            (
+                X11Forwarding::Trusted,
+                strings.x11_trusted_label,
+                "hosts.editor.x11.trusted",
+            ),
+        ] {
+            row = row.child(
+                components::segment(label, mode == chosen, metrics)
+                    .id(selector)
+                    .debug_selector(move || selector.to_owned())
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        if let Some(draft) = view.hosts.draft_mut() {
+                            draft.set_x11(mode);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .child(
+                div()
+                    .pt(metrics.scale(spacing::HAIRLINE))
+                    .text_size(metrics.caption_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.x11_label),
+            )
+            .child(row)
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(strings.x11_note),
+            )
+            .when(chosen.needs_risk_confirmation(), |section| {
+                section.child(
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(Tone::Warning.text())
+                        .debug_selector(|| "hosts.editor.x11.warning".to_owned())
+                        .child(strings.x11_trusted_body),
+                )
+            })
+    }
+
     /// The dialog over a dimmed window, while a host is being created or edited.
     ///
     /// # The copy protocol
@@ -503,6 +579,8 @@ impl ShelluneView {
             .child(self.jump_section(fields, &draft, cx))
             .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
             .child(self.copy_protocol_section(&draft, metrics, strings, cx))
+            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
+            .child(self.x11_section(&draft, metrics, strings, cx))
             .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
             .child(section(strings.host_startup_label))
             .child(

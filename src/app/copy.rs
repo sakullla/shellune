@@ -629,6 +629,36 @@ pub struct Strings {
     pub host_startup_note: &'static str,
     /// Host dialog: what the agent method needs.
     pub host_agent_note: &'static str,
+    /// Label of the X11 forwarding choice (R11).
+    pub x11_label: &'static str,
+    /// The three X11 modes, as a chooser shows them.
+    pub x11_off_label: &'static str,
+    /// The mode bound by the X11 SECURITY extension, like `ssh -X`.
+    pub x11_restricted_label: &'static str,
+    /// The mode without those limits, like `ssh -Y`.
+    pub x11_trusted_label: &'static str,
+    /// What X11 forwarding is and why off is the default.
+    pub x11_note: &'static str,
+    /// Heading of the per-connection X11 choice.
+    pub x11_connect_label: &'static str,
+    /// Title of the trusted-mode risk confirmation.
+    pub x11_trusted_title: &'static str,
+    /// What the trusted mode lets a remote program do.
+    pub x11_trusted_body: &'static str,
+    /// Answer that turns the trusted mode on for this connection.
+    pub x11_trusted_confirm: &'static str,
+    /// Answer that keeps forwarding but with the security extension limits.
+    pub x11_trusted_restricted: &'static str,
+    /// Answer that does not connect at all.
+    pub x11_trusted_cancel: &'static str,
+    /// Session bar: no X11 forwarding for this session.
+    pub x11_bar_off: &'static str,
+    /// Session bar: the request is on its way.
+    pub x11_bar_enabling: &'static str,
+    /// Session bar: forwarding is available.
+    pub x11_bar_ready: &'static str,
+    /// Session bar: forwarding could not be used.
+    pub x11_bar_failed: &'static str,
     /// Host dialog: save and open a connection at once.
     pub host_save_connect: &'static str,
     /// Tooltip of the dialog's close button.
@@ -1210,6 +1240,21 @@ pub static ENGLISH: Strings = Strings {
     host_startup_label: "Run after connecting",
     host_startup_placeholder: "For example cd /srv && tmux attach",
     host_startup_note: "Typed into the remote shell once, each time the connection opens.",
+    x11_label: "X11 forwarding",
+    x11_off_label: "Off",
+    x11_restricted_label: "Restricted (-X)",
+    x11_trusted_label: "Trusted (-Y)",
+    x11_note: "Off by default. Restricted uses the X11 SECURITY extension, as ssh -X does; trusted removes those limits, as ssh -Y does. A display server must already be running on this computer.",
+    x11_connect_label: "X11 forwarding for this connection",
+    x11_trusted_title: "Allow trusted X11 forwarding?",
+    x11_trusted_body: "Trusted forwarding lets remote programs use this computer's display without the X11 SECURITY extension. A program on the server can then read what you type in other windows of that display, including windows of other applications. The choice applies to this connection only.",
+    x11_trusted_confirm: "Use trusted forwarding",
+    x11_trusted_restricted: "Use restricted forwarding",
+    x11_trusted_cancel: "Do not connect",
+    x11_bar_off: "X11 off",
+    x11_bar_enabling: "X11 starting",
+    x11_bar_ready: "X11",
+    x11_bar_failed: "X11 failed",
     host_agent_note: "Uses a key already loaded into the system SSH agent; nothing to fill in here.",
     host_save_connect: "Save and connect",
     host_dialog_close: "Close",
@@ -1640,6 +1685,21 @@ pub static CHINESE: Strings = Strings {
     host_startup_label: "连接后运行",
     host_startup_placeholder: "例如 cd /srv && tmux attach",
     host_startup_note: "每次连接成功后，在远程 Shell 中自动执行一次。",
+    x11_label: "X11 转发",
+    x11_off_label: "关闭",
+    x11_restricted_label: "受限（-X）",
+    x11_trusted_label: "信任（-Y）",
+    x11_note: "默认关闭。受限模式与 ssh -X 一样交给 X11 SECURITY 扩展限制远程程序；信任模式与 ssh -Y 一样去掉这些限制。这台电脑上必须已经运行显示服务。",
+    x11_connect_label: "本次连接的 X11 转发",
+    x11_trusted_title: "允许信任模式的 X11 转发？",
+    x11_trusted_body: "信任模式会让远程程序不受 X11 SECURITY 扩展限制地使用这台电脑的显示服务。服务器上的程序因此可能读取你在该显示其它窗口中输入的内容，包括其它应用的窗口。该选择只对本次连接生效。",
+    x11_trusted_confirm: "使用信任模式",
+    x11_trusted_restricted: "改用受限模式",
+    x11_trusted_cancel: "不连接",
+    x11_bar_off: "X11 关",
+    x11_bar_enabling: "X11 启用中",
+    x11_bar_ready: "X11",
+    x11_bar_failed: "X11 失败",
     host_agent_note: "使用系统 SSH Agent 中已加载的密钥，这里无需填写。",
     host_save_connect: "保存并连接",
     host_dialog_close: "关闭",
