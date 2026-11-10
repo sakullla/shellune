@@ -34,6 +34,7 @@ use crate::app::actions::{
     GoToTransfers, ToggleLanguage,
 };
 use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
+use crate::app::files::{FileSource, FilesStop};
 use crate::app::hosts::HostView;
 use crate::app::keymap::Keymap;
 use crate::app::layout::Direction;
@@ -1561,12 +1562,13 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
             + 4
             + 4
             + 2
+            + 2
             + 3,
         "three pages and the settings comma, next and previous, zoom, new shell, language \
          and dismiss; the palette, close tab, next and previous tab; one jump per \
          tab digit; split right and split down, zoom pane, focus, resize and move in \
-         four directions, move tab left and right; and the three terminal actions \
-         (search, copy, paste)"
+         four directions, move tab left and right; the keyboard's upload and download; \
+         and the three terminal actions (search, copy, paste)"
     );
 }
 
@@ -8094,13 +8096,32 @@ async fn file_actions_have_a_button_path_and_a_drop_uses_that_same_request(
 
     // Keyboard rename needs a selected row. Refresh is separate, and a modified key is not a file action.
     let before = local.requests().len();
-    let handled = cx.update(|_window, app| {
+    let handled = cx.update(|window, app| {
         view.update(app, |view, cx| {
-            let ignored =
-                view.files_key_for_test(id, crate::app::files::FileSource::Local, "c", true, cx);
-            view.files_key_for_test(id, crate::app::files::FileSource::Local, "down", false, cx);
-            let rename =
-                view.files_key_for_test(id, crate::app::files::FileSource::Local, "f2", false, cx);
+            let ignored = view.files_key_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                "c",
+                true,
+                window,
+                cx,
+            );
+            view.files_key_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                "down",
+                false,
+                window,
+                cx,
+            );
+            let rename = view.files_key_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                "f2",
+                false,
+                window,
+                cx,
+            );
             (!ignored, rename)
         })
     });
@@ -8116,9 +8137,16 @@ async fn file_actions_have_a_button_path_and_a_drop_uses_that_same_request(
     );
     click(cx, "files.question.cancel");
     assert!(!cx.update(|_window, app| view.read(app).files_question_open()));
-    let refreshed = cx.update(|_window, app| {
+    let refreshed = cx.update(|window, app| {
         view.update(app, |view, cx| {
-            view.files_key_for_test(id, crate::app::files::FileSource::Local, "f5", false, cx)
+            view.files_key_for_test(
+                id,
+                crate::app::files::FileSource::Local,
+                "f5",
+                false,
+                window,
+                cx,
+            )
         })
     });
     assert!(refreshed, "f5 refreshes the focused source");
@@ -8952,6 +8980,417 @@ async fn a_server_without_sftp_downloads_the_remote_path_the_user_types(cx: &mut
     assert_eq!(
         cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
         Some("~".to_owned())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The file view's keyboard path (R4, R10)
+// ---------------------------------------------------------------------------
+
+/// The keystroke the catalogue binds to one action on this platform.
+fn catalog_shortcut(id: &str) -> String {
+    Keymap::defaults(Platform::current())
+        .keystroke(id)
+        .unwrap_or_else(|| panic!("{id} has no shortcut"))
+        .to_owned()
+}
+
+/// Presses one keystroke on the window, as a keyboard does, and lets the page settle.
+fn press_key(cx: &mut VisualTestContext, keystroke: &str) {
+    cx.simulate_keystrokes(keystroke);
+    cx.run_until_parked();
+}
+
+/// The file view's stop that holds the keyboard, for a test that says where it is.
+fn files_stop(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+) -> Option<(FileSource, FilesStop)> {
+    cx.update(|window, app| view.read(app).files_keyboard_stop(window, app))
+}
+
+/// Types into the field that holds the keyboard and lets the page settle.
+fn type_here(cx: &mut VisualTestContext, text: &str) {
+    cx.simulate_input(text);
+    cx.run_until_parked();
+}
+
+/// A remote session with scripted files and transfers, for a keyboard test.
+fn keyboard_remote(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<ShelluneView>,
+    &mut VisualTestContext,
+    SessionId,
+    FileAnswers,
+    TransferAnswers,
+) {
+    let (view, cx) = remote_view(cx);
+    // The shortcuts are what this test exercises, so the catalogue is bound as a window
+    // does on start.
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    let transfers = TransferAnswers::accepting();
+    let file_channel = files.clone();
+    let transfer_channel = transfers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(id, "web", "deploy@10.0.0.5:22", Box::new(file_channel), cx);
+            view.attach_transfers_for_test(id, Box::new(transfer_channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    (view, cx, id, files, transfers)
+}
+
+#[gpui::test]
+async fn the_upload_question_is_asked_and_answered_with_the_keyboard_alone(
+    cx: &mut TestAppContext,
+) {
+    // R4 asks for file transfer to be usable without a pointer, and R10 makes that the
+    // only way a file moves on a server that refuses the SFTP subsystem. Nothing in this
+    // test clicks: the shortcut opens the file view of the session in front and asks about
+    // the upload, Tab walks the question, and Enter confirms it.
+    let (view, cx, _id, files, transfers) = keyboard_remote(cx);
+
+    press_key(cx, &catalog_shortcut("files.upload"));
+    assert!(
+        cx.update(|_window, app| view.read(app).files_question_open()),
+        "the shortcut asks about the upload"
+    );
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionLocal)),
+        "the question starts at the local file to send"
+    );
+    files.fail(
+        1,
+        shellune_core::BrowseFailure::Unavailable {
+            reason: "the server refused the sftp subsystem".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+    assert!(
+        cx.debug_bounds("files.failure.scp.upload").is_some(),
+        "the read failed, so the typed path is the only way a copy can start"
+    );
+
+    // The local file to send, then the remote directory it lands in.
+    type_here(cx, "C:/work/report.txt");
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionRemote)),
+        "Tab reaches the remote directory"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
+        Some("~".to_owned()),
+        "with no listing the directory starts at the account's home"
+    );
+    type_here(cx, "/inbox");
+
+    // The protocol belongs to this task, so the switch is part of the same walk.
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionSftp))
+    );
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionScp))
+    );
+    press_key(cx, "enter");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_protocol()),
+        Some(shellune_core::TransferProtocol::Scp),
+        "Enter on the SCP choice chooses it for this one task"
+    );
+
+    // SCP brought the recursive switch with it; Tab walks past it to the confirmation.
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionRecursive))
+    );
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionConfirm))
+    );
+    press_key(cx, "enter");
+
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 1, "the question started one task: {starts:?}");
+    assert_eq!(starts[0].direction, TransferDirection::Upload);
+    assert_eq!(starts[0].protocol, shellune_core::TransferProtocol::Scp);
+    assert_eq!(starts[0].source, "C:/work/report.txt");
+    assert_eq!(
+        starts[0].destination, "~/inbox/report.txt",
+        "the directory that was typed is exactly the one used"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_question_open()),
+        "the question is answered and gone"
+    );
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Body)),
+        "the column takes the keyboard back once its question is answered"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).pointer_input_for_test()),
+        "no click happened anywhere in this flow"
+    );
+}
+
+#[gpui::test]
+async fn the_download_question_is_asked_and_answered_with_the_keyboard_alone(
+    cx: &mut TestAppContext,
+) {
+    // The same walk in the other direction: the shortcut asks which remote path is
+    // downloaded, and the copy lands in the folder the question proposed.
+    let (view, cx, _id, files, transfers) = keyboard_remote(cx);
+
+    press_key(cx, &catalog_shortcut("files.download"));
+    assert!(
+        cx.update(|_window, app| view.read(app).files_question_open()),
+        "the shortcut asks about the download"
+    );
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionLocal)),
+        "the question starts at the folder the file lands in"
+    );
+    let folder = cx
+        .update(|_window, app| view.read(app).files_question_text().map(str::to_owned))
+        .expect("the folder the copy lands in is proposed");
+    assert!(!folder.trim().is_empty(), "a real folder is proposed");
+    files.fail(
+        1,
+        shellune_core::BrowseFailure::Unavailable {
+            reason: "the server refused the sftp subsystem".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionRemote))
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
+        Some("~".to_owned())
+    );
+    type_here(cx, "/report.txt");
+    press_key(cx, "tab");
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionScp))
+    );
+    press_key(cx, "enter");
+    press_key(cx, "tab");
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionConfirm))
+    );
+    press_key(cx, "enter");
+
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 1, "the question started one task: {starts:?}");
+    assert_eq!(starts[0].direction, TransferDirection::Download);
+    assert_eq!(starts[0].protocol, shellune_core::TransferProtocol::Scp);
+    assert_eq!(starts[0].source, "~/report.txt");
+    assert!(
+        starts[0]
+            .destination
+            .ends_with(&format!("{}report.txt", std::path::MAIN_SEPARATOR)),
+        "the file lands under its own name in the proposed folder: {}",
+        starts[0].destination
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).pointer_input_for_test()),
+        "no click happened anywhere in this flow"
+    );
+}
+
+#[gpui::test]
+async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboard(
+    cx: &mut TestAppContext,
+) {
+    // The two typed-path entries of a failed read are drawn below the slice at 200% text in
+    // the minimum window, and they are the only way a file is copied from a server without
+    // SFTP. Page Up/Down turn the pane and Tab walks the column's own controls, so the
+    // whole path exists without a pointer (R4).
+    let (view, cx, _id, files, transfers) = keyboard_remote(cx);
+
+    // The page is already as small and as large-typed as it gets, so the slice the entries
+    // have to be reached in is the one measured below.
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+
+    // The shortcut opens the file view and asks about the upload; Escape leaves the
+    // question, which puts the keyboard in the server column.
+    press_key(cx, &catalog_shortcut("files.upload"));
+    assert!(cx.update(|_window, app| view.read(app).files_question_open()));
+    files.fail(
+        1,
+        shellune_core::BrowseFailure::Unavailable {
+            reason: "the server refused the sftp subsystem".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+    press_key(cx, "escape");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_question_open()),
+        "Escape closes the question"
+    );
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Body)),
+        "the column takes the keyboard back"
+    );
+
+    // The pane is one slice tall and the card is taller than that, so the entry starts
+    // under an edge nothing can reach without turning the pane.
+    let panel = bounds_of(cx, "files.panel");
+    let entry = bounds_of(cx, "files.failure.scp.upload");
+    assert!(
+        entry.origin.y > panel.origin.y + panel.size.height,
+        "the typed entry starts below the slice: {entry:?} in {panel:?}"
+    );
+
+    // Page Down turns the pane from the keyboard and Page Up brings it back, so the reason
+    // above the entries is read as well as the entries themselves.
+    let header = bounds_of(cx, "files.header");
+    press_key(cx, "pagedown");
+    assert!(
+        bounds_of(cx, "files.header").origin.y < header.origin.y,
+        "Page Down turns the pane, header and all"
+    );
+    press_key(cx, "pageup");
+    assert!(
+        (bounds_of(cx, "files.header").origin.y - header.origin.y).abs() < px(0.5),
+        "Page Up goes back to the top of the pane"
+    );
+    press_key(cx, "home");
+    assert!(
+        (bounds_of(cx, "files.header").origin.y - header.origin.y).abs() < px(0.5),
+        "Home is the top of the pane as well"
+    );
+    press_key(cx, "end");
+    let panel = bounds_of(cx, "files.panel");
+    let entry = bounds_of(cx, "files.failure.scp.upload");
+    assert!(
+        entry.origin.y >= panel.origin.y - px(0.5)
+            && entry.origin.y + entry.size.height <= panel.origin.y + panel.size.height + px(0.5),
+        "End turns to the entries, which are the card's last rows: {entry:?} in {panel:?}"
+    );
+
+    // Tab walks the column: its toolbar's two entries, then the failed read's two.
+    for expected in [
+        FilesStop::ToolbarUpload,
+        FilesStop::ToolbarDownload,
+        FilesStop::CardUpload,
+        FilesStop::CardDownload,
+    ] {
+        press_key(cx, "tab");
+        assert_eq!(
+            files_stop(cx, &view),
+            Some((FileSource::Remote, expected)),
+            "Tab reaches {expected:?}"
+        );
+    }
+    // The arrows step the same ring while a control has it, one step each way.
+    press_key(cx, "up");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::CardUpload)),
+        "Up steps back one control"
+    );
+    press_key(cx, "down");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::CardDownload)),
+        "Down steps forward again"
+    );
+
+    // Both entries are activated from here, and both open the question they stand for.
+    press_key(cx, "enter");
+    assert!(
+        cx.update(|_window, app| view.read(app).files_question_open()),
+        "Enter on the download entry asks about the download"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_question_remote().map(str::to_owned)),
+        Some("~".to_owned()),
+        "the typed remote path starts at the account's home"
+    );
+    press_key(cx, "escape");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Body)),
+        "Escape gives the keyboard back to the column"
+    );
+    for _ in 0..3 {
+        press_key(cx, "tab");
+    }
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::CardUpload)),
+        "the upload entry is three steps from the listing"
+    );
+
+    // The ring is on a control the user can see: the pane scrolled the entry into it.
+    let panel = bounds_of(cx, "files.panel");
+    let entry = bounds_of(cx, "files.failure.scp.upload");
+    assert!(
+        entry.origin.y >= panel.origin.y - px(0.5)
+            && entry.origin.y + entry.size.height <= panel.origin.y + panel.size.height + px(0.5),
+        "the ring is drawn on an entry inside the slice: {entry:?} in {panel:?}"
+    );
+
+    // Enter on the entry asks the same question the pointer's press asks, and the keyboard
+    // answers it: the copy starts without a click anywhere.
+    press_key(cx, "enter");
+    assert!(
+        cx.update(|_window, app| view.read(app).files_question_open()),
+        "Enter on the entry asks about the upload"
+    );
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionLocal))
+    );
+    type_here(cx, "C:/work/report.txt");
+    press_key(cx, "tab");
+    press_key(cx, "tab");
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionScp))
+    );
+    press_key(cx, "enter");
+    press_key(cx, "tab");
+    press_key(cx, "tab");
+    press_key(cx, "enter");
+    let starts = transfers.starts();
+    assert_eq!(
+        starts.len(),
+        1,
+        "the typed entry started one task: {starts:?}"
+    );
+    assert_eq!(starts[0].direction, TransferDirection::Upload);
+    assert_eq!(starts[0].protocol, shellune_core::TransferProtocol::Scp);
+    assert!(
+        !cx.update(|_window, app| view.read(app).pointer_input_for_test()),
+        "no click happened anywhere in this flow"
     );
 }
 

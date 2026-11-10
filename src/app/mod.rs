@@ -103,6 +103,8 @@ pub mod actions {
             MovePaneDown,
             MoveTabLeft,
             MoveTabRight,
+            FilesUpload,
+            FilesDownload,
             TerminalSearch,
             TerminalCopy,
             TerminalPaste

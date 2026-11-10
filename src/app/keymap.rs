@@ -20,13 +20,14 @@
 use gpui::{KeyBinding, Keystroke};
 
 use crate::app::actions::{
-    CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, GoToHosts, GoToLocalShells, GoToSettings, MovePaneDown, MovePaneLeft,
-    MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell, NextDestination, NextTab,
-    OpenPalette, PreviousDestination, PreviousTab, ResizePaneDown, ResizePaneLeft, ResizePaneRight,
-    ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, TerminalCopy, TerminalPaste,
-    TerminalSearch, ToggleLanguage, ToggleSidebar, ZoomPane,
+    CloseActiveTab, CycleTextSize, DismissNotice, FilesDownload, FilesUpload, FocusPaneDown,
+    FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoToHosts, GoToLocalShells, GoToSettings,
+    MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight,
+    NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab,
+    ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2,
+    SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
+    SplitPaneDown, SplitPaneRight, TerminalCopy, TerminalPaste, TerminalSearch, ToggleLanguage,
+    ToggleSidebar, ZoomPane,
 };
 use crate::app::copy::Locale;
 use crate::app::nav::{Destination, Platform};
@@ -489,6 +490,20 @@ pub const ACTIONS: &[ActionSpec] = &[
         name_en: "Move the pane down",
         name_zh: "窗格下移",
         defaults: &[DefaultKey::Literal("ctrl-alt-down")],
+    },
+    ActionSpec {
+        id: "files.upload",
+        context: Context::Shell,
+        name_en: "Upload a file to the server",
+        name_zh: "上传文件到服务器",
+        defaults: &[DefaultKey::Modifier("shift-u")],
+    },
+    ActionSpec {
+        id: "files.download",
+        context: Context::Shell,
+        name_en: "Download a file from the server",
+        name_zh: "从服务器下载文件",
+        defaults: &[DefaultKey::Modifier("shift-d")],
     },
     ActionSpec {
         id: "terminal.search",
@@ -1042,6 +1057,8 @@ fn binding_for(spec: &'static ActionSpec, keystroke: &str) -> KeyBinding {
         "pane.move-right" => KeyBinding::new(keystroke, MovePaneRight, context),
         "pane.move-up" => KeyBinding::new(keystroke, MovePaneUp, context),
         "pane.move-down" => KeyBinding::new(keystroke, MovePaneDown, context),
+        "files.upload" => KeyBinding::new(keystroke, FilesUpload, context),
+        "files.download" => KeyBinding::new(keystroke, FilesDownload, context),
         "terminal.search" => KeyBinding::new(keystroke, TerminalSearch, context),
         "terminal.copy" => KeyBinding::new(keystroke, TerminalCopy, context),
         "terminal.paste" => KeyBinding::new(keystroke, TerminalPaste, context),

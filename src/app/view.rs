@@ -35,20 +35,21 @@ use shellune_storage::{
 use shellune_terminal::GridSize;
 
 use crate::app::actions::{
-    CloseActiveTab, CycleTextSize, DismissNotice, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
-    FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToSettings,
-    GoToTransfers, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft,
-    MoveTabRight, NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination,
-    PreviousTab, ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1,
-    SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
-    SplitPaneDown, SplitPaneRight, ToggleLanguage, ToggleSidebar, ZoomPane,
+    CloseActiveTab, CycleTextSize, DismissNotice, FilesDownload, FilesUpload, FocusPaneDown,
+    FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells,
+    GoToSessions, GoToSettings, GoToTransfers, MovePaneDown, MovePaneLeft, MovePaneRight,
+    MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell, NextDestination, NextTab, OpenPalette,
+    PreviousDestination, PreviousTab, ResizePaneDown, ResizePaneLeft, ResizePaneRight,
+    ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+    SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleLanguage,
+    ToggleSidebar, ZoomPane,
 };
 use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(test)]
 use crate::app::files::BrowseChannel;
 use crate::app::files::{
-    FileSource, FileViews, FilesDialog, browse_failure_text, display_path, kind_label,
+    FileSource, FileViews, FilesDialog, FilesStop, browse_failure_text, display_path, kind_label,
     local_protocol_to_os, path_crumbs, path_problem_text, problem_text, transfer_problem_text,
 };
 use crate::app::forwarding::ForwardCenter;
@@ -198,6 +199,19 @@ fn files_element_id(source: FileSource, suffix: &str) -> SharedString {
         FileSource::Remote => SharedString::from(format!("files.{suffix}")),
         FileSource::Local => SharedString::from(format!("files.local.{suffix}")),
     }
+}
+
+/// The ring a file control draws while it holds the keyboard (R4).
+///
+/// It is the accent of a focused settings row, on the control's own border, so "the
+/// keyboard is here" reads the same way in both places and the label stays legible on
+/// the fill. The ring is drawn by the element itself, from the window's record of where
+/// the keys are, so a control focused by a click or by Tab looks the same.
+fn files_focus_ring(style: gpui::StyleRefinement) -> gpui::StyleRefinement {
+    style
+        .border_1()
+        .border_color(theme::swatch(palette::ACCENT))
+        .bg(theme::swatch(palette::SURFACE_SELECTED))
 }
 
 /// A divider drag. The listener is registered again on every frame it lasts.
@@ -443,6 +457,37 @@ pub struct ShelluneView {
     files_local_focus: FocusHandle,
     /// Focus of the remote column.
     files_remote_focus: FocusHandle,
+    /// The scroll of each column's listing, and of the column around it.
+    ///
+    /// Page Up/Down, Home and End turn these, so a card taller than the slice is read
+    /// without a pointer (R4). The listing and the column turn separately because a
+    /// listing fills the slice itself while a failed read's card does not fit in it.
+    files_local_scroll: gpui::ScrollHandle,
+    files_remote_scroll: gpui::ScrollHandle,
+    files_local_list_scroll: gpui::ScrollHandle,
+    files_remote_list_scroll: gpui::ScrollHandle,
+    /// Focus of the file view's keyboard stops (R4), in the order [`files_stops`] gives.
+    ///
+    /// Each one is a real control the pointer can also press; the handles make them
+    /// stops of the window's keyboard order, and their focus style draws the ring that
+    /// says which one holds the keys.
+    files_toolbar_upload_focus: FocusHandle,
+    files_toolbar_download_focus: FocusHandle,
+    files_card_upload_focus: FocusHandle,
+    files_card_download_focus: FocusHandle,
+    files_question_sftp_focus: FocusHandle,
+    files_question_scp_focus: FocusHandle,
+    files_question_recursive_focus: FocusHandle,
+    files_question_confirm_focus: FocusHandle,
+    files_question_cancel_focus: FocusHandle,
+    /// Whether the question that was just opened should take the keyboard next draw.
+    ///
+    /// The field is focused by the drawing rather than by the call that opened the
+    /// question: the panel that asked is what the keyboard was in, and a focus change made
+    /// while the page is being built would be overwritten by that frame.
+    files_field_focus: bool,
+    /// The column that should take the keyboard back next draw, after a question ended.
+    files_panel_focus_pending: Option<FileSource>,
     /// Last viewport width, which chooses two columns or one.
     viewport_width: gpui::Pixels,
     /// Forces the file layout in a test. `None` follows the viewport.
@@ -855,6 +900,21 @@ impl ShelluneView {
             files_remote_field: None,
             files_local_focus: cx.focus_handle(),
             files_remote_focus: cx.focus_handle(),
+            files_local_scroll: gpui::ScrollHandle::new(),
+            files_remote_scroll: gpui::ScrollHandle::new(),
+            files_local_list_scroll: gpui::ScrollHandle::new(),
+            files_remote_list_scroll: gpui::ScrollHandle::new(),
+            files_toolbar_upload_focus: cx.focus_handle(),
+            files_toolbar_download_focus: cx.focus_handle(),
+            files_card_upload_focus: cx.focus_handle(),
+            files_card_download_focus: cx.focus_handle(),
+            files_question_sftp_focus: cx.focus_handle(),
+            files_question_scp_focus: cx.focus_handle(),
+            files_question_recursive_focus: cx.focus_handle(),
+            files_question_confirm_focus: cx.focus_handle(),
+            files_question_cancel_focus: cx.focus_handle(),
+            files_field_focus: false,
+            files_panel_focus_pending: None,
             viewport_width: px(crate::app::DEFAULT_WINDOW_SIZE.0),
             files_layout_override: None,
             palette: None,
@@ -1879,6 +1939,62 @@ impl ShelluneView {
     // Transfers (R10, R17)
     // -----------------------------------------------------------------------
 
+    /// Opens the upload question from the keyboard's shortcut (R4, R10).
+    ///
+    /// The shortcut is the keyboard's way into copying at all: it opens the session's
+    /// file view when that is closed, puts the keyboard in the server column and asks
+    /// the same question the toolbar's entry asks. Nothing is sent and no session is
+    /// started by asking.
+    fn files_upload_from_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.files_shortcut_session(window, cx) {
+            self.files_ask_upload(id, cx);
+        }
+    }
+
+    /// Opens the download question from the keyboard's shortcut (R4, R10).
+    ///
+    /// The folder the copy would land in follows the column that holds the keyboard: the
+    /// folder this computer's column shows when that column has the keys, and this
+    /// platform's downloads folder when the server column does.
+    fn files_download_from_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.files_shortcut_session(window, cx) else {
+            return;
+        };
+        let folder = self
+            .files_keyboard_stop(window, cx)
+            .filter(|(source, _)| *source == FileSource::Local)
+            .and_then(|_| self.files.browser_in(id, FileSource::Local))
+            .and_then(|browser| browser.current_directory())
+            .and_then(local_protocol_to_os)
+            .map(|path| path.to_string_lossy().into_owned());
+        self.files_ask_download_into(id, None, folder, cx);
+    }
+
+    /// The session a file shortcut acts on, with its file view open (R4).
+    ///
+    /// Nothing answers when the session in front cannot browse: a local shell has no
+    /// server to ask, and a shortcut that invented a view for it would promise a copy
+    /// nothing can make.
+    fn files_shortcut_session(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<SessionId> {
+        let id = self.active?;
+        if !self.files.can_browse(id) {
+            return None;
+        }
+        if !self.files.is_open(id) {
+            self.toggle_files(id, cx);
+        }
+        // The keyboard lands in the server column: that is where a typed remote path is
+        // read, and where this session's transfers are listed.
+        let handle = self.files_remote_focus.clone();
+        window.focus(&handle);
+        cx.notify();
+        Some(id)
+    }
+
     /// Asks for the local file to upload into a remote directory (R10).
     ///
     /// Two things are visible before anything is sent: the remote directory the file
@@ -1928,6 +2044,22 @@ impl ShelluneView {
     /// an entry from - so the remote path is typed, starting at that account's home, and
     /// the download is the same task either way.
     fn files_ask_download(&mut self, id: SessionId, name: Option<&str>, cx: &mut Context<Self>) {
+        self.files_ask_download_into(id, name, None, cx);
+    }
+
+    /// The same question, with the folder the copy would land in already chosen.
+    ///
+    /// The keyboard's download shortcut passes the folder the local column is showing:
+    /// someone working in that column means "into this folder" by it, which is why the
+    /// focused column decides it (R4). Without one, the platform's downloads folder is
+    /// the answer, as it is for the toolbar's entry.
+    fn files_ask_download_into(
+        &mut self,
+        id: SessionId,
+        name: Option<&str>,
+        folder: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let directory = self
             .files
             .browser(id)
@@ -1942,7 +2074,7 @@ impl ShelluneView {
         };
         let protocol = self.session_protocol(id);
         let placeholder = self.strings().transfers_download_placeholder;
-        let suggested = default_download_directory();
+        let suggested = folder.unwrap_or_else(default_download_directory);
         let field = cx.new(|cx| {
             let mut field = TextField::with_text(placeholder, &suggested, cx);
             field.set_browse(Browse::Directory, cx);
@@ -2058,9 +2190,15 @@ impl ShelluneView {
     ) {
         match started {
             Ok(_) => {
+                let source = self.files_dialog.as_ref().map(FilesDialog::source);
                 self.files_dialog = None;
                 self.clear_files_fields();
                 self.transfer_problem = None;
+                // The confirming control left the screen with the question, so the column
+                // it was about takes the keyboard instead of nothing doing so (R4).
+                if let Some(source) = source {
+                    self.restore_files_focus(source, cx);
+                }
                 self.watch_files(cx);
             }
             Err(problem) => {
@@ -7994,13 +8132,27 @@ impl ShelluneView {
                 cx.notify();
             })
             .detach();
-        }
-        let handle = field.read(cx).focus_handle().clone();
-        if let Some(window) = cx.active_window() {
-            let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
+            // Enter in either field submits the question: the remote path is a field the
+            // keyboard can be in, and the one control that ends the question must not be
+            // reachable from only one of the two (R4, R10).
+            let view = cx.entity().downgrade();
+            remote.update(cx, |text_field, _cx| {
+                text_field.on_submit(move |_text, _window, app| {
+                    view.update(app, |view, cx| {
+                        view.submit_files_change(cx);
+                        false
+                    })
+                    .unwrap_or(false)
+                });
+            });
         }
         self.files_field = Some(field);
         self.files_remote_field = remote;
+        // The next draw puts the caret in the first field, which is where the keyboard
+        // answers the question from (R4). A field focused here would be replaced by the
+        // frame that is still being built.
+        self.files_field_focus = true;
+        self.files_panel_focus_pending = None;
         cx.notify();
     }
 
@@ -8046,10 +8198,16 @@ impl ShelluneView {
     /// Closes the question without sending anything at all (R11).
     ///
     /// Cancelling is not a request the server has to refuse: the target never left
-    /// this process, so there is nothing on the server to undo.
+    /// this process, so there is nothing on the server to undo. The column the question
+    /// was asked about takes the keyboard back, because the controls that had it left
+    /// the screen with the question (R4).
     fn files_cancel_change(&mut self, cx: &mut Context<Self>) {
+        let source = self.files_dialog.as_ref().map(FilesDialog::source);
         self.files_dialog = None;
         self.clear_files_fields();
+        if let Some(source) = source {
+            self.restore_files_focus(source, cx);
+        }
         cx.notify();
     }
 
@@ -8341,18 +8499,58 @@ impl ShelluneView {
     ///
     /// Modified keys are left alone: Escape, Ctrl+L and Ctrl+C belong to the
     /// terminal when it is focused, and a file column must not take them either.
-    /// Returns whether the key was a file action.
+    /// Tab, Page Up/Page Down, Home and End are the column's own: they walk the
+    /// controls of this column and turn it, so a failed read's typed entries are reached
+    /// without a pointer (R4). Returns whether the key was a file action.
     fn files_key(
         &mut self,
         id: SessionId,
         source: FileSource,
         event: &KeyDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if event.keystroke.modifiers.modified() {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        // Tab is the only shifted key a column takes, because one step back is Shift+Tab.
+        // Every other combination with Ctrl, Alt or the platform key stays with the
+        // window's own actions and with the program.
+        if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
+            let delta = if modifiers.shift { -1 } else { 1 };
+            self.files_step_stop(id, delta, window, cx);
+            return true;
+        }
+        if modifiers.modified() {
             return false;
         }
-        match event.keystroke.key.as_str() {
+        if matches!(key, "pageup" | "pagedown" | "home" | "end") {
+            self.files_turn(source, key, cx);
+            return true;
+        }
+        // A control with the ring on it answers Enter and Space exactly as the pointer's
+        // press does, and the arrows step the ring itself, as a row of controls does. The
+        // listing keeps its own keys, so Enter still opens the entry the keyboard is on and
+        // the arrows still move its selection while the column holds the ring.
+        let ring = self
+            .files_keyboard_stop(window, cx)
+            .filter(|(at, stop)| *at == source && *stop != FilesStop::Body)
+            .map(|(_at, stop)| stop);
+        if let Some(stop) = ring {
+            let step = match key {
+                "right" | "down" => Some(1),
+                "left" | "up" => Some(-1),
+                _ => None,
+            };
+            if let Some(step) = step {
+                self.files_step_stop(id, step, window, cx);
+                return true;
+            }
+            if matches!(key, "enter" | "space") {
+                self.files_activate_stop(id, source, stop, window, cx);
+                return true;
+            }
+        }
+        match key {
             "f5" => {
                 self.files_refresh(id, source, cx);
                 true
@@ -8403,6 +8601,292 @@ impl ShelluneView {
             }
             _ => false,
         }
+    }
+
+    /// The scroll of one column's own box, which turns the whole column.
+    fn files_panel_scroll(&self, source: FileSource) -> &gpui::ScrollHandle {
+        match source {
+            FileSource::Local => &self.files_local_scroll,
+            FileSource::Remote => &self.files_remote_scroll,
+        }
+    }
+
+    /// The scroll of one column's listing, which turns the entries in it.
+    fn files_list_scroll(&self, source: FileSource) -> &gpui::ScrollHandle {
+        match source {
+            FileSource::Local => &self.files_local_list_scroll,
+            FileSource::Remote => &self.files_remote_list_scroll,
+        }
+    }
+
+    /// The focus of one column, which is where its keys arrive.
+    fn files_panel_focus(&self, source: FileSource) -> &FocusHandle {
+        match source {
+            FileSource::Local => &self.files_local_focus,
+            FileSource::Remote => &self.files_remote_focus,
+        }
+    }
+
+    /// Whether the remote column has no listing to pick a row from (R10).
+    ///
+    /// A server without an SFTP subsystem cannot be browsed at all, and a read that has
+    /// not answered yet is no listing either. In both cases the remote path is typed,
+    /// which is why the toolbar offers a download entry of its own there.
+    fn files_without_a_listing(&self, id: SessionId) -> bool {
+        self.files
+            .browser(id)
+            .is_some_and(|browser| browser.state().listing().is_none())
+    }
+
+    /// Whether the remote column failed because the server has no SFTP subsystem (R10).
+    fn files_failed_for_want_of_sftp(&self, id: SessionId) -> bool {
+        self.files
+            .browser(id)
+            .and_then(|browser| browser.state().failure())
+            .is_some_and(|failure| matches!(failure, BrowseFailure::Unavailable { .. }))
+    }
+
+    /// Every control of the file view the keyboard can stop on, in reading order (R4).
+    ///
+    /// A column starts at its listing and then offers what its header carries, the
+    /// question it is asking and - on a server without an SFTP subsystem - the two
+    /// entries that copy by typed path. A narrow window draws one column, so only that
+    /// column is listed; a wide one walks both, which is how the keyboard crosses from
+    /// this computer to the server.
+    fn files_stops(&self, id: SessionId) -> Vec<(FileSource, FilesStop)> {
+        let wide = self.files_side_by_side();
+        let shown = self.files.shown(id).unwrap_or(FileSource::Remote);
+        let mut stops = Vec::new();
+        for source in [FileSource::Local, FileSource::Remote] {
+            if (!wide && shown != source) || self.files.browser_in(id, source).is_none() {
+                continue;
+            }
+            stops.push((source, FilesStop::Body));
+            if source == FileSource::Remote {
+                stops.push((source, FilesStop::ToolbarUpload));
+                if self.files_without_a_listing(id) {
+                    stops.push((source, FilesStop::ToolbarDownload));
+                }
+            }
+            if let Some(dialog) = self
+                .files_dialog
+                .as_ref()
+                .filter(|dialog| dialog.session() == id && dialog.source() == source)
+            {
+                stops.extend(
+                    self.files_question_stops(dialog)
+                        .into_iter()
+                        .map(|stop| (source, stop)),
+                );
+            }
+            if source == FileSource::Remote && self.files_failed_for_want_of_sftp(id) {
+                stops.push((source, FilesStop::CardUpload));
+                stops.push((source, FilesStop::CardDownload));
+            }
+        }
+        stops
+    }
+
+    /// The stops a question offers, in the order it draws them.
+    fn files_question_stops(&self, dialog: &FilesDialog) -> Vec<FilesStop> {
+        let mut stops = Vec::new();
+        if self.files_field.is_some() {
+            stops.push(FilesStop::QuestionLocal);
+        }
+        if self.files_remote_field.is_some() {
+            stops.push(FilesStop::QuestionRemote);
+        }
+        if let Some(protocol) = dialog.protocol() {
+            stops.push(FilesStop::QuestionSftp);
+            stops.push(FilesStop::QuestionScp);
+            if protocol == TransferProtocol::Scp {
+                stops.push(FilesStop::QuestionRecursive);
+            }
+        }
+        stops.push(FilesStop::QuestionConfirm);
+        stops.push(FilesStop::QuestionCancel);
+        stops
+    }
+
+    /// The focus handle of one stop, or nothing when that control is not on screen.
+    fn files_stop_focus(
+        &self,
+        source: FileSource,
+        stop: FilesStop,
+        cx: &gpui::App,
+    ) -> Option<FocusHandle> {
+        Some(match stop {
+            FilesStop::Body => self.files_panel_focus(source).clone(),
+            FilesStop::ToolbarUpload => self.files_toolbar_upload_focus.clone(),
+            FilesStop::ToolbarDownload => self.files_toolbar_download_focus.clone(),
+            FilesStop::CardUpload => self.files_card_upload_focus.clone(),
+            FilesStop::CardDownload => self.files_card_download_focus.clone(),
+            FilesStop::QuestionLocal => self.files_field.as_ref()?.read(cx).focus_handle().clone(),
+            FilesStop::QuestionRemote => self
+                .files_remote_field
+                .as_ref()?
+                .read(cx)
+                .focus_handle()
+                .clone(),
+            FilesStop::QuestionSftp => self.files_question_sftp_focus.clone(),
+            FilesStop::QuestionScp => self.files_question_scp_focus.clone(),
+            FilesStop::QuestionRecursive => self.files_question_recursive_focus.clone(),
+            FilesStop::QuestionConfirm => self.files_question_confirm_focus.clone(),
+            FilesStop::QuestionCancel => self.files_question_cancel_focus.clone(),
+        })
+    }
+
+    /// Which control of the file view holds the keyboard, if one does.
+    ///
+    /// The window's own record is the truth: a stop that was focused by a click, by
+    /// the keyboard or by a question opening is reported the same way, so the ring is
+    /// never drawn on a control that does not have the keys.
+    pub(crate) fn files_keyboard_stop(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<(FileSource, FilesStop)> {
+        let focused = window.focused(cx)?;
+        let id = self.active.filter(|id| self.files.is_open(*id))?;
+        self.files_stops(id).into_iter().find(|(source, stop)| {
+            self.files_stop_focus(*source, *stop, cx)
+                .is_some_and(|handle| handle == focused)
+        })
+    }
+
+    /// Puts the keyboard on one control of the file view.
+    fn files_focus_stop(
+        &mut self,
+        source: FileSource,
+        stop: FilesStop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.files_stop_focus(source, stop, cx) else {
+            return;
+        };
+        window.focus(&handle);
+        if matches!(stop, FilesStop::CardUpload | FilesStop::CardDownload) {
+            // The two typed entries are the card's last rows, and the card is taller than
+            // one slice at 200% text in the minimum window: putting the keyboard on one
+            // turns the pane to its end, so the ring lands where it can be seen (R4).
+            self.files_panel_scroll(source).scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    /// One step of Tab through the file view's own controls (R4).
+    fn files_step_stop(
+        &mut self,
+        id: SessionId,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let stops = self.files_stops(id);
+        if stops.len() < 2 {
+            return;
+        }
+        let at = self
+            .files_keyboard_stop(window, cx)
+            .and_then(|focused| stops.iter().position(|stop| *stop == focused))
+            .unwrap_or(0) as isize;
+        let next = (at + delta).rem_euclid(stops.len() as isize) as usize;
+        let (source, stop) = stops[next];
+        self.files_focus_stop(source, stop, window, cx);
+    }
+
+    /// Presses one control of the file view from the keyboard (R4).
+    ///
+    /// A control that answers the pointer exactly once answers the keyboard the same
+    /// way, because both call the same code; a field is activated by putting the caret
+    /// in it, and the two protocol choices are the same switch the pointer presses.
+    fn files_activate_stop(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        stop: FilesStop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match stop {
+            FilesStop::Body => {}
+            FilesStop::ToolbarUpload | FilesStop::CardUpload => self.files_ask_upload(id, cx),
+            FilesStop::ToolbarDownload | FilesStop::CardDownload => {
+                self.files_ask_download(id, None, cx);
+            }
+            FilesStop::QuestionLocal | FilesStop::QuestionRemote => {
+                self.files_focus_stop(source, stop, window, cx);
+            }
+            FilesStop::QuestionSftp => self.files_choose_protocol(TransferProtocol::Sftp, cx),
+            FilesStop::QuestionScp => self.files_choose_protocol(TransferProtocol::Scp, cx),
+            FilesStop::QuestionRecursive => {
+                let next = self
+                    .files_dialog
+                    .as_mut()
+                    .map(|dialog| {
+                        let next = !dialog.recursive();
+                        dialog.set_recursive(next);
+                        next
+                    })
+                    .unwrap_or(false);
+                // The recursive switch only exists while SCP is the chosen protocol, so
+                // turning it off leaves its own stop and the ring returns to the choice.
+                let stop = if next {
+                    FilesStop::QuestionRecursive
+                } else {
+                    FilesStop::QuestionScp
+                };
+                self.files_focus_stop(source, stop, window, cx);
+            }
+            FilesStop::QuestionConfirm => self.submit_files_change(cx),
+            FilesStop::QuestionCancel => self.files_cancel_change(cx),
+        }
+    }
+
+    /// Chooses the protocol of the open question, as its switch does (R10).
+    fn files_choose_protocol(&mut self, protocol: TransferProtocol, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.files_dialog.as_mut() {
+            dialog.set_protocol(protocol);
+        }
+        cx.notify();
+    }
+
+    /// Turns the pane that holds the keyboard (R4).
+    ///
+    /// A listing taller than its own box turns first; the column itself turns when its
+    /// content does not fit, which is what a failed read's card does at 200% text in the
+    /// minimum window. Home and End go to one end or the other.
+    fn files_turn(&mut self, source: FileSource, key: &str, cx: &mut Context<Self>) {
+        let listing = self.files_list_scroll(source);
+        let target = if listing.max_offset().height > px(0.0) {
+            listing.clone()
+        } else {
+            self.files_panel_scroll(source).clone()
+        };
+        let offset = target.offset();
+        let page = target.bounds().size.height;
+        let limit = -target.max_offset().height;
+        let next = match key {
+            "pagedown" => offset.y - page,
+            "pageup" => offset.y + page,
+            "home" => px(0.0),
+            "end" => limit,
+            _ => return,
+        };
+        target.set_offset(gpui::point(offset.x, next.max(limit).min(px(0.0))));
+        cx.notify();
+    }
+
+    /// Gives the keyboard back to the column a question was asked from.
+    ///
+    /// A question's controls leave the screen with it, so the ring cannot stay on one of
+    /// them: the column it was about takes the keys instead of nothing doing so. The move
+    /// happens on the next draw, because the question's own frame still owns the keyboard.
+    fn restore_files_focus(&mut self, source: FileSource, cx: &mut Context<Self>) {
+        self.files_panel_focus_pending = Some(source);
+        self.files_field_focus = false;
+        cx.notify();
     }
 
     /// The names in one listing, in the order the column draws them.
@@ -8561,20 +9045,28 @@ impl ShelluneView {
                     .items_center()
                     .flex_wrap()
                     .gap(metrics.scale(spacing::HAIRLINE))
-                    .child(self.text_button(
-                        upload_id,
-                        strings.transfers_upload,
-                        Variant::Secondary,
-                        cx,
-                        move |view, cx| view.files_ask_upload(id, cx),
-                    ))
-                    .child(self.text_button(
-                        download_id,
-                        strings.transfers_download,
-                        Variant::Secondary,
-                        cx,
-                        move |view, cx| view.files_ask_download(id, None, cx),
-                    )),
+                    .child(
+                        self.text_button(
+                            upload_id,
+                            strings.transfers_upload,
+                            Variant::Secondary,
+                            cx,
+                            move |view, cx| view.files_ask_upload(id, cx),
+                        )
+                        .track_focus(&self.files_card_upload_focus)
+                        .focus(files_focus_ring),
+                    )
+                    .child(
+                        self.text_button(
+                            download_id,
+                            strings.transfers_download,
+                            Variant::Secondary,
+                            cx,
+                            move |view, cx| view.files_ask_download(id, None, cx),
+                        )
+                        .track_focus(&self.files_card_download_focus)
+                        .focus(files_focus_ring),
+                    ),
             );
         }
         // The terminal still owns the connection, so Refresh is the action that
@@ -8673,7 +9165,9 @@ impl ShelluneView {
                     cx,
                     move |view, cx| view.files_ask_upload(id, cx),
                 )
-                .ml(metrics.scale(spacing::HAIRLINE)),
+                .ml(metrics.scale(spacing::HAIRLINE))
+                .track_focus(&self.files_toolbar_upload_focus)
+                .focus(files_focus_ring),
             );
             // With a listing, a download starts from the entry a row names. Without one
             // - a server that offers no SFTP subsystem - the remote path is typed, and
@@ -8689,7 +9183,9 @@ impl ShelluneView {
                         cx,
                         move |view, cx| view.files_ask_download(id, None, cx),
                     )
-                    .ml(metrics.scale(spacing::HAIRLINE)),
+                    .ml(metrics.scale(spacing::HAIRLINE))
+                    .track_focus(&self.files_toolbar_download_focus)
+                    .focus(files_focus_ring),
                 );
             }
         }
@@ -8834,6 +9330,7 @@ impl ShelluneView {
                 .into_any_element(),
             BrowseState::Ready(listing) => {
                 let list_id = files_element_id(source, "list");
+                let list_scroll = self.files_list_scroll(source).clone();
                 let mut list = div()
                     .id(list_id.clone())
                     .flex()
@@ -8841,6 +9338,9 @@ impl ShelluneView {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
+                    // Page Up/Down turns the entries themselves while they are taller
+                    // than the box that holds them (R4).
+                    .track_scroll(&list_scroll)
                     .rounded(px(radius::MEDIUM))
                     .bg(theme::swatch(palette::SURFACE))
                     .border_1()
@@ -8892,10 +9392,8 @@ impl ShelluneView {
         };
 
         let panel_id = files_element_id(source, "panel");
-        let focus = match source {
-            FileSource::Local => &self.files_local_focus,
-            FileSource::Remote => &self.files_remote_focus,
-        };
+        let focus = self.files_panel_focus(source).clone();
+        let panel_scroll = self.files_panel_scroll(source).clone();
         let mut panel = div()
             .flex()
             .flex_col()
@@ -8913,13 +9411,22 @@ impl ShelluneView {
             // The pane is one slice tall at 200% text in the minimum window, and a
             // failed read draws a card that is far taller than that slice. Clipping it
             // would put the reason and the two typed-path entries below an edge nothing
-            // can reach, so the pane turns instead and each of them is reached by
-            // scrolling (R4). A listing fills the slice itself and scrolls inside its own
-            // box, so this one has nothing to turn until something does not fit.
+            // can reach, so the pane turns instead: the wheel and Page Up/Down both do
+            // it, and Home and End go to either end (R4). A listing fills the slice
+            // itself and scrolls inside its own box, so this one has nothing to turn
+            // until something does not fit.
             .overflow_y_scroll()
-            .track_focus(focus)
-            .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _window, cx| {
-                if view.files_key(id, source, event, cx) {
+            .track_scroll(&panel_scroll)
+            .track_focus(&focus)
+            // The column draws the ring while it holds the keys, so the keyboard's place
+            // is visible before Tab has moved it anywhere (R4).
+            .focus(|style| {
+                style
+                    .border_1()
+                    .border_color(theme::swatch(palette::ACCENT))
+            })
+            .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
+                if view.files_key(id, source, event, window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -9386,15 +9893,21 @@ impl ShelluneView {
                 TransferProtocol::Sftp => "files.question.protocol.sftp",
                 TransferProtocol::Scp => "files.question.protocol.scp",
             };
+            let focus = match protocol {
+                TransferProtocol::Sftp => &self.files_question_sftp_focus,
+                TransferProtocol::Scp => &self.files_question_scp_focus,
+            };
             row = row.child(
                 components::segment(label, protocol == chosen, metrics)
                     .id(selector)
                     .debug_selector(move || selector.to_owned())
+                    // The switch is a stop of the file view's keyboard order too: the
+                    // protocol belongs to this one task, so choosing it must not need a
+                    // pointer (R4, R10).
+                    .track_focus(focus)
+                    .focus(files_focus_ring)
                     .on_click(cx.listener(move |view, _event, _window, cx| {
-                        if let Some(dialog) = view.files_dialog.as_mut() {
-                            dialog.set_protocol(protocol);
-                        }
-                        cx.notify();
+                        view.files_choose_protocol(protocol, cx);
                     })),
             );
         }
@@ -9534,6 +10047,8 @@ impl ShelluneView {
                             )
                             .id("files.question.recursive")
                             .debug_selector(|| "files.question.recursive".to_owned())
+                            .track_focus(&self.files_question_recursive_focus)
+                            .focus(files_focus_ring)
                             .on_click(cx.listener(
                                 |view, _event, _window, cx| {
                                     if let Some(dialog) = view.files_dialog.as_mut() {
@@ -9576,20 +10091,28 @@ impl ShelluneView {
                         .items_center()
                         .flex_wrap()
                         .gap(metrics.scale(spacing::HAIRLINE))
-                        .child(self.text_button(
-                            SharedString::from("files.question.confirm"),
-                            confirm,
-                            Variant::Primary,
-                            cx,
-                            |view, cx| view.submit_files_change(cx),
-                        ))
-                        .child(self.text_button(
-                            SharedString::from("files.question.cancel"),
-                            strings.files_cancel,
-                            Variant::Secondary,
-                            cx,
-                            |view, cx| view.files_cancel_change(cx),
-                        )),
+                        .child(
+                            self.text_button(
+                                SharedString::from("files.question.confirm"),
+                                confirm,
+                                Variant::Primary,
+                                cx,
+                                |view, cx| view.submit_files_change(cx),
+                            )
+                            .track_focus(&self.files_question_confirm_focus)
+                            .focus(files_focus_ring),
+                        )
+                        .child(
+                            self.text_button(
+                                SharedString::from("files.question.cancel"),
+                                strings.files_cancel,
+                                Variant::Secondary,
+                                cx,
+                                |view, cx| view.files_cancel_change(cx),
+                            )
+                            .track_focus(&self.files_question_cancel_focus)
+                            .focus(files_focus_ring),
+                        ),
                 );
             }
             FilesDialog::Delete { name, kind, .. } => {
@@ -9652,20 +10175,28 @@ impl ShelluneView {
                         .items_center()
                         .flex_wrap()
                         .gap(metrics.scale(spacing::HAIRLINE))
-                        .child(self.text_button(
-                            SharedString::from("files.question.confirm"),
-                            strings.files_delete_confirm,
-                            Variant::Danger,
-                            cx,
-                            |view, cx| view.submit_files_change(cx),
-                        ))
-                        .child(self.text_button(
-                            SharedString::from("files.question.cancel"),
-                            strings.files_cancel,
-                            Variant::Secondary,
-                            cx,
-                            |view, cx| view.files_cancel_change(cx),
-                        )),
+                        .child(
+                            self.text_button(
+                                SharedString::from("files.question.confirm"),
+                                strings.files_delete_confirm,
+                                Variant::Danger,
+                                cx,
+                                |view, cx| view.submit_files_change(cx),
+                            )
+                            .track_focus(&self.files_question_confirm_focus)
+                            .focus(files_focus_ring),
+                        )
+                        .child(
+                            self.text_button(
+                                SharedString::from("files.question.cancel"),
+                                strings.files_cancel,
+                                Variant::Secondary,
+                                cx,
+                                |view, cx| view.files_cancel_change(cx),
+                            )
+                            .track_focus(&self.files_question_cancel_focus)
+                            .focus(files_focus_ring),
+                        ),
                 );
             }
         }
@@ -10208,6 +10739,7 @@ impl ShelluneView {
         source: FileSource,
         key: &str,
         modified: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let mut keystroke = gpui::Keystroke {
@@ -10224,6 +10756,7 @@ impl ShelluneView {
                 keystroke,
                 is_held: false,
             },
+            window,
             cx,
         )
     }
@@ -10280,6 +10813,15 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn files_question_text(&self) -> Option<&str> {
         self.files_dialog.as_ref().and_then(FilesDialog::text)
+    }
+
+    /// Whether the last input was the pointer, for a test that says it was not.
+    ///
+    /// A test of the keyboard's own path asserts this stayed false: the shell records every
+    /// pointer press here, so a flow that never set it never touched the mouse.
+    #[cfg(test)]
+    pub fn pointer_input_for_test(&self) -> bool {
+        self.pointer_input
     }
 
     /// Why a session ended, and what the user can do about it (R12).
@@ -11223,6 +11765,24 @@ impl Render for ShelluneView {
         {
             window.focus(&handle);
         }
+        // A file view's question takes the keyboard in its first field, and gives it back
+        // to the column it asked about once it is gone, so a copy can be asked for, typed
+        // and confirmed without a pointer (R4).
+        if std::mem::take(&mut self.files_field_focus)
+            && let Some(handle) = self
+                .files_field
+                .as_ref()
+                .map(|field| field.read(cx).focus_handle().clone())
+            && !handle.is_focused(window)
+        {
+            window.focus(&handle);
+        }
+        if let Some(source) = self.files_panel_focus_pending.take() {
+            let handle = self.files_panel_focus(source).clone();
+            if !handle.is_focused(window) {
+                window.focus(&handle);
+            }
+        }
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);
 
@@ -11332,6 +11892,12 @@ impl Render for ShelluneView {
                     this.close_shell_menu(cx);
                     return;
                 }
+                // A file view's question is inline rather than floating, so it is the last
+                // thing Escape closes: the column it asked about takes the keys back (R4).
+                if this.files_dialog.is_some() {
+                    this.files_cancel_change(cx);
+                    return;
+                }
                 this.workspace.dismiss_notice();
                 cx.notify();
             }))
@@ -11434,6 +12000,15 @@ impl Render for ShelluneView {
             }))
             .on_action(cx.listener(|this, _: &MoveTabRight, _window, cx| {
                 this.reorder_active_tab(1, cx);
+            }))
+            // Copying a file has a shortcut of its own, so a keyboard user reaches the
+            // transfer chain without first finding a button in a card that may be drawn
+            // below the fold (R4, R10).
+            .on_action(cx.listener(|this, _: &FilesUpload, window, cx| {
+                this.files_upload_from_shortcut(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FilesDownload, window, cx| {
+                this.files_download_from_shortcut(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectTab9, window, cx| {
                 let last = this.workspace.layout().tabs().len().saturating_sub(1);

@@ -63,6 +63,42 @@ pub enum FileSource {
     Remote,
 }
 
+/// One control of the file view the keyboard can stop on, in the order the page
+/// draws them (R4).
+///
+/// The window does not hand out a collection-wide tab order: the column that holds the
+/// keyboard keeps it and offers its own controls, and each of them is a stop here. The
+/// list is what `files_key` steps through, so a failed read of a server without an SFTP
+/// subsystem really does reach its two typed-path entries with the keyboard alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilesStop {
+    /// The column itself: the listing, or the card that says why there is none. The
+    /// keyboard arrives here and Page Up/Down turns what it holds.
+    Body,
+    /// The toolbar's upload entry (the typed local path).
+    ToolbarUpload,
+    /// The toolbar's download entry, drawn where there is no listing to pick a row from.
+    ToolbarDownload,
+    /// The failed read's typed-path upload entry.
+    CardUpload,
+    /// The failed read's typed-path download entry.
+    CardDownload,
+    /// The question's local path field.
+    QuestionLocal,
+    /// The question's remote path field.
+    QuestionRemote,
+    /// The question's SFTP choice.
+    QuestionSftp,
+    /// The question's SCP choice.
+    QuestionScp,
+    /// The question's recursive switch, drawn once SCP is the chosen protocol.
+    QuestionRecursive,
+    /// The question's confirming button.
+    QuestionConfirm,
+    /// The question's cancelling button.
+    QuestionCancel,
+}
+
 /// One browsable session: the remote connection, the local disk, and both views.
 struct SessionFiles {
     remote: Box<dyn BrowseChannel>,
