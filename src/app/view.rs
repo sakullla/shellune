@@ -313,6 +313,16 @@ pub const FILES_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// carries the whole number, so the list can stay a report and not a log.
 pub const FILES_REPORT_STEPS: usize = 12;
 
+/// The share of the window a failed bridge's explanation may take.
+///
+/// The reason and the next step sit under the session bar, above the terminal that keeps
+/// working; their text grows with the text size, so a window at 720×480 with 200% text
+/// cannot hold them at their natural height without pushing the terminal out of the
+/// window. Bounding them to this share keeps the terminal on screen and leaves the rest
+/// of the text one scroll away, whatever the window's height is (R4). Chosen so the same
+/// text still fits whole in an ordinary window, where nothing scrolls at all.
+const X11_NOTICE_SHARE: f32 = 0.35;
+
 /// Ends a menu entry that asks for more input before it acts.
 const ELLIPSIS: &str = "\u{2026}";
 
@@ -7609,7 +7619,7 @@ impl ShelluneView {
     }
 
     /// The content under the top bar: the settings, a terminal, or the hosts home.
-    fn destination_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn destination_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let destination = self.workspace.destination();
         if destination == Destination::Settings {
             return self.settings_page(cx);
@@ -7623,7 +7633,7 @@ impl ShelluneView {
                 .id("content.scroll")
                 .debug_selector(|| "content".to_owned())
                 .track_focus(self.destination_focus(destination))
-                .child(self.terminal_panel(cx));
+                .child(self.terminal_panel(window, cx));
         }
         self.home_page(cx)
     }
@@ -7632,9 +7642,9 @@ impl ShelluneView {
     ///
     /// The terminal fills the panel edge to edge with the bar of its session on top,
     /// so the name, the state and the actions are read in the same place as the output.
-    fn terminal_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn terminal_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         if self.workspace.layout().active_tab().is_some() {
-            return self.layout_terminal(cx);
+            return self.layout_terminal(window, cx);
         }
         let metrics = self.metrics();
         let strings = self.strings();
@@ -7675,7 +7685,7 @@ impl ShelluneView {
         let mut frame = div().flex().flex_col().flex_1().min_h(px(0.0));
 
         if let Some(pane) = self.active_pane() {
-            frame = frame.child(self.session_bar(id, cx));
+            frame = frame.child(self.session_bar(id, window, cx));
             // A shell that ended keeps its last screen, but the reason it stopped is
             // stated above it instead of being left for the user to guess.
             let notice = if let Some((failure, reconnectable)) = ended {
@@ -7704,7 +7714,7 @@ impl ShelluneView {
             // it opened one, or a process that never started. The session still holds
             // the reason, so it is drawn where the terminal would be instead of being
             // recorded and shown nowhere.
-            frame = frame.child(self.session_bar(id, cx));
+            frame = frame.child(self.session_bar(id, window, cx));
             let notice = if let Some((failure, reconnectable)) = ended {
                 self.failure_notice(&failure, reconnectable)
             } else {
@@ -11308,7 +11318,12 @@ impl ShelluneView {
     }
 
     /// The state, the object and the actions of the selected session.
-    fn session_bar(&self, id: Option<SessionId>, cx: &mut Context<Self>) -> Div {
+    fn session_bar(
+        &self,
+        id: Option<SessionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let Some(session) = id.and_then(|id| self.workspace.session(id)) else {
@@ -11560,11 +11575,26 @@ impl ShelluneView {
             .flex_none()
             .w_full()
             .child(row)
-            .children(
-                x11_failure.map(|(reason, next_step)| {
-                    self.x11_failure_banner(&reason, &next_step, metrics)
-                }),
-            )
+            .children(x11_failure.map(|(reason, next_step)| {
+                // A failed bridge leaves a working session, so the bar keeps its buttons
+                // and the terminal keeps the room under them: the two blocks of text are
+                // bounded to the share of the window a notice may take, and what does not
+                // fit is reached by scrolling instead of being drawn past the bottom edge
+                // (R4, R11). At 720×480 with 200% text the reason and the next step are
+                // together taller than the window, and a box let grow to its content would
+                // leave the terminal no height at all.
+                let room = window.viewport_size().height * X11_NOTICE_SHARE;
+                div()
+                    .id("session.x11.notice.body")
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .min_h(px(0.0))
+                    .max_h(room)
+                    .overflow_y_scroll()
+                    .debug_selector(|| "session.x11.notice.body".to_owned())
+                    .child(self.x11_failure_banner(&reason, &next_step, metrics))
+            }))
             .children(notice.map(|notice| self.quick_save_banner(&notice)))
     }
 
@@ -12249,7 +12279,7 @@ impl Render for ShelluneView {
                     .children(notice)
                     .children(self.close_transfer_question(cx))
                     .children(self.close_app_question(cx))
-                    .child(self.destination_panel(cx)),
+                    .child(self.destination_panel(window, cx)),
             )
             // Floating layers, drawn after the page and so above it, the later the
             // higher. They are plain layers rather than deferred draws, so a field

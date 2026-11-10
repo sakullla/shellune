@@ -359,7 +359,7 @@ impl ShelluneView {
     }
 
     /// The active tab, or the pending layout, drawn as a tree.
-    pub(super) fn layout_terminal(&self, cx: &mut Context<Self>) -> gpui::Div {
+    pub(super) fn layout_terminal(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let metrics = self.metrics();
         let mut column = div()
             .flex()
@@ -384,7 +384,7 @@ impl ShelluneView {
             self.active
         };
         if session_id.is_some_and(|id| self.workspace.session(id).is_some()) {
-            column = column.child(self.session_bar(session_id, cx));
+            column = column.child(self.session_bar(session_id, window, cx));
             if let Some(notice) = self.active_failure_notice(session_id, cx) {
                 column = column.child(
                     div()

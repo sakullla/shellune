@@ -17432,3 +17432,122 @@ async fn the_session_bar_says_what_x11_forwarding_is_doing(cx: &mut TestAppConte
         "the bar says that this session forwards nothing"
     );
 }
+
+/// The X11 state, its reason and the session's actions in the smallest window (R4, R11).
+///
+/// The chip sits at the right of the session bar, after the identity and the target, in
+/// the same row as the buttons that belong to the session; the banner that repeats the
+/// reason and the next step hangs under that row. At 720×480 with 200% text the row has
+/// no room to spare, so this measures that neither the state nor the text a keyboard user
+/// reads instead of the tooltip is pushed past the window's edge, and that the session's
+/// own close button stays inside it too.
+#[gpui::test]
+async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hundred_percent(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, _dir) =
+        dialog_view(cx, vec![stored_host("web", "127.0.0.1", 1, "deploy", None)]);
+    click(cx, "hosts.connect.0");
+    type_into(cx, "remote.password", "hunter2");
+    // The failure the restricted mode reports where the display refuses the authorization
+    // it issued: the longest reason and next step of this round, so the banner is measured
+    // with the text it really carries.
+    let failure = shellune_ssh::X11Failure::RestrictedUnsupportedByDisplay {
+        display: "127.0.0.1:96".to_owned(),
+        detail: "Invalid MIT-MAGIC-COOKIE-1 key".to_owned(),
+    };
+    let (reason, next_step) = (failure.to_string(), failure.next_step());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::X11(X11Status::Failed {
+                        reason: reason.clone(),
+                        next_step: next_step.clone(),
+                    }),
+                    shellune_ssh::RemoteEvent::Connected,
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.x11.failed").is_some(),
+        "the bar reports the refused display before the window is made small"
+    );
+    // In an ordinary window the same text is shown whole: the bound only takes over when
+    // the window and the text size cannot both have their way.
+    assert!(
+        bounds_of(cx, "session.x11.notice").size.height
+            <= bounds_of(cx, "session.x11.notice.body").size.height + px(0.5),
+        "the explanation scrolled in a window that has room for all of it"
+    );
+
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest,
+        "200% text is what this measures"
+    );
+
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    // The state itself stays on the bar, in the row of the session's own actions.
+    assert_within_width(
+        bounds_of(cx, "session.x11.failed"),
+        viewport,
+        "session.x11.failed",
+    );
+    // The explanation is bounded by the room the window has, so it cannot be drawn past
+    // the bottom edge with the terminal behind it.
+    let boxed = bounds_of(cx, "session.x11.notice.body");
+    assert_fits_inside(boxed, viewport, "the X11 notice box");
+    assert!(
+        boxed.size.height <= viewport.height * 0.45,
+        "the notice took more than its share of the window: {boxed:?} in {viewport:?}"
+    );
+    // The reason is the first block, so it is read without scrolling.
+    let reason_bounds = bounds_of(cx, "session.x11.reason");
+    assert_inside_box(reason_bounds, boxed, "the reason");
+    assert!(
+        reason_bounds.origin.y >= boxed.origin.y - px(0.5)
+            && reason_bounds.origin.y + reason_bounds.size.height
+                <= boxed.origin.y + boxed.size.height + px(0.5),
+        "the reason is not wholly inside the box before any scrolling: \
+         {reason_bounds:?} in {boxed:?}"
+    );
+    // The next step is the rest of the same text: it is reached by scrolling the box,
+    // which is what "inside the window, or reachable by explicit scrolling" means here.
+    scroll_fully_into_view(cx, "session.x11.notice.body", "session.x11.next");
+    let next = bounds_of(cx, "session.x11.next");
+    assert_inside_box(
+        next,
+        bounds_of(cx, "session.x11.notice.body"),
+        "the next step",
+    );
+    let boxed = bounds_of(cx, "session.x11.notice.body");
+    assert!(
+        next.origin.y >= boxed.origin.y - px(0.5)
+            && next.origin.y + next.size.height <= boxed.origin.y + boxed.size.height + px(0.5),
+        "the next step is not wholly inside the box it was scrolled into: {next:?} in {boxed:?}"
+    );
+    // A bounded notice is only worth it if the session it belongs to is usable: the
+    // terminal keeps a real height under it, and the actions still fit in the window.
+    let terminal = bounds_of(cx, "terminal.viewport");
+    assert!(
+        terminal.size.height >= px(24.0),
+        "the terminal has no room left under the notice: {terminal:?}"
+    );
+    assert_fits_inside(terminal, viewport, "the terminal");
+    assert_fits_inside(bounds_of(cx, "session.close"), viewport, "session.close");
+}
