@@ -85,6 +85,32 @@ fn assert_within_width(bounds: gpui::Bounds<Pixels>, viewport: Size<Pixels>, wha
     );
 }
 
+/// Whether `inner` sits inside `outer` on the horizontal axis.
+///
+/// A dialog clips what it does not fit (`overflow_hidden`), so a row drawn past its
+/// card's right edge is drawn past everything a person can reach: the page under a
+/// dialog has no horizontal scroll, and at 200% text in the minimum window there is no
+/// room to spare. That makes "inside the card" the property to measure, not "inside the
+/// window" (R4).
+fn assert_inside_horizontally(
+    inner: gpui::Bounds<Pixels>,
+    outer: gpui::Bounds<Pixels>,
+    what: &str,
+) {
+    assert!(
+        inner.size.width > px(0.0),
+        "{what} was measured with an empty box: {inner:?}"
+    );
+    assert!(
+        inner.origin.x >= outer.origin.x - px(0.5),
+        "{what} starts left of its card: {inner:?} in {outer:?}"
+    );
+    assert!(
+        inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + px(0.5),
+        "{what} extends past its card's right edge: {inner:?} in {outer:?}"
+    );
+}
+
 fn assert_fits_inside(bounds: gpui::Bounds<Pixels>, viewport: Size<Pixels>, what: &str) {
     assert!(
         bounds.size.width > px(0.0) && bounds.size.height > px(0.0),
@@ -10911,6 +10937,150 @@ async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_t
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert!(!cx.update(|_window, app| view.read(app).tab_rename_open()));
+}
+
+#[gpui::test]
+async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scrolling(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    // A tab that carries a name and a colour, so the rows holding them are the measured
+    // ones. Both are set through the UI, the way a person sets them.
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let first = tabs[0];
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.accent.teal");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    right_click(cx, "session.tab.0");
+    click(cx, "tab.menu.rename");
+    cx.simulate_input("deploy");
+    cx.run_until_parked();
+    click(cx, "tab.rename.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(first)),
+        "deploy",
+        "the tab is named before the boundary size is measured"
+    );
+
+    // The smallest window at the largest text: there is no room to spare anywhere, so a
+    // row that does not wrap is a row that is drawn past the card that holds it.
+    let viewport = minimum_window();
+    cx.simulate_resize(viewport);
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+
+    // The list of every tab: each row stays inside the dialog's own width.
+    click(cx, "tabs.list.open");
+    cx.run_until_parked();
+    let list = bounds_of(cx, "tabs.list.dialog");
+    let list_body = bounds_of(cx, "tabs.list.dialog.body");
+    assert_fits_inside(list, viewport, "the tab list");
+    assert_inside_horizontally(list_body, list, "the tab list's body");
+    assert!(
+        list_body.size.height >= px(24.0),
+        "the body the rows live in has no line to stand on: {list_body:?}"
+    );
+    let first_row = bounds_of(cx, "tabs.list.row.0");
+    assert_inside_horizontally(first_row, list_body, "the first tab row");
+    for selector in [
+        "tabs.list.accent.0",
+        "tabs.list.accent-name.0",
+        "tabs.list.rename.0",
+    ] {
+        assert_inside_horizontally(bounds_of(cx, selector), first_row, selector);
+    }
+    assert_pointer_target(cx, "tabs.list.rename.0");
+    let next_row = bounds_of(cx, "tabs.list.row.1");
+    assert_inside_horizontally(next_row, list_body, "the second tab row");
+    assert_inside_horizontally(
+        bounds_of(cx, "tabs.list.rename.1"),
+        next_row,
+        "the second row's pencil",
+    );
+    // Wrapped rather than cut: the row is taller than the controls it holds, which is
+    // what one line of them would be, so its contents took a second line inside it.
+    let pencil = bounds_of(cx, "tabs.list.rename.0");
+    assert!(
+        first_row.size.height > pencil.size.height + px(8.0),
+        "the row should wrap at 200% text rather than stay one clipped line: \
+         {first_row:?} for a {pencil:?} pencil"
+    );
+
+    // The name dialog, opened from the list's pencil: the field the dialog exists for is
+    // what the body has room for on screen ...
+    click(cx, "tabs.list.rename.0");
+    let rename = bounds_of(cx, "tab.rename.dialog");
+    let rename_body = bounds_of(cx, "tab.rename.dialog.body");
+    assert_fits_inside(rename, viewport, "the name dialog");
+    assert_inside_horizontally(rename_body, rename, "the name dialog's body");
+    let field = bounds_of(cx, "tab.rename.field");
+    assert!(
+        field.origin.y >= rename_body.origin.y - px(0.5)
+            && field.origin.y + field.size.height
+                <= rename_body.origin.y + rename_body.size.height + px(0.5),
+        "the name field is outside the part of the body that is on screen: {field:?} in {rename_body:?}"
+    );
+
+    // ... and the colours are one scroll away, wrapped inside the dialog's own width.
+    let accents = bounds_of(cx, "tab.rename.accents");
+    assert_inside_horizontally(accents, rename, "the colour row");
+    let mut swatches = Vec::new();
+    for accent in ["none", "iris", "violet", "teal", "lime", "orchid", "clay"] {
+        let selector: &'static str =
+            Box::leak(format!("tab.rename.accent.{accent}").into_boxed_str());
+        let bounds = bounds_of(cx, selector);
+        assert_inside_horizontally(bounds, accents, selector);
+        assert_pointer_target(cx, selector);
+        swatches.push(bounds);
+    }
+    assert!(
+        swatches
+            .windows(2)
+            .any(|pair| pair[0].origin.y != pair[1].origin.y),
+        "the swatches take a second line inside the row instead of running past it: {swatches:?}"
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: rename_body.center(),
+        delta: gpui::ScrollDelta::Lines(point(0.0, -2.0)),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let reached = bounds_of(cx, "tab.rename.accents");
+    assert_ne!(
+        reached.origin.y, accents.origin.y,
+        "the dialog's body does not scroll its own colours"
+    );
+    assert!(
+        reached.origin.y >= rename_body.origin.y - px(0.5)
+            && reached.origin.y < rename_body.origin.y + rename_body.size.height,
+        "the colour row did not come into the body that is on screen: {reached:?} in {rename_body:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // The same row in the tab menu, still at 200% text, in a window where the strip has
+    // room to be pointed at.
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    right_click(cx, "session.tab.0");
+    let menu = bounds_of(cx, "tab.menu");
+    assert_fits_inside(menu, design_window(), "the tab menu");
+    let menu_accents = bounds_of(cx, "tab.menu.accents");
+    assert_inside_horizontally(menu_accents, menu, "the menu's colour row");
+    for accent in ["none", "iris", "violet", "teal", "lime", "orchid", "clay"] {
+        let selector: &'static str =
+            Box::leak(format!("tab.menu.accent.{accent}").into_boxed_str());
+        assert_inside_horizontally(bounds_of(cx, selector), menu, selector);
+    }
 }
 
 #[gpui::test]

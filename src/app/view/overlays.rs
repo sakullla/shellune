@@ -1856,18 +1856,18 @@ impl ShelluneView {
             cx,
             |this, cx| this.close_tab_rename_pending(cx),
         );
+        // The field is the first thing in the body, because at the smallest window with
+        // 200% text the body is only a few lines tall: the control the dialog exists for
+        // has to be the one that is on screen without scrolling. What explains the name
+        // and what changes the tab's mark follow it, and are reached by the body's own
+        // scroll (R4); the body always has one line to show and never collapses, which it
+        // did while the hint above the field was taller than the whole body.
         let body = div()
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(colors::TEXT_SECONDARY))
-                    .child(strings.tab_rename_hint),
-            )
             .child(
                 div()
                     .debug_selector(|| "tab.rename.field".to_owned())
@@ -1884,8 +1884,7 @@ impl ShelluneView {
                     .child(dialog.field.clone()),
             )
             // What the dialog says about the name sits right under the name, above the
-            // colours, so it is next to the field it is about and high in the body that
-            // scrolls at large text.
+            // colours, so it is next to the field it is about.
             .children(
                 dialog
                     .problem
@@ -1900,6 +1899,15 @@ impl ShelluneView {
                 self.tab_rename_notice(selector, template)
             }))
             .child(self.tab_accent_choices(tab, AccentRow::Rename, cx))
+            // The explanation of the whole dialog closes the body, where it scrolls
+            // rather than pushing the field out of the part of the body that is on screen.
+            .child(
+                div()
+                    .debug_selector(|| "tab.rename.hint".to_owned())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(colors::TEXT_SECONDARY))
+                    .child(strings.tab_rename_hint),
+            )
             .into_any_element();
         let footer = div()
             .flex()

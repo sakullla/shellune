@@ -1630,6 +1630,7 @@ impl ShelluneView {
             .child(
                 div()
                     .id(SharedString::from(format!("{id}.body")))
+                    .debug_selector(move || format!("{id}.body"))
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -1728,6 +1729,11 @@ impl ShelluneView {
                     )
                     .children(subtitle.map(|subtitle| {
                         div()
+                            // One line, like the title above it: a subtitle that wraps at
+                            // 200% text in the smallest window grows the header past the
+                            // dialog's own height and leaves the body — the controls the
+                            // header introduces — without a line to stand on (R4).
+                            .truncate()
                             .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
                             .child(SharedString::from(subtitle))
