@@ -15477,6 +15477,10 @@ async fn the_session_bar_says_what_x11_forwarding_is_doing(cx: &mut TestAppConte
         cx.debug_bounds("session.x11.enabling").is_none(),
         "the newest status is the one on the bar"
     );
+    assert!(
+        cx.debug_bounds("session.x11.notice").is_none(),
+        "a working bridge has nothing to explain"
+    );
 
     // A second session whose bridge failed keeps its shell and says why the display
     // is not available.
@@ -15503,6 +15507,20 @@ async fn the_session_bar_says_what_x11_forwarding_is_doing(cx: &mut TestAppConte
     assert!(
         cx.debug_bounds("session.x11.failed").is_some(),
         "the bar reports a display that could not be used"
+    );
+    // The reason and the next step are on the screen, not only in a tooltip: this test
+    // never moved the pointer, which is what a keyboard-only reader depends on (R4).
+    assert!(
+        cx.debug_bounds("session.x11.notice").is_some(),
+        "a failed bridge says so in text under the bar"
+    );
+    assert!(
+        cx.debug_bounds("session.x11.reason").is_some(),
+        "the reason is readable without a pointer"
+    );
+    assert!(
+        cx.debug_bounds("session.x11.next").is_some(),
+        "the next step is readable without a pointer"
     );
     assert_eq!(
         cx.update(|_window, app| {

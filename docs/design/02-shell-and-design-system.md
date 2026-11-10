@@ -261,16 +261,38 @@ X11 转发让服务器上的图形程序显示在这台电脑上。三个模式�
   （本次连接生效）、"改用受限模式"（保留转发但回到 `-X` 的限制）、"不连接"（什么都不连，表单与已输入的内容
   保持原样）。回答前一个字节都不发：没有任何连接被拨出。风险文字说明它会去掉 X11 SECURITY 扩展，服务器上的
   程序因此可能读取同一显示上其它窗口的按键输入。
+- **两种模式用的凭据不同，而且都是真的不同**（`Prepared::credential`）：
+  - 受限模式先向本机显示申请一个**不受信任**的 cookie，用的就是 `ssh -X` 的那条命令
+    （`xauth -f <authority> generate <display> MIT-MAGIC-COOKIE-1 untrusted`，`xauth` 按 `PATH` 查找）。
+    X 服务器因此把经这条授权连上来的远程程序当作不受信任的客户端，SECURITY 扩展才有东西可限制。
+    生成的条目和 OpenSSH 一样写在这台电脑的 authority 文件里——显示服务只承认它自己那边有记录的授权；
+    文件里原有的条目（用户自己程序的授权）原封不动。
+  - 信任模式直接用 `XAUTHORITY` 里这个显示自己的 cookie，不申请、也不改写任何东西，所以它不需要 `xauth`。
+  - 受限模式拿不到不受信任的 cookie 时（本机没有 `xauth`、`xauth` 失败或超时、显示服务不支持 SECURITY 扩展）
+    给出**独立失败原因**（`X11Failure::NoUntrustedCookie`）与下一步（装 `xauth`／换支持 SECURITY 的显示服务／
+    改选信任模式并确认风险），**绝不退回用受信 cookie 转发**：那会把默认模式悄悄变成它本来要避免的风险。
+- 显示名按平台解析（`parse_display`）：`:N`、`host:N`、`tcp/host:N` 之外，macOS 上 XQuartz 用 launchd socket
+  路径命名显示（`/private/tmp/com.apple.launchd.XXXX/org.xquartz:0`），凡是 host 部分含路径分隔符的就按本机
+  unix socket 直接连接，并按本地显示查 cookie，而不是把它当成 TCP 主机名。
 - 请求发生在 shell 之前（`x11-req` 必须在服务器准备会话环境之前到达，否则远端 `DISPLAY` 不会被设置）。请求被
-  接受后才把本机显示桥接起来；请求被拒绝、本机没有显示服务或本机没有 cookie 时只产生"X11 失败"，SSH 会话照常
-  可用，终端不会被判为断开，也不会被标成"X11 可用"。
+  接受后才把本机显示桥接起来；请求被拒绝、本机没有显示服务、本机没有 cookie、本机无法申请受限 cookie 时只产生
+  "X11 失败"，SSH 会话照常可用，终端不会被判为断开，也不会被标成"X11 可用"。
 - 本机 cookie 不出门：每个会话生成一个随机的代理 cookie 发给服务器（`MIT-MAGIC-COOKIE-1`），远端程序用它连回
-  来，桥接在这一侧把请求里的代理 cookie 换成真正的本机 cookie 再交给 X 服务器（`rewrite_setup`）。据此同一会话里
-  的第二个程序不需要第二次认证，服务器也从未拿到真实的 cookie。
+  来，桥接在这一侧把请求里的代理 cookie 换成上面那份凭据再交给 X 服务器（`rewrite_setup`）。据此同一会话里
+  的第二个程序不需要第二次认证，服务器也从未拿到本机的 cookie。
+- 失败原因是分开的，因为修法不同（`X11Failure`，每条都有自己的原因与下一步）：本机没有 `DISPLAY`、authority
+  文件里没有该显示的 cookie、显示服务连不上、**本机申请不到不受信任的 cookie**、**服务器没有可用的 `xauth`**、
+  **服务器有 `xauth` 但仍然拒绝（多半是 `X11Forwarding no` 或 `XAuthLocation` 指向跑不起来的程序）**、桥接中途
+  断开。服务器对 `x11-req` 的拒绝不带原因，所以在同一条已认证连接上做一次**尽力而为的探测**
+  （`probe_remote_xauth`：一个独立 channel 上执行 `command -v xauth` + 可执行性检查，限时）：能证明"远端没有
+  可用的 xauth"就单独给出这一条与"装 xauth"的修复方向；能证明 xauth 在位就说明是转发配置（多半
+  `X11Forwarding no`，或 `XAuthLocation` 指向跑不起来的程序）；探测不出结论时保留合并说明并**明说服务器没有提供
+  原因**，不猜。
 - 会话栏（`session.bar`）用一个小 chip 说明当前状态，四种状态各有自己的选择器：`session.x11.off`（关闭，中性）、
   `session.x11.enabling`（启用中，warning）、`session.x11.ready`（可用，positive）、`session.x11.failed`（失败，
-  danger）。失败与启用中的原因和下一步在 tooltip 里，因为会话栏没有位置写它们，而一个没桥接成功的会话仍然是
-  一个能用的会话。断开或关闭会话时 chip 随桥接一起消失。
+  danger）。chip 的 tooltip 写原因和下一步；失败时**同一段原因与下一步还会作为常显文本块**（`session.x11.notice`
+  /`session.x11.reason`/`session.x11.next`）出现在会话栏下方——tooltip 只有指针能读，键盘用户读到的是这块文本
+  （R4）。一个没桥接成功的会话仍然是一个能用的会话，断开或关闭会话时 chip 与文本块随桥接一起消失。
 - 关闭会话先停止接受新通道，再关掉既有桥接：不留下监听，也不留下仍在转发到本机显示的连接。
 - 对话框里的控件复用同一套分段与横幅；连接表单里的 X11 选择是一行（标签 + 三个分段，说明在 tooltip 里），
   因为同一个对话框下方还有其它正在进行的连接，长段落会把它们挤出小窗口。主机表单整页可滚动，X11 分段与确定

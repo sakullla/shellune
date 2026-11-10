@@ -37,7 +37,7 @@ use crate::session::{
 use crate::sftp::{self, FileLink};
 use crate::transfer::{self, TransferLink};
 use crate::transport::{self, Cancel, IoStream, ProxyProcess};
-use crate::x11::{self, X11Gate, X11Status};
+use crate::x11::{self, X11Gate, X11Notice, X11Status};
 
 /// Credentials and the stored trust decision for one hop.
 ///
@@ -676,7 +676,7 @@ async fn run_chain(
     transfers: transfer::Wiring,
     forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
     gate: Arc<forwarding::ForwardGate>,
-    x11_events: UnboundedReceiver<X11Status>,
+    x11_events: UnboundedReceiver<X11Notice>,
 ) {
     let result = connect_chain(
         request,
@@ -706,7 +706,7 @@ async fn connect_chain(
     transfers: transfer::Wiring,
     forwards: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
     gate: Arc<forwarding::ForwardGate>,
-    mut x11_events: UnboundedReceiver<X11Status>,
+    mut x11_events: UnboundedReceiver<X11Notice>,
 ) -> Result<(), ChainFailure> {
     let cancel = &attempt.cancel;
     let planned = plan_chain(&request.hosts, request.target, request.auth)?;
@@ -1216,7 +1216,7 @@ async fn drive_shell(
     transfers: transfer::Wiring,
     forward_events: tokio::sync::mpsc::UnboundedSender<forwarding::ForwardEvent>,
     gate: Arc<forwarding::ForwardGate>,
-    x11_events: &mut UnboundedReceiver<X11Status>,
+    x11_events: &mut UnboundedReceiver<X11Notice>,
 ) -> Result<(), ChainFailure> {
     let events = &attempt.events;
     let cancel = &attempt.cancel;
@@ -1246,17 +1246,11 @@ async fn drive_shell(
             report_x11(X11Status::Off);
         }
         let prepared = if attempt.x11.mode().is_enabled() {
-            match x11::prepare(attempt.x11.mode()) {
-                Ok(prepared) => match prepared.reachable().await {
-                    Ok(()) => Some(prepared),
-                    Err(failure) => {
-                        report_x11(X11Status::Failed {
-                            reason: failure.to_string(),
-                            next_step: failure.next_step(),
-                        });
-                        None
-                    }
-                },
+            // A display that is not there, an authority file without a cookie and a
+            // display that cannot issue a restricted cookie are reported before the
+            // request is sent, and never stop the shell below.
+            match x11::arm(attempt.x11.mode()).await {
+                Ok(prepared) => Some(prepared),
                 Err(failure) => {
                     report_x11(X11Status::Failed {
                         reason: failure.to_string(),
@@ -1383,9 +1377,18 @@ async fn drive_shell(
                     let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                     return Ok(());
                 }
-                status = x11_events.recv(), if x11_open => {
-                    match status {
-                        Some(status) => {
+                notice = x11_events.recv(), if x11_open => {
+                    match notice {
+                        Some(X11Notice::Status(status)) => {
+                            let _ = events.send(ChainEvent::X11 {
+                                hop: location.clone(),
+                                status,
+                            });
+                        }
+                        // A refusal is answered with what the target says about its own
+                        // xauth, so the two server-side causes can be told apart.
+                        Some(X11Notice::Refused) => {
+                            let status = x11::refusal_status(handle).await;
                             let _ = events.send(ChainEvent::X11 {
                                 hop: location.clone(),
                                 status,
@@ -1490,9 +1493,18 @@ async fn drive_shell(
                 let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                 return Ok(());
             }
-            status = x11_events.recv(), if x11_open => {
-                match status {
-                    Some(status) => {
+            notice = x11_events.recv(), if x11_open => {
+                match notice {
+                    Some(X11Notice::Status(status)) => {
+                        let _ = events.send(ChainEvent::X11 {
+                            hop: location.clone(),
+                            status,
+                        });
+                    }
+                    // A refusal is answered with what the target says about its own
+                    // xauth, so the two server-side causes can be told apart.
+                    Some(X11Notice::Refused) => {
+                        let status = x11::refusal_status(handle).await;
                         let _ = events.send(ChainEvent::X11 {
                             hop: location.clone(),
                             status,

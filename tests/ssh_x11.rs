@@ -7,8 +7,14 @@
 //! a bridge that dropped it or forwarded the session cookie unchanged would be refused
 //! instead of quietly passing.
 //!
-//! The disposable server, the display server and the two environment variables the
-//! product reads (`DISPLAY`, `XAUTHORITY`) belong to the whole process, so the tests of
+//! The restricted mode is exercised with the same `xauth` command OpenSSH's client uses
+//! (`xauth generate <display> MIT-MAGIC-COOKIE-1 untrusted`), through a stand-in on
+//! `PATH` that runs the real `xauth` of the Linux environment the display belongs to.
+//! The trusted mode is exercised without any `xauth` at all, which is the difference
+//! between the two credentials.
+//!
+//! The disposable server, the display server and the environment variables the product
+//! reads (`DISPLAY`, `XAUTHORITY`, `PATH`) belong to the whole process, so the tests of
 //! this file run one at a time. When this host cannot start an OpenSSH server or has no
 //! Xvfb, a test prints why it cannot run and returns: a skipped end-to-end check is a
 //! gap in evidence, never a pass.
@@ -54,18 +60,31 @@ fn skip(what: &str, needs_display: bool) -> bool {
     false
 }
 
-/// The two variables the product reads, restored when the test ends.
+/// The variables the product reads, restored when the test ends.
 struct DisplayEnv {
     display: Option<OsString>,
     authority: Option<OsString>,
+    path: Option<OsString>,
 }
 
 impl DisplayEnv {
-    fn set(display: Option<&str>, authority: Option<&Path>) -> Self {
+    /// Shows the product a display, and puts `xauth` where it looks for it.
+    ///
+    /// `xauth` is the directory to put in front of `PATH`; the rest of `PATH` stays, so
+    /// the harness itself can still run `wsl.exe`.
+    fn set(display: Option<&str>, authority: Option<&Path>, xauth: Option<&Path>) -> Self {
         let previous = Self {
             display: std::env::var_os("DISPLAY"),
             authority: std::env::var_os("XAUTHORITY"),
+            path: std::env::var_os("PATH"),
         };
+        let path = xauth.map(|xauth| {
+            let existing = std::env::var_os("PATH").unwrap_or_default();
+            std::env::join_paths(
+                std::iter::once(xauth.to_path_buf()).chain(std::env::split_paths(&existing)),
+            )
+            .expect("a search path")
+        });
         // The product reads these from its own environment, which is this process's:
         // that is how a real user's shell hands it a display, and the tests drive the
         // same path rather than a test-only parameter.
@@ -77,6 +96,9 @@ impl DisplayEnv {
             match authority {
                 Some(authority) => std::env::set_var("XAUTHORITY", authority),
                 None => std::env::remove_var("XAUTHORITY"),
+            }
+            if let Some(path) = &path {
+                std::env::set_var("PATH", path);
             }
         }
         previous
@@ -93,6 +115,10 @@ impl Drop for DisplayEnv {
             match self.authority.take() {
                 Some(value) => std::env::set_var("XAUTHORITY", value),
                 None => std::env::remove_var("XAUTHORITY"),
+            }
+            match self.path.take() {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
             }
         }
     }
@@ -245,6 +271,20 @@ fn accepted_logins(server: &Harness) -> usize {
         .count()
 }
 
+/// Waits until the display has no client left, or reports how many are still there.
+fn wait_for_no_connections(display: &DisplayServer) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut open = usize::MAX;
+    while Instant::now() < deadline {
+        open = display.connections().unwrap_or(0);
+        if open == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    open
+}
+
 #[test]
 fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_login() {
     let _serial = gate();
@@ -254,10 +294,20 @@ fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_logi
     let server = Harness::start_with_x11("x11-ready", Harness::free_port(), X11Server::Enabled)
         .expect("the disposable server starts");
     let display = DisplayServer::start("x11-ready").expect("the display server starts");
-    let _env = DisplayEnv::set(Some(&display.display()), Some(&display.authority()));
+    let xauth = display.xauth_path();
+    let _env = DisplayEnv::set(
+        Some(&display.display()),
+        Some(&display.authority()),
+        Some(&xauth),
+    );
     // The log holds every run of this harness; the count that matters is the one this
     // session adds.
     let logins_before = accepted_logins(&server);
+    // The entry this machine's own programs authenticate with, read before the session
+    // adds anything to the file.
+    let own_cookie_hex = display.cookie_hex();
+    let own_cookie = hex_bytes(&own_cookie_hex);
+    let authority_before = std::fs::read(display.authority()).expect("the authority file");
 
     let mut session = connect(&server, X11Forwarding::Restricted);
     let started = wait_connected(&mut session);
@@ -268,7 +318,7 @@ fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_logi
     );
 
     // The first remote program: its own connection to the display, through the
-    // session's X11 channel and this machine's real cookie.
+    // session's X11 channel and the restricted credential this machine obtained.
     write(&mut session, "xdpyinfo 2>&1 | head -2");
     let output = wait_for_output(&mut session, "version number", &started.output);
     assert!(
@@ -294,12 +344,12 @@ fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_logi
         "the second program reached the display: {output:?}"
     );
 
-    // The cookie the server was given is this session's own: the real one of this
-    // machine is never sent, so a leaked server cannot authenticate to the display.
+    // The cookie the server was given is this session's own: the local one is never
+    // sent, so a leaked server cannot authenticate to the display.
     write(&mut session, "xauth list 2>/dev/null");
     let listed = wait_for_output(&mut session, "MIT-MAGIC-COOKIE-1", &output);
     assert!(
-        !listed.contains(&display.cookie_hex()),
+        !listed.contains(&own_cookie_hex),
         "the remote authority file must not hold this machine's cookie"
     );
 
@@ -323,18 +373,71 @@ fn a_remote_program_reaches_this_machines_display_and_a_second_one_needs_no_logi
     // Closing the session ends its bridge: the display is left with no connection from
     // the forwarded programs.
     session.close();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut open = usize::MAX;
-    while Instant::now() < deadline {
-        open = display.connections().unwrap_or(0);
-        if open == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
     assert_eq!(
-        open, 0,
+        wait_for_no_connections(&display),
+        0,
         "a closed session left no display connection behind"
+    );
+    // The restricted mode asked the display for an untrusted cookie, as `ssh -X` does,
+    // and that entry is what the file now holds in addition. The entry this machine's
+    // own programs use is untouched, so their access to the display did not change.
+    let authority_after = std::fs::read(display.authority()).expect("the authority file");
+    assert_ne!(
+        authority_after, authority_before,
+        "the restricted mode must have obtained an untrusted entry from the display"
+    );
+    assert!(
+        authority_after
+            .windows(own_cookie.len())
+            .any(|window| window == own_cookie),
+        "the display's own entry was left as it was"
+    );
+}
+
+/// The bytes of a hex string, as an authority file holds them.
+fn hex_bytes(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("a hex byte"))
+        .collect()
+}
+
+#[test]
+fn a_trusted_session_forwards_without_needing_a_restricted_cookie() {
+    let _serial = gate();
+    if skip("a trusted X11 session", true) {
+        return;
+    }
+    let server = Harness::start_with_x11("x11-trusted", Harness::free_port(), X11Server::Enabled)
+        .expect("the disposable server starts");
+    let display = DisplayServer::start("x11-trusted").expect("the display server starts");
+    // No working xauth on this machine at all: the trusted mode forwards with the
+    // display's own cookie and never asks for another one.
+    let broken = display.broken_xauth_path();
+    let _env = DisplayEnv::set(
+        Some(&display.display()),
+        Some(&display.authority()),
+        Some(&broken),
+    );
+
+    let mut session = connect(&server, X11Forwarding::Trusted);
+    let started = wait_connected(&mut session);
+    let status = wait_x11(&mut session, started.x11);
+    assert!(
+        matches!(status, X11Status::Ready { .. }),
+        "the trusted mode needs no restricted cookie, got {status:?}"
+    );
+    write(&mut session, "xdpyinfo 2>&1 | head -2");
+    let output = wait_for_output(&mut session, "version number", &started.output);
+    assert!(
+        output.contains("version number"),
+        "the remote program reached the display: {output:?}"
+    );
+    session.close();
+    assert_eq!(
+        wait_for_no_connections(&display),
+        0,
+        "the bridge was dropped"
     );
 }
 
@@ -376,7 +479,7 @@ fn a_machine_without_a_display_says_so_and_keeps_the_shell() {
     }
     let server = Harness::start_with_x11("x11-nodisplay", Harness::free_port(), X11Server::Enabled)
         .expect("the disposable server starts");
-    let _env = DisplayEnv::set(None, None);
+    let _env = DisplayEnv::set(None, None, None);
 
     let mut session = connect(&server, X11Forwarding::Restricted);
     let started = wait_connected(&mut session);
@@ -402,6 +505,101 @@ fn a_machine_without_a_display_says_so_and_keeps_the_shell() {
 }
 
 #[test]
+fn a_display_without_the_security_extension_stops_the_restricted_mode() {
+    let _serial = gate();
+    if skip("restricted forwarding to a display without SECURITY", true) {
+        return;
+    }
+    let server =
+        Harness::start_with_x11("x11-nosecurity", Harness::free_port(), X11Server::Enabled)
+            .expect("the disposable server starts");
+    let display =
+        DisplayServer::start_without_security("x11-nosecurity").expect("the display server starts");
+    let xauth = display.xauth_path();
+    let _env = DisplayEnv::set(
+        Some(&display.display()),
+        Some(&display.authority()),
+        Some(&xauth),
+    );
+
+    let mut session = connect(&server, X11Forwarding::Restricted);
+    let started = wait_connected(&mut session);
+    match wait_x11(&mut session, started.x11) {
+        X11Status::Failed { reason, next_step } => {
+            assert!(
+                reason.contains("no restricted X11 cookie"),
+                "the reason is the missing untrusted cookie: {reason}"
+            );
+            assert!(
+                reason.to_lowercase().contains("security"),
+                "the reason is what the display said: {reason}"
+            );
+            // The way out is a choice the user makes, never a silent fallback.
+            assert!(
+                next_step.to_lowercase().contains("trusted"),
+                "the next step names the trusted mode as a choice: {next_step}"
+            );
+        }
+        other => panic!("a display without SECURITY cannot restrict, got {other:?}"),
+    }
+    // Nothing was forwarded: no display connection was made on this session's behalf.
+    assert_eq!(
+        display.connections().unwrap_or(0),
+        0,
+        "a refused restricted session must not reach the display"
+    );
+    write(&mut session, "echo PLAIN-$((6 * 7))");
+    let output = wait_for_output(&mut session, "PLAIN-42", &started.output);
+    assert!(output.contains("PLAIN-42"), "{output:?}");
+}
+
+#[test]
+fn a_restricted_session_whose_xauth_fails_reports_it_instead_of_forwarding_trusted() {
+    let _serial = gate();
+    if skip("restricted forwarding with a failing xauth", true) {
+        return;
+    }
+    let server = Harness::start_with_x11("x11-badxauth", Harness::free_port(), X11Server::Enabled)
+        .expect("the disposable server starts");
+    let display = DisplayServer::start("x11-badxauth").expect("the display server starts");
+    let broken = display.broken_xauth_path();
+    let _env = DisplayEnv::set(
+        Some(&display.display()),
+        Some(&display.authority()),
+        Some(&broken),
+    );
+
+    let mut session = connect(&server, X11Forwarding::Restricted);
+    let started = wait_connected(&mut session);
+    match wait_x11(&mut session, started.x11) {
+        X11Status::Failed { reason, next_step } => {
+            assert!(
+                reason.contains("no restricted X11 cookie"),
+                "the reason names the credential that could not be made: {reason}"
+            );
+            assert!(
+                reason.contains("untrusted cookie"),
+                "the reason repeats what xauth said: {reason}"
+            );
+            assert!(
+                next_step.to_lowercase().contains("xauth")
+                    && next_step.to_lowercase().contains("trusted"),
+                "the next step names both ways out: {next_step}"
+            );
+        }
+        other => panic!("a failing xauth cannot restrict, got {other:?}"),
+    }
+    assert_eq!(
+        display.connections().unwrap_or(0),
+        0,
+        "the trusted cookie must not have been used instead"
+    );
+    write(&mut session, "echo STILL-$((2 + 40))");
+    let output = wait_for_output(&mut session, "STILL-42", &started.output);
+    assert!(output.contains("STILL-42"), "{output:?}");
+}
+
+#[test]
 fn a_server_that_forbids_x11_is_reported_and_the_shell_still_works() {
     let _serial = gate();
     if skip("a server that forbids X11 forwarding", true) {
@@ -410,7 +608,12 @@ fn a_server_that_forbids_x11_is_reported_and_the_shell_still_works() {
     let server = Harness::start_with_x11("x11-disabled", Harness::free_port(), X11Server::Disabled)
         .expect("the disposable server starts");
     let display = DisplayServer::start("x11-disabled").expect("the display server starts");
-    let _env = DisplayEnv::set(Some(&display.display()), Some(&display.authority()));
+    let xauth = display.xauth_path();
+    let _env = DisplayEnv::set(
+        Some(&display.display()),
+        Some(&display.authority()),
+        Some(&xauth),
+    );
 
     let mut session = connect(&server, X11Forwarding::Restricted);
     let started = wait_connected(&mut session);
@@ -420,9 +623,15 @@ fn a_server_that_forbids_x11_is_reported_and_the_shell_still_works() {
                 reason.contains("refused"),
                 "a refusal is described as one: {reason}"
             );
+            // The server has xauth, so the refusal is its forwarding configuration; the
+            // reason says that instead of listing both server-side causes.
+            assert!(
+                reason.contains("X11Forwarding") && reason.contains("xauth"),
+                "the reason is the one the server's own state proves: {reason}"
+            );
             assert!(
                 next_step.contains("X11Forwarding") && next_step.contains("xauth"),
-                "the next step names both server-side causes: {next_step}"
+                "the next step names the configuration to change: {next_step}"
             );
         }
         other => panic!("a server that forbids X11 must report a failure, got {other:?}"),
@@ -450,8 +659,14 @@ fn a_server_without_xauth_reports_that_cause_and_the_shell_still_works() {
     let server =
         Harness::start_with_x11("x11-noxauth", Harness::free_port(), X11Server::WithoutXauth)
             .expect("the disposable server starts");
+
     let display = DisplayServer::start("x11-noxauth").expect("the display server starts");
-    let _env = DisplayEnv::set(Some(&display.display()), Some(&display.authority()));
+    let xauth = display.xauth_path();
+    let _env = DisplayEnv::set(
+        Some(&display.display()),
+        Some(&display.authority()),
+        Some(&xauth),
+    );
 
     let mut session = connect(&server, X11Forwarding::Restricted);
     let started = wait_connected(&mut session);
@@ -460,6 +675,16 @@ fn a_server_without_xauth_reports_that_cause_and_the_shell_still_works() {
             assert!(
                 reason.contains("refused"),
                 "the refusal is described as one: {reason}"
+            );
+            // The server's own check found no usable xauth, which is a different reason
+            // from a server that forbids forwarding.
+            assert!(
+                reason.contains("no usable xauth"),
+                "the reason is the cause the probe could prove: {reason}"
+            );
+            assert!(
+                !reason.contains("X11Forwarding"),
+                "a missing xauth is not reported as a forbidden server: {reason}"
             );
             assert!(
                 next_step.to_lowercase().contains("xauth"),

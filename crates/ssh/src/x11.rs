@@ -7,32 +7,37 @@
 //! * the local display is found from `DISPLAY` and its cookie from `XAUTHORITY`, so
 //!   nothing has to be typed and no remote `DISPLAY` is ever set by hand;
 //! * the cookie that travels to the server is a random one generated for this session.
-//!   The real local cookie never leaves this machine: it is written into each X11
-//!   connection setup request here, after the request arrived over SSH;
+//!   The local cookie never leaves this machine: it is written into each X11 connection
+//!   setup request here, after the request arrived over SSH;
+//! * the credential this bridge presents to the local display is the one the mode
+//!   promises. [`X11Forwarding::Restricted`] has a cookie the display itself issued as
+//!   *untrusted* (the same thing `xauth generate … untrusted` does for `ssh -X`), so
+//!   the X11 SECURITY extension is what limits a remote program;
+//!   [`X11Forwarding::Trusted`] presents the display's own cookie and therefore lifts
+//!   those limits, which is why the connection form asks again before each attempt;
 //! * every inbound `x11` channel is bridged to the local display separately, so a
 //!   second program in the same session needs no second authentication;
 //! * closing the session first stops accepting channels and then drops the bridges, so
 //!   nothing is left listening or forwarding afterwards.
 //!
-//! The mode is not a boolean: [`X11Forwarding::Restricted`] is what `ssh -X` asks for
-//! and leaves the X11 SECURITY extension in charge of what a remote program may do,
-//! while [`X11Forwarding::Trusted`] (`ssh -Y`) lifts those limits and is the reason the
-//! connection form asks again before each attempt.
-//!
 //! A machine without a reachable display server, a display whose authority file holds
-//! no cookie, a server that refuses the request and a missing remote `xauth` are four
-//! different failures: each names itself and its next step, and none of them ends the
-//! SSH session, which keeps working without X11.
+//! no cookie, a display that cannot issue an untrusted cookie, and a server that
+//! refuses the request are different failures: each names itself and its next step,
+//! and none of them ends the SSH session, which keeps working without X11. A refusal
+//! is asked about once, on the same authenticated connection, so a server without
+//! `xauth` is told apart from a server that forbids forwarding.
 
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use russh::client::{self, ChannelOpenHandle};
-use russh::{Channel, ChannelOpenFailure};
+use russh::{Channel, ChannelMsg, ChannelOpenFailure};
 use shellune_core::X11Forwarding;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -54,6 +59,18 @@ const X11_TCP_BASE: u16 = 6000;
 /// A setup request carries a protocol name and a cookie, both a few dozen bytes. The
 /// cap keeps a misbehaving remote program from making this side buffer without bound.
 const MAX_SETUP: usize = 64 * 1024;
+
+/// How long the program that issues a restricted cookie may take.
+///
+/// It answers out of the local display, so it does not need a network round trip; the
+/// limit is what keeps a wedged display server from holding a connection attempt open.
+const XAUTH_PATIENCE: Duration = Duration::from_secs(10);
+
+/// How long the server may take to say whether it has an `xauth` (R11).
+///
+/// The question is a courtesy that makes a refusal more precise; a server that does not
+/// answer it in time leaves the refusal as the server stated it.
+const PROBE_PATIENCE: Duration = Duration::from_secs(5);
 
 /// Why X11 forwarding could not be used.
 ///
@@ -78,10 +95,31 @@ pub enum X11Failure {
         /// What the system said.
         detail: String,
     },
-    /// The server refused the forwarding request.
+    /// The display answered, but could not issue an untrusted cookie.
     ///
-    /// The usual causes are a server with `X11Forwarding no` and a server without
-    /// `xauth` installed, both of which are the server's configuration.
+    /// The restricted mode forwards with an authorization the X11 SECURITY extension
+    /// treats as untrusted, which is the whole of what the mode promises. Forwarding
+    /// with the display's own cookie instead would quietly give a remote program more
+    /// than that, so a display that cannot issue one is a failure and not a fallback.
+    NoUntrustedCookie {
+        /// What went wrong while asking the display for one.
+        detail: String,
+    },
+    /// The server refused the forwarding request and has no usable `xauth`.
+    ///
+    /// This is the server's own preparation failing: it cannot write the remote
+    /// authority file, so it declines before `DISPLAY` is set.
+    RemoteWithoutXauth {
+        /// What the server's own check reported.
+        detail: String,
+    },
+    /// The server refused the forwarding request although it has `xauth`.
+    ///
+    /// The usual cause is `X11Forwarding no`, and the other one is an `XAuthLocation`
+    /// that names a program the server cannot run. The protocol carries no reason, so
+    /// what is known is what the server's own check showed.
+    ForwardingForbidden,
+    /// The server refused the forwarding request and nothing more could be learned.
     Refused {
         /// What the request reported.
         reason: String,
@@ -108,6 +146,18 @@ impl X11Failure {
             }
             Self::DisplayUnreachable { .. } => {
                 "Start the X server the display names and try again, or connect without X11 forwarding."
+                    .to_owned()
+            }
+            Self::NoUntrustedCookie { .. } => {
+                "Install xauth so a restricted cookie can be created for this display, use a display server that supports the X11 SECURITY extension, or choose trusted forwarding and accept its risk. The SSH session itself is not affected."
+                    .to_owned()
+            }
+            Self::RemoteWithoutXauth { .. } => {
+                "Install xauth on the server (or point its XAuthLocation at one that runs), then connect again. The SSH session itself is not affected."
+                    .to_owned()
+            }
+            Self::ForwardingForbidden => {
+                "Turn on X11Forwarding and point XAuthLocation at a working xauth in the server's sshd_config, then connect again. The SSH session itself is not affected."
                     .to_owned()
             }
             Self::Refused { .. } => {
@@ -137,6 +187,17 @@ impl std::fmt::Display for X11Failure {
                     "the X server for display {display} is unreachable: {detail}"
                 )
             }
+            Self::NoUntrustedCookie { detail } => write!(
+                formatter,
+                "no restricted X11 cookie could be obtained: {detail}"
+            ),
+            Self::RemoteWithoutXauth { detail } => write!(
+                formatter,
+                "the server refused X11 forwarding: it has no usable xauth ({detail})"
+            ),
+            Self::ForwardingForbidden => formatter.write_str(
+                "the server refused X11 forwarding although it has xauth: X11Forwarding is probably off, or XAuthLocation names a program that cannot run",
+            ),
             Self::Refused { reason } => {
                 write!(formatter, "the server refused X11 forwarding: {reason}")
             }
@@ -199,13 +260,14 @@ impl std::fmt::Display for X11Status {
 /// Where the local X server of one display listens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DisplayTarget {
-    /// The unix socket X servers use for a local display.
+    /// A unix socket, either the one X servers use for a local display or the socket a
+    /// launchd-named display points at.
     ///
-    /// Never built on a platform without unix sockets; the variant stays so the
+    /// A platform without unix sockets cannot open one; the variant stays so the
     /// matches over a display name read the same way everywhere.
     #[allow(dead_code)]
     Unix {
-        /// `/tmp/.X11-unix/X<n>`.
+        /// `/tmp/.X11-unix/X<n>`, or the path a display name gave.
         path: PathBuf,
         /// The same name as a Linux abstract socket, which some servers only have.
         abstract_name: String,
@@ -245,13 +307,20 @@ struct ParsedDisplay {
 
 /// Everything one session needs to bridge its X11 channels.
 ///
-/// The real cookie stays in this value and is never formatted, logged or sent over
-/// the connection; only [`Self::request_cookie`] travels to the server.
+/// The credential stays in this value and is never formatted, logged or sent over the
+/// connection; only [`Self::request_cookie`] travels to the server.
 pub(crate) struct Prepared {
     target: DisplayTarget,
     screen: u32,
     display: String,
-    real_cookie: Vec<u8>,
+    /// The authority file this machine's own cookie was read from, which is also the
+    /// entry a restricted session needs to be able to reach the display once.
+    authority: PathBuf,
+    /// The cookie this bridge presents to the local display.
+    ///
+    /// The display's own cookie in the trusted mode, and a cookie the display issued as
+    /// untrusted in the restricted mode.
+    credential: Vec<u8>,
     remote_cookie: String,
 }
 
@@ -263,6 +332,7 @@ impl std::fmt::Debug for Prepared {
             .field("target", &self.target)
             .field("screen", &self.screen)
             .field("display", &self.display)
+            .field("authority", &self.authority)
             .finish_non_exhaustive()
     }
 }
@@ -271,7 +341,7 @@ impl Prepared {
     /// The cookie the server is told to put in its `DISPLAY` authority file.
     ///
     /// A cookie of this session only: it authenticates the remote programs to this
-    /// bridge, which then presents the real local cookie to the X server.
+    /// bridge, which then presents the local credential to the X server.
     pub(crate) fn request_cookie(&self) -> &str {
         &self.remote_cookie
     }
@@ -293,7 +363,34 @@ impl Prepared {
             }),
         }
     }
+
+    /// Replaces the credential with an untrusted cookie of the local display.
+    ///
+    /// This is what makes the restricted mode restricted: a remote program reaches the
+    /// display through an authorization the X server's SECURITY extension marks as
+    /// untrusted, so it cannot use the parts of the display another application owns.
+    /// When no such cookie can be had, this says so and keeps nothing: forwarding with
+    /// the trusted cookie instead would be exactly the risk the mode promises to avoid.
+    pub(crate) async fn restrict(&mut self, issue: CookieIssuer) -> Result<(), X11Failure> {
+        let display = self.display.clone();
+        let authority = self.authority.clone();
+        // Registering the cookie means running a program that talks to the display,
+        // which is blocking work and does not belong on the connection's thread.
+        let credential = tokio::task::spawn_blocking(move || issue(&display, &authority))
+            .await
+            .map_err(|error| X11Failure::NoUntrustedCookie {
+                detail: format!("the request for a restricted cookie could not be run: {error}"),
+            })??;
+        self.credential = credential;
+        Ok(())
+    }
 }
+
+/// What registers an untrusted cookie with the local display and returns it.
+///
+/// A function rather than a method so a test can drive the whole decision without an X
+/// server: [`issue_untrusted_cookie`] is the real one.
+pub(crate) type CookieIssuer = fn(&str, &Path) -> Result<Vec<u8>, X11Failure>;
 
 /// Discovers the display and the cookie a session would forward to.
 ///
@@ -308,6 +405,21 @@ pub(crate) fn prepare(mode: X11Forwarding) -> Result<Prepared, X11Failure> {
     prepare_from(&display, authority.as_deref(), home.as_deref())
 }
 
+/// Everything one enabled session needs before its request is sent.
+///
+/// The two steps are in this order on purpose: a display that does not answer is
+/// reported as unreachable before this machine tries to ask it for a restricted cookie,
+/// and a display that cannot issue one is a failure of its own rather than a quiet
+/// fallback to the trusted credential.
+pub(crate) async fn arm(mode: X11Forwarding) -> Result<Prepared, X11Failure> {
+    let mut prepared = prepare(mode)?;
+    prepared.reachable().await?;
+    if mode == X11Forwarding::Restricted {
+        prepared.restrict(issue_untrusted_cookie).await?;
+    }
+    Ok(prepared)
+}
+
 /// The same, from values a test supplies instead of the environment.
 fn prepare_from(
     display: &str,
@@ -315,7 +427,7 @@ fn prepare_from(
     home: Option<&Path>,
 ) -> Result<Prepared, X11Failure> {
     let parsed = parse_display(display)?;
-    let real_cookie = read_cookie(&parsed, authority, home)?;
+    let (authority, credential) = read_cookie(&parsed, authority, home)?;
     // The session's own cookie: random, so a remote program can never authenticate to
     // the local X server with anything it was told, and so two sessions cannot use
     // each other's authority.
@@ -324,7 +436,8 @@ fn prepare_from(
         target: parsed.target,
         screen: parsed.screen,
         display: parsed.text,
-        real_cookie,
+        authority,
+        credential,
         remote_cookie,
     })
 }
@@ -356,12 +469,23 @@ fn parse_display(value: &str) -> Result<ParsedDisplay, X11Failure> {
         None => 0,
     };
     let host = host.strip_prefix("tcp/").unwrap_or(host);
+    // XQuartz names its display by the path of its launchd socket, for example
+    // `/private/tmp/com.apple.launchd.XXXX/org.xquartz:0`. A host part with a path
+    // separator in it is that socket and not a machine name, so the display is on this
+    // computer even though the name does not look like `:0`.
+    let socket_path = host.contains('/').then(|| host.to_owned());
     let local = host.is_empty()
         || host == "unix"
         || host == "localhost"
         || host == "127.0.0.1"
-        || host == "::1";
-    let target = if host.is_empty() || host == "unix" {
+        || host == "::1"
+        || socket_path.is_some();
+    let target = if let Some(path) = socket_path {
+        DisplayTarget::Unix {
+            path: PathBuf::from(path.clone()),
+            abstract_name: path,
+        }
+    } else if host.is_empty() || host == "unix" {
         local_target(number)?
     } else {
         let port = X11_TCP_BASE
@@ -428,12 +552,16 @@ struct AuthorityEntry {
     data: Vec<u8>,
 }
 
-/// Reads the real cookie for a display out of the authority file.
+/// Reads the cookie for a display out of the authority file it came from.
+///
+/// The file is returned with the cookie because the restricted mode needs it once more:
+/// the program that issues an untrusted cookie has to reach the display with the
+/// trusted one first.
 fn read_cookie(
     parsed: &ParsedDisplay,
     authority: Option<&Path>,
     home: Option<&Path>,
-) -> Result<Vec<u8>, X11Failure> {
+) -> Result<(PathBuf, Vec<u8>), X11Failure> {
     let path = match authority {
         Some(path) => path.to_path_buf(),
         None => {
@@ -451,13 +579,14 @@ fn read_cookie(
     })?;
     let entries = parse_authority(&bytes);
     let number = parsed.number.to_string();
-    find_cookie(&entries, &number, parsed).ok_or_else(|| X11Failure::NoAuthority {
+    let cookie = find_cookie(&entries, &number, parsed).ok_or_else(|| X11Failure::NoAuthority {
         detail: format!(
             "{} holds no {AUTH_NAME} entry for display {}",
             path.display(),
             parsed.text
         ),
-    })
+    })?;
+    Ok((path, cookie))
 }
 
 /// Picks the cookie that belongs to a display.
@@ -580,6 +709,206 @@ fn take_field(bytes: &[u8], at: &mut usize) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// The restricted mode's credential
+// ---------------------------------------------------------------------------
+
+/// The names an `xauth` program has on this platform.
+///
+/// The program is looked up the way the system looks up any other: by these names in
+/// the directories on `PATH`.
+fn xauth_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["xauth.exe", "xauth.cmd", "xauth.bat", "xauth"]
+    }
+    #[cfg(not(windows))]
+    {
+        &["xauth"]
+    }
+}
+
+/// The `xauth` program of this machine, if there is one.
+fn xauth_program() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        for name in xauth_names() {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Asks the local display for an untrusted cookie, the way `ssh -X` does.
+fn issue_untrusted_cookie(display: &str, authority: &Path) -> Result<Vec<u8>, X11Failure> {
+    issue_with(xauth_program().as_deref(), display, authority)
+}
+
+/// The same, from the program a caller names instead of the one on `PATH`.
+///
+/// `None` means this machine has no program that could issue the cookie, which is a
+/// reason of its own: the restricted mode cannot be honoured by guessing.
+///
+/// The entry is written into the authority file itself, exactly as `ssh -X` does: an
+/// authorization the display was never told about is one it will not accept, and the
+/// file is where the requesting client and the display agree on it. The entries that
+/// were already there belong to this machine's own programs and are left as they are.
+fn issue_with(
+    program: Option<&Path>,
+    display: &str,
+    authority: &Path,
+) -> Result<Vec<u8>, X11Failure> {
+    let Some(program) = program else {
+        return Err(X11Failure::NoUntrustedCookie {
+            detail: format!(
+                "no {} program was found on PATH, and a restricted cookie has to be created with one",
+                xauth_names().join("/")
+            ),
+        });
+    };
+    let before = parse_authority(&read_authority(authority)?);
+    run_generate(program, authority, display)?;
+    let after = parse_authority(&read_authority(authority)?);
+    let added = new_records(&before, &after);
+    match added.as_slice() {
+        [only] => Ok(only.data.clone()),
+        [] => Err(X11Failure::NoUntrustedCookie {
+            detail: format!(
+                "{} exited successfully but added no entry for {display} to {}",
+                program.display(),
+                authority.display()
+            ),
+        }),
+        // Two entries would mean two programs wrote to this file at the same time, and
+        // the trusted one of them is not a credential this mode may forward with. Saying
+        // so is the only safe answer.
+        many => Err(X11Failure::NoUntrustedCookie {
+            detail: format!(
+                "{} added {} entries for {display}, so which of them belongs to this session cannot be told",
+                program.display(),
+                many.len()
+            ),
+        }),
+    }
+}
+
+/// Reads one authority file, naming it when it cannot be read.
+fn read_authority(authority: &Path) -> Result<Vec<u8>, X11Failure> {
+    std::fs::read(authority).map_err(|error| X11Failure::NoUntrustedCookie {
+        detail: format!("{}: {error}", authority.display()),
+    })
+}
+
+/// Runs the one `xauth` command that registers an untrusted cookie.
+///
+/// The command is the one OpenSSH's own client uses for `ssh -X`: the display it talks
+/// to, the protocol both ends speak, and `untrusted` as the trust level, which is what
+/// makes the X server's SECURITY extension restrict what a client of that cookie may
+/// do. A program that fails, or that does not answer, is a failure to report and never
+/// a reason to forward with the trusted cookie instead.
+fn run_generate(program: &Path, file: &Path, display: &str) -> Result<(), X11Failure> {
+    let mut child = Command::new(program)
+        .arg("-f")
+        .arg(file)
+        .arg("generate")
+        .arg(display)
+        .arg(AUTH_NAME)
+        .arg("untrusted")
+        // The file the program was given is the one it must read and write; naming it
+        // in the environment as well keeps the two from disagreeing.
+        .env("XAUTHORITY", file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| X11Failure::NoUntrustedCookie {
+            detail: format!("{} could not be run: {error}", program.display()),
+        })?;
+    let deadline = Instant::now() + XAUTH_PATIENCE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(X11Failure::NoUntrustedCookie {
+                    detail: format!(
+                        "{display} did not answer within {}s",
+                        XAUTH_PATIENCE.as_secs()
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(X11Failure::NoUntrustedCookie {
+                    detail: format!("{} could not be waited for: {error}", program.display()),
+                });
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| X11Failure::NoUntrustedCookie {
+            detail: format!("{} left no result: {error}", program.display()),
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&output.stderr);
+    let said = said
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(X11Failure::NoUntrustedCookie {
+        detail: if said.is_empty() {
+            format!(
+                "{} could not create an untrusted cookie for {display} ({})",
+                program.display(),
+                output.status
+            )
+        } else {
+            format!(
+                "{} could not create an untrusted cookie for {display} ({}): {}",
+                program.display(),
+                output.status,
+                said.chars().take(400).collect::<String>()
+            )
+        },
+    })
+}
+
+/// The records the display added to the authority file, in file order.
+///
+/// The file is compared before and after rather than read for the "best" entry: the
+/// entry the program adds is the untrusted one, and an entry that was already there
+/// belongs to something else.
+fn new_records<'a>(
+    before: &[AuthorityEntry],
+    after: &'a [AuthorityEntry],
+) -> Vec<&'a AuthorityEntry> {
+    after
+        .iter()
+        .filter(|candidate| {
+            candidate.name == AUTH_NAME && !before.iter().any(|entry| same_record(entry, candidate))
+        })
+        .collect()
+}
+
+fn same_record(left: &AuthorityEntry, right: &AuthorityEntry) -> bool {
+    left.family == right.family
+        && left.address == right.address
+        && left.number == right.number
+        && left.name == right.name
+        && left.data == right.data
+}
+
+// ---------------------------------------------------------------------------
 // The X11 connection setup request
 // ---------------------------------------------------------------------------
 
@@ -604,7 +933,7 @@ fn setup_size(buffer: &[u8]) -> Option<usize> {
 /// the real one of this machine. The request is rebuilt rather than edited in place so
 /// a cookie of a different length is written with the length and padding it needs.
 /// Anything the client already sent behind the setup request is kept.
-fn rewrite_setup(request: &[u8], real_cookie: &[u8]) -> Vec<u8> {
+fn rewrite_setup(request: &[u8], credential: &[u8]) -> Vec<u8> {
     let Some(order) = request.first().copied() else {
         return Vec::new();
     };
@@ -624,19 +953,19 @@ fn rewrite_setup(request: &[u8], real_cookie: &[u8]) -> Vec<u8> {
         return request.to_vec();
     }
     let setup_len = 12 + pad4(name_len) + pad4(data_len);
-    let mut out = Vec::with_capacity(setup_len + real_cookie.len());
+    let mut out = Vec::with_capacity(setup_len + credential.len());
     out.push(order);
     out.push(0);
     out.extend_from_slice(&request[2..6]);
     push_u16(&mut out, name_len, order);
-    push_u16(&mut out, real_cookie.len(), order);
+    push_u16(&mut out, credential.len(), order);
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(name);
     out.extend(std::iter::repeat_n(0u8, pad4(name_len) - name_len));
-    out.extend_from_slice(real_cookie);
+    out.extend_from_slice(credential);
     out.extend(std::iter::repeat_n(
         0u8,
-        pad4(real_cookie.len()) - real_cookie.len(),
+        pad4(credential.len()) - credential.len(),
     ));
     if let Some(rest) = request.get(setup_len..) {
         out.extend_from_slice(rest);
@@ -803,19 +1132,31 @@ struct GateInner {
 /// The live part of a forwarding session: where to connect and with which cookie.
 struct Ready {
     target: DisplayTarget,
-    real_cookie: Vec<u8>,
+    credential: Vec<u8>,
     display: String,
 }
 
+/// What one session's forwarding reports to the loop that owns its connection.
+///
+/// A refusal is not a status on its own: the reason the server refused is not in the
+/// protocol, so the loop asks the server about its own `xauth` before deciding what the
+/// user is told. Everything else is already decided here.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum X11Notice {
+    /// A status to pass on as it is.
+    Status(X11Status),
+    /// The server answered the forwarding request with a failure.
+    Refused,
+}
 /// One session's X11 forwarding, shared by its handler and its shell loop.
 pub(crate) struct X11Gate {
     inner: Mutex<GateInner>,
-    events: UnboundedSender<X11Status>,
+    events: UnboundedSender<X11Notice>,
 }
 
 impl X11Gate {
     /// The gate of one attempt, plus the channel it reports its status on.
-    pub(crate) fn channel(mode: X11Forwarding) -> (Arc<Self>, UnboundedReceiver<X11Status>) {
+    pub(crate) fn channel(mode: X11Forwarding) -> (Arc<Self>, UnboundedReceiver<X11Notice>) {
         let (events, receiver) = unbounded_channel();
         (
             Arc::new(Self {
@@ -876,13 +1217,13 @@ impl X11Gate {
         {
             inner.ready = Some(Ready {
                 target: prepared.target.clone(),
-                real_cookie: prepared.real_cookie.clone(),
+                credential: prepared.credential.clone(),
                 display: prepared.display.clone(),
             });
             reported = true;
         }
         if reported {
-            let _ = self.events.send(X11Status::Enabling);
+            let _ = self.events.send(X11Notice::Status(X11Status::Enabling));
         }
     }
 
@@ -910,17 +1251,18 @@ impl X11Gate {
                     .ok()
                     .and_then(|inner| inner.ready.as_ref().map(|ready| ready.display.clone()));
                 if let Some(display) = ready {
-                    let _ = self.events.send(X11Status::Ready { display });
+                    let _ = self
+                        .events
+                        .send(X11Notice::Status(X11Status::Ready { display }));
                 }
             }
             Some(false) => {
-                let failure = X11Failure::Refused {
-                    reason: "the server answered the request with a failure".to_owned(),
-                };
                 // Nothing may be bridged through a request the server refused, so the
-                // local cookie stops being reachable from this session at once.
+                // local cookie stops being reachable from this session at once. Why it
+                // refused is not in the protocol: the loop asks the server, which is
+                // why this reports the refusal rather than a reason of its own.
                 self.discard_ready();
-                let _ = self.events.send(X11Status::failed(&failure));
+                let _ = self.events.send(X11Notice::Refused);
             }
             None => {}
         }
@@ -956,7 +1298,7 @@ impl X11Gate {
                 inner.ready.as_ref().map(|ready| {
                     (
                         ready.target.clone(),
-                        ready.real_cookie.clone(),
+                        ready.credential.clone(),
                         ready.display.clone(),
                     )
                 })
@@ -972,10 +1314,10 @@ impl X11Gate {
         let events = self.events.clone();
         let task = tokio::spawn(async move {
             if let Err(failure) = relay(channel.into_stream(), target, cookie).await {
-                let _ = events.send(X11Status::Failed {
+                let _ = events.send(X11Notice::Status(X11Status::Failed {
                     reason: format!("X11 program from {display}: {failure}"),
                     next_step: failure.next_step(),
-                });
+                }));
             }
         });
         if let Ok(mut inner) = self.lock() {
@@ -1023,8 +1365,108 @@ impl Drop for X11Gate {
     }
 }
 
+/// What the server said about its own `xauth` (R11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteXauth {
+    /// The server has an `xauth` it could have run.
+    Present,
+    /// The server has none it could run, which is why it could not prepare a display.
+    Missing {
+        /// What the check found.
+        detail: String,
+    },
+    /// The server would not say.
+    Unknown {
+        /// Why the answer is missing.
+        detail: String,
+    },
+}
+
+/// Asks the server whether it has an `xauth` it could have used.
+///
+/// The SSH protocol answers a refused `x11-req` with a failure and nothing else: a
+/// server with `X11Forwarding no` and a server whose `xauth` cannot run look the same.
+/// This asks the same authenticated connection one question, on a channel of its own,
+/// so the refusal can name the cause it can prove. It is a best effort: a server that
+/// cannot run the check leaves the refusal as it was.
+pub(crate) async fn probe_remote_xauth<H: client::Handler>(
+    handle: &client::Handle<H>,
+) -> RemoteXauth {
+    // The check is deliberately the same one sshd needs: a program called `xauth` that
+    // this account can execute. It runs under `sh` so a login shell of another family
+    // does not change what the answer means.
+    const CHECK: &str = r#"sh -c 'p=$(command -v xauth 2>/dev/null) || exit 127; [ -n "$p" ] || exit 127; [ -x "$p" ] || exit 126'"#;
+    let mut channel = match crate::session::open_exec_channel(handle, CHECK).await {
+        Ok(channel) => channel,
+        Err(
+            crate::sftp::ChannelFailure::Unavailable { reason }
+            | crate::sftp::ChannelFailure::Lost { reason },
+        ) => {
+            return RemoteXauth::Unknown { detail: reason };
+        }
+    };
+    let deadline = tokio::time::Instant::now() + PROBE_PATIENCE;
+    let mut exit: Option<u32> = None;
+    let mut answered = tokio::time::Instant::now() + PROBE_PATIENCE;
+    loop {
+        tokio::select! {
+            message = channel.wait() => match message {
+                Some(ChannelMsg::ExitStatus { exit_status }) => exit = Some(exit_status),
+                Some(ChannelMsg::Failure) => {
+                    let _ = channel.close().await;
+                    return RemoteXauth::Unknown {
+                        detail: "the server refused to run the check".to_owned(),
+                    };
+                }
+                // The status is sent before the channel closes, but the two can arrive
+                // in either order; after the end of the output, only a short wait is
+                // worth having.
+                Some(ChannelMsg::Eof) => {
+                    answered = answered.min(tokio::time::Instant::now() + Duration::from_millis(500));
+                }
+                Some(ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            },
+            () = tokio::time::sleep_until(deadline.min(answered)) => {
+                let _ = channel.close().await;
+                return RemoteXauth::Unknown {
+                    detail: "the server did not answer the check in time".to_owned(),
+                };
+            }
+        }
+    }
+    let _ = channel.close().await;
+    match exit {
+        Some(0) => RemoteXauth::Present,
+        Some(126) => RemoteXauth::Missing {
+            detail: "the xauth it finds is not executable".to_owned(),
+        },
+        Some(127) => RemoteXauth::Missing {
+            detail: "no xauth was found".to_owned(),
+        },
+        Some(status) => RemoteXauth::Unknown {
+            detail: format!("the check exited with {status}"),
+        },
+        None => RemoteXauth::Unknown {
+            detail: "the check reported no status".to_owned(),
+        },
+    }
+}
+
+/// What the user is told about a refusal, after the server was asked why.
+pub(crate) async fn refusal_status<H: client::Handler>(handle: &client::Handle<H>) -> X11Status {
+    let failure = match probe_remote_xauth(handle).await {
+        RemoteXauth::Missing { detail } => X11Failure::RemoteWithoutXauth { detail },
+        RemoteXauth::Present => X11Failure::ForwardingForbidden,
+        RemoteXauth::Unknown { detail } => X11Failure::Refused {
+            reason: format!("the server did not say why it failed ({detail})"),
+        },
+    };
+    X11Status::failed(&failure)
+}
+
 /// Copies one X11 channel to the local display, replacing the session cookie.
-async fn relay<R>(remote: R, target: DisplayTarget, real_cookie: Vec<u8>) -> Result<(), X11Failure>
+async fn relay<R>(remote: R, target: DisplayTarget, credential: Vec<u8>) -> Result<(), X11Failure>
 where
     R: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1037,7 +1479,7 @@ where
             })?;
     let mut remote = remote;
     let setup = read_setup(&mut remote).await?;
-    let rewritten = rewrite_setup(&setup, &real_cookie);
+    let rewritten = rewrite_setup(&setup, &credential);
     local
         .write_all(&rewritten)
         .await
@@ -1130,6 +1572,59 @@ mod tests {
         out.extend(std::iter::repeat_n(0u8, pad4(cookie.len()) - cookie.len()));
         out.extend_from_slice(extra);
         out
+    }
+
+    /// A prepared session as the gate tests need it, without a display or a file.
+    fn prepared_for_gate() -> Prepared {
+        Prepared {
+            target: DisplayTarget::Tcp {
+                host: "127.0.0.1".to_owned(),
+                port: 6000,
+            },
+            screen: 0,
+            display: ":0".to_owned(),
+            authority: PathBuf::from("/tmp/shellune-test-Xauthority"),
+            credential: vec![1u8; 16],
+            remote_cookie: "00".repeat(16),
+        }
+    }
+
+    /// A directory that holds one authority file, removed when the test ends.
+    struct Authority {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Authority {
+        fn holding(cookie: &[u8]) -> Self {
+            let dir = std::env::temp_dir().join(format!("shellune-x11-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("a test directory");
+            let path = dir.join("Xauthority");
+            std::fs::write(&path, entry(65535, "", "", AUTH_NAME, cookie))
+                .expect("write the authority file");
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for Authority {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The cookie the stand-in display issues for the restricted mode.
+    const ISSUED: [u8; 16] = [0x5A; 16];
+
+    /// A stand-in for the program that registers an untrusted cookie with the display.
+    fn issue_issued_cookie(_display: &str, _authority: &Path) -> Result<Vec<u8>, X11Failure> {
+        Ok(ISSUED.to_vec())
+    }
+
+    /// The same, for a display that cannot issue one.
+    fn issue_nothing(_display: &str, _authority: &Path) -> Result<Vec<u8>, X11Failure> {
+        Err(X11Failure::NoUntrustedCookie {
+            detail: "the display has no SECURITY extension".to_owned(),
+        })
     }
 
     #[test]
@@ -1233,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepared_session_keeps_its_real_cookie_and_hands_out_another_one() {
+    fn a_prepared_session_keeps_its_own_cookie_and_hands_out_another_one() {
         let directory = std::env::temp_dir().join(format!("shellune-x11-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).expect("a test directory");
         let authority = directory.join("Xauthority");
@@ -1262,6 +1757,146 @@ mod tests {
             "every session gets its own cookie"
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_two_modes_forward_with_different_credentials() {
+        let trusted_cookie = [0xABu8; 16];
+        let authority = Authority::holding(&trusted_cookie);
+
+        // The trusted mode presents this machine's own cookie to the display.
+        let trusted =
+            prepare_from("127.0.0.1:99", Some(&authority.path), None).expect("a prepared session");
+        assert_eq!(
+            trusted.credential,
+            trusted_cookie.to_vec(),
+            "the trusted mode forwards with the cookie of the authority file"
+        );
+
+        // The restricted mode replaces it with the untrusted one the display issued:
+        // that cookie, and nothing else, is what makes the mode restricted.
+        let mut restricted =
+            prepare_from("127.0.0.1:99", Some(&authority.path), None).expect("a prepared session");
+        assert_eq!(
+            restricted.credential,
+            trusted_cookie.to_vec(),
+            "nothing is replaced before the display was asked"
+        );
+        block_on(restricted.restrict(issue_issued_cookie)).expect("an untrusted cookie");
+        assert_eq!(restricted.credential, ISSUED.to_vec());
+        assert_ne!(
+            restricted.credential,
+            trusted_cookie.to_vec(),
+            "the restricted mode must not present the trusted cookie"
+        );
+        // What the server is told is neither of the two: it is this session's own.
+        assert_eq!(restricted.request_cookie().len(), 32);
+        assert_ne!(restricted.request_cookie().to_owned(), hex(&ISSUED));
+    }
+
+    #[test]
+    fn a_display_that_cannot_issue_an_untrusted_cookie_stops_the_restricted_mode() {
+        let authority = Authority::holding(&[0xABu8; 16]);
+        let mut prepared =
+            prepare_from("127.0.0.1:99", Some(&authority.path), None).expect("a prepared session");
+        let failure = block_on(prepared.restrict(issue_nothing))
+            .expect_err("a display without the extension cannot restrict anything");
+        match &failure {
+            X11Failure::NoUntrustedCookie { detail } => {
+                assert!(detail.contains("SECURITY extension"), "{detail}");
+            }
+            other => panic!("the failure must name the missing cookie, got {other:?}"),
+        }
+        // The failure says what to do, and one of the ways out is the trusted mode,
+        // which the user has to choose: the restricted mode never falls back to it.
+        let next = failure.next_step();
+        assert!(next.contains("xauth"), "{next}");
+        assert!(next.to_lowercase().contains("trusted"), "{next}");
+        assert!(
+            !failure.to_string().contains("trusted cookie"),
+            "nothing may claim the trusted cookie was used"
+        );
+    }
+
+    #[test]
+    fn an_untrusted_cookie_is_taken_from_the_record_the_display_added() {
+        let trusted = entry(65535, "", "", AUTH_NAME, &[1u8; 16]);
+        let first = [2u8; 16];
+        let second = [3u8; 16];
+        let mut with_first = trusted.clone();
+        with_first.extend_from_slice(&entry(256, "testhost", "99", AUTH_NAME, &first));
+        let mut with_second = trusted.clone();
+        with_second.extend_from_slice(&entry(256, "testhost", "99", AUTH_NAME, &second));
+
+        let before = parse_authority(&trusted);
+        let after = parse_authority(&with_first);
+        assert_eq!(
+            new_records(&before, &after)
+                .iter()
+                .map(|entry| entry.data.clone())
+                .collect::<Vec<_>>(),
+            vec![first.to_vec()],
+            "the entry that was not there before is the one the display added"
+        );
+        // A program that exits without writing anything adds no entry.
+        assert!(new_records(&before, &before).is_empty());
+        // The second request for one display replaces the first entry, which makes the
+        // replacement the record this session uses.
+        assert_eq!(
+            new_records(&after, &parse_authority(&with_second))
+                .iter()
+                .map(|entry| entry.data.clone())
+                .collect::<Vec<_>>(),
+            vec![second.to_vec()]
+        );
+        // Two additions at once cannot be told apart, and the caller refuses rather than
+        // guessing which of them is the restricted one.
+        let mut with_both = with_first.clone();
+        with_both.extend_from_slice(&entry(256, "otherhost", "99", AUTH_NAME, &[4u8; 16]));
+        assert_eq!(
+            new_records(&before, &parse_authority(&with_both)).len(),
+            2,
+            "an ambiguous answer is visible as two records"
+        );
+    }
+
+    #[test]
+    fn a_machine_without_an_xauth_program_says_so_instead_of_forwarding_trusted() {
+        let authority = Authority::holding(&[0xABu8; 16]);
+        let failure = issue_with(None, "127.0.0.1:99", &authority.path)
+            .expect_err("a cookie cannot be issued without a program");
+        match &failure {
+            X11Failure::NoUntrustedCookie { detail } => {
+                assert!(detail.contains("xauth"), "{detail}");
+                assert!(detail.contains("PATH"), "{detail}");
+            }
+            other => panic!("the failure must name the missing program, got {other:?}"),
+        }
+        let next = failure.next_step();
+        assert!(next.contains("xauth"), "{next}");
+        // The authority file is left exactly as it was: nothing was written to it.
+        let bytes = std::fs::read(&authority.path).expect("the authority file");
+        assert_eq!(bytes, entry(65535, "", "", AUTH_NAME, &[0xABu8; 16]));
+    }
+
+    #[test]
+    fn a_quartz_display_name_is_a_socket_path_on_this_machine() {
+        // XQuartz names its display by its launchd socket, not by `:0`.
+        let parsed = parse_display("/private/tmp/com.apple.launchd.AbCdEf/org.xquartz:0")
+            .expect("a mac display");
+        assert_eq!(parsed.number, 0);
+        assert_eq!(parsed.screen, 0);
+        assert!(
+            parsed.local,
+            "the socket is on this machine, so its cookie is a local one"
+        );
+        match &parsed.target {
+            DisplayTarget::Unix { path, .. } => assert_eq!(
+                path,
+                &PathBuf::from("/private/tmp/com.apple.launchd.AbCdEf/org.xquartz")
+            ),
+            other => panic!("a quartz display is a socket, not a machine: {other:?}"),
+        }
     }
 
     #[test]
@@ -1370,19 +2005,13 @@ mod tests {
             "a request that was not accepted yet bridges nothing"
         );
 
-        let prepared = Prepared {
-            target: DisplayTarget::Tcp {
-                host: "127.0.0.1".to_owned(),
-                port: 6000,
-            },
-            screen: 0,
-            display: ":0".to_owned(),
-            real_cookie: vec![1u8; 16],
-            remote_cookie: "00".repeat(16),
-        };
+        let prepared = prepared_for_gate();
         gate.announce(&prepared);
         assert!(gate.accepts_inbound());
-        assert_eq!(events.try_recv(), Ok(X11Status::Enabling));
+        assert_eq!(
+            events.try_recv(),
+            Ok(X11Notice::Status(X11Status::Enabling))
+        );
 
         // Closing the session stops accepting before anything else happens.
         gate.close();
@@ -1394,19 +2023,13 @@ mod tests {
     fn the_answer_to_the_x11_request_decides_the_session_status() {
         let (gate, mut events) = X11Gate::channel(X11Forwarding::Trusted);
         let channel = 7u32;
-        let prepared = Prepared {
-            target: DisplayTarget::Tcp {
-                host: "127.0.0.1".to_owned(),
-                port: 6000,
-            },
-            screen: 0,
-            display: ":0".to_owned(),
-            real_cookie: vec![1u8; 16],
-            remote_cookie: "00".repeat(16),
-        };
+        let prepared = prepared_for_gate();
         gate.announce(&prepared);
         gate.shell_requests(channel, true);
-        assert_eq!(events.try_recv(), Ok(X11Status::Enabling));
+        assert_eq!(
+            events.try_recv(),
+            Ok(X11Notice::Status(X11Status::Enabling))
+        );
 
         // The pseudo-terminal was accepted first; that answer says nothing about X11.
         gate.on_channel_reply(channel, true);
@@ -1415,27 +2038,22 @@ mod tests {
         gate.on_channel_reply(channel, true);
         assert_eq!(
             events.try_recv(),
-            Ok(X11Status::Ready {
+            Ok(X11Notice::Status(X11Status::Ready {
                 display: ":0".to_owned()
-            })
+            }))
         );
 
         // The shell request's own answer is not a second status.
         gate.on_channel_reply(channel, true);
         assert!(events.try_recv().is_err());
 
-        // A refused request drops the bridge and reports its own reason.
+        // A refused request drops the bridge at once and reports the refusal, so the
+        // loop that owns the connection can ask the server why it happened.
         gate.shell_requests(channel, true);
         let _ = events.try_recv();
         gate.on_channel_reply(channel, true);
         gate.on_channel_reply(channel, false);
-        match events.try_recv() {
-            Ok(X11Status::Failed { reason, next_step }) => {
-                assert!(reason.contains("refused"), "{reason}");
-                assert!(next_step.contains("X11Forwarding"), "{next_step}");
-            }
-            other => panic!("a refusal must be reported, got {other:?}"),
-        }
+        assert_eq!(events.try_recv(), Ok(X11Notice::Refused));
         assert!(
             !gate.accepts_inbound(),
             "a refused request must not leave a bridge available"
@@ -1455,6 +2073,13 @@ mod tests {
                 display: ":0".to_owned(),
                 detail: "refused".to_owned(),
             },
+            X11Failure::NoUntrustedCookie {
+                detail: "no xauth on PATH".to_owned(),
+            },
+            X11Failure::RemoteWithoutXauth {
+                detail: "no xauth was found".to_owned(),
+            },
+            X11Failure::ForwardingForbidden,
             X11Failure::Refused {
                 reason: "X11 forwarding disabled".to_owned(),
             },
@@ -1463,18 +2088,48 @@ mod tests {
             },
         ];
         let mut steps = Vec::new();
+        let mut reasons = Vec::new();
         for failure in &failures {
             let next = failure.next_step();
             assert!(!next.is_empty(), "every failure has a next step: {failure}");
             assert!(!next.contains("hunter2"));
             steps.push(next);
+            reasons.push(failure.to_string());
         }
         steps.sort();
         steps.dedup();
         assert_eq!(
             steps.len(),
             failures.len(),
+            "the next steps stay distinguishable"
+        );
+        reasons.sort();
+        reasons.dedup();
+        assert_eq!(
+            reasons.len(),
+            failures.len(),
             "the reasons stay distinguishable"
         );
+    }
+
+    #[test]
+    fn the_two_refusals_a_server_can_cause_are_not_one_message() {
+        // A server without xauth cannot prepare a display; a server that has one and
+        // still refuses has forwarding turned off or a broken XAuthLocation. The
+        // protocol says neither, which is why the two are worded apart from each other
+        // and from a refusal that could not be asked about at all.
+        let missing = X11Failure::RemoteWithoutXauth {
+            detail: "no xauth was found".to_owned(),
+        };
+        let forbidden = X11Failure::ForwardingForbidden;
+        let unknown = X11Failure::Refused {
+            reason: "the server did not say why it failed".to_owned(),
+        };
+        assert!(missing.to_string().contains("no usable xauth"));
+        assert!(forbidden.to_string().contains("X11Forwarding"));
+        assert!(!forbidden.to_string().contains("no usable xauth"));
+        assert!(unknown.to_string().contains("did not say why"));
+        assert!(missing.next_step().contains("Install xauth"));
+        assert!(forbidden.next_step().contains("Turn on X11Forwarding"));
     }
 }

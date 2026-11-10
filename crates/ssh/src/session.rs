@@ -38,7 +38,7 @@ use crate::forwarding::{self, ForwardLink};
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 use crate::sftp::{self, ChannelFailure, FileLink};
 use crate::transfer::{self, TransferLink};
-use crate::x11::{self, X11Gate, X11Status};
+use crate::x11::{self, X11Gate, X11Notice, X11Status};
 
 /// Value of the TERM variable the remote shell is told about.
 ///
@@ -523,7 +523,7 @@ struct Channels {
     gate: std::sync::Arc<forwarding::ForwardGate>,
     /// This session's X11 forwarding, shared with the handler.
     x11: Arc<X11Gate>,
-    x11_events: tokio::sync::mpsc::UnboundedReceiver<X11Status>,
+    x11_events: tokio::sync::mpsc::UnboundedReceiver<X11Notice>,
     open: UnboundedSender<Command>,
 }
 
@@ -637,17 +637,12 @@ async fn connect_and_shell(
             let _ = events.send(RemoteEvent::X11(X11Status::Off));
         }
         let prepared = if x11_mode.is_enabled() {
-            match x11::prepare(x11_mode) {
-                Ok(prepared) => match prepared.reachable().await {
-                    Ok(()) => Some(prepared),
-                    Err(failure) => {
-                        let _ = events.send(RemoteEvent::X11(X11Status::Failed {
-                            reason: failure.to_string(),
-                            next_step: failure.next_step(),
-                        }));
-                        None
-                    }
-                },
+            // A display server that is not there, an authority file without a cookie and
+            // a display that cannot issue a restricted cookie are all reported before
+            // the request is sent, and never as a reason to stop the connection: the
+            // shell below is opened exactly as it would have been.
+            match x11::arm(x11_mode).await {
+                Ok(prepared) => Some(prepared),
                 Err(failure) => {
                     let _ = events.send(RemoteEvent::X11(X11Status::Failed {
                         reason: failure.to_string(),
@@ -726,9 +721,20 @@ async fn connect_and_shell(
                         });
                     }
                 }
-                status = x11_events.recv(), if x11_open => {
-                    match status {
-                        Some(status) => {
+                notice = x11_events.recv(), if x11_open => {
+                    match notice {
+                        Some(X11Notice::Status(status)) => {
+                            if events.send(RemoteEvent::X11(status)).is_err() {
+                                forwards.shutdown(&handle).await;
+                                return Ok(());
+                            }
+                        }
+                        // A refusal is answered with what the server says about its own
+                        // xauth, which is the only way the two server-side causes can be
+                        // told apart. The answer is best effort and never blocks the
+                        // session for long.
+                        Some(X11Notice::Refused) => {
+                            let status = x11::refusal_status(&handle).await;
                             if events.send(RemoteEvent::X11(status)).is_err() {
                                 forwards.shutdown(&handle).await;
                                 return Ok(());

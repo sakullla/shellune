@@ -10769,22 +10769,64 @@ impl ShelluneView {
                         ),
                 );
         let notice = self.quick_save_notice.clone();
+        // A failed bridge says why in the bar's tooltip, but a tooltip is a pointer
+        // target: the reason and the next step are repeated as text under the bar so a
+        // keyboard user reads them too (R4, R11).
+        let x11_failure = match self.x11.get(&id) {
+            Some(X11Status::Failed { reason, next_step }) => {
+                Some((reason.clone(), next_step.clone()))
+            }
+            _ => None,
+        };
         div()
             .flex()
             .flex_col()
             .flex_none()
             .w_full()
             .child(row)
+            .children(
+                x11_failure.map(|(reason, next_step)| {
+                    self.x11_failure_banner(&reason, &next_step, metrics)
+                }),
+            )
             .children(notice.map(|notice| self.quick_save_banner(&notice)))
+    }
+
+    /// Why X11 forwarding is unavailable, as text under the session bar (R11).
+    ///
+    /// The chip next to the session identity carries the state and its tooltip carries
+    /// the details; this is the same reason and next step in the part of the interface
+    /// that is always there and readable without a pointer.
+    fn x11_failure_banner(&self, reason: &str, next_step: &str, metrics: Metrics) -> Div {
+        let strings = self.strings();
+        components::banner(Tone::Danger, metrics)
+            .debug_selector(|| "session.x11.notice".to_owned())
+            .child(
+                div()
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "session.x11.reason".to_owned())
+                    .child(SharedString::from(reason.to_owned())),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "session.x11.next".to_owned())
+                    .child(SharedString::from(format!(
+                        "{}: {next_step}",
+                        strings.next_step
+                    ))),
+            )
     }
 
     /// What X11 forwarding of this session is doing, on its session bar (R11).
     ///
     /// The chip is the state, not a decoration: off says nothing was requested,
     /// "starting" says the request is on its way, "X11" says a remote program can reach
-    /// this machine's display, and "failed" says why it cannot. The reason and the next
-    /// step are in the tooltip, because the bar has no room for them and a session that
-    /// failed to forward is still a working session.
+    /// this machine's display, and "failed" says why it cannot. The tooltip carries the
+    /// details for a pointer, and [`Self::x11_failure_banner`] repeats them as text under
+    /// the bar for everyone else: a session that failed to forward is still a working
+    /// session, so it needs a line of explanation rather than a modal.
     fn x11_chip(&self, status: &X11Status, metrics: Metrics) -> gpui::Stateful<Div> {
         let strings = self.strings();
         let selector = match status {

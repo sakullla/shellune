@@ -38,13 +38,24 @@ impl X11Server {
         match self {
             Self::Enabled => "X11Forwarding yes\nXAuthLocation /usr/bin/xauth\n".to_owned(),
             Self::Disabled => "X11Forwarding no\nXAuthLocation /usr/bin/xauth\n".to_owned(),
-            // A path that does not exist is how a server without xauth behaves: the
-            // request is refused because the display cannot be prepared, not because
-            // forwarding is off, which is a different reason to show the user.
+            // Forwarding is allowed and there is no xauth anywhere for this server: the
+            // program it is configured with does not exist, and the account finds none
+            // either (see `hides_xauth`). The request is refused because the display
+            // cannot be prepared, not because forwarding is off - a different reason to
+            // show the user.
             Self::WithoutXauth => {
                 "X11Forwarding yes\nXAuthLocation /nonexistent/shellune-xauth\n".to_owned()
             }
         }
+    }
+
+    /// Whether the account of this server has no `xauth` at all.
+    ///
+    /// A server whose account really has no `xauth`: the program is masked inside the
+    /// server's own mount namespace, before sshd starts, and only there. The machine's
+    /// `/usr/bin/xauth` is untouched, and so is every other test.
+    fn hides_xauth(self) -> bool {
+        matches!(self, Self::WithoutXauth)
     }
 }
 
@@ -60,6 +71,8 @@ pub struct DisplayServer {
     number: u32,
     dir: PathBuf,
     running: bool,
+    /// Extra command-line words for Xvfb, such as taking an extension away.
+    extra: String,
 }
 
 impl DisplayServer {
@@ -70,6 +83,23 @@ impl DisplayServer {
     /// Returns the reason the display could not be started, which includes "this host
     /// has no Xvfb".
     pub fn start(name: &str) -> Result<Self, String> {
+        Self::start_with(name, &[])
+    }
+
+    /// Starts the same server without the X11 SECURITY extension.
+    ///
+    /// A display server that cannot issue an untrusted authorization is the case the
+    /// restricted mode has to refuse rather than forward as trusted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the display could not be started.
+    pub fn start_without_security(name: &str) -> Result<Self, String> {
+        Self::start_with(name, &["-extension", "SECURITY"])
+    }
+
+    /// Starts Xvfb with extra command-line words.
+    fn start_with(name: &str, extra: &[&str]) -> Result<Self, String> {
         let dir = harness_root().join(name).join("x11");
         std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
         std::fs::write(dir.join("x11-display.sh"), DISPLAY_SCRIPT)
@@ -86,6 +116,7 @@ impl DisplayServer {
                 number,
                 dir: dir.clone(),
                 running: false,
+                extra: extra.join(" "),
             };
             match display.launch() {
                 Ok(()) => return Ok(display),
@@ -97,6 +128,40 @@ impl DisplayServer {
         } else {
             last
         })
+    }
+
+    /// A directory to put in front of `PATH`, holding a stand-in `xauth`.
+    ///
+    /// The product looks for `xauth` on `PATH`, exactly as it does on a machine where
+    /// the X tools are installed. This machine has no `xauth` of its own - the display
+    /// lives inside the Linux environment the harness runs - so the stand-in passes the
+    /// one command the restricted mode sends to that `xauth`. What it starts is the real
+    /// /usr/bin/xauth of that environment, talking to the same display over the same
+    /// TCP port, reading the same authority file through the shared drive.
+    #[must_use]
+    pub fn xauth_path(&self) -> PathBuf {
+        let directory = self.dir.join("xauth-path");
+        std::fs::create_dir_all(&directory).expect("a directory for the stand-in xauth");
+        std::fs::write(directory.join("xauth.cmd"), XAUTH_SCRIPT)
+            .expect("the stand-in xauth is written");
+        directory
+    }
+
+    /// A directory whose stand-in `xauth` always fails.
+    ///
+    /// This is what a machine looks like whose `xauth` cannot issue a restricted cookie:
+    /// the program is there and says no, which is the case the product has to report
+    /// instead of forwarding as trusted.
+    #[must_use]
+    pub fn broken_xauth_path(&self) -> PathBuf {
+        let directory = self.dir.join("xauth-broken");
+        std::fs::create_dir_all(&directory).expect("a directory for the failing xauth");
+        std::fs::write(
+            directory.join("xauth.cmd"),
+            "@echo off\r\necho xauth: the display cannot issue an untrusted cookie 1>&2\r\nexit /b 1\r\n",
+        )
+        .expect("the failing stand-in is written");
+        directory
     }
 
     /// Whether this machine can run a headless X server at all.
@@ -205,6 +270,7 @@ impl DisplayServer {
             .arg(wsl_path(&self.dir))
             .arg(self.number.to_string())
             .arg(self.port().to_string())
+            .arg(&self.extra)
             .output()
             .map_err(|error| format!("wsl.exe could not be run: {error}"))?;
         if !output.status.success() {
@@ -252,7 +318,7 @@ impl DisplayServer {
 const DISPLAY_SCRIPT: &str = r#"#!/usr/bin/env bash
 # A disposable headless X server for Shellune's X11 forwarding tests (R11).
 #
-#   x11-display.sh start <work-dir> <display-number> <port>
+#   x11-display.sh start <work-dir> <display-number> <port> [extra Xvfb words]
 #   x11-display.sh stop  <work-dir> <display-number> <port>
 #   x11-display.sh windows     <work-dir> <display-number> <port>
 #   x11-display.sh connections <work-dir> <display-number> <port>
@@ -266,6 +332,7 @@ ACTION="${1:-start}"
 WORK="${2:?the work directory is required}"
 NUMBER="${3:-96}"
 PORT="${4:-6096}"
+EXTRA="${5:-}"
 AUTH="$WORK/Xauthority.$NUMBER"
 LOG="$WORK/xvfb-$NUMBER.log"
 PIDFILE="$WORK/xvfb-$NUMBER.pid"
@@ -278,7 +345,8 @@ start)
     pkill -f "^Xvfb :$NUMBER " 2>/dev/null || true
     chmod 1777 /tmp/.X11-unix 2>/dev/null || true
     rm -f "$LOG" "$PIDFILE"
-    setsid Xvfb ":$NUMBER" -screen 0 800x600x24 -listen tcp -auth "$AUTH" \
+    # shellcheck disable=SC2086 # the extra words are a command line of their own
+    setsid Xvfb ":$NUMBER" -screen 0 800x600x24 -listen tcp -auth "$AUTH" $EXTRA \
         </dev/null >"$LOG" 2>&1 &
     echo $! >"$PIDFILE"
     # The launcher stays alive until the server listens: a session that ends in the
@@ -322,6 +390,66 @@ impl Drop for DisplayServer {
         self.stop();
     }
 }
+
+/// The stand-in `xauth` the tests put on `PATH` (R11).
+///
+/// The restricted mode of the product looks for `xauth` the way a machine with the X
+/// tools installed provides it. On this host the display belongs to the Linux
+/// environment, so the stand-in hands the one command the product sends to that
+/// environment's real `/usr/bin/xauth`, with the authority file's path translated. The
+/// cookie it writes therefore comes from a real `xauth` and a real display, and the
+/// product reads it back from the file it named.
+const XAUTH_SCRIPT: &str = r#"@echo off
+rem Runs the real xauth of the disposable display for one invocation (R11).
+setlocal enabledelayedexpansion
+set "FILE="
+set "REST="
+:arguments
+if "%~1"=="" goto translate
+if /I "%~1"=="-f" goto take-file
+set "REST=!REST! %1"
+shift
+goto arguments
+:take-file
+set "FILE=%~2"
+shift
+shift
+goto arguments
+:translate
+for /f "usebackq delims=" %%p in (`wsl.exe -d Debian -u root -- wslpath -u "!FILE!"`) do set "LINUX=%%p"
+rem The cookie has to be found where the program looks for it as well as where it is
+rem told to write: both are the one file this invocation was given.
+wsl.exe -d Debian -u root -- env XAUTHORITY="!LINUX!" /usr/bin/xauth -f "!LINUX!"!REST!
+exit /b !ERRORLEVEL!
+"#;
+
+/// Starts an OpenSSH server that has no usable `xauth` (R11).
+///
+/// The program is replaced by an empty, non-executable file bound over `/usr/bin/xauth`
+/// inside a private mount namespace, and sshd is started in that namespace. The
+/// machine's own `xauth` is untouched, and this server really has none: both sshd and
+/// the account's own check fail for the reason a missing installation would.
+const MASKED_SSH_SCRIPT: &str = r#"#!/usr/bin/env bash
+#   sshd-without-xauth.sh <sshd config> <log file>
+#
+# The first run makes the mask and re-enters itself inside the namespace, where the mask
+# is bound over the program. sshd daemonizes in there, so the mask lasts exactly as long
+# as the server does.
+set -uo pipefail
+CONFIG="${1:?the sshd configuration is required}"
+LOG="${2:?the log file is required}"
+
+if [ "${SHELLUNE_XAUTH_MASKED:-}" != "1" ]; then
+    mask="$(mktemp /tmp/shellune-xauth-mask.XXXXXX)"
+    chmod 0644 "$mask"
+    export SHELLUNE_XAUTH_MASKED=1
+    export SHELLUNE_XAUTH_MASK="$mask"
+    exec unshare -m --propagation private bash "$0" "$@"
+fi
+
+mount --bind "$SHELLUNE_XAUTH_MASK" /usr/bin/xauth
+/usr/sbin/sshd -t -f "$CONFIG" && /usr/sbin/sshd -f "$CONFIG" -E "$LOG"
+"#;
 
 /// Whether a display number is already served on this machine.
 fn display_taken(number: u32) -> bool {
@@ -618,11 +746,20 @@ runuser -u '{user}' -- bash '{file}'",
         std::fs::write(self.dir.join("sshd_config"), config).map_err(|error| error.to_string())?;
         let config = wsl_path(&self.dir.join("sshd_config"));
         let log = wsl_path(&self.dir.join("sshd.log"));
-        self.wsl(&[
-            "bash",
-            "-c",
-            &format!("/usr/sbin/sshd -t -f '{config}' && /usr/sbin/sshd -f '{config}' -E '{log}'"),
-        ])?;
+        // A server without xauth is a server whose own `xauth` cannot run. The program
+        // is masked by a bind mount inside the namespace sshd is started in, so the
+        // machine keeps its xauth and this server really has none: the account's own
+        // check and sshd's fail for the same reason a missing install would. The mask is
+        // made by a script rather than a command line, because wsl.exe re-quotes what it
+        // is given and a command carrying quotes of its own arrives mangled.
+        let start = if x11.hides_xauth() {
+            let script = self.dir.join("sshd-without-xauth.sh");
+            std::fs::write(&script, MASKED_SSH_SCRIPT).map_err(|error| error.to_string())?;
+            format!("bash '{}' '{config}' '{log}'", wsl_path(&script))
+        } else {
+            format!("/usr/sbin/sshd -t -f '{config}' && /usr/sbin/sshd -f '{config}' -E '{log}'")
+        };
+        self.wsl(&["bash", "-c", &start])?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             if std::net::TcpStream::connect_timeout(
