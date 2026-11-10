@@ -9258,6 +9258,10 @@ async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboar
         "the column takes the keyboard back"
     );
 
+    // The question above turned the pane to its own field while it was open, so the pane
+    // starts from its top before the card is measured.
+    press_key(cx, "home");
+
     // The pane is one slice tall and the card is taller than that, so the entry starts
     // under an edge nothing can reach without turning the pane.
     let panel = bounds_of(cx, "files.panel");
@@ -9388,6 +9392,205 @@ async fn the_failed_reads_typed_entries_are_reached_and_pressed_with_the_keyboar
     );
     assert_eq!(starts[0].direction, TransferDirection::Upload);
     assert_eq!(starts[0].protocol, shellune_core::TransferProtocol::Scp);
+    assert!(
+        !cx.update(|_window, app| view.read(app).pointer_input_for_test()),
+        "no click happened anywhere in this flow"
+    );
+}
+
+/// Whether a control lies inside the slice a column shows (R4).
+///
+/// The ring is drawn on the control itself, so "the keyboard is here" is only true if the
+/// control is inside the box the column shows: a control under an edge is a place the
+/// person cannot see. The bounds are painted boxes, so this measures what is on screen
+/// rather than what the column's offset happens to be.
+fn assert_inside_slice(inner: gpui::Bounds<Pixels>, outer: gpui::Bounds<Pixels>, what: &str) {
+    assert!(
+        inner.size.height > px(0.0),
+        "{what} was measured with an empty box: {inner:?}"
+    );
+    assert!(
+        inner.origin.y >= outer.origin.y - px(0.5)
+            && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + px(0.5),
+        "{what} is under an edge of the column: {inner:?} in {outer:?}"
+    );
+}
+
+#[gpui::test]
+async fn every_control_the_keyboard_stops_on_is_turned_into_its_column(cx: &mut TestAppContext) {
+    // R4 asks for a ring the user can see, and the ring is drawn on the control itself. At
+    // 200% text in the minimum window the question is much taller than the slice a column
+    // shows, so every stop has to turn the column to its own row - not only the failed
+    // card's two typed entries, which are the card's last rows.
+    let (view, cx, _id, files, _transfers) = keyboard_remote(cx);
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+
+    // The shortcut opens the question with the keyboard in its first field, which is the
+    // first stop of the walk.
+    press_key(cx, &catalog_shortcut("files.upload"));
+    files.fail(
+        1,
+        shellune_core::BrowseFailure::Unavailable {
+            reason: "the server refused the sftp subsystem".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionLocal)),
+        "the question opens with the keyboard in its local path"
+    );
+    let panel = bounds_of(cx, "files.panel");
+    assert_inside_slice(
+        bounds_of(cx, "files.question.input"),
+        panel,
+        "the field the question opens at",
+    );
+
+    // The rest of the question: the remote path, the protocol, and the two buttons at its
+    // end. Each one is turned into the slice as the keyboard reaches it.
+    for (steps, selector) in [
+        (1, "files.question.remote"),
+        (2, "files.question.protocol"),
+        (1, "files.question.confirm"),
+        (1, "files.question.cancel"),
+    ] {
+        for _ in 0..steps {
+            press_key(cx, "tab");
+        }
+        let panel = bounds_of(cx, "files.panel");
+        assert_inside_slice(bounds_of(cx, selector), panel, selector);
+    }
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::QuestionCancel)),
+        "the cancelling button is the last stop of the question"
+    );
+
+    // The toolbar sits at the top of the column. With the pane turned to the card's end,
+    // Tab back to the upload entry turns it to the toolbar, so the ring is drawn there and
+    // not above the slice.
+    press_key(cx, "escape");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Body))
+    );
+    press_key(cx, "end");
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::ToolbarUpload))
+    );
+    let panel = bounds_of(cx, "files.panel");
+    assert_inside_slice(bounds_of(cx, "files.upload"), panel, "the toolbar's upload");
+    press_key(cx, "tab");
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::ToolbarDownload))
+    );
+    let panel = bounds_of(cx, "files.panel");
+    assert_inside_slice(
+        bounds_of(cx, "files.download"),
+        panel,
+        "the toolbar's download",
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).pointer_input_for_test()),
+        "no click happened anywhere in this flow"
+    );
+}
+
+#[gpui::test]
+async fn the_file_view_is_left_with_the_keyboard_and_the_terminal_takes_the_keys_back(
+    cx: &mut TestAppContext,
+) {
+    // The file view takes the terminal's place while it is open, so without an exit the
+    // keyboard would have no way back to the program (R4). Two exits are on the keyboard:
+    // the switch back to the terminal in the session bar, which is a stop of the column's
+    // own walk, and Escape, which gives up one layer at a time.
+    let (view, cx, id, _files, _transfers) = keyboard_remote(cx);
+
+    press_key(cx, &catalog_shortcut("files.upload"));
+    assert!(
+        cx.update(|_window, app| view.read(app).files_question_open()),
+        "the shortcut asks about the upload"
+    );
+    type_here(cx, "C:/work/report.txt");
+    press_key(cx, "escape");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_question_open()),
+        "Escape gives up the question first"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).files_visible(id)),
+        "the view itself is still open"
+    );
+
+    // The last stop of the walk is the session bar's switch back to the terminal: Tab
+    // reaches it from the column, and Enter presses it. How many steps that takes depends
+    // on what the column holds - a read that answered has a listing and no download entry,
+    // a read still in flight has neither - so the walk goes until the switch.
+    let mut steps = 0;
+    while files_stop(cx, &view) != Some((FileSource::Remote, FilesStop::Close)) && steps < 8 {
+        press_key(cx, "tab");
+        steps += 1;
+    }
+    let at = files_stop(cx, &view);
+    assert_eq!(
+        at,
+        Some((FileSource::Remote, FilesStop::Close)),
+        "the way back to the terminal is the last stop of the column, at {at:?}"
+    );
+    let bar = bounds_of(cx, "files.close");
+    assert!(
+        bar.size.height > px(0.0),
+        "the switch that holds the ring is drawn: {bar:?}"
+    );
+    press_key(cx, "enter");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_visible(id)),
+        "Enter on the switch closes the file view"
+    );
+    assert_eq!(
+        files_stop(cx, &view),
+        None,
+        "no control of the file view holds the keyboard any more"
+    );
+    assert!(
+        cx.update(|window, app| view.read(app).terminal_has_the_keyboard(window, app)),
+        "the keys go back to the program in the terminal"
+    );
+
+    // The same view opened again and left with Escape: the question goes first, the view
+    // second, and the terminal takes the keys back either way.
+    press_key(cx, &catalog_shortcut("files.upload"));
+    assert!(
+        cx.update(|_window, app| view.read(app).files_visible(id)),
+        "the shortcut opens the file view again"
+    );
+    press_key(cx, "escape");
+    press_key(cx, "escape");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_visible(id)),
+        "Escape closes the file view and the terminal takes its place back"
+    );
+    assert_eq!(
+        files_stop(cx, &view),
+        None,
+        "no control of the file view holds the keyboard any more"
+    );
+    assert!(
+        cx.update(|window, app| view.read(app).terminal_has_the_keyboard(window, app)),
+        "the keys go back to the program in the terminal"
+    );
+    assert_eq!(
+        destination_of(&view, cx),
+        Destination::LocalShells,
+        "the terminal page is the one on screen"
+    );
     assert!(
         !cx.update(|_window, app| view.read(app).pointer_input_for_test()),
         "no click happened anywhere in this flow"

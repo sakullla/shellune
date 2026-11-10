@@ -16,7 +16,9 @@ use gpui::{
     Context, Div, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Render, SharedString,
     Stateful, Window, div, px,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use shellune_core::X11Forwarding;
 use shellune_core::{
@@ -93,6 +95,12 @@ mod toasts;
 #[cfg(test)]
 pub use shell::Tool;
 pub use titlebar::{TRAFFIC_LIGHT_POSITION, custom_titlebar};
+
+/// Where one control of a file column was drawn (R4).
+///
+/// The column, the stop it belongs to, and the box it filled in that column's own content:
+/// what the column compares with its viewport to turn a control into the slice it shows.
+type FilesRow = (FileSource, FilesStop, gpui::Bounds<gpui::Pixels>);
 
 /// Where a terminal comes from.
 ///
@@ -480,6 +488,11 @@ pub struct ShelluneView {
     files_question_recursive_focus: FocusHandle,
     files_question_confirm_focus: FocusHandle,
     files_question_cancel_focus: FocusHandle,
+    /// Focus of the session bar's switch back to the terminal (R4).
+    ///
+    /// The file view itself has no close button of its own: the bar above it already has
+    /// the switch, and a second one would be the same decision twice.
+    files_close_focus: FocusHandle,
     /// Whether the question that was just opened should take the keyboard next draw.
     ///
     /// The field is focused by the drawing rather than by the call that opened the
@@ -488,6 +501,14 @@ pub struct ShelluneView {
     files_field_focus: bool,
     /// The column that should take the keyboard back next draw, after a question ended.
     files_panel_focus_pending: Option<FileSource>,
+    /// Where each control of a file column was when that column last drew it (R4).
+    ///
+    /// A control the keyboard stops on has to be seen, and at 200% text in the minimum
+    /// window a question is taller than the slice the column shows. The rows are recorded
+    /// by the frame that drew them, so the column is turned to one before the frame that
+    /// has to show it: the ring is never drawn under an edge. The boxes are the column's
+    /// own content, so a turn is the difference between a box and the column's viewport.
+    files_rows: Rc<RefCell<Vec<FilesRow>>>,
     /// Last viewport width, which chooses two columns or one.
     viewport_width: gpui::Pixels,
     /// Forces the file layout in a test. `None` follows the viewport.
@@ -913,8 +934,10 @@ impl ShelluneView {
             files_question_recursive_focus: cx.focus_handle(),
             files_question_confirm_focus: cx.focus_handle(),
             files_question_cancel_focus: cx.focus_handle(),
+            files_close_focus: cx.focus_handle(),
             files_field_focus: false,
             files_panel_focus_pending: None,
+            files_rows: Rc::new(RefCell::new(Vec::new())),
             viewport_width: px(crate::app::DEFAULT_WINDOW_SIZE.0),
             files_layout_override: None,
             palette: None,
@@ -8098,6 +8121,12 @@ impl ShelluneView {
         remote: Option<Entity<TextField>>,
         cx: &mut Context<Self>,
     ) {
+        // A question that opens now is not the one whose rows the last frame measured: its
+        // own rows are recorded by the frame that draws it, and a stale box would turn the
+        // column to where the previous question's controls used to be (R4).
+        self.files_rows
+            .borrow_mut()
+            .retain(|(at, _, _)| *at != dialog.source());
         self.files_dialog = Some(dialog);
         let view = cx.entity().downgrade();
         field.update(cx, |text_field, _cx| {
@@ -8684,6 +8713,9 @@ impl ShelluneView {
                 stops.push((source, FilesStop::CardDownload));
             }
         }
+        // The way back to the terminal is the last stop of the walk: it belongs to the bar
+        // above both columns rather than to either of them.
+        stops.push((FileSource::Remote, FilesStop::Close));
         stops
     }
 
@@ -8733,6 +8765,7 @@ impl ShelluneView {
             FilesStop::QuestionRecursive => self.files_question_recursive_focus.clone(),
             FilesStop::QuestionConfirm => self.files_question_confirm_focus.clone(),
             FilesStop::QuestionCancel => self.files_question_cancel_focus.clone(),
+            FilesStop::Close => self.files_close_focus.clone(),
         })
     }
 
@@ -8766,13 +8799,103 @@ impl ShelluneView {
             return;
         };
         window.focus(&handle);
-        if matches!(stop, FilesStop::CardUpload | FilesStop::CardDownload) {
-            // The two typed entries are the card's last rows, and the card is taller than
-            // one slice at 200% text in the minimum window: putting the keyboard on one
-            // turns the pane to its end, so the ring lands where it can be seen (R4).
-            self.files_panel_scroll(source).scroll_to_bottom();
-        }
+        // The ring is drawn on the control itself, so the control has to be inside the
+        // slice the column shows: at 200% text in the minimum window a question is taller
+        // than that slice (R4).
+        self.files_reveal(source, stop, window, cx);
         cx.notify();
+    }
+
+    /// Where one control of a column was drawn, if the column has drawn it (R4).
+    ///
+    /// The toolbar shares the column's own header, which is the first row of the column's
+    /// content. A question's rows are known only from the frame that drew them, because
+    /// the height of a row depends on the text, the problems and the choices it carries.
+    fn files_row_of(
+        &self,
+        source: FileSource,
+        stop: FilesStop,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        match stop {
+            // The column itself is what a turn moves: it has no row inside itself, and a
+            // listing taller than its own box turns its entries instead.
+            FilesStop::Body => None,
+            // The switch back to the terminal is in the session bar above the column, so
+            // no slice of the column can hide it.
+            FilesStop::Close => None,
+            FilesStop::ToolbarUpload | FilesStop::ToolbarDownload => {
+                self.files_panel_scroll(source).bounds_for_item(0)
+            }
+            _ => self
+                .files_rows
+                .borrow()
+                .iter()
+                .find(|(at, at_stop, _)| *at == source && *at_stop == stop)
+                .map(|(_, _, row)| *row),
+        }
+    }
+
+    /// Turns one column the least amount that shows the whole of a control's row (R4).
+    ///
+    /// The row is in the column's own content, so the turn is the distance between that
+    /// content and the column's viewport. A control already inside the slice does not move
+    /// the page under the user's eyes; a row taller than the slice is read from its top.
+    fn files_turn_to(&self, source: FileSource, row: gpui::Bounds<gpui::Pixels>) {
+        let scroll = self.files_panel_scroll(source);
+        let viewport = scroll.bounds();
+        let offset = scroll.offset();
+        let floor = viewport.origin.y + viewport.size.height;
+        let top = row.origin.y + offset.y;
+        let mut y = offset.y;
+        if row.size.height >= viewport.size.height || top < viewport.origin.y {
+            y = viewport.origin.y - row.origin.y;
+        } else if top + row.size.height > floor {
+            y = floor - row.origin.y - row.size.height;
+        }
+        // The offset is zero at the top and minus what does not fit at the bottom.
+        let y = y.min(px(0.0)).max(-scroll.max_offset().height);
+        if (y - offset.y).abs() > px(0.5) {
+            scroll.set_offset(gpui::point(offset.x, y));
+        }
+    }
+
+    /// Makes sure the control the keyboard just reached is inside its column (R4).
+    ///
+    /// The two typed entries of a failed read are the card's last rows, so the end of the
+    /// column is where they are. Every other control has a row of its own, and the column
+    /// is turned to it as soon as that row is known - one frame after a question opened
+    /// here, because the question is drawn by a frame that is still being built.
+    fn files_reveal(
+        &mut self,
+        source: FileSource,
+        stop: FilesStop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match (stop, self.files_row_of(source, stop)) {
+            // The column itself is what a turn moves, and the way back to the terminal is
+            // in the bar above it: neither is a row a turn could bring into the slice.
+            (FilesStop::Body | FilesStop::Close, _) => {}
+            (FilesStop::CardUpload | FilesStop::CardDownload, _) => {
+                self.files_panel_scroll(source).scroll_to_bottom();
+            }
+            (_, Some(row)) => self.files_turn_to(source, row),
+            (_, None) => {
+                // The control's row is not known yet, so the turn waits for the frame that
+                // draws it. A stop that left the screen in the meantime - a question that
+                // was answered before this ran - is not turned to.
+                let id = self.active;
+                cx.defer_in(window, move |view, _window, cx| {
+                    if let Some(id) = id
+                        && view.files_stops(id).contains(&(source, stop))
+                        && let Some(row) = view.files_row_of(source, stop)
+                    {
+                        view.files_turn_to(source, row);
+                        cx.notify();
+                    }
+                });
+            }
+        }
     }
 
     /// One step of Tab through the file view's own controls (R4).
@@ -8841,6 +8964,15 @@ impl ShelluneView {
             }
             FilesStop::QuestionConfirm => self.submit_files_change(cx),
             FilesStop::QuestionCancel => self.files_cancel_change(cx),
+            FilesStop::Close => {
+                // The same switch the pointer presses: the terminal is where this session
+                // came from, and it takes the keyboard back (R4). A view that is already
+                // closed is left alone, so the switch cannot reopen it.
+                if self.files.is_open(id) {
+                    self.toggle_files(id, cx);
+                    self.reclaim_focus(window, cx);
+                }
+            }
         }
     }
 
@@ -9937,10 +10069,13 @@ impl ShelluneView {
             .and_then(|browser| browser.current_directory())
             .map(str::to_owned);
         let danger = matches!(dialog, FilesDialog::Delete { .. });
-        let mut card =
-            components::banner(if danger { Tone::Danger } else { Tone::Accent }, metrics)
-                .gap(metrics.scale(spacing::TIGHT - 2.0))
-                .debug_selector(|| "files.question".to_owned());
+        let card = components::banner(if danger { Tone::Danger } else { Tone::Accent }, metrics)
+            .gap(metrics.scale(spacing::TIGHT - 2.0))
+            .debug_selector(|| "files.question".to_owned());
+        // Every row of the question, with the controls the keyboard can stop on. The
+        // frame that draws them records where each one landed, so the column can turn a
+        // control the keyboard just reached into its slice (R4).
+        let mut rows: Vec<(Vec<FilesStop>, Div)> = Vec::new();
 
         let heading = match dialog {
             FilesDialog::NewDirectory { .. } => strings.files_new,
@@ -9949,13 +10084,14 @@ impl ShelluneView {
             FilesDialog::Upload { .. } => strings.transfers_upload,
             FilesDialog::Download { .. } => strings.transfers_download,
         };
-        card = card.child(
+        rows.push((
+            Vec::new(),
             div()
                 .text_size(metrics.label_size())
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .debug_selector(|| "files.question.heading".to_owned())
                 .child(SharedString::from(heading)),
-        );
+        ));
 
         match dialog {
             FilesDialog::NewDirectory { .. }
@@ -9992,7 +10128,8 @@ impl ShelluneView {
                     },
                     &self.files_remote_field,
                 ) {
-                    card = card.child(
+                    rows.push((
+                        vec![FilesStop::QuestionRemote],
                         div()
                             .flex()
                             .flex_col()
@@ -10006,9 +10143,10 @@ impl ShelluneView {
                                     .child(SharedString::from(label)),
                             )
                             .child(div().flex_none().child(field.clone())),
-                    );
+                    ));
                 }
-                card = card.child(
+                rows.push((
+                    Vec::new(),
                     div()
                         .flex_1()
                         .min_w(px(0.0))
@@ -10016,68 +10154,79 @@ impl ShelluneView {
                         .text_color(theme::swatch(palette::TEXT_SECONDARY))
                         .debug_selector(|| "files.question.target".to_owned())
                         .child(SharedString::from(display_path(dialog.source(), &target))),
-                );
+                ));
                 if let Some(field) = &self.files_field {
-                    card = card.child(
+                    rows.push((
+                        vec![FilesStop::QuestionLocal],
                         div()
                             .flex_none()
                             .debug_selector(|| "files.question.input".to_owned())
                             .child(field.clone()),
-                    );
+                    ));
                 }
                 if let Some(chosen) = dialog.protocol() {
-                    card = card.child(self.transfer_protocol_choice(chosen, metrics, strings, cx));
+                    rows.push((
+                        vec![FilesStop::QuestionSftp, FilesStop::QuestionScp],
+                        self.transfer_protocol_choice(chosen, metrics, strings, cx),
+                    ));
                     if chosen == TransferProtocol::Scp {
-                        card = card.child(
+                        rows.push((
+                            Vec::new(),
                             div()
                                 .text_size(metrics.caption_size())
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
                                 .debug_selector(|| "files.question.protocol.note".to_owned())
                                 .child(SharedString::from(strings.transfers_protocol_note)),
-                        );
-                        card = card.child(
-                            components::segment(
-                                format!(
-                                    "{} {}",
-                                    if dialog.recursive() { "[x]" } else { "[ ]" },
-                                    strings.transfers_recursive
-                                ),
-                                dialog.recursive(),
-                                metrics,
-                            )
-                            .id("files.question.recursive")
-                            .debug_selector(|| "files.question.recursive".to_owned())
-                            .track_focus(&self.files_question_recursive_focus)
-                            .focus(files_focus_ring)
-                            .on_click(cx.listener(
-                                |view, _event, _window, cx| {
-                                    if let Some(dialog) = view.files_dialog.as_mut() {
-                                        let next = !dialog.recursive();
-                                        dialog.set_recursive(next);
-                                    }
-                                    cx.notify();
-                                },
-                            )),
-                        );
+                        ));
+                        rows.push((
+                            vec![FilesStop::QuestionRecursive],
+                            div().flex_none().child(
+                                components::segment(
+                                    format!(
+                                        "{} {}",
+                                        if dialog.recursive() { "[x]" } else { "[ ]" },
+                                        strings.transfers_recursive
+                                    ),
+                                    dialog.recursive(),
+                                    metrics,
+                                )
+                                .flex_1()
+                                .id("files.question.recursive")
+                                .debug_selector(|| "files.question.recursive".to_owned())
+                                .track_focus(&self.files_question_recursive_focus)
+                                .focus(files_focus_ring)
+                                .on_click(cx.listener(
+                                    |view, _event, _window, cx| {
+                                        if let Some(dialog) = view.files_dialog.as_mut() {
+                                            let next = !dialog.recursive();
+                                            dialog.set_recursive(next);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                        ));
                     }
                 }
                 if let Some(problem) = dialog.problem() {
-                    card = card.child(
+                    rows.push((
+                        Vec::new(),
                         div()
                             .text_size(metrics.caption_size())
                             .text_color(Tone::Danger.text())
                             .debug_selector(|| "files.question.problem".to_owned())
                             .child(SharedString::from(problem_text(problem, strings))),
-                    );
+                    ));
                 }
                 if let Some(problem) = dialog.path_problem() {
-                    card = card.child(
+                    rows.push((
+                        Vec::new(),
                         div()
                             .text_size(metrics.caption_size())
                             .text_color(Tone::Danger.text())
                             .debug_selector(|| "files.question.problem".to_owned())
                             .child(SharedString::from(path_problem_text(problem, strings))),
-                    );
+                    ));
                 }
                 let confirm = match dialog {
                     FilesDialog::Rename { .. } => strings.files_rename_confirm,
@@ -10085,7 +10234,8 @@ impl ShelluneView {
                     FilesDialog::Download { .. } => strings.transfers_download_confirm,
                     _ => strings.files_create,
                 };
-                card = card.child(
+                rows.push((
+                    vec![FilesStop::QuestionConfirm, FilesStop::QuestionCancel],
                     div()
                         .flex()
                         .items_center()
@@ -10113,14 +10263,15 @@ impl ShelluneView {
                             .track_focus(&self.files_question_cancel_focus)
                             .focus(files_focus_ring),
                         ),
-                );
+                ));
             }
             FilesDialog::Delete { name, kind, .. } => {
                 let target = directory
                     .as_deref()
                     .map(|directory| join_path(directory, name))
                     .unwrap_or_else(|| name.clone());
-                card = card.child(
+                rows.push((
+                    Vec::new(),
                     div()
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -10130,8 +10281,9 @@ impl ShelluneView {
                             strings.files_target_label,
                             display_path(dialog.source(), &target)
                         ))),
-                );
-                card = card.child(
+                ));
+                rows.push((
+                    Vec::new(),
                     div()
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_SECONDARY))
@@ -10141,8 +10293,9 @@ impl ShelluneView {
                             strings.files_kind_label,
                             kind_label(*kind, strings)
                         ))),
-                );
-                card = card.child(
+                ));
+                rows.push((
+                    Vec::new(),
                     div()
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_MUTED))
@@ -10155,21 +10308,23 @@ impl ShelluneView {
                                 (FileSource::Remote, false) => strings.files_delete_file,
                             },
                         )),
-                );
+                ));
                 // A deletion the browser refuses says so here. Without it, confirming a
                 // delete of an entry that is no longer in the directory - removed by
                 // someone else, or gone since the last Refresh - would look like a button
                 // that does nothing at all.
                 if let Some(problem) = dialog.problem() {
-                    card = card.child(
+                    rows.push((
+                        Vec::new(),
                         div()
                             .text_size(metrics.caption_size())
                             .text_color(Tone::Danger.text())
                             .debug_selector(|| "files.question.problem".to_owned())
                             .child(SharedString::from(problem_text(problem, strings))),
-                    );
+                    ));
                 }
-                card = card.child(
+                rows.push((
+                    vec![FilesStop::QuestionConfirm, FilesStop::QuestionCancel],
                     div()
                         .flex()
                         .items_center()
@@ -10197,9 +10352,42 @@ impl ShelluneView {
                             .track_focus(&self.files_question_cancel_focus)
                             .focus(files_focus_ring),
                         ),
-                );
+                ));
             }
         }
+        // The frame that draws the question is the one that knows where each of its rows
+        // landed: a question's height depends on its text, its problems and its choices.
+        // Recording them here is what lets the keyboard's next stop turn the column to
+        // itself (R4).
+        let stored = self.files_rows.clone();
+        let row_stops: Vec<Vec<FilesStop>> = rows.iter().map(|(stops, _)| stops.clone()).collect();
+        let card = card
+            .children(rows.into_iter().map(|(_, row)| row))
+            .on_children_prepainted(move |bounds, window, _cx| {
+                // The rows were laid out under the window's current offset; the column's
+                // own content is where they sit with nothing scrolled, which is what a
+                // turn is measured in.
+                let offset = window.element_offset();
+                let mut rows = stored.borrow_mut();
+                // The question that was drawn last is the one on screen: an earlier
+                // one's boxes say nothing about it.
+                rows.retain(|(at, _, _)| *at != source);
+                for (index, stops) in row_stops.iter().enumerate() {
+                    let Some(row) = bounds.get(index) else {
+                        break;
+                    };
+                    for stop in stops {
+                        rows.push((
+                            source,
+                            *stop,
+                            gpui::Bounds {
+                                origin: row.origin - offset,
+                                size: row.size,
+                            },
+                        ));
+                    }
+                }
+            });
         Some(card)
     }
 
@@ -10824,6 +11012,16 @@ impl ShelluneView {
         self.pointer_input
     }
 
+    /// Whether the terminal of the session in front holds the keyboard, for a test.
+    ///
+    /// Closing the file view has to give the keys back to something: a view that left the
+    /// window with no control focused would answer no shortcut at all (R4).
+    #[cfg(test)]
+    pub fn terminal_has_the_keyboard(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.active_pane()
+            .is_some_and(|pane| pane.read(cx).focus_handle().is_focused(window))
+    }
+
     /// Why a session ended, and what the user can do about it (R12).
     ///
     /// The reason and the next step are one notice because the requirement is about
@@ -11173,9 +11371,21 @@ impl ShelluneView {
                         ux.settings_terminal,
                         !files_open,
                     )
+                    // The way back to the terminal is a stop of the file view's keyboard
+                    // walk, so it can be reached with Tab and pressed with Enter (R4). It
+                    // answers the ring through the same handler the columns use, because
+                    // the walk is one list whichever of its controls holds the keys.
+                    .track_focus(&self.files_close_focus)
+                    .focus(files_focus_ring)
+                    .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
+                        if view.files_key(id, FileSource::Remote, event, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
                     .on_click(cx.listener(move |view, _event, _window, cx| {
                         if view.files.is_open(id) {
                             view.toggle_files(id, cx);
+                            view.reclaim_focus(_window, cx);
                         }
                     })),
                 )
@@ -11767,15 +11977,21 @@ impl Render for ShelluneView {
         }
         // A file view's question takes the keyboard in its first field, and gives it back
         // to the column it asked about once it is gone, so a copy can be asked for, typed
-        // and confirmed without a pointer (R4).
-        if std::mem::take(&mut self.files_field_focus)
-            && let Some(handle) = self
+        // and confirmed without a pointer (R4). The field is also brought into the column:
+        // at 200% text in the minimum window the question is taller than the slice, and a
+        // caret in a field nobody can see is no keyboard path at all.
+        if std::mem::take(&mut self.files_field_focus) {
+            if let Some(handle) = self
                 .files_field
                 .as_ref()
                 .map(|field| field.read(cx).focus_handle().clone())
-            && !handle.is_focused(window)
-        {
-            window.focus(&handle);
+                && !handle.is_focused(window)
+            {
+                window.focus(&handle);
+            }
+            if let Some(source) = self.files_dialog.as_ref().map(FilesDialog::source) {
+                self.files_reveal(source, FilesStop::QuestionLocal, window, cx);
+            }
         }
         if let Some(source) = self.files_panel_focus_pending.take() {
             let handle = self.files_panel_focus(source).clone();
@@ -11896,6 +12112,14 @@ impl Render for ShelluneView {
                 // thing Escape closes: the column it asked about takes the keys back (R4).
                 if this.files_dialog.is_some() {
                     this.files_cancel_change(cx);
+                    return;
+                }
+                // The file view itself is a place the keyboard can leave. It takes the
+                // terminal's place while it is open, so without this a person who never
+                // touches the pointer would be left in it (R4).
+                if let Some(id) = this.active.filter(|id| this.files.is_open(*id)) {
+                    this.toggle_files(id, cx);
+                    this.reclaim_focus(window, cx);
                     return;
                 }
                 this.workspace.dismiss_notice();

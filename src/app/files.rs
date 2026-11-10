@@ -97,6 +97,10 @@ pub enum FilesStop {
     QuestionConfirm,
     /// The question's cancelling button.
     QuestionCancel,
+    /// The session bar's switch back to the terminal, which is how the view is left: the
+    /// file view takes the terminal's place, so the way back has to be reachable with the
+    /// keyboard as well as by Escape (R4).
+    Close,
 }
 
 /// One browsable session: the remote connection, the local disk, and both views.
