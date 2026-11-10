@@ -519,6 +519,27 @@ Enter/Space 触发当前控件——与指针点击调用同一段代码，所�
 控件仍在卡片内。走查记录请同时写下 `viewport_size` / `scale_factor` 的证据（或使用 DPI 感知工具），不要只凭截图
 判断右缘。
 
+#### 2026-11-11 Windows 实窗
+
+这次构建的 Windows 窗口在界面文字 200% 下，由进程自己报出 `viewport_size=720x480`、`scale_factor=1.5`
+（同时报 `text_size=200%`）。客户区是 1080×720 物理像素，与 720×480 乘 1.5 一致。下面的图是这扇窗口的客户区，
+不是更早的走查图。设置页可以纵向滚动；卡片右缘到客户区右缘留着 96 物理像素，等于页边 `scale(32)` 再乘
+`scale_factor` 1.5，内容没有贴上窗口右缘。
+
+- 主题分段「跟随系统 / 浅色 / 深色」整段都在卡片里，「跟随」没有被右缘切开。
+  ![主题分段](windows-720x480-200-settings-theme.png)
+- 终端配色「跟随应用 / 深色 / 浅色」同样完整。
+  ![终端配色](windows-720x480-200-settings-scheme.png)
+- 界面文字大小选中的是 200%，四个分段都完整。
+  ![界面文字大小](windows-720x480-200-settings-text-size.png)
+- 默认 Shell 放不下一行时换到下一行：「Windows PowerShell」和「PowerShell 7」在第一行，「Command Prompt」
+  在第二行，名称没有在右缘被切开。
+  ![默认 Shell](windows-720x480-200-settings-shell.png)
+- 快捷键行里的搜索框、keycap（图中为 Ctrl+2）和「修改」「解除绑定」都在卡片内。
+  ![快捷键行](windows-720x480-200-settings-keys.png)
+
+顶栏的搜索、设置和关闭也在这扇窗口里。macOS 与 Linux 没有实窗，上面不能当成那两端已经验收。
+
 ### 输入框（`text_field.rs`）
 
 单行输入框支持：点击定位、拖动选择、双击选词、三击全选；Shift+方向键 / Home / End 扩展选区，
