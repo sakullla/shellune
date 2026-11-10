@@ -899,30 +899,49 @@ impl ShelluneView {
             .child(self.settings_group(
                 ux.settings_appearance,
                 vec![
-                    self.settings_row(ux.settings_theme, ux.settings_theme_hint, theme_control),
                     self.settings_row(
+                        "theme",
+                        ux.settings_theme,
+                        ux.settings_theme_hint,
+                        theme_control,
+                    ),
+                    self.settings_row(
+                        "language",
                         ux.settings_language,
                         ux.settings_language_hint,
                         language_control,
                     ),
                     self.settings_row(
+                        "text-size",
                         ux.settings_text_size,
                         ux.settings_text_size_hint,
                         zoom_control,
                     ),
-                    self.settings_row(ux.settings_motion, ux.settings_motion_hint, motion_control),
+                    self.settings_row(
+                        "motion",
+                        ux.settings_motion,
+                        ux.settings_motion_hint,
+                        motion_control,
+                    ),
                 ],
             ))
             .child(self.settings_group(
                 ux.settings_terminal,
                 vec![
-                    self.settings_row(ux.settings_scheme, ux.settings_scheme_hint, scheme_control),
                     self.settings_row(
+                        "scheme",
+                        ux.settings_scheme,
+                        ux.settings_scheme_hint,
+                        scheme_control,
+                    ),
+                    self.settings_row(
+                        "font-size",
                         ux.settings_font_size,
                         ux.settings_font_size_hint,
                         font_control,
                     ),
                     self.settings_row(
+                        "default-shell",
                         ux.settings_default_shell,
                         ux.settings_default_shell_hint,
                         shell_control,
@@ -933,11 +952,13 @@ impl ShelluneView {
                 ux.settings_notices,
                 vec![
                     self.settings_row(
+                        "bell-notice",
                         ux.settings_bell_notice,
                         ux.settings_bell_notice_hint,
                         bell_control,
                     ),
                     self.settings_row(
+                        "finished-notice",
                         ux.settings_finished_notice,
                         ux.settings_finished_notice_hint,
                         finished_control,
@@ -949,6 +970,7 @@ impl ShelluneView {
                 ux.settings_data,
                 vec![
                     self.settings_row(
+                        "hosts-file",
                         ux.settings_hosts_file,
                         "",
                         div()
@@ -957,11 +979,13 @@ impl ShelluneView {
                             .font_family(crate::app::terminal::monospace_family())
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "settings.paths".to_owned())
                             .child(SharedString::from(super::home_relative(
                                 &self.store.path().display().to_string(),
                             ))),
                     ),
                     self.settings_row(
+                        "import",
                         strings.import_open,
                         ux.settings_import_hint,
                         components::icon_label_button(
@@ -982,6 +1006,7 @@ impl ShelluneView {
             .child(self.settings_group(
                 ux.settings_about,
                 vec![self.settings_row(
+                    "about",
                     crate::app::product::NAME,
                     match self.workspace.locale() {
                         Locale::English => crate::app::product::TAGLINE_EN,
@@ -1177,12 +1202,14 @@ impl ShelluneView {
             div()
                 .flex()
                 .items_center()
+                .flex_wrap()
+                .min_w(px(0.0))
                 .gap(metrics.scale(spacing::HAIRLINE))
-                .children(
-                    labels
-                        .into_iter()
-                        .map(|label| components::keycap(SharedString::from(label), metrics)),
-                )
+                .children(labels.into_iter().enumerate().map(|(position, label)| {
+                    let selector = format!("settings.keys.keycap.{action}.{position}");
+                    components::keycap(SharedString::from(label), metrics)
+                        .debug_selector(move || selector.clone())
+                }))
                 .into_any_element()
         } else {
             div()
@@ -1233,10 +1260,15 @@ impl ShelluneView {
                     ),
             )
             .child({
+                // The keys and their three controls wrap as a group of their own: when
+                // the name column leaves no room on the line, the group takes the next
+                // line instead of pushing its controls past the window's right edge
+                // (R4, 720×480 at 200% text).
                 let mut group = div()
                     .flex()
                     .items_center()
                     .flex_wrap()
+                    .min_w(px(0.0))
                     .gap(metrics.scale(spacing::TIGHT))
                     .child(keys);
                 for (position, control) in controls.iter().copied().enumerate() {
@@ -1439,8 +1471,15 @@ impl ShelluneView {
     }
 
     /// One settings row: the label and its hint on the left, the control on the right.
+    ///
+    /// The row wraps, and the control's column may shrink below the control's own
+    /// width, so a control that does not fit beside its label moves under the label and
+    /// a control wider than the row wraps inside itself. Nothing is drawn past the
+    /// window's right edge, where the settings page — which scrolls only downwards —
+    /// would put it out of reach (R4, 720×480 at 200% text).
     fn settings_row(
         &self,
+        id: &'static str,
         label: &'static str,
         hint: &'static str,
         control: impl IntoElement,
@@ -1454,6 +1493,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::BASE))
             .py(metrics.scale(spacing::SNUG))
+            .debug_selector(move || format!("settings.row.{id}"))
             .child(
                 div()
                     .flex()
@@ -1477,7 +1517,7 @@ impl ShelluneView {
                         )
                     }),
             )
-            .child(div().flex_none().child(control))
+            .child(div().flex().flex_col().min_w(px(0.0)).child(control))
     }
 
     /// A segmented control whose segments call `pick` with their index.

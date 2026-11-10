@@ -364,12 +364,19 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
 }
 
 /// The track a row of [`segment`]s sits in.
+///
+/// The track shrinks and wraps instead of leaving its container: at 200% text in the
+/// minimum window a row of segments is wider than the line it sits on, and a control
+/// that could not shrink would be drawn past the window's right edge where neither the
+/// pointer nor a horizontal scroll can reach it (R4). A segment itself stays whole, so
+/// the track gains a line rather than cutting a label.
 pub fn segmented(metrics: Metrics) -> Div {
     div()
         .flex()
         .flex_none()
         .flex_wrap()
         .items_center()
+        .min_w(px(0.0))
         .gap(metrics.scale(2.0))
         .p(metrics.scale(3.0))
         .rounded(px(radius::MEDIUM + 1.0))

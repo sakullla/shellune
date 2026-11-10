@@ -30,8 +30,8 @@ use shellune_storage::{
 use shellune_terminal::{BlockStatus, ExitReport, GridSize, TermMode, encode_paste};
 
 use crate::app::actions::{
-    CycleTextSize, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToTransfers,
-    ToggleLanguage,
+    CycleTextSize, GoToForwards, GoToHosts, GoToLocalShells, GoToSessions, GoToSettings,
+    GoToTransfers, ToggleLanguage,
 };
 use crate::app::copy::{self, CHINESE, ENGLISH, Locale, Strings};
 use crate::app::hosts::HostView;
@@ -309,6 +309,193 @@ async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
         assert_fits_inside(bounds_of(cx, "nav.settings"), viewport, name);
         assert_within_width(bounds_of(cx, "content"), viewport, name);
     }
+}
+
+/// At the minimum window with the largest text, every settings row keeps its control
+/// inside the row and the row inside the window (R4).
+///
+/// This is the size the delivery walkthrough found the page overflowing in: a label and
+/// its control no longer share one line, and the control has to sit under the label
+/// instead of being drawn past the window's right edge, which the settings page — it
+/// scrolls downwards only — could not reach.
+#[gpui::test]
+async fn every_settings_row_stays_inside_the_minimum_window_at_two_hundred_percent(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    show_settings_at_the_minimum_window_in_large_text(&view, cx);
+    let viewport = cx.update(|window, _app| window.viewport_size());
+
+    for (row, control) in [
+        ("settings.row.theme", "settings.theme"),
+        ("settings.row.language", "settings.language"),
+        ("settings.row.text-size", "settings.zoom"),
+        ("settings.row.motion", "settings.motion"),
+        ("settings.row.scheme", "settings.scheme"),
+        ("settings.row.font-size", "settings.font.less"),
+        ("settings.row.font-size", "settings.font.value"),
+        ("settings.row.font-size", "settings.font.more"),
+        ("settings.row.default-shell", "settings.shell"),
+        ("settings.row.bell-notice", "settings.notice.bell"),
+        ("settings.row.finished-notice", "settings.notice.finished"),
+        ("settings.row.hosts-file", "settings.paths"),
+        ("settings.row.import", "settings.import"),
+        ("settings.row.about", "status.version"),
+    ] {
+        assert_inside_its_row(cx, viewport, row, control);
+    }
+
+    // The controls are not squeezed into stubs to make that fit: the two text-size
+    // buttons keep the pointer target the rest of the page has (R4).
+    for selector in ["settings.font.less", "settings.font.more"] {
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
+            "{selector} shrank below its pointer target: {bounds:?}"
+        );
+    }
+}
+
+/// A control that is wider than its row wraps inside it rather than leaving the window
+/// (R4).
+///
+/// The default-shell choice is the case the walkthrough caught: the names of the shells
+/// on this machine are wider than the row at 200% text, and the track used to keep its
+/// full width — drawn past the row and past the window's right edge. The shells are
+/// fixed here so the test measures the layout and not the machine it runs on.
+#[gpui::test]
+async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_percent(
+    cx: &mut TestAppContext,
+) {
+    let mut workspace = Workspace::new();
+    workspace.set_shells(vec![
+        LocalShell::new("Windows PowerShell (x86)", "powershell.exe"),
+        LocalShell::new("PowerShell 7 Preview", "pwsh.exe"),
+        LocalShell::new("Command Prompt (Administrator)", "cmd.exe"),
+    ]);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+    show_settings_at_the_minimum_window_in_large_text(&view, cx);
+    let viewport = cx.update(|window, _app| window.viewport_size());
+
+    let row = bounds_of(cx, "settings.row.default-shell");
+    assert_within_width(row, viewport, "the default-shell row");
+    let track = bounds_of(cx, "settings.shell");
+    assert_within_width(track, viewport, "the default-shell choice");
+    assert!(
+        track.origin.x >= row.origin.x - px(0.5)
+            && track.origin.x + track.size.width <= row.origin.x + row.size.width + px(0.5),
+        "the default-shell choice leaves its row: {track:?} in {row:?}"
+    );
+    assert!(
+        track.size.width <= row.size.width,
+        "the choice kept its width instead of shrinking to the row: {track:?} in {row:?}"
+    );
+
+    // So the shells gain a line inside the same track: the first shell is on the first
+    // line and a later one below it, both inside the row.
+    let first = bounds_of(cx, "settings.shell.0");
+    let later = bounds_of(cx, "settings.shell.1");
+    assert!(
+        first.origin.y < later.origin.y,
+        "the shells stayed on one line instead of wrapping: {first:?} and {later:?}"
+    );
+    for selector in ["settings.shell.0", "settings.shell.1", "settings.shell.2"] {
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.origin.x >= track.origin.x - px(0.5)
+                && bounds.origin.x + bounds.size.width
+                    <= track.origin.x + track.size.width + px(0.5),
+            "{selector} leaves the choice it belongs to: {bounds:?} in {track:?}"
+        );
+    }
+}
+
+/// A shortcut row keeps its keys and its three controls inside the row at 200% text
+/// (R4).
+///
+/// A combination as long as a real one takes a wide keycap once the text is doubled, and
+/// the row then holds a name column, the key and three buttons. The row wraps those
+/// parts instead of letting the buttons leave the window.
+#[gpui::test]
+async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    // A long combination, so the keycap is as wide as a real keyboard layout makes it.
+    let saved = saved_for_this_platform(vec![shellune_storage::KeymapEntry::new(
+        "terminal.copy",
+        "terminal",
+        Some("ctrl-alt-shift-f12".to_owned()),
+    )]);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_saved_keymap_for_test(&saved, cx));
+    });
+    show_settings_at_the_minimum_window_in_large_text(&view, cx);
+    let viewport = cx.update(|window, _app| window.viewport_size());
+
+    let row = "settings.keys.row.terminal.copy";
+    for control in [
+        "settings.keys.keycap.terminal.copy.0",
+        "settings.keys.change.terminal.copy",
+        "settings.keys.unbind.terminal.copy",
+        // The combination differs from the default, so this row also offers to go back.
+        "settings.keys.reset.terminal.copy",
+    ] {
+        assert_inside_its_row(cx, viewport, row, control);
+    }
+    // The search field above the list is a control of the same page and stays inside the
+    // card too.
+    assert_within_width(
+        bounds_of(cx, "settings.keys.search"),
+        viewport,
+        "the search field",
+    );
+}
+
+/// Asserts one control stays inside the row it belongs to, and that row inside the
+/// window it is drawn in.
+///
+/// A settings page that scrolls downwards only cannot reach a control drawn past the
+/// window's right edge, so the row is the outermost place a control may sit (R4).
+fn assert_inside_its_row(
+    cx: &mut VisualTestContext,
+    viewport: Size<Pixels>,
+    row: &'static str,
+    control: &'static str,
+) {
+    let row_bounds = bounds_of(cx, row);
+    assert_within_width(row_bounds, viewport, row);
+    let bounds = bounds_of(cx, control);
+    assert_within_width(bounds, viewport, control);
+    assert!(
+        bounds.origin.x >= row_bounds.origin.x - px(0.5),
+        "{control} starts left of its row: {bounds:?} in {row_bounds:?}"
+    );
+    assert!(
+        bounds.origin.x + bounds.size.width
+            <= row_bounds.origin.x + row_bounds.size.width + px(0.5),
+        "{control} leaves its row on the right: {bounds:?} in {row_bounds:?}"
+    );
+}
+
+/// Sets the window to the minimum size and the interface to the largest text in Chinese,
+/// then opens the settings page — the size at which labels and controls meet.
+fn show_settings_at_the_minimum_window_in_large_text(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+) {
+    cx.simulate_resize(minimum_window());
+    focus_root(view, cx);
+    cx.dispatch_action(ToggleLanguage);
+    largest_text_size(view, cx);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese
+    );
+    cx.dispatch_action(GoToSettings);
+    cx.run_until_parked();
 }
 
 #[gpui::test]
@@ -13384,6 +13571,23 @@ fn smallest_text_size(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) {
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Compact
+    );
+}
+
+/// Sets the interface text size to the largest step, where labels and controls are at
+/// their widest against the window.
+fn largest_text_size(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) {
+    focus_root(view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
     );
 }
 
