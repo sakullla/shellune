@@ -1180,7 +1180,7 @@ pub static ENGLISH: Strings = Strings {
     transfers_remote_directory: "Remote directory",
     transfers_remote_path: "Remote path",
     transfers_protocol_label: "Protocol",
-    files_sftp_scp_hint: "Listing and managing a directory need SFTP. Copying a file still works with SCP: open Upload or Download, type the remote path yourself (for example ~/report.txt) and choose SCP.",
+    files_sftp_scp_hint: "Listing and managing a directory need SFTP. Copying a file still works with SCP: open Upload and type a remote directory (for example ~), or open Download and type the remote file (for example ~/report.txt), then choose SCP.",
     transfers_close_question: "Closing this session cancels its transfers",
     transfers_close_cancel: "Keep the session open",
     transfers_close_confirm: "Close and cancel",
@@ -1625,7 +1625,7 @@ pub static CHINESE: Strings = Strings {
     transfers_remote_directory: "远端目录",
     transfers_remote_path: "远端路径",
     transfers_protocol_label: "协议",
-    files_sftp_scp_hint: "目录列表与管理需要 SFTP。复制文件仍可用 SCP：打开“上传”或“下载”，手动输入远端路径（例如 ~/报告.txt）并选择 SCP。",
+    files_sftp_scp_hint: "目录列表与管理需要 SFTP。复制文件仍可用 SCP：打开“上传”并填写远端目录（例如 ~），或打开“下载”并填写远端文件（例如 ~/报告.txt），再选择 SCP。",
     transfers_close_question: "关闭这个会话会取消它的传输",
     transfers_close_cancel: "保持会话打开",
     transfers_close_confirm: "关闭并取消",
@@ -2815,5 +2815,28 @@ mod ux_tests {
     #[test]
     fn fill_replaces_every_placeholder() {
         assert_eq!(fill("{a} to {b}", &[("a", "x"), ("b", "y")]), "x to y");
+    }
+
+    #[test]
+    fn the_scp_hint_gives_each_direction_its_own_example() {
+        // Upload types a remote *directory* and Download types the remote *file*; one
+        // shared "~/report.txt" example would send the upload direction to a directory
+        // that is really a file, and the task would fail on a correctly written path.
+        assert!(
+            ENGLISH
+                .files_sftp_scp_hint
+                .contains("remote directory (for example ~)")
+        );
+        assert!(
+            ENGLISH
+                .files_sftp_scp_hint
+                .contains("remote file (for example ~/report.txt)")
+        );
+        assert!(CHINESE.files_sftp_scp_hint.contains("远端目录（例如 ~）"));
+        assert!(
+            CHINESE
+                .files_sftp_scp_hint
+                .contains("远端文件（例如 ~/报告.txt）")
+        );
     }
 }

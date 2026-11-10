@@ -8910,7 +8910,13 @@ impl ShelluneView {
                 move || panel_id.to_string()
             })
             .h_full()
-            .overflow_hidden()
+            // The pane is one slice tall at 200% text in the minimum window, and a
+            // failed read draws a card that is far taller than that slice. Clipping it
+            // would put the reason and the two typed-path entries below an edge nothing
+            // can reach, so the pane turns instead and each of them is reached by
+            // scrolling (R4). A listing fills the slice itself and scrolls inside its own
+            // box, so this one has nothing to turn until something does not fit.
+            .overflow_y_scroll()
             .track_focus(focus)
             .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _window, cx| {
                 if view.files_key(id, source, event, cx) {

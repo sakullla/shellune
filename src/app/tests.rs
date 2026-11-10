@@ -8790,6 +8790,89 @@ async fn a_server_without_sftp_says_so_and_offers_the_scp_copy_it_still_has(
 }
 
 #[gpui::test]
+async fn the_scp_path_on_a_failed_listing_is_reached_by_scrolling_the_pane(
+    cx: &mut TestAppContext,
+) {
+    // R4 measures this page in the minimum window at 200% text, where the file pane is
+    // one slice tall and the failed card is much taller than that slice. Its next step -
+    // the reason and the two typed-path entries - has to be reachable there, or the only
+    // way to copy a file from a server without SFTP is drawn past an edge nothing can
+    // reach.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    let channel = files.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(id, "web", "deploy@10.0.0.5:22", Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+    files.fail(
+        1,
+        shellune_core::BrowseFailure::Unavailable {
+            reason: "the server refused the sftp subsystem".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+
+    let viewport = minimum_window();
+    // The header's upload and download stay in the pane's own toolbar, so either
+    // direction can be started without turning anything.
+    for selector in ["files.upload", "files.download"] {
+        assert_within_width(bounds_of(cx, selector), viewport, selector);
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+    }
+    // The reason comes first, then the caption, then the two entries: each is reached by
+    // turning the pane down, and once reached it is inside the window rather than under a
+    // clipped edge.
+    scroll_fully_into_view(cx, "files.panel", "files.failure.reason");
+    let reason = bounds_of(cx, "files.failure.reason");
+    assert_within_width(reason, viewport, "files.failure.reason");
+    assert_fits_inside(reason, viewport, "files.failure.reason");
+
+    // The card is taller than the whole slice, which is why the pane has to turn: the
+    // caption's middle comes into the slice and the rest of the card is read by turning
+    // on.
+    scroll_into_view(cx, "files.panel", "files.failure.scp.hint");
+    let hint = bounds_of(cx, "files.failure.scp.hint");
+    let panel = bounds_of(cx, "files.panel");
+    let card = bounds_of(cx, "files.failure");
+    assert_within_width(hint, viewport, "files.failure.scp.hint");
+    assert!(
+        card.size.height > panel.size.height,
+        "the card is taller than the slice, so it is read by turning: {card:?} in {panel:?}"
+    );
+    let centre = hint.center();
+    assert!(
+        centre.y >= panel.origin.y - px(0.5)
+            && centre.y <= panel.origin.y + panel.size.height + px(0.5),
+        "the caption's middle is inside the pane once it is turned: {centre:?} in {panel:?}"
+    );
+
+    for selector in ["files.failure.scp.upload", "files.failure.scp.download"] {
+        scroll_fully_into_view(cx, "files.panel", selector);
+        let bounds = bounds_of(cx, selector);
+        assert_within_width(bounds, viewport, selector);
+        assert_fits_inside(bounds, viewport, selector);
+        assert_pointer_target(cx, selector);
+    }
+    // The pane is what turned, not a card drawn past an edge: its own header went up with
+    // the rest, so nothing in the card stays under the clip.
+    let header = bounds_of(cx, "files.header");
+    assert!(
+        header.origin.y < panel.origin.y,
+        "the pane scrolled its header out of the slice: {header:?} in {panel:?}"
+    );
+}
+
+#[gpui::test]
 async fn a_server_without_sftp_downloads_the_remote_path_the_user_types(cx: &mut TestAppContext) {
     // R10 asks for an upload *and* a download on a server that offers no SFTP. With no
     // listing there is no row to start a download from, so the typed remote path is the
@@ -16138,6 +16221,46 @@ async fn the_shortcut_command_dialog_stays_inside_the_minimum_window_at_200_perc
     }
 }
 
+/// Wheels a scrollable box by one line, with the pointer over the box.
+fn wheel_down(cx: &mut VisualTestContext, container: &'static str) {
+    let at = bounds_of(cx, container).center();
+    cx.simulate_mouse_move(at, None, Modifiers::default());
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Lines(point(0.0, -1.0)),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+}
+
+/// Wheels a scrollable box until `target` is wholly inside the part of it that is on
+/// screen.
+///
+/// A pane one slice tall can only show a card that is taller than itself, so "the whole
+/// control is reachable" means the wheel brings all of it into the box, not just its
+/// centre (R4).
+fn scroll_fully_into_view(
+    cx: &mut VisualTestContext,
+    container: &'static str,
+    target: &'static str,
+) {
+    for _ in 0..80 {
+        let outer = bounds_of(cx, container);
+        let bounds = bounds_of(cx, target);
+        let top = outer.origin.y - px(0.5);
+        let bottom = outer.origin.y + outer.size.height + px(0.5);
+        if bounds.origin.y >= top && bounds.origin.y + bounds.size.height <= bottom {
+            return;
+        }
+        assert!(
+            bounds.origin.y + bounds.size.height > top,
+            "{target} scrolled past {container} without ever being inside it"
+        );
+        wheel_down(cx, container);
+    }
+    panic!("{target} never fit inside {container}");
+}
+
 /// Wheels a scrollable box until the centre of `target` is inside the part of it that is
 /// on screen, the way a person scrolls down to a control below the fold.
 ///
@@ -16159,15 +16282,7 @@ fn scroll_into_view(cx: &mut VisualTestContext, container: &'static str, target:
             center.y >= outer.origin.y - px(0.5),
             "{target} scrolled past {container} without ever being inside it"
         );
-        // The wheel turns what the pointer is over, so the pointer is moved there first.
-        let at = outer.center();
-        cx.simulate_mouse_move(at, None, Modifiers::default());
-        cx.simulate_event(gpui::ScrollWheelEvent {
-            position: at,
-            delta: gpui::ScrollDelta::Lines(point(0.0, -1.0)),
-            ..Default::default()
-        });
-        cx.run_until_parked();
+        wheel_down(cx, container);
     }
     panic!("{target} never came into view inside {container}");
 }
