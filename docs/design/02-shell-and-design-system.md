@@ -521,24 +521,40 @@ Enter/Space 触发当前控件——与指针点击调用同一段代码，所�
 
 #### 2026-11-11 Windows 实窗
 
-这次构建的 Windows 窗口在界面文字 200% 下，由进程自己报出 `viewport_size=720x480`、`scale_factor=1.5`
-（同时报 `text_size=200%`）。客户区是 1080×720 物理像素，与 720×480 乘 1.5 一致。下面的图是这扇窗口的客户区，
-不是更早的走查图。设置页可以纵向滚动；卡片右缘到客户区右缘留着 96 物理像素，等于页边 `scale(32)` 再乘
-`scale_factor` 1.5，内容没有贴上窗口右缘。
+同一次进程在打开视口日志时，把下面四行原样写到 stdout。数字没有改过：
 
-- 主题分段「跟随系统 / 浅色 / 深色」整段都在卡片里，「跟随」没有被右缘切开。
+```
+shellune-viewport viewport_size=1120x720 scale_factor=1.5 text_size=100%
+shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=100%
+shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=115%
+shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
+```
+
+第一行是窗口刚出现时的视口。客户区随后被收成 1080×720 物理像素（该窗口 dpi 144），进程改报
+`viewport_size=720x480`、`scale_factor=1.5`。界面文字再调两档之后，同一行的 `text_size` 成为 `200%`，
+视口仍是 `720x480`。此后这个进程没有再打印别的视口行。下面每一张图都是这次进程的客户区，截图时客户区
+仍是 1080×720 物理像素。界面语言是英文。
+
+- 主题分段 System / Light / Dark 整段都在卡片里。
   ![主题分段](windows-720x480-200-settings-theme.png)
-- 终端配色「跟随应用 / 深色 / 浅色」同样完整。
-  ![终端配色](windows-720x480-200-settings-scheme.png)
-- 界面文字大小选中的是 200%，四个分段都完整。
+- 界面文字大小选中的是 200%，90% / 100% / 115% / 200% 四个分段都在卡片里。
   ![界面文字大小](windows-720x480-200-settings-text-size.png)
-- 默认 Shell 放不下一行时换到下一行：「Windows PowerShell」和「PowerShell 7」在第一行，「Command Prompt」
-  在第二行，名称没有在右缘被切开。
+- 终端配色 Match app / Dark / Light 整段都在卡片里。
+  ![终端配色](windows-720x480-200-settings-scheme.png)
+- 默认 Shell 换行：Windows PowerShell 与 PowerShell 7 在第一行，Command Prompt 在第二行，名称没有在右缘被切开。
   ![默认 Shell](windows-720x480-200-settings-shell.png)
-- 快捷键行里的搜索框、keycap（图中为 Ctrl+2）和「修改」「解除绑定」都在卡片内。
+- 快捷键区的搜索框、keycap（图中为 Ctrl+2）、Change 和 Unbind 都在卡片里。
   ![快捷键行](windows-720x480-200-settings-keys.png)
+- 本地 PowerShell 里搜索 HELLO，结果行是 `1 / 2`，终端里能看到 HELLO-SHELLUNE。
+  ![搜索结果](windows-720x480-200-search-results.png)
+- 全部标签对话框列出 Windows PowerShell 1 和 Windows PowerShell 2。
+  ![标签溢出](windows-720x480-200-tab-overflow.png)
+- 快捷命令对话框打开着，底部是 New shortcut command 和 Close。
+  ![快捷命令](windows-720x480-200-shortcut-commands.png)
+- 已连上的会话条下面是 X11 失败说明：下一步写着启动本机 X server 并让 DISPLAY 指向它，或改为不转发；原因一行是没有本地 X display，DISPLAY is not set。
+  ![X11 失败](windows-720x480-200-x11-failure.png)
 
-顶栏的搜索、设置和关闭也在这扇窗口里。macOS 与 Linux 没有实窗，上面不能当成那两端已经验收。
+同一次窗口里文件页出现了 Transfers 标题和计数 0。标题下面的行在 1080×720 客户区底边之外，没有看到失败原因或 Retry，所以这里没有传输失败图。macOS 没有实窗。Linux 上也没有把本应用窗口打开在一台机器的显示上；上面这些图只说明这扇 Windows 窗口。
 
 ### 输入框（`text_field.rs`）
 

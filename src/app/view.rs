@@ -11943,6 +11943,9 @@ impl Render for ShelluneView {
             }));
         }
         self.viewport_width = window.viewport_size().width;
+        // Opt-in only: a walkthrough can ask the process for its own viewport.
+        // A normal launch does not print.
+        log_viewport_for_walkthrough(window, zoom_percent(self.workspace.zoom()));
         // The palette is decided before anything is drawn: the user's choice, or the
         // system's when the choice is to follow it, which the window reports when it
         // changes.
@@ -12587,6 +12590,45 @@ fn zoom_percent(zoom: theme::Zoom) -> u16 {
         theme::Zoom::Comfortable => 115,
         theme::Zoom::Largest => 200,
     }
+}
+
+/// Prints one line when `SHELLUNE_LOG_VIEWPORT=1` and the measurement changes.
+///
+/// The line is this process's `viewport_size`, `scale_factor` and text size.
+/// It stays off unless that variable is set, so a normal launch is quiet.
+fn log_viewport_for_walkthrough(window: &Window, text_size_percent: u16) {
+    use std::sync::{Mutex, OnceLock};
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let enabled =
+        ENABLED.get_or_init(|| std::env::var("SHELLUNE_LOG_VIEWPORT").ok().as_deref() == Some("1"));
+    if !enabled {
+        return;
+    }
+    let size = window.viewport_size();
+    let width = size.width / px(1.0);
+    let height = size.height / px(1.0);
+    let scale = window.scale_factor();
+    let line = format!(
+        "shellune-viewport viewport_size={width}x{height} scale_factor={scale} text_size={text_size_percent}%"
+    );
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *last == line {
+        return;
+    }
+    *last = line.clone();
+    emit_viewport_line(&line);
+}
+
+fn emit_viewport_line(line: &str) {
+    use std::io::Write;
+    // Stdout and stderr only. Attaching the parent console would make closing
+    // that console terminate this window, so a walkthrough redirects these.
+    let _ = writeln!(std::io::stdout(), "{line}");
+    let _ = std::io::stdout().flush();
+    let _ = writeln!(std::io::stderr(), "{line}");
+    let _ = std::io::stderr().flush();
 }
 
 /// A scratch store, so a test that mounts the whole shell never reads or writes the
