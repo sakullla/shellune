@@ -18,9 +18,12 @@
 //! A display server that answers `xauth generate` and then refuses the authorization it
 //! issued cannot complete the restricted path: no remote program authenticates through
 //! it. Debian's Xvfb 21.1.16 is such a server (only what is in its own `-auth` file is
-//! accepted), so the restricted test asks the server first and prints that gap instead of
-//! claiming either way; the programs-reach-the-display check runs where the display does
-//! honour what it issues, and over the trusted credential here.
+//! accepted). The display is asked about that itself before the product is involved, and
+//! the two answers have to agree: where the display honours what it issues the restricted
+//! session must end as ready and a remote program must reach the display; where it does
+//! not, the product must report that refusal and must not claim a display it cannot
+//! forward to. The second case is what this host can measure; a restricted session that
+//! really shows a remote program therefore stays a printed gap here, never a pass.
 //!
 //! The disposable server, the display server and the environment variables the product
 //! reads (`DISPLAY`, `XAUTHORITY`, `PATH`) belong to the whole process, so the tests of
@@ -423,23 +426,23 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
     let mut session = connect(&server, X11Forwarding::Restricted);
     let started = wait_connected(&mut session);
     let status = wait_x11(&mut session, started.x11);
-    assert!(
-        matches!(status, X11Status::Ready { .. }),
-        "a server that allows X11 and a display that answers must end as ready, got {status:?}"
-    );
-
-    // The credential the local display issued is never the one the server is told: the
-    // remote programs get this session's own cookie and the bridge translates it.
-    write(&mut session, "xauth list 2>/dev/null");
-    let listed = wait_for_output(&mut session, "MIT-MAGIC-COOKIE-1", &started.output);
-    assert!(
-        !listed.contains(&own.cookie_hex),
-        "the remote authority file must not hold this machine's cookie"
-    );
-
     if honoured {
-        // The display accepts what it issues, so a remote program must reach it through
-        // the restricted credential.
+        // The display accepts what it issues, so the session forwards: ready, and the
+        // remote program really reaches the display through the restricted credential.
+        assert!(
+            matches!(status, X11Status::Ready { .. }),
+            "a server that allows X11 and a display that honours its own cookie must end as ready, got {status:?}"
+        );
+
+        // The credential the local display issued is never the one the server is told: the
+        // remote programs get this session's own cookie and the bridge translates it.
+        write(&mut session, "xauth list 2>/dev/null");
+        let listed = wait_for_output(&mut session, "MIT-MAGIC-COOKIE-1", &started.output);
+        assert!(
+            !listed.contains(&own.cookie_hex),
+            "the remote authority file must not hold this machine's cookie"
+        );
+
         write(&mut session, "xdpyinfo 2>&1 | head -2");
         let output = wait_for_output(&mut session, "version number", &listed);
         assert!(
@@ -447,14 +450,53 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
             "the remote program reached the display through the issued cookie: {output:?}"
         );
     } else {
+        // The display answers `xauth generate` and then refuses the authorization: the
+        // product has to say exactly that. Reporting a display that no remote program can
+        // use would be a pass on paper only.
+        match &status {
+            X11Status::Failed { reason, next_step } => {
+                assert!(
+                    reason.contains("refuses") && reason.to_lowercase().contains("restricted"),
+                    "the reason is the display's refusal of the cookie it issued: {reason}"
+                );
+                assert!(
+                    next_step.to_lowercase().contains("trusted"),
+                    "the next step offers the trusted mode as a choice: {next_step}"
+                );
+                assert!(
+                    next_step.contains("Xorg")
+                        || next_step.contains("XWayland")
+                        || next_step.contains("XQuartz"),
+                    "the next step names a display server that enforces the extension: {next_step}"
+                );
+            }
+            other => panic!(
+                "a display that refuses what it issues must be reported as a failure, not {other:?}"
+            ),
+        }
         eprintln!(
-            "GAP restricted X11 forwarding: this display server answers `xauth generate … \
-             untrusted` and then refuses the authorization it issued (measured on Debian's Xvfb \
-             21.1.16: the cookie works only once it is in the server's own -auth file), so no \
-             remote program can authenticate through the restricted mode on this server. What \
-             is checked here is the issuance, the key it is written under and the untouched \
-             authority file; a program reaching the display under the restricted mode is not \
-             claimed on this server."
+            "GAP restricted X11 forwarding: this display server registers the X11 SECURITY \
+             extension, answers `xauth generate … untrusted`, and then refuses the \
+             authorization it issued (measured here on Debian's Xvfb 21.1.16, and reproduced \
+             by the owner: the cookie is accepted only once it is in the server's own -auth \
+             file). A remote program therefore cannot reach this machine's display under the \
+             restricted mode on this server. What is checked here is the issuance, the key it \
+             is written under, the untouched authority file, and that the product reports the \
+             refusal instead of a display it cannot forward to. Restricted forwarding that \
+             really shows a remote program needs a display server that enforces the extension \
+             (Xorg, XWayland or XQuartz) and is a delivery gap here, not a pass."
+        );
+
+        // Nothing was requested of the server for X11, so the remote shell has no DISPLAY
+        // and the session is a plain SSH session that keeps working.
+        write(
+            &mut session,
+            "printf 'DISPLAY-%s-END\\n' \"${DISPLAY:-none}\"",
+        );
+        let output = wait_for_output(&mut session, "DISPLAY-none-END", &started.output);
+        assert!(
+            output.contains("DISPLAY-none-END"),
+            "a session that could not forward was given no remote DISPLAY: {output:?}"
         );
     }
 
@@ -743,14 +785,19 @@ fn a_server_that_forbids_x11_is_reported_and_the_shell_still_works() {
     let server = Harness::start_with_x11("x11-disabled", Harness::free_port(), X11Server::Disabled)
         .expect("the disposable server starts");
     let display = DisplayServer::start("x11-disabled").expect("the display server starts");
-    let xauth = display.xauth_path();
+    // The trusted mode, because the server is what this test is about: the restricted
+    // mode asks this machine's display for a restricted cookie first, and that check
+    // comes before the request is sent (this host's Xvfb refuses the cookies it issues).
+    // A refusal of the request itself is what is measured here, and the trusted mode is
+    // the one that reaches the server on every display.
+    let broken = display.broken_xauth_path();
     let _env = DisplayEnv::set(
         Some(&display.display()),
         Some(&display.authority()),
-        Some(&xauth),
+        Some(&broken),
     );
 
-    let mut session = connect(&server, X11Forwarding::Restricted);
+    let mut session = connect(&server, X11Forwarding::Trusted);
     let started = wait_connected(&mut session);
     match wait_x11(&mut session, started.x11) {
         X11Status::Failed { reason, next_step } => {
@@ -796,14 +843,17 @@ fn a_server_without_xauth_reports_that_cause_and_the_shell_still_works() {
             .expect("the disposable server starts");
 
     let display = DisplayServer::start("x11-noxauth").expect("the display server starts");
-    let xauth = display.xauth_path();
+    // The trusted mode again: the server's own preparation is the subject, and this
+    // host's display server refuses the restricted cookies it issues, which the product
+    // reports before any request is sent.
+    let broken = display.broken_xauth_path();
     let _env = DisplayEnv::set(
         Some(&display.display()),
         Some(&display.authority()),
-        Some(&xauth),
+        Some(&broken),
     );
 
-    let mut session = connect(&server, X11Forwarding::Restricted);
+    let mut session = connect(&server, X11Forwarding::Trusted);
     let started = wait_connected(&mut session);
     match wait_x11(&mut session, started.x11) {
         X11Status::Failed { reason, next_step } => {

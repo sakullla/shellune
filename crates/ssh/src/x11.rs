@@ -17,17 +17,24 @@
 //!   never written to;
 //!   [`X11Forwarding::Trusted`] presents the display's own cookie and therefore lifts
 //!   those limits, which is why the connection form asks again before each attempt;
+//! * an authorization the display issued is not taken as an authorization the display
+//!   accepts. Before a restricted session is reported ready, the cookie is presented to
+//!   the display once, with the same setup request the bridge sends, because a server
+//!   can register the SECURITY extension, answer `xauth generate` and still refuse what
+//!   it issued. Such a display gets a reason of its own instead of a forwarding status
+//!   that no remote program could live up to;
 //! * every inbound `x11` channel is bridged to the local display separately, so a
 //!   second program in the same session needs no second authentication;
 //! * closing the session first stops accepting channels and then drops the bridges, so
 //!   nothing is left listening or forwarding afterwards.
 //!
 //! A machine without a reachable display server, a display whose authority file holds
-//! no cookie, a display that cannot issue an untrusted cookie, and a server that
-//! refuses the request are different failures: each names itself and its next step,
-//! and none of them ends the SSH session, which keeps working without X11. A refusal
-//! is asked about once, on the same authenticated connection, so a server without
-//! `xauth` is told apart from a server that forbids forwarding.
+//! no cookie, a display that cannot issue an untrusted cookie, a display that refuses
+//! the one it issued, and a server that refuses the request are different failures: each
+//! names itself and its next step, and none of them ends the SSH session, which keeps
+//! working without X11. A refusal is asked about once, on the same authenticated
+//! connection, so a server without `xauth` is told apart from a server that forbids
+//! forwarding.
 
 use std::collections::VecDeque;
 use std::io;
@@ -74,6 +81,15 @@ const XAUTH_PATIENCE: Duration = Duration::from_secs(10);
 /// answer it in time leaves the refusal as the server stated it.
 const PROBE_PATIENCE: Duration = Duration::from_secs(5);
 
+/// How long the local display may take to answer one connection setup request.
+///
+/// The display is on this machine and was just reached, so a request that gets no answer
+/// in this time is a display that is not answering rather than a slow one.
+const SETUP_PATIENCE: Duration = Duration::from_secs(5);
+
+/// The status byte the X server answers a setup request it accepted with.
+const SETUP_ACCEPTED: u8 = 1;
+
 /// Why X11 forwarding could not be used.
 ///
 /// Each variant is a different thing to fix, which is why they are kept apart instead
@@ -105,6 +121,21 @@ pub enum X11Failure {
     /// than that, so a display that cannot issue one is a failure and not a fallback.
     NoUntrustedCookie {
         /// What went wrong while asking the display for one.
+        detail: String,
+    },
+    /// The display issued an untrusted cookie and then refused to accept it.
+    ///
+    /// Registering the X11 SECURITY extension is not the same as honouring the
+    /// authorizations it hands out: some servers answer `xauth generate`, register the
+    /// new authorization id, and accept only the entries of their own `-auth` file
+    /// (Debian's Xvfb 21.1.16 is one). Forwarding through such a cookie would be reported
+    /// as working while every remote program is turned away, so this is a failure of its
+    /// own. The way out is the trusted mode, which the user has to choose, or a display
+    /// server that enforces the extension.
+    RestrictedUnsupportedByDisplay {
+        /// The display that refused the authorization it issued.
+        display: String,
+        /// What the display answered.
         detail: String,
     },
     /// The server refused the forwarding request and has no usable `xauth`.
@@ -154,6 +185,10 @@ impl X11Failure {
                 "Install xauth so a restricted cookie can be created for this display, use a display server that supports the X11 SECURITY extension, or choose trusted forwarding and accept its risk. The SSH session itself is not affected."
                     .to_owned()
             }
+            Self::RestrictedUnsupportedByDisplay { .. } => {
+                "Choose trusted forwarding and accept its risk, or use a display server that enforces the X11 SECURITY extension (Xorg, XWayland or XQuartz). The SSH session itself is not affected."
+                    .to_owned()
+            }
             Self::RemoteWithoutXauth { .. } => {
                 "Install xauth on the server (or point its XAuthLocation at one that runs), then connect again. The SSH session itself is not affected."
                     .to_owned()
@@ -192,6 +227,10 @@ impl std::fmt::Display for X11Failure {
             Self::NoUntrustedCookie { detail } => write!(
                 formatter,
                 "no restricted X11 cookie could be obtained: {detail}"
+            ),
+            Self::RestrictedUnsupportedByDisplay { display, detail } => write!(
+                formatter,
+                "the X server for display {display} refuses the restricted authorization it issued: {detail}"
             ),
             Self::RemoteWithoutXauth { detail } => write!(
                 formatter,
@@ -389,6 +428,61 @@ impl Prepared {
         self.credential = credential;
         Ok(())
     }
+
+    /// Checks that the display accepts the credential this session would present.
+    ///
+    /// An authorization the display issued is not an authorization the display accepts:
+    /// a server can register the SECURITY extension, answer `xauth generate` with an id
+    /// and still accept only the entries of its own `-auth` file. Such a session would be
+    /// reported as ready and every remote program would then be turned away, with the
+    /// X server's own refusal in the user's terminal. So the credential is presented
+    /// once, with the same setup request the bridge sends, and the session only goes on
+    /// when the display accepts it.
+    ///
+    /// This asks for nothing and forwards nothing: one connection is opened, one setup
+    /// request is written, one status byte is read, and the connection is dropped. The
+    /// trusted mode needs no such check: its credential is the display's own cookie,
+    /// which this machine already uses to reach that display.
+    pub(crate) async fn confirm_restricted(&self) -> Result<(), X11Failure> {
+        let unreachable = |error: io::Error| X11Failure::DisplayUnreachable {
+            display: self.display.clone(),
+            detail: error.to_string(),
+        };
+        let mut local = open_display(&self.target).await.map_err(unreachable)?;
+        local
+            .write_all(&local_setup(&self.credential))
+            .await
+            .map_err(unreachable)?;
+        local.flush().await.map_err(unreachable)?;
+        let mut answer = [0u8; 1];
+        let read = tokio::time::timeout(SETUP_PATIENCE, local.read_exact(&mut answer)).await;
+        // The connection is this check's own; a program's session starts later, with a
+        // connection of its own, so nothing of it is kept here.
+        drop(local);
+        match read {
+            Ok(Ok(_)) if answer[0] == SETUP_ACCEPTED => Ok(()),
+            Ok(Ok(_)) => Err(X11Failure::RestrictedUnsupportedByDisplay {
+                display: self.display.clone(),
+                detail: format!(
+                    "the connection setup was answered with status {}, so the cookie is not accepted",
+                    answer[0]
+                ),
+            }),
+            Ok(Err(error)) => Err(X11Failure::RestrictedUnsupportedByDisplay {
+                display: self.display.clone(),
+                detail: format!(
+                    "the display closed the connection instead of answering the setup request: {error}"
+                ),
+            }),
+            Err(_) => Err(X11Failure::DisplayUnreachable {
+                display: self.display.clone(),
+                detail: format!(
+                    "the display did not answer a connection setup request within {}s",
+                    SETUP_PATIENCE.as_secs()
+                ),
+            }),
+        }
+    }
 }
 
 /// What registers an untrusted cookie with the local display and returns it.
@@ -412,15 +506,18 @@ pub(crate) fn prepare(mode: X11Forwarding) -> Result<Prepared, X11Failure> {
 
 /// Everything one enabled session needs before its request is sent.
 ///
-/// The two steps are in this order on purpose: a display that does not answer is
-/// reported as unreachable before this machine tries to ask it for a restricted cookie,
-/// and a display that cannot issue one is a failure of its own rather than a quiet
-/// fallback to the trusted credential.
+/// The steps are in this order on purpose: a display that does not answer is reported as
+/// unreachable before this machine tries to ask it for a restricted cookie, a display
+/// that cannot issue one is a failure of its own rather than a quiet fallback to the
+/// trusted credential, and a display that issues a cookie without accepting it is found
+/// out before the server is asked for anything, instead of in the terminal of the first
+/// remote program.
 pub(crate) async fn arm(mode: X11Forwarding) -> Result<Prepared, X11Failure> {
     let mut prepared = prepare(mode)?;
     prepared.reachable().await?;
     if mode == X11Forwarding::Restricted {
         prepared.restrict(issue_untrusted_cookie).await?;
+        prepared.confirm_restricted().await?;
     }
     Ok(prepared)
 }
@@ -1063,6 +1160,29 @@ fn push_u16(out: &mut Vec<u8>, value: usize, order: u8) {
 
 fn pad4(length: usize) -> usize {
     (length + 3) & !3
+}
+
+/// The setup request this bridge writes when it presents a credential to the display.
+///
+/// The same shape a remote program's own request is rewritten into ([`rewrite_setup`]),
+/// with the protocol this bridge speaks and this machine's `11.0`: asking the display
+/// with anything else would test a request no bridged program sends. The cookie is
+/// filled in by [`rewrite_setup`], which is the one place that writes it, so the check
+/// and the bridge cannot drift apart in length or padding.
+fn local_setup(credential: &[u8]) -> Vec<u8> {
+    let mut request = vec![b'l', 0];
+    request.extend_from_slice(&11u16.to_le_bytes());
+    request.extend_from_slice(&0u16.to_le_bytes());
+    push_u16(&mut request, AUTH_NAME.len(), b'l');
+    // The cookie length: `rewrite_setup` replaces both the length and the bytes.
+    push_u16(&mut request, 0, b'l');
+    request.extend_from_slice(&[0, 0]);
+    request.extend_from_slice(AUTH_NAME.as_bytes());
+    request.extend(std::iter::repeat_n(
+        0u8,
+        pad4(AUTH_NAME.len()) - AUTH_NAME.len(),
+    ));
+    rewrite_setup(&request, credential)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1887,6 +2007,134 @@ mod tests {
         );
     }
 
+    /// A stand-in X server that reads one connection setup request and answers it with
+    /// one status byte, the way a real one does before it sends the setup reply.
+    ///
+    /// The request it read is returned, so a test can check what the display was shown.
+    fn setup_answer(
+        listener: std::net::TcpListener,
+        status: u8,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("a connection to the display");
+            let mut header = [0u8; 12];
+            std::io::Read::read_exact(&mut stream, &mut header).expect("a setup header");
+            let name_len = usize::from(u16::from_le_bytes([header[6], header[7]]));
+            let data_len = usize::from(u16::from_le_bytes([header[8], header[9]]));
+            let mut body = vec![0u8; pad4(name_len) + pad4(data_len)];
+            std::io::Read::read_exact(&mut stream, &mut body).expect("a setup body");
+            stream.write_all(&[status]).expect("a status byte");
+            stream.flush().expect("a status byte");
+            let mut seen = header.to_vec();
+            seen.extend_from_slice(&body);
+            seen
+        })
+    }
+
+    /// A prepared session whose display is one this test started.
+    fn prepared_for_display(port: u16, credential: &[u8]) -> Prepared {
+        Prepared {
+            target: DisplayTarget::Tcp {
+                host: "127.0.0.1".to_owned(),
+                port,
+            },
+            screen: 0,
+            // The name is only used in messages; the port the test got is what is dialled.
+            display: "127.0.0.1:99".to_owned(),
+            authority: PathBuf::from("/tmp/shellune-test-Xauthority"),
+            credential: credential.to_vec(),
+            remote_cookie: "00".repeat(16),
+        }
+    }
+
+    #[test]
+    fn a_restricted_session_presents_its_issued_cookie_before_it_is_ready() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a test display");
+        let port = listener.local_addr().expect("an address").port();
+        let display = setup_answer(listener, SETUP_ACCEPTED);
+        let prepared = prepared_for_display(port, &ISSUED);
+
+        block_on(prepared.confirm_restricted()).expect("a display that accepts its own cookie");
+        let seen = display.join().expect("the stand-in display");
+        assert!(
+            seen.windows(ISSUED.len()).any(|window| window == ISSUED),
+            "the display is shown the cookie it issued, not another one"
+        );
+        // The request is the X11 one, complete, and describes exactly what it carries:
+        // a display reading it must find a whole setup request and nothing else.
+        assert_eq!(
+            setup_size(&seen),
+            Some(seen.len()),
+            "the display is given one complete setup request: {seen:?}"
+        );
+        assert_eq!(seen.first(), Some(&b'l'));
+        assert_eq!(
+            u16_at(&seen, 8, b'l'),
+            Some(u16::try_from(ISSUED.len()).expect("short")),
+            "the cookie length in the header is the cookie that follows"
+        );
+    }
+
+    #[test]
+    fn a_display_that_refuses_the_cookie_it_issued_is_not_reported_as_ready() {
+        // Debian's Xvfb 21.1.16 is such a server: it registers the SECURITY extension,
+        // answers `xauth generate`, and accepts only the entries of its own `-auth` file.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a test display");
+        let port = listener.local_addr().expect("an address").port();
+        let display = setup_answer(listener, 0);
+        let prepared = prepared_for_display(port, &ISSUED);
+
+        let failure = block_on(prepared.confirm_restricted())
+            .expect_err("a display that refuses its own cookie cannot forward for a session");
+        drop(display.join());
+        match &failure {
+            X11Failure::RestrictedUnsupportedByDisplay { display, detail } => {
+                assert_eq!(display, "127.0.0.1:99");
+                assert!(detail.contains("status 0"), "{detail}");
+            }
+            other => panic!("the failure must name the display's refusal, got {other:?}"),
+        }
+        let reason = failure.to_string();
+        assert!(reason.contains("refuses"), "{reason}");
+        assert!(reason.contains("restricted"), "{reason}");
+        // The way out is a choice the user makes, never a silent fallback, and one of
+        // them is a display server that really enforces the extension.
+        let next = failure.next_step();
+        assert!(next.to_lowercase().contains("trusted"), "{next}");
+        for server in ["Xorg", "XWayland", "XQuartz"] {
+            assert!(
+                next.contains(server),
+                "the next step names {server}: {next}"
+            );
+        }
+        assert!(
+            !reason.contains("ready"),
+            "nothing may present this as forwarding that works: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_display_that_goes_away_during_the_check_is_unreachable_and_not_a_refusal() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a test display");
+        let port = listener.local_addr().expect("an address").port();
+        // A display that takes the connection and then closes it without an answer is a
+        // display that is not doing its job, and saying so is different from saying its
+        // authorization was refused.
+        let display = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("a connection to the display");
+            drop(stream);
+        });
+        let prepared = prepared_for_display(port, &ISSUED);
+        let failure = block_on(prepared.confirm_restricted())
+            .expect_err("a display that answers nothing cannot be used");
+        display.join().expect("the stand-in display");
+        assert!(
+            matches!(&failure, X11Failure::RestrictedUnsupportedByDisplay { detail, .. }
+                if detail.contains("closed the connection")),
+            "{failure:?}"
+        );
+    }
+
     #[test]
     fn an_untrusted_cookie_is_the_one_entry_of_this_sessions_own_file() {
         // What the display writes for `generate <display> untrusted`: one entry, keyed
@@ -2187,6 +2435,10 @@ mod tests {
             },
             X11Failure::NoUntrustedCookie {
                 detail: "no xauth on PATH".to_owned(),
+            },
+            X11Failure::RestrictedUnsupportedByDisplay {
+                display: ":0".to_owned(),
+                detail: "the cookie was refused".to_owned(),
             },
             X11Failure::RemoteWithoutXauth {
                 detail: "no xauth was found".to_owned(),
