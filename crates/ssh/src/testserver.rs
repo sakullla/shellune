@@ -307,10 +307,10 @@ impl DisplayServer {
         }
         #[cfg(windows)]
         {
-            return in_linux(["test", "-x", "/usr/bin/Xvfb"])
+            in_linux(["test", "-x", "/usr/bin/Xvfb"])
                 .status()
                 .map(|status| status.success())
-                .unwrap_or(false);
+                .unwrap_or(false)
         }
         #[cfg(not(windows))]
         {
@@ -1114,10 +1114,10 @@ runuser -u '{user}' -- bash '{file}'",
     pub fn is_available() -> bool {
         #[cfg(windows)]
         {
-            return in_linux(["true"])
+            in_linux(["true"])
                 .status()
                 .map(|status| status.success())
-                .unwrap_or(false);
+                .unwrap_or(false)
         }
         // The harness adds a throw-away user, which a disposable sshd needs root for.
         #[cfg(not(windows))]
