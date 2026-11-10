@@ -17516,30 +17516,43 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
         boxed.size.height <= viewport.height * 0.45,
         "the notice took more than its share of the window: {boxed:?} in {viewport:?}"
     );
-    // The reason is the first block, so it is read without scrolling.
-    let reason_bounds = bounds_of(cx, "session.x11.reason");
-    assert_inside_box(reason_bounds, boxed, "the reason");
-    assert!(
-        reason_bounds.origin.y >= boxed.origin.y - px(0.5)
-            && reason_bounds.origin.y + reason_bounds.size.height
-                <= boxed.origin.y + boxed.size.height + px(0.5),
-        "the reason is not wholly inside the box before any scrolling: \
-         {reason_bounds:?} in {boxed:?}"
-    );
-    // The next step is the rest of the same text: it is reached by scrolling the box,
-    // which is what "inside the window, or reachable by explicit scrolling" means here.
-    scroll_fully_into_view(cx, "session.x11.notice.body", "session.x11.next");
+    // The next step opens the box, so it is the text this window shows before anyone
+    // scrolls — and this test never moved the pointer, so it is also the text a keyboard
+    // user reads. Scrolling this box takes a pointer, which is why the actionable text,
+    // not the diagnosis, is what the first screen holds (R4, R11).
     let next = bounds_of(cx, "session.x11.next");
-    assert_inside_box(
-        next,
-        bounds_of(cx, "session.x11.notice.body"),
-        "the next step",
-    );
-    let boxed = bounds_of(cx, "session.x11.notice.body");
+    assert_inside_box(next, boxed, "the next step");
+    let one_line = Metrics::new(Zoom::Largest).label_size();
+    // The banner's own padding is the only thing above it, so the next step is the first
+    // text in the box rather than something the reason was put in front of.
     assert!(
-        next.origin.y >= boxed.origin.y - px(0.5)
-            && next.origin.y + next.size.height <= boxed.origin.y + boxed.size.height + px(0.5),
-        "the next step is not wholly inside the box it was scrolled into: {next:?} in {boxed:?}"
+        next.origin.y - boxed.origin.y <= one_line,
+        "the next step does not open the notice box: {next:?} in {boxed:?}"
+    );
+    let reason_first = bounds_of(cx, "session.x11.reason");
+    assert!(
+        reason_first.origin.y >= next.origin.y + next.size.height - px(0.5),
+        "the reason is not placed after the next step: {reason_first:?} after {next:?}"
+    );
+    let first_screen = (boxed.origin.y + boxed.size.height).min(next.origin.y + next.size.height)
+        - next.origin.y.max(boxed.origin.y);
+    // What the direction itself costs is two or three lines; the first screen has to hold
+    // that much for the ordering to mean anything to a reader who cannot scroll.
+    assert!(
+        first_screen >= one_line * 4.0,
+        "the next step shows too little before any scrolling: \
+         {first_screen:?} of {one_line:?} per line in {boxed:?}"
+    );
+    // The reason is the rest of the same text: it is reached by scrolling the box, which
+    // is what "inside the window, or reachable by explicit scrolling" means here.
+    scroll_fully_into_view(cx, "session.x11.notice.body", "session.x11.reason");
+    let boxed = bounds_of(cx, "session.x11.notice.body");
+    let reason = bounds_of(cx, "session.x11.reason");
+    assert_inside_box(reason, boxed, "the reason");
+    assert!(
+        reason.origin.y >= boxed.origin.y - px(0.5)
+            && reason.origin.y + reason.size.height <= boxed.origin.y + boxed.size.height + px(0.5),
+        "the reason is not wholly inside the box it was scrolled into: {reason:?} in {boxed:?}"
     );
     // A bounded notice is only worth it if the session it belongs to is usable: the
     // terminal keeps a real height under it, and the actions still fit in the window.

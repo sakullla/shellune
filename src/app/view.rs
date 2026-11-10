@@ -11605,23 +11605,28 @@ impl ShelluneView {
     /// that is always there and readable without a pointer.
     fn x11_failure_banner(&self, reason: &str, next_step: &str, metrics: Metrics) -> Div {
         let strings = self.strings();
+        // The next step comes first, the reason after it. At the smallest window with the
+        // largest text the bounded box above cannot show the whole of both, and scrolling
+        // it takes a pointer: a keyboard user reads only what the first screen holds, so
+        // what they get there is what they can do about the failure (R4, R11). The reason
+        // follows whole and is reached by scrolling the box.
         components::banner(Tone::Danger, metrics)
             .debug_selector(|| "session.x11.notice".to_owned())
             .child(
                 div()
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .debug_selector(|| "session.x11.reason".to_owned())
-                    .child(SharedString::from(reason.to_owned())),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .debug_selector(|| "session.x11.next".to_owned())
                     .child(SharedString::from(format!(
                         "{}: {next_step}",
                         strings.next_step
                     ))),
+            )
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "session.x11.reason".to_owned())
+                    .child(SharedString::from(reason.to_owned())),
             )
     }
 

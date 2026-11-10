@@ -484,7 +484,10 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
              is written under, the untouched authority file, and that the product reports the \
              refusal instead of a display it cannot forward to. Restricted forwarding that \
              really shows a remote program needs a display server that enforces the extension \
-             (Xorg, XWayland or XQuartz) and is a delivery gap here, not a pass."
+             (Xorg, XWayland or XQuartz) and is a delivery gap here, not a pass. The \
+             disposition is recorded in docs/design/02-shell-and-design-system.md (X11 \
+             forwarding): the restricted mode's display-side acceptance is not passed, and \
+             the condition for it is that display server."
         );
 
         // Nothing was requested of the server for X11, so the remote shell has no DISPLAY
