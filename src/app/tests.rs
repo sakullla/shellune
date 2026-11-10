@@ -367,8 +367,34 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Largest
     );
+    let (metrics, theme_system, unbind_label) = cx.update(|_window, app| {
+        let workspace = view.read(app).workspace();
+        let locale = workspace.locale();
+        (
+            workspace.metrics(),
+            workspace.strings().theme_system,
+            copy::ux_for(locale).keys_unbind,
+        )
+    });
+    // The test font draws 「跟随系统」 near 100px. A real UI font at this text size is
+    // four ems plus the segment's padding, and the measured segment has to reserve
+    // that or the same label is cut off at the real window's right edge.
+    let theme_floor = crate::app::components::segment_reserved_width(theme_system, metrics);
+    let full_em = metrics.label_size() * 4.0 + metrics.scale(theme::spacing::TIGHT + 2.0) * 2.0;
+    assert!(
+        theme_floor + px(0.5) >= full_em,
+        "the theme floor {theme_floor:?} is below a full-em 「{theme_system}」 ({full_em:?})"
+    );
 
-    // Every card is inside the window before anything inside it is measured.
+    let content = bounds_of(cx, "content");
+    assert!(
+        content.size.width <= viewport.width + px(0.5),
+        "the settings scroll grew past the window: {content:?} in {viewport:?}"
+    );
+    let page_pad = metrics.scale(theme::spacing::LOOSE + 8.0);
+
+    // Every card is inside the window before anything inside it is measured, and it
+    // keeps the page padding instead of sitting flush with the right edge.
     for (card, name) in [
         ("settings.card.appearance", "the appearance card"),
         ("settings.card.terminal", "the terminal card"),
@@ -377,8 +403,19 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
         ("settings.card.data", "the data card"),
         ("settings.card.about", "the about card"),
     ] {
-        assert_within_width(bounds_of(cx, card), viewport, name);
+        let bounds = bounds_of(cx, card);
+        assert_within_width(bounds, viewport, name);
+        assert!(
+            bounds.origin.x + bounds.size.width <= viewport.width - page_pad + px(0.5),
+            "{name} reaches the window edge instead of keeping the page padding: {bounds:?}"
+        );
     }
+
+    let theme_segment = bounds_of(cx, "settings.theme.0");
+    assert!(
+        theme_segment.size.width + px(0.5) >= theme_floor,
+        "the theme segment is narrower than a full-em font would draw {theme_system:?}: {theme_segment:?}, floor {theme_floor:?}"
+    );
 
     // Each row, its control and each part of that control: inside the card. The segments
     // are listed one by one — a track that fits while one of its segments does not would
@@ -532,6 +569,12 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
             assert_inside_box(bounds_of(cx, part), keys_card, part);
         }
     }
+    let unbind_floor = crate::app::components::compact_label_reserved_width(unbind_label, metrics);
+    let unbind = bounds_of(cx, "settings.keys.unbind.terminal.copy");
+    assert!(
+        unbind.size.width + px(0.5) >= unbind_floor,
+        "the unbind control is narrower than a full-em font would draw {unbind_label:?}: {unbind:?}, floor {unbind_floor:?}"
+    );
 
     // The controls are not squeezed into stubs to make that fit: the two text-size
     // buttons keep the pointer target the rest of the page has (R4).
@@ -592,8 +635,18 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
         first.origin.y < later.origin.y,
         "the shells stayed on one line instead of wrapping: {first:?} and {later:?}"
     );
-    for selector in ["settings.shell.0", "settings.shell.1", "settings.shell.2"] {
+    let metrics = cx.update(|_window, app| view.read(app).workspace().metrics());
+    for (selector, name) in [
+        ("settings.shell.0", "Windows PowerShell (x86)"),
+        ("settings.shell.1", "PowerShell 7 Preview"),
+        ("settings.shell.2", "Command Prompt (Administrator)"),
+    ] {
         let bounds = bounds_of(cx, selector);
+        let floor = crate::app::components::segment_reserved_width(name, metrics);
+        assert!(
+            bounds.size.width + px(0.5) >= floor,
+            "{selector} is narrower than a real font would draw {name:?}: {bounds:?}, floor {floor:?}"
+        );
         assert!(
             bounds.origin.x >= track.origin.x - px(0.5)
                 && bounds.origin.x + bounds.size.width
@@ -640,6 +693,21 @@ async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window
     ] {
         assert_inside_box(bounds_of(cx, control), card, control);
     }
+    let (metrics, key_label) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (
+            view.workspace().metrics(),
+            view.keymap()
+                .label("terminal.copy")
+                .unwrap_or_else(|| "Ctrl+Alt+Shift+F12".to_owned()),
+        )
+    });
+    let keycap = bounds_of(cx, "settings.keys.keycap.terminal.copy.0");
+    let key_floor = crate::app::components::keycap_reserved_width(&key_label, metrics);
+    assert!(
+        keycap.size.width + px(0.5) >= key_floor,
+        "the keycap is narrower than a real font would draw {key_label:?}: {keycap:?}, floor {key_floor:?}"
+    );
     // The search field above the list is a control of the same page and stays inside the
     // card too.
     assert_inside_box(

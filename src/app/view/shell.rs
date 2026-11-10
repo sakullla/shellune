@@ -823,7 +823,10 @@ impl ShelluneView {
         let font = self.workspace.local_font_size();
         let font_control = div()
             .flex()
+            .flex_wrap()
             .items_center()
+            .min_w(px(0.0))
+            .max_w_full()
             .gap(metrics.scale(spacing::HAIRLINE))
             .child(
                 components::icon_button("A−", metrics)
@@ -870,6 +873,7 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
+            .min_w(px(0.0))
             .max_w(metrics.scale(760.0))
             .mx_auto()
             .px(metrics.scale(spacing::LOOSE + 8.0))
@@ -1017,15 +1021,24 @@ impl ShelluneView {
                         Locale::English => crate::app::product::TAGLINE_EN,
                         Locale::Chinese => crate::app::product::TAGLINE_ZH,
                     },
-                    div()
-                        .text_size(metrics.label_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .debug_selector(|| "status.version".to_owned())
-                        .child(SharedString::from(format!(
-                            "{} {}",
-                            ux.settings_version,
-                            self.version()
-                        ))),
+                    {
+                        // A bare text div stretches to the control column, and that
+                        // column's minimum is zero, so the line collapses and the
+                        // version wraps one glyph per row. The floor is the real-font
+                        // width, capped to the row, so it stays one line inside the card.
+                        let version = format!("{} {}", ux.settings_version, self.version());
+                        let reserved =
+                            components::reserved_text_width(&version, metrics.label_size())
+                                .min(components::settings_row_content_cap(metrics));
+                        div()
+                            .min_w(reserved)
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "status.version".to_owned())
+                            .child(SharedString::from(version))
+                    },
                 )],
             ));
 
@@ -1039,8 +1052,11 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_1()
+            .w_full()
+            .min_w(px(0.0))
             .min_h(px(0.0))
             .overflow_y_scroll()
+            .overflow_x_hidden()
             .bg(theme::swatch(palette::CANVAS))
             .child(page)
     }
@@ -1110,6 +1126,9 @@ impl ShelluneView {
         }
         rows.push(
             div()
+                .flex()
+                .w_full()
+                .min_w(px(0.0))
                 .px(metrics.scale(spacing::BASE))
                 .py(metrics.scale(spacing::TIGHT))
                 .debug_selector(|| "settings.keys.search".to_owned())
@@ -1212,7 +1231,14 @@ impl ShelluneView {
                 .gap(metrics.scale(spacing::HAIRLINE))
                 .children(labels.into_iter().enumerate().map(|(position, label)| {
                     let selector = format!("settings.keys.keycap.{action}.{position}");
+                    let reserved = components::keycap_reserved_width(&label, metrics);
                     components::keycap(SharedString::from(label), metrics)
+                        .min_w(reserved)
+                        .max_w_full()
+                        .flex_shrink()
+                        .whitespace_normal()
+                        .h(gpui::auto())
+                        .min_h(metrics.scale(18.0))
                         .debug_selector(move || selector.clone())
                 }))
                 .into_any_element()
@@ -1227,6 +1253,8 @@ impl ShelluneView {
         div()
             .debug_selector(move || selector.clone())
             .flex()
+            .w_full()
+            .min_w(px(0.0))
             .items_center()
             .justify_between()
             .flex_wrap()
@@ -1246,9 +1274,12 @@ impl ShelluneView {
                     .flex_col()
                     .flex_1()
                     .min_w(metrics.scale(180.0))
+                    .max_w_full()
                     .gap(metrics.scale(2.0))
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.0))
                             .text_size(metrics.body_size())
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -1256,6 +1287,8 @@ impl ShelluneView {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.0))
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(SharedString::from(format!(
@@ -1274,6 +1307,7 @@ impl ShelluneView {
                     .items_center()
                     .flex_wrap()
                     .min_w(px(0.0))
+                    .max_w_full()
                     .gap(metrics.scale(spacing::TIGHT))
                     .child(keys);
                 for (position, control) in controls.iter().copied().enumerate() {
@@ -1288,7 +1322,14 @@ impl ShelluneView {
                     // so the step between Change, Unbind and Restore is visible (R4).
                     let focused = ringed && position == cursor;
                     let selector = format!("settings.keys.{name}.{action}");
+                    let reserved = components::compact_label_reserved_width(label, metrics);
                     let button = components::compact_button(label, variant, metrics)
+                        .min_w(reserved)
+                        .max_w_full()
+                        .flex_shrink()
+                        .whitespace_normal()
+                        .h(gpui::auto())
+                        .min_h(metrics.compact_control_height())
                         .id(SharedString::from(selector.clone()))
                         .debug_selector(move || selector.clone())
                         .when(focused, |button| button.border_color(focus).bg(focus_fill))
@@ -1311,6 +1352,8 @@ impl ShelluneView {
         let count = self.keymap.custom_count();
         div()
             .flex()
+            .w_full()
+            .min_w(px(0.0))
             .items_center()
             .justify_between()
             .flex_wrap()
@@ -1319,6 +1362,8 @@ impl ShelluneView {
             .py(metrics.scale(spacing::TIGHT))
             .child(
                 div()
+                    .min_w(px(0.0))
+                    .max_w_full()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .debug_selector(|| "settings.keys.count".to_owned())
@@ -1328,6 +1373,15 @@ impl ShelluneView {
             )
             .child(
                 components::compact_button(ux.keys_reset_all, Variant::Secondary, metrics)
+                    .min_w(components::compact_label_reserved_width(
+                        ux.keys_reset_all,
+                        metrics,
+                    ))
+                    .max_w_full()
+                    .flex_shrink()
+                    .whitespace_normal()
+                    .h(gpui::auto())
+                    .min_h(metrics.compact_control_height())
                     .id("settings.keys.reset_all")
                     .debug_selector(|| "settings.keys.reset_all".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {
@@ -1461,6 +1515,8 @@ impl ShelluneView {
         let mut card = div()
             .flex()
             .flex_col()
+            .w_full()
+            .min_w(px(0.0))
             .rounded(px(radius::LARGE))
             .bg(theme::swatch(palette::SURFACE))
             .border_1()
@@ -1475,6 +1531,8 @@ impl ShelluneView {
         div()
             .flex()
             .flex_col()
+            .w_full()
+            .min_w(px(0.0))
             .gap(metrics.scale(spacing::TIGHT))
             .child(components::section_label(title, metrics))
             .child(card)
@@ -1482,12 +1540,11 @@ impl ShelluneView {
 
     /// One settings row: the label and its hint on the left, the control on the right.
     ///
-    /// The row wraps, and the control's column may shrink below the control's own
-    /// width, so a control that does not fit beside its label moves under the label and
-    /// a control wider than the row wraps inside itself. Nothing is drawn past the card
-    /// it sits in — and the card is inside the window — because the settings page scrolls
-    /// only downwards, so a control past the card's right edge has no scroll that could
-    /// bring it back (R4, 720×480 at 200% text).
+    /// The row is at most as wide as the card. Its label keeps a floor, and the control
+    /// is at most the row, so a control that does not fit beside the label moves under
+    /// it and a control wider than the row wraps inside itself. The page scrolls only
+    /// downwards: a control past the card's right edge has no scroll that could bring
+    /// it back (R4, 720×480 at 200% text).
     fn settings_row(
         &self,
         id: &'static str,
@@ -1498,6 +1555,8 @@ impl ShelluneView {
         let metrics = self.metrics();
         div()
             .flex()
+            .w_full()
+            .min_w(px(0.0))
             .items_center()
             .justify_between()
             .flex_wrap()
@@ -1511,9 +1570,12 @@ impl ShelluneView {
                     .flex_col()
                     .flex_1()
                     .min_w(metrics.scale(200.0))
+                    .max_w_full()
                     .gap(metrics.scale(2.0))
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.0))
                             .text_size(metrics.body_size())
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -1522,13 +1584,20 @@ impl ShelluneView {
                     .when(!hint.is_empty(), |column| {
                         column.child(
                             div()
+                                .w_full()
+                                .min_w(px(0.0))
                                 .text_size(metrics.caption_size())
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
                                 .child(hint),
                         )
                     }),
             )
-            .child(div().flex().flex_col().min_w(px(0.0)).child(control))
+            .child(
+                // No max width here: a percentage max is cyclic with the row and
+                // collapses a text control to nothing. The row is already at most
+                // the card, and each control caps itself.
+                div().flex().flex_col().min_w(px(0.0)).child(control),
+            )
     }
 
     /// A segmented control whose segments call `pick` with their index.
@@ -1543,8 +1612,15 @@ impl ShelluneView {
         let mut control = components::segmented(metrics).debug_selector(move || id.to_owned());
         for (index, (label, selected)) in options.into_iter().enumerate() {
             let pick = pick.clone();
+            let reserved = components::segment_reserved_width(&label, metrics);
             control = control.child(
                 components::segment(label, selected, metrics)
+                    .min_w(reserved)
+                    .max_w_full()
+                    .flex_shrink()
+                    .whitespace_normal()
+                    .h(gpui::auto())
+                    .min_h(metrics.compact_control_height())
                     .id(SharedString::from(format!("{id}.{index}")))
                     .debug_selector(move || format!("{id}.{index}"))
                     .on_click(cx.listener(move |this, _event, _window, cx| {

@@ -10,7 +10,9 @@
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{Animation, AnimationExt, AnyElement, AnyView, App, Div, SharedString, Window, div, px};
+use gpui::{
+    Animation, AnimationExt, AnyElement, AnyView, App, Div, Pixels, SharedString, Window, div, px,
+};
 
 use crate::app::icons::{self, Icon};
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
@@ -365,26 +367,105 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
 
 /// The track a row of [`segment`]s sits in.
 ///
-/// The track is narrower than its content when it has to be: a zero minimum width and
-/// `flex_wrap` let the column that holds it squeeze it to the line, and the segments then
-/// take a second line inside the track instead of hanging over its edge. Without that, a
-/// track of long names (a shell called "Command Prompt (Administrator)") would be drawn
-/// past the card and past the window's right edge at 200% text in the minimum window,
-/// where neither the pointer nor a horizontal scroll can reach it (R4). A segment itself
-/// stays whole, so the track gains a line rather than cutting a label.
+/// The track shrinks to its column and wraps. `flex_none` would keep it at the sum of its
+/// segments: the settings scroller's horizontal overflow is visible, so that sum becomes
+/// the scroller's minimum width, the row grows past the window, and `flex_wrap` never
+/// sees a definite line to wrap on. The test font draws CJK narrower than the DirectWrite
+/// font the window uses, so the same track stays inside the test window and still paints
+/// past the real window's right edge (R4, 720×480 at 200% text).
 pub fn segmented(metrics: Metrics) -> Div {
     div()
         .flex()
-        .flex_none()
+        .flex_shrink()
         .flex_wrap()
         .items_center()
         .min_w(px(0.0))
+        .max_w_full()
         .gap(metrics.scale(2.0))
         .p(metrics.scale(3.0))
         .rounded(px(radius::MEDIUM + 1.0))
         .bg(theme::swatch(palette::CANVAS))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
+}
+
+/// Em widths reserved so a label is at least as wide as a UI font, not the test font.
+///
+/// Wide glyphs (CJK, fullwidth forms) take a full em. Other glyphs take a little over
+/// half an em, which covers Segoe-like Latin without exceeding the settings row: a floor
+/// wider than the row beats `max_w_full` and the control paints past the card.
+const WIDE_EM: f32 = 1.0;
+const NARROW_EM: f32 = 0.55;
+
+fn is_wide_glyph(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{1100}'..='\u{115F}'
+            | '\u{2329}'..='\u{232A}'
+            | '\u{2E80}'..='\u{A4CF}'
+            | '\u{AC00}'..='\u{D7A3}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE10}'..='\u{FE19}'
+            | '\u{FE30}'..='\u{FE6F}'
+            | '\u{FF00}'..='\u{FF60}'
+            | '\u{FFE0}'..='\u{FFE6}'
+            | '\u{1F300}'..='\u{1F64F}'
+            | '\u{1F900}'..='\u{1F9FF}'
+            | '\u{20000}'..='\u{3FFFD}'
+    )
+}
+
+/// Width to reserve for `text` at `text_size`, in logical pixels.
+pub(crate) fn reserved_text_width(text: &str, text_size: Pixels) -> Pixels {
+    let units = text
+        .chars()
+        .map(|ch| {
+            if is_wide_glyph(ch) {
+                WIDE_EM
+            } else {
+                NARROW_EM
+            }
+        })
+        .sum::<f32>();
+    text_size * units
+}
+
+/// Inner width of a settings row at the minimum window for this zoom.
+///
+/// The page keeps `scale(32)` on each side and the row keeps `scale(16)`. A control
+/// floor wider than what remains cannot sit inside the card.
+pub(crate) fn settings_row_content_cap(metrics: Metrics) -> Pixels {
+    let window = px(crate::app::MIN_WINDOW_SIZE.0);
+    let page_pad = metrics.scale(spacing::LOOSE + 8.0) * 2.0;
+    let row_pad = metrics.scale(spacing::BASE) * 2.0;
+    window - page_pad - row_pad
+}
+
+/// Border-box floor for one [`segment`], capped so it still fits in the track.
+pub(crate) fn segment_reserved_width(label: &str, metrics: Metrics) -> Pixels {
+    let text = reserved_text_width(label, metrics.label_size());
+    let padding = metrics.scale(spacing::TIGHT + 2.0) * 2.0;
+    let border = px(2.0);
+    let track_pad = metrics.scale(3.0) * 2.0;
+    let track_border = px(2.0);
+    let cap = settings_row_content_cap(metrics) - track_pad - track_border;
+    (text + padding + border).min(cap)
+}
+
+/// Border-box floor for a [`compact_button`] label.
+pub(crate) fn compact_label_reserved_width(label: &str, metrics: Metrics) -> Pixels {
+    let text = reserved_text_width(label, metrics.caption_size());
+    let padding = metrics.scale(spacing::TIGHT + 2.0) * 2.0;
+    let border = px(2.0);
+    (text + padding + border).min(settings_row_content_cap(metrics))
+}
+
+/// Border-box floor for a [`keycap`].
+pub(crate) fn keycap_reserved_width(label: &str, metrics: Metrics) -> Pixels {
+    let text = reserved_text_width(label, metrics.scale(10.5));
+    let padding = metrics.scale(5.0) * 2.0;
+    let border = px(2.0);
+    (text + padding + border).min(settings_row_content_cap(metrics))
 }
 
 /// A short uppercase-style label above a group of controls.
