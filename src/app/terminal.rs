@@ -2685,7 +2685,8 @@ impl TerminalPane {
     /// Exactly one note is drawn beside the query — position and total, an empty
     /// result, or the reason an expression could not be read — so "nothing matched"
     /// and "this pattern is broken" never look alike, and an empty query says
-    /// neither (R1).
+    /// neither (R1). Each note is a sentence: it may shrink and wrap onto its own
+    /// line instead of running past the pane (R4).
     fn search_bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
         let strings = self.locale.strings();
         let empty_query = self.search_query.is_empty();
@@ -2694,11 +2695,17 @@ impl TerminalPane {
         } else {
             self.search_query.clone()
         };
+        // The count, the empty result and the invalid-expression reason are whole
+        // sentences. The reason for `a{2,1}` is wider than one pane of a sideways
+        // split (354 px at the minimum window). A note that cannot shrink is drawn
+        // past that pane's right edge, and the pane's `overflow_hidden` clips the
+        // end of the reason where it cannot be read (R4). The line may be narrower
+        // than its words and wraps there, the same way the key hint does.
         let note = match self.search_note() {
             SearchNote::Silent => None,
             SearchNote::Position { position, total } => Some(
                 div()
-                    .flex_none()
+                    .min_w(px(0.0))
                     .debug_selector(|| "terminal.search.position".to_owned())
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
@@ -2706,7 +2713,7 @@ impl TerminalPane {
             ),
             SearchNote::Empty => Some(
                 div()
-                    .flex_none()
+                    .min_w(px(0.0))
                     .debug_selector(|| "terminal.search.empty".to_owned())
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(shell_palette::TEXT_MUTED))
@@ -2714,7 +2721,7 @@ impl TerminalPane {
             ),
             SearchNote::Invalid(reason) => Some(
                 div()
-                    .flex_none()
+                    .min_w(px(0.0))
                     .debug_selector(|| "terminal.search.error".to_owned())
                     .text_size(metrics.caption_size())
                     .text_color(Tone::Danger.text())

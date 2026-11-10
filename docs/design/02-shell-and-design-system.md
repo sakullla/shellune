@@ -129,10 +129,13 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 条按窗格宽度排布，不按窗口：一行放不下就换行（`flex_wrap`），按钮与开关保持整块不拆字，查询框至少留 80 px，
 键位提示这类整句文字可以先被压窄、再在自己的行里换行——它比一个窗格还宽（英文提示约 509 px），
 在最小窗口横向分栏时（每格 354 px，条内 336 px）若不允许收缩就会被画到窗格右缘之外，关闭键的说明也跟着看不见。
+计数、空结果和非法正则原因是同一类整句，同一条规则：可以先被压窄，再在自己的行里换行。
+`a{2,1}` 的原因（重复次数的起点大于终点）比分栏后的窗格宽；钉成 `flex_none` 时尾部画出窗格右缘，被窗格的 `overflow_hidden` 裁掉。
 条所在的命令块面板最高 180 px（按文字大小上限 260 px），内容更高时在面板内纵向滚动，关闭与两个开关因此始终可达。
 最小窗口 720×480 + 200% 文字（中英文）与分栏窗格下，条的全部部件都在窗口与所在面板/窗格内，由
 `src/app/tests.rs` 的 `the_find_bar_stays_inside_the_window_at_two_hundred_percent`、
-`the_find_bar_narrows_with_the_pane_instead_of_leaving_it` 与 `a_find_bar_in_a_split_pane_stays_inside_its_pane`
+`the_find_bar_narrows_with_the_pane_instead_of_leaving_it`、`a_find_bar_in_a_split_pane_stays_inside_its_pane`
+与 `a_broken_expression_reason_wraps_inside_the_narrow_pane`
 按测量到的 bounds 锁定。
 
 键盘：搜索条持有键盘时 Enter 下一处、Shift+Enter 上一处（两端循环）、Backspace 编辑查询、Alt+C 切换区分大小写、

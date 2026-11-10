@@ -3143,6 +3143,71 @@ async fn the_find_bar_narrows_with_the_pane_instead_of_leaving_it(cx: &mut TestA
     );
 }
 
+/// The reason under a broken expression, in a pane as narrow as one half of the
+/// minimum window.
+///
+/// A sideways split of 720 px gives each pane 354 px (the divider takes 12). The
+/// engine's reason for `a{2,1}` — the start of a repetition is past its end — is a
+/// sentence wider than that pane. The count, the empty result and that reason are
+/// the three notes beside the query; a note that cannot shrink is drawn past the
+/// pane's right edge, and the pane clips it, so the end of the reason cannot be
+/// read (R4). This measures the same width as
+/// [the_find_bar_narrows_with_the_pane_instead_of_leaving_it], which is the width a
+/// real split pane has. The boxes are the test window's `debug_bounds`, not a
+/// Windows, macOS or Linux walkthrough.
+#[gpui::test]
+async fn a_broken_expression_reason_wraps_inside_the_narrow_pane(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("needle\r\nother", cx);
+    cx.simulate_resize(size(px(354.0), px(392.0)));
+    cx.run_until_parked();
+    click(cx, "terminal.search");
+    cx.simulate_keystrokes("alt-r");
+    cx.simulate_input("a{2,1}");
+    cx.run_until_parked();
+
+    let note = search_state_of(&pane, cx).note;
+    let SearchNote::Invalid(reason) = &note else {
+        panic!(
+            "a repetition whose start is past its end is an invalid expression, not a count: {note:?}"
+        );
+    };
+    assert!(
+        reason.contains("the start must be <= the end"),
+        "the bar is showing the engine's reason, whose tail is what a narrow pane used to clip: {reason}"
+    );
+    let before = cx.update(|_window, app| pane.read(app).visible_text());
+    assert!(
+        before.iter().any(|line| line.contains("needle")),
+        "a broken expression must not clear the grid: {before:?}"
+    );
+
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let bar = bounds_of(cx, "terminal.search.bar");
+    let query = bounds_of(cx, "terminal.search.query");
+    let error = bounds_of(cx, "terminal.search.error");
+    assert_fits_inside(bar, viewport, "terminal.search.bar");
+    assert_fits_inside(error, viewport, "terminal.search.error");
+    assert_inside_box(error, bar, "the invalid-expression reason");
+    assert!(
+        error.size.width <= bar.size.width + px(0.5),
+        "the reason is drawn past the bar: {error:?} vs {bar:?}"
+    );
+    assert!(
+        error.size.height > query.size.height,
+        "the reason stayed on one line and ran past the pane: {error:?} vs {query:?}"
+    );
+    for selector in [
+        "terminal.search.close",
+        "terminal.search.case",
+        "terminal.search.regex",
+        "terminal.search.previous",
+        "terminal.search.next",
+    ] {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+        assert_inside_box(bounds_of(cx, selector), bar, selector);
+    }
+}
+
 /// The same bar inside a real sideways split of the minimum window.
 ///
 /// [the_find_bar_narrows_with_the_pane_instead_of_leaving_it] measures the width a split
