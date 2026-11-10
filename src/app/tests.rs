@@ -2917,6 +2917,183 @@ async fn a_resize_recounts_the_matches_on_the_new_wrap(cx: &mut TestAppContext) 
     );
 }
 
+/// The measured parts of the find bar, plus the bar itself.
+///
+/// Each is a box the walkthrough would have to reach with a pointer: the query and the
+/// count are read, the switches and the two arrows are pressed, and the last one closes
+/// the bar (R1, R4).
+const FIND_BAR_PARTS: [&str; 8] = [
+    "terminal.search.query",
+    "terminal.search.keys",
+    "terminal.search.previous",
+    "terminal.search.next",
+    "terminal.search.case",
+    "terminal.search.regex",
+    "terminal.search.close",
+    "terminal.search.bar",
+];
+
+/// The find bar at the size the walkthrough measures it: the minimum window in the
+/// largest text, with the session drawn inside the window rather than the pane alone.
+///
+/// The bar hangs over the grid at the bottom of the pane, so every part of it has to be
+/// inside the window and inside the panel it belongs to. A part drawn past either edge
+/// is drawn past the window where neither the pointer nor a scroll can bring it back
+/// (R4); this test reads the boxes instead of the drawing, so a squeezed part still has
+/// to be inside them.
+#[gpui::test]
+async fn the_find_bar_stays_inside_the_window_at_two_hundred_percent(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the session has a terminal");
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|window, _app| window.viewport_size()),
+        minimum_window(),
+        "the bar is not being measured at the minimum window"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
+
+    click(cx, "terminal.search");
+    cx.simulate_input("ready");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        },
+        "the bar has something to count at this size"
+    );
+
+    // Both languages: the words on the bar are the widest thing in it, and the count and
+    // the switches have to share whatever the Chinese labels leave them.
+    for locale in [Locale::English, Locale::Chinese] {
+        if locale == Locale::Chinese {
+            cx.dispatch_action(ToggleLanguage);
+            cx.run_until_parked();
+            assert_eq!(
+                cx.update(|_window, app| view.read(app).workspace().locale()),
+                Locale::Chinese
+            );
+        }
+        let viewport = cx.update(|window, _app| window.viewport_size());
+        let panel = bounds_of(cx, "content");
+        assert!(
+            cx.debug_bounds("terminal.search.position").is_some(),
+            "the count is drawn in {locale:?}"
+        );
+        for selector in FIND_BAR_PARTS {
+            let bounds = bounds_of(cx, selector);
+            assert_fits_inside(bounds, viewport, selector);
+            assert_inside_box(bounds, panel, selector);
+        }
+    }
+
+    // And it is still a bar, not just a drawing of one: its close button answers at this
+    // size and hands the keys back to the terminal.
+    click(cx, "terminal.search.close");
+    cx.run_until_parked();
+    let closed = search_state_of(&pane, cx);
+    assert!(!closed.open, "the close button closed the bar: {closed:?}");
+    assert!(!closed.focused, "the terminal has the keys again");
+}
+
+/// The bar in one pane of a sideways split of the minimum window.
+///
+/// At that size the sidebar is an icon strip and the two panes share the 720 px: each
+/// pane is 354 px wide with the 12 px divider between them, so the bar inside one is
+/// 336 px wide. The line naming the keys is wider than that on its own, so it takes a
+/// line of its own and wraps there instead of running past the pane's right edge, where
+/// the rest of it — including the key that closes the bar — would be unreadable (R4).
+/// The size is the measured pane box, not a guess; the split test below measures the
+/// same bar inside a real split.
+#[gpui::test]
+async fn the_find_bar_narrows_with_the_pane_instead_of_leaving_it(cx: &mut TestAppContext) {
+    let (_pane, cx) = pane_with("needle line\r\nother", cx);
+    cx.simulate_resize(size(px(354.0), px(392.0)));
+    cx.run_until_parked();
+    click(cx, "terminal.search");
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let bar = bounds_of(cx, "terminal.search.bar");
+    let query = bounds_of(cx, "terminal.search.query");
+    let hint = bounds_of(cx, "terminal.search.keys");
+    assert!(
+        hint.size.width <= bar.size.width + px(0.5),
+        "the key hint is drawn past the bar: {hint:?} vs {bar:?}"
+    );
+    assert!(
+        hint.size.height > query.size.height,
+        "the hint kept one line where there is no room for one: {hint:?} vs {query:?}"
+    );
+    for selector in FIND_BAR_PARTS {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+    }
+    assert!(
+        cx.debug_bounds("terminal.search.position").is_some(),
+        "the count is drawn in the narrow pane too"
+    );
+}
+
+/// The same bar inside a real sideways split of the minimum window.
+///
+/// [the_find_bar_narrows_with_the_pane_instead_of_leaving_it] measures the width a split
+/// pane has; this one takes it from the window, so the two sizes cannot drift apart: the
+/// bar and every part of it stays inside the pane it belongs to and inside the window.
+#[gpui::test]
+async fn a_find_bar_in_a_split_pane_stays_inside_its_pane(cx: &mut TestAppContext) {
+    let Some((view, cx, _left, right)) = split_tab(cx) else {
+        // No shell to start: nothing is measured here, and a skip is not a pass.
+        return;
+    };
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(right).cloned())
+        .expect("the split has two terminals");
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    feed_session(cx, &view, right, b"needle line\r\n");
+
+    cx.dispatch_action(crate::app::actions::TerminalSearch);
+    cx.run_until_parked();
+    assert!(
+        search_state_of(&pane, cx).open,
+        "the keys opened the bar in the pane they were typed in"
+    );
+    cx.simulate_input("needle");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        }
+    );
+
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let frame = bounds_of(cx, "pane.active");
+    assert!(
+        frame.size.width < px(400.0),
+        "the split really shares the window: {frame:?}"
+    );
+    for selector in FIND_BAR_PARTS {
+        let bounds = bounds_of(cx, selector);
+        assert_fits_inside(bounds, viewport, selector);
+        assert_inside_box(bounds, frame, selector);
+    }
+}
+
 #[gpui::test]
 async fn chinese_text_is_sent_as_utf8_and_composition_is_not_sent_early(cx: &mut TestAppContext) {
     let (pane, cx) = pane_with("", cx);

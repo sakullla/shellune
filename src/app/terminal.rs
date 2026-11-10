@@ -2784,9 +2784,15 @@ impl TerminalPane {
             );
         // Which keys do what, or — once the terminal has the keyboard again — the one
         // thing the reader needs to know before typing: their keys go to the shell.
+        //
+        // The line is allowed to be narrower than its words: in a pane of a split tab
+        // (354 px at the minimum window) it is wider than the whole bar, and a line that
+        // could not shrink would be drawn past the pane's edge, where the rest of it —
+        // including the key that closes the bar — cannot be read or scrolled to (R4).
+        // It takes its own line and wraps there instead; the buttons stay whole.
         bar = bar.child(
             div()
-                .flex_none()
+                .min_w(px(0.0))
                 .debug_selector(move || {
                     if focused {
                         "terminal.search.keys".to_owned()
