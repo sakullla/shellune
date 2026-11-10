@@ -311,39 +311,199 @@ async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
     }
 }
 
-/// At the minimum window with the largest text, every settings row keeps its control
-/// inside the row and the row inside the window (R4).
+/// At the minimum window with the largest text, every settings row, every control in it
+/// and every part of that control stays inside its card, and every card inside the
+/// window (R4).
 ///
-/// This is the size the delivery walkthrough found the page overflowing in: a label and
-/// its control no longer share one line, and the control has to sit under the label
-/// instead of being drawn past the window's right edge, which the settings page — it
-/// scrolls downwards only — could not reach.
+/// The card is the box the walkthrough measured: a control drawn past the card's right
+/// edge is drawn past the window too, and the settings page — it scrolls downwards only —
+/// cannot bring it back. Rows wrap and wide controls wrap inside themselves, so nothing
+/// is cut off; this test reads the measured boxes rather than the drawing, so a control
+/// that is squeezed to a stub still has to be inside the box it belongs to.
 #[gpui::test]
-async fn every_settings_row_stays_inside_the_minimum_window_at_two_hundred_percent(
+async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_percent(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     show_settings_at_the_minimum_window_in_large_text(&view, cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
+    // The size this test claims to measure: the smallest window the app allows, in
+    // logical pixels. A window that came out larger would make every assertion below
+    // pass while the real minimum window still overflowed.
+    assert_eq!(
+        viewport,
+        minimum_window(),
+        "the settings page is not being measured at the minimum window"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
 
-    for (row, control) in [
-        ("settings.row.theme", "settings.theme"),
-        ("settings.row.language", "settings.language"),
-        ("settings.row.text-size", "settings.zoom"),
-        ("settings.row.motion", "settings.motion"),
-        ("settings.row.scheme", "settings.scheme"),
-        ("settings.row.font-size", "settings.font.less"),
-        ("settings.row.font-size", "settings.font.value"),
-        ("settings.row.font-size", "settings.font.more"),
-        ("settings.row.default-shell", "settings.shell"),
-        ("settings.row.bell-notice", "settings.notice.bell"),
-        ("settings.row.finished-notice", "settings.notice.finished"),
-        ("settings.row.hosts-file", "settings.paths"),
-        ("settings.row.import", "settings.import"),
-        ("settings.row.about", "status.version"),
+    // Every card is inside the window before anything inside it is measured.
+    for (card, name) in [
+        ("settings.card.appearance", "the appearance card"),
+        ("settings.card.terminal", "the terminal card"),
+        ("settings.card.notices", "the notices card"),
+        ("settings.card.keys", "the shortcut card"),
+        ("settings.card.data", "the data card"),
+        ("settings.card.about", "the about card"),
     ] {
-        assert_inside_its_row(cx, viewport, row, control);
+        assert_within_width(bounds_of(cx, card), viewport, name);
+    }
+
+    // Each row, its control and each part of that control: inside the card. The segments
+    // are listed one by one — a track that fits while one of its segments does not would
+    // still put that segment past the card's edge (the walkthrough measured a segment,
+    // not the track).
+    for (card, row, track, segments) in [
+        (
+            "settings.card.appearance",
+            "settings.row.theme",
+            "settings.theme",
+            &["settings.theme.0", "settings.theme.1", "settings.theme.2"][..],
+        ),
+        (
+            "settings.card.appearance",
+            "settings.row.language",
+            "settings.language",
+            &["settings.language.0", "settings.language.1"][..],
+        ),
+        (
+            "settings.card.appearance",
+            "settings.row.text-size",
+            "settings.zoom",
+            &[
+                "settings.zoom.0",
+                "settings.zoom.1",
+                "settings.zoom.2",
+                "settings.zoom.3",
+            ][..],
+        ),
+        (
+            "settings.card.appearance",
+            "settings.row.motion",
+            "settings.motion",
+            &["settings.motion.0", "settings.motion.1"][..],
+        ),
+        (
+            "settings.card.terminal",
+            "settings.row.scheme",
+            "settings.scheme",
+            &[
+                "settings.scheme.0",
+                "settings.scheme.1",
+                "settings.scheme.2",
+            ][..],
+        ),
+        (
+            "settings.card.terminal",
+            "settings.row.default-shell",
+            "settings.shell",
+            &["settings.shell.0"][..],
+        ),
+        (
+            "settings.card.notices",
+            "settings.row.bell-notice",
+            "settings.notice.bell",
+            &["settings.notice.bell.0", "settings.notice.bell.1"][..],
+        ),
+        (
+            "settings.card.notices",
+            "settings.row.finished-notice",
+            "settings.notice.finished",
+            &["settings.notice.finished.0", "settings.notice.finished.1"][..],
+        ),
+    ] {
+        let card_bounds = bounds_of(cx, card);
+        let row_bounds = bounds_of(cx, row);
+        assert_inside_box(row_bounds, card_bounds, row);
+        let track_bounds = bounds_of(cx, track);
+        assert_inside_box(track_bounds, card_bounds, track);
+        for segment in segments {
+            assert_inside_box(bounds_of(cx, segment), card_bounds, segment);
+        }
+    }
+
+    // The controls that are not a segmented track are rows of their own: the two
+    // text-size buttons, the font size between them, the file path and the import
+    // button.
+    for (card, row, control) in [
+        (
+            "settings.card.terminal",
+            "settings.row.font-size",
+            "settings.font.less",
+        ),
+        (
+            "settings.card.terminal",
+            "settings.row.font-size",
+            "settings.font.value",
+        ),
+        (
+            "settings.card.terminal",
+            "settings.row.font-size",
+            "settings.font.more",
+        ),
+        (
+            "settings.card.data",
+            "settings.row.hosts-file",
+            "settings.paths",
+        ),
+        (
+            "settings.card.data",
+            "settings.row.import",
+            "settings.import",
+        ),
+        (
+            "settings.card.about",
+            "settings.row.about",
+            "status.version",
+        ),
+    ] {
+        let card_bounds = bounds_of(cx, card);
+        assert_inside_box(bounds_of(cx, row), card_bounds, row);
+        assert_inside_box(bounds_of(cx, control), card_bounds, control);
+    }
+
+    // The shortcut list: its search field, a row and that row's key and buttons are all
+    // inside the shortcut card. The rest of the list is the same row built again.
+    let keys_card = bounds_of(cx, "settings.card.keys");
+    assert_inside_box(
+        bounds_of(cx, "settings.keys.search"),
+        keys_card,
+        "the search field",
+    );
+    for (row, parts) in [
+        (
+            "settings.keys.row.terminal.search",
+            &[
+                "settings.keys.keycap.terminal.search.0",
+                "settings.keys.change.terminal.search",
+                "settings.keys.unbind.terminal.search",
+            ][..],
+        ),
+        (
+            "settings.keys.row.terminal.copy",
+            &[
+                "settings.keys.keycap.terminal.copy.0",
+                "settings.keys.change.terminal.copy",
+                "settings.keys.unbind.terminal.copy",
+            ][..],
+        ),
+        (
+            "settings.keys.row.palette.open",
+            &[
+                "settings.keys.keycap.palette.open.0",
+                "settings.keys.change.palette.open",
+                "settings.keys.unbind.palette.open",
+            ][..],
+        ),
+    ] {
+        assert_inside_box(bounds_of(cx, row), keys_card, row);
+        for part in parts {
+            assert_inside_box(bounds_of(cx, part), keys_card, part);
+        }
     }
 
     // The controls are not squeezed into stubs to make that fit: the two text-size
@@ -379,10 +539,12 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
     show_settings_at_the_minimum_window_in_large_text(&view, cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
 
+    let card = bounds_of(cx, "settings.card.terminal");
+    assert_within_width(card, viewport, "the terminal card");
     let row = bounds_of(cx, "settings.row.default-shell");
-    assert_within_width(row, viewport, "the default-shell row");
+    assert_inside_box(row, card, "the default-shell row");
     let track = bounds_of(cx, "settings.shell");
-    assert_within_width(track, viewport, "the default-shell choice");
+    assert_inside_box(track, card, "the default-shell choice");
     assert!(
         track.origin.x >= row.origin.x - px(0.5)
             && track.origin.x + track.size.width <= row.origin.x + row.size.width + px(0.5),
@@ -394,7 +556,9 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
     );
 
     // So the shells gain a line inside the same track: the first shell is on the first
-    // line and a later one below it, both inside the row.
+    // line and a later one below it, all of them inside the track and the card. Each
+    // segment is measured on its own: the track being inside the card says nothing about
+    // a segment that hangs over its edge.
     let first = bounds_of(cx, "settings.shell.0");
     let later = bounds_of(cx, "settings.shell.1");
     assert!(
@@ -409,6 +573,7 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
                     <= track.origin.x + track.size.width + px(0.5),
             "{selector} leaves the choice it belongs to: {bounds:?} in {track:?}"
         );
+        assert_inside_box(bounds, card, selector);
     }
 }
 
@@ -435,7 +600,10 @@ async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window
     show_settings_at_the_minimum_window_in_large_text(&view, cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
 
+    let card = bounds_of(cx, "settings.card.keys");
+    assert_within_width(card, viewport, "the shortcut card");
     let row = "settings.keys.row.terminal.copy";
+    assert_inside_box(bounds_of(cx, row), card, row);
     for control in [
         "settings.keys.keycap.terminal.copy.0",
         "settings.keys.change.terminal.copy",
@@ -443,40 +611,35 @@ async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window
         // The combination differs from the default, so this row also offers to go back.
         "settings.keys.reset.terminal.copy",
     ] {
-        assert_inside_its_row(cx, viewport, row, control);
+        assert_inside_box(bounds_of(cx, control), card, control);
     }
     // The search field above the list is a control of the same page and stays inside the
     // card too.
-    assert_within_width(
+    assert_inside_box(
         bounds_of(cx, "settings.keys.search"),
-        viewport,
+        card,
         "the search field",
     );
 }
 
-/// Asserts one control stays inside the row it belongs to, and that row inside the
-/// window it is drawn in.
+/// Asserts one measured box stays inside another one, on the left and on the right.
 ///
 /// A settings page that scrolls downwards only cannot reach a control drawn past the
-/// window's right edge, so the row is the outermost place a control may sit (R4).
-fn assert_inside_its_row(
-    cx: &mut VisualTestContext,
-    viewport: Size<Pixels>,
-    row: &'static str,
-    control: &'static str,
-) {
-    let row_bounds = bounds_of(cx, row);
-    assert_within_width(row_bounds, viewport, row);
-    let bounds = bounds_of(cx, control);
-    assert_within_width(bounds, viewport, control);
+/// card it belongs to, and the card itself cannot leave the window (R4). Both are
+/// measured boxes, so this catches a control that overflowed its row, and a row that
+/// overflowed its card, without either being clipped on the way.
+fn assert_inside_box(inner: gpui::Bounds<Pixels>, outer: gpui::Bounds<Pixels>, what: &str) {
     assert!(
-        bounds.origin.x >= row_bounds.origin.x - px(0.5),
-        "{control} starts left of its row: {bounds:?} in {row_bounds:?}"
+        inner.size.width > px(0.0),
+        "{what} was measured with an empty box: {inner:?}"
     );
     assert!(
-        bounds.origin.x + bounds.size.width
-            <= row_bounds.origin.x + row_bounds.size.width + px(0.5),
-        "{control} leaves its row on the right: {bounds:?} in {row_bounds:?}"
+        inner.origin.x >= outer.origin.x - px(0.5),
+        "{what} starts left of the box it belongs to: {inner:?} in {outer:?}"
+    );
+    assert!(
+        inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + px(0.5),
+        "{what} leaves the box it belongs to on the right: {inner:?} in {outer:?}"
     );
 }
 

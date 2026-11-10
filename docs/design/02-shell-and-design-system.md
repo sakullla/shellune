@@ -402,24 +402,35 @@ macOS 的 ⌘F 是系统通用"查找"，没有 shell 程序读它，所以直�
 ### 大文字与最小窗口（720×480、200%）
 
 界面文字大小最大为 200%，窗口最小为 720×480 逻辑像素，两者同时成立时一行放不下"标题 + 说明 + 右对齐控件"。
-设置页因此只有纵向滚动，横向必须靠换行容纳，不能靠裁切：被画到窗口右缘之外的行内控件既点不到，也没有横向
+设置页因此只有纵向滚动，横向必须靠换行容纳，不能靠裁切：被画到**卡片**右缘之外的行内控件既点不到，也没有横向
 滚动条把它找回来。
 
 - **设置行**（`view/shell.rs::settings_row`）：标题列最小 200（随缩放，200% 时 400），控件列可以收缩到比控件自身
   宽度更窄（`min_w(0)`，不再是 `flex_none`）。一行放不下时整个控件换到标题下面一行，此时控件列占满行宽；
   行本身始终在卡片内，卡片始终在窗口内。
-- **分段控件**（`components::segmented`）与**快捷键行**（`settings_keys_row`）：轨道与"按键 + 修改/解除绑定/恢复默认"
-  这一组都可以收缩，内部按 `flex_wrap` 换行。单个分段（Shell 名称、200% 等）和单个 keycap 保持完整不被截断，
-  多出来的换到轨道内的下一行，所以"默认 Shell"这类名称很长的分段在 200% 下会变成两行，而不是把轨道推出窗口。
+- **分段控件**（`components::segmented`）与**快捷键行**（`settings_keys_row`）：轨道可以窄于自身内容（`min_w(0)`），
+  外面那层可收缩的列把它压到行宽，内部再按 `flex_wrap` 换行。单个分段（Shell 名称、200% 等）和单个 keycap
+  保持完整不被截断，多出来的换到轨道内的下一行，所以"默认 Shell"这类名称很长的分段在 200% 下会变成两行，
+  而不是把轨道推出卡片。
 - **快捷键行**：名称列最小 180（随缩放），按键与三个操作按钮作为一组整体换行，因此长组合键（如
-  `Ctrl+Alt+Shift+F12`）不会把按钮挤出窗口。
+  `Ctrl+Alt+Shift+F12`）不会把按钮挤出卡片。
 - 新增设置行或行内控件时沿用这三条：控件外面不要再套 `flex_none` 容器；可能比行宽的内容自带 `flex_wrap` 与
   `min_w(0)`；控件仍按 `Metrics::hit_target()` 等因素绘制，不靠缩小命中区换取宽度。
 - 该约束由三处测试锁定（`src/app/tests.rs`，均为 720×480、200%、中文）：
-  `every_settings_row_stays_inside_the_minimum_window_at_two_hundred_percent`（每行控件都在行内且在窗口内）、
-  `a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_percent`（比行宽的控件在行内换行）、
-  `the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window`（长组合键下按键与按钮都在行内）。
-  测试读的是实测 bounds，不使用被裁切后的旧值。
+  `every_settings_row_and_control_stays_inside_its_card_at_two_hundred_percent`（每行、每个控件、以及分段控件里的
+  每一个分段都在所属卡片内，卡片在窗口内）、
+  `a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_percent`（比行宽的控件在行内换行，每个分段
+  仍在卡片内）、`the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window`（长组合键下 keycap 与
+  三个按钮都在卡片内）。测试读的是实测 bounds（卡片有 `settings.card.<id>` 选择器），不使用被裁切后的旧值。
+
+#### 走查时怎么确定窗口真的是 720×480
+
+720×480 是**逻辑**像素。Windows 在 150% 缩放下客户区要设成 1080×720 **物理**像素；应用内
+`window.viewport_size()` 报 `720x480`、`scale_factor()` 报 `1.5` 才算对上了最小窗口。非 DPI 感知的工具（未调用
+`SetProcessDPIAware` 或等价 API）把 `1080×720` 当成逻辑像素，得到的是 1080×720 逻辑像素的窗口（物理 1620×1080），
+比最小窗口大 2.25 倍；再把它裁成 1095×729 的截图，右侧控件看起来就像"越过了窗口右缘"，其实只是截图被裁掉，
+控件仍在卡片内。走查记录请同时写下 `viewport_size` / `scale_factor` 的证据（或使用 DPI 感知工具），不要只凭截图
+判断右缘。
 
 ### 输入框（`text_field.rs`）
 

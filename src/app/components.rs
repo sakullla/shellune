@@ -365,11 +365,13 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
 
 /// The track a row of [`segment`]s sits in.
 ///
-/// The track shrinks and wraps instead of leaving its container: at 200% text in the
-/// minimum window a row of segments is wider than the line it sits on, and a control
-/// that could not shrink would be drawn past the window's right edge where neither the
-/// pointer nor a horizontal scroll can reach it (R4). A segment itself stays whole, so
-/// the track gains a line rather than cutting a label.
+/// The track is narrower than its content when it has to be: a zero minimum width and
+/// `flex_wrap` let the column that holds it squeeze it to the line, and the segments then
+/// take a second line inside the track instead of hanging over its edge. Without that, a
+/// track of long names (a shell called "Command Prompt (Administrator)") would be drawn
+/// past the card and past the window's right edge at 200% text in the minimum window,
+/// where neither the pointer nor a horizontal scroll can reach it (R4). A segment itself
+/// stays whole, so the track gains a line rather than cutting a label.
 pub fn segmented(metrics: Metrics) -> Div {
     div()
         .flex()

@@ -897,6 +897,7 @@ impl ShelluneView {
                     ),
             )
             .child(self.settings_group(
+                "appearance",
                 ux.settings_appearance,
                 vec![
                     self.settings_row(
@@ -926,6 +927,7 @@ impl ShelluneView {
                 ],
             ))
             .child(self.settings_group(
+                "terminal",
                 ux.settings_terminal,
                 vec![
                     self.settings_row(
@@ -949,6 +951,7 @@ impl ShelluneView {
                 ],
             ))
             .child(self.settings_group(
+                "notices",
                 ux.settings_notices,
                 vec![
                     self.settings_row(
@@ -967,6 +970,7 @@ impl ShelluneView {
             ))
             .child(self.settings_keys_group(cx))
             .child(self.settings_group(
+                "data",
                 ux.settings_data,
                 vec![
                     self.settings_row(
@@ -1004,6 +1008,7 @@ impl ShelluneView {
                 ],
             ))
             .child(self.settings_group(
+                "about",
                 ux.settings_about,
                 vec![self.settings_row(
                     "about",
@@ -1138,7 +1143,7 @@ impl ShelluneView {
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(ux.settings_keys_hint),
             )
-            .child(self.settings_group(ux.settings_keys, rows))
+            .child(self.settings_group("keys", ux.settings_keys, rows))
     }
 
     /// A tone-carrying line inside the shortcut card: why the saved keys were not
@@ -1262,7 +1267,7 @@ impl ShelluneView {
             .child({
                 // The keys and their three controls wrap as a group of their own: when
                 // the name column leaves no room on the line, the group takes the next
-                // line instead of pushing its controls past the window's right edge
+                // line instead of pushing its controls past the card's right edge
                 // (R4, 720×480 at 200% text).
                 let mut group = div()
                     .flex()
@@ -1446,7 +1451,11 @@ impl ShelluneView {
     }
 
     /// A titled group of settings rows inside one card.
-    fn settings_group(&self, title: &'static str, rows: Vec<Div>) -> Div {
+    ///
+    /// `id` names the card in measurements: a row, and every control in it, has to stay
+    /// inside the card's own box — the card is what the window clips nothing of, so a
+    /// control drawn past it is drawn past the window as well (R4, 720×480 at 200%).
+    fn settings_group(&self, id: &'static str, title: &'static str, rows: Vec<Div>) -> Div {
         let metrics = self.metrics();
         let count = rows.len();
         let mut card = div()
@@ -1455,7 +1464,8 @@ impl ShelluneView {
             .rounded(px(radius::LARGE))
             .bg(theme::swatch(palette::SURFACE))
             .border_1()
-            .border_color(theme::swatch(palette::BORDER));
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(move || format!("settings.card.{id}"));
         for (index, row) in rows.into_iter().enumerate() {
             card = card.child(row.when(index + 1 < count, |row| {
                 row.border_b_1()
@@ -1474,9 +1484,10 @@ impl ShelluneView {
     ///
     /// The row wraps, and the control's column may shrink below the control's own
     /// width, so a control that does not fit beside its label moves under the label and
-    /// a control wider than the row wraps inside itself. Nothing is drawn past the
-    /// window's right edge, where the settings page — which scrolls only downwards —
-    /// would put it out of reach (R4, 720×480 at 200% text).
+    /// a control wider than the row wraps inside itself. Nothing is drawn past the card
+    /// it sits in — and the card is inside the window — because the settings page scrolls
+    /// only downwards, so a control past the card's right edge has no scroll that could
+    /// bring it back (R4, 720×480 at 200% text).
     fn settings_row(
         &self,
         id: &'static str,
