@@ -16125,6 +16125,245 @@ async fn the_shortcut_command_dialog_stays_inside_the_minimum_window_at_200_perc
     ] {
         assert_within_width(bounds_of(cx, selector), viewport, selector);
     }
+    // The editor is taller than the body at this text size, so its fields and the button
+    // that saves them are reached by scrolling the body rather than clipped by it.
+    for selector in [
+        "snippet.editor.name",
+        "snippet.editor.body",
+        "snippet.editor.save",
+    ] {
+        scroll_into_view(cx, "snippets.dialog.body", selector);
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+        assert_pointer_target(cx, selector);
+    }
+}
+
+/// Wheels a scrollable box until the centre of `target` is inside the part of it that is
+/// on screen, the way a person scrolls down to a control below the fold.
+///
+/// In the minimum window at 200% text a dialog shows one slice of its body, so where an
+/// element was laid out says nothing about whether anyone can reach it (R4): the question
+/// is whether scrolling reaches it, and this is that question asked of the drawing itself.
+fn scroll_into_view(cx: &mut VisualTestContext, container: &'static str, target: &'static str) {
+    for _ in 0..80 {
+        let outer = bounds_of(cx, container);
+        let center = bounds_of(cx, target).center();
+        let inside_y = center.y >= outer.origin.y - px(0.5)
+            && center.y <= outer.origin.y + outer.size.height + px(0.5);
+        let inside_x = center.x >= outer.origin.x - px(0.5)
+            && center.x <= outer.origin.x + outer.size.width + px(0.5);
+        if inside_x && inside_y {
+            return;
+        }
+        assert!(
+            center.y >= outer.origin.y - px(0.5),
+            "{target} scrolled past {container} without ever being inside it"
+        );
+        // The wheel turns what the pointer is over, so the pointer is moved there first.
+        let at = outer.center();
+        cx.simulate_mouse_move(at, None, Modifiers::default());
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Lines(point(0.0, -1.0)),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    }
+    panic!("{target} never came into view inside {container}");
+}
+
+#[gpui::test]
+async fn a_saved_command_row_keeps_a_readable_preview_and_reaches_its_buttons_at_200_percent(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippet-reached");
+    seed_snippet(
+        &dir,
+        "a rather long name for a saved command",
+        "cargo fmt\ncargo test --workspace",
+    );
+    let (view, cx) = snippet_view(cx, &dir);
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(false, cx));
+    });
+    cx.run_until_parked();
+
+    let metrics = Metrics::new(cx.update(|_window, app| view.read(app).workspace().zoom()));
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    // The row is one line of name and one line of body, not a column of single
+    // characters: at this text size the four action labels are wider than the row, and a
+    // name that is allowed to wrap instead is squeezed to a few pixels and drawn one
+    // character per line — a 2716 px row inside a 119 px body.
+    let row = bounds_of(cx, "snippet.row.0");
+    let preview = bounds_of(cx, "snippet.preview.0");
+    assert_within_width(row, viewport, "the row");
+    assert!(
+        preview.size.width >= metrics.scale(120.0),
+        "the body preview keeps a readable part of the row: {preview:?}"
+    );
+    assert!(
+        preview.size.height <= metrics.caption_size() * 2.0,
+        "the preview is one line of text rather than a ribbon of characters: {preview:?}"
+    );
+    assert!(
+        row.size.height <= metrics.scale(140.0),
+        "one saved command stays a row, not a column taller than the dialog: {row:?}"
+    );
+
+    // Every action of the row is on the card, and the ones below the fold are reached by
+    // scrolling the body rather than lost.
+    let dialog = bounds_of(cx, "snippets.dialog");
+    for selector in [
+        "snippet.insert.0",
+        "snippet.run.0",
+        "snippet.edit.0",
+        "snippet.delete.0",
+    ] {
+        assert_inside_horizontally(bounds_of(cx, selector), dialog, selector);
+        assert_pointer_target(cx, selector);
+    }
+
+    // The same holds in Chinese, where the four labels are full-width words.
+    cx.dispatch_action(ToggleLanguage);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese,
+        "the row is measured in Chinese too"
+    );
+    let preview = bounds_of(cx, "snippet.preview.0");
+    assert!(
+        preview.size.width >= metrics.scale(120.0),
+        "the preview keeps its part of the row in Chinese: {preview:?}"
+    );
+    assert!(
+        preview.size.height <= metrics.caption_size() * 2.0,
+        "the preview stays one line in Chinese: {preview:?}"
+    );
+    for selector in [
+        "snippet.insert.0",
+        "snippet.run.0",
+        "snippet.edit.0",
+        "snippet.delete.0",
+    ] {
+        assert_inside_horizontally(bounds_of(cx, selector), dialog, selector);
+        assert_pointer_target(cx, selector);
+    }
+
+    scroll_into_view(cx, "snippets.dialog.body", "snippet.delete.0");
+    assert_fits_inside(
+        bounds_of(cx, "snippet.delete.0"),
+        viewport,
+        "the delete button once scrolled to",
+    );
+
+    // The question it opens is reached the same way, and its answer is a real one.
+    click(cx, "snippet.delete.0");
+    assert!(
+        cx.debug_bounds("snippet.delete.question").is_some(),
+        "opening the question draws it"
+    );
+    scroll_into_view(cx, "snippets.dialog.body", "snippet.delete.no");
+    for selector in ["snippet.delete.yes", "snippet.delete.no"] {
+        assert_inside_horizontally(bounds_of(cx, selector), dialog, selector);
+        assert_pointer_target(cx, selector);
+    }
+    click(cx, "snippet.delete.no");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).snippets().snippets().len()),
+        1,
+        "answering no keeps the command in the library"
+    );
+}
+
+#[gpui::test]
+async fn the_palette_reaches_the_saved_command_rows_in_the_minimum_window_at_200_percent(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippet-palette");
+    seed_snippet(
+        &dir,
+        "deploy the release",
+        "cargo fmt\ncargo test --workspace",
+    );
+    let (view, cx) = snippet_view(cx, &dir);
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    go(cx, crate::app::actions::OpenPalette);
+    cx.run_until_parked();
+
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let palette = bounds_of(cx, "palette");
+    assert_fits_inside(palette, viewport, "the palette");
+
+    // The palette is longer than its list box at this text size. The rows below the fold
+    // are reached by scrolling the list, and the panel itself does not move or grow while
+    // they are: a panel that left the window would take the list with it (R4).
+    let entries = cx.update(|_window, app| view.read(app).palette_titles());
+    assert!(
+        entries.len() > 3,
+        "the palette has more entries than its box shows: {entries:?}"
+    );
+    let last_selector: &'static str =
+        Box::leak(format!("palette.item.{}", entries.len() - 1).into_boxed_str());
+    scroll_into_view(cx, "palette.list", last_selector);
+    let list = bounds_of(cx, "palette.list");
+    let last = bounds_of(cx, last_selector);
+    assert_inside_horizontally(last, palette, last_selector);
+    assert!(
+        last.center().y >= list.origin.y - px(0.5)
+            && last.center().y <= list.origin.y + list.size.height + px(0.5),
+        "the last row was scrolled into the list's own box: {last:?} in {list:?}"
+    );
+    assert_fits_inside(
+        bounds_of(cx, "palette"),
+        viewport,
+        "the palette after scrolling",
+    );
+
+    // Searching by the command's name leaves the pair the palette offers for it — type it,
+    // or run it — and both rows are drawn inside the list's box rather than clipped by it.
+    cx.simulate_input("deploy");
+    cx.run_until_parked();
+    let titles = cx.update(|_window, app| view.read(app).palette_titles());
+    assert_eq!(
+        titles.len(),
+        2,
+        "the saved command is found by its name: {titles:?}"
+    );
+    assert!(
+        titles
+            .iter()
+            .all(|title| title.contains("deploy the release")),
+        "both entries name the command they are about: {titles:?}"
+    );
+    let list = bounds_of(cx, "palette.list");
+    for index in 0..titles.len() {
+        let selector: &'static str = Box::leak(format!("palette.item.{index}").into_boxed_str());
+        let row = bounds_of(cx, selector);
+        assert_inside_horizontally(row, palette, selector);
+        assert!(
+            row.origin.y >= list.origin.y - px(0.5)
+                && row.origin.y + row.size.height <= list.origin.y + list.size.height + px(0.5),
+            "the row of the saved command is inside the list's box: {row:?} in {list:?}"
+        );
+    }
 }
 
 #[gpui::test]

@@ -2553,14 +2553,21 @@ impl ShelluneView {
         let lines = snippet.line_count();
         let selected = self.snippet_panel.selected() == index;
         let hover = theme::swatch(palette::SURFACE_HOVER);
+        // The name and the body are one line each, ellipsized when the row is narrow: a
+        // column that is allowed to wrap instead is squeezed to a few pixels by the four
+        // actions beside it, and at 200% text in the minimum window that turned each
+        // command's preview into a ribbon of single characters thousands of pixels tall
+        // (R4). The share the row keeps for them is a floor, so the actions wrap under
+        // them as a group rather than leaving no room for what the row is about.
         let mut detail = div()
             .flex()
             .flex_col()
             .flex_1()
-            .min_w(px(0.0))
+            .min_w(metrics.scale(160.0))
             .gap(px(1.0))
             .child(
                 div()
+                    .truncate()
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .child(SharedString::from(snippet.name().to_owned())),
@@ -2571,6 +2578,7 @@ impl ShelluneView {
                         let selector = format!("snippet.preview.{index}");
                         move || selector.clone()
                     })
+                    .truncate()
                     .font_family(crate::app::terminal::monospace_family())
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
@@ -2612,39 +2620,49 @@ impl ShelluneView {
                 cx.notify();
             }))
             .child(detail)
-            .child(self.snippet_row_button(
-                format!("snippet.insert.{index}"),
-                ux.snippet_insert,
-                id,
-                false,
-                cx,
-            ))
-            .child(self.snippet_row_button(
-                format!("snippet.run.{index}"),
-                ux.snippet_run,
-                id,
-                true,
-                cx,
-            ))
-            .child(self.text_button(
-                SharedString::from(format!("snippet.edit.{index}")),
-                ux.snippet_edit,
-                Variant::Ghost,
-                cx,
-                move |this, cx| this.open_snippet_editor(Some(id), cx),
-            ))
-            .child(self.text_button(
-                SharedString::from(format!("snippet.delete.{index}")),
-                ux.snippet_delete,
-                Variant::Ghost,
-                cx,
-                move |this, cx| {
-                    this.snippet_panel.ask_delete(id);
-                    let len = this.snippets.snippets().len();
-                    this.snippet_panel.select(index, len);
-                    cx.notify();
-                },
-            ))
+            // What can be done with the command stays together: at 200% text the four
+            // labels are wider than the row, so they take a line of their own below the
+            // name and body instead of splitting the name into a column of characters.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(self.snippet_row_button(
+                        format!("snippet.insert.{index}"),
+                        ux.snippet_insert,
+                        id,
+                        false,
+                        cx,
+                    ))
+                    .child(self.snippet_row_button(
+                        format!("snippet.run.{index}"),
+                        ux.snippet_run,
+                        id,
+                        true,
+                        cx,
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("snippet.edit.{index}")),
+                        ux.snippet_edit,
+                        Variant::Ghost,
+                        cx,
+                        move |this, cx| this.open_snippet_editor(Some(id), cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from(format!("snippet.delete.{index}")),
+                        ux.snippet_delete,
+                        Variant::Ghost,
+                        cx,
+                        move |this, cx| {
+                            this.snippet_panel.ask_delete(id);
+                            let len = this.snippets.snippets().len();
+                            this.snippet_panel.select(index, len);
+                            cx.notify();
+                        },
+                    )),
+            )
     }
 
     /// The insert or run button of one row.
