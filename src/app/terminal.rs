@@ -2734,6 +2734,17 @@ impl TerminalPane {
 
         let focused = self.search_focused;
         let accent = theme::swatch(shell_palette::ACCENT);
+        // The placeholder is a sentence. A field that shrinks to a few letters and
+        // then truncates cuts it through a word ("Search this te"), and the pane
+        // has no other place that text is written (R4).
+        let caption = metrics.caption_size();
+        let proportional =
+            crate::app::components::reserved_text_width(strings.terminal_search, caption);
+        let mono = px(strings.terminal_search.chars().count() as f32
+            * (caption / px(1.0))
+            * shellune_terminal::MONOSPACE_ADVANCE_RATIO);
+        let query_text_floor = proportional.max(mono);
+        let query_field_floor = query_text_floor + metrics.scale(spacing::HAIRLINE) * 2.0 + px(2.0);
         let mut bar = div()
             .flex()
             .flex_wrap()
@@ -2748,8 +2759,11 @@ impl TerminalPane {
                 div()
                     .flex()
                     .items_center()
-                    .flex_1()
-                    .min_w(px(80.0))
+                    .when(empty_query, |field| {
+                        field.flex_none().min_w(query_field_floor)
+                    })
+                    .when(!empty_query, |field| field.flex_1().min_w(px(80.0)))
+                    .max_w_full()
                     .rounded(px(radius::SMALL))
                     .border_1()
                     .border_color(if focused {
@@ -2776,8 +2790,13 @@ impl TerminalPane {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
+                            .min_w(if empty_query {
+                                query_text_floor
+                            } else {
+                                px(0.0)
+                            })
+                            .when(empty_query, |text| text.whitespace_normal())
+                            .when(!empty_query, |text| text.truncate())
                             .debug_selector(|| "terminal.search.query".to_owned())
                             .font_family(monospace_family())
                             .text_size(metrics.caption_size())

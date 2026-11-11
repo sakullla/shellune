@@ -5123,6 +5123,27 @@ impl ShelluneView {
         self.on_remote_failed(id, &error, cx);
     }
 
+    /// Records a jump-chain failure through the same path a hop uses.
+    ///
+    /// The chain text names the hop. A direct [`ConnectError`] does not, and that
+    /// longer line is what a 720×480 window at 200% text used to cut off.
+    #[cfg(test)]
+    pub(crate) fn fail_chain_for_test(
+        &mut self,
+        failure: shellune_ssh::ChainFailure,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.remote.as_ref().map(|panel| panel.host().clone()) else {
+            return;
+        };
+        let id = match self.reconnect.take() {
+            Some(id) => id,
+            None => self.workspace.register_remote_session(&host).id(),
+        };
+        self.form_session = Some(id);
+        self.on_chain_failed(id, &failure, cx);
+    }
+
     /// Tries again with whatever the form holds now.
     fn retry_remote(&mut self, cx: &mut Context<Self>) {
         if let Some(panel) = self.remote.as_mut() {
@@ -5881,7 +5902,7 @@ impl ShelluneView {
             column = column.child(
                 components::banner(Tone::Danger, metrics)
                     .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                    .py(metrics.scale(spacing::SNUG))
+                    .py(metrics.scale(spacing::HAIRLINE))
                     .debug_selector(|| "remote.failure".to_owned())
                     .child(
                         div()
@@ -5892,6 +5913,9 @@ impl ShelluneView {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector(|| "remote.failure.reason".to_owned())
@@ -5899,6 +5923,9 @@ impl ShelluneView {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_SECONDARY))
                             .debug_selector(|| "remote.failure.next".to_owned())

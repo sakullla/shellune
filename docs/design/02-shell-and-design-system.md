@@ -530,17 +530,26 @@ shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
 
 界面文字从这一进程一开始就是 200%。第一行是窗口刚出现时的视口。客户区随后被收成 1080×720
 物理像素（该窗口 dpi 144），进程改报 `viewport_size=720x480`、`scale_factor=1.5`。
-没有把窗口拉到别的尺寸。界面语言是英文。
+之后没有再改窗口尺寸。下面的图都是这最后一行出现之后、同一次进程的客户区。界面语言是英文。
 
-已保存主机 lan109（root@192.168.0.109:22）用本机私钥连了一次。对话框里能看见的指纹以
-`SHA256:XR6MByyOO2` 开头，与本机 OpenSSH known_hosts 里该地址的 ED25519 指纹开头一致。接受后服务器拒绝了所提供的密钥，
-对话框停在 Could not connect。看得见的原因是 hop 1 "lan109" (root@192.168.0.109:22) failed: the server rejected the offered，
-下一行被窗口裁切；下一步是 Check the credentials, or change the authentication method。没有再试。
-因此没有传输失败图，也没有这次进程的 X11 失败图。macOS 没有实窗。Linux 上也没有把本应用窗口打开在 root@192.168.0.109 的显示 :1 上。
+- `windows-720x480-200-settings-theme.png`：主题分段 System、Light、Dark 都完整，说明是整句
+  “Follow the system, or stay light or dark”。
+- `windows-720x480-200-settings-shell.png`：默认 Shell 的三个名称都完整，Windows PowerShell、
+  PowerShell 7、Command Prompt。
+- `windows-720x480-200-settings-keys.png`：快捷键行里的 keycap、Change、Unbind 都完整。Go to hosts
+  这一行整行都在窗口内。
+- `windows-720x480-200-terminal-search.png`：搜索框是整句 “Search this terminal”，会话名
+  Windows PowerShell 和 powershell.exe 都完整。
+- `windows-720x480-200-tab-overflow.png`：全部标签对话框。副标题是整句
+  “Every open tab, in strip order. Choosing one shows it.”
+- `windows-720x480-200-shortcut-commands.png`：快捷命令对话框。副标题是整句
+  “Insert types a command into the active terminal. Run also submits it, once.”
+  New shortcut command 和 Close 都在。
 
-同一天较早一次进程留下的连接、主题、默认 Shell、快捷键和搜索图不是这次视口记录之后截的，不能当作这次的传输失败或 X11 失败。
+主机簿里没有已保存的 lan109。没有再试本机私钥，也没有打开 root@212.60.153.19，所以这次没有连接对话框，
+没有传输失败图，也没有 X11 失败图。macOS 没有实窗。Linux 上没有把本应用窗口打开在显示 :1 上。
 
-设置页换行没有改。`SHELLUNE_LOG_VIEWPORT` 默认仍关闭，只有这次进程设了 `=1`。
+标题换行、副标题换行和设置页换行都没有改回去。`SHELLUNE_LOG_VIEWPORT` 默认仍关闭，只有这次进程设了 `=1`。
 
 ### 输入框（`text_field.rs`）
 

@@ -3060,6 +3060,16 @@ async fn the_find_bar_stays_inside_the_window_at_two_hundred_percent(cx: &mut Te
     );
 
     click(cx, "terminal.search");
+    cx.run_until_parked();
+    let query = bounds_of(cx, "terminal.search.query");
+    // The find bar uses the terminal metrics, which stay at the regular size.
+    let placeholder = px("Search this terminal".chars().count() as f32
+        * (Metrics::new(Zoom::Regular).caption_size() / px(1.0))
+        * shellune_terminal::MONOSPACE_ADVANCE_RATIO);
+    assert!(
+        query.size.width + px(1.0) >= placeholder,
+        "the empty search field cuts the placeholder through a word: {query:?} needs {placeholder:?}"
+    );
     cx.simulate_input("ready");
     cx.run_until_parked();
     assert_eq!(
@@ -5822,6 +5832,70 @@ async fn an_attempt_that_fails_shows_the_reason_and_opens_no_terminal(cx: &mut T
                 .iter()
                 .any(|recent| recent.connections() > 0),
             "a failed attempt is not a recent connection"
+        );
+    });
+}
+
+/// A hop rejection names the host and then the credential error.
+///
+/// That sentence is wider than one line of a 720×480 window at 200% text. It has to
+/// wrap inside the dialog, and both it and the next step have to be inside the
+/// window: the previous line used to end at "offered" and the rest was past the
+/// client edge (R4).
+#[gpui::test]
+async fn a_rejected_hop_reason_and_its_next_step_fit_the_minimum_window(cx: &mut TestAppContext) {
+    let dir = TempDir::new("remote-hop-reason");
+    seed(
+        &dir.store(),
+        vec![stored_host("lan109", "192.168.0.109", 22, "root", None)],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let host = view.book().hosts()[0].clone();
+            let failure = shellune_ssh::ChainFailure::Hop {
+                hop: Box::new(shellune_ssh::HopLocation {
+                    host_id: host.id(),
+                    index: 0,
+                    name: host.name().to_owned(),
+                    address: host.address().to_owned(),
+                    port: host.port().get(),
+                    user: host.user().to_owned(),
+                }),
+                error: Box::new(shellune_ssh::ConnectError::AuthRejected),
+            };
+            view.fail_chain_for_test(failure, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let reason = bounds_of(cx, "remote.failure.reason");
+    let next = bounds_of(cx, "remote.failure.next");
+    assert_fits_inside(reason, viewport, "remote.failure.reason");
+    assert_fits_inside(next, viewport, "remote.failure.next");
+    assert!(
+        reason.size.height > px(36.0),
+        "the hop reason stayed on one line, which is how the window used to cut it: {reason:?}"
+    );
+    cx.update(|_window, app| {
+        let failure = view
+            .read(app)
+            .remote_state()
+            .and_then(|panel| panel.status().failure().cloned())
+            .expect("the dialog is showing the hop failure");
+        assert!(
+            failure.reason().contains("credentials"),
+            "the reason is the full rejection: {}",
+            failure.reason()
+        );
+        assert!(
+            failure.next_step().contains("authentication method"),
+            "the next step is still the credential one: {}",
+            failure.next_step()
         );
     });
 }

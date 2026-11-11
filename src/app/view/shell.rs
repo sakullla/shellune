@@ -1685,10 +1685,12 @@ impl ShelluneView {
     ) -> Div {
         let metrics = self.metrics();
         let viewport = window.viewport_size();
-        let width = metrics
-            .scale(width)
-            .min(viewport.width - metrics.scale(spacing::LOOSE) * 2.0);
-        let max_height = viewport.height - metrics.scale(spacing::LOOSE) * 2.0;
+        // The inset stays a small edge gap. Scaling it with the text turned a 200%
+        // minimum window into a short dialog, and the failure's next line was drawn
+        // past the client edge where it could not be read (R4).
+        let margin = metrics.scale(spacing::LOOSE).min(px(16.0));
+        let width = metrics.scale(width).min(viewport.width - margin * 2.0);
+        let max_height = viewport.height - margin * 2.0;
         let dialog = div()
             .id(id)
             .debug_selector(move || id.to_owned())
@@ -1886,9 +1888,7 @@ impl ShelluneView {
                 .pb(metrics.scale(spacing::LOOSE))
                 .child(self.quick_panel(cx))
                 .into_any_element();
-            return Some(self.modal(
-                window, "quick.dialog", 520.0, header, subtitle, body, None,
-            ));
+            return Some(self.modal(window, "quick.dialog", 520.0, header, subtitle, body, None));
         }
         if !(self.showing_connection_form && self.remote.is_some()) {
             return None;
@@ -1898,10 +1898,10 @@ impl ShelluneView {
         let (status_label, tone) = super::remote_status_label(panel.status(), strings);
         // The hint is about choosing a sign-in; while the server asks a question or
         // the connection runs, it would only be in the way.
-        let choosing = matches!(
-            panel.status(),
-            crate::app::remote::RemoteStatus::Idle | crate::app::remote::RemoteStatus::Failed(_)
-        );
+        // A failure already says what happened and what to do next. The sign-in hint
+        // on top of it pushed that next line past the window (R4).
+        let choosing = matches!(panel.status(), crate::app::remote::RemoteStatus::Idle);
+        let failed = matches!(panel.status(), crate::app::remote::RemoteStatus::Failed(_));
         let (header, subtitle) = self.modal_header_with(
             None,
             format!("{} {}", ux.connect_title, host.name()),
@@ -1916,15 +1916,22 @@ impl ShelluneView {
             .w_full()
             .items_start()
             .pl(metrics.scale(spacing::LOOSE))
+            .child(div().pt(metrics.scale(spacing::SNUG)).child(host_avatar(
+                host.name(),
+                false,
+                metrics,
+            )))
             .child(
-                div()
-                    .pt(metrics.scale(spacing::SNUG))
-                    .child(host_avatar(host.name(), false, metrics)),
-            )
-            .child(header.flex_1().min_w(px(0.0)).pl(metrics.scale(spacing::SNUG)));
+                header
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .pl(metrics.scale(spacing::SNUG)),
+            );
         let body = div()
             .flex()
             .flex_col()
+            .w_full()
+            .min_w(px(0.0))
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))
@@ -1940,8 +1947,9 @@ impl ShelluneView {
             .child(self.other_attempts(cx))
             .into_any_element();
         // A connection that is already running can go on without the dialog: it keeps
-        // its tab, and clicking that tab brings the dialog back.
-        let footer = self.form_session.is_some().then(|| {
+        // its tab, and clicking that tab brings the dialog back. A failure is finished,
+        // so that button would only take the room the reason and the next step need.
+        let footer = (self.form_session.is_some() && !failed).then(|| {
             div()
                 .flex()
                 .justify_end()
@@ -1958,7 +1966,13 @@ impl ShelluneView {
                 ))
         });
         Some(self.modal(
-            window, "remote.dialog", 600.0, header, subtitle, body, footer,
+            window,
+            "remote.dialog",
+            600.0,
+            header,
+            subtitle,
+            body,
+            footer,
         ))
     }
 
@@ -2139,9 +2153,7 @@ impl ShelluneView {
                         cx,
                     ))
                     .into_any_element();
-                Some(self.modal(
-                    window, "forwards.dialog", 680.0, header, hint, body, None,
-                ))
+                Some(self.modal(window, "forwards.dialog", 680.0, header, hint, body, None))
             }
             Tool::Transfers => {
                 let (header, subtitle) = self.modal_header(
