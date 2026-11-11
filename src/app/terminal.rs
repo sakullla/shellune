@@ -871,6 +871,13 @@ impl TerminalPane {
         self.core.display_offset()
     }
 
+    /// Lines of scrollback above the screen.
+    #[cfg(test)]
+    #[must_use]
+    pub fn history_len(&self) -> usize {
+        self.core.history()
+    }
+
     /// Applies whatever the shell wrote since the last poll.
     ///
     /// The polling task waits on the window's timer, which a test cannot advance, so

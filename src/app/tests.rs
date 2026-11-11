@@ -2650,6 +2650,123 @@ async fn new_output_while_searching_parked_history_keeps_the_place_and_the_hit(
     );
 }
 
+/// `without_process` keeps 1000 lines. This is longer than that, so the oldest
+/// rows have already rotated out before the search opens.
+fn full_scrollback_lines(rows: usize) -> String {
+    let mut lines = Vec::with_capacity(rows + 1030);
+    for index in 0..rows + 1030 {
+        lines.push(format!("id-{index:05}"));
+    }
+    lines.join("\r\n")
+}
+
+#[gpui::test]
+async fn a_full_scrollback_keeps_the_place_and_the_hit_when_output_arrives(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with("", cx);
+    let rows = cx.update(|_window, app| pane.read(app).grid().rows);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(full_scrollback_lines(rows).as_bytes(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).history_len()),
+        1000,
+        "the test pane's scrollback is full, not merely long"
+    );
+
+    let center = bounds_of(cx, "terminal.viewport").center();
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Lines(point(0.0, 2000.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: Default::default(),
+    });
+    cx.run_until_parked();
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Lines(point(0.0, -400.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: Default::default(),
+    });
+    cx.run_until_parked();
+    let parked = cx.update(|_window, app| pane.read(app).display_offset());
+    assert!(
+        parked > 0 && parked < 1000,
+        "the viewport is in the middle of a full history, not at an end, got {parked}"
+    );
+    let reading = cx.update(|_window, app| pane.read(app).visible_text());
+    let top = reading[0].clone();
+    assert!(
+        top.starts_with("id-"),
+        "the parked row is one of the filled lines, got {top:?}"
+    );
+
+    click(cx, "terminal.search");
+    cx.simulate_input(&top);
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        },
+        "the parked row is the only match"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text().first().cloned()),
+        Some(top.clone()),
+        "locating the parked row leaves it at the top"
+    );
+
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"\r\nfresh-line\r\n", cx)
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| pane.read(app).display_offset()) > parked,
+        "the parked viewport's offset grew with the new row"
+    );
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 1
+        },
+        "the current hit is still the parked row, not a later line"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text().first().cloned()),
+        Some(top),
+        "recounting leaves the same row on screen"
+    );
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Lines(point(0.0, -30.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: Default::default(),
+    });
+    cx.run_until_parked();
+    assert_ne!(
+        cx.update(|_window, app| pane.read(app).visible_text()),
+        reading,
+        "the wheel moved off the parked rows while the bar was open"
+    );
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text()),
+        reading,
+        "closing puts back the rows that were on screen before the search"
+    );
+}
+
 #[gpui::test]
 async fn the_case_and_expression_switches_narrow_the_same_query(cx: &mut TestAppContext) {
     let (pane, cx) = pane_with("needle\r\nNeedle", cx);

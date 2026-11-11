@@ -191,6 +191,9 @@ pub struct HistoryMatch {
 /// `stable` is `history_size + line + lines_dropped`, the same quantity a command
 /// block stores. A raw line number is not that quantity: while the viewport is
 /// parked in history, new output moves every existing row further up the grid.
+/// Once the scrollback is full, that move no longer changes `history_size`;
+/// `lines_dropped` counts the rows rotated out instead, so the sum still names
+/// the same row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineAnchor {
     stable: i64,
@@ -366,9 +369,16 @@ pub struct TerminalCore {
     /// Classic, or command blocks when the shell actually reports them.
     presentation: TerminalMode,
     /// Lines dropped from the front of history, so anchors survive a full scrollback.
+    ///
+    /// A shrink of `history_size` is one way lines leave. A full ring also rotates
+    /// a row out on every extra scroll without `history_size` changing; both add
+    /// here, or a parked row's anchor slips one line per new row.
     lines_dropped: i64,
     /// History size after the previous chunk, to see how many lines were dropped.
     last_history: usize,
+    /// `scrolling_history` from construction. The grid stops growing at this size
+    /// and then rotates.
+    scrollback: usize,
 }
 
 impl TerminalCore {
@@ -393,6 +403,7 @@ impl TerminalCore {
             presentation: TerminalMode::Classic,
             lines_dropped: 0,
             last_history: 0,
+            scrollback,
         }
     }
 
@@ -411,7 +422,7 @@ impl TerminalCore {
                     if chunk.is_empty() {
                         continue;
                     }
-                    self.parser.advance(&mut self.term, &chunk);
+                    self.advance_bytes(&chunk);
                     let next = self.sink.take_effects();
                     if let Some(title) = &next.title {
                         self.title = Some(title.clone());
@@ -946,6 +957,182 @@ impl TerminalCore {
             .to_owned()
     }
 
+    fn screen_rows(&self) -> usize {
+        self.grid.rows.max(1)
+    }
+
+    /// Parses `bytes`, counting rows rotated out of a full scrollback.
+    ///
+    /// Below the limit the grid grows and line numbers move with `history_size`,
+    /// so anchors stay put without touching `lines_dropped`. At the limit the
+    /// ring rotates instead: the row now at the top is the row that used to sit
+    /// `dropped` lines below it, and that distance is what `lines_dropped` gains.
+    fn advance_bytes(&mut self, mut bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.scrollback == 0 {
+            self.parser.advance(&mut self.term, bytes);
+            return;
+        }
+        while !bytes.is_empty() {
+            if self.on_alternate_screen() {
+                // One byte at a time so a sequence that leaves the alternate grid
+                // does not swallow the primary output that follows it.
+                let n = Self::alt_step(bytes).clamp(1, bytes.len());
+                self.parser.advance(&mut self.term, &bytes[..n]);
+                bytes = &bytes[n..];
+                if !self.on_alternate_screen() {
+                    self.note_history();
+                }
+                continue;
+            }
+            let history = self.history();
+            let rows = self.screen_rows();
+            if history < self.scrollback {
+                let room = self.scrollback - history;
+                // One byte scrolls at most one screen, so this many bytes cannot
+                // rotate anything out yet.
+                if room >= rows {
+                    let n = (room / rows).min(bytes.len()).max(1);
+                    self.parser.advance(&mut self.term, &bytes[..n]);
+                    bytes = &bytes[n..];
+                    self.note_history();
+                    continue;
+                }
+            }
+            let (n, depth) = self.measured_step(bytes);
+            self.advance_measured(&mut bytes, n, depth);
+        }
+    }
+
+    /// Bytes that can start a control sequence, as opposed to plain text.
+    fn is_hazard(byte: u8) -> bool {
+        byte == 0x1b || (0x80..=0x9f).contains(&byte)
+    }
+
+    /// How many leading bytes to parse while the alternate grid is showing.
+    ///
+    /// A sequence is taken whole. Any other byte is taken alone: it may be the
+    /// final byte of a sequence started earlier, including the one that returns
+    /// to the primary grid, and the bytes after it must be counted there.
+    fn alt_step(bytes: &[u8]) -> usize {
+        if bytes.is_empty() {
+            return 0;
+        }
+        if Self::is_hazard(bytes[0]) {
+            return sequence_len(bytes);
+        }
+        1
+    }
+
+    /// A slice whose scroll is bounded, and how many rows that bound covers.
+    ///
+    /// The depth stays inside the active grid so the top row after the slice is
+    /// still one of the rows snapshotted before it. A larger scroll would wrap
+    /// the ring and the same address would name a different row.
+    fn measured_step(&self, bytes: &[u8]) -> (usize, usize) {
+        let rows = self.screen_rows();
+        let active = self.history().saturating_add(rows).max(1);
+        let limit = active - 1;
+        if Self::is_hazard(bytes[0]) {
+            let n = sequence_len(bytes).clamp(1, bytes.len());
+            let depth = self.scroll_bound(&bytes[..n]).min(limit).max(1);
+            return (n, depth);
+        }
+        let cols = self.grid.cols.max(1);
+        let mut n = 0;
+        let mut newlines = 0usize;
+        while n < bytes.len() && !Self::is_hazard(bytes[n]) {
+            let mut next_newlines = newlines;
+            if matches!(bytes[n], b'\n' | 0x0b | 0x0c) {
+                next_newlines += 1;
+            }
+            let next = n + 1;
+            // `rows` covers one control action already in progress at the start
+            // of this slice. After that, only newlines and wraps scroll.
+            let bound = rows + next_newlines + next / cols;
+            if n > 0 && bound > limit {
+                break;
+            }
+            n = next;
+            newlines = next_newlines;
+            if bound > limit {
+                break;
+            }
+        }
+        let n = n.clamp(1, bytes.len());
+        let depth = self.scroll_bound(&bytes[..n]).min(limit).max(1);
+        (n, depth)
+    }
+
+    /// Upper bound on how many rows `bytes` can scroll into history.
+    fn scroll_bound(&self, bytes: &[u8]) -> usize {
+        let rows = self.screen_rows();
+        let cols = self.grid.cols.max(1);
+        let newlines = bytes
+            .iter()
+            .filter(|byte| matches!(byte, b'\n' | 0x0b | 0x0c))
+            .count();
+        rows.saturating_add(newlines)
+            .saturating_add(bytes.len() / cols)
+            .max(1)
+    }
+
+    fn advance_measured(&mut self, bytes: &mut &[u8], n: usize, depth: usize) {
+        let n = n.clamp(1, bytes.len());
+        let before_history = self.history();
+        let before_alt = self.on_alternate_screen();
+        let rows = self.line_addrs(depth);
+        self.parser.advance(&mut self.term, &bytes[..n]);
+        *bytes = &bytes[n..];
+        if self.on_alternate_screen() || self.on_alternate_screen() != before_alt {
+            if !self.on_alternate_screen() {
+                self.note_history();
+            }
+            return;
+        }
+        let history = self.history();
+        if history < before_history {
+            self.lines_dropped += (before_history - history) as i64;
+        } else if before_history == self.scrollback || history == self.scrollback {
+            self.lines_dropped += self.dropped_in_rotation(&rows) as i64;
+        }
+        self.last_history = history;
+    }
+
+    /// Addresses of the rows a scroll of at most `depth` can move onto the top.
+    fn line_addrs(&self, depth: usize) -> Vec<usize> {
+        let top = -i32::try_from(self.history()).unwrap_or(i32::MAX);
+        let bottom = self.term.grid().bottommost_line().0;
+        let depth = i32::try_from(depth).unwrap_or(i32::MAX);
+        let end = top.saturating_add(depth).min(bottom);
+        if end < top {
+            return Vec::new();
+        }
+        let grid = self.term.grid();
+        (top..=end)
+            .map(|line| std::ptr::from_ref(&grid[Line(line)]).addr())
+            .collect()
+    }
+
+    /// How many rows rotated off the top, from a [`Self::line_addrs`] snapshot.
+    ///
+    /// Growing into free history leaves the old top row as the new top, so this
+    /// is zero. A full ring (or a scroll that also crosses the limit) puts an
+    /// older row there; its index in the snapshot is the number of rows that left.
+    fn dropped_in_rotation(&self, before: &[usize]) -> usize {
+        if before.is_empty() {
+            return 0;
+        }
+        let top = -i32::try_from(self.history()).unwrap_or(i32::MAX);
+        let addr = std::ptr::from_ref(&self.term.grid()[Line(top)]).addr();
+        before
+            .iter()
+            .position(|candidate| *candidate == addr)
+            .unwrap_or(before.len())
+    }
+
     fn note_history(&mut self) {
         // The alternate grid reports no scrollback. That zero is not the primary
         // grid losing lines, so it must not move anchors that still point at it.
@@ -958,6 +1145,65 @@ impl TerminalCore {
         }
         self.last_history = history;
     }
+}
+
+/// Leading control sequence, or one byte when `bytes` does not start one.
+///
+/// A CSI or OSC is one terminal action (one scroll, one clear, one mode change),
+/// so it is parsed in one step. The scan stops at the final byte; it does not
+/// interpret the sequence.
+fn sequence_len(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    if bytes[0] == 0x9b {
+        return csi_len(&bytes[1..]).saturating_add(1).min(bytes.len());
+    }
+    if bytes[0] != 0x1b {
+        return 1;
+    }
+    if bytes.len() == 1 {
+        return 1;
+    }
+    match bytes[1] {
+        b'[' => csi_len(&bytes[2..]).saturating_add(2).min(bytes.len()),
+        b']' => osc_len(&bytes[2..]).saturating_add(2).min(bytes.len()),
+        _ => 2,
+    }
+}
+
+/// Bytes of a CSI body, including its final byte when one is present.
+fn csi_len(bytes: &[u8]) -> usize {
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if (0x40..=0x7e).contains(&byte) {
+            return index + 1;
+        }
+        // A new introducer or a C0 control aborts the sequence. Leave that byte
+        // for the next step. Parameter bytes are bounded so a broken sequence
+        // cannot swallow the rest of the chunk.
+        if byte == 0x1b || byte < 0x20 || index >= 64 {
+            return index;
+        }
+    }
+    bytes.len()
+}
+
+/// Bytes of an OSC body, including its BEL or ST terminator when present.
+fn osc_len(bytes: &[u8]) -> usize {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x07 {
+            return index + 1;
+        }
+        if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'\\' {
+            return index + 2;
+        }
+        if bytes[index] == 0x1b {
+            return index;
+        }
+        index += 1;
+    }
+    bytes.len()
 }
 
 fn merge_effects(into: &mut TerminalEffects, next: TerminalEffects) {
@@ -1142,6 +1388,200 @@ mod tests {
         let current = i32::try_from(terminal.display_offset()).unwrap_or(0);
         terminal.scroll(restored - current);
         assert_eq!(terminal.snapshot().text(), shown);
+    }
+
+    /// The review probe: scrollback 8, screen 5, viewport parked at offset 4.
+    #[test]
+    fn a_full_scrollback_keeps_the_parked_row_and_the_match_when_output_arrives() {
+        let mut terminal = TerminalCore::new(40, 5, 8);
+        for line in 0..24 {
+            terminal.feed(format!("mark-{line:04}\r\n").as_bytes());
+        }
+        assert_eq!(terminal.history(), 8, "the scrollback is full");
+        terminal.scroll(4);
+        assert_eq!(terminal.display_offset(), 4);
+        let shown = terminal.snapshot().text();
+        let top = shown[0].clone();
+        assert!(
+            top.starts_with("mark-"),
+            "the parked row is one of the retained marks, not a blank, got {top:?}"
+        );
+        let parked = terminal
+            .parked_viewport()
+            .expect("the viewport is in history");
+        let hits = terminal
+            .search_history(&top, SearchOptions::literal())
+            .expect("a literal query compiles");
+        let hit = hits
+            .iter()
+            .find(|hit| hit.text == top)
+            .expect("the visible row is a match");
+        let mark = terminal.anchor_line(hit.line, hit.column);
+        let saved_line = hit.line;
+
+        terminal.feed(b"extra\r\n");
+        assert_eq!(
+            terminal.display_offset(),
+            5,
+            "a parked viewport's raw offset grows so the same rows stay put"
+        );
+        assert_eq!(terminal.offset_of(parked), terminal.display_offset());
+        assert_eq!(
+            terminal.snapshot().text(),
+            shown,
+            "the rows on screen are the ones that were parked"
+        );
+        let line = terminal
+            .line_of(mark)
+            .expect("the match is still in the grid");
+        assert!(
+            line < saved_line,
+            "the raw line number moved up, the anchor did not"
+        );
+        let again = terminal
+            .search_history(&top, SearchOptions::literal())
+            .expect("a literal query compiles");
+        let again = again
+            .iter()
+            .find(|hit| hit.text == top)
+            .expect("the same mark is still a match");
+        assert_eq!(again.line, line);
+        assert_eq!(again.column, mark.column());
+        assert_eq!(again.text, top);
+
+        // Closing uses the anchor, not the offset captured when search opened.
+        terminal.scroll_to_bottom();
+        let stale = 4i32;
+        let current = i32::try_from(terminal.display_offset()).unwrap_or(0);
+        terminal.scroll(stale - current);
+        assert_ne!(
+            terminal.snapshot().text(),
+            shown,
+            "the offset from before the new row now shows a later screen"
+        );
+        let restored = i32::try_from(terminal.offset_of(parked)).unwrap_or(0);
+        let current = i32::try_from(terminal.display_offset()).unwrap_or(0);
+        terminal.scroll(restored - current);
+        assert_eq!(terminal.snapshot().text(), shown);
+    }
+
+    #[test]
+    fn a_parked_row_that_scrolls_out_of_a_full_history_clamps_to_the_oldest_line() {
+        let mut terminal = TerminalCore::new(40, 5, 8);
+        for line in 0..24 {
+            terminal.feed(format!("mark-{line:04}\r\n").as_bytes());
+        }
+        assert_eq!(terminal.history(), 8);
+        terminal.scroll(4);
+        let shown = terminal.snapshot().text();
+        let parked_text = shown[0].clone();
+        let parked = terminal.parked_viewport().expect("parked");
+
+        // One chunk both keeps the row (the first lines) and then rotates it out.
+        terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        assert!(
+            terminal.line_of(parked).is_none(),
+            "the parked row is no longer in the grid"
+        );
+        assert_eq!(
+            terminal.offset_of(parked),
+            terminal.history(),
+            "closing clamps to the oldest retained row, not the offset from open"
+        );
+        assert_ne!(terminal.offset_of(parked), 4);
+
+        terminal.scroll_to_bottom();
+        let stale = 4i32;
+        let current = i32::try_from(terminal.display_offset()).unwrap_or(0);
+        terminal.scroll(stale - current);
+        assert_ne!(
+            terminal.snapshot().text(),
+            shown,
+            "the offset saved at open now shows a later screen"
+        );
+        let target = i32::try_from(terminal.offset_of(parked)).unwrap_or(0);
+        let current = i32::try_from(terminal.display_offset()).unwrap_or(0);
+        terminal.scroll(target - current);
+        assert_eq!(terminal.display_offset(), terminal.history());
+        let oldest = terminal.snapshot().row_text(0).expect("oldest row");
+        assert_ne!(oldest, parked_text);
+        assert!(
+            oldest.starts_with("mark-") || oldest == "one" || oldest == "two" || oldest == "three",
+            "the oldest retained row is real output, got {oldest:?}"
+        );
+    }
+
+    #[test]
+    fn a_control_scroll_in_a_full_history_moves_the_anchor_with_the_rows() {
+        let mut terminal = TerminalCore::new(40, 5, 8);
+        for line in 0..24 {
+            terminal.feed(format!("mark-{line:04}\r\n").as_bytes());
+        }
+        terminal.scroll(4);
+        let shown = terminal.snapshot().text();
+        let parked = terminal.parked_viewport().expect("parked");
+        // SU scrolls the whole screen up by two rows and into the full history.
+        terminal.feed(b"\x1b[2S");
+        assert_eq!(terminal.offset_of(parked), terminal.display_offset());
+        assert_eq!(terminal.snapshot().text(), shown);
+    }
+
+    #[test]
+    fn identical_rows_in_a_full_scrollback_stay_parked_when_another_arrives() {
+        let mut terminal = TerminalCore::new(20, 5, 8);
+        for _ in 0..30 {
+            terminal.feed(b"same\r\n");
+        }
+        assert_eq!(terminal.history(), 8);
+        terminal.scroll(4);
+        let shown = terminal.snapshot().text();
+        let parked = terminal.parked_viewport().expect("parked");
+        terminal.feed(b"same\r\n");
+        assert_eq!(terminal.offset_of(parked), terminal.display_offset());
+        assert_eq!(terminal.snapshot().text(), shown);
+    }
+
+    #[test]
+    fn the_last_free_history_slot_does_not_count_as_a_dropped_row() {
+        let mut terminal = TerminalCore::new(40, 5, 8);
+        let mut n = 0;
+        while terminal.history() < 7 {
+            terminal.feed(format!("row-{n:04}\r\n").as_bytes());
+            n += 1;
+            assert!(n < 100, "history never reached one below the limit");
+        }
+        terminal.scroll(3);
+        let shown = terminal.snapshot().text();
+        let parked = terminal.parked_viewport().expect("parked");
+        let saved = terminal.display_offset();
+        terminal.feed(b"last-free\r\n");
+        assert!(terminal.history() <= 8);
+        assert_eq!(terminal.offset_of(parked), terminal.display_offset());
+        assert_eq!(terminal.snapshot().text(), shown);
+        assert!(terminal.display_offset() > saved);
+    }
+
+    #[test]
+    fn crossing_the_scrollback_limit_in_one_chunk_keeps_the_anchor() {
+        let mut terminal = TerminalCore::new(40, 5, 8);
+        let mut n = 0;
+        while terminal.history() < 7 {
+            terminal.feed(format!("row-{n:04}\r\n").as_bytes());
+            n += 1;
+            assert!(n < 100, "history never reached one below the limit");
+        }
+        terminal.scroll(3);
+        let shown = terminal.snapshot().text();
+        let parked = terminal.parked_viewport().expect("parked");
+        // One newline fills the last free slot and the next rotates a row out.
+        terminal.feed(b"cross-a\r\ncross-b\r\n");
+        assert_eq!(terminal.history(), 8);
+        assert_eq!(terminal.offset_of(parked), terminal.display_offset());
+        assert_eq!(
+            terminal.snapshot().text(),
+            shown,
+            "the parked rows stay put across the limit"
+        );
     }
 
     #[test]
