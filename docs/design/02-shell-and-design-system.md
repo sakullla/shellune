@@ -344,7 +344,8 @@ X11 转发让服务器上的图形程序显示在这台电脑上。三个模式�
   `session.x11.enabling`（启用中，warning）、`session.x11.ready`（可用，positive）、`session.x11.failed`（失败，
   danger）。chip 的 tooltip 写原因和下一步；失败时**同一段原因与下一步还会作为常显文本块**（`session.x11.notice`，
   里面是 `session.x11.next` 与 `session.x11.reason`）出现在会话栏下方——tooltip 只有指针能读，键盘用户读到的
-  是这块文本（R4）。一个没桥接成功的会话仍然是一个能用的会话，断开或关闭会话时 chip 与文本块随桥接一起消失。
+  是这块文本（R4）。文件视图打开时不画这块文本，失败 chip 留在会话栏上，回到终端才再画：720×480、200% 下文本块
+  若留在文件窗格上方，会把失败传输的原因和 Retry 顶出客户区。一个没桥接成功的会话仍然是一个能用的会话，断开或关闭会话时 chip 与文本块随桥接一起消失。
 - 这块常显文本的高度上限是窗口高度的 35%（`X11_NOTICE_SHARE`），超出部分在框内滚动（`session.x11.notice.body`，
   与传输列表同一套 `max_h` + `overflow_y_scroll` 写法）：原因与下一步都随文字大小放大，720×480 加 200% 文字时
   两者加起来比整个窗口还高，按内容自然高度绘制会把终端压到零高、并把最后一行画到窗口外。**下一步排在原因之前**
@@ -529,8 +530,18 @@ shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
 ```
 
 界面文字从这一进程一开始就是 200%。第一行是窗口刚出现时的视口。客户区随后被收成 1080×720
-物理像素（该窗口 dpi 144），进程改报 `viewport_size=720x480`、`scale_factor=1.5`。
-之后没有再改窗口尺寸。下面的图都是这最后一行出现之后、同一次进程的客户区。界面语言是英文。
+物理像素（该窗口 dpi 144），进程改报 `viewport_size=720x480`、`scale_factor=1.5`。截这两张图时客户区仍是
+1080×720 物理像素，日志没有再多一行。界面语言是英文。连的是已保存主机 lan109（192.168.0.109:22，root，受限 X11）。
+应用里已有与 known_hosts 一致的 ED25519 指纹，这次没有再弹出确认框，也没有去连 212.60.153.19。
+
+- `windows-720x480-200-x11-failure.png`：连上之后的终端。下一步整段是
+  “Start an X server for this computer and make sure DISPLAY names it, or connect without X11 forwarding.”
+  原因整段是 “no local X display is available: DISPLAY is not set”。会话栏 chip 是 X11 failed。
+- `windows-720x480-200-transfer-failure.png`：同一扇窗口打开文件视图后的一次下载。远端路径是 `/root`（目录，不是缺失文件）。
+  原因整段是 “Failed · the server refused the transfer: the source is a directory, not a file”。下一步是 Retry，整颗按钮都在客户区内。
+  没有删除远端已有文件。文件视图打开时 X11 常显文本不画，chip 仍在；传输条可以滚动，原因和 Retry 同时留在客户区内。
+
+同日更早一扇窗口留下的图不是这一进程：
 
 - `windows-720x480-200-settings-theme.png`：主题分段 System、Light、Dark 都完整，说明是整句
   “Follow the system, or stay light or dark”。
@@ -546,10 +557,9 @@ shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
   “Insert types a command into the active terminal. Run also submits it, once.”
   New shortcut command 和 Close 都在。
 
-主机簿里没有已保存的 lan109。没有再试本机私钥，也没有打开 root@212.60.153.19，所以这次没有连接对话框，
-没有传输失败图，也没有 X11 失败图。macOS 没有实窗。Linux 上没有把本应用窗口打开在显示 :1 上。
+macOS 没有实窗。Linux 上没有把本应用窗口打开在 192.168.0.109 的显示 :1 上。
 
-标题换行、副标题换行和设置页换行都没有改回去。`SHELLUNE_LOG_VIEWPORT` 默认仍关闭，只有这次进程设了 `=1`。
+标题换行、副标题换行、设置页换行和搜索框整句都没有改回去。`SHELLUNE_LOG_VIEWPORT` 默认仍关闭，只有这次进程设了 `=1`。
 
 ### 输入框（`text_field.rs`）
 

@@ -10106,6 +10106,9 @@ impl ShelluneView {
             .flex_wrap()
             .gap(metrics.scale(spacing::HAIRLINE));
         actions = self.transfer_actions(actions, "transfers", index, task, false, cx);
+        // Reason and Retry come before the path. At 720×480 and 200% text the strip
+        // cannot hold a wrapped path and still show the failure, and the path is the
+        // part a reader can scroll to (R4).
         div()
             .id(("transfers.row", index))
             .debug_selector(move || format!("transfers.row.{index}"))
@@ -10118,6 +10121,16 @@ impl ShelluneView {
             .px(metrics.scale(spacing::TIGHT))
             .py(metrics.scale(spacing::HAIRLINE + 2.0))
             .text_size(metrics.caption_size())
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    .text_color(tone.text())
+                    .debug_selector(move || format!("transfers.state.{index}"))
+                    .child(SharedString::from(detail)),
+            )
+            .child(actions)
             .child(
                 div()
                     .flex()
@@ -10156,16 +10169,6 @@ impl ShelluneView {
                         .debug_selector(move || format!("transfers.protocol.{index}")),
                     ),
             )
-            .child(
-                div()
-                    .w_full()
-                    .min_w(px(0.0))
-                    .whitespace_normal()
-                    .text_color(tone.text())
-                    .debug_selector(move || format!("transfers.state.{index}"))
-                    .child(SharedString::from(detail)),
-            )
-            .child(actions)
     }
 
     /// The switch that chooses this one transfer's protocol (R10).
@@ -11599,173 +11602,183 @@ impl ShelluneView {
                 )
         });
 
-        let row =
-            div()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .flex_none()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                // The name, the target and the state take their own line, and the actions
-                // take the next. One wrapping row squeezed the name until it painted
-                // under the X11 chip, or grew tall enough to push the terminal out of a
-                // 720×480 window (R4).
-                .min_h(metrics.session_bar_height())
-                .pl(metrics.scale(spacing::BASE - 2.0))
-                .pr(metrics.scale(spacing::TIGHT))
-                .bg(theme::swatch(palette::CANVAS))
-                .border_b_1()
-                .border_color(theme::swatch(palette::BORDER))
-                .debug_selector(|| "session.bar".to_owned())
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .w_full()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .flex_none()
-                        .child(
-                            div()
-                                .id("session.kind")
-                                .flex()
-                                .flex_none()
-                                .items_center()
-                                .justify_center()
-                                .size(metrics.scale(22.0))
-                                .rounded(px(radius::SMALL))
-                                .bg(theme::swatch(palette::ACCENT_TINT))
-                                .tooltip(components::tooltip(kind_label))
-                                .child(icons::icon(
-                                    if kind == PaneKind::Remote {
-                                        Icon::Server
+        let row = div()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .flex_none()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            // The name, the target and the state take their own line, and the actions
+            // take the next. One wrapping row squeezed the name until it painted
+            // under the X11 chip, or grew tall enough to push the terminal out of a
+            // 720×480 window (R4).
+            .min_h(metrics.session_bar_height())
+            .pl(metrics.scale(spacing::BASE - 2.0))
+            .pr(metrics.scale(spacing::TIGHT))
+            .bg(theme::swatch(palette::CANVAS))
+            .border_b_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "session.bar".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .flex_nowrap()
+                    .items_center()
+                    .w_full()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .flex_none()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex_wrap()
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .child(
+                                div()
+                                    .id("session.kind")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(metrics.scale(22.0))
+                                    .rounded(px(radius::SMALL))
+                                    .bg(theme::swatch(palette::ACCENT_TINT))
+                                    .tooltip(components::tooltip(kind_label))
+                                    .child(icons::icon(
+                                        if kind == PaneKind::Remote {
+                                            Icon::Server
+                                        } else {
+                                            Icon::Terminal
+                                        },
+                                        metrics.small_icon_size(),
+                                        theme::swatch(palette::ACCENT),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    // Natural width, then the next line of the cluster: a
+                                    // single-line truncate at 200% cut the last glyph in half
+                                    // and had no ellipsis (R4).
+                                    .flex_none()
+                                    .max_w_full()
+                                    .whitespace_normal()
+                                    .text_size(metrics.label_size())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .debug_selector(|| "session.identity".to_owned())
+                                    // "Current" only tells panes apart; a lone pane is
+                                    // simply the session.
+                                    .child(SharedString::from(if self.active_tab_is_solo() {
+                                        label.clone()
                                     } else {
-                                        Icon::Terminal
-                                    },
-                                    metrics.small_icon_size(),
-                                    theme::swatch(palette::ACCENT),
-                                )),
-                        )
-                        .child(
-                            div()
-                                // Natural width, then the next line of the cluster: a
-                                // single-line truncate at 200% cut the last glyph in half
-                                // and had no ellipsis (R4).
-                                .flex_none()
-                                .max_w_full()
-                                .whitespace_normal()
-                                .text_size(metrics.label_size())
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .debug_selector(|| "session.identity".to_owned())
-                                // "Current" only tells panes apart; a lone pane is
-                                // simply the session.
-                                .child(SharedString::from(if self.active_tab_is_solo() {
-                                    label.clone()
-                                } else {
-                                    format!("{} · {label}", strings.workspace_current)
-                                })),
-                        )
-                        .children(target.map(|target| {
-                            div()
-                                .flex_none()
-                                .max_w_full()
-                                .whitespace_normal()
-                                .font_family(terminal::monospace_family())
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .debug_selector(|| "session.target".to_owned())
-                                .child(SharedString::from(target))
-                        }))
-                        .when(!live, |row| {
-                            row.child(components::chip(state_label, tone, metrics))
-                        })
-                        .when_some(self.x11.get(&id).cloned(), |row, status| {
-                            row.child(self.x11_chip(&status, metrics))
-                        })
-                        .children(self.unsaved.iter().find(|(session, _)| *session == id).map(
-                            |_| {
+                                        format!("{} · {label}", strings.workspace_current)
+                                    })),
+                            )
+                            .children(target.map(|target| {
                                 div()
                                     .flex_none()
                                     .max_w_full()
-                                    .min_w(px(0.0))
                                     .whitespace_normal()
+                                    .font_family(terminal::monospace_family())
                                     .text_size(metrics.caption_size())
                                     .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(strings.quick_unsaved_note)
+                                    .debug_selector(|| "session.target".to_owned())
+                                    .child(SharedString::from(target))
+                            }))
+                            .when(!live, |row| {
+                                row.child(components::chip(state_label, tone, metrics))
+                            })
+                            .when_some(self.x11.get(&id).cloned(), |row, status| {
+                                row.child(self.x11_chip(&status, metrics))
+                            })
+                            .children(self.unsaved.iter().find(|(session, _)| *session == id).map(
+                                |_| {
+                                    div()
+                                        .flex_none()
+                                        .max_w_full()
+                                        .min_w(px(0.0))
+                                        .whitespace_normal()
+                                        .text_size(metrics.caption_size())
+                                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                                        .child(strings.quick_unsaved_note)
+                                },
+                            )),
+                    )
+                    // A growing spacer in the wrapping row took the leftover width and
+                    // pushed Close onto a line of its own. That line, under the X11
+                    // notice, left the file pane shorter than a failed transfer (R4).
+                    .child(
+                        components::icon_only_button(Icon::Close, metrics)
+                            .id("session.close")
+                            .debug_selector(|| "session.close".to_owned())
+                            .tooltip(components::tooltip(strings.session_close))
+                            .on_click(cx.listener(move |view, _event, _window, cx| {
+                                view.request_close_session(id, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_end()
+                    .w_full()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .children(self.solo_split_buttons(cx))
+                    .when_some(files_button, |row, button| row.child(button))
+                    .when_some(forward_host, |row, host| {
+                        row.child(self.icon_text_button(
+                            SharedString::from("session.forwards"),
+                            Icon::Forward,
+                            copy::ux().session_forwards,
+                            Variant::Ghost,
+                            cx,
+                            move |view, cx| {
+                                view.show_forwards_scope(
+                                    crate::app::forwarding::ForwardScope::Host(host),
+                                    cx,
+                                );
                             },
                         ))
-                        // The close control sits on this line, in the space after the
-                        // name. On the action line it was the one button that wrapped,
-                        // and that extra line left the file pane shorter than the
-                        // failure reason it has to show whole (R4).
-                        .child(div().flex_1().min_w(px(0.0)))
-                        .child(
-                            components::icon_only_button(Icon::Close, metrics)
-                                .id("session.close")
-                                .debug_selector(|| "session.close".to_owned())
-                                .tooltip(components::tooltip(strings.session_close))
-                                .on_click(cx.listener(move |view, _event, _window, cx| {
-                                    view.request_close_session(id, cx);
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_end()
-                        .w_full()
-                        .gap(metrics.scale(spacing::HAIRLINE))
-                        .children(self.solo_split_buttons(cx))
-                        .when_some(files_button, |row, button| row.child(button))
-                        .when_some(forward_host, |row, host| {
+                    })
+                    .when(can_reconnect, |row| {
+                        row.child(self.icon_text_button(
+                            SharedString::from("session.reconnect"),
+                            Icon::Refresh,
+                            strings.session_reconnect,
+                            Variant::Primary,
+                            cx,
+                            move |view, cx| view.reconnect_session(id, cx),
+                        ))
+                    })
+                    .when(
+                        self.unsaved.iter().any(|(session, _)| *session == id),
+                        |row| {
                             row.child(self.icon_text_button(
-                                SharedString::from("session.forwards"),
-                                Icon::Forward,
-                                copy::ux().session_forwards,
-                                Variant::Ghost,
-                                cx,
-                                move |view, cx| {
-                                    view.show_forwards_scope(
-                                        crate::app::forwarding::ForwardScope::Host(host),
-                                        cx,
-                                    );
-                                },
-                            ))
-                        })
-                        .when(can_reconnect, |row| {
-                            row.child(self.icon_text_button(
-                                SharedString::from("session.reconnect"),
-                                Icon::Refresh,
-                                strings.session_reconnect,
+                                SharedString::from("session.save_host"),
+                                Icon::Server,
+                                strings.quick_save_host,
                                 Variant::Primary,
                                 cx,
-                                move |view, cx| view.reconnect_session(id, cx),
+                                move |view, cx| view.save_quick_host(id, cx),
                             ))
-                        })
-                        .when(
-                            self.unsaved.iter().any(|(session, _)| *session == id),
-                            |row| {
-                                row.child(self.icon_text_button(
-                                    SharedString::from("session.save_host"),
-                                    Icon::Server,
-                                    strings.quick_save_host,
-                                    Variant::Primary,
-                                    cx,
-                                    move |view, cx| view.save_quick_host(id, cx),
-                                ))
-                            },
-                        ),
-                );
+                        },
+                    ),
+            );
         let notice = self.quick_save_notice.clone();
         // A failed bridge says why in the bar's tooltip, but a tooltip is a pointer
         // target: the reason and the next step are repeated as text under the bar so a
         // keyboard user reads them too (R4, R11).
+        // The notice stays under the terminal, where the short reason fits whole.
+        // While files are open it would sit above that pane and leave a failed
+        // transfer shorter than its reason and Retry, so the chip on the bar is
+        // the state and the body comes back with the terminal (R4).
         let x11_failure = match self.x11.get(&id) {
-            Some(X11Status::Failed { reason, next_step }) => {
+            Some(X11Status::Failed { reason, next_step }) if !self.files.is_open(id) => {
                 Some((reason.clone(), next_step.clone()))
             }
             _ => None,

@@ -17937,3 +17937,87 @@ async fn a_failed_transfer_shows_its_reason_and_retry_in_the_minimum_window(
         assert_fits_inside(bounds, viewport, selector);
     }
 }
+
+/// A failed transfer stays readable in the minimum window while X11 also failed.
+///
+/// The notice under the session bar is tall enough for the short X11 reason. Leaving
+/// it there with files open pushes Retry past the client edge, so the body yields
+/// while the file pane is up and the chip stays (R4).
+#[gpui::test]
+async fn a_transfer_failure_stays_whole_while_x11_failed_at_two_hundred_percent(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    click(cx, "nav.hosts");
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::X11(X11Status::Failed {
+                        reason: "no local X display is available: DISPLAY is not set".to_owned(),
+                        next_step: "Start an X server for this computer and make sure DISPLAY names it, or connect without X11 forwarding.".to_owned(),
+                    }),
+                    shellune_ssh::RemoteEvent::Connected,
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+    let id = cx
+        .update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .sessions()
+                .items()
+                .iter()
+                .find(|session| {
+                    session.kind().is_remote() && matches!(session.state(), SessionState::Connected)
+                })
+                .map(|session| session.id())
+        })
+        .expect("the remote session is live");
+    show_remote_terminal(cx, &view, id);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let task = transfers.starts()[0].transfer;
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Failed {
+            failure: shellune_core::TransferFailure::NotFound,
+            residue: None,
+            resume: None,
+        },
+    });
+    pump_files(cx, &view);
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.x11.failed").is_some(),
+        "the bar still says the bridge failed"
+    );
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    for selector in ["transfers.state.0", "transfers.retry.0"] {
+        let bounds = bounds_of(cx, selector);
+        let outer = bounds_of(cx, "files.transfers");
+        assert!(
+            bounds.origin.y >= outer.origin.y - px(0.5)
+                && bounds.origin.y + bounds.size.height
+                    <= outer.origin.y + outer.size.height + px(0.5),
+            "{selector} is clipped inside the transfer strip: {bounds:?} in {outer:?}"
+        );
+        assert_fits_inside(bounds, viewport, selector);
+    }
+    assert_fits_inside(bounds_of(cx, "session.close"), viewport, "session.close");
+}
