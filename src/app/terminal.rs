@@ -30,7 +30,7 @@ use std::ops::Range;
 
 use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession, X11Status};
-use shellune_terminal::core::SearchOptions;
+use shellune_terminal::core::{LineAnchor, SearchOptions};
 use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
     GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, MouseAction,
@@ -424,10 +424,18 @@ pub struct TerminalPane {
     search_hits: Vec<HistoryMatch>,
     /// Index of the match the viewport was last put on, counted from zero.
     search_at: usize,
+    /// The current hit as a stable row, so a recount can find it after the grid
+    /// has moved the raw line numbers.
+    search_mark: Option<LineAnchor>,
     /// Literal, case and expression switches, shared by the scrollback and the blocks.
     search_options: SearchOptions,
-    /// Where the viewport was when the bar opened, put back when it closes.
-    search_scroll: Option<usize>,
+    /// Top row of the viewport when the bar opened, put back when it closes.
+    ///
+    /// `None` means the viewport was pinned to the live bottom. A display offset
+    /// is not stored: while the reader is parked in history, new output increases
+    /// that offset so the same rows stay on screen, and the old number would
+    /// close onto a lower row.
+    search_scroll: Option<LineAnchor>,
     block_filter: BlockFilter,
     /// The shortcuts the pane's own controls answer, as the bindings in force show
     /// them (R5). The view keeps this in step with the settings page.
@@ -586,6 +594,7 @@ impl TerminalPane {
             search_error: None,
             search_hits: Vec::new(),
             search_at: 0,
+            search_mark: None,
             search_options: SearchOptions::literal(),
             search_scroll: None,
             block_filter: BlockFilter::All,
@@ -645,6 +654,7 @@ impl TerminalPane {
             search_error: None,
             search_hits: Vec::new(),
             search_at: 0,
+            search_mark: None,
             search_options: SearchOptions::literal(),
             search_scroll: None,
             block_filter: BlockFilter::All,
@@ -703,6 +713,7 @@ impl TerminalPane {
             search_error: None,
             search_hits: Vec::new(),
             search_at: 0,
+            search_mark: None,
             search_options: SearchOptions::literal(),
             search_scroll: None,
             block_filter: BlockFilter::All,
@@ -777,6 +788,7 @@ impl TerminalPane {
             search_error: None,
             search_hits: Vec::new(),
             search_at: 0,
+            search_mark: None,
             search_options: SearchOptions::literal(),
             search_scroll: None,
             block_filter: BlockFilter::All,
@@ -1483,9 +1495,11 @@ impl TerminalPane {
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_open = true;
         self.search_focused = true;
-        // Remembered before anything scrolls, so closing puts the reader back on the
-        // line they were reading rather than at the bottom of a live shell.
-        self.search_scroll = Some(self.core.display_offset());
+        // The top row, taken before anything scrolls, so closing puts the reader
+        // back on the line they were reading rather than at the bottom of a live
+        // shell. The anchor, not the display offset: new output while this row is
+        // parked in history grows the offset and would otherwise close lower.
+        self.search_scroll = self.core.parked_viewport();
         self.refresh_search(true);
         window.focus(&self.focus);
         cx.notify();
@@ -1498,9 +1512,11 @@ impl TerminalPane {
         self.search_query.clear();
         self.search_hits.clear();
         self.search_at = 0;
+        self.search_mark = None;
         self.search_error = None;
-        if let Some(offset) = self.search_scroll.take() {
-            self.scroll_to_offset(offset);
+        match self.search_scroll.take() {
+            Some(anchor) => self.scroll_to_offset(self.core.offset_of(anchor)),
+            None => self.core.scroll_to_bottom(),
         }
         // The terminal is where the keyboard was, and where it goes back to.
         window.focus(&self.focus);
@@ -1520,11 +1536,19 @@ impl TerminalPane {
     /// open only recounts, so the numbers stay true without moving the viewport the
     /// reader is looking at.
     fn refresh_search(&mut self, reveal: bool) {
-        let previous = self.search_hits.get(self.search_at).map(|hit| hit.line);
+        // Resolved after the grid has moved. Comparing the line number saved
+        // before a scroll with the numbers after it skips the hit: those numbers
+        // are more negative, so the old line now belongs to a later match.
+        let previous = self.search_mark.and_then(|anchor| {
+            self.core
+                .line_of(anchor)
+                .map(|line| (line, anchor.column()))
+        });
         self.search_hits.clear();
         self.search_at = 0;
         self.search_error = None;
         if self.search_query.is_empty() {
+            self.search_mark = None;
             return;
         }
         match self
@@ -1534,27 +1558,42 @@ impl TerminalPane {
             Ok(hits) => {
                 self.search_hits = hits;
                 let Some(last) = self.search_hits.len().checked_sub(1) else {
+                    self.search_mark = None;
                     return;
                 };
-                // A longer query keeps the reader near the line they were on: the
-                // first match at or below it, or the last one when the query moved
-                // past every remaining match.
+                // A longer query keeps the reader near the hit they were on: the
+                // first match at or below that row, or the last one when the query
+                // moved past every remaining match.
                 self.search_at = match previous {
-                    Some(line) => self
+                    Some((line, column)) => self
                         .search_hits
                         .iter()
-                        .position(|hit| hit.line >= line)
+                        .position(|hit| {
+                            hit.line > line || (hit.line == line && hit.column >= column)
+                        })
                         .unwrap_or(last),
                     None => 0,
                 };
+                self.note_search_hit();
                 if reveal {
                     self.reveal_current();
                 }
             }
             // A pattern the engine cannot compile is reported, and the empty list it
             // leaves behind is never drawn as "no matches".
-            Err(failure) => self.search_error = Some(failure.reason),
+            Err(failure) => {
+                self.search_error = Some(failure.reason);
+                self.search_mark = None;
+            }
         }
+    }
+
+    /// Remembers the current hit as a stable row.
+    fn note_search_hit(&mut self) {
+        self.search_mark = self
+            .search_hits
+            .get(self.search_at)
+            .map(|hit| self.core.anchor_line(hit.line, hit.column));
     }
 
     fn reveal_current(&mut self) {
@@ -1614,6 +1653,7 @@ impl TerminalPane {
         let current = i32::try_from(self.search_at).unwrap_or(0);
         let next = (current + step).rem_euclid(count);
         self.search_at = usize::try_from(next).unwrap_or(0);
+        self.note_search_hit();
         self.reveal_current();
         cx.notify();
     }

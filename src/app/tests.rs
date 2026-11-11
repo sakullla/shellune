@@ -2544,6 +2544,112 @@ async fn closing_the_find_bar_restores_the_scroll_position_and_the_keyboard(
     );
 }
 
+/// History long enough to park the viewport, with three matches far enough apart
+/// that a one-line shift cannot make the next match look like the current one.
+fn parked_history() -> String {
+    let mut lines = Vec::with_capacity(120);
+    lines.push("mark-alpha".to_owned());
+    for index in 0..40 {
+        lines.push(format!("filler {index}"));
+    }
+    lines.push("mark-beta".to_owned());
+    for index in 40..80 {
+        lines.push(format!("filler {index}"));
+    }
+    lines.push("mark-gamma".to_owned());
+    for index in 80..120 {
+        lines.push(format!("filler {index}"));
+    }
+    lines.join("\r\n")
+}
+
+#[gpui::test]
+async fn new_output_while_searching_parked_history_keeps_the_place_and_the_hit(
+    cx: &mut TestAppContext,
+) {
+    let (pane, cx) = pane_with(&parked_history(), cx);
+    let center = bounds_of(cx, "terminal.viewport").center();
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Lines(point(0.0, 3.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: Default::default(),
+    });
+    cx.run_until_parked();
+    let parked = cx.update(|_window, app| pane.read(app).display_offset());
+    assert!(
+        parked > 0,
+        "the viewport is parked in history, not on the live row"
+    );
+    let reading = cx.update(|_window, app| pane.read(app).visible_text());
+
+    click(cx, "terminal.search");
+    cx.simulate_input("mark-");
+    cx.run_until_parked();
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 3
+        },
+        "the first of the three marks is current"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text().first().cloned()),
+        Some("mark-alpha".to_owned()),
+        "locating the first mark puts that line at the top"
+    );
+
+    // One new row while the bar is open and the viewport is not pinned to the
+    // bottom. The grid keeps the same rows on screen by growing display_offset;
+    // the saved offset and the saved match line must grow with it.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(b"\r\nfresh line\r\n", cx)
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| pane.read(app).display_offset()) > parked,
+        "the parked viewport's offset grew with the new row"
+    );
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 1,
+            total: 3
+        },
+        "the count stays on the mark that was current, not the next one the shift made look later"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text().first().cloned()),
+        Some("mark-alpha".to_owned()),
+        "recounting leaves the reader on the same mark"
+    );
+
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        search_state_of(&pane, cx).note,
+        SearchNote::Position {
+            position: 2,
+            total: 3
+        },
+        "the next place is the next mark, not the one after the shifted index"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text().first().cloned()),
+        Some("mark-beta".to_owned()),
+        "the next place is mark-beta, not mark-gamma"
+    );
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).visible_text()),
+        reading,
+        "closing puts back the rows that were on screen before the search"
+    );
+}
+
 #[gpui::test]
 async fn the_case_and_expression_switches_narrow_the_same_query(cx: &mut TestAppContext) {
     let (pane, cx) = pane_with("needle\r\nNeedle", cx);

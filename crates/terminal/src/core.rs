@@ -186,6 +186,26 @@ pub struct HistoryMatch {
     pub text: String,
 }
 
+/// A grid row that still names the same content after lines scroll into history.
+///
+/// `stable` is `history_size + line + lines_dropped`, the same quantity a command
+/// block stores. A raw line number is not that quantity: while the viewport is
+/// parked in history, new output moves every existing row further up the grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineAnchor {
+    stable: i64,
+    /// Byte column of a search hit. A viewport row leaves this at zero.
+    column: usize,
+}
+
+impl LineAnchor {
+    /// Byte column captured with the row.
+    #[must_use]
+    pub fn column(self) -> usize {
+        self.column
+    }
+}
+
 /// How a query is compared with the terminal's text (R1).
 ///
 /// The scrollback and the command blocks read the same options, so one query means
@@ -752,6 +772,51 @@ impl TerminalCore {
         self.scroll(target.saturating_sub(current));
     }
 
+    /// Anchors `line` so it can be found again after the grid scrolls.
+    #[must_use]
+    pub fn anchor_line(&self, line: i32, column: usize) -> LineAnchor {
+        LineAnchor {
+            stable: self.stable_line(line),
+            column,
+        }
+    }
+
+    /// Top row of a viewport parked in history.
+    ///
+    /// `None` means the viewport is pinned to the live bottom. That pin is not a
+    /// row: new output leaves it there, and anchoring line 0 would later scroll
+    /// back to an old row.
+    #[must_use]
+    pub fn parked_viewport(&self) -> Option<LineAnchor> {
+        let offset = self.display_offset();
+        if offset == 0 {
+            return None;
+        }
+        let line = -i32::try_from(offset).unwrap_or(i32::MAX);
+        Some(self.anchor_line(line, 0))
+    }
+
+    /// Grid line of `anchor`, if that row is still in the grid.
+    #[must_use]
+    pub fn line_of(&self, anchor: LineAnchor) -> Option<i32> {
+        self.line_from_stable(anchor.stable)
+    }
+
+    /// Display offset that puts `anchor` at the top of the viewport.
+    ///
+    /// A row that has fallen out of the scrollback clamps to the oldest row still
+    /// kept. A row on the live screen clamps to the bottom.
+    #[must_use]
+    pub fn offset_of(&self, anchor: LineAnchor) -> usize {
+        let history = self.history();
+        let history_i = i64::try_from(history).unwrap_or(i64::MAX);
+        let line = anchor.stable - self.lines_dropped - history_i;
+        if line >= 0 {
+            return 0;
+        }
+        usize::try_from(-line).unwrap_or(history).min(history)
+    }
+
     fn grid_point(&self, row: usize, column: usize) -> Point {
         let column = column.min(self.grid.cols.saturating_sub(1));
         let row = row.min(self.grid.rows.saturating_sub(1));
@@ -833,22 +898,32 @@ impl TerminalCore {
 
     fn anchor_now(&self) -> GridAnchor {
         let point = self.term.grid().cursor.point;
-        let history = self.term.grid().history_size() as i64;
         GridAnchor {
-            stable: history + i64::from(point.line.0) + self.lines_dropped,
+            stable: self.stable_line(point.line.0),
             column: point.column.0,
         }
     }
 
-    fn point_of(&self, anchor: GridAnchor) -> Option<Point> {
+    /// `history_size + line + lines_dropped`. Command blocks and search anchors
+    /// both use this, so a row that scrolled into history stays the same row.
+    fn stable_line(&self, line: i32) -> i64 {
         let history = self.term.grid().history_size() as i64;
-        let line = anchor.stable - self.lines_dropped - history;
+        history + i64::from(line) + self.lines_dropped
+    }
+
+    fn line_from_stable(&self, stable: i64) -> Option<i32> {
+        let history = self.term.grid().history_size() as i64;
+        let line = stable - self.lines_dropped - history;
         let top = -history;
         let bottom = self.term.grid().screen_lines() as i64 - 1;
-        if line < top || line > bottom {
+        if !(top..=bottom).contains(&line) {
             return None;
         }
-        let line = i32::try_from(line).ok()?;
+        i32::try_from(line).ok()
+    }
+
+    fn point_of(&self, anchor: GridAnchor) -> Option<Point> {
+        let line = self.line_from_stable(anchor.stable)?;
         let column = anchor.column.min(self.grid.cols.saturating_sub(1));
         Some(Point::new(Line(line), Column(column)))
     }
@@ -1015,6 +1090,58 @@ mod tests {
             Some("line 8"),
             "returning to the bottom restores the live output"
         );
+    }
+
+    #[test]
+    fn a_parked_viewport_and_a_match_keep_their_rows_when_output_arrives() {
+        let mut terminal = TerminalCore::new(20, 5, 100);
+        for line in 0..12 {
+            terminal.feed(format!("line {line}\r\n").as_bytes());
+        }
+        assert!(terminal.parked_viewport().is_none());
+        terminal.scroll(5);
+        let shown = terminal.snapshot().text();
+        let parked = terminal
+            .parked_viewport()
+            .expect("the viewport is in history");
+        let hits = terminal
+            .search_history("line 3", SearchOptions::literal())
+            .expect("a literal query compiles");
+        let mark = terminal.anchor_line(hits[0].line, hits[0].column);
+        let saved_offset = terminal.display_offset();
+
+        terminal.feed(b"extra\r\n");
+        assert!(
+            terminal.display_offset() > saved_offset,
+            "a parked viewport's raw offset grows so the same rows stay put"
+        );
+        assert_eq!(terminal.offset_of(parked), terminal.display_offset());
+        assert_eq!(
+            terminal.snapshot().text(),
+            shown,
+            "the rows on screen are the ones that were parked"
+        );
+        let line = terminal
+            .line_of(mark)
+            .expect("the match is still in the grid");
+        let again = terminal
+            .search_history("line 3", SearchOptions::literal())
+            .expect("a literal query compiles");
+        assert_eq!(again[0].line, line);
+        assert!(
+            again[0].line < hits[0].line,
+            "the raw line number moved, the anchor did not"
+        );
+
+        // Restoring the number captured before the new row lands lower.
+        terminal.scroll_to_bottom();
+        let current = i32::try_from(terminal.display_offset()).unwrap_or(0);
+        terminal.scroll(i32::try_from(saved_offset).unwrap_or(0) - current);
+        assert_ne!(terminal.snapshot().text(), shown);
+        let restored = i32::try_from(terminal.offset_of(parked)).unwrap_or(0);
+        let current = i32::try_from(terminal.display_offset()).unwrap_or(0);
+        terminal.scroll(restored - current);
+        assert_eq!(terminal.snapshot().text(), shown);
     }
 
     #[test]
