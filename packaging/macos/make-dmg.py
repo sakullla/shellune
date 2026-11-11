@@ -3,7 +3,7 @@
 
 Usage:
     python3 packaging/macos/make-dmg.py --app dist/Shellune.app \
-        [--version 0.3.2] [--out dist]
+        [--version 0.4.0] [--out dist]
 
 Result: dist/Shellune-<version>-macos-arm64.dmg holding Shellune.app beside an
 /Applications symlink, so installing is dragging the app onto the symlink. The
@@ -37,7 +37,7 @@ def run(command):
 def main():
     parser = argparse.ArgumentParser(description="wrap Shellune.app in a DMG")
     parser.add_argument("--app", required=True)
-    parser.add_argument("--version", default="0.3.2")
+    parser.add_argument("--version", default="0.4.0")
     parser.add_argument("--out", default=os.path.join(REPO, "dist"))
     args = parser.parse_args()
 

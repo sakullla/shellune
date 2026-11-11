@@ -6049,7 +6049,7 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shellune"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "embed-resource",
  "gpui",
@@ -6066,7 +6066,7 @@ dependencies = [
 
 [[package]]
 name = "shellune-core"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6077,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "shellune-ssh"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "russh",
  "russh-sftp",
@@ -6092,7 +6092,7 @@ dependencies = [
 
 [[package]]
 name = "shellune-storage"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "keyring",
  "serde",
@@ -6103,7 +6103,7 @@ dependencies = [
 
 [[package]]
 name = "shellune-terminal"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "portable-pty",
