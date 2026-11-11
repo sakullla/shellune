@@ -521,33 +521,24 @@ Enter/Space 触发当前控件——与指针点击调用同一段代码，所�
 
 #### 2026-11-11 Windows 实窗
 
-同一次进程在 `SHELLUNE_LOG_VIEWPORT=1` 时把下面四行原样写到 stdout。数字没有改过：
+这次进程在 `SHELLUNE_LOG_VIEWPORT=1` 时把下面两行原样写到 stdout。数字没有改过：
 
 ```
 shellune-viewport viewport_size=1120x720 scale_factor=1.5 text_size=200%
-shellune-viewport viewport_size=1120x720 scale_factor=1.5 text_size=200%
-shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
 shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
 ```
 
-界面文字从这一进程一开始就是 200%。前两行是窗口刚出现时的视口，同一测量写了两次。客户区随后被收成 1080×720
-物理像素（该窗口 dpi 144），进程改报 `viewport_size=720x480`、`scale_factor=1.5`，这一测量也写了两次。
-没有把窗口拉到别的尺寸。下面的图是最后一行之后截的客户区，截图时客户区仍是 1080×720 物理像素。界面语言是英文。
+界面文字从这一进程一开始就是 200%。第一行是窗口刚出现时的视口。客户区随后被收成 1080×720
+物理像素（该窗口 dpi 144），进程改报 `viewport_size=720x480`、`scale_factor=1.5`。
+没有把窗口拉到别的尺寸。界面语言是英文。
 
-- 连接对话框标题整词是 “Connect to test”，关闭在标题行右侧。状态芯片在标题下面一行（先是 Connecting，随后是
-  Could not connect），标题没有再被切成半个词。副标题 `root@212.60.153.19:22` 完整。
-  ![连接对话框](windows-720x480-200-connection-dialog.png)
-- 设置页主题分段是 System、Light、Dark，每个分段都完整。
-  ![主题](windows-720x480-200-settings-theme.png)
-- 默认 Shell 在行内换行：Windows PowerShell、PowerShell 7、Command Prompt 都完整。
-  ![默认 Shell](windows-720x480-200-settings-shell.png)
-- 快捷键行里 keycap 与 Change、Unbind 留在卡片内。Go to settings 这一行能看见 Ctrl+3 和 Ctrl+,。
-  ![快捷键](windows-720x480-200-settings-keys.png)
-- 新建的本地 Windows PowerShell 打开了终端搜索条。
-  ![搜索](windows-720x480-200-terminal-search.png)
+已保存主机 lan109（root@192.168.0.109:22）用本机私钥连了一次。对话框里能看见的指纹以
+`SHA256:XR6MByyOO2` 开头，与本机 OpenSSH known_hosts 里该地址的 ED25519 指纹开头一致。接受后服务器拒绝了所提供的密钥，
+对话框停在 Could not connect。看得见的原因是 hop 1 "lan109" (root@192.168.0.109:22) failed: the server rejected the offered，
+下一行被窗口裁切；下一步是 Check the credentials, or change the authentication method。没有再试。
+因此没有传输失败图，也没有这次进程的 X11 失败图。macOS 没有实窗。Linux 上也没有把本应用窗口打开在 root@192.168.0.109 的显示 :1 上。
 
-已保存主机 test（root@212.60.153.19:22）用密钥连了一次，对话框停在 Could not connect，没有再试。没有 X11
-失败图，也没有传输失败图。macOS 没有实窗。Linux 上也没有把本应用窗口打开在 root@192.168.0.109 的显示 :1 上。
+同一天较早一次进程留下的连接、主题、默认 Shell、快捷键和搜索图不是这次视口记录之后截的，不能当作这次的传输失败或 X11 失败。
 
 设置页换行没有改。`SHELLUNE_LOG_VIEWPORT` 默认仍关闭，只有这次进程设了 `=1`。
 
