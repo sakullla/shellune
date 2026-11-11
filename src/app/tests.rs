@@ -12197,24 +12197,25 @@ async fn the_tab_identity_rows_stay_inside_their_cards_and_are_reached_by_scroll
         "the name field is outside the part of the body that is on screen: {field:?} in {rename_body:?}"
     );
 
-    // ... and the colours are one scroll away, wrapped inside the dialog's own width.
+    // The colours stay inside the dialog's own width. The row wraps when one line
+    // would run past that width, and stays one line when the dialog is wide enough.
+    // Either way each swatch sits fully inside the row. The row starts at the bottom
+    // of this body, so the scroll below is how the rest of a swatch is reached.
     let accents = bounds_of(cx, "tab.rename.accents");
     assert_inside_horizontally(accents, rename, "the colour row");
-    let mut swatches = Vec::new();
     for accent in ["none", "iris", "violet", "teal", "lime", "orchid", "clay"] {
         let selector: &'static str =
             Box::leak(format!("tab.rename.accent.{accent}").into_boxed_str());
         let bounds = bounds_of(cx, selector);
         assert_inside_horizontally(bounds, accents, selector);
+        assert!(
+            bounds.origin.y >= accents.origin.y - px(0.5)
+                && bounds.origin.y + bounds.size.height
+                    <= accents.origin.y + accents.size.height + px(0.5),
+            "{selector} is clipped by its own row: {bounds:?} in {accents:?}"
+        );
         assert_pointer_target(cx, selector);
-        swatches.push(bounds);
     }
-    assert!(
-        swatches
-            .windows(2)
-            .any(|pair| pair[0].origin.y != pair[1].origin.y),
-        "the swatches take a second line inside the row instead of running past it: {swatches:?}"
-    );
     cx.simulate_event(gpui::ScrollWheelEvent {
         position: rename_body.center(),
         delta: gpui::ScrollDelta::Lines(point(0.0, -2.0)),
