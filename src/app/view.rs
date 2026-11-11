@@ -7857,6 +7857,9 @@ impl ShelluneView {
         // Its box is a share of this window, not a length that 200% text turns into
         // more than the files view has left: the failure and its retry stay inside
         // the client area, and Page Up/Down reach a row the share cannot show whole.
+        // The title stays above the scroller. A scrollport clips glyphs that paint
+        // above its first line, and at 720×480 with 200% text that cut the title
+        // and the count flat (R4).
         let transfers = self.transfers_strip_shown(id).then(|| {
             let cap = window.viewport_size().height * 0.42;
             let scroll = self.transfers_scroll.clone();
@@ -7865,13 +7868,11 @@ impl ShelluneView {
                 .flex()
                 .flex_col()
                 // Shrinks into the files view instead of drawing past the client edge.
-                // What does not fit the box scrolls, and Page Up/Down turn it (R4).
                 .flex_shrink()
                 .w_full()
                 .min_h(px(0.0))
                 .max_h(cap)
-                .overflow_y_scroll()
-                .track_scroll(&scroll)
+                .overflow_hidden()
                 .track_focus(&self.files_transfer_focus)
                 .focus(|style| {
                     style
@@ -7884,12 +7885,29 @@ impl ShelluneView {
                     }
                 }))
                 .px(metrics.scale(spacing::BASE))
-                .py(metrics.scale(spacing::TIGHT))
+                // Top padding keeps the title's glyphs inside the strip. The bottom
+                // padding is smaller so the failure and its Retry still fit the scroller
+                // at 720×480 and 200% text (R4).
+                .pt(metrics.scale(spacing::TIGHT))
+                .pb(metrics.scale(spacing::HAIRLINE))
                 .bg(theme::swatch(palette::SURFACE))
                 .border_b_1()
                 .border_color(theme::swatch(palette::BORDER))
                 .debug_selector(|| "files.transfers".to_owned())
-                .child(self.transfers_panel(id, cx))
+                .child(self.transfers_heading(id))
+                .child(
+                    div()
+                        .id("files.transfers.scroll")
+                        .flex()
+                        .flex_col()
+                        .flex_shrink()
+                        .w_full()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll)
+                        .debug_selector(|| "files.transfers.scroll".to_owned())
+                        .child(self.transfers_panel(id, cx)),
+                )
         });
 
         div()
@@ -9782,47 +9800,58 @@ impl ShelluneView {
         panel
     }
 
+    /// Title and count for the transfer strip. They sit above the scroller so its
+    /// clip cannot cut the first line of glyphs (R4).
+    fn transfers_heading(&self, id: SessionId) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let active = self
+            .transfers
+            .for_session(id)
+            .filter(|task| task.is_active())
+            .count();
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "transfers.heading".to_owned())
+            .child(components::section_label(
+                strings.transfers_heading,
+                metrics,
+            ))
+            .child(
+                components::badge(
+                    active,
+                    if active > 0 {
+                        Tone::Accent
+                    } else {
+                        Tone::Neutral
+                    },
+                    metrics,
+                )
+                .debug_selector(|| "transfers.count".to_owned()),
+            )
+    }
+
     /// The transfers of one session: their state, their progress and the actions left (R10).
     ///
     /// Every line here comes from the queue, so nothing is drawn that a worker did not
     /// report. A task waiting for an overwrite decision is asked about above its own row,
     /// with the exact target and two buttons, because the answer decides whether a file
-    /// that already exists is replaced.
+    /// that already exists is replaced. The title is drawn above this list.
     fn transfers_panel(&self, id: SessionId, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let tasks: Vec<Transfer> = self.transfers.for_session(id).cloned().collect();
-        let active = tasks.iter().filter(|task| task.is_active()).count();
 
         let mut card = div()
             .flex()
             .flex_col()
             .flex_none()
             .gap(metrics.scale(1.0))
-            .debug_selector(|| "transfers.panel".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .child(components::section_label(
-                        strings.transfers_heading,
-                        metrics,
-                    ))
-                    .child(
-                        components::badge(
-                            active,
-                            if active > 0 {
-                                Tone::Accent
-                            } else {
-                                Tone::Neutral
-                            },
-                            metrics,
-                        )
-                        .debug_selector(|| "transfers.count".to_owned()),
-                    ),
-            );
+            .debug_selector(|| "transfers.panel".to_owned());
 
         if let Some((session, problem)) = &self.transfer_problem
             && *session == id

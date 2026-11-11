@@ -136,6 +136,31 @@ fn bounds_of(cx: &mut VisualTestContext, selector: &'static str) -> gpui::Bounds
         .unwrap_or_else(|| panic!("{selector} was never rendered"))
 }
 
+/// The transfer title and count sit above the scroller.
+///
+/// The scroller used to be the strip itself, so its clip cut the first line of
+/// glyphs at 720×480 and 200% text. The title has to clear that clip, and the
+/// failure underneath still has to fit the strip.
+fn assert_transfer_title_clears_the_scroll_clip(cx: &mut VisualTestContext) {
+    let strip = bounds_of(cx, "files.transfers");
+    let heading = bounds_of(cx, "transfers.heading");
+    let badge = bounds_of(cx, "transfers.count");
+    let scroll = bounds_of(cx, "files.transfers.scroll");
+    for (name, bounds) in [("transfers.heading", heading), ("transfers.count", badge)] {
+        assert!(
+            bounds.origin.y >= strip.origin.y - px(0.5)
+                && bounds.origin.y + bounds.size.height
+                    <= strip.origin.y + strip.size.height + px(0.5),
+            "{name} is clipped by the transfer strip: {bounds:?} in {strip:?}"
+        );
+    }
+    assert!(
+        scroll.origin.y + px(0.5) >= heading.origin.y + heading.size.height,
+        "the title is still inside the scrollport that clips its first line: \
+         heading {heading:?} scroll {scroll:?}"
+    );
+}
+
 fn destination_of(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> Destination {
     cx.update(|_window, app| view.read(app).workspace().destination())
 }
@@ -18133,6 +18158,7 @@ async fn a_failed_transfer_shows_its_reason_and_retry_in_the_minimum_window(
     let viewport = minimum_window();
     let strip = bounds_of(cx, "files.transfers");
     assert_fits_inside(strip, viewport, "the transfer strip");
+    assert_transfer_title_clears_the_scroll_clip(cx);
     cx.update(|window, app| {
         view.update(app, |view, _cx| view.focus_transfer_strip_for_test(window));
     });
@@ -18231,7 +18257,9 @@ async fn a_transfer_failure_stays_whole_while_x11_failed_at_two_hundred_percent(
         cx.debug_bounds("session.x11.failed").is_some(),
         "the bar still says the bridge failed"
     );
+    assert_transfer_title_clears_the_scroll_clip(cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
+    let scroll = bounds_of(cx, "files.transfers.scroll");
     for selector in ["transfers.state.0", "transfers.retry.0"] {
         let bounds = bounds_of(cx, selector);
         let outer = bounds_of(cx, "files.transfers");
@@ -18240,6 +18268,12 @@ async fn a_transfer_failure_stays_whole_while_x11_failed_at_two_hundred_percent(
                 && bounds.origin.y + bounds.size.height
                     <= outer.origin.y + outer.size.height + px(0.5),
             "{selector} is clipped inside the transfer strip: {bounds:?} in {outer:?}"
+        );
+        assert!(
+            bounds.origin.y >= scroll.origin.y - px(0.5)
+                && bounds.origin.y + bounds.size.height
+                    <= scroll.origin.y + scroll.size.height + px(0.5),
+            "{selector} is clipped inside the transfer scroller: {bounds:?} in {scroll:?}"
         );
         assert_fits_inside(bounds, viewport, selector);
     }

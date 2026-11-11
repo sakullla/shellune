@@ -540,6 +540,7 @@ shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
 - `windows-720x480-200-transfer-failure.png`：同一扇窗口打开文件视图后的一次下载。远端路径是 `/root`（目录，不是缺失文件）。
   原因整段是 “Failed · the server refused the transfer: the source is a directory, not a file”。下一步是 Retry，整颗按钮都在客户区内。
   没有删除远端已有文件。文件视图打开时 X11 常显文本不画，chip 仍在；传输条可以滚动，原因和 Retry 同时留在客户区内。
+  这张图里标题 “Transfers” 和数量徽章的顶部被当时的滚动口切平。标题和数量现在画在滚动区域之上，滚动口只裁下面的任务行。
 
 同日更早一扇窗口留下的图不是这一进程：
 
