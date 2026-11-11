@@ -25,8 +25,8 @@ pub fn custom_titlebar(platform: Platform) -> bool {
 /// The room the macOS window buttons need at the left of the top row.
 pub const TRAFFIC_LIGHT_ROOM: f32 = 72.0;
 
-/// Where the macOS window buttons sit, centred in the 52-point header row.
-pub const TRAFFIC_LIGHT_POSITION: (f32, f32) = (18.0, 19.0);
+/// Where the macOS window buttons sit, centred in the 46-point header row.
+pub const TRAFFIC_LIGHT_POSITION: (f32, f32) = (18.0, 16.0);
 
 /// The background colour of the close button under the pointer, the platform's red.
 const CLOSE_HOVER: u32 = 0xc42b1c;

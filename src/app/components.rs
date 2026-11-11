@@ -350,12 +350,12 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
         .cursor_pointer()
         .child(label.into());
     if selected {
-        base.bg(theme::swatch(palette::SURFACE_SELECTED))
+        base.bg(theme::swatch(palette::SEGMENT_THUMB))
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .font_weight(gpui::FontWeight::MEDIUM)
             .shadow_sm()
             .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .border_color(theme::faded(theme::swatch(palette::BORDER_STRONG), 0.6))
     } else {
         let hover = theme::swatch(palette::TEXT_PRIMARY);
         base.text_color(theme::swatch(palette::TEXT_MUTED))
@@ -384,9 +384,9 @@ pub fn segmented(metrics: Metrics) -> Div {
         .gap(metrics.scale(2.0))
         .p(metrics.scale(3.0))
         .rounded(px(radius::MEDIUM + 1.0))
-        .bg(theme::swatch(palette::CANVAS))
+        .bg(theme::swatch(palette::SEGMENT_TRACK))
         .border_1()
-        .border_color(theme::swatch(palette::BORDER))
+        .border_color(theme::faded(theme::swatch(palette::BORDER), 0.7))
 }
 
 /// Em widths reserved so a label is at least as wide as a UI font, not the test font.
@@ -472,9 +472,9 @@ pub(crate) fn keycap_reserved_width(label: &str, metrics: Metrics) -> Pixels {
 pub fn section_label(label: impl Into<SharedString>, metrics: Metrics) -> Div {
     div()
         .flex_none()
-        .text_size(metrics.caption_size())
+        .text_size(metrics.label_size())
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme::swatch(palette::TEXT_MUTED))
+        .text_color(theme::swatch(palette::TEXT_SECONDARY))
         .child(label.into())
 }
 
@@ -622,9 +622,10 @@ pub fn state_card_with_icon(
         .px(metrics.scale(spacing::LOOSE))
         .py(metrics.scale(spacing::LOOSE + 16.0))
         .rounded(px(radius::XLARGE))
-        .bg(theme::swatch(palette::SURFACE))
+        .bg(theme::swatch(palette::SURFACE_RAISED))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
+        .shadow_xs()
         .child(emblem)
         .child(text)
 }
@@ -668,8 +669,8 @@ pub fn row(metrics: Metrics) -> Div {
         .min_h(metrics.list_row_height() + metrics.scale(4.0))
         .px(metrics.scale(spacing::BASE - 2.0))
         .py(metrics.scale(spacing::TIGHT + 2.0))
-        .rounded(px(radius::LARGE - 2.0))
-        .bg(theme::swatch(palette::SURFACE))
+        .rounded(px(radius::LARGE))
+        .bg(theme::swatch(palette::SURFACE_RAISED))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
         .hover(move |style| style.bg(hover).border_color(hover_border))
@@ -723,8 +724,8 @@ impl Render for Tooltip {
         div()
             .px(metrics.scale(spacing::TIGHT + 1.0))
             .py(metrics.scale(spacing::HAIRLINE + 1.0))
-            .rounded(px(radius::SMALL + 1.0))
-            .bg(theme::swatch(palette::SURFACE_SELECTED))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
             .shadow_lg()

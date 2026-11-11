@@ -25,33 +25,37 @@ pub mod palette {
     /// Application background: the content area and the terminal itself.
     pub const CANVAS: u32 = 0x0b0c10;
     /// Chrome surface: the navigation rail, the tab strip and the status bar.
-    pub const SURFACE: u32 = 0x101116;
+    pub const SURFACE: u32 = 0x111218;
     /// Raised surface for cards, rows and inputs.
-    pub const SURFACE_RAISED: u32 = 0x16181e;
+    pub const SURFACE_RAISED: u32 = 0x171920;
     /// Surface under the pointer, one step above [`SURFACE_RAISED`].
-    pub const SURFACE_HOVER: u32 = 0x1c1f27;
+    pub const SURFACE_HOVER: u32 = 0x1e2029;
     /// Surface used for the selected navigation entry, tab or choice.
-    pub const SURFACE_SELECTED: u32 = 0x23262f;
+    pub const SURFACE_SELECTED: u32 = 0x262935;
     /// Hairline border between regions.
-    pub const BORDER: u32 = 0x1f222a;
+    pub const BORDER: u32 = 0x1f2129;
     /// Border of controls and of an element under the pointer.
-    pub const BORDER_STRONG: u32 = 0x2e323d;
+    pub const BORDER_STRONG: u32 = 0x30333f;
+    /// The sunken track a segmented control's options sit in.
+    pub const SEGMENT_TRACK: u32 = 0x0e0f14;
+    /// The raised thumb under the chosen option of a segmented control.
+    pub const SEGMENT_THUMB: u32 = 0x2b2e3a;
     /// Primary text: titles and the current object.
-    pub const TEXT_PRIMARY: u32 = 0xeceef3;
+    pub const TEXT_PRIMARY: u32 = 0xf0f1f5;
     /// Secondary text: body copy and list metadata.
     pub const TEXT_SECONDARY: u32 = 0xb3b8c6;
     /// Muted text: hints, counts and the status bar.
     pub const TEXT_MUTED: u32 = 0x8b92a3;
     /// Accent used for the selected destination and primary actions.
-    pub const ACCENT: u32 = 0x8fa0ff;
+    pub const ACCENT: u32 = 0x949bff;
     /// Accent under the pointer, for a solid primary button.
-    pub const ACCENT_HOVER: u32 = 0xa9b6ff;
+    pub const ACCENT_HOVER: u32 = 0xaeb3ff;
     /// Text drawn on a solid [`ACCENT`] fill.
-    pub const ON_ACCENT: u32 = 0x0a0d22;
+    pub const ON_ACCENT: u32 = 0x0b0c26;
     /// Accent tint for filled accent surfaces.
-    pub const ACCENT_TINT: u32 = 0x1e2340;
+    pub const ACCENT_TINT: u32 = 0x202249;
     /// Text and icons drawn on [`ACCENT_TINT`].
-    pub const ACCENT_ON_TINT: u32 = 0xc9d0ff;
+    pub const ACCENT_ON_TINT: u32 = 0xcdcfff;
     /// Dark tint behind a positive chip or banner.
     pub const POSITIVE_TINT: u32 = 0x12241d;
     /// Dark tint behind a warning chip or banner.
@@ -69,7 +73,7 @@ pub mod palette {
     pub const PLANNED: u32 = 0xa2a9ba;
     /// Host avatar pairs (tint, text): iris, violet, teal, amber, rose, sky.
     pub const AVATARS: [(u32, u32); 6] = [
-        (0x1e2340, 0xc9d0ff),
+        (ACCENT_TINT, ACCENT_ON_TINT),
         (0x2a1f40, 0xd9c6ff),
         (0x13292a, 0x8fe3d6),
         (0x2b2416, 0xf2d08f),
@@ -77,7 +81,7 @@ pub mod palette {
         (0x162536, 0x9fd3ff),
     ];
     /// Second stop of the brand gradient, a violet beside the accent.
-    pub const BRAND_END: u32 = 0xb48cff;
+    pub const BRAND_END: u32 = 0xc08bff;
     /// Tab identity colours, in [`TabAccent::ALL`] order.
     ///
     /// They are deliberately not the status hues: green, amber and red keep meaning
@@ -402,20 +406,22 @@ pub mod light {
     /// Every token of [`super::palette`] and its light value.
     pub const TABLE: &[(u32, u32)] = &[
         (dark::CANVAS, 0xfcfcfd),
-        (dark::SURFACE, 0xf3f4f7),
+        (dark::SURFACE, 0xf5f6f8),
         (dark::SURFACE_RAISED, 0xffffff),
-        (dark::SURFACE_HOVER, 0xe9ebf0),
-        (dark::SURFACE_SELECTED, 0xe3e6ed),
-        (dark::BORDER, 0xe2e4ea),
-        (dark::BORDER_STRONG, 0xc9cdd6),
-        (dark::TEXT_PRIMARY, 0x1b1d24),
-        (dark::TEXT_SECONDARY, 0x454a57),
+        (dark::SURFACE_HOVER, 0xeef0f3),
+        (dark::SURFACE_SELECTED, 0xe6e8ee),
+        (dark::BORDER, 0xe5e7ec),
+        (dark::BORDER_STRONG, 0xd2d6de),
+        (dark::SEGMENT_TRACK, 0xeceef2),
+        (dark::SEGMENT_THUMB, 0xffffff),
+        (dark::TEXT_PRIMARY, 0x15171c),
+        (dark::TEXT_SECONDARY, 0x464b58),
         (dark::TEXT_MUTED, 0x5f6574),
-        (dark::ACCENT, 0x4653cf),
-        (dark::ACCENT_HOVER, 0x3a46bd),
+        (dark::ACCENT, 0x4f4bd8),
+        (dark::ACCENT_HOVER, 0x403cc4),
         (dark::ON_ACCENT, 0xffffff),
-        (dark::ACCENT_TINT, 0xe5e8ff),
-        (dark::ACCENT_ON_TINT, 0x2f3ba8),
+        (dark::ACCENT_TINT, 0xecebfe),
+        (dark::ACCENT_ON_TINT, 0x3a35b0),
         (dark::POSITIVE_TINT, 0xe1f4ea),
         (dark::WARNING_TINT, 0xfaefd8),
         (dark::DANGER_TINT, 0xfce6e9),
@@ -687,7 +693,7 @@ impl Metrics {
 
     /// Height of the header that names the current object.
     pub fn header_height(self) -> Pixels {
-        self.scale(52.0)
+        self.scale(46.0)
     }
 
     /// Height of one list row.
@@ -731,7 +737,7 @@ impl Metrics {
 
     /// Height of one session tab.
     pub fn tab_height(self) -> Pixels {
-        self.scale(32.0)
+        self.scale(30.0)
     }
 
     /// Body text size.

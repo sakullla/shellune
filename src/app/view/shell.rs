@@ -226,7 +226,7 @@ impl ShelluneView {
                 this.select(Destination::Hosts, window, cx);
             }));
         tab = if selected {
-            tab.bg(theme::swatch(palette::CANVAS))
+            tab.bg(theme::swatch(palette::SURFACE_RAISED))
                 .border_1()
                 .border_color(theme::swatch(palette::BORDER_STRONG))
                 .shadow_sm()
@@ -334,7 +334,7 @@ impl ShelluneView {
 
         let heading = div()
             .flex()
-            .items_end()
+            .items_center()
             .justify_between()
             .flex_wrap()
             .gap(metrics.scale(spacing::SNUG))
@@ -346,7 +346,7 @@ impl ShelluneView {
                     .min_w(px(0.0))
                     .child(
                         div()
-                            .text_size(metrics.hero_size())
+                            .text_size(metrics.hero_size() + metrics.scale(2.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector(|| "header.title".to_owned())
@@ -407,11 +407,12 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .w_full()
-            .max_w(metrics.scale(960.0))
+            .max_w(metrics.scale(super::HOME_MAX_WIDTH))
             .mx_auto()
-            .px(metrics.scale(spacing::LOOSE + 8.0))
-            .py(metrics.scale(spacing::LOOSE + 4.0))
-            .gap(metrics.scale(spacing::LOOSE))
+            .px(metrics.scale(super::HOME_SIDE_PADDING))
+            .pt(metrics.scale(spacing::LOOSE + 12.0))
+            .pb(metrics.scale(spacing::LOOSE + 16.0))
+            .gap(metrics.scale(spacing::LOOSE + 4.0))
             .debug_selector(|| "home".to_owned())
             .child(heading)
             .children(
@@ -524,34 +525,36 @@ impl ShelluneView {
         badge: Option<&'static str>,
     ) -> Div {
         let metrics = self.metrics();
-        let hover_border = theme::swatch(palette::ACCENT);
+        let hover_border = theme::faded(theme::swatch(palette::ACCENT), 0.55);
         let hover_bg = theme::swatch(palette::SURFACE_RAISED);
         div()
             .group("home-card")
             .flex()
             .items_center()
             .gap(metrics.scale(spacing::SNUG))
-            .w(metrics.scale(210.0))
-            .p(metrics.scale(spacing::SNUG))
+            .w(metrics.scale(228.0))
+            .p(metrics.scale(spacing::SNUG + 2.0))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
+            .shadow_xs()
             .cursor_pointer()
-            .hover(move |style| style.border_color(hover_border).bg(hover_bg))
+            .hover(move |style| style.border_color(hover_border).bg(hover_bg).shadow_md())
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .size(metrics.scale(36.0))
-                    .rounded(px(radius::MEDIUM))
-                    .bg(theme::swatch(palette::ACCENT_TINT))
+                    .size(metrics.scale(38.0))
+                    .rounded(px(radius::MEDIUM + 2.0))
+                    .bg(super::brand_gradient())
+                    .shadow_sm()
                     .child(icons::icon(
                         icon,
                         metrics.icon_size(),
-                        theme::swatch(palette::ACCENT),
+                        theme::swatch(palette::ON_ACCENT),
                     )),
             )
             .child(
@@ -617,9 +620,10 @@ impl ShelluneView {
                 .gap(metrics.scale(spacing::LOOSE))
                 .p(metrics.scale(spacing::LOOSE))
                 .rounded(px(radius::XLARGE))
-                .bg(theme::swatch(palette::SURFACE))
+                .bg(theme::swatch(palette::SURFACE_RAISED))
                 .border_1()
                 .border_color(theme::swatch(palette::BORDER))
+                .shadow_xs()
                 .debug_selector(|| "hosts.empty".to_owned())
                 .child(
                     div()
@@ -629,11 +633,12 @@ impl ShelluneView {
                         .justify_center()
                         .size(metrics.scale(56.0))
                         .rounded(px(radius::XLARGE))
-                        .bg(theme::swatch(palette::ACCENT_TINT))
+                        .bg(super::brand_gradient())
+                        .shadow_md()
                         .child(icons::icon(
                             Icon::Server,
                             metrics.scale(26.0),
-                            theme::swatch(palette::ACCENT),
+                            theme::swatch(palette::ON_ACCENT),
                         )),
                 )
                 .child(
@@ -900,7 +905,7 @@ impl ShelluneView {
                     .gap(metrics.scale(spacing::HAIRLINE))
                     .child(
                         div()
-                            .text_size(metrics.hero_size())
+                            .text_size(metrics.hero_size() + metrics.scale(2.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector(|| "header.title".to_owned())
@@ -1531,9 +1536,10 @@ impl ShelluneView {
             .w_full()
             .min_w(px(0.0))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
+            .shadow_xs()
             .debug_selector(move || format!("settings.card.{id}"));
         for (index, row) in rows.into_iter().enumerate() {
             card = card.child(row.when(index + 1 < count, |row| {
@@ -1622,7 +1628,20 @@ impl ShelluneView {
         pick: impl Fn(&mut Self, usize, &mut Context<Self>) + Clone + 'static,
     ) -> Div {
         let metrics = self.metrics();
-        let mut control = components::segmented(metrics).debug_selector(move || id.to_owned());
+        // The track's own floor is the sum of its segments' floors, capped at what a
+        // settings row has at the minimum window. Without it the track measured its
+        // labels' natural widths, which are narrower than the floors of short labels
+        // ("Full"), and the last segment wrapped under the others in a wide window.
+        let floor = options
+            .iter()
+            .map(|(label, _)| components::segment_reserved_width(label, metrics))
+            .fold(px(0.0), |sum, width| sum + width)
+            + metrics.scale(2.0) * options.len().saturating_sub(1) as f32
+            + metrics.scale(3.0) * 2.0
+            + px(2.0);
+        let mut control = components::segmented(metrics)
+            .min_w(floor.min(components::settings_row_content_cap(metrics)))
+            .debug_selector(move || id.to_owned());
         for (index, (label, selected)) in options.into_iter().enumerate() {
             let pick = pick.clone();
             let reserved = components::segment_reserved_width(&label, metrics);
@@ -1715,10 +1734,10 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .rounded(px(radius::XLARGE))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_lg()
+            .shadow_2xl()
             .overflow_hidden()
             .occlude()
             .child(header)
@@ -1748,7 +1767,7 @@ impl ShelluneView {
                         .id(SharedString::from(format!("{id}.backdrop")))
                         .absolute()
                         .inset_0()
-                        .bg(gpui::rgba(0x0000_0080))
+                        .bg(gpui::rgba(0x0508_1470))
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                             cx.stop_propagation();
@@ -1772,7 +1791,7 @@ impl ShelluneView {
         self.modal_header_with(icon, title, subtitle, None, close_id, cx, close)
     }
 
-    /// [`Self::modal_header`] with a badge before the close button.
+    /// [`Self::modal_header`] with a badge under the title.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn modal_header_with(
         &self,
@@ -1785,14 +1804,45 @@ impl ShelluneView {
         close: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> (Div, Option<Div>) {
         let metrics = self.metrics();
-        // The title stays on its own row with the close button. The subtitle is
-        // returned separately and drawn at the top of the scrolling body: beside the
-        // icon it wrapped one glyph per line, and in the fixed header a full sentence
-        // at 200% text left the body 24px tall, so the editor could not be scrolled
-        // into view (R4).
-        // A status chip on this row is flex_none. At 720×480 and 200% the title
-        // column is then narrower than one word, and truncate cuts a glyph with no
-        // ellipsis. The chip takes the next row and the title wraps on spaces.
+        let lead = icon.map(|icon| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(metrics.scale(32.0))
+                .rounded(px(radius::MEDIUM + 2.0))
+                .bg(theme::swatch(palette::ACCENT_TINT))
+                .child(icons::icon(
+                    icon,
+                    metrics.icon_size(),
+                    theme::swatch(palette::ACCENT),
+                ))
+        });
+        self.modal_header_lead(lead, title, subtitle, badge, close_id, cx, close)
+    }
+
+    /// The header of a dialog with any leading tile: a host's avatar, or an icon.
+    ///
+    /// The title and the badge share one column beside the tile. The subtitle is
+    /// returned separately and drawn at the top of the scrolling body: beside the
+    /// icon it wrapped one glyph per line, and in the fixed header a full sentence
+    /// at 200% text left the body 24px tall, so the editor could not be scrolled
+    /// into view (R4). A title with a badge wraps on spaces: at 720×480 and 200% the
+    /// column is narrower than one word, and truncate would cut a glyph with no
+    /// ellipsis.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn modal_header_lead(
+        &self,
+        lead: Option<Div>,
+        title: String,
+        subtitle: Option<String>,
+        badge: Option<Div>,
+        close_id: &'static str,
+        cx: &mut Context<Self>,
+        close: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> (Div, Option<Div>) {
+        let metrics = self.metrics();
         let wrapping = badge.is_some();
         let title = div()
             .min_w(px(0.0))
@@ -1800,38 +1850,30 @@ impl ShelluneView {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .when(wrapping, |title| title.w_full().whitespace_normal())
-            .when(!wrapping, |title| title.flex_1().truncate())
+            .when(!wrapping, |title| title.w_full().truncate())
             .child(SharedString::from(title));
-        let title = if wrapping {
-            div().flex_1().min_w(px(0.0)).child(title)
-        } else {
-            title
-        };
+        let column = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .child(title)
+            .children(badge.map(|badge| div().flex().min_w(px(0.0)).child(badge)));
         let bar = div()
             .flex()
             .flex_none()
             .w_full()
-            .items_center()
+            .min_w(px(0.0))
+            .when(wrapping, |bar| bar.items_start())
+            .when(!wrapping, |bar| bar.items_center())
             .gap(metrics.scale(spacing::SNUG))
-            .px(metrics.scale(spacing::LOOSE))
-            .pt(metrics.scale(spacing::SNUG))
+            .pl(metrics.scale(spacing::LOOSE))
+            .pr(metrics.scale(spacing::BASE))
+            .pt(metrics.scale(spacing::SNUG + 2.0))
             .pb(metrics.scale(spacing::TIGHT))
-            .children(icon.map(|icon| {
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(metrics.scale(28.0))
-                    .rounded(px(radius::MEDIUM + 2.0))
-                    .bg(theme::swatch(palette::ACCENT_TINT))
-                    .child(icons::icon(
-                        icon,
-                        metrics.icon_size(),
-                        theme::swatch(palette::ACCENT),
-                    ))
-            }))
-            .child(title)
+            .children(lead)
+            .child(column)
             .child(
                 components::icon_only_button(Icon::Close, metrics)
                     .id(close_id)
@@ -1841,25 +1883,6 @@ impl ShelluneView {
                         close(this, cx);
                     })),
             );
-        let bar = if let Some(badge) = badge {
-            div()
-                .flex()
-                .flex_col()
-                .flex_none()
-                .w_full()
-                .min_w(px(0.0))
-                .child(bar)
-                .child(
-                    div()
-                        .w_full()
-                        .min_w(px(0.0))
-                        .px(metrics.scale(spacing::LOOSE))
-                        .pb(metrics.scale(spacing::TIGHT))
-                        .child(badge),
-                )
-        } else {
-            bar
-        };
         let subtitle = subtitle.map(|subtitle| {
             div()
                 // Whole words across the dialog. A single-line truncate cut the
@@ -1928,8 +1951,8 @@ impl ShelluneView {
         // on top of it pushed that next line past the window (R4).
         let choosing = matches!(panel.status(), crate::app::remote::RemoteStatus::Idle);
         let failed = matches!(panel.status(), crate::app::remote::RemoteStatus::Failed(_));
-        let (header, subtitle) = self.modal_header_with(
-            None,
+        let (header, subtitle) = self.modal_header_lead(
+            Some(host_avatar(host.name(), false, metrics)),
             format!("{} {}", ux.connect_title, host.name()),
             Some(host.target()),
             Some(components::chip(status_label, tone, metrics)),
@@ -1937,22 +1960,6 @@ impl ShelluneView {
             cx,
             |this, cx| this.close_remote(cx),
         );
-        let header = div()
-            .flex()
-            .w_full()
-            .items_start()
-            .pl(metrics.scale(spacing::LOOSE))
-            .child(div().pt(metrics.scale(spacing::SNUG)).child(host_avatar(
-                host.name(),
-                false,
-                metrics,
-            )))
-            .child(
-                header
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .pl(metrics.scale(spacing::SNUG)),
-            );
         let body = div()
             .flex()
             .flex_col()

@@ -443,6 +443,8 @@ pub struct TextField {
     revealed: bool,
     /// Whether the field holds a path, and the system chooser can fill it.
     browse: Option<Browse>,
+    /// A quiet icon before the text, such as the magnifier of a search field.
+    leading: Option<Icon>,
     /// Whether the left button is down after a press in the field: dragging selects.
     selecting: bool,
     /// How far the line is scrolled left so the caret stays in view.
@@ -495,6 +497,7 @@ impl TextField {
             revealable: false,
             revealed: false,
             browse: None,
+            leading: None,
             selecting: false,
             scroll: px(0.0),
             menu: None,
@@ -528,6 +531,12 @@ impl TextField {
             self.revealable = revealable;
             cx.notify();
         }
+    }
+
+    /// Draws a quiet icon before the text, such as a search field's magnifier.
+    pub fn set_leading_icon(&mut self, icon: Icon, cx: &mut Context<Self>) {
+        self.leading = Some(icon);
+        cx.notify();
     }
 
     /// Makes the field a path field: a button at its end opens the system chooser, and
@@ -1058,6 +1067,15 @@ impl Render for TextField {
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx);
+            }))
+            .children(self.leading.map(|icon| {
+                icons::icon(
+                    icon,
+                    metrics.small_icon_size(),
+                    theme::swatch(palette::TEXT_MUTED),
+                )
+                .flex_none()
+                .mr(metrics.scale(2.0))
             }))
             .child(
                 div()

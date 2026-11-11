@@ -2197,9 +2197,9 @@ impl TerminalPane {
             .flex_none()
             .pl(metrics.scale(spacing::BASE - 2.0))
             .pr(metrics.scale(spacing::HAIRLINE))
-            .bg(theme::swatch(shell_palette::SURFACE))
+            .bg(theme::swatch(shell_palette::CANVAS))
             .border_t_1()
-            .border_color(theme::swatch(shell_palette::BORDER))
+            .border_color(theme::faded(theme::swatch(shell_palette::BORDER), 0.8))
             .text_size(metrics.caption_size())
             .text_color(muted)
             .child(

@@ -715,11 +715,14 @@ impl ShelluneView {
             .size_full()
             .overflow_hidden()
             .when(!solo, |frame| {
-                frame.border_1().border_color(theme::swatch(if active {
-                    palette::ACCENT
-                } else {
-                    palette::BORDER
-                }))
+                frame
+                    .rounded(px(radius::MEDIUM))
+                    .border_1()
+                    .border_color(if active {
+                        theme::faded(theme::swatch(palette::ACCENT), 0.7)
+                    } else {
+                        theme::swatch(palette::BORDER)
+                    })
             })
             .when(active, |frame| {
                 frame.debug_selector(|| "pane.active".to_owned())
@@ -816,6 +819,14 @@ impl ShelluneView {
                     .min_w(px(0.0))
                     .truncate()
                     .text_size(metrics.caption_size())
+                    .when(active, |title| {
+                        title
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    })
+                    .when(!active, |title| {
+                        title.text_color(theme::swatch(palette::TEXT_MUTED))
+                    })
                     .child(SharedString::from(title)),
             )
             .when(active, |row| {
@@ -1071,7 +1082,7 @@ impl ShelluneView {
                 this.select_tab(index, window, cx);
             }));
         tab = if selected {
-            tab.bg(theme::swatch(palette::CANVAS))
+            tab.bg(theme::swatch(palette::SURFACE_RAISED))
                 .border_color(theme::swatch(palette::BORDER_STRONG))
         } else {
             tab.border_color(theme::clear())

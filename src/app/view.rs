@@ -803,8 +803,16 @@ impl ShelluneView {
             field.set_browse(Browse::File, cx);
             field
         });
-        let hosts_search = cx.new(|cx| TextField::new(search_placeholder, cx));
-        let keys_search = cx.new(|cx| TextField::new(strings.keys_search_placeholder, cx));
+        let hosts_search = cx.new(|cx| {
+            let mut field = TextField::new(search_placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
+        let keys_search = cx.new(|cx| {
+            let mut field = TextField::new(strings.keys_search_placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
 
         // The credentials fields are created once and reused: a field that is
         // recreated per attempt would lose the caret on every keystroke that
@@ -6779,7 +6787,7 @@ impl ShelluneView {
         let mut list = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::TIGHT))
+            .gap(metrics.scale(spacing::SNUG))
             .w_full()
             .debug_selector(move || format!("hosts.list.{entries}"));
 
@@ -6789,9 +6797,11 @@ impl ShelluneView {
                 if hosts.is_empty() {
                     return self.nothing_to_list(list);
                 }
+                let mut grid = self.host_grid();
                 for (index, host) in hosts.into_iter().enumerate() {
-                    list = list.child(self.host_row(index, host, cx));
+                    grid = grid.child(self.host_row(index, host, cx));
                 }
+                list = list.child(grid);
             }
             HostView::Groups => {
                 let groups = self.hosts.groups(&self.book);
@@ -6817,9 +6827,11 @@ impl ShelluneView {
                             .child(components::section_label(label.to_owned(), metrics))
                             .child(components::badge(group.len(), Tone::Neutral, metrics)),
                     );
+                    let mut grid = self.host_grid();
                     for (row_index, host) in (offset..).zip(group.hosts()) {
-                        list = list.child(self.host_row(row_index, host, cx));
+                        grid = grid.child(self.host_row(row_index, host, cx));
                     }
+                    list = list.child(grid);
                 }
             }
             HostView::Recent => {
@@ -6827,12 +6839,111 @@ impl ShelluneView {
                 if recent.is_empty() {
                     return list.child(self.hosts_recent_empty());
                 }
+                let mut grid = self.host_grid();
                 for (index, entry) in recent.into_iter().enumerate() {
-                    list = list.child(self.host_recent_row(index, entry, cx));
+                    grid = grid.child(self.host_recent_row(index, entry, cx));
                 }
+                list = list.child(grid);
             }
         }
         list
+    }
+
+    /// The grid the host cards sit in: as many columns as the window has room for,
+    /// each at least [`HOST_CARD_MIN_WIDTH`] wide, so a card never squeezes its name
+    /// or its buttons and a narrow window simply lists one card per line (R4).
+    fn host_grid(&self) -> Div {
+        let metrics = self.metrics();
+        let room = self.viewport_width.min(metrics.scale(HOME_MAX_WIDTH))
+            - metrics.scale(HOME_SIDE_PADDING * 2.0);
+        let card = metrics.scale(HOST_CARD_MIN_WIDTH);
+        let columns = ((room / card).floor() as u16).clamp(1, 3);
+        div()
+            .grid()
+            .grid_cols(columns)
+            .w_full()
+            .gap(metrics.scale(spacing::SNUG))
+    }
+
+    /// One saved host as a card: who it is on top, what to do with it underneath.
+    fn host_card(
+        &self,
+        selector: String,
+        avatar: Div,
+        name: String,
+        target: String,
+        footer_note: Option<Div>,
+        actions: [Stateful<Div>; 4],
+    ) -> Div {
+        let metrics = self.metrics();
+        let hover_border = theme::swatch(palette::BORDER_STRONG);
+        let hover_bg = theme::swatch(palette::SURFACE_RAISED);
+        let [connect, forwards, edit, delete] = actions;
+        div()
+            .debug_selector(move || selector.clone())
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .min_w(px(0.0))
+            .p(metrics.scale(spacing::SNUG + 2.0))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .shadow_xs()
+            .hover(move |style| style.bg(hover_bg).border_color(hover_border).shadow_md())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .min_w(px(0.0))
+                    .child(avatar)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap(metrics.scale(2.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(metrics.body_size())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .child(SharedString::from(name)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_family(terminal::monospace_family())
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(SharedString::from(target)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .items_center()
+                            .children(footer_note),
+                    )
+                    .child(forwards)
+                    .child(edit)
+                    .child(delete)
+                    .child(connect.ml(metrics.scale(spacing::HAIRLINE))),
+            )
     }
 
     /// One saved host with the buttons that change it.
@@ -6841,42 +6952,24 @@ impl ShelluneView {
         let strings = self.strings();
         let id = host.id();
         let edited = host.clone();
-
-        let mut row = components::row(metrics)
-            .debug_selector(move || format!("hosts.row.{index}"))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .gap(metrics.scale(spacing::SNUG))
-                    .min_w(px(0.0))
-                    .child(host_avatar(host.name(), false, metrics))
-                    .child(components::stacked(
-                        host.name().to_owned(),
-                        host.target(),
-                        metrics,
-                    )),
-            );
-        if let Some(group) = host_group_chip(host) {
-            row = row.child(components::tag(group, metrics));
-        }
         let target = host.clone();
-        row.child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(metrics.scale(spacing::TIGHT))
-                .child(self.icon_text_button(
+        let note = host_group_chip(host).map(|group| components::tag(group, metrics));
+        self.host_card(
+            format!("hosts.row.{index}"),
+            host_avatar(host.name(), false, metrics),
+            host.name().to_owned(),
+            host.target(),
+            note,
+            [
+                self.icon_text_button(
                     SharedString::from(format!("hosts.connect.{index}")),
                     Icon::Plug,
                     strings.remote_connect,
                     Variant::Soft,
                     cx,
                     move |view, cx| view.open_remote(&target, cx),
-                ))
-                .child(self.row_icon_button(
+                ),
+                self.row_icon_button(
                     SharedString::from(format!("hosts.forwards.{index}")),
                     Icon::Forward,
                     strings.forward_open,
@@ -6888,23 +6981,24 @@ impl ShelluneView {
                             cx,
                         );
                     },
-                ))
-                .child(self.row_icon_button(
+                ),
+                self.row_icon_button(
                     SharedString::from(format!("hosts.edit.{index}")),
                     Icon::Pencil,
                     strings.host_edit,
                     false,
                     cx,
                     move |view, cx| view.open_edit_host(&edited, cx),
-                ))
-                .child(self.row_icon_button(
+                ),
+                self.row_icon_button(
                     SharedString::from(format!("hosts.delete.{index}")),
                     Icon::Trash,
                     strings.host_delete,
                     true,
                     cx,
                     move |view, cx| view.ask_delete_host(id, cx),
-                )),
+                ),
+            ],
         )
     }
 
@@ -6927,67 +7021,58 @@ impl ShelluneView {
             entry.connections,
             strings.host_connection_count
         );
-
-        components::row(metrics)
-            .debug_selector(move || format!("hosts.recent.{index}"))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .gap(metrics.scale(spacing::SNUG))
-                    .min_w(px(0.0))
-                    .child(host_avatar(entry.host.name(), true, metrics))
-                    .child(components::stacked(
-                        entry.host.name().to_owned(),
-                        format!("{} · {last}", entry.host.target()),
-                        metrics,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(self.icon_text_button(
-                        SharedString::from(format!("hosts.recent.connect.{index}")),
-                        Icon::Plug,
-                        strings.remote_connect,
-                        Variant::Soft,
-                        cx,
-                        move |view, cx| view.open_remote(&reconnect_target, cx),
-                    ))
-                    .child(self.row_icon_button(
-                        SharedString::from(format!("hosts.recent.forwards.{index}")),
-                        Icon::Forward,
-                        strings.forward_open,
-                        false,
-                        cx,
-                        move |view, cx| {
-                            view.show_forwards_scope(
-                                crate::app::forwarding::ForwardScope::Host(id),
-                                cx,
-                            );
-                        },
-                    ))
-                    .child(self.row_icon_button(
-                        SharedString::from(format!("hosts.recent.edit.{index}")),
-                        Icon::Pencil,
-                        strings.host_edit,
-                        false,
-                        cx,
-                        move |view, cx| view.open_edit_host(&edited, cx),
-                    ))
-                    .child(self.row_icon_button(
-                        SharedString::from(format!("hosts.recent.delete.{index}")),
-                        Icon::Trash,
-                        strings.host_delete,
-                        true,
-                        cx,
-                        move |view, cx| view.ask_delete_host(id, cx),
-                    )),
-            )
+        let note = div()
+            .min_w(px(0.0))
+            .whitespace_normal()
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(palette::TEXT_MUTED))
+            .child(SharedString::from(last));
+        self.host_card(
+            format!("hosts.recent.{index}"),
+            host_avatar(entry.host.name(), true, metrics),
+            entry.host.name().to_owned(),
+            entry.host.target(),
+            Some(note),
+            [
+                self.icon_text_button(
+                    SharedString::from(format!("hosts.recent.connect.{index}")),
+                    Icon::Plug,
+                    strings.remote_connect,
+                    Variant::Soft,
+                    cx,
+                    move |view, cx| view.open_remote(&reconnect_target, cx),
+                ),
+                self.row_icon_button(
+                    SharedString::from(format!("hosts.recent.forwards.{index}")),
+                    Icon::Forward,
+                    strings.forward_open,
+                    false,
+                    cx,
+                    move |view, cx| {
+                        view.show_forwards_scope(
+                            crate::app::forwarding::ForwardScope::Host(id),
+                            cx,
+                        );
+                    },
+                ),
+                self.row_icon_button(
+                    SharedString::from(format!("hosts.recent.edit.{index}")),
+                    Icon::Pencil,
+                    strings.host_edit,
+                    false,
+                    cx,
+                    move |view, cx| view.open_edit_host(&edited, cx),
+                ),
+                self.row_icon_button(
+                    SharedString::from(format!("hosts.recent.delete.{index}")),
+                    Icon::Trash,
+                    strings.host_delete,
+                    true,
+                    cx,
+                    move |view, cx| view.ask_delete_host(id, cx),
+                ),
+            ],
+        )
     }
 
     /// Nothing to list: a search that matched nothing says so, while an empty
@@ -9660,8 +9745,8 @@ impl ShelluneView {
                     // Page Up/Down turns the entries themselves while they are taller
                     // than the box that holds them (R4).
                     .track_scroll(&list_scroll)
-                    .rounded(px(radius::MEDIUM))
-                    .bg(theme::swatch(palette::SURFACE))
+                    .rounded(px(radius::LARGE))
+                    .bg(theme::swatch(palette::SURFACE_RAISED))
                     .border_1()
                     .border_color(theme::swatch(palette::BORDER))
                     .debug_selector({
@@ -11376,7 +11461,7 @@ impl ShelluneView {
                 }),
             );
         tab = if selected {
-            tab.bg(theme::swatch(palette::CANVAS))
+            tab.bg(theme::swatch(palette::SURFACE_RAISED))
                 .border_color(theme::swatch(palette::BORDER_STRONG))
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .shadow_sm()
@@ -11631,173 +11716,187 @@ impl ShelluneView {
                 )
         });
 
-        let row = div()
+        // One line: who and what on the left, the session's own actions on the right.
+        // The line wraps as a whole, so at 200% text in a small window the actions move
+        // under the identity instead of squeezing the name under a chip (R4).
+        let actions_row = div()
             .flex()
-            .flex_col()
-            .justify_center()
-            .flex_none()
+            .flex_shrink()
+            .min_w(px(0.0))
+            .max_w_full()
+            .flex_wrap()
+            .items_center()
+            .justify_end()
+            .ml_auto()
             .gap(metrics.scale(spacing::HAIRLINE))
-            // The name, the target and the state take their own line, and the actions
-            // take the next. One wrapping row squeezed the name until it painted
-            // under the X11 chip, or grew tall enough to push the terminal out of a
-            // 720×480 window (R4).
-            .min_h(metrics.session_bar_height())
-            .pl(metrics.scale(spacing::BASE - 2.0))
-            .pr(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(palette::CANVAS))
-            .border_b_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .debug_selector(|| "session.bar".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .flex_nowrap()
-                    .items_center()
-                    .w_full()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .flex_none()
+            .children(self.solo_split_buttons(cx))
+            .when_some(files_button, |row, button| row.child(button))
+            .when_some(forward_host, |row, host| {
+                row.child(self.icon_text_button(
+                    SharedString::from("session.forwards"),
+                    Icon::Forward,
+                    copy::ux().session_forwards,
+                    Variant::Ghost,
+                    cx,
+                    move |view, cx| {
+                        view.show_forwards_scope(
+                            crate::app::forwarding::ForwardScope::Host(host),
+                            cx,
+                        );
+                    },
+                ))
+            })
+            .when(can_reconnect, |row| {
+                row.child(self.icon_text_button(
+                    SharedString::from("session.reconnect"),
+                    Icon::Refresh,
+                    strings.session_reconnect,
+                    Variant::Primary,
+                    cx,
+                    move |view, cx| view.reconnect_session(id, cx),
+                ))
+            })
+            .when(
+                self.unsaved.iter().any(|(session, _)| *session == id),
+                |row| {
+                    row.child(self.icon_text_button(
+                        SharedString::from("session.save_host"),
+                        Icon::Server,
+                        strings.quick_save_host,
+                        Variant::Primary,
+                        cx,
+                        move |view, cx| view.save_quick_host(id, cx),
+                    ))
+                },
+            );
+        let close = components::icon_only_button(Icon::Close, metrics)
+            .id("session.close")
+            .debug_selector(|| "session.close".to_owned())
+            .tooltip(components::tooltip(strings.session_close))
+            .on_click(cx.listener(move |view, _event, _window, cx| {
+                view.request_close_session(id, cx);
+            }));
+        // A wide window has room for one line: identity on the left, every action and
+        // Close on the right. A narrow one (or large text) keeps Close beside the
+        // identity and gives the actions a line of their own, which is the shortest the
+        // bar can be there, so the terminal and the file pane keep their room (R4).
+        let compact = self.viewport_width < metrics.scale(SESSION_BAR_ONE_LINE_WIDTH);
+        let (actions_row, close) = if compact {
+            (
+                actions_row.w_full(),
+                Some(div().flex_none().ml_auto().child(close)),
+            )
+        } else {
+            (
+                actions_row
                     .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex_wrap()
-                            .items_center()
-                            .gap(metrics.scale(spacing::TIGHT))
-                            .child(
-                                div()
-                                    .id("session.kind")
-                                    .flex()
-                                    .flex_none()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(metrics.scale(22.0))
-                                    .rounded(px(radius::SMALL))
-                                    .bg(theme::swatch(palette::ACCENT_TINT))
-                                    .tooltip(components::tooltip(kind_label))
-                                    .child(icons::icon(
-                                        if kind == PaneKind::Remote {
-                                            Icon::Server
-                                        } else {
-                                            Icon::Terminal
-                                        },
-                                        metrics.small_icon_size(),
-                                        theme::swatch(palette::ACCENT),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    // Natural width, then the next line of the cluster: a
-                                    // single-line truncate at 200% cut the last glyph in half
-                                    // and had no ellipsis (R4).
-                                    .flex_none()
-                                    .max_w_full()
-                                    .whitespace_normal()
-                                    .text_size(metrics.label_size())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .debug_selector(|| "session.identity".to_owned())
-                                    // "Current" only tells panes apart; a lone pane is
-                                    // simply the session.
-                                    .child(SharedString::from(if self.active_tab_is_solo() {
-                                        label.clone()
+                        components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)),
+                    )
+                    .child(close),
+                None,
+            )
+        };
+
+        let row =
+            div()
+                .flex()
+                .flex_none()
+                .flex_wrap()
+                .items_center()
+                .w_full()
+                .gap_x(metrics.scale(spacing::TIGHT))
+                .gap_y(metrics.scale(spacing::HAIRLINE))
+                .min_h(metrics.session_bar_height())
+                .py(px(1.0))
+                .pl(metrics.scale(spacing::SNUG))
+                .pr(metrics.scale(spacing::HAIRLINE + 2.0))
+                .bg(theme::swatch(palette::SURFACE))
+                .border_b_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .debug_selector(|| "session.bar".to_owned())
+                .child(
+                    div()
+                        .flex()
+                        .flex_grow()
+                        .flex_shrink()
+                        .flex_basis(gpui::auto())
+                        .min_w(px(0.0))
+                        .flex_wrap()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(
+                            div()
+                                .id("session.kind")
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(metrics.scale(22.0))
+                                .rounded(px(radius::SMALL))
+                                .bg(theme::swatch(palette::ACCENT_TINT))
+                                .tooltip(components::tooltip(kind_label))
+                                .child(icons::icon(
+                                    if kind == PaneKind::Remote {
+                                        Icon::Server
                                     } else {
-                                        format!("{} · {label}", strings.workspace_current)
-                                    })),
-                            )
-                            .children(target.map(|target| {
+                                        Icon::Terminal
+                                    },
+                                    metrics.small_icon_size(),
+                                    theme::swatch(palette::ACCENT),
+                                )),
+                        )
+                        .child(
+                            div()
+                                // Natural width, then the next line of the cluster: a
+                                // single-line truncate at 200% cut the last glyph in half
+                                // and had no ellipsis (R4).
+                                .flex_none()
+                                .max_w_full()
+                                .whitespace_normal()
+                                .text_size(metrics.label_size())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .debug_selector(|| "session.identity".to_owned())
+                                // "Current" only tells panes apart; a lone pane is
+                                // simply the session.
+                                .child(SharedString::from(if self.active_tab_is_solo() {
+                                    label.clone()
+                                } else {
+                                    format!("{} · {label}", strings.workspace_current)
+                                })),
+                        )
+                        .children(target.map(|target| {
+                            div()
+                                .flex_none()
+                                .max_w_full()
+                                .whitespace_normal()
+                                .font_family(terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .debug_selector(|| "session.target".to_owned())
+                                .child(SharedString::from(target))
+                        }))
+                        .when(!live, |row| {
+                            row.child(components::chip(state_label, tone, metrics))
+                        })
+                        .when_some(self.x11.get(&id).cloned(), |row, status| {
+                            row.child(self.x11_chip(&status, metrics))
+                        })
+                        .children(self.unsaved.iter().find(|(session, _)| *session == id).map(
+                            |_| {
                                 div()
                                     .flex_none()
                                     .max_w_full()
+                                    .min_w(px(0.0))
                                     .whitespace_normal()
-                                    .font_family(terminal::monospace_family())
                                     .text_size(metrics.caption_size())
                                     .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .debug_selector(|| "session.target".to_owned())
-                                    .child(SharedString::from(target))
-                            }))
-                            .when(!live, |row| {
-                                row.child(components::chip(state_label, tone, metrics))
-                            })
-                            .when_some(self.x11.get(&id).cloned(), |row, status| {
-                                row.child(self.x11_chip(&status, metrics))
-                            })
-                            .children(self.unsaved.iter().find(|(session, _)| *session == id).map(
-                                |_| {
-                                    div()
-                                        .flex_none()
-                                        .max_w_full()
-                                        .min_w(px(0.0))
-                                        .whitespace_normal()
-                                        .text_size(metrics.caption_size())
-                                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                                        .child(strings.quick_unsaved_note)
-                                },
-                            )),
-                    )
-                    // A growing spacer in the wrapping row took the leftover width and
-                    // pushed Close onto a line of its own. That line, under the X11
-                    // notice, left the file pane shorter than a failed transfer (R4).
-                    .child(
-                        components::icon_only_button(Icon::Close, metrics)
-                            .id("session.close")
-                            .debug_selector(|| "session.close".to_owned())
-                            .tooltip(components::tooltip(strings.session_close))
-                            .on_click(cx.listener(move |view, _event, _window, cx| {
-                                view.request_close_session(id, cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_end()
-                    .w_full()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .children(self.solo_split_buttons(cx))
-                    .when_some(files_button, |row, button| row.child(button))
-                    .when_some(forward_host, |row, host| {
-                        row.child(self.icon_text_button(
-                            SharedString::from("session.forwards"),
-                            Icon::Forward,
-                            copy::ux().session_forwards,
-                            Variant::Ghost,
-                            cx,
-                            move |view, cx| {
-                                view.show_forwards_scope(
-                                    crate::app::forwarding::ForwardScope::Host(host),
-                                    cx,
-                                );
+                                    .child(strings.quick_unsaved_note)
                             },
-                        ))
-                    })
-                    .when(can_reconnect, |row| {
-                        row.child(self.icon_text_button(
-                            SharedString::from("session.reconnect"),
-                            Icon::Refresh,
-                            strings.session_reconnect,
-                            Variant::Primary,
-                            cx,
-                            move |view, cx| view.reconnect_session(id, cx),
-                        ))
-                    })
-                    .when(
-                        self.unsaved.iter().any(|(session, _)| *session == id),
-                        |row| {
-                            row.child(self.icon_text_button(
-                                SharedString::from("session.save_host"),
-                                Icon::Server,
-                                strings.quick_save_host,
-                                Variant::Primary,
-                                cx,
-                                move |view, cx| view.save_quick_host(id, cx),
-                            ))
-                        },
-                    ),
-            );
+                        )),
+                )
+                .children(close)
+                .child(actions_row);
         let notice = self.quick_save_notice.clone();
         // A failed bridge says why in the bar's tooltip, but a tooltip is a pointer
         // target: the reason and the next step are repeated as text under the bar so a
@@ -13000,6 +13099,26 @@ fn destination_icon(destination: Destination) -> Icon {
 }
 
 /// The product mark, shared with the native application icons.
+/// The window width, before zoom, from which the session bar is one line.
+const SESSION_BAR_ONE_LINE_WIDTH: f32 = 860.0;
+
+/// The widest the home page's column grows, before zoom.
+pub(super) const HOME_MAX_WIDTH: f32 = 1040.0;
+/// The home column's padding on either side, before zoom.
+pub(super) const HOME_SIDE_PADDING: f32 = 32.0;
+/// The narrowest a host card may be, before zoom; fewer columns are used instead.
+const HOST_CARD_MIN_WIDTH: f32 = 300.0;
+
+/// The brand's accent-to-violet gradient, for the few marks that carry the identity:
+/// the shell tiles on the home page and the emblems of empty states.
+pub(super) fn brand_gradient() -> gpui::Background {
+    gpui::linear_gradient(
+        135.0,
+        gpui::linear_color_stop(theme::swatch(palette::ACCENT), 0.0),
+        gpui::linear_color_stop(theme::swatch(palette::BRAND_END), 1.0),
+    )
+}
+
 fn brand_mark(size: gpui::Pixels, _metrics: Metrics) -> Div {
     div()
         .flex()
