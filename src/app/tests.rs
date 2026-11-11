@@ -18259,6 +18259,14 @@ async fn a_transfer_failure_stays_whole_while_x11_failed_at_two_hundred_percent(
     );
     assert_transfer_title_clears_the_scroll_clip(cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
+    // The title now sits above the transfer scroller. That must not push the failure
+    // chip out of this window; the reason and the next step are not drawn while files
+    // are open, so the chip is the failure a reader still has (R4, R11).
+    assert_fits_inside(
+        bounds_of(cx, "session.x11.failed"),
+        viewport,
+        "session.x11.failed",
+    );
     let scroll = bounds_of(cx, "files.transfers.scroll");
     for selector in ["transfers.state.0", "transfers.retry.0"] {
         let bounds = bounds_of(cx, selector);
