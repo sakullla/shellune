@@ -11751,6 +11751,11 @@ async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_t
     assert_pointer_target(cx, "tabs.list.open");
     click(cx, "tabs.list.open");
     assert_fits_inside(bounds_of(cx, "tabs.list.dialog"), viewport, "the tab list");
+    assert_fits_inside(
+        bounds_of(cx, "modal.subtitle"),
+        viewport,
+        "the tab list subtitle",
+    );
     // The first row is on screen; the rest are reached by the dialog's own scroll, so
     // the test asks that each one is rendered rather than that all fit at once.
     assert_fits_inside(
@@ -16965,6 +16970,7 @@ async fn the_shortcut_command_dialog_stays_inside_the_minimum_window_at_200_perc
         "snippets.dialog",
         "snippets.dialog.footer.close",
         "snippets.new",
+        "modal.subtitle",
     ] {
         assert_fits_inside(bounds_of(cx, selector), viewport, selector);
     }
@@ -17642,24 +17648,33 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
     );
 
     let viewport = cx.update(|window, _app| window.viewport_size());
-    // The state itself stays on the bar, in the row of the session's own actions.
+    // The state itself stays on the bar, in the row of the session's own actions,
+    // and it does not paint over the session name (R4).
     assert_within_width(
         bounds_of(cx, "session.x11.failed"),
         viewport,
         "session.x11.failed",
+    );
+    let identity = bounds_of(cx, "session.identity");
+    let chip = bounds_of(cx, "session.x11.failed");
+    assert_fits_inside(identity, viewport, "session.identity");
+    assert_fits_inside(chip, viewport, "session.x11.failed");
+    assert!(
+        chip.origin.x >= identity.origin.x + identity.size.width - px(1.0)
+            || chip.origin.y >= identity.origin.y + identity.size.height - px(1.0),
+        "the X11 state overlaps the session name: {chip:?} vs {identity:?}"
     );
     // The explanation is bounded by the room the window has, so it cannot be drawn past
     // the bottom edge with the terminal behind it.
     let boxed = bounds_of(cx, "session.x11.notice.body");
     assert_fits_inside(boxed, viewport, "the X11 notice box");
     assert!(
-        boxed.size.height <= viewport.height * 0.45,
+        boxed.size.height <= viewport.height * 0.48,
         "the notice took more than its share of the window: {boxed:?} in {viewport:?}"
     );
-    // The next step opens the box, so it is the text this window shows before anyone
-    // scrolls — and this test never moved the pointer, so its opening is also what a
-    // keyboard user reads. Scrolling this box takes a pointer, which is why the actionable
-    // text, not the diagnosis, is what the first screen holds (R4, R11).
+    // The next step opens the box. The short failure's reason also fits this share;
+    // a longer one is reached by scrolling, including with Page Up/Down once the box
+    // has the keyboard (R4, R11).
     let next = bounds_of(cx, "session.x11.next");
     assert_inside_box(next, boxed, "the next step");
     // The whole direction does not fit this box at this size, and that is the contract and
@@ -17689,8 +17704,24 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
         "the next step shows too little before any scrolling: \
          {first_screen:?} of {one_line:?} per line in {boxed:?}"
     );
-    // The reason is the rest of the same text: it is reached by scrolling the box, which
-    // is what "inside the window, or reachable by explicit scrolling" means here.
+    // The reason is the rest of the same text. When it does not fit the first screen,
+    // the keyboard reaches it: focus the box and page down, which is the same contract
+    // as the wheel (R4).
+    cx.update(|window, app| {
+        view.update(app, |view, _cx| view.focus_x11_notice_for_test(window));
+    });
+    cx.run_until_parked();
+    press_key(cx, "home");
+    for _ in 0..12 {
+        let outer = bounds_of(cx, "session.x11.notice.body");
+        let bounds = bounds_of(cx, "session.x11.reason");
+        let top = outer.origin.y - px(0.5);
+        let bottom = outer.origin.y + outer.size.height + px(0.5);
+        if bounds.origin.y >= top && bounds.origin.y + bounds.size.height <= bottom {
+            break;
+        }
+        press_key(cx, "pagedown");
+    }
     scroll_fully_into_view(cx, "session.x11.notice.body", "session.x11.reason");
     let boxed = bounds_of(cx, "session.x11.notice.body");
     let reason = bounds_of(cx, "session.x11.reason");
@@ -17709,4 +17740,126 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
     );
     assert_fits_inside(terminal, viewport, "the terminal");
     assert_fits_inside(bounds_of(cx, "session.close"), viewport, "session.close");
+}
+
+/// The failure a real window shows when DISPLAY is unset: the reason line is whole
+/// on the first screen at 720×480 and 200% text, not cut by the banner edge (R4).
+#[gpui::test]
+async fn the_short_x11_reason_stays_on_the_first_screen_at_two_hundred_percent(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, _dir) =
+        dialog_view(cx, vec![stored_host("web", "127.0.0.1", 1, "deploy", None)]);
+    click(cx, "hosts.connect.0");
+    type_into(cx, "remote.password", "hunter2");
+    let reason = "no local X display is available: DISPLAY is not set";
+    let next_step = "Start an X server for this computer and make sure DISPLAY names it, or connect without X11 forwarding.";
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::X11(X11Status::Failed {
+                        reason: reason.to_owned(),
+                        next_step: next_step.to_owned(),
+                    }),
+                    shellune_ssh::RemoteEvent::Connected,
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.run_until_parked();
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    for _ in 0..Zoom::ALL.len() {
+        if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
+            break;
+        }
+        cx.dispatch_action(CycleTextSize);
+        cx.run_until_parked();
+    }
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let boxed = bounds_of(cx, "session.x11.notice.body");
+    let reason_bounds = bounds_of(cx, "session.x11.reason");
+    let next = bounds_of(cx, "session.x11.next");
+    assert_fits_inside(boxed, viewport, "the X11 notice");
+    assert_fits_inside(next, viewport, "the next step");
+    assert_fits_inside(reason_bounds, viewport, "the reason");
+    assert!(
+        reason_bounds.origin.y >= boxed.origin.y - px(0.5)
+            && reason_bounds.origin.y + reason_bounds.size.height
+                <= boxed.origin.y + boxed.size.height + px(0.5),
+        "the reason is not whole on the first screen: {reason_bounds:?} in {boxed:?}"
+    );
+    let identity = bounds_of(cx, "session.identity");
+    let chip = bounds_of(cx, "session.x11.failed");
+    assert!(
+        chip.origin.x >= identity.origin.x + identity.size.width - px(1.0)
+            || chip.origin.y >= identity.origin.y + identity.size.height - px(1.0),
+        "the X11 state overlaps the session name: {chip:?} vs {identity:?}"
+    );
+}
+
+/// A failed transfer's reason and Retry stay inside 720×480 at 200% text (R4).
+#[gpui::test]
+async fn a_failed_transfer_shows_its_reason_and_retry_in_the_minimum_window(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/report.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let started = transfers.starts();
+    let task = started[0].transfer;
+    transfers.push(shellune_core::TransferEvent {
+        transfer: task,
+        update: shellune_core::TransferUpdate::Failed {
+            failure: shellune_core::TransferFailure::NotFound,
+            residue: None,
+            resume: None,
+        },
+    });
+    pump_files(cx, &view);
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    let viewport = minimum_window();
+    let strip = bounds_of(cx, "files.transfers");
+    assert_fits_inside(strip, viewport, "the transfer strip");
+    cx.update(|window, app| {
+        view.update(app, |view, _cx| view.focus_transfer_strip_for_test(window));
+    });
+    cx.run_until_parked();
+    press_key(cx, "home");
+    for selector in ["transfers.state.0", "transfers.retry.0"] {
+        for _ in 0..12 {
+            let outer = bounds_of(cx, "files.transfers");
+            let bounds = bounds_of(cx, selector);
+            let top = outer.origin.y - px(0.5);
+            let bottom = outer.origin.y + outer.size.height + px(0.5);
+            if bounds.origin.y >= top && bounds.origin.y + bounds.size.height <= bottom {
+                break;
+            }
+            press_key(cx, "pagedown");
+        }
+        let bounds = bounds_of(cx, selector);
+        let outer = bounds_of(cx, "files.transfers");
+        assert!(
+            bounds.origin.y >= outer.origin.y - px(0.5)
+                && bounds.origin.y + bounds.size.height
+                    <= outer.origin.y + outer.size.height + px(0.5),
+            "{selector} is not inside the transfer strip after keyboard scrolling: \
+             {bounds:?} in {outer:?}"
+        );
+        assert_fits_inside(bounds, viewport, selector);
+    }
 }

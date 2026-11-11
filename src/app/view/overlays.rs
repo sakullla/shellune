@@ -1624,7 +1624,7 @@ impl ShelluneView {
         let locale = self.workspace.locale();
         let count = self.workspace.layout().tabs().len();
         let active = self.workspace.layout().active_tab_id();
-        let header = self.modal_header(
+        let (header, subtitle) = self.modal_header(
             Some(Icon::Layers),
             strings.tab_list_title.to_owned(),
             Some(strings.tab_list_hint.to_owned()),
@@ -1812,7 +1812,15 @@ impl ShelluneView {
             .pb(metrics.scale(spacing::LOOSE))
             .child(rows)
             .into_any_element();
-        Some(self.modal(window, "tabs.list.dialog", 680.0, header, body, None))
+        Some(self.modal(
+            window,
+            "tabs.list.dialog",
+            680.0,
+            header,
+            subtitle,
+            body,
+            None,
+        ))
     }
 
     /// The dialog that names one tab and chooses its colour.
@@ -1848,7 +1856,7 @@ impl ShelluneView {
         // What the field holds now: a name past the limit says so before it is saved,
         // so the cut is visible while the user can still shorten it by hand.
         let limit = self.tab_rename_limit(cx);
-        let header = self.modal_header(
+        let (header, hint) = self.modal_header(
             Some(Icon::Pencil),
             strings.tab_rename_title.to_owned(),
             subtitle,
@@ -1956,6 +1964,7 @@ impl ShelluneView {
             "tab.rename.dialog",
             520.0,
             header,
+            hint,
             body,
             Some(footer),
         ))

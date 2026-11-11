@@ -397,7 +397,7 @@ impl ShelluneView {
         }
         let files = session_id.filter(|id| self.files.is_open(*id));
         if let Some(id) = files {
-            column = column.child(self.files_view(id, cx));
+            column = column.child(self.files_view(id, window, cx));
         } else if let Some(tab) = self.workspace.layout().active_tab() {
             let zoomed = tab.zoomed();
             let tree = if let Some(zoomed) = zoomed {

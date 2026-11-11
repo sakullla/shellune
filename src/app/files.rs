@@ -97,6 +97,9 @@ pub enum FilesStop {
     QuestionConfirm,
     /// The question's cancelling button.
     QuestionCancel,
+    /// The transfer strip: the failure and its retry or cancel. Page Up/Down turn the
+    /// strip when the row is taller than the slice the window keeps for it (R4).
+    Transfers,
     /// The session bar's switch back to the terminal, which is how the view is left: the
     /// file view takes the terminal's place, so the way back has to be reachable with the
     /// keyboard as well as by Escape (R4).

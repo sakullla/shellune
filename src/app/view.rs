@@ -316,12 +316,12 @@ pub const FILES_REPORT_STEPS: usize = 12;
 /// The share of the window a failed bridge's explanation may take.
 ///
 /// The reason and the next step sit under the session bar, above the terminal that keeps
-/// working; their text grows with the text size, so a window at 720×480 with 200% text
-/// cannot hold them at their natural height without pushing the terminal out of the
-/// window. Bounding them to this share keeps the terminal on screen and leaves the rest
-/// of the text one scroll away, whatever the window's height is (R4). Chosen so the same
-/// text still fits whole in an ordinary window, where nothing scrolls at all.
-const X11_NOTICE_SHARE: f32 = 0.35;
+/// working. At 720×480 with 200% text a 0.35 cap cut the short reason through the glyphs,
+/// and a 0.46 cap left the terminal with no height once the bar wrapped. The notice text
+/// uses a tighter line height so the short reason still fits this share on the first
+/// screen, and a longer failure scrolls with Page Up/Down once the box has the keyboard
+/// (R4, R11).
+const X11_NOTICE_SHARE: f32 = 0.38;
 
 /// Ends a menu entry that asks for more input before it acts.
 const ELLIPSIS: &str = "\u{2026}";
@@ -503,6 +503,13 @@ pub struct ShelluneView {
     /// The file view itself has no close button of its own: the bar above it already has
     /// the switch, and a second one would be the same decision twice.
     files_close_focus: FocusHandle,
+    /// Focus and scroll of the transfer strip, so a failure under the first screen is
+    /// reached with Page Up/Down rather than only with the wheel (R4).
+    files_transfer_focus: FocusHandle,
+    transfers_scroll: gpui::ScrollHandle,
+    /// Focus and scroll of an X11 failure notice that is taller than its box (R4, R11).
+    x11_notice_focus: FocusHandle,
+    x11_notice_scroll: gpui::ScrollHandle,
     /// Whether the question that was just opened should take the keyboard next draw.
     ///
     /// The field is focused by the drawing rather than by the call that opened the
@@ -945,6 +952,10 @@ impl ShelluneView {
             files_question_confirm_focus: cx.focus_handle(),
             files_question_cancel_focus: cx.focus_handle(),
             files_close_focus: cx.focus_handle(),
+            files_transfer_focus: cx.focus_handle(),
+            transfers_scroll: gpui::ScrollHandle::new(),
+            x11_notice_focus: cx.focus_handle(),
+            x11_notice_scroll: gpui::ScrollHandle::new(),
             files_field_focus: false,
             files_panel_focus_pending: None,
             files_rows: Rc::new(RefCell::new(Vec::new())),
@@ -7706,7 +7717,7 @@ impl ShelluneView {
                 );
             }
             match id.filter(|id| self.files.is_open(*id)) {
-                Some(open) => frame = frame.child(self.files_view(open, cx)),
+                Some(open) => frame = frame.child(self.files_view(open, window, cx)),
                 None => frame = frame.child(pane.clone()),
             }
         } else if let Some(session) = session {
@@ -7738,8 +7749,10 @@ impl ShelluneView {
     /// The terminal, with the file view beside it while one is open (R9).
     /// The terminal column, or - while the file view of this session is open - the
     /// file manager in its place: this computer and the server side by side, with
-    /// the transfers underneath. The session bar stays on top either way.
-    fn files_view(&self, id: SessionId, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// the transfers above the listing. A strip under the listing was drawn past the
+    /// bottom of a 720×480 window at 200% text, so the failure never reached the
+    /// client area (R4). The session bar stays on top either way.
+    fn files_view(&self, id: SessionId, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
@@ -7814,19 +7827,41 @@ impl ShelluneView {
         });
 
         // The transfer strip takes room only while there is something to show.
+        // Its box is a share of this window, not a length that 200% text turns into
+        // more than the files view has left: the failure and its retry stay inside
+        // the client area, and Page Up/Down reach a row the share cannot show whole.
         let transfers = self.transfers_strip_shown(id).then(|| {
+            let cap = window.viewport_size().height * 0.42;
+            let scroll = self.transfers_scroll.clone();
             div()
                 .id("files.transfers")
                 .flex()
                 .flex_col()
-                .flex_none()
-                .max_h(metrics.scale(180.0))
+                // Shrinks into the files view instead of drawing past the client edge.
+                // What does not fit the box scrolls, and Page Up/Down turn it (R4).
+                .flex_shrink()
+                .w_full()
+                .min_h(px(0.0))
+                .max_h(cap)
                 .overflow_y_scroll()
+                .track_scroll(&scroll)
+                .track_focus(&self.files_transfer_focus)
+                .focus(|style| {
+                    style
+                        .border_1()
+                        .border_color(theme::swatch(palette::ACCENT))
+                })
+                .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
+                    if view.files_transfer_key(id, event, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .px(metrics.scale(spacing::BASE))
                 .py(metrics.scale(spacing::TIGHT))
                 .bg(theme::swatch(palette::SURFACE))
-                .border_t_1()
+                .border_b_1()
                 .border_color(theme::swatch(palette::BORDER))
+                .debug_selector(|| "files.transfers".to_owned())
                 .child(self.transfers_panel(id, cx))
         });
 
@@ -7841,8 +7876,8 @@ impl ShelluneView {
             .overflow_hidden()
             .bg(theme::swatch(palette::CANVAS))
             .children(toolbar)
-            .child(panes)
             .children(transfers)
+            .child(panes)
     }
 
     /// "Upload" or "Download" in the interface language.
@@ -8563,7 +8598,15 @@ impl ShelluneView {
             return false;
         }
         if matches!(key, "pageup" | "pagedown" | "home" | "end") {
-            self.files_turn(source, key, cx);
+            if self
+                .files_keyboard_stop(window, cx)
+                .is_some_and(|(_, stop)| stop == FilesStop::Transfers)
+            {
+                scroll_by_key(&self.transfers_scroll, key);
+                cx.notify();
+            } else {
+                self.files_turn(source, key, cx);
+            }
             return true;
         }
         // A control with the ring on it answers Enter and Space exactly as the pointer's
@@ -8723,6 +8766,11 @@ impl ShelluneView {
                 stops.push((source, FilesStop::CardDownload));
             }
         }
+        // The failure and its retry sit above the listing. They are a stop of their own
+        // so a keyboard user reaches them without a pointer (R4).
+        if self.transfers_strip_shown(id) {
+            stops.push((FileSource::Remote, FilesStop::Transfers));
+        }
         // The way back to the terminal is the last stop of the walk: it belongs to the bar
         // above both columns rather than to either of them.
         stops.push((FileSource::Remote, FilesStop::Close));
@@ -8775,6 +8823,7 @@ impl ShelluneView {
             FilesStop::QuestionRecursive => self.files_question_recursive_focus.clone(),
             FilesStop::QuestionConfirm => self.files_question_confirm_focus.clone(),
             FilesStop::QuestionCancel => self.files_question_cancel_focus.clone(),
+            FilesStop::Transfers => self.files_transfer_focus.clone(),
             FilesStop::Close => self.files_close_focus.clone(),
         })
     }
@@ -8831,8 +8880,8 @@ impl ShelluneView {
             // listing taller than its own box turns its entries instead.
             FilesStop::Body => None,
             // The switch back to the terminal is in the session bar above the column, so
-            // no slice of the column can hide it.
-            FilesStop::Close => None,
+            // no slice of the column can hide it. The transfer strip is its own box.
+            FilesStop::Close | FilesStop::Transfers => None,
             FilesStop::ToolbarUpload | FilesStop::ToolbarDownload => {
                 self.files_panel_scroll(source).bounds_for_item(0)
             }
@@ -8885,7 +8934,8 @@ impl ShelluneView {
         match (stop, self.files_row_of(source, stop)) {
             // The column itself is what a turn moves, and the way back to the terminal is
             // in the bar above it: neither is a row a turn could bring into the slice.
-            (FilesStop::Body | FilesStop::Close, _) => {}
+            // The transfer strip scrolls itself.
+            (FilesStop::Body | FilesStop::Close | FilesStop::Transfers, _) => {}
             (FilesStop::CardUpload | FilesStop::CardDownload, _) => {
                 self.files_panel_scroll(source).scroll_to_bottom();
             }
@@ -8974,6 +9024,7 @@ impl ShelluneView {
             }
             FilesStop::QuestionConfirm => self.submit_files_change(cx),
             FilesStop::QuestionCancel => self.files_cancel_change(cx),
+            FilesStop::Transfers => self.transfer_keyboard_recover(id, cx),
             FilesStop::Close => {
                 // The same switch the pointer presses: the terminal is where this session
                 // came from, and it takes the keyboard back (R4). A view that is already
@@ -9018,6 +9069,87 @@ impl ShelluneView {
         };
         target.set_offset(gpui::point(offset.x, next.max(limit).min(px(0.0))));
         cx.notify();
+    }
+
+    /// Keys for the transfer strip: Tab keeps the file view's walk, Page Up/Down turn
+    /// the strip, and Enter runs the recovery the row is offering (R4).
+    fn files_transfer_key(
+        &mut self,
+        id: SessionId,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
+            let delta = if modifiers.shift { -1 } else { 1 };
+            self.files_step_stop(id, delta, window, cx);
+            return true;
+        }
+        if modifiers.modified() {
+            return false;
+        }
+        if matches!(key, "pageup" | "pagedown" | "home" | "end" | "up" | "down") {
+            scroll_by_key(&self.transfers_scroll, key);
+            cx.notify();
+            return true;
+        }
+        if matches!(key, "enter" | "space") {
+            self.transfer_keyboard_recover(id, cx);
+            return true;
+        }
+        false
+    }
+
+    /// The recovery a keyboard user gets from the transfer strip.
+    ///
+    /// A failed or cancelled task is retried (or restarted, when that is what its row
+    /// offers). Otherwise an active task is cancelled. The buttons on the row call the
+    /// same two paths.
+    fn transfer_keyboard_recover(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let tasks: Vec<Transfer> = self.transfers.for_session(id).cloned().collect();
+        if let Some(task) = tasks.iter().find(|task| {
+            matches!(
+                task.state(),
+                shellune_core::TransferState::Failed { .. }
+                    | shellune_core::TransferState::Cancelled { .. }
+            )
+        }) {
+            let resumable = task.resume_hint().is_some();
+            let refused = matches!(
+                task.state().failure(),
+                Some(shellune_core::TransferFailure::ResumeRefused { .. })
+            );
+            if resumable || refused {
+                self.transfer_restart(task.id(), cx);
+            } else {
+                self.transfer_retry(task.id(), cx);
+            }
+            return;
+        }
+        if let Some(task) = tasks
+            .iter()
+            .find(|task| task.is_active() && !task.state().is_awaiting_overwrite())
+        {
+            self.transfer_cancel(task.id(), cx);
+        }
+    }
+
+    /// Page Up/Down, Home and End, and the arrow keys, while the X11 notice has the
+    /// keyboard. The terminal keeps its own keys; this only runs when the notice is
+    /// focused (R4).
+    fn x11_notice_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let key = event.keystroke.key.as_str();
+        if event.keystroke.modifiers.modified() {
+            return false;
+        }
+        if !matches!(key, "pageup" | "pagedown" | "home" | "end" | "up" | "down") {
+            return false;
+        }
+        scroll_by_key(&self.x11_notice_scroll, key);
+        cx.notify();
+        true
     }
 
     /// Gives the keyboard back to the column a question was asked from.
@@ -9968,8 +10100,9 @@ impl ShelluneView {
                     .child(components::status_dot(tone, metrics))
                     .child(
                         div()
+                            .w_full()
                             .min_w(px(0.0))
-                            .truncate()
+                            .whitespace_normal()
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector(move || format!("transfers.name.{index}"))
                             .child(SharedString::from(format!(
@@ -9998,6 +10131,9 @@ impl ShelluneView {
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
                     .text_color(tone.text())
                     .debug_selector(move || format!("transfers.state.{index}"))
                     .child(SharedString::from(detail)),
@@ -10757,6 +10893,18 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Puts the keyboard on the X11 failure notice, for a test.
+    #[cfg(test)]
+    pub fn focus_x11_notice_for_test(&self, window: &mut Window) {
+        window.focus(&self.x11_notice_focus);
+    }
+
+    /// Puts the keyboard on the transfer strip, for a test.
+    #[cfg(test)]
+    pub fn focus_transfer_strip_for_test(&self, window: &mut Window) {
+        window.focus(&self.files_transfer_focus);
+    }
+
     /// Attaches a scripted transfer channel to one session, for a test.
     ///
     /// The window creates the real one when a connection becomes live; a test that
@@ -11378,7 +11526,12 @@ impl ShelluneView {
                         .id(selector)
                         .debug_selector(move || selector.to_owned())
                 };
+            // One line. The shared track wraps so a settings row can shrink, and that
+            // same wrap stacked these two segments until the session bar was tall
+            // enough to leave the file pane shorter than the failure it has to show.
             components::segmented(metrics)
+                .flex_none()
+                .flex_nowrap()
                 .child(
                     view_segment(
                         "files.close",
@@ -11422,11 +11575,15 @@ impl ShelluneView {
         let row =
             div()
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
+                .justify_center()
                 .flex_none()
-                .gap(metrics.scale(spacing::TIGHT))
-                .h(metrics.session_bar_height())
+                .gap(metrics.scale(spacing::HAIRLINE))
+                // The name, the target and the state take their own line, and the actions
+                // take the next. One wrapping row squeezed the name until it painted
+                // under the X11 chip, or grew tall enough to push the terminal out of a
+                // 720×480 window (R4).
+                .min_h(metrics.session_bar_height())
                 .pl(metrics.scale(spacing::BASE - 2.0))
                 .pr(metrics.scale(spacing::TIGHT))
                 .bg(theme::swatch(palette::CANVAS))
@@ -11436,9 +11593,11 @@ impl ShelluneView {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
+                        .w_full()
                         .gap(metrics.scale(spacing::TIGHT))
-                        .min_w(px(0.0))
+                        .flex_none()
                         .child(
                             div()
                                 .id("session.kind")
@@ -11462,9 +11621,12 @@ impl ShelluneView {
                         )
                         .child(
                             div()
+                                // Natural width, then the next line of the cluster: a
+                                // single-line truncate at 200% cut the last glyph in half
+                                // and had no ellipsis (R4).
                                 .flex_none()
-                                .max_w(metrics.scale(240.0))
-                                .truncate()
+                                .max_w_full()
+                                .whitespace_normal()
                                 .text_size(metrics.label_size())
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
@@ -11479,11 +11641,13 @@ impl ShelluneView {
                         )
                         .children(target.map(|target| {
                             div()
-                                .min_w(px(0.0))
-                                .truncate()
+                                .flex_none()
+                                .max_w_full()
+                                .whitespace_normal()
                                 .font_family(terminal::monospace_family())
                                 .text_size(metrics.caption_size())
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .debug_selector(|| "session.target".to_owned())
                                 .child(SharedString::from(target))
                         }))
                         .when(!live, |row| {
@@ -11496,18 +11660,37 @@ impl ShelluneView {
                             |_| {
                                 div()
                                     .flex_none()
-                                    .truncate()
+                                    .max_w_full()
+                                    .min_w(px(0.0))
+                                    .whitespace_normal()
                                     .text_size(metrics.caption_size())
                                     .text_color(theme::swatch(palette::TEXT_MUTED))
                                     .child(strings.quick_unsaved_note)
                             },
-                        )),
+                        ))
+                        // The close control sits on this line, in the space after the
+                        // name. On the action line it was the one button that wrapped,
+                        // and that extra line left the file pane shorter than the
+                        // failure reason it has to show whole (R4).
+                        .child(div().flex_1().min_w(px(0.0)))
+                        .child(
+                            components::icon_only_button(Icon::Close, metrics)
+                                .id("session.close")
+                                .debug_selector(|| "session.close".to_owned())
+                                .tooltip(components::tooltip(strings.session_close))
+                                .on_click(cx.listener(move |view, _event, _window, cx| {
+                                    view.request_close_session(id, cx);
+                                })),
+                        ),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_none()
+                        .flex_wrap()
                         .items_center()
+                        .justify_end()
+                        .w_full()
                         .gap(metrics.scale(spacing::HAIRLINE))
                         .children(self.solo_split_buttons(cx))
                         .when_some(files_button, |row, button| row.child(button))
@@ -11548,15 +11731,6 @@ impl ShelluneView {
                                     move |view, cx| view.save_quick_host(id, cx),
                                 ))
                             },
-                        )
-                        .child(
-                            components::icon_only_button(Icon::Close, metrics)
-                                .id("session.close")
-                                .debug_selector(|| "session.close".to_owned())
-                                .tooltip(components::tooltip(strings.session_close))
-                                .on_click(cx.listener(move |view, _event, _window, cx| {
-                                    view.request_close_session(id, cx);
-                                })),
                         ),
                 );
         let notice = self.quick_save_notice.clone();
@@ -11577,13 +11751,11 @@ impl ShelluneView {
             .child(row)
             .children(x11_failure.map(|(reason, next_step)| {
                 // A failed bridge leaves a working session, so the bar keeps its buttons
-                // and the terminal keeps the room under them: the two blocks of text are
-                // bounded to the share of the window a notice may take, and what does not
-                // fit is reached by scrolling instead of being drawn past the bottom edge
-                // (R4, R11). At 720×480 with 200% text the reason and the next step are
-                // together taller than the window, and a box let grow to its content would
-                // leave the terminal no height at all.
+                // and the terminal keeps the room under them. The box is tall enough that
+                // the short reason stays whole on the first screen; a longer one scrolls,
+                // and Page Up/Down do that while this box has the keyboard (R4, R11).
                 let room = window.viewport_size().height * X11_NOTICE_SHARE;
+                let scroll = self.x11_notice_scroll.clone();
                 div()
                     .id("session.x11.notice.body")
                     .flex()
@@ -11592,6 +11764,18 @@ impl ShelluneView {
                     .min_h(px(0.0))
                     .max_h(room)
                     .overflow_y_scroll()
+                    .track_scroll(&scroll)
+                    .track_focus(&self.x11_notice_focus)
+                    .focus(|style| {
+                        style
+                            .border_1()
+                            .border_color(theme::swatch(palette::ACCENT))
+                    })
+                    .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
+                        if view.x11_notice_key(event, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
                     .debug_selector(|| "session.x11.notice.body".to_owned())
                     .child(self.x11_failure_banner(&reason, &next_step, metrics))
             }))
@@ -11605,15 +11789,20 @@ impl ShelluneView {
     /// that is always there and readable without a pointer.
     fn x11_failure_banner(&self, reason: &str, next_step: &str, metrics: Metrics) -> Div {
         let strings = self.strings();
-        // The next step comes first, the reason after it. At the smallest window with the
-        // largest text the bounded box above cannot show the whole of both, and scrolling
-        // it takes a pointer: a keyboard user reads only what the first screen holds, so
-        // what they get there is what they can do about the failure (R4, R11). The reason
-        // follows whole and is reached by scrolling the box.
+        // The next step comes first, the reason after it. The box above is sized so the
+        // short reason is still on that first screen; what a longer failure cannot show
+        // is reached with Page Up/Down while the box has the keyboard (R4, R11).
         components::banner(Tone::Danger, metrics)
             .debug_selector(|| "session.x11.notice".to_owned())
             .child(
                 div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    // Tighter than the default golden-ratio line height so the short
+                    // reason stays whole inside the notice's share of a 720×480 window
+                    // at 200% text, without cutting a glyph (R4).
+                    .line_height(gpui::relative(1.25))
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .debug_selector(|| "session.x11.next".to_owned())
                     .child(SharedString::from(format!(
@@ -11623,6 +11812,10 @@ impl ShelluneView {
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    .line_height(gpui::relative(1.25))
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .debug_selector(|| "session.x11.reason".to_owned())
@@ -12590,6 +12783,24 @@ fn zoom_percent(zoom: theme::Zoom) -> u16 {
         theme::Zoom::Comfortable => 115,
         theme::Zoom::Largest => 200,
     }
+}
+
+/// Moves a scroll handle by one page, one line, or to either end.
+fn scroll_by_key(handle: &gpui::ScrollHandle, key: &str) {
+    let offset = handle.offset();
+    let page = handle.bounds().size.height;
+    let line = page * 0.2;
+    let limit = -handle.max_offset().height;
+    let next = match key {
+        "pagedown" => offset.y - page,
+        "pageup" => offset.y + page,
+        "down" => offset.y - line,
+        "up" => offset.y + line,
+        "home" => px(0.0),
+        "end" => limit,
+        _ => return,
+    };
+    handle.set_offset(gpui::point(offset.x, next.max(limit).min(px(0.0))));
 }
 
 /// Prints one line when `SHELLUNE_LOG_VIEWPORT=1` and the measurement changes.

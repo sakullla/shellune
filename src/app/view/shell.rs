@@ -1679,6 +1679,7 @@ impl ShelluneView {
         id: &'static str,
         width: f32,
         header: Div,
+        subtitle: Option<Div>,
         body: AnyElement,
         footer: Option<Div>,
     ) -> Div {
@@ -1712,9 +1713,10 @@ impl ShelluneView {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
+                    .children(subtitle)
                     .child(body),
             )
-            .children(footer);
+            .children(footer.map(|footer| footer.flex_none()));
         super::overlay_layer().child(
             div()
                 .relative()
@@ -1748,7 +1750,7 @@ impl ShelluneView {
         close_id: &'static str,
         cx: &mut Context<Self>,
         close: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-    ) -> Div {
+    ) -> (Div, Option<Div>) {
         self.modal_header_with(icon, title, subtitle, None, close_id, cx, close)
     }
 
@@ -1763,23 +1765,29 @@ impl ShelluneView {
         close_id: &'static str,
         cx: &mut Context<Self>,
         close: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-    ) -> Div {
+    ) -> (Div, Option<Div>) {
         let metrics = self.metrics();
-        div()
+        // The title stays on its own row with the close button. The subtitle is
+        // returned separately and drawn at the top of the scrolling body: beside the
+        // icon it wrapped one glyph per line, and in the fixed header a full sentence
+        // at 200% text left the body 24px tall, so the editor could not be scrolled
+        // into view (R4).
+        let bar = div()
             .flex()
             .flex_none()
+            .w_full()
             .items_center()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
-            .pt(metrics.scale(spacing::LOOSE - 4.0))
-            .pb(metrics.scale(spacing::SNUG))
+            .pt(metrics.scale(spacing::SNUG))
+            .pb(metrics.scale(spacing::TIGHT))
             .children(icon.map(|icon| {
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .size(metrics.scale(36.0))
+                    .size(metrics.scale(28.0))
                     .rounded(px(radius::MEDIUM + 2.0))
                     .bg(theme::swatch(palette::ACCENT_TINT))
                     .child(icons::icon(
@@ -1790,30 +1798,13 @@ impl ShelluneView {
             }))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
                     .flex_1()
                     .min_w(px(0.0))
-                    .gap(metrics.scale(2.0))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(metrics.heading_size())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(title)),
-                    )
-                    .children(subtitle.map(|subtitle| {
-                        div()
-                            // One line, like the title above it: a subtitle that wraps at
-                            // 200% text in the smallest window grows the header past the
-                            // dialog's own height and leaves the body — the controls the
-                            // header introduces — without a line to stand on (R4).
-                            .truncate()
-                            .text_size(metrics.label_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .child(SharedString::from(subtitle))
-                    })),
+                    .truncate()
+                    .text_size(metrics.heading_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(title)),
             )
             .children(badge)
             .child(
@@ -1824,7 +1815,22 @@ impl ShelluneView {
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         close(this, cx);
                     })),
-            )
+            );
+        let subtitle = subtitle.map(|subtitle| {
+            div()
+                // Whole words across the dialog. A single-line truncate cut the
+                // sentence through a glyph and drew no ellipsis (R4).
+                .w_full()
+                .min_w(px(0.0))
+                .whitespace_normal()
+                .px(metrics.scale(spacing::LOOSE))
+                .pb(metrics.scale(spacing::TIGHT))
+                .text_size(metrics.label_size())
+                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .debug_selector(|| "modal.subtitle".to_owned())
+                .child(SharedString::from(subtitle))
+        });
+        (bar, subtitle)
     }
 
     /// The connection being set up, or the quick-connect form, as a dialog.
@@ -1837,7 +1843,7 @@ impl ShelluneView {
         let strings = self.strings();
         let ux = copy::ux();
         if self.quick_open {
-            let header = self.modal_header(
+            let (header, subtitle) = self.modal_header(
                 Some(Icon::Plug),
                 strings.quick_connect_title.to_owned(),
                 Some(ux.quick_hint.to_owned()),
@@ -1854,7 +1860,9 @@ impl ShelluneView {
                 .pb(metrics.scale(spacing::LOOSE))
                 .child(self.quick_panel(cx))
                 .into_any_element();
-            return Some(self.modal(window, "quick.dialog", 520.0, header, body, None));
+            return Some(self.modal(
+                window, "quick.dialog", 520.0, header, subtitle, body, None,
+            ));
         }
         if !(self.showing_connection_form && self.remote.is_some()) {
             return None;
@@ -1868,7 +1876,7 @@ impl ShelluneView {
             panel.status(),
             crate::app::remote::RemoteStatus::Idle | crate::app::remote::RemoteStatus::Failed(_)
         );
-        let header = self.modal_header_with(
+        let (header, subtitle) = self.modal_header_with(
             None,
             format!("{} {}", ux.connect_title, host.name()),
             Some(host.target()),
@@ -1879,10 +1887,11 @@ impl ShelluneView {
         );
         let header = div()
             .flex()
+            .w_full()
             .items_center()
             .pl(metrics.scale(spacing::LOOSE))
             .child(host_avatar(host.name(), false, metrics))
-            .child(header.flex_1().pl(metrics.scale(spacing::SNUG)));
+            .child(header.flex_1().min_w(px(0.0)).pl(metrics.scale(spacing::SNUG)));
         let body = div()
             .flex()
             .flex_col()
@@ -1918,7 +1927,9 @@ impl ShelluneView {
                     |view, cx| view.hide_connection(cx),
                 ))
         });
-        Some(self.modal(window, "remote.dialog", 600.0, header, body, footer))
+        Some(self.modal(
+            window, "remote.dialog", 600.0, header, subtitle, body, footer,
+        ))
     }
 
     /// Importing hosts from an SSH configuration, as a dialog: read, preview, then
@@ -1929,7 +1940,7 @@ impl ShelluneView {
         }
         let metrics = self.metrics();
         let strings = self.strings();
-        let header = self.modal_header(
+        let (header, subtitle) = self.modal_header(
             Some(Icon::Import),
             strings.import_title.to_owned(),
             Some(strings.import_read_only.to_owned()),
@@ -1942,7 +1953,15 @@ impl ShelluneView {
             .pb(metrics.scale(spacing::LOOSE))
             .child(self.import_panel(cx))
             .into_any_element();
-        Some(self.modal(window, "hosts.import.dialog", 720.0, header, body, None))
+        Some(self.modal(
+            window,
+            "hosts.import.dialog",
+            720.0,
+            header,
+            subtitle,
+            body,
+            None,
+        ))
     }
 
     /// Starting any program by its path: a field, one line on what it takes, and
@@ -1957,7 +1976,7 @@ impl ShelluneView {
         }
         let metrics = self.metrics();
         let ux = copy::ux();
-        let header = self.modal_header(
+        let (header, subtitle) = self.modal_header(
             Some(Icon::FolderOpen),
             ux.custom_shell_title.to_owned(),
             None,
@@ -2042,6 +2061,7 @@ impl ShelluneView {
             "shell.custom.dialog",
             520.0,
             header,
+            subtitle,
             body,
             Some(footer),
         ))
@@ -2070,7 +2090,7 @@ impl ShelluneView {
                         self.book.host(id).map_or("?", |host| host.name())
                     ),
                 };
-                let header = self.modal_header(
+                let (header, hint) = self.modal_header(
                     Some(Icon::Forward),
                     ux.tool_forwards_title.to_owned(),
                     Some(subtitle),
@@ -2089,10 +2109,12 @@ impl ShelluneView {
                         cx,
                     ))
                     .into_any_element();
-                Some(self.modal(window, "forwards.dialog", 680.0, header, body, None))
+                Some(self.modal(
+                    window, "forwards.dialog", 680.0, header, hint, body, None,
+                ))
             }
             Tool::Transfers => {
-                let header = self.modal_header(
+                let (header, subtitle) = self.modal_header(
                     Some(Icon::Transfer),
                     ux.tool_transfers_title.to_owned(),
                     Some(ux.tool_transfers_subtitle.to_owned()),
@@ -2112,7 +2134,15 @@ impl ShelluneView {
                     .pb(metrics.scale(spacing::LOOSE))
                     .child(list)
                     .into_any_element();
-                Some(self.modal(window, "transfers.dialog", 680.0, header, body, None))
+                Some(self.modal(
+                    window,
+                    "transfers.dialog",
+                    680.0,
+                    header,
+                    subtitle,
+                    body,
+                    None,
+                ))
             }
             Tool::Snippets => Some(self.snippet_tool(window, cx, close)),
         }
@@ -2488,7 +2518,7 @@ impl ShelluneView {
             )
         };
         let close_header = close.clone();
-        let header = self.modal_header(
+        let (header, hint) = self.modal_header(
             Some(Icon::Terminal),
             ux.snippet_manage_title.to_owned(),
             Some(subtitle),
@@ -2613,6 +2643,7 @@ impl ShelluneView {
             "snippets.dialog",
             640.0,
             header,
+            hint,
             body.into_any_element(),
             Some(footer),
         )
