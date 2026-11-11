@@ -14,6 +14,7 @@ use shellune_core::{
     TabId, tab_name_in_limits,
 };
 
+use super::shell::ModalContent;
 use super::{
     AccentRow, PaneKind, ShelluneView, TabRenameLimit, destination_icon, program_label,
     session_target,
@@ -1816,10 +1817,12 @@ impl ShelluneView {
             window,
             "tabs.list.dialog",
             680.0,
-            header,
-            subtitle,
-            body,
-            None,
+            ModalContent {
+                header,
+                subtitle,
+                body,
+                footer: None,
+            },
         ))
     }
 
@@ -1963,10 +1966,12 @@ impl ShelluneView {
             window,
             "tab.rename.dialog",
             520.0,
-            header,
-            hint,
-            body,
-            Some(footer),
+            ModalContent {
+                header,
+                subtitle: hint,
+                body,
+                footer: Some(footer),
+            },
         ))
     }
 

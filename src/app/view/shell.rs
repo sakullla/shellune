@@ -36,6 +36,19 @@ pub enum Tool {
     Snippets,
 }
 
+/// The pieces of one centred dialog, kept together so [`ShelluneView::modal`] stays
+/// within the argument limit.
+///
+/// The subtitle is its own piece and is drawn at the top of the scrolling body.
+/// Putting that sentence in the fixed header left the body too short to reach
+/// at 200% text (R4).
+pub(super) struct ModalContent {
+    pub(super) header: Div,
+    pub(super) subtitle: Option<Div>,
+    pub(super) body: AnyElement,
+    pub(super) footer: Option<Div>,
+}
+
 impl ShelluneView {
     // -----------------------------------------------------------------------
     // Top bar
@@ -1678,11 +1691,14 @@ impl ShelluneView {
         window: &Window,
         id: &'static str,
         width: f32,
-        header: Div,
-        subtitle: Option<Div>,
-        body: AnyElement,
-        footer: Option<Div>,
+        content: ModalContent,
     ) -> Div {
+        let ModalContent {
+            header,
+            subtitle,
+            body,
+            footer,
+        } = content;
         let metrics = self.metrics();
         let viewport = window.viewport_size();
         // The inset stays a small edge gap. Scaling it with the text turned a 200%
@@ -1888,7 +1904,17 @@ impl ShelluneView {
                 .pb(metrics.scale(spacing::LOOSE))
                 .child(self.quick_panel(cx))
                 .into_any_element();
-            return Some(self.modal(window, "quick.dialog", 520.0, header, subtitle, body, None));
+            return Some(self.modal(
+                window,
+                "quick.dialog",
+                520.0,
+                ModalContent {
+                    header,
+                    subtitle,
+                    body,
+                    footer: None,
+                },
+            ));
         }
         if !(self.showing_connection_form && self.remote.is_some()) {
             return None;
@@ -1969,10 +1995,12 @@ impl ShelluneView {
             window,
             "remote.dialog",
             600.0,
-            header,
-            subtitle,
-            body,
-            footer,
+            ModalContent {
+                header,
+                subtitle,
+                body,
+                footer,
+            },
         ))
     }
 
@@ -2001,10 +2029,12 @@ impl ShelluneView {
             window,
             "hosts.import.dialog",
             720.0,
-            header,
-            subtitle,
-            body,
-            None,
+            ModalContent {
+                header,
+                subtitle,
+                body,
+                footer: None,
+            },
         ))
     }
 
@@ -2104,10 +2134,12 @@ impl ShelluneView {
             window,
             "shell.custom.dialog",
             520.0,
-            header,
-            subtitle,
-            body,
-            Some(footer),
+            ModalContent {
+                header,
+                subtitle,
+                body,
+                footer: Some(footer),
+            },
         ))
     }
 
@@ -2153,7 +2185,17 @@ impl ShelluneView {
                         cx,
                     ))
                     .into_any_element();
-                Some(self.modal(window, "forwards.dialog", 680.0, header, hint, body, None))
+                Some(self.modal(
+                    window,
+                    "forwards.dialog",
+                    680.0,
+                    ModalContent {
+                        header,
+                        subtitle: hint,
+                        body,
+                        footer: None,
+                    },
+                ))
             }
             Tool::Transfers => {
                 let (header, subtitle) = self.modal_header(
@@ -2180,10 +2222,12 @@ impl ShelluneView {
                     window,
                     "transfers.dialog",
                     680.0,
-                    header,
-                    subtitle,
-                    body,
-                    None,
+                    ModalContent {
+                        header,
+                        subtitle,
+                        body,
+                        footer: None,
+                    },
                 ))
             }
             Tool::Snippets => Some(self.snippet_tool(window, cx, close)),
@@ -2684,10 +2728,12 @@ impl ShelluneView {
             window,
             "snippets.dialog",
             640.0,
-            header,
-            hint,
-            body.into_any_element(),
-            Some(footer),
+            ModalContent {
+                header,
+                subtitle: hint,
+                body: body.into_any_element(),
+                footer: Some(footer),
+            },
         )
     }
 
