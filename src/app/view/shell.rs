@@ -1772,6 +1772,23 @@ impl ShelluneView {
         // icon it wrapped one glyph per line, and in the fixed header a full sentence
         // at 200% text left the body 24px tall, so the editor could not be scrolled
         // into view (R4).
+        // A status chip on this row is flex_none. At 720×480 and 200% the title
+        // column is then narrower than one word, and truncate cuts a glyph with no
+        // ellipsis. The chip takes the next row and the title wraps on spaces.
+        let wrapping = badge.is_some();
+        let title = div()
+            .min_w(px(0.0))
+            .text_size(metrics.heading_size())
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+            .when(wrapping, |title| title.w_full().whitespace_normal())
+            .when(!wrapping, |title| title.flex_1().truncate())
+            .child(SharedString::from(title));
+        let title = if wrapping {
+            div().flex_1().min_w(px(0.0)).child(title)
+        } else {
+            title
+        };
         let bar = div()
             .flex()
             .flex_none()
@@ -1796,17 +1813,7 @@ impl ShelluneView {
                         theme::swatch(palette::ACCENT),
                     ))
             }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(metrics.heading_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(SharedString::from(title)),
-            )
-            .children(badge)
+            .child(title)
             .child(
                 components::icon_only_button(Icon::Close, metrics)
                     .id(close_id)
@@ -1816,6 +1823,25 @@ impl ShelluneView {
                         close(this, cx);
                     })),
             );
+        let bar = if let Some(badge) = badge {
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .w_full()
+                .min_w(px(0.0))
+                .child(bar)
+                .child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .px(metrics.scale(spacing::LOOSE))
+                        .pb(metrics.scale(spacing::TIGHT))
+                        .child(badge),
+                )
+        } else {
+            bar
+        };
         let subtitle = subtitle.map(|subtitle| {
             div()
                 // Whole words across the dialog. A single-line truncate cut the
@@ -1888,9 +1914,13 @@ impl ShelluneView {
         let header = div()
             .flex()
             .w_full()
-            .items_center()
+            .items_start()
             .pl(metrics.scale(spacing::LOOSE))
-            .child(host_avatar(host.name(), false, metrics))
+            .child(
+                div()
+                    .pt(metrics.scale(spacing::SNUG))
+                    .child(host_avatar(host.name(), false, metrics)),
+            )
             .child(header.flex_1().min_w(px(0.0)).pl(metrics.scale(spacing::SNUG)));
         let body = div()
             .flex()

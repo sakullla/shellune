@@ -525,30 +525,31 @@ Enter/Space 触发当前控件——与指针点击调用同一段代码，所�
 
 ```
 shellune-viewport viewport_size=1120x720 scale_factor=1.5 text_size=200%
+shellune-viewport viewport_size=1120x720 scale_factor=1.5 text_size=200%
 shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
-shellune-viewport viewport_size=2560x1392 scale_factor=1.5 text_size=200%
 shellune-viewport viewport_size=720x480 scale_factor=1.5 text_size=200%
 ```
 
-界面文字从这一进程一开始就是 200%。第一行是窗口刚出现时的视口。客户区随后被收成 1080×720 物理像素
-（该窗口 dpi 144），进程改报 `viewport_size=720x480`、`scale_factor=1.5`。中间窗口曾被放到
-`2560x1392`，随后又回到 1080×720 物理像素，进程再次报 `720x480`。下面三张图是最后一行之后截的客户区，
-截图时客户区仍是 1080×720 物理像素。界面语言是英文。
+界面文字从这一进程一开始就是 200%。前两行是窗口刚出现时的视口，同一测量写了两次。客户区随后被收成 1080×720
+物理像素（该窗口 dpi 144），进程改报 `viewport_size=720x480`、`scale_factor=1.5`，这一测量也写了两次。
+没有把窗口拉到别的尺寸。下面的图是最后一行之后截的客户区，截图时客户区仍是 1080×720 物理像素。界面语言是英文。
 
-- 全部标签的副标题整句换行，没有从字母中间切开，关闭在标题行右侧。
-  ![全部标签](windows-720x480-200-tab-overflow.png)
-- 快捷命令的副标题整句换行。New shortcut command 和 Close 都在这扇窗口里。
-  ![快捷命令](windows-720x480-200-shortcut-commands.png)
-- 本地会话名 Windows PowerShell 3 与目标 powershell.exe 分开，字形完整，关闭在右侧。这是本地会话，条上没有 X11 状态。
-  ![会话目标](windows-720x480-200-session-target.png)
+- 连接对话框标题整词是 “Connect to test”，关闭在标题行右侧。状态芯片在标题下面一行（先是 Connecting，随后是
+  Could not connect），标题没有再被切成半个词。副标题 `root@212.60.153.19:22` 完整。
+  ![连接对话框](windows-720x480-200-connection-dialog.png)
+- 设置页主题分段是 System、Light、Dark，每个分段都完整。
+  ![主题](windows-720x480-200-settings-theme.png)
+- 默认 Shell 在行内换行：Windows PowerShell、PowerShell 7、Command Prompt 都完整。
+  ![默认 Shell](windows-720x480-200-settings-shell.png)
+- 快捷键行里 keycap 与 Change、Unbind 留在卡片内。Go to settings 这一行能看见 Ctrl+3 和 Ctrl+,。
+  ![快捷键](windows-720x480-200-settings-keys.png)
+- 新建的本地 Windows PowerShell 打开了终端搜索条。
+  ![搜索](windows-720x480-200-terminal-search.png)
 
-这次没有重拍 X11 失败，也没有传输失败图。已保存主机 test（root@212.60.153.19:22）用密钥连接，对话框停在
-Could not connect，没有进入带失败原因的会话，文件页也没有失败传输。连接对话框的标题在状态芯片旁边被切成半个词
-（看到的是 Conr），副标题 `root@212.60.153.19:22` 是完整的。macOS 没有实窗。Linux 上也没有把本应用窗口打开在
-root@192.168.0.109 的显示 :1 上。
+已保存主机 test（root@212.60.153.19:22）用密钥连了一次，对话框停在 Could not connect，没有再试。没有 X11
+失败图，也没有传输失败图。macOS 没有实窗。Linux 上也没有把本应用窗口打开在 root@192.168.0.109 的显示 :1 上。
 
-主题、文字大小、终端配色、默认 Shell、快捷键和搜索结果那几张图是当天更早一扇窗口留下的，不是这次进程，这次没有重拍。
-设置页换行没有改。
+设置页换行没有改。`SHELLUNE_LOG_VIEWPORT` 默认仍关闭，只有这次进程设了 `=1`。
 
 ### 输入框（`text_field.rs`）
 
