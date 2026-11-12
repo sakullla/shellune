@@ -482,14 +482,23 @@ impl GroupBook {
     /// Renames a group and everything inside it.
     ///
     /// Returns the paths that changed, as `(old, new)` pairs in stored order, so the
-    /// caller can move the hosts that named the old paths.
+    /// caller can move the hosts that named the old paths. A destination below a parent
+    /// that was never created gets that parent, because a stored path without its
+    /// ancestors is a tree this build would refuse to read back.
+    ///
+    /// The whole rewrite is staged first and checked against the same invariants a
+    /// file has to pass when it is loaded, so a rename either happens completely or
+    /// leaves the tree exactly as it was: a row that could not be moved does not leave
+    /// a half-renamed tree behind.
     ///
     /// # Errors
     ///
     /// Returns [`GroupBookError::Unknown`] when the group is not stored,
     /// [`GroupBookError::AlreadyExists`] when the new name is taken and
     /// [`GroupBookError::NestedInsideItself`] when the destination lies inside the
-    /// group being renamed; a rename never produces a group with two parents.
+    /// group being renamed; a rename never produces a group with two parents. A move
+    /// that would make a path too deep or that would collide with a saved group is
+    /// refused before anything is changed.
     pub fn rename(
         &mut self,
         from: &GroupPath,
@@ -507,25 +516,51 @@ impl GroupBook {
                 into: to.clone(),
             });
         }
-        let affected: Vec<usize> = self
-            .groups
-            .iter()
-            .enumerate()
-            .filter(|(_, saved)| saved.starts_with(from))
-            .map(|(index, _)| index)
-            .collect();
-        let mut changes = Vec::with_capacity(affected.len());
-        for index in affected {
-            let old = self.groups[index].clone();
+
+        // Stage every rewritten row before one is assigned: the tree on disk must never
+        // be a partly renamed one.
+        let mut staged = self.groups.clone();
+        let mut changes: Vec<(GroupPath, GroupPath)> = Vec::new();
+        for (index, old) in self.groups.iter().enumerate() {
+            if !old.starts_with(from) {
+                continue;
+            }
             let Some(new) = old.rebase(from, to) else {
                 return Err(GroupBookError::InvalidPath(GroupPathError::TooDeep {
                     depth: to.depth() + old.depth() - from.depth(),
                     max: MAX_GROUP_DEPTH,
                 }));
             };
-            self.groups[index] = new.clone();
-            changes.push((old, new));
+            // The destination path may already be taken by a group that is not part of
+            // the rename; two groups with one name have no single place in the tree.
+            if self.groups.contains(&new) && !new.starts_with(from) {
+                return Err(GroupBookError::AlreadyExists { path: new });
+            }
+            staged[index] = new.clone();
+            changes.push((old.clone(), new));
         }
+
+        // A destination such as `Lab/New` may name a parent that was never created;
+        // storing the child without it produces a file that cannot be loaded again.
+        let mut missing: Vec<GroupPath> = Vec::new();
+        let mut parent = to.parent();
+        while let Some(candidate) = parent {
+            if staged.contains(&candidate) {
+                break;
+            }
+            parent = candidate.parent();
+            missing.push(candidate);
+        }
+        staged.extend(missing.into_iter().rev());
+
+        let staged_book = Self {
+            version: self.version,
+            groups: staged,
+        };
+        staged_book
+            .validate()
+            .map_err(|reason| GroupBookError::Inconsistent { reason })?;
+        self.groups = staged_book.groups;
         Ok(changes)
     }
 
@@ -744,6 +779,54 @@ mod tests {
         assert_eq!(
             book.remove(&path("Prod")),
             Err(GroupBookError::Unknown { path: path("Prod") })
+        );
+    }
+
+    #[test]
+    fn a_rename_adds_the_parents_of_its_destination() {
+        // "Staging" was never created: a tree that stored "Staging/New" without it
+        // would be a file this build refuses to read back.
+        let mut book =
+            GroupBook::from_paths([path("Prod"), path("Prod/Web")]).expect("the tree is valid");
+        let changes = book
+            .rename(&path("Prod"), &path("Staging/New"))
+            .expect("the rename is valid");
+        assert_eq!(
+            changes,
+            [
+                (path("Prod"), path("Staging/New")),
+                (path("Prod/Web"), path("Staging/New/Web"))
+            ]
+        );
+        assert_eq!(
+            book.paths(),
+            [
+                path("Staging/New"),
+                path("Staging/New/Web"),
+                path("Staging")
+            ],
+            "the destination's parent is stored with it, at the end like any new group"
+        );
+        assert_eq!(book.validate(), Ok(()), "the tree can be read back");
+    }
+
+    #[test]
+    fn a_rename_that_cannot_finish_leaves_the_tree_untouched() {
+        let mut book =
+            GroupBook::from_paths([path("Prod"), path("Prod/Web")]).expect("the tree is valid");
+        let before = book.clone();
+        let deep = path(&["n"; MAX_GROUP_DEPTH].join("/"));
+        assert_eq!(
+            book.rename(&path("Prod"), &deep),
+            Err(GroupBookError::InvalidPath(GroupPathError::TooDeep {
+                depth: MAX_GROUP_DEPTH + 1,
+                max: MAX_GROUP_DEPTH,
+            })),
+            "the child cannot follow its group that deep"
+        );
+        assert_eq!(
+            book, before,
+            "a rename that stops half way leaves nothing changed"
         );
     }
 }

@@ -48,7 +48,8 @@ mod workspace;
 
 pub use audit::{CONFIG_KEYS, LOG_FIELDS, StoreEvent};
 pub use book::{
-    FORMAT_VERSION, Group, HostBook, HostEdit, RecentConnection, RecentHost, host_matches,
+    FORMAT_VERSION, Group, HostBook, HostEdit, LegacyGroupLabel, RecentConnection, RecentHost,
+    host_matches,
 };
 pub use credentials::{MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
 pub use error::{BookError, PersistError, StorageError};

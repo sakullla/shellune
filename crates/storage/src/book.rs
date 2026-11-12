@@ -404,9 +404,10 @@ impl HostBook {
 
     /// Moves the given hosts into one group, or out of every group.
     ///
-    /// Returns how many hosts changed. All or nothing: an identifier that names no
-    /// saved host leaves the book exactly as it was, because a half-applied move would
-    /// make the counts the user confirmed disagree with the tree.
+    /// Returns how many hosts actually changed group, so moving a selection that is
+    /// already where it is being moved to reports nothing. All or nothing: an
+    /// identifier that names no saved host leaves the book exactly as it was, because a
+    /// half-applied move would make the counts the user confirmed disagree with the tree.
     ///
     /// # Errors
     ///
@@ -426,12 +427,34 @@ impl HostBook {
         let selected: HashSet<HostId> = ids.iter().copied().collect();
         let mut changed = 0;
         for host in &mut self.hosts {
-            if selected.contains(&host.id()) {
-                host.set_group_path(destination.cloned());
-                changed += 1;
+            if !selected.contains(&host.id()) || already_in(host, destination) {
+                continue;
             }
+            host.set_group_path(destination.cloned());
+            changed += 1;
         }
         Ok(changed)
+    }
+
+    /// The hosts whose saved label has no group path this build can draw.
+    ///
+    /// A label with a control character, or one longer than a group name, is not a
+    /// group the tree can hold, so those hosts cannot be counted in a group and cannot
+    /// be moved with one. They are listed instead of disappearing from a count: the
+    /// caller shows them, and the label itself stays exactly as it was saved.
+    #[must_use]
+    pub fn legacy_group_labels(&self) -> Vec<LegacyGroupLabel> {
+        self.hosts
+            .iter()
+            .filter_map(|host| {
+                host.group_label_without_path()
+                    .map(|label| LegacyGroupLabel {
+                        host: host.id(),
+                        host_name: host.name().to_owned(),
+                        label: label.to_owned(),
+                    })
+            })
+            .collect()
     }
 
     /// Rewrites the path of every host inside a renamed group.
@@ -522,6 +545,48 @@ impl HostBook {
     /// Rejects a document that breaks the invariants, used after deserialization.
     pub(crate) fn ensure_valid(&self) -> Result<(), String> {
         self.validate()
+    }
+}
+
+/// Whether a host is already exactly in one group.
+///
+/// `None` is "no group at all", which is different from a host that still carries a
+/// label: clearing that label is a change, so it is counted.
+fn already_in(host: &HostConfig, destination: Option<&GroupPath>) -> bool {
+    match destination {
+        Some(path) => host.group_path().as_ref() == Some(path),
+        None => host.group_path().is_none() && host.group().is_none(),
+    }
+}
+
+/// A saved group label that has no group path this build can draw.
+///
+/// The label is kept as it was written, so a view can still show it beside the host;
+/// what it cannot do is place the host in the group tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyGroupLabel {
+    host: HostId,
+    host_name: String,
+    label: String,
+}
+
+impl LegacyGroupLabel {
+    /// The host that carries the label.
+    #[must_use]
+    pub fn host(&self) -> HostId {
+        self.host
+    }
+
+    /// The name of that host, so a preview can name it without another lookup.
+    #[must_use]
+    pub fn host_name(&self) -> &str {
+        &self.host_name
+    }
+
+    /// The label as it was saved.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
     }
 }
 

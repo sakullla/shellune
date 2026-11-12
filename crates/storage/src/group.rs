@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use shellune_core::{GROUPS_FORMAT_VERSION, GroupBook, GroupBookError, GroupPath, HostId};
 
-use crate::book::HostBook;
+use crate::book::{HostBook, LegacyGroupLabel};
 use crate::error::{BookError, PersistError, StorageError};
 use crate::store::{self, HostStore};
 
@@ -147,8 +147,14 @@ pub struct GroupUpdate {
     pub hosts: HostBook,
     /// The tree as it is now saved.
     pub groups: GroupBook,
-    /// How many hosts moved into another group.
+    /// How many hosts actually moved into another group.
     pub hosts_changed: usize,
+    /// Hosts that still carry a saved label this build cannot place in the tree.
+    ///
+    /// They are reported rather than counted as ungrouped: the label stays visible,
+    /// and a change that could not touch them says so instead of dropping them from
+    /// its result.
+    pub labels_without_group: Vec<LegacyGroupLabel>,
 }
 
 /// What deleting a group would touch, before anything is written.
@@ -160,6 +166,10 @@ pub struct GroupDeletion {
     pub groups_removed: Vec<GroupPath>,
     /// Where those hosts would go; `None` means out of every group.
     pub destination: Option<GroupPath>,
+    /// Hosts that carry a saved label with no group path, so they are neither in the
+    /// group nor moved with it. Listed for the confirmation instead of being left out
+    /// of the count without a word.
+    pub labels_without_group: Vec<LegacyGroupLabel>,
 }
 
 /// The host file and the group tree changed together.
@@ -255,11 +265,13 @@ impl GroupService {
         {
             next_groups.insert(destination)?;
         }
+        let labels_without_group = next_hosts.legacy_group_labels();
         self.commit(&next_hosts, &next_groups)?;
         Ok(GroupUpdate {
             hosts: next_hosts,
             groups: next_groups,
             hosts_changed: moved,
+            labels_without_group,
         })
     }
 
@@ -280,11 +292,13 @@ impl GroupService {
         next_groups.rename(from, to)?;
         let mut next_hosts = hosts.clone();
         let moved = next_hosts.rename_group_paths(from, to)?;
+        let labels_without_group = next_hosts.legacy_group_labels();
         self.commit(&next_hosts, &next_groups)?;
         Ok(GroupUpdate {
             hosts: next_hosts,
             groups: next_groups,
             hosts_changed: moved,
+            labels_without_group,
         })
     }
 
@@ -324,6 +338,7 @@ impl GroupService {
             hosts_moved: hosts.hosts_under_group(path).len(),
             groups_removed: removed,
             destination: destination.cloned(),
+            labels_without_group: hosts.legacy_group_labels(),
         })
     }
 
@@ -346,7 +361,7 @@ impl GroupService {
         let preview = self.preview_deletion(hosts, groups, path, destination)?;
         let ids = hosts.hosts_under_group(path);
         let mut next_hosts = hosts.clone();
-        next_hosts.reassign_group(&ids, destination)?;
+        let moved = next_hosts.reassign_group(&ids, destination)?;
         let mut next_groups = groups.clone();
         next_groups.remove(path)?;
         if let Some(destination) = destination
@@ -354,12 +369,14 @@ impl GroupService {
         {
             next_groups.insert(destination)?;
         }
+        let labels_without_group = next_hosts.legacy_group_labels();
         self.commit(&next_hosts, &next_groups)?;
         Ok((
             GroupUpdate {
-                hosts_changed: ids.len(),
+                hosts_changed: moved,
                 hosts: next_hosts,
                 groups: next_groups,
+                labels_without_group,
             },
             preview,
         ))

@@ -415,6 +415,21 @@ impl HostConfig {
         }
     }
 
+    /// The legacy label this host still carries although it has no path form.
+    ///
+    /// A label with a control character or one longer than a group name is not a
+    /// group this build can draw, so [`Self::group_path`] answers `None` for it. It
+    /// stays a label on purpose — rewriting it would lose what the user saved — which
+    /// is why the host book lists these records instead of counting them as
+    /// ungrouped and saying nothing.
+    #[must_use]
+    pub fn group_label_without_path(&self) -> Option<&str> {
+        match (&self.group_path, &self.group) {
+            (None, Some(label)) if GroupPath::from_label(label).is_err() => Some(label.as_str()),
+            _ => None,
+        }
+    }
+
     /// The group as one string, for search and the flat label view.
     ///
     /// A hierarchy is written in its canonical form, so searching `Prod/Web` finds the
@@ -544,26 +559,25 @@ impl HostConfig {
 
     /// Assigns or clears the single grouping label.
     ///
-    /// Naming a label replaces any hierarchy this host was in: a host belongs to one
-    /// place, and two fields that could disagree would make the group counts wrong.
+    /// Naming a label replaces any hierarchy this host was in, and clearing the label
+    /// clears the path too: a host belongs to one place, and two fields that could
+    /// disagree would make the group counts wrong.
     pub fn set_group(&mut self, group: Option<impl Into<String>>) {
         self.group = group
             .map(Into::into)
             .map(|group: String| group.trim().to_owned())
             .filter(|group| !group.is_empty());
-        if self.group.is_some() {
-            self.group_path = None;
-        }
+        self.group_path = None;
     }
 
     /// Moves this host into a group path, or out of every group.
     ///
-    /// The path was validated when it was built, so this cannot fail. Assigning a path
-    /// clears a legacy label for the same reason [`Self::set_group`] clears a path.
+    /// The path was validated when it was built, so this cannot fail. The label is
+    /// always cleared, including when the destination is `None`: a host moved out of
+    /// its group has to leave it for real, and keeping the old label would leave it
+    /// filed under the group the user just removed it from.
     pub fn set_group_path(&mut self, path: Option<GroupPath>) {
-        if path.is_some() {
-            self.group = None;
-        }
+        self.group = None;
         self.group_path = path;
     }
 
