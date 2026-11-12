@@ -12,8 +12,14 @@ This script owns the rest of the command:
 * it builds the binary with the "ui-capture" feature;
 * it passes the filters through (--list, --quick, --theme, --size, --only) and captures
   into a staging directory;
-* on success it publishes: it removes exactly the PNGs the previous manifest registered,
-  moves this run's files into docs/verification/ui and writes the gallery;
+* a round publishes into a directory of its own: a full run into docs/verification/ui, a
+  quick or filtered run into a subdirectory of it (quick/, only-home-hosts/ ...), so a
+  narrow run can never delete the shots it did not take;
+* on success it publishes in three steps: every staged PNG is checked and repacked
+  losslessly first, then the whole round is moved into place, and only then are the
+  images the previous round registered - and this one did not - removed. A failure in
+  either of the first two steps leaves the previous round complete, and the command can
+  simply be run again;
 * on failure it moves the staging directory aside as ".failed-<stamp>" and leaves the
   previous round's images, manifest and gallery untouched, so a failed run can never
   replace the baseline it was meant to compare against.
@@ -32,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import html
 import json
 import os
@@ -47,6 +54,12 @@ MANIFEST_NAME = "capture-ui-manifest.json"
 GALLERY_NAME = "index.html"
 STAGING_PREFIX = ".staging-"
 FAILED_PREFIX = ".failed-"
+BACKUP_PREFIX = ".backup-"
+FULL_ROUND = "full"
+
+
+class RoundError(Exception):
+    """A round that cannot be published. The published round is still the old one."""
 
 
 def repo_root() -> Path:
@@ -55,6 +68,44 @@ def repo_root() -> Path:
 
 def stamp() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def slug(text: str) -> str:
+    """A directory name for one part of a filter, safe on every filesystem."""
+    cleaned = "".join(character if character.isalnum() or character in "-_." else "-"
+                      for character in text.strip().lower())
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned[:60] or "run"
+
+
+def round_key(quick: bool, theme, sizes, only) -> str:
+    """Which round this run takes, as a directory name below the published root.
+
+    A round keeps every shot it took and only ever replaces itself, so a quick run is
+    published beside the full round instead of over it: narrowing a run used to delete
+    the eighteen shots the narrowed run did not take, which is exactly what a baseline
+    must not lose.
+    """
+    parts = []
+    if quick:
+        parts.append("quick")
+    if theme and theme != "both":
+        parts.append("theme-" + slug(theme))
+    for size in sizes or []:
+        parts.append("size-" + slug(size))
+    for pattern in only or []:
+        parts.append("only-" + slug(pattern))
+    if not parts:
+        return FULL_ROUND
+    key = "+".join(parts)
+    if len(key) > 80:
+        # Long filter lists are still one round; the digest keeps the name usable.
+        key = key[:60] + "+" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    return key
+
+
+def round_directory(root: Path, key: str) -> Path:
+    return root if key == FULL_ROUND else root / key
 
 
 def target_directory(root: Path) -> Path:
@@ -141,10 +192,17 @@ def registered_files(manifest) -> list:
     return names
 
 
-def remove_previous_images(dest: Path, previous) -> list:
-    """Deletes the PNGs the previous manifest registered, and nothing else."""
+def retire_previous(dest: Path, previous, published) -> list:
+    """Deletes the PNGs the previous manifest registered, and nothing else.
+
+    This runs only after the new round is completely in place: until then the previous
+    round is the one a reader sees, and it has to stay whole. An image this round
+    published too has already been replaced in place, so it is not removed.
+    """
     removed = []
     for name in registered_files(previous):
+        if name in published:
+            continue
         path = dest / name
         if path.is_file():
             try:
@@ -252,8 +310,12 @@ def bullet_list(lines) -> str:
     return "<ul>" + "".join("<li>" + html.escape(sort_text(line)) + "</li>" for line in lines) + "</ul>"
 
 
-def render_gallery(manifest, previous_report) -> str:
-    """The gallery: one card per shot, filterable by scenario, theme, size and language."""
+def render_gallery(manifest, previous_report, others=()) -> str:
+    """The gallery: one card per shot, filterable by scenario, theme, size and language.
+
+    `others` names the other rounds published beside this one, so a reader who lands on
+    the quick round can find the full baseline without knowing the directory layout.
+    """
     shots = sorted(manifest.get("shots") or [], key=scenario_sort_key)
     failures = [item for item in manifest.get("failures") or [] if isinstance(item, dict)]
     changed = set(previous_report.get("changed") or [])
@@ -281,6 +343,13 @@ def render_gallery(manifest, previous_report) -> str:
     changed_html = ""
     if changed:
         changed_html = "<h2>与本轮之前相比有变化的画面</h2>" + bullet_list(sorted(changed))
+    rounds_html = ""
+    if others:
+        rounds_html = ("<h2>其他轮次</h2>"
+                       + '<p class="summary">'
+                       + " · ".join('<a href="' + html.escape(href) + '">' + html.escape(label)
+                                    + "</a>" for label, href in others)
+                       + "</p>")
 
     parts = [
         "<!doctype html>",
@@ -313,6 +382,7 @@ def render_gallery(manifest, previous_report) -> str:
         "</style></head><body>",
         "<h1>Shellune UI capture</h1>",
         '<p class="summary">' + html.escape(summary) + "</p>",
+        rounds_html,
         "<h2>过滤</h2>",
         chips(shots, "scenario", "场景"),
         chips(shots, "theme", "主题"),
@@ -414,43 +484,147 @@ def label_for(dest: Path) -> str:
         return str(dest)
 
 
-def publish(dest: Path, staging: Path, manifest, previous, label) -> dict:
-    """Replaces the published round with this one, after it succeeded."""
-    report = compare_with_previous(manifest, previous)
-    removed = remove_previous_images(dest, previous)
-    moved = []
+def staged_names(staging: Path) -> list:
+    return sorted(entry.name for entry in staging.iterdir() if entry.is_file())
+
+
+def check_staged_images(staging: Path) -> None:
+    """Checks and repacks every image the round would publish, still inside staging.
+
+    A damaged frame must not be published as evidence. Repacking verifies the chunks and
+    the pixels, and it happens before anything is moved, so one bad shot stops the round
+    while the published one is still whole and the command can be run again.
+    """
     for entry in sorted(staging.iterdir()):
-        if not entry.is_file():
+        if not entry.is_file() or entry.suffix.lower() != ".png":
             continue
-        if entry.suffix.lower() == ".png":
-            # A damaged frame must not be published as evidence: recompressing checks the
-            # chunks and the pixels, so a corrupt file stops the run before it replaces
-            # the previous round.
-            try:
-                recompress_png(entry)
-            except (ValueError, zlib.error) as error:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise SystemExit("refusing to publish a damaged image: " + str(error))
-        target = dest / entry.name
-        shutil.move(str(entry), str(target))
-        moved.append(entry.name)
+        try:
+            recompress_png(entry)
+        except (ValueError, zlib.error) as error:
+            raise RoundError("refusing to publish a damaged image: " + str(error)) from error
+
+
+def prepare_round(staging: Path, manifest, previous, label, others) -> dict:
+    """Makes the whole round ready to publish, without touching the published one.
+
+    The manifest and the gallery are written into staging too: a round that cannot
+    describe itself must not be half published, and the gallery a reader sees only ever
+    names the round that is actually on disk.
+    """
+    check_staged_images(staging)
+    prepared = dict(manifest)
     # The run recorded the staging directory it was given; the published manifest names
-    # where the images really are, so a reader is never pointed at a directory that the
-    # next run has already deleted.
-    manifest = dict(manifest)
-    manifest["out"] = label
-    for shot in manifest.get("shots") or []:
-        if isinstance(shot, dict) and shot.get("file"):
-            path = dest / shot["file"]
-            if path.is_file():
-                shot["bytes"] = path.stat().st_size
-    write_manifest(dest, manifest)
-    (dest / GALLERY_NAME).write_text(
-        render_gallery(manifest, report), encoding="utf-8")
+    # where the images really are, so a reader is never pointed at a directory the next
+    # run has already deleted.
+    prepared["out"] = label
+    shots = [dict(shot) if isinstance(shot, dict) else shot
+             for shot in prepared.get("shots") or []]
+    prepared["shots"] = shots
+    missing = []
+    for shot in shots:
+        if not isinstance(shot, dict) or not shot.get("file"):
+            continue
+        path = staging / shot["file"]
+        if not path.is_file():
+            missing.append(shot["file"])
+            continue
+        shot["bytes"] = path.stat().st_size
+    if missing:
+        raise RoundError("the manifest names images staging does not hold: "
+                         + ", ".join(sorted(missing)))
+    report = compare_with_previous(prepared, previous)
+    write_manifest(staging, prepared)
+    (staging / GALLERY_NAME).write_text(render_gallery(prepared, report, others),
+                                        encoding="utf-8")
+    return {"manifest": prepared, "report": report, "names": staged_names(staging)}
+
+
+def install_order(names) -> list:
+    """Images first, then the manifest, then the gallery.
+
+    A reader's gallery must never be newer than the images it shows, so the index is
+    installed last and the manifest - which the index is built from - just before it.
+    """
+    order = [name for name in names if name not in (MANIFEST_NAME, GALLERY_NAME)]
+    for tail in (MANIFEST_NAME, GALLERY_NAME):
+        if tail in names:
+            order.append(tail)
+    return order
+
+
+def install_round(dest: Path, staging: Path, prepared, move=os.replace) -> list:
+    """Moves a prepared round into place, and puts the old one back if a move fails.
+
+    Staging lives inside the published directory, so a move is a rename on one
+    filesystem: each file appears complete or not at all. What it replaces is kept in a
+    backup until the whole round is in place, because a half moved round is worse than
+    the old one: the gallery a reader has open would link to images that are gone.
+    """
+    backup = dest / (BACKUP_PREFIX + stamp())
+    moved = []
+    replaced = []
+    installed = False
+    try:
+        for name in install_order(prepared["names"]):
+            target = dest / name
+            if target.exists():
+                backup.mkdir(parents=True, exist_ok=True)
+                move(target, backup / name)
+                replaced.append(name)
+            move(staging / name, target)
+            moved.append(name)
+        installed = True
+    except OSError as error:
+        for name in moved:
+            # Put what this round moved back into staging first: the run can then simply
+            # be repeated instead of captured again.
+            try:
+                move(dest / name, staging / name)
+            except OSError:
+                try:
+                    (dest / name).unlink()
+                except OSError:
+                    pass
+        for name in replaced:
+            try:
+                move(backup / name, dest / name)
+            except OSError:
+                print("could not put " + name + " back")
+        raise RoundError("could not move the round into place: " + str(error)) from error
+    finally:
+        # A backup a rollback could not empty is the only copy of something: it stays.
+        if backup.exists() and (installed or not any(backup.iterdir())):
+            shutil.rmtree(backup, ignore_errors=True)
+    return moved
+
+
+def publish(dest: Path, staging: Path, manifest, previous, label, others=()) -> dict:
+    """Publishes this round: prepare all of it, move all of it, and only then retire."""
+    prepared = prepare_round(staging, manifest, previous, label, others)
+    moved = install_round(dest, staging, prepared)
+    # Only now: the previous round was the one on disk until this line, and it had to
+    # stay complete for as long as that was true.
+    removed = retire_previous(dest, previous, set(prepared["names"]))
     shutil.rmtree(staging, ignore_errors=True)
-    report["removed"] = removed
+    report = prepared["report"]
     report["moved"] = moved
+    report["removed"] = removed
     return report
+
+
+def sibling_rounds(root: Path, dest: Path) -> list:
+    """The other rounds a reader can reach, as (label, href) pairs for the gallery."""
+    rounds = []
+    if dest != root and (root / GALLERY_NAME).is_file():
+        rounds.append((FULL_ROUND, "../" + GALLERY_NAME))
+    if root.is_dir():
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir() or entry == dest or entry.name.startswith("."):
+                continue
+            if (entry / GALLERY_NAME).is_file():
+                prefix = "../" if dest != root else ""
+                rounds.append((entry.name, prefix + entry.name + "/" + GALLERY_NAME))
+    return rounds
 
 
 def keep_failed(dest: Path, staging: Path) -> Path:
@@ -462,6 +636,19 @@ def keep_failed(dest: Path, staging: Path) -> Path:
         suffix += 1
     shutil.move(str(staging), str(target))
     return target
+
+
+def drop_empty_round(directory: Path) -> None:
+    """Removes a round directory this run created and published nothing into.
+
+    A run that captured nothing must not leave a directory behind that a reader could
+    mistake for a round.
+    """
+    try:
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    except OSError:
+        pass
 
 
 def clean_stale_staging(dest: Path) -> None:
@@ -483,7 +670,8 @@ def run_capture(dest: Path, binary: Path, passthrough) -> tuple:
     return completed.returncode, staging
 
 
-def capture(dest: Path, binary: Path, passthrough) -> int:
+def capture(published: Path, dest: Path, binary: Path, passthrough) -> int:
+    """Captures one round and publishes it into `dest`, beside the other rounds."""
     dest.mkdir(parents=True, exist_ok=True)
     clean_stale_staging(dest)
     previous = load_manifest(dest)
@@ -494,6 +682,7 @@ def capture(dest: Path, binary: Path, passthrough) -> int:
         # Bad arguments: the tool captured nothing, so there is nothing to diagnose and
         # nothing to keep beside the baseline.
         shutil.rmtree(staging, ignore_errors=True)
+        drop_empty_round(dest)
         print("the capture tool refused the arguments (exit 2); nothing was captured and "
               "the previous round is untouched.")
         return 2
@@ -509,7 +698,16 @@ def capture(dest: Path, binary: Path, passthrough) -> int:
                           + sort_text(failure.get("size")) + ": "
                           + sort_text(failure.get("reason")))
         return 1 if code == 0 else code
-    report = publish(dest, staging, manifest, previous, label_for(dest))
+    try:
+        report = publish(dest, staging, manifest, previous, label_for(dest),
+                         sibling_rounds(published, dest))
+    except RoundError as error:
+        # The published round is untouched: the run may simply be repeated once what the
+        # message names is fixed.
+        kept = keep_failed(dest, staging)
+        print("not published: " + str(error))
+        print("the published round is unchanged; the staged round is kept at " + str(kept))
+        return 1
     print("published " + str(len(report["moved"])) + " file(s) to " + str(dest))
     print("  gallery: " + str(dest / GALLERY_NAME))
     print("  manifest: " + str(dest / MANIFEST_NAME))
@@ -572,6 +770,13 @@ def fake_manifest(shots, status="ok") -> dict:
         "shots": shots,
         "failures": [],
     }
+
+
+def round_snapshot(directory: Path) -> dict:
+    """Every published file of a round and its bytes, so a test can say it did not move."""
+    return {entry.name: entry.read_bytes()
+            for entry in sorted(directory.iterdir())
+            if entry.is_file()}
 
 
 def self_test() -> int:
@@ -660,7 +865,7 @@ def self_test() -> int:
         outside = root / "outside.png"
         outside.write_bytes(b"keep")
         write_manifest(dest, fake_manifest([fake_shot("../outside.png", "outside", "2222")]))
-        remove_previous_images(dest, load_manifest(dest))
+        retire_previous(dest, load_manifest(dest), set())
         assert outside.is_file(), "a manifest path escaped the folder"
 
         # A failed run keeps the previous round and leaves its own diagnostics aside.
@@ -675,6 +880,123 @@ def self_test() -> int:
             "a failed run replaced the gallery")
         assert (dest / "home-empty-1120x720-dark.png").is_file(), (
             "a failed run removed a published image")
+
+        # A round that cannot be checked never touches the published one, and the run can
+        # simply be repeated once the damage is fixed. This is the order that matters: the
+        # gallery a reader already has open must never name an image that is gone.
+        before = round_snapshot(dest)
+        staging = dest / (STAGING_PREFIX + "damaged")
+        staging.mkdir()
+        write_png(staging / "home-empty-1120x720-dark.png", 32, 18, (1, 2, 3))
+        (staging / "terminal-local-1120x720-dark.png").write_bytes(b"half a png")
+        damaged_manifest = fake_manifest([
+            fake_shot("home-empty-1120x720-dark.png", "home-empty", "3333"),
+            fake_shot("terminal-local-1120x720-dark.png", "terminal-local", "4444"),
+        ])
+        write_manifest(staging, damaged_manifest)
+        previous = load_manifest(dest)
+        try:
+            publish(dest, staging, damaged_manifest, previous, "test/ui")
+            raise AssertionError("a damaged round was published")
+        except RoundError:
+            pass
+        assert round_snapshot(dest) == before, "a damaged round changed the published one"
+        # The same round publishes once the file is whole again.
+        write_png(staging / "terminal-local-1120x720-dark.png", 32, 18, (1, 2, 3))
+        report = publish(dest, staging, damaged_manifest, previous, "test/ui")
+        assert report["moved"], "the repaired round did not publish"
+        reprinted = load_manifest(dest)
+        assert reprinted is not None
+        assert [shot["pixel_crc32"] for shot in reprinted["shots"]] == ["3333", "4444"], (
+            "the repaired round did not replace the manifest")
+
+        # A move that fails half way puts the previous round back, and leaves the staged
+        # round whole for the retry.
+        before = round_snapshot(dest)
+        staging = dest / (STAGING_PREFIX + "half")
+        staging.mkdir()
+        for name in ("home-empty-1120x720-dark.png", "terminal-local-1120x720-dark.png"):
+            write_png(staging / name, 32, 18, (9, 9, 9))
+        half_manifest = fake_manifest([
+            fake_shot("home-empty-1120x720-dark.png", "home-empty", "5555"),
+            fake_shot("terminal-local-1120x720-dark.png", "terminal-local", "6666"),
+        ])
+        write_manifest(staging, half_manifest)
+        previous = load_manifest(dest)
+        attempts = []
+
+        def failing_move(source, target):
+            attempts.append(str(target))
+            if len(attempts) == 2:
+                raise OSError("the volume went away")
+            os.replace(source, target)
+
+        prepared = prepare_round(staging, half_manifest, previous, "test/ui", ())
+        try:
+            install_round(dest, staging, prepared, move=failing_move)
+            raise AssertionError("a failed move was accepted")
+        except RoundError:
+            pass
+        assert round_snapshot(dest) == before, "a failed move left the round half published"
+        report = publish(dest, staging, half_manifest, previous, "test/ui")
+        assert report["moved"], "the round did not publish when it was repeated"
+
+        # A quick round publishes beside the full one and replaces only itself: the
+        # baseline keeps the shots the quick run did not take.
+        published_root = root / "gallery"
+        full = published_root
+        full.mkdir()
+        for index in range(3):
+            write_png(full / ("home-%d-1120x720-dark.png" % index), 32, 18, (5, 5, 5))
+        write_manifest(full, fake_manifest([
+            fake_shot("home-%d-1120x720-dark.png" % index, "home-%d" % index, "aa%02d" % index)
+            for index in range(3)]))
+        (full / GALLERY_NAME).write_text("full gallery", encoding="utf-8")
+        full_before = round_snapshot(full)
+
+        quick = round_directory(published_root, round_key(True, None, None, None))
+        assert quick == published_root / "quick", quick
+        quick.mkdir()
+        staging = quick / (STAGING_PREFIX + "quick")
+        staging.mkdir()
+        write_png(staging / "home-0-1120x720-dark.png", 32, 18, (5, 5, 5))
+        quick_manifest = fake_manifest([fake_shot("home-0-1120x720-dark.png", "home-0", "aa00")])
+        write_manifest(staging, quick_manifest)
+        publish(quick, staging, quick_manifest, None, "gallery/quick",
+                sibling_rounds(published_root, quick))
+        assert round_snapshot(full) == full_before, "the quick round changed the full one"
+        assert (quick / "home-0-1120x720-dark.png").is_file(), "the quick shot is missing"
+        quick_gallery = (quick / GALLERY_NAME).read_text(encoding="utf-8")
+        assert 'href="../index.html"' in quick_gallery, (
+            "the quick gallery cannot reach the full round")
+        # The full round, published at the root, has to find the rounds beside it too.
+        assert ("quick", "quick/" + GALLERY_NAME) in sibling_rounds(published_root, published_root), (
+            "the full gallery cannot reach the quick round")
+        # A second quick round retires only what the quick round itself published.
+        write_png(quick / "home-9-1120x720-dark.png", 32, 18, (6, 6, 6))
+        write_manifest(quick, fake_manifest([
+            fake_shot("home-0-1120x720-dark.png", "home-0", "aa00"),
+            fake_shot("home-9-1120x720-dark.png", "home-9", "bb99"),
+        ]))
+        staging = quick / (STAGING_PREFIX + "again")
+        staging.mkdir()
+        write_png(staging / "home-0-1120x720-dark.png", 32, 18, (5, 5, 5))
+        once_more = fake_manifest([fake_shot("home-0-1120x720-dark.png", "home-0", "aa00")])
+        write_manifest(staging, once_more)
+        publish(quick, staging, once_more, load_manifest(quick), "gallery/quick")
+        assert not (quick / "home-9-1120x720-dark.png").exists(), "a retired image was kept"
+        assert round_snapshot(full) == full_before, "the quick round changed the full one"
+
+        # A round is named after what was asked for, so two narrow runs never publish over
+        # each other and neither of them can land on the baseline.
+        assert round_key(False, None, None, None) == FULL_ROUND
+        assert round_key(False, "both", None, None) == FULL_ROUND
+        assert round_key(True, None, None, None) == "quick"
+        assert round_key(False, "light", None, None) == "theme-light"
+        assert round_key(False, None, ["720x480"], None) == "size-720x480"
+        assert round_key(False, "dark", None, ["home-hosts"]) == "theme-dark+only-home-hosts"
+        long_key = round_key(False, None, None, ["a" * 40, "b" * 40])
+        assert len(long_key) <= 80, long_key
 
         # A staging directory a crashed run left behind is cleaned up.
         stale = dest / (STAGING_PREFIX + "stale")
@@ -700,7 +1022,9 @@ def main(argv) -> int:
     parser.add_argument("--only", action="append", metavar="PATTERN",
                         help="keep the scenarios whose id matches (glob); repeatable")
     parser.add_argument("--out", metavar="DIRECTORY",
-                        help="where to publish (default: docs/verification/ui)")
+                        help="the published root (default: docs/verification/ui); a full "
+                             "run publishes there, a quick or filtered run publishes in a "
+                             "subdirectory of it")
     parser.add_argument("--bin", metavar="PATH",
                         help="the capture binary (default: target/debug/shellune)")
     parser.add_argument("--no-build", action="store_true",
@@ -748,10 +1072,16 @@ def main(argv) -> int:
             print(path.read_text(encoding="utf-8"))
         return completed.returncode
 
-    dest = Path(arguments.out) if arguments.out else root / "docs" / "verification" / "ui"
-    if not dest.is_absolute():
-        dest = root / dest
-    return capture(dest, binary, passthrough)
+    published = Path(arguments.out) if arguments.out else root / "docs" / "verification" / "ui"
+    if not published.is_absolute():
+        published = root / published
+    # A full run publishes at the root and every narrower run publishes beside it, in a
+    # directory of its own: a quick run replaces the quick round, never the baseline it
+    # did not shoot.
+    key = round_key(arguments.quick, arguments.theme, arguments.size, arguments.only)
+    dest = round_directory(published, key)
+    print("round " + key + " publishes to " + str(dest))
+    return capture(published, dest, binary, passthrough)
 
 
 if __name__ == "__main__":

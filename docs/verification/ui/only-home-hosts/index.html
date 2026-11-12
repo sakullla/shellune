@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>Shellune UI capture</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin: 0 auto; max-width: 1400px; padding: 32px 24px 64px; font: 14px/1.5 system-ui, "Segoe UI", "Noto Sans SC", sans-serif; }
+h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
+h2 { font-size: 15px; margin: 32px 0 8px; font-weight: 600; }
+.summary, .note, .meta { color: #6b6f76; }
+.summary { margin: 0 0 24px; }
+.row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.chip { border: 1px solid #c9ccd1; background: transparent; color: inherit; border-radius: 3px; padding: 3px 9px; font: inherit; cursor: pointer; }
+.chip.on { border-color: #0f7f8a; color: #0f7f8a; }
+.grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); }
+.card { margin: 0; border: 1px solid #d8dade; border-radius: 4px; overflow: hidden; }
+.card img { display: block; width: 100%; height: auto; background: #000; }
+figcaption { padding: 10px 12px 12px; }
+figcaption strong { font-weight: 600; }
+.meta { font-size: 12px; }
+.note { font-size: 12px; margin-top: 4px; }
+.changed { font-size: 11px; border: 1px solid #b4741b; color: #b4741b; border-radius: 3px; padding: 0 5px; margin-left: 6px; }
+ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; }
+.hidden { display: none; }
+</style></head><body>
+<h1>Shellune UI capture</h1>
+<p class="summary">capture ok · full run · 2026-11-12T20:31:31Z · 5 shots · scale 1.5 · GPU back-buffer readback of a hidden GPUI window (Window::capture_frame) · compared with 2026-11-12T20:13:56Z</p>
+<h2>其他轮次</h2><p class="summary"><a href="../index.html">full</a> · <a href="../quick/index.html">quick</a></p>
+<h2>过滤</h2>
+<div class="row"><button type="button" class="chip on" data-filter="scenario" data-value="*">场景</button><button type="button" class="chip" data-filter="scenario" data-value="home-hosts">home-hosts</button></div>
+<div class="row"><button type="button" class="chip on" data-filter="theme" data-value="*">主题</button><button type="button" class="chip" data-filter="theme" data-value="dark">dark</button><button type="button" class="chip" data-filter="theme" data-value="light">light</button></div>
+<div class="row"><button type="button" class="chip on" data-filter="size" data-value="*">尺寸</button></div>
+<div class="row"><button type="button" class="chip on" data-filter="language" data-value="*">语言</button><button type="button" class="chip" data-filter="language" data-value="en">en</button><button type="button" class="chip" data-filter="language" data-value="zh">zh</button></div>
+<h2>画面</h2>
+<div class="grid" id="grid">
+<figure class="card" data-scenario="home-hosts" data-theme="dark" data-size="720.0x480.0" data-language="en"><a href="home-hosts-720x480-dark.png"><img loading="lazy" src="home-hosts-720x480-dark.png" alt="home-hosts-720x480-dark.png"></a><figcaption><strong>首页 · 已保存的主机与分组</strong><div class="meta">home-hosts · dark · 720.0x480.0 · 100% text · en</div><div class="meta">1080x720 px · 150.0% DPI · 21668 bytes · crc 35483f32</div><div class="note">fixture: six saved hosts in three groups, seeded on disk before the view starts</div><div class="note">does not prove: shows the list this build draws; the hosts were never connected and no group tree exists yet</div></figcaption></figure><figure class="card" data-scenario="home-hosts" data-theme="dark" data-size="1120.0x720.0" data-language="en"><a href="home-hosts-1120x720-dark.png"><img loading="lazy" src="home-hosts-1120x720-dark.png" alt="home-hosts-1120x720-dark.png"></a><figcaption><strong>首页 · 已保存的主机与分组</strong><div class="meta">home-hosts · dark · 1120.0x720.0 · 100% text · en</div><div class="meta">1680x1080 px · 150.0% DPI · 44690 bytes · crc 92e39f1a</div><div class="note">fixture: six saved hosts in three groups, seeded on disk before the view starts</div><div class="note">does not prove: shows the list this build draws; the hosts were never connected and no group tree exists yet</div></figcaption></figure><figure class="card" data-scenario="home-hosts" data-theme="dark" data-size="1120.0x720.0" data-language="zh"><a href="home-hosts-1120x720-dark-zh.png"><img loading="lazy" src="home-hosts-1120x720-dark-zh.png" alt="home-hosts-1120x720-dark-zh.png"></a><figcaption><strong>首页 · 已保存的主机与分组</strong><div class="meta">home-hosts · dark · 1120.0x720.0 · 100% text · zh</div><div class="meta">1680x1080 px · 150.0% DPI · 43760 bytes · crc f9b164cf</div><div class="note">fixture: six saved hosts in three groups, seeded on disk before the view starts</div><div class="note">does not prove: shows the list this build draws; the hosts were never connected and no group tree exists yet</div></figcaption></figure><figure class="card" data-scenario="home-hosts" data-theme="dark" data-size="1120.0x720.0" data-language="en"><a href="home-hosts-1120x720-dark-z115.png"><img loading="lazy" src="home-hosts-1120x720-dark-z115.png" alt="home-hosts-1120x720-dark-z115.png"></a><figcaption><strong>首页 · 已保存的主机与分组</strong><div class="meta">home-hosts · dark · 1120.0x720.0 · 115% text · en</div><div class="meta">1680x1080 px · 150.0% DPI · 46243 bytes · crc 2ef1a766</div><div class="note">fixture: six saved hosts in three groups, seeded on disk before the view starts</div><div class="note">does not prove: shows the list this build draws; the hosts were never connected and no group tree exists yet</div></figcaption></figure><figure class="card" data-scenario="home-hosts" data-theme="light" data-size="1120.0x720.0" data-language="en"><a href="home-hosts-1120x720-light.png"><img loading="lazy" src="home-hosts-1120x720-light.png" alt="home-hosts-1120x720-light.png"></a><figcaption><strong>首页 · 已保存的主机与分组</strong><div class="meta">home-hosts · light · 1120.0x720.0 · 100% text · en</div><div class="meta">1680x1080 px · 150.0% DPI · 48735 bytes · crc a7656955</div><div class="note">fixture: six saved hosts in three groups, seeded on disk before the view starts</div><div class="note">does not prove: shows the list this build draws; the hosts were never connected and no group tree exists yet</div></figcaption></figure>
+</div>
+<h2>证据边界</h2>
+<ul><li>the sessions in the shots are display-only fixtures; a PNG of a page is not proof that the page works</li><li>only the Windows DirectX readback path is exercised; macOS and Linux capture is unverified</li><li>the text is rendered with the fonts installed on this machine, so a pixel comparison across machines is not meaningful</li><li>no layout selector is read: a scenario confirms arrival from the same model the render reads, not from where a pixel landed</li></ul>
+<h2>隔离</h2>
+<ul><li>credentials: MemorySecrets (in memory only)</li><li>hosts: per-scenario temporary directory</li><li>network: nothing dialled: no SSH connection, ProxyCommand, PTY or user command is started</li><li>preferences: per-scenario temporary directory</li><li>snippets: per-scenario temporary directory</li><li>trust: per-scenario temporary directory</li><li>workspace: per-scenario temporary directory</li></ul>
+
+
+<script>
+const state = { scenario: "*", theme: "*", size: "*", language: "*" };
+function apply() {
+  for (const card of document.querySelectorAll(".card")) {
+    const keys = ["scenario", "theme", "size", "language"];
+    const shown = keys.every((key) => state[key] === "*" || card.dataset[key] === state[key]);
+    card.classList.toggle("hidden", !shown);
+  }
+  for (const chip of document.querySelectorAll(".chip")) {
+    chip.classList.toggle("on", state[chip.dataset.filter] === chip.dataset.value);
+  }
+}
+for (const chip of document.querySelectorAll(".chip")) {
+  chip.addEventListener("click", () => {
+    state[chip.dataset.filter] = chip.dataset.value;
+    apply();
+  });
+}
+apply();
+</script>
+</body></html>

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>Shellune UI capture</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin: 0 auto; max-width: 1400px; padding: 32px 24px 64px; font: 14px/1.5 system-ui, "Segoe UI", "Noto Sans SC", sans-serif; }
+h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
+h2 { font-size: 15px; margin: 32px 0 8px; font-weight: 600; }
+.summary, .note, .meta { color: #6b6f76; }
+.summary { margin: 0 0 24px; }
+.row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.chip { border: 1px solid #c9ccd1; background: transparent; color: inherit; border-radius: 3px; padding: 3px 9px; font: inherit; cursor: pointer; }
+.chip.on { border-color: #0f7f8a; color: #0f7f8a; }
+.grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); }
+.card { margin: 0; border: 1px solid #d8dade; border-radius: 4px; overflow: hidden; }
+.card img { display: block; width: 100%; height: auto; background: #000; }
+figcaption { padding: 10px 12px 12px; }
+figcaption strong { font-weight: 600; }
+.meta { font-size: 12px; }
+.note { font-size: 12px; margin-top: 4px; }
+.changed { font-size: 11px; border: 1px solid #b4741b; color: #b4741b; border-radius: 3px; padding: 0 5px; margin-left: 6px; }
+ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; }
+.hidden { display: none; }
+</style></head><body>
+<h1>Shellune UI capture</h1>
+<p class="summary">capture ok · quick run · 2026-11-12T20:31:20Z · 3 shots · scale 1.5 · GPU back-buffer readback of a hidden GPUI window (Window::capture_frame) · compared with 2026-11-12T20:13:44Z</p>
+<h2>其他轮次</h2><p class="summary"><a href="../index.html">full</a> · <a href="../only-home-hosts/index.html">only-home-hosts</a></p>
+<h2>过滤</h2>
+<div class="row"><button type="button" class="chip on" data-filter="scenario" data-value="*">场景</button><button type="button" class="chip" data-filter="scenario" data-value="home-hosts">home-hosts</button><button type="button" class="chip" data-filter="scenario" data-value="settings">settings</button><button type="button" class="chip" data-filter="scenario" data-value="terminal-local">terminal-local</button></div>
+<div class="row"><button type="button" class="chip on" data-filter="theme" data-value="*">主题</button><button type="button" class="chip" data-filter="theme" data-value="dark">dark</button></div>
+<div class="row"><button type="button" class="chip on" data-filter="size" data-value="*">尺寸</button></div>
+<div class="row"><button type="button" class="chip on" data-filter="language" data-value="*">语言</button><button type="button" class="chip" data-filter="language" data-value="en">en</button></div>
+<h2>画面</h2>
+<div class="grid" id="grid">
+<figure class="card" data-scenario="home-hosts" data-theme="dark" data-size="1120.0x720.0" data-language="en"><a href="home-hosts-1120x720-dark.png"><img loading="lazy" src="home-hosts-1120x720-dark.png" alt="home-hosts-1120x720-dark.png"></a><figcaption><strong>首页 · 已保存的主机与分组</strong><div class="meta">home-hosts · dark · 1120.0x720.0 · 100% text · en</div><div class="meta">1680x1080 px · 150.0% DPI · 44690 bytes · crc 92e39f1a</div><div class="note">fixture: six saved hosts in three groups, seeded on disk before the view starts</div><div class="note">does not prove: shows the list this build draws; the hosts were never connected and no group tree exists yet</div></figcaption></figure><figure class="card" data-scenario="settings" data-theme="dark" data-size="1120.0x720.0" data-language="en"><a href="settings-1120x720-dark.png"><img loading="lazy" src="settings-1120x720-dark.png" alt="settings-1120x720-dark.png"></a><figcaption><strong>设置</strong><div class="meta">settings · dark · 1120.0x720.0 · 100% text · en</div><div class="meta">1680x1080 px · 150.0% DPI · 34283 bytes · crc 43eceeff</div><div class="note">fixture: default preferences; nothing is saved</div><div class="note">does not prove: shows the settings this build draws; the section navigation is still the single page the redesign replaces</div></figcaption></figure><figure class="card" data-scenario="terminal-local" data-theme="dark" data-size="1120.0x720.0" data-language="en"><a href="terminal-local-1120x720-dark.png"><img loading="lazy" src="terminal-local-1120x720-dark.png" alt="terminal-local-1120x720-dark.png"></a><figcaption><strong>本地终端 · 会话与标签</strong><div class="meta">terminal-local · dark · 1120.0x720.0 · 100% text · en</div><div class="meta">1680x1080 px · 150.0% DPI · 51968 bytes · crc 0c9b4ea7</div><div class="note">fixture: one display-only session fed a fixed transcript; no PTY or shell ran</div><div class="note">does not prove: proves terminal layout, colour and text rendering; proves nothing about a live shell, its environment or its keystrokes</div></figcaption></figure>
+</div>
+<h2>证据边界</h2>
+<ul><li>the sessions in the shots are display-only fixtures; a PNG of a page is not proof that the page works</li><li>only the Windows DirectX readback path is exercised; macOS and Linux capture is unverified</li><li>the text is rendered with the fonts installed on this machine, so a pixel comparison across machines is not meaningful</li><li>no layout selector is read: a scenario confirms arrival from the same model the render reads, not from where a pixel landed</li></ul>
+<h2>隔离</h2>
+<ul><li>credentials: MemorySecrets (in memory only)</li><li>hosts: per-scenario temporary directory</li><li>network: nothing dialled: no SSH connection, ProxyCommand, PTY or user command is started</li><li>preferences: per-scenario temporary directory</li><li>snippets: per-scenario temporary directory</li><li>trust: per-scenario temporary directory</li><li>workspace: per-scenario temporary directory</li></ul>
+
+
+<script>
+const state = { scenario: "*", theme: "*", size: "*", language: "*" };
+function apply() {
+  for (const card of document.querySelectorAll(".card")) {
+    const keys = ["scenario", "theme", "size", "language"];
+    const shown = keys.every((key) => state[key] === "*" || card.dataset[key] === state[key]);
+    card.classList.toggle("hidden", !shown);
+  }
+  for (const chip of document.querySelectorAll(".chip")) {
+    chip.classList.toggle("on", state[chip.dataset.filter] === chip.dataset.value);
+  }
+}
+for (const chip of document.querySelectorAll(".chip")) {
+  chip.addEventListener("click", () => {
+    state[chip.dataset.filter] = chip.dataset.value;
+    apply();
+  });
+}
+apply();
+</script>
+</body></html>

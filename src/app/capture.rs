@@ -13,6 +13,10 @@
 //! * a shot is taken only after the scenario says it arrived and after the window drew
 //!   two more frames, and the frame is only accepted when two consecutive readbacks are
 //!   byte-identical, so a fixed sleep is never the reason a shot is right;
+//! * a shot is drawn from its own state and from nothing the run did before it: the
+//!   isolated stores are named after the shot rather than after its place in the plan,
+//!   because the shell prints where its records live and that path is pixels. The same
+//!   shot taken in a quick, an `--only` or a full run is therefore the same picture;
 //! * every store lives in a temporary directory that is removed again, credentials are in
 //!   memory, and no PTY, SSH connection, ProxyCommand or user command is started;
 //! * a failure - a missing scenario state, a blank or wrong-sized frame, a write error -
@@ -89,10 +93,17 @@ a manifest. It never shows a window, never reads the screen or the desktop, and 
 starts a shell, a connection or a user command. A shot that cannot be taken ends the run
 non-zero.";
 
+// The waits and the frame floors below belong to the Windows half: on a platform
+// without the hidden-window readback nothing waits for a frame or judges one, and a
+// `Duration` there would be an unused import that stops the build outright - a platform
+// that cannot compile its tests cannot run them either.
 /// Frames a shot lets the shell draw after its state is installed, and how long a step
 /// may wait for the platform to deliver them at all.
+#[cfg(target_os = "windows")]
 const SETTLE_FRAMES: u32 = 3;
+#[cfg(target_os = "windows")]
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(target_os = "windows")]
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 
 /// How long two identical readbacks must be apart before the shot is called settled.
@@ -102,13 +113,17 @@ const SETTLE_POLL: Duration = Duration::from_millis(25);
 /// for its icons. The window is an observation, not the reason a shot is right: the
 /// condition is still that the pixels stopped changing, and a frame that keeps changing
 /// inside the window is never accepted.
+#[cfg(target_os = "windows")]
 const STABLE_WINDOW: Duration = Duration::from_millis(150);
 
 /// How long a whole run may take before the watchdog ends it with a report.
+#[cfg(target_os = "windows")]
 const WATCHDOG_BASE: Duration = Duration::from_secs(120);
+#[cfg(target_os = "windows")]
 const WATCHDOG_PER_SHOT: Duration = Duration::from_secs(30);
 
 /// A real page is not one colour; this is the floor below which the image is not a page.
+#[cfg(target_os = "windows")]
 const DISTINCT_COLOR_FLOOR: usize = 16;
 
 /// Entry point. Returns the process exit status: 0 for a run that captured every shot,
@@ -873,7 +888,7 @@ async fn run_shots(
             shot.variant.width as u32,
             shot.variant.height as u32
         ));
-        match capture_shot(wx, options, root, shot, index, state).await {
+        match capture_shot(wx, options, root, shot, state).await {
             Ok(Some(record)) => manifest.records.push(record),
             Ok(None) => {}
             Err(ShotError::Scenario(reason)) => {
@@ -944,6 +959,20 @@ impl From<String> for ShotError {
     }
 }
 
+/// The directory one shot's stores live in.
+///
+/// The name is the shot's own file stem and nothing else. It used to carry the shot's
+/// position in the plan in front of it, and that number reaches the pixels: the hosts
+/// page prints where its records are stored, so the same shot came out different in a
+/// quick run (position 1) than in a full one (position 7) - a nine by twelve pixel
+/// difference in one glyph, which reads as a change that never happened. A shot's
+/// directory is named by the shot, so the plan it belongs to cannot be seen in its
+/// picture.
+#[cfg(any(target_os = "windows", test))]
+fn shot_root_name(shot: Shot) -> String {
+    shot.variant.file_stem(shot.scenario.id)
+}
+
 /// Takes one shot: fresh view, fresh isolated root, waited-for state, stable frame.
 #[cfg(target_os = "windows")]
 async fn capture_shot(
@@ -951,14 +980,9 @@ async fn capture_shot(
     options: &Options,
     root: &Path,
     shot: Shot,
-    index: usize,
     state: &Arc<Mutex<RunState>>,
 ) -> Result<Option<Record>, ShotError> {
-    let shot_root = root.join(format!(
-        "{:02}-{}",
-        index,
-        shot.variant.file_stem(shot.scenario.id)
-    ));
+    let shot_root = root.join(shot_root_name(shot));
     // A root that is the same on every run keeps anything the shell renders from the data
     // directory (a notice naming it, for one) out of the picture as a run-to-run difference.
     if let Err(error) = std::fs::remove_dir_all(&shot_root)
@@ -1361,7 +1385,11 @@ fn now_text() -> String {
 }
 
 /// Days since 1970-01-01 to a calendar date (Howard Hinnant's civil_from_days).
-#[cfg(target_os = "windows")]
+///
+/// The arithmetic is platform-free, and the test that pins it has to run on every
+/// platform: a Windows-only function made `cargo test` fail to compile on macOS and
+/// Linux instead of failing a test.
+#[cfg(any(target_os = "windows", test))]
 fn civil_from_days(days: u64) -> (i64, u32, u32) {
     let z = days as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -1737,6 +1765,38 @@ mod tool_tests {
             .map(|shot| (shot.scenario.id.to_owned(), shot.variant.theme_name()))
             .collect();
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn a_shot_lives_in_the_same_directory_whichever_plan_takes_it() {
+        let quick = plan(&options(&["--quick"])).expect("the quick run has shots");
+        let full = plan(&options(&[])).expect("a full run has shots");
+        let only = plan(&options(&["--only", "home-hosts"])).expect("the pattern matches");
+        // The hosts page prints the path of its store, so the store's directory is part of
+        // the picture: the same shot has to reach the same directory whether a quick, an
+        // --only or a full run takes it, or two runs of one build disagree about pixels.
+        let wanted = "home-hosts-1120x720-dark";
+        let named = |shots: &[Shot]| -> Vec<String> {
+            let names: Vec<String> = shots
+                .iter()
+                .copied()
+                .map(shot_root_name)
+                .filter(|name| name == wanted)
+                .collect();
+            assert_eq!(names.len(), 1, "the shot is taken {wanted} once per run");
+            names
+        };
+        assert_eq!(named(&quick), named(&full), "quick and full disagree");
+        assert_eq!(named(&only), named(&full), "--only and full disagree");
+        // And no two shots of a run share a directory: a name that did would let one
+        // shot's fixture stand in for another's.
+        for shots in [&quick, &full] {
+            let mut names: Vec<String> = shots.iter().copied().map(shot_root_name).collect();
+            let total = names.len();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), total, "two shots share a directory");
+        }
     }
 
     #[test]
