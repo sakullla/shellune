@@ -5,10 +5,14 @@
 //! `docs/design/02-shell-and-design-system.md`. Views reference tokens instead of literal
 //! colours or sizes, so a visual review only has to change this module.
 //!
-//! Two properties are checked by tests rather than trusted:
+//! Four properties are checked by tests rather than trusted:
 //!
 //! * every text and status colour reaches the WCAG contrast floor against the
-//!   surface it is drawn on ([`contrast`]);
+//!   surface it is drawn on ([`contrast`]), in both palettes;
+//! * every token has exactly one light value and no two tokens share a value, so the
+//!   dark-keyed table in [`light`] can resolve all of them;
+//! * the chrome stays neutral and the accent is the only identity hue in regular
+//!   use, which is what keeps two themes looking like one product;
 //! * layout metrics shrink and grow with [`Zoom`] instead of being hard-coded
 //!   per view.
 
@@ -17,71 +21,106 @@ use shellune_core::{SessionFailure, SessionKind, SessionState, TabAccent, Transf
 
 /// Raw colour tokens as 24-bit sRGB values.
 ///
-/// The palette is a cool, low-chroma dark theme: a near-black canvas, one raised
-/// surface per nesting level and a single moon-blue accent for the current
-/// object. Status colours are the only saturated hues, which keeps a busy
-/// session list readable.
+/// The palette is neutral graphite in the dark and soft paper white in the light,
+/// with exactly one chromatic identity colour: a cyan-blue accent for the current
+/// object and the one primary action. Nothing else in the regular interface is
+/// allowed to be saturated, so a busy session list stays quiet and the only colours
+/// that shout are the four status tones.
 pub mod palette {
     /// Application background: the content area and the terminal itself.
     pub const CANVAS: u32 = 0x0b0c10;
     /// Chrome surface: the navigation rail, the tab strip and the status bar.
-    pub const SURFACE: u32 = 0x111218;
+    pub const SURFACE: u32 = 0x121317;
     /// Raised surface for cards, rows and inputs.
-    pub const SURFACE_RAISED: u32 = 0x171920;
+    pub const SURFACE_RAISED: u32 = 0x17181d;
     /// Surface under the pointer, one step above [`SURFACE_RAISED`].
-    pub const SURFACE_HOVER: u32 = 0x1e2029;
+    pub const SURFACE_HOVER: u32 = 0x1e2026;
     /// Surface used for the selected navigation entry, tab or choice.
-    pub const SURFACE_SELECTED: u32 = 0x262935;
+    pub const SURFACE_SELECTED: u32 = 0x26282f;
+    /// Surface of a control under the pressed pointer: a step below
+    /// [`SURFACE_SELECTED`], so a press is felt and not only tinted.
+    pub const SURFACE_PRESSED: u32 = 0x2e3038;
     /// Hairline border between regions.
-    pub const BORDER: u32 = 0x1f2129;
+    pub const BORDER: u32 = 0x24262d;
     /// Border of controls and of an element under the pointer.
-    pub const BORDER_STRONG: u32 = 0x30333f;
+    pub const BORDER_STRONG: u32 = 0x383b44;
     /// The sunken track a segmented control's options sit in.
-    pub const SEGMENT_TRACK: u32 = 0x0e0f14;
+    pub const SEGMENT_TRACK: u32 = 0x0e0f13;
     /// The raised thumb under the chosen option of a segmented control.
-    pub const SEGMENT_THUMB: u32 = 0x2b2e3a;
+    pub const SEGMENT_THUMB: u32 = 0x282a32;
     /// Primary text: titles and the current object.
-    pub const TEXT_PRIMARY: u32 = 0xf0f1f5;
+    pub const TEXT_PRIMARY: u32 = 0xecedf1;
     /// Secondary text: body copy and list metadata.
-    pub const TEXT_SECONDARY: u32 = 0xb3b8c6;
+    pub const TEXT_SECONDARY: u32 = 0xaeb2bb;
     /// Muted text: hints, counts and the status bar.
-    pub const TEXT_MUTED: u32 = 0x8b92a3;
+    pub const TEXT_MUTED: u32 = 0x8e929c;
     /// Accent used for the selected destination and primary actions.
-    pub const ACCENT: u32 = 0x949bff;
+    pub const ACCENT: u32 = 0x4cc2dd;
     /// Accent under the pointer, for a solid primary button.
-    pub const ACCENT_HOVER: u32 = 0xaeb3ff;
+    pub const ACCENT_HOVER: u32 = 0x6bd4ec;
+    /// The accent under a pressed primary button: one step down from [`ACCENT`], so a
+    /// press sinks instead of brightening.
+    pub const ACCENT_PRESSED: u32 = 0x37a9c4;
     /// Text drawn on a solid [`ACCENT`] fill.
-    pub const ON_ACCENT: u32 = 0x0b0c26;
+    pub const ON_ACCENT: u32 = 0x04161c;
     /// Accent tint for filled accent surfaces.
-    pub const ACCENT_TINT: u32 = 0x202249;
+    pub const ACCENT_TINT: u32 = 0x0f2b33;
     /// Text and icons drawn on [`ACCENT_TINT`].
-    pub const ACCENT_ON_TINT: u32 = 0xcdcfff;
+    pub const ACCENT_ON_TINT: u32 = 0x9fe3f2;
     /// Dark tint behind a positive chip or banner.
-    pub const POSITIVE_TINT: u32 = 0x12241d;
+    pub const POSITIVE_TINT: u32 = 0x11241d;
     /// Dark tint behind a warning chip or banner.
-    pub const WARNING_TINT: u32 = 0x282114;
+    pub const WARNING_TINT: u32 = 0x261f12;
     /// Dark tint behind a danger chip, banner or destructive button.
-    pub const DANGER_TINT: u32 = 0x2b181d;
+    pub const DANGER_TINT: u32 = 0x2b1618;
     /// Live and completed status.
-    pub const POSITIVE: u32 = 0x5fd4a0;
+    pub const POSITIVE: u32 = 0x5ed6a4;
     /// Waiting, verifying or in-progress status.
-    pub const WARNING: u32 = 0xf0c36d;
+    pub const WARNING: u32 = 0xe8c07a;
     /// Failed, rejected or unavailable status.
-    pub const DANGER: u32 = 0xff8c97;
+    pub const DANGER: u32 = 0xff8f96;
     /// Planned-but-not-shipped status; deliberately desaturated so it never
     /// reads as an error or as success.
-    pub const PLANNED: u32 = 0xa2a9ba;
-    /// Host avatar pairs (tint, text): iris, violet, teal, amber, rose, sky.
+    pub const PLANNED: u32 = 0x9aa0ab;
+    /// The ring drawn around the control the keyboard is on.
+    ///
+    /// It is the accent's own family but its own token: a focus ring may be tuned
+    /// for visibility without moving the colour of the primary action. The ring is
+    /// always drawn in addition to a thickness or edge change, never instead of one.
+    pub const FOCUS_RING: u32 = 0x7fdcf1;
+    /// Fill of a control that cannot be used right now.
+    pub const DISABLED_SURFACE: u32 = 0x141519;
+    /// Text and icons on [`DISABLED_SURFACE`].
+    ///
+    /// Inactive controls are exempt from WCAG AA, but they are still read, so the
+    /// pair keeps the graphic floor instead of disappearing into the fill.
+    pub const DISABLED_TEXT: u32 = 0x7a7e87;
+    /// The groove an in-flight indicator travels in.
+    pub const LOADING_TRACK: u32 = 0x22242b;
+    /// The in-flight indicator itself; it never carries meaning on its own, the
+    /// state's word does.
+    pub const LOADING_FILL: u32 = 0x59c9e3;
+    /// What a dialog lays over the page beneath it, at [`scrim`]'s alpha.
+    pub const SCRIM: u32 = 0x05060a;
+    /// Host avatar pairs (tint, initials): slate, steel, sand, sage, clay.
+    ///
+    /// The first pair is the accent tint, kept for the first host group. The rest are
+    /// low-chroma earth and metal tints: an avatar says which host this is, so it must
+    /// not compete with the accent that says which host is current.
     pub const AVATARS: [(u32, u32); 6] = [
         (ACCENT_TINT, ACCENT_ON_TINT),
-        (0x2a1f40, 0xd9c6ff),
-        (0x13292a, 0x8fe3d6),
-        (0x2b2416, 0xf2d08f),
-        (0x2e1a26, 0xffb8d2),
-        (0x162536, 0x9fd3ff),
+        (0x1a2430, 0xbcd2e6),
+        (0x16262a, 0xa9d0cb),
+        (0x282219, 0xe0cfa4),
+        (0x1e2620, 0xb3cfb0),
+        (0x2a1f1d, 0xe0bcae),
     ];
-    /// Second stop of the brand gradient, a violet beside the accent.
-    pub const BRAND_END: u32 = 0xc08bff;
+    /// The deeper stop of the one remaining accent gradient.
+    ///
+    /// It stays in the accent's own family: a violet second stop is gone, and no
+    /// regular control may be filled with a gradient - only the welcome emblem still
+    /// uses two stops of the same cyan.
+    pub const BRAND_END: u32 = 0x1f7f96;
     /// Tab identity colours, in [`TabAccent::ALL`] order.
     ///
     /// They are deliberately not the status hues: green, amber and red keep meaning
@@ -89,12 +128,12 @@ pub mod palette {
     /// one of those. Each value keeps its contrast on every tab surface in both
     /// palettes (checked by the palette tests).
     pub const TAB_ACCENTS: [u32; 6] = [
-        0x9db4ff, // iris
-        0xc9a8ff, // violet
-        0x7ad9c4, // teal
-        0xc4d98a, // lime
-        0xe5a6e0, // orchid
-        0xe8b48a, // clay
+        0x9cbcd8, // slate
+        0xb9aecb, // heather
+        0x8fc6cf, // steel
+        0xaec79a, // sage
+        0xd3bc9c, // sand
+        0xd4a8ae, // dust
     ];
 }
 
@@ -406,48 +445,56 @@ pub mod light {
     /// Every token of [`super::palette`] and its light value.
     pub const TABLE: &[(u32, u32)] = &[
         (dark::CANVAS, 0xfcfcfd),
-        (dark::SURFACE, 0xf5f6f8),
+        (dark::SURFACE, 0xf4f5f7),
         (dark::SURFACE_RAISED, 0xffffff),
-        (dark::SURFACE_HOVER, 0xeef0f3),
-        (dark::SURFACE_SELECTED, 0xe6e8ee),
-        (dark::BORDER, 0xe5e7ec),
-        (dark::BORDER_STRONG, 0xd2d6de),
-        (dark::SEGMENT_TRACK, 0xeceef2),
+        (dark::SURFACE_HOVER, 0xeeeff2),
+        (dark::SURFACE_SELECTED, 0xe4e7ea),
+        (dark::SURFACE_PRESSED, 0xdcdfe4),
+        (dark::BORDER, 0xe3e5e9),
+        (dark::BORDER_STRONG, 0xc9cdd4),
+        (dark::SEGMENT_TRACK, 0xeef0f2),
         (dark::SEGMENT_THUMB, 0xffffff),
-        (dark::TEXT_PRIMARY, 0x15171c),
-        (dark::TEXT_SECONDARY, 0x464b58),
-        (dark::TEXT_MUTED, 0x5f6574),
-        (dark::ACCENT, 0x4f4bd8),
-        (dark::ACCENT_HOVER, 0x403cc4),
+        (dark::TEXT_PRIMARY, 0x14161a),
+        (dark::TEXT_SECONDARY, 0x454a53),
+        (dark::TEXT_MUTED, 0x60656e),
+        (dark::ACCENT, 0x0d6b82),
+        (dark::ACCENT_HOVER, 0x0a5a6e),
+        (dark::ACCENT_PRESSED, 0x084f60),
         (dark::ON_ACCENT, 0xffffff),
-        (dark::ACCENT_TINT, 0xecebfe),
-        (dark::ACCENT_ON_TINT, 0x3a35b0),
-        (dark::POSITIVE_TINT, 0xe1f4ea),
-        (dark::WARNING_TINT, 0xfaefd8),
-        (dark::DANGER_TINT, 0xfce6e9),
-        (dark::POSITIVE, 0x17734a),
-        (dark::WARNING, 0x815400),
-        (dark::DANGER, 0xbb2c45),
-        (dark::PLANNED, 0x5f6574),
-        (dark::BRAND_END, 0x8a57ec),
+        (dark::ACCENT_TINT, 0xe2f1f6),
+        (dark::ACCENT_ON_TINT, 0x0a5568),
+        (dark::POSITIVE_TINT, 0xdff2e8),
+        (dark::WARNING_TINT, 0xfaf0d8),
+        (dark::DANGER_TINT, 0xfce7e9),
+        (dark::POSITIVE, 0x10714b),
+        (dark::WARNING, 0x7a5300),
+        (dark::DANGER, 0xb32b3c),
+        (dark::PLANNED, 0x5b606a),
+        (dark::FOCUS_RING, 0x0a5a6e),
+        (dark::DISABLED_SURFACE, 0xf1f2f4),
+        (dark::DISABLED_TEXT, 0x777c85),
+        (dark::LOADING_TRACK, 0xe2e4e8),
+        (dark::LOADING_FILL, 0x0d6b82),
+        (dark::SCRIM, 0x1a1c20),
+        (dark::BRAND_END, 0x0a5a6e),
         // Host avatars after the accent pair they share their first entry with.
-        (dark::AVATARS[1].0, 0xefe6ff),
-        (dark::AVATARS[1].1, 0x6234b8),
-        (dark::AVATARS[2].0, 0xdcf2ee),
-        (dark::AVATARS[2].1, 0x0f6a5f),
-        (dark::AVATARS[3].0, 0xf9edd2),
-        (dark::AVATARS[3].1, 0x7a5000),
-        (dark::AVATARS[4].0, 0xfce4ee),
-        (dark::AVATARS[4].1, 0xa1285f),
-        (dark::AVATARS[5].0, 0xdfeefc),
-        (dark::AVATARS[5].1, 0x1b5f9e),
+        (dark::AVATARS[1].0, 0xe4eef7),
+        (dark::AVATARS[1].1, 0x1c4a6b),
+        (dark::AVATARS[2].0, 0xdff1ee),
+        (dark::AVATARS[2].1, 0x14574f),
+        (dark::AVATARS[3].0, 0xf8efd9),
+        (dark::AVATARS[3].1, 0x6b4a00),
+        (dark::AVATARS[4].0, 0xe6f1e4),
+        (dark::AVATARS[4].1, 0x2d5a2a),
+        (dark::AVATARS[5].0, 0xf9e9e3),
+        (dark::AVATARS[5].1, 0x7a3a24),
         // Tab identity colours: the same hue, dark enough for a light surface.
-        (dark::TAB_ACCENTS[0], 0x3547bd),
-        (dark::TAB_ACCENTS[1], 0x6b3fb0),
-        (dark::TAB_ACCENTS[2], 0x0f6a5f),
-        (dark::TAB_ACCENTS[3], 0x5c6a12),
-        (dark::TAB_ACCENTS[4], 0x913a86),
-        (dark::TAB_ACCENTS[5], 0x8a4a12),
+        (dark::TAB_ACCENTS[0], 0x2f5f86),
+        (dark::TAB_ACCENTS[1], 0x5d4a80),
+        (dark::TAB_ACCENTS[2], 0x1a6b74),
+        (dark::TAB_ACCENTS[3], 0x51662f),
+        (dark::TAB_ACCENTS[4], 0x8a5a20),
+        (dark::TAB_ACCENTS[5], 0x8b4450),
     ];
 
     /// The terminal's default colours and its 16 ANSI colours, light.
@@ -457,7 +504,7 @@ pub mod light {
     pub const TERMINAL: &[(u32, u32)] = &[
         (0xe6e9f0, 0x1f2329), // foreground
         (0x0b0c10, 0xfcfcfd), // background
-        (0x8fa0ff, 0x4653cf), // cursor
+        (0x8fa0ff, 0x0d6b82), // cursor
         (0x2b313d, 0x3a3e48), // black
         (0xff8d99, 0xc8334a), // red
         (0x64d8a8, 0x2a7a3f), // green
@@ -502,6 +549,23 @@ pub fn clear() -> Rgba {
     gpui::rgba(0x0000_0000)
 }
 
+/// How much of the page a dialog hides behind itself.
+///
+/// The page stays legible underneath: the backdrop only has to make the dialog the
+/// front-most object, not to black the window out.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SCRIM_ALPHA: f32 = 0.62;
+
+/// The backdrop a dialog draws over the page beneath it.
+///
+/// It is a translucent [`palette::SCRIM`] rather than a solid fill, so a dialog does
+/// not look like a second window and the page keeps its place.
+#[cfg_attr(not(test), allow(dead_code))]
+#[must_use]
+pub fn scrim() -> Rgba {
+    faded(swatch(palette::SCRIM), SCRIM_ALPHA)
+}
+
 /// Semantic colour role attached to a state label, chip or dot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
@@ -519,7 +583,44 @@ pub enum Tone {
     Planned,
 }
 
+/// The silhouette a status mark is drawn with.
+///
+/// A state is never told by colour alone (R8): the mark differs in shape, the state
+/// word names it, and only then does the tone colour agree with both. The shapes stay
+/// inside one small square so a chip's geometry does not change with its state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusMark {
+    /// A solid disc: live, connected, completed.
+    Disc,
+    /// A hollow ring: waiting, verifying, connecting.
+    Ring,
+    /// A solid square: failed, rejected, unavailable.
+    Square,
+    /// A hollow square: a capability this build does not ship.
+    Box,
+    /// A vertical bar: the current object.
+    Bar,
+    /// A horizontal dash: nothing is running here.
+    Dash,
+}
+
 impl Tone {
+    /// The silhouette this tone is drawn with wherever a mark stands beside a word.
+    ///
+    /// The mapping is fixed per tone so the same state looks the same in a list row, a
+    /// chip, a banner and the status bar.
+    #[must_use]
+    pub fn mark(self) -> StatusMark {
+        match self {
+            Self::Positive => StatusMark::Disc,
+            Self::Warning => StatusMark::Ring,
+            Self::Danger => StatusMark::Square,
+            Self::Planned => StatusMark::Box,
+            Self::Accent => StatusMark::Bar,
+            Self::Neutral => StatusMark::Dash,
+        }
+    }
+
     /// Text colour for a label in this tone.
     pub fn text(self) -> Rgba {
         swatch(self.token())
@@ -839,5 +940,292 @@ pub mod contrast {
             (background, foreground)
         };
         (lighter + 0.05) / (darker + 0.05)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        StatusMark, Tone, contrast,
+        light::{TABLE, TERMINAL},
+        light_value, palette,
+    };
+
+    /// Minimum contrast for body text (WCAG AA).
+    const BODY: f64 = 4.5;
+    /// Minimum contrast for status dots, marks, focus rings and inactive controls.
+    const GRAPHIC: f64 = 3.0;
+
+    /// The light value of a dark token.
+    fn light(token: u32) -> u32 {
+        light_value(token)
+    }
+
+    /// Every colour token the shell paints with, in one list.
+    ///
+    /// The light palette is a table keyed by the dark value, so two tokens may never
+    /// share one: a duplicate would silently resolve both of them to one light value.
+    fn tokens() -> Vec<(&'static str, u32)> {
+        let mut tokens = vec![
+            ("canvas", palette::CANVAS),
+            ("surface", palette::SURFACE),
+            ("surface raised", palette::SURFACE_RAISED),
+            ("surface hover", palette::SURFACE_HOVER),
+            ("surface selected", palette::SURFACE_SELECTED),
+            ("surface pressed", palette::SURFACE_PRESSED),
+            ("border", palette::BORDER),
+            ("border strong", palette::BORDER_STRONG),
+            ("segment track", palette::SEGMENT_TRACK),
+            ("segment thumb", palette::SEGMENT_THUMB),
+            ("text primary", palette::TEXT_PRIMARY),
+            ("text secondary", palette::TEXT_SECONDARY),
+            ("text muted", palette::TEXT_MUTED),
+            ("accent", palette::ACCENT),
+            ("accent hover", palette::ACCENT_HOVER),
+            ("accent pressed", palette::ACCENT_PRESSED),
+            ("on accent", palette::ON_ACCENT),
+            ("accent tint", palette::ACCENT_TINT),
+            ("accent on tint", palette::ACCENT_ON_TINT),
+            ("positive", palette::POSITIVE),
+            ("warning", palette::WARNING),
+            ("danger", palette::DANGER),
+            ("planned", palette::PLANNED),
+            ("positive tint", palette::POSITIVE_TINT),
+            ("warning tint", palette::WARNING_TINT),
+            ("danger tint", palette::DANGER_TINT),
+            ("focus ring", palette::FOCUS_RING),
+            ("disabled surface", palette::DISABLED_SURFACE),
+            ("disabled text", palette::DISABLED_TEXT),
+            ("loading track", palette::LOADING_TRACK),
+            ("loading fill", palette::LOADING_FILL),
+            ("scrim", palette::SCRIM),
+            ("brand end", palette::BRAND_END),
+        ];
+        // The first avatar pair is the accent tint itself, already listed above.
+        for (tint, text) in palette::AVATARS.iter().skip(1) {
+            tokens.push(("avatar tint", *tint));
+            tokens.push(("avatar text", *text));
+        }
+        for token in palette::TAB_ACCENTS {
+            tokens.push(("tab accent", token));
+        }
+        tokens
+    }
+
+    /// The surfaces a control or a label can be drawn on, in both palettes.
+    fn surfaces() -> Vec<(&'static str, u32, u32)> {
+        [
+            ("canvas", palette::CANVAS),
+            ("surface", palette::SURFACE),
+            ("raised", palette::SURFACE_RAISED),
+            ("selected", palette::SURFACE_SELECTED),
+            ("pressed", palette::SURFACE_PRESSED),
+        ]
+        .into_iter()
+        .map(|(name, token)| (name, token, light(token)))
+        .collect()
+    }
+
+    #[test]
+    fn no_two_tokens_share_a_value() {
+        let tokens = tokens();
+        for (index, (name, token)) in tokens.iter().enumerate() {
+            for (other_name, other) in tokens.iter().skip(index + 1) {
+                assert_ne!(
+                    token, other,
+                    "{name} and {other_name} are both {token:06x}, so the light table \
+                     cannot tell them apart"
+                );
+            }
+        }
+        assert_eq!(
+            TABLE.len(),
+            tokens.len(),
+            "every token has exactly one light value"
+        );
+    }
+
+    #[test]
+    fn every_token_has_a_light_value_of_its_own() {
+        for (name, token) in tokens() {
+            assert_ne!(
+                light(token),
+                token,
+                "{name} ({token:06x}) resolves to itself in the light palette"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_tokens_reach_their_contrast_floor_in_both_palettes() {
+        for (surface_name, surface, light_surface) in surfaces() {
+            let ring = palette::FOCUS_RING;
+            assert!(
+                contrast::ratio(ring, surface) >= GRAPHIC,
+                "the dark focus ring on {surface_name} is {:.2}:1",
+                contrast::ratio(ring, surface)
+            );
+            assert!(
+                contrast::ratio(light(ring), light_surface) >= GRAPHIC,
+                "the light focus ring on {surface_name} is {:.2}:1",
+                contrast::ratio(light(ring), light_surface)
+            );
+            for text in [palette::TEXT_PRIMARY, palette::TEXT_SECONDARY] {
+                assert!(
+                    contrast::ratio(text, surface) >= BODY,
+                    "body text on the dark {surface_name} is {:.2}:1",
+                    contrast::ratio(text, surface)
+                );
+                assert!(
+                    contrast::ratio(light(text), light_surface) >= BODY,
+                    "body text on the light {surface_name} is {:.2}:1",
+                    contrast::ratio(light(text), light_surface)
+                );
+            }
+        }
+
+        // An inactive control is still read: its text keeps the graphic floor on its
+        // own fill, in both palettes.
+        for (text, surface, palette_name) in [
+            (palette::DISABLED_TEXT, palette::DISABLED_SURFACE, "dark"),
+            (
+                light(palette::DISABLED_TEXT),
+                light(palette::DISABLED_SURFACE),
+                "light",
+            ),
+        ] {
+            let ratio = contrast::ratio(text, surface);
+            assert!(
+                ratio >= GRAPHIC,
+                "{palette_name} disabled text is {ratio:.2}:1"
+            );
+        }
+
+        // The indicator is a graphic, not text: 3:1 against its own track is enough.
+        for (fill, track, palette_name) in [
+            (palette::LOADING_FILL, palette::LOADING_TRACK, "dark"),
+            (
+                light(palette::LOADING_FILL),
+                light(palette::LOADING_TRACK),
+                "light",
+            ),
+        ] {
+            let ratio = contrast::ratio(fill, track);
+            assert!(
+                ratio >= GRAPHIC,
+                "{palette_name} loading indicator is {ratio:.2}:1"
+            );
+        }
+    }
+
+    /// What one colour looks like laid over another, per sRGB channel.
+    fn over(top: u32, alpha: f64, under: u32) -> u32 {
+        let channel = |shift: u32| {
+            let top = f64::from((top >> shift) & 0xff);
+            let under = f64::from((under >> shift) & 0xff);
+            (top * alpha + under * (1.0 - alpha)).round() as u32
+        };
+        channel(16) << 16 | channel(8) << 8 | channel(0)
+    }
+
+    #[test]
+    fn the_scrim_dims_the_page_it_covers() {
+        let scrim = palette::SCRIM;
+        for (name, scrim, canvas) in [
+            ("dark", scrim, palette::CANVAS),
+            ("light", light(scrim), light(palette::CANVAS)),
+        ] {
+            let covered = over(scrim, f64::from(super::SCRIM_ALPHA), canvas);
+            assert!(
+                (super::scrim().a - super::SCRIM_ALPHA).abs() < f32::EPSILON,
+                "the {name} backdrop is drawn at the documented alpha"
+            );
+            let before = contrast::relative_luminance(canvas);
+            let after = contrast::relative_luminance(covered);
+            assert!(
+                after <= before * 0.85,
+                "the {name} scrim leaves the page at {after:.4} of its {before:.4} luminance"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chrome_stays_neutral_and_only_the_accent_carries_hue() {
+        for (name, token) in [
+            ("canvas", palette::CANVAS),
+            ("surface", palette::SURFACE),
+            ("surface raised", palette::SURFACE_RAISED),
+            ("surface hover", palette::SURFACE_HOVER),
+            ("surface selected", palette::SURFACE_SELECTED),
+            ("surface pressed", palette::SURFACE_PRESSED),
+            ("border", palette::BORDER),
+            ("border strong", palette::BORDER_STRONG),
+            ("text primary", palette::TEXT_PRIMARY),
+            ("text secondary", palette::TEXT_SECONDARY),
+            ("text muted", palette::TEXT_MUTED),
+            ("disabled surface", palette::DISABLED_SURFACE),
+            ("disabled text", palette::DISABLED_TEXT),
+            ("loading track", palette::LOADING_TRACK),
+        ] {
+            for (palette_name, value) in [("dark", token), ("light", light(token))] {
+                let [_, r, g, b] = value.to_be_bytes();
+                let spread = u8::max(u8::max(r, g), b) - u8::min(u8::min(r, g), b);
+                assert!(
+                    spread <= 14,
+                    "{palette_name} {name} is {value:06x}, a {spread}-step hue in the chrome"
+                );
+            }
+        }
+
+        // The one identity colour is cyan-blue: no violet or magenta stops are left in
+        // the regular interface (R3).
+        for (name, token) in [
+            ("accent", palette::ACCENT),
+            ("accent hover", palette::ACCENT_HOVER),
+            ("brand end", palette::BRAND_END),
+        ] {
+            for (palette_name, value) in [("dark", token), ("light", light(token))] {
+                let [_, r, g, b] = value.to_be_bytes();
+                assert!(
+                    g > r && b > r,
+                    "{palette_name} {name} is {value:06x}, which is not a cyan-blue"
+                );
+                assert!(
+                    b.abs_diff(g) < 0x50,
+                    "{palette_name} {name} is {value:06x}, which leans purple"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_tone_has_a_mark_of_its_own() {
+        let tones = [
+            Tone::Neutral,
+            Tone::Accent,
+            Tone::Positive,
+            Tone::Warning,
+            Tone::Danger,
+            Tone::Planned,
+        ];
+        let mut marks: Vec<StatusMark> = tones.iter().map(|tone| tone.mark()).collect();
+        let count = marks.len();
+        marks.sort_by_key(|mark| *mark as u8);
+        marks.dedup();
+        assert_eq!(count, marks.len(), "two tones are drawn with one mark");
+    }
+
+    #[test]
+    fn the_light_terminal_keeps_a_cyan_cursor() {
+        let cursor = TERMINAL
+            .iter()
+            .find(|(from, _)| *from == 0x8fa0ff)
+            .map(|(_, to)| *to)
+            .expect("the cursor has a light value");
+        let [_, r, g, b] = cursor.to_be_bytes();
+        assert!(
+            g > r && b > r,
+            "the light cursor {cursor:06x} is not the accent"
+        );
     }
 }

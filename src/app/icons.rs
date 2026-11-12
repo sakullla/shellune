@@ -4,6 +4,11 @@
 //! application never depends on files beside the executable. GPUI renders an SVG as
 //! an alpha mask and fills it with the element's text colour, so one drawing serves
 //! every tone and both hover states.
+//!
+//! They are drawn at a 1.6 stroke and never filled: at the sizes the shell uses
+//! (14 for a control, 16 for a row or a heading, 20 for a state emblem) a heavier
+//! line reads as a block, and a block competes with the accent. Corners are rounded
+//! the same way in every drawing so a row of icons sits on one weight.
 
 use std::borrow::Cow;
 
@@ -217,10 +222,10 @@ impl Icon {
     fn body(self) -> &'static str {
         match self {
             Self::Terminal => {
-                r#"<rect x="2.5" y="4" width="19" height="16" rx="3"/><path d="M7 9.5l3 2.5-3 2.5"/><path d="M12.5 15h4.5"/>"#
+                r#"<rect x="2.6" y="4.2" width="18.8" height="15.6" rx="2.6"/><path d="M7.2 9.6l2.9 2.4-2.9 2.4"/><path d="M12.6 14.9h4.2"/>"#
             }
             Self::Server => {
-                r#"<rect x="3" y="3.5" width="18" height="7" rx="2"/><rect x="3" y="13.5" width="18" height="7" rx="2"/><path d="M7 7h.01"/><path d="M7 17h.01"/>"#
+                r#"<rect x="3.2" y="3.6" width="17.6" height="7" rx="1.8"/><rect x="3.2" y="13.4" width="17.6" height="7" rx="1.8"/><path d="M7 7.1h.01"/><path d="M7 16.9h.01"/>"#
             }
             Self::Layers => {
                 r#"<path d="M12 3l9 4.5-9 4.5-9-4.5z"/><path d="M3 12l9 4.5 9-4.5"/><path d="M3 16.5l9 4.5 9-4.5"/>"#
@@ -329,7 +334,7 @@ impl Icon {
     /// The complete SVG document for this icon.
     pub fn svg_source(self) -> String {
         format!(
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{}</svg>"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{}</svg>"#,
             self.body()
         )
     }
