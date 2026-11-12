@@ -1331,6 +1331,9 @@ async fn open_display(target: &DisplayTarget) -> io::Result<DisplaySocket> {
                     return Ok(DisplaySocket::Unix(stream));
                 }
             }
+            // Only Linux has abstract sockets; elsewhere the name is carried but unused.
+            #[cfg(not(target_os = "linux"))]
+            let _ = abstract_name;
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{} cannot be opened", path.display()),
