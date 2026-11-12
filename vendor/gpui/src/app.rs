@@ -208,6 +208,31 @@ impl Application {
         self
     }
 
+    /// Invokes a handler when the platform asks the application to terminate, and lets
+    /// it refuse.
+    ///
+    /// On macOS a Cmd+Q, a Dock `Quit` or any other `terminate:` arrives here before
+    /// the process ends. Returning `false` cancels that request: no window is destroyed
+    /// and no close callback runs, so work that is still going keeps going. The platform
+    /// asks again on the next request, which is how a question answered with `true`
+    /// finally lets the application quit. Platforms without the hook never call it.
+    pub fn on_should_terminate<F>(&self, mut callback: F) -> &Self
+    where
+        F: 'static + FnMut(&mut App) -> bool,
+    {
+        let this = Rc::downgrade(&self.0);
+        self.0
+            .borrow_mut()
+            .platform
+            .on_should_terminate(Box::new(move || {
+                // A callback that outlived the application cannot answer, and letting the
+                // process end is the only answer left.
+                this.upgrade()
+                    .map_or(true, |app| callback(&mut app.borrow_mut()))
+            }));
+        self
+    }
+
     /// Returns a handle to the [`BackgroundExecutor`] associated with this app, which can be used to spawn futures in the background.
     pub fn background_executor(&self) -> BackgroundExecutor {
         self.0.borrow().background_executor.clone()

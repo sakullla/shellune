@@ -342,9 +342,10 @@ pub(crate) enum CloseIntent {
 /// always had, where a close closes - after the transfer question, which only a real
 /// close can act on. A confirmed exit is a close on every platform.
 ///
-/// An explicit quit on macOS (Cmd+Q, the Dock menu's Quit) never reaches this: the
-/// system terminates the application, GPUI's quit hook cannot cancel that, and the
-/// window-closed callback ends the sessions as before. That path is unchanged by R13.
+/// An explicit quit on macOS (Cmd+Q, the Dock menu's Quit) never reaches this while
+/// anything is running: `applicationShouldTerminate:` is the only place a quit can still
+/// be refused, so `on_app_should_terminate` answers it there. A quit the user confirmed
+/// sets `app_close_confirmed`, which turns every later window close into a real one.
 #[must_use]
 pub(crate) fn close_intent(platform: Platform, app_close_confirmed: bool) -> CloseIntent {
     if platform == Platform::MacOs && !app_close_confirmed {
@@ -489,6 +490,14 @@ pub struct ShelluneView {
     closing_app: bool,
     /// The user confirmed that those transfers may stop, so the window may close.
     app_close_confirmed: bool,
+    /// The system asked to terminate and this shell refused to let it (R9).
+    ///
+    /// macOS delivers Cmd+Q and the Dock's Quit through `applicationShouldTerminate:`,
+    /// which can cancel the request but cannot carry an answer back: the question is
+    /// drawn in the window. So a refused termination is remembered here, and confirming
+    /// the question asks the platform to terminate again - this time allowed - instead
+    /// of only removing the window.
+    terminate_pending: bool,
     /// Whether the window-close callback has been registered.
     watching_close: bool,
     /// Whether this shell asked to hide the window and is waiting for the icon (R13).
@@ -1101,6 +1110,7 @@ impl ShelluneView {
             closing: None,
             closing_app: false,
             app_close_confirmed: false,
+            terminate_pending: false,
             watching_close: false,
             hidden_for_reopen: false,
             files_polling: false,
@@ -2658,10 +2668,15 @@ impl ShelluneView {
 
     /// Puts a window that survived the close back in front (R13).
     ///
-    /// Only the window is reordered and refocused. Its sessions were never closed, which
-    /// is why reopening cannot repeat a connection or duplicate a tab.
+    /// Both ways a window can survive are undone here: a hidden window is shown again,
+    /// and a minimized one is taken back out of the Dock before it is ordered in front.
+    /// Activating alone would only raise the application, leaving the window shrunk into
+    /// the Dock, which looks like nothing happened. Only the window is restored and
+    /// refocused: its sessions were never closed, which is why reopening cannot repeat a
+    /// connection or duplicate a tab.
     pub(crate) fn reveal_after_reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.hidden_for_reopen = false;
+        window.deminiaturize_window();
         window.activate_window();
         let focus = self.root_focus();
         window.focus(focus);
@@ -2682,16 +2697,53 @@ impl ShelluneView {
         false
     }
 
+    /// Answers a request to terminate the whole application (R9).
+    ///
+    /// macOS reaches this for Cmd+Q, the Dock's Quit and the Apple menu before it tears
+    /// anything down, so returning false is the only way to keep a running transfer or
+    /// forward from being killed without a word. The refusal is remembered: the question
+    /// is drawn in this window, and confirming it asks for termination again. A hidden
+    /// window is put back on screen first, because a question nobody can see would just
+    /// look like a quit that did not work.
+    ///
+    /// Windows and Linux never call this, so their quitting is unchanged.
+    pub(crate) fn on_app_should_terminate(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.app_close_confirmed || (!self.transfers.any_active() && !self.forwards.any_active())
+        {
+            return true;
+        }
+        if self.hidden_for_reopen {
+            self.reveal_after_reopen(window, cx);
+            cx.activate(true);
+        }
+        self.terminate_pending = true;
+        self.closing_app = true;
+        cx.notify();
+        false
+    }
+
     fn cancel_close_app(&mut self, cx: &mut Context<Self>) {
         self.closing_app = false;
+        self.terminate_pending = false;
         cx.notify();
     }
 
     fn confirm_close_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.app_close_confirmed = true;
         self.closing_app = false;
+        let terminate = std::mem::take(&mut self.terminate_pending);
         self.close_all_sessions(cx);
-        window.remove_window();
+        if terminate {
+            // The system cancelled its own quit so this question could be answered, and
+            // only asking again ends the process. Windows and Linux never get here.
+            cx.quit();
+        } else {
+            window.remove_window();
+        }
     }
 
     /// The question shown before the application closes with transfers still running.
@@ -11378,6 +11430,18 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn is_hidden_for_reopen(&self) -> bool {
         self.hidden_for_reopen
+    }
+
+    /// Whether a refused termination is waiting for the user's answer (R9).
+    #[cfg(test)]
+    pub fn terminate_pending_for_test(&self) -> bool {
+        self.terminate_pending
+    }
+
+    /// Whether the user confirmed that stopping is allowed (R9).
+    #[cfg(test)]
+    pub fn app_close_confirmed_for_test(&self) -> bool {
+        self.app_close_confirmed
     }
 
     /// Confirms the application close without drawing again afterwards.

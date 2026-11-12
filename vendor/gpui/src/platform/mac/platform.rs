@@ -98,6 +98,12 @@ unsafe fn build_classes() {
                 sel!(applicationWillTerminate:),
                 will_terminate as extern "C" fn(&mut Object, Sel, id),
             );
+            // Cmd+Q, the Dock's Quit and the Apple menu all end here, before anything is
+            // torn down, which is the only place a termination can still be refused.
+            decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSInteger,
+            );
             decl.add_method(
                 sel!(handleGPUIMenuItem:),
                 handle_menu_item as extern "C" fn(&mut Object, Sel, id),
@@ -166,6 +172,8 @@ pub(crate) struct MacPlatformState {
     text_hash_pasteboard_type: id,
     metadata_pasteboard_type: id,
     reopen: Option<Box<dyn FnMut()>>,
+    /// Asked before `terminate:` ends the process; `false` cancels the request.
+    should_terminate: Option<Box<dyn FnMut() -> bool>>,
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     quit: Option<Box<dyn FnMut()>>,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
@@ -208,6 +216,7 @@ impl MacPlatform {
             text_hash_pasteboard_type: unsafe { ns_string("zed-text-hash") },
             metadata_pasteboard_type: unsafe { ns_string("zed-metadata") },
             reopen: None,
+            should_terminate: None,
             quit: None,
             menu_command: None,
             validate_menu_command: None,
@@ -879,6 +888,10 @@ impl Platform for MacPlatform {
         self.0.lock().reopen = Some(callback);
     }
 
+    fn on_should_terminate(&self, callback: Box<dyn FnMut() -> bool>) {
+        self.0.lock().should_terminate = Some(callback);
+    }
+
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().on_keyboard_layout_change = Some(callback);
     }
@@ -1415,6 +1428,32 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
             callback();
             platform.0.lock().reopen.get_or_insert(callback);
         }
+    }
+}
+
+/// Answers `applicationShouldTerminate:`, whose reply type is `NSApplicationTerminateReply`.
+///
+/// The two values that matter are 0 (`NSTerminateCancel`, the application keeps running)
+/// and 1 (`NSTerminateNow`, the process ends). The callback is taken out of the state
+/// while it runs, because it borrows the application state that this platform lives in;
+/// a refused termination puts it back so the question can be asked again.
+extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSInteger {
+    const NST_TERMINATE_CANCEL: NSInteger = 0;
+    const NST_TERMINATE_NOW: NSInteger = 1;
+
+    let platform = unsafe { get_mac_platform(this) };
+    let mut lock = platform.0.lock();
+    let Some(mut callback) = lock.should_terminate.take() else {
+        // Nothing asked to be consulted: termination proceeds as it always has.
+        return NST_TERMINATE_NOW;
+    };
+    drop(lock);
+    let allowed = callback();
+    platform.0.lock().should_terminate.get_or_insert(callback);
+    if allowed {
+        NST_TERMINATE_NOW
+    } else {
+        NST_TERMINATE_CANCEL
     }
 }
 

@@ -1341,6 +1341,34 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn is_minimized(&self) -> bool {
+        let window = self.0.lock().native_window;
+        unsafe {
+            let miniaturized: BOOL = msg_send![window, isMiniaturized];
+            miniaturized == YES
+        }
+    }
+
+    /// Takes the window back out of the Dock (R13).
+    ///
+    /// `deminiaturize:` is the only thing that undoes `miniaturize:`: ordering a
+    /// minimized window in front leaves it shrunk into the Dock, which is why a Dock
+    /// click on a minimized Shellune used to show nothing. Ordering it in front
+    /// afterwards puts the restored window on screen; the key and focus are set by the
+    /// caller's activate and focus.
+    fn deminiaturize(&self) {
+        let window = self.0.lock().native_window;
+        unsafe {
+            let miniaturized: BOOL = msg_send![window, isMiniaturized];
+            if miniaturized == YES {
+                let _: () = msg_send![window, deminiaturize: nil];
+            }
+            // Ordering a still-minimized window in front would leave it in the Dock, so
+            // the order is always restore, then front.
+            let _: () = msg_send![window, orderFront: nil];
+        }
+    }
+
     fn zoom(&self) {
         let this = self.0.lock();
         let window = this.native_window;

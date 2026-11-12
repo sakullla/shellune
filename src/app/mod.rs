@@ -187,6 +187,10 @@ pub fn run() {
             eprintln!("shellune: failed to reopen the main window: {error}");
         }
     });
+    // Cmd+Q and the Dock's Quit end the application without ever closing a window, so
+    // the transfer question has to be asked here or not at all (R9). Only macOS reaches
+    // this; elsewhere the hook is never installed and quitting is unchanged.
+    application.on_should_terminate(allow_termination);
     application.run(|cx: &mut App| {
         cx.bind_keys(key_bindings(Platform::current()));
         if let Err(error) = open_main_window(cx) {
@@ -194,6 +198,26 @@ pub fn run() {
         }
         cx.activate(true);
     });
+}
+
+/// Answers a request to terminate the application: `true` lets it end (R9).
+///
+/// The question belongs to the main window, because it is drawn there and lists the
+/// work that would stop. A termination that arrives with no window - the last one was
+/// really closed - has nothing to ask about and is allowed. A window that is already
+/// confirmed, or has nothing running, answers `true` too, so an ordinary quit stays as
+/// quick as it always was.
+pub fn allow_termination(cx: &mut App) -> bool {
+    let Some(handle) = cx.try_global::<MainWindow>().and_then(|main| main.0) else {
+        return true;
+    };
+    handle
+        .update(cx, |view, window, cx| {
+            view.on_app_should_terminate(window, cx)
+        })
+        // A window that went away between the request and the question cannot be asked,
+        // and there is nothing left to protect.
+        .unwrap_or(true)
 }
 
 /// Brings the main window back after the application icon is clicked (R13).

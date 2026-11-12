@@ -11304,6 +11304,168 @@ async fn a_macos_close_hides_the_window_and_keeps_its_sessions(cx: &mut TestAppC
     );
 }
 
+/// Asks the application-level handler a question the platform would ask (R9, R13).
+///
+/// The window is checked out for the duration of a `VisualTestContext` update, and the
+/// application-level handlers have to see the real window, so they run through the app
+/// and the applied handle is registered as the main one first.
+fn ask_application<R>(cx: &mut TestAppContext, ask: impl FnOnce(&mut gpui::App) -> R) -> R {
+    cx.update(|app| {
+        let handle = app
+            .windows()
+            .first()
+            .and_then(|handle| handle.downcast::<ShelluneView>())
+            .expect("the test window shows the shell");
+        app.set_global(crate::app::MainWindow(Some(handle)));
+        ask(app)
+    })
+}
+
+#[gpui::test]
+async fn a_termination_with_running_transfers_is_refused_then_allowed(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    // Nothing is running, so an ordinary quit is not slowed down by a question.
+    assert!(
+        ask_application(cx, crate::app::allow_termination),
+        "a shell with no running work lets the application quit"
+    );
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/c.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let task = transfers.starts()[0].transfer;
+
+    // Cmd+Q arrives as a termination request, not as a window close.
+    assert!(
+        !ask_application(cx, crate::app::allow_termination),
+        "a termination with a running transfer is refused"
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).closing_app_for_test()),
+        "the refusal asks the question instead of quitting"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).terminate_pending_for_test()),
+        "the refusal is remembered, because the question is drawn in the window"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions())
+            .contains(&id),
+        "the session survives the refused termination"
+    );
+    assert!(
+        transfers.cancels().is_empty(),
+        "asking does not stop the transfer"
+    );
+
+    click(cx, "app.close.cancel");
+    assert!(!cx.update(|_window, app| view.read(app).closing_app_for_test()));
+    assert!(
+        !cx.update(|_window, app| view.read(app).terminate_pending_for_test()),
+        "cancelling the question also forgets the refused termination"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(id)),
+        1,
+        "the cancelled question leaves the transfer running"
+    );
+
+    // A window the red button hid still has to show the question, or the quit looks
+    // broken: the refusal reveals it instead of drawing into a hidden window.
+    let hidden = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.on_window_should_close(Platform::MacOs, cx)
+        })
+    });
+    assert!(!hidden, "the red button hides the window");
+    assert!(cx.update(|_window, app| view.read(app).is_hidden_for_reopen()));
+    assert!(
+        !ask_application(cx, crate::app::allow_termination),
+        "a Cmd+Q of a hidden window with a running transfer is refused"
+    );
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).is_hidden_for_reopen()),
+        "the window with the question is put back on screen"
+    );
+    assert!(
+        cx.debug_bounds("app.close.question").is_some(),
+        "the question is drawn where the user can answer it"
+    );
+    click(cx, "app.close.cancel");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(id)),
+        1,
+        "the second cancelled question leaves the transfer running"
+    );
+
+    // Asking again is refused again: the transfer is still there.
+    assert!(
+        !ask_application(cx, crate::app::allow_termination),
+        "a third Cmd+Q asks the same question"
+    );
+    cx.run_until_parked();
+
+    // Confirming stops the work and asks once more, which is now allowed.
+    cx.update(|window, app| {
+        view.update(app, |view, cx| view.confirm_close_app_for_test(window, cx));
+    });
+    assert_eq!(transfers.cancels(), vec![task]);
+    assert!(
+        cx.update(|_window, app| view.read(app).app_close_confirmed_for_test()),
+        "the answer is remembered for the termination that follows"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).terminate_pending_for_test()),
+        "the request is not left waiting once it was answered"
+    );
+    assert!(
+        ask_application(cx, crate::app::allow_termination),
+        "the termination asked after the confirmation really ends the application"
+    );
+}
+
+#[gpui::test]
+async fn a_dock_reopen_restores_a_minimized_window(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let windows = cx.update(|_window, app| app.windows().len());
+
+    cx.update(|window, _app| window.minimize_window());
+    assert!(
+        cx.update(|window, _app| window.is_minimized_window()),
+        "the window is in the Dock"
+    );
+
+    ask_application(cx, |app| {
+        crate::app::reopen_main_window(app).expect("the minimized window comes back");
+    });
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|window, _app| window.is_minimized_window()),
+        "activating the application is not enough: the window itself is restored"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).is_hidden_for_reopen()),
+        "the window is on screen, not waiting for the icon"
+    );
+    assert_eq!(
+        cx.update(|_window, app| app.windows().len()),
+        windows,
+        "restoring a minimized window does not build a second one"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Command palette and tab handling
 // ---------------------------------------------------------------------------

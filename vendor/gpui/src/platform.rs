@@ -231,6 +231,17 @@ pub(crate) trait Platform: 'static {
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
 
+    /// Asks a callback whether the application may terminate right now.
+    ///
+    /// A platform that can hold a termination request - macOS, where Cmd+Q, the Dock
+    /// menu and the Apple menu all reach `terminate:` - calls this before ending the
+    /// process, and answers `false` by cancelling the request. The callback owns the
+    /// decision: returning `false` keeps the application, its windows and whatever is
+    /// running in them alive, and the platform asks again the next time termination is
+    /// requested. Platforms without such a hook keep the default, which never asks and
+    /// therefore never changes how quitting works there.
+    fn on_should_terminate(&self, _callback: Box<dyn FnMut() -> bool>) {}
+
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
         None
@@ -495,6 +506,18 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     fn minimize(&self);
+    /// Whether the window is minimized, which is not the same as being hidden or
+    /// merely behind another window.
+    fn is_minimized(&self) -> bool {
+        false
+    }
+    /// Puts a minimized window back on the screen.
+    ///
+    /// The default does nothing, so a platform that never minimises - or one whose
+    /// restore path is not wired yet - keeps its current behaviour instead of being
+    /// asked for a capability it does not have. macOS implements it with
+    /// `deminiaturize:`, the only way back out of the Dock.
+    fn deminiaturize(&self) {}
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;

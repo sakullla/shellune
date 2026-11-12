@@ -4128,6 +4128,19 @@ impl Window {
         self.platform_window.minimize();
     }
 
+    /// Whether the current window is minimized, rather than hidden or behind another one.
+    pub fn is_minimized_window(&self) -> bool {
+        self.platform_window.is_minimized()
+    }
+
+    /// Restores the current window when it is minimized.
+    ///
+    /// Activating a minimized window only brings the application forward; the window
+    /// itself stays shrunk into the Dock until this is called.
+    pub fn deminiaturize_window(&self) {
+        self.platform_window.deminiaturize();
+    }
+
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();

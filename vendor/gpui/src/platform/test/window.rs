@@ -29,6 +29,9 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    /// Set by `minimize` and cleared by `deminiaturize`, so a test can tell a window
+    /// that came back on screen from one that only had its application activated.
+    is_minimized: bool,
 }
 
 #[derive(Clone)]
@@ -74,6 +77,7 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            is_minimized: false,
         })))
     }
 
@@ -216,7 +220,15 @@ impl PlatformWindow for TestWindow {
     }
 
     fn minimize(&self) {
-        unimplemented!()
+        self.0.lock().is_minimized = true;
+    }
+
+    fn is_minimized(&self) -> bool {
+        self.0.lock().is_minimized
+    }
+
+    fn deminiaturize(&self) {
+        self.0.lock().is_minimized = false;
     }
 
     fn zoom(&self) {
