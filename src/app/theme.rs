@@ -53,7 +53,10 @@ pub mod palette {
     /// Secondary text: body copy and list metadata.
     pub const TEXT_SECONDARY: u32 = 0xaeb2bb;
     /// Muted text: hints, counts and the status bar.
-    pub const TEXT_MUTED: u32 = 0x8e929c;
+    ///
+    /// Light enough to keep the body floor on [`SURFACE_PRESSED`], the darkest
+    /// surface a muted label is drawn on, not just on the raised surfaces.
+    pub const TEXT_MUTED: u32 = 0x9498a2;
     /// Accent used for the selected destination and primary actions.
     pub const ACCENT: u32 = 0x4cc2dd;
     /// Accent under the pointer, for a solid primary button.
@@ -456,7 +459,7 @@ pub mod light {
         (dark::SEGMENT_THUMB, 0xffffff),
         (dark::TEXT_PRIMARY, 0x14161a),
         (dark::TEXT_SECONDARY, 0x454a53),
-        (dark::TEXT_MUTED, 0x60656e),
+        (dark::TEXT_MUTED, 0x5c616a),
         (dark::ACCENT, 0x0d6b82),
         (dark::ACCENT_HOVER, 0x0a5a6e),
         (dark::ACCENT_PRESSED, 0x084f60),
@@ -1070,7 +1073,13 @@ mod tests {
                 "the light focus ring on {surface_name} is {:.2}:1",
                 contrast::ratio(light(ring), light_surface)
             );
-            for text in [palette::TEXT_PRIMARY, palette::TEXT_SECONDARY] {
+            // Muted is included: hints, counts and the status bar also sit on a
+            // pressed row, so "muted" is not an exemption from the body floor.
+            for text in [
+                palette::TEXT_PRIMARY,
+                palette::TEXT_SECONDARY,
+                palette::TEXT_MUTED,
+            ] {
                 assert!(
                     contrast::ratio(text, surface) >= BODY,
                     "body text on the dark {surface_name} is {:.2}:1",

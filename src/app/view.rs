@@ -13400,8 +13400,10 @@ pub(super) const HOME_SIDE_PADDING: f32 = 32.0;
 /// The narrowest a host card may be, before zoom; fewer columns are used instead.
 const HOST_CARD_MIN_WIDTH: f32 = 300.0;
 
-/// The brand's accent-to-violet gradient, for the few marks that carry the identity:
-/// the shell tiles on the home page and the emblems of empty states.
+/// The brand's accent-to-cyan gradient, for the few marks that carry the identity:
+/// the shell tiles on the home page and the emblems of empty states. Both stops are
+/// the accent family (`palette::ACCENT` to `palette::BRAND_END`); the violet
+/// second stop is gone, so this is not the old purple-to-blue brand gradient.
 pub(super) fn brand_gradient() -> gpui::Background {
     gpui::linear_gradient(
         135.0,
