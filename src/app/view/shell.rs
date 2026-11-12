@@ -548,7 +548,7 @@ impl ShelluneView {
                     .items_center()
                     .justify_center()
                     .size(metrics.scale(38.0))
-                    .rounded(px(radius::MEDIUM + 2.0))
+                    .rounded(px(radius::MEDIUM))
                     .bg(super::brand_gradient())
                     .shadow_sm()
                     .child(icons::icon(
@@ -1811,7 +1811,7 @@ impl ShelluneView {
                 .items_center()
                 .justify_center()
                 .size(metrics.scale(32.0))
-                .rounded(px(radius::MEDIUM + 2.0))
+                .rounded(px(radius::MEDIUM))
                 .bg(theme::swatch(palette::ACCENT_TINT))
                 .child(icons::icon(
                     icon,

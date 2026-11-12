@@ -720,7 +720,7 @@ impl ShelluneView {
             .w(width)
             .flex()
             .flex_col()
-            .rounded(px(radius::LARGE + 2.0))
+            .rounded(px(radius::LARGE))
             .bg(theme::swatch(colors::SURFACE_RAISED))
             .border_1()
             .border_color(theme::swatch(colors::BORDER_STRONG))

@@ -44,7 +44,7 @@ fn checkbox(
                 .items_center()
                 .justify_center()
                 .size(metrics.scale(16.0))
-                .rounded(px(radius::SMALL - 2.0))
+                .rounded(px(radius::SMALL))
                 .border_1()
                 .when(checked, |box_| {
                     box_.bg(accent).border_color(accent).child(icons::icon(

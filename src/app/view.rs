@@ -13457,7 +13457,7 @@ fn host_avatar(name: &str, reached: bool, metrics: Metrics) -> Div {
         .justify_center()
         .w(metrics.scale(36.0))
         .h(metrics.scale(36.0))
-        .rounded(px(radius::MEDIUM + 2.0))
+        .rounded(px(radius::MEDIUM))
         .bg(theme::swatch(background))
         .text_size(metrics.label_size())
         .font_weight(FontWeight::BOLD)
