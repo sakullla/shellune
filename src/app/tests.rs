@@ -1399,7 +1399,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             attempt_others,
             attempt_cancel,
             palette_group_recent,
-            workspace_current,
             quick_port_invalid,
             quick_port_blank,
             quick_fix_port,
@@ -6594,7 +6593,7 @@ async fn two_local_sessions_open_at_once_and_switch_by_identity(cx: &mut TestApp
         "opening a second terminal must not end the first one"
     );
     assert!(
-        cx.debug_bounds("session.bar").is_some(),
+        cx.debug_bounds("session.context").is_some(),
         "the selected session is described on screen"
     );
 
@@ -13148,9 +13147,15 @@ async fn the_startup_command_is_typed_once_the_connection_is_live(cx: &mut TestA
         Destination::LocalShells,
         "the terminal that was connected is shown in the workspace"
     );
+    // The name is the tab's, and the head's second row carries the rest: the merge
+    // leaves exactly one place for each (R12).
     assert!(
-        cx.debug_bounds("session.identity").is_some(),
-        "the connected session names itself"
+        cx.debug_bounds("session.tab.0").is_some(),
+        "the connected session names itself on its tab"
+    );
+    assert!(
+        cx.debug_bounds("session.context").is_some(),
+        "the head describes the connected session"
     );
 }
 
@@ -13209,8 +13214,8 @@ async fn local_and_remote_sessions_share_the_workspace(cx: &mut TestAppContext) 
         shellune_core::PanelSection::None,
         "the connected session comes back to the workspace"
     );
-    assert!(cx.debug_bounds("session.bar").is_some());
-    assert!(cx.debug_bounds("session.identity").is_some());
+    assert!(cx.debug_bounds("session.context").is_some());
+    assert!(cx.debug_bounds("session.tab.0").is_some());
     assert!(
         cx.update(|_window, app| {
             view.read(app)
@@ -13248,7 +13253,7 @@ async fn local_and_remote_sessions_share_the_workspace(cx: &mut TestAppContext) 
     go(cx, crate::app::actions::GoToLocalShells);
     assert_eq!(destination_of(&view, cx), Destination::LocalShells);
     assert!(
-        cx.debug_bounds("session.identity").is_some(),
+        cx.debug_bounds("session.context").is_some(),
         "coming back shows which session is current"
     );
 }
@@ -13343,7 +13348,7 @@ async fn a_quick_connection_can_be_saved_as_a_host_afterwards(cx: &mut TestAppCo
         "a live quick connection is still unsaved"
     );
     assert!(cx.debug_bounds("session.save_host").is_some());
-    assert!(cx.debug_bounds("session.identity").is_some());
+    assert!(cx.debug_bounds("session.context").is_some());
     click(cx, "session.save_host");
 
     assert_eq!(destination_of(&view, cx), Destination::LocalShells);
@@ -15037,7 +15042,7 @@ async fn a_damaged_snapshot_is_left_unchanged(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 #[gpui::test]
-async fn a_single_pane_has_no_frame_and_a_split_brings_the_pane_headers(cx: &mut TestAppContext) {
+async fn a_single_pane_has_no_frame_and_a_split_marks_each_pane(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
@@ -15052,7 +15057,7 @@ async fn a_single_pane_has_no_frame_and_a_split_brings_the_pane_headers(cx: &mut
     assert!(
         cx.debug_bounds("pane.split.right").is_some()
             && cx.debug_bounds("pane.split.down").is_some(),
-        "the split buttons move to the session bar"
+        "the split buttons are in the head, so no pane needs a strip for them"
     );
     click(cx, "pane.split.right");
     assert_eq!(
@@ -15062,11 +15067,107 @@ async fn a_single_pane_has_no_frame_and_a_split_brings_the_pane_headers(cx: &mut
     );
     assert!(
         cx.debug_bounds("pane.close").is_some(),
-        "two panes each get a header again"
+        "the active pane keeps its own close beside its own mark"
     );
     assert!(cx.debug_bounds("pane.active").is_some());
+    // R12: a split adds which pane is which, not a second copy of the session's name.
+    assert!(
+        cx.debug_bounds("pane.active.mark").is_some(),
+        "the active pane is marked in the pane, not only in the head"
+    );
+    assert!(
+        cx.debug_bounds("pane.idle").is_some(),
+        "the pane the keys are not in is drawn, and marked apart"
+    );
 }
 
+#[gpui::test]
+async fn the_head_is_one_band_that_names_the_session_once(cx: &mut TestAppContext) {
+    // R12: the strip and the session's row under it are one continuous head, and the
+    // name lives in one place. Before the merge the tab wrote "Zsh" and the bar under
+    // it wrote "Zsh" again, with the same close button beside both.
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let Some(_id) = start_local_session(cx, &view) else {
+        eprintln!("no shell on this machine, skipping");
+        return;
+    };
+
+    let header = bounds_of(cx, "session.header");
+    let tabs = bounds_of(cx, "session.tabs");
+    let context = bounds_of(cx, "session.context");
+    assert_fits_inside(tabs, header.size, "the tab strip in the head");
+    assert_fits_inside(context, header.size, "the session's own row in the head");
+    assert!(
+        context.origin.y >= tabs.origin.y + tabs.size.height - px(1.0),
+        "the session row is under the strip, in the same band: {context:?} vs {tabs:?}"
+    );
+    // The name is the tab's. Node that repeated it below is gone.
+    assert!(
+        cx.debug_bounds("session.tab.0").is_some(),
+        "the tab is where the session names itself"
+    );
+    assert!(
+        cx.debug_bounds("session.identity").is_none(),
+        "the name is not drawn a second time under the tabs"
+    );
+    // The terminal starts where the head ends: no second band, no gap.
+    let terminal = bounds_of(cx, "terminal.viewport");
+    assert!(
+        terminal.origin.y >= header.origin.y + header.size.height - px(1.0),
+        "the terminal is drawn over the head or beside it: {terminal:?} vs {header:?}"
+    );
+    assert!(
+        terminal.origin.y - (header.origin.y + header.size.height) < px(16.0),
+        "a band was left between the head and the terminal: {terminal:?} vs {header:?}"
+    );
+    // One close button for the session, not one per strip.
+    assert!(cx.debug_bounds("session.close").is_some());
+    assert_fits_inside(
+        bounds_of(cx, "session.close"),
+        header.size,
+        "the session's close button in the head",
+    );
+}
+
+#[gpui::test]
+async fn the_head_menu_holds_the_actions_that_do_not_need_a_button(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let Some(_id) = start_local_session(cx, &view) else {
+        return;
+    };
+    // The head keeps one button for the actions a user needs at a glance and one menu
+    // for the rest (R5).
+    assert!(cx.debug_bounds("session.more").is_some());
+    assert!(
+        cx.debug_bounds("session.more.menu").is_none(),
+        "the menu is closed until it is asked for"
+    );
+
+    click(cx, "session.more");
+    assert!(
+        cx.debug_bounds("session.more.menu").is_some(),
+        "the menu opens on the head's own button"
+    );
+    assert!(cx.debug_bounds("session.more.duplicate").is_some());
+    assert!(cx.debug_bounds("session.more.close").is_some());
+
+    // Escape closes it and gives the keys back to the program in the terminal, which
+    // is where they were before the menu opened (R5).
+    press_key(cx, "escape");
+    assert!(
+        !cx.update(|_window, app| view.read(app).session_more_open()),
+        "Escape closes the menu, even while the terminal holds the keys"
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, app| view.read(app).terminal_has_the_keyboard(window, app)),
+        "closing the menu hands the keys back to the terminal"
+    );
+}
 #[gpui::test]
 async fn start_all_starts_every_waiting_local_pane(cx: &mut TestAppContext) {
     let dir = TempDir::new("start-all");
@@ -18365,14 +18466,14 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
         viewport,
         "session.x11.failed",
     );
-    let identity = bounds_of(cx, "session.identity");
+    let target = bounds_of(cx, "session.target");
     let chip = bounds_of(cx, "session.x11.failed");
-    assert_fits_inside(identity, viewport, "session.identity");
+    assert_fits_inside(target, viewport, "session.target");
     assert_fits_inside(chip, viewport, "session.x11.failed");
     assert!(
-        chip.origin.x >= identity.origin.x + identity.size.width - px(1.0)
-            || chip.origin.y >= identity.origin.y + identity.size.height - px(1.0),
-        "the X11 state overlaps the session name: {chip:?} vs {identity:?}"
+        chip.origin.x >= target.origin.x + target.size.width - px(1.0)
+            || chip.origin.y >= target.origin.y + target.size.height - px(1.0),
+        "the X11 state overlaps the session target: {chip:?} vs {target:?}"
     );
     // The explanation is bounded by the room the window has, so it cannot be drawn past
     // the bottom edge with the terminal behind it.
@@ -18503,12 +18604,12 @@ async fn the_short_x11_reason_stays_on_the_first_screen_at_two_hundred_percent(
                 <= boxed.origin.y + boxed.size.height + px(0.5),
         "the reason is not whole on the first screen: {reason_bounds:?} in {boxed:?}"
     );
-    let identity = bounds_of(cx, "session.identity");
+    let target = bounds_of(cx, "session.target");
     let chip = bounds_of(cx, "session.x11.failed");
     assert!(
-        chip.origin.x >= identity.origin.x + identity.size.width - px(1.0)
-            || chip.origin.y >= identity.origin.y + identity.size.height - px(1.0),
-        "the X11 state overlaps the session name: {chip:?} vs {identity:?}"
+        chip.origin.x >= target.origin.x + target.size.width - px(1.0)
+            || chip.origin.y >= target.origin.y + target.size.height - px(1.0),
+        "the X11 state overlaps the session target: {chip:?} vs {target:?}"
     );
 }
 

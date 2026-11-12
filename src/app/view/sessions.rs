@@ -401,6 +401,157 @@ impl ShelluneView {
         )
     }
 
+    /// Opens the head's "more" menu where the pointer pressed it (R5, R12).
+    ///
+    /// The low-frequency session actions live here so the head keeps one short row. What
+    /// a user needs at a glance - close, split, the terminal/files switch, reconnect and
+    /// save - stays on the head itself; everything that is a one-off belongs to a menu.
+    pub(super) fn open_session_more(
+        &mut self,
+        id: SessionId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shell_menu_open = false;
+        self.tab_menu = None;
+        self.session_menu = None;
+        self.remember_focus(window, cx);
+        self.session_more = Some((id, position));
+        // The terminal keeps the keyboard, as it does for the tab menu: Escape is bound
+        // where the shell answers it, and the menu takes no keys of its own (R5).
+        cx.notify();
+    }
+
+    /// Whether the head's more menu is open.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn session_more_open(&self) -> bool {
+        self.session_more.is_some()
+    }
+
+    pub(super) fn close_session_more(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_more.take().is_some() {
+            self.restore_overlay_focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The menu of the session on the head.
+    pub(super) fn session_more_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let (id, position) = self.session_more?;
+        let session = self.workspace.session(id)?;
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let viewport = window.viewport_size();
+        let closed = matches!(session.state(), SessionState::Closed);
+        let forward_host = match session.kind() {
+            SessionKind::Remote { host } if self.book.host(*host).is_some() => Some(*host),
+            _ => None,
+        };
+        let more_than_one = self.workspace.layout().tabs().len() > 1;
+
+        let mut menu = menu_card("session.more.menu", metrics);
+        if !closed {
+            menu = menu.child(
+                menu_entry(
+                    strings.tab_menu_duplicate,
+                    "session.more.duplicate",
+                    Some(Icon::Copy),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.duplicate_session(id, window, cx);
+                })),
+            );
+        }
+        if let Some(host) = forward_host {
+            menu = menu.child(
+                menu_entry(
+                    crate::app::copy::ux().session_forwards,
+                    "session.more.forwards",
+                    Some(Icon::Forward),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.show_forwards_scope(crate::app::forwarding::ForwardScope::Host(host), cx);
+                })),
+            );
+        }
+        menu = menu.child(menu_divider(metrics));
+        if !closed {
+            menu = menu.child(
+                menu_entry(
+                    strings.session_menu_close,
+                    "session.more.close",
+                    Some(Icon::Close),
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.request_close_session(id, cx);
+                })),
+            );
+        }
+        if more_than_one {
+            menu = menu.child(
+                menu_entry(
+                    strings.tab_menu_close_others,
+                    "session.more.close_others",
+                    None,
+                    true,
+                    false,
+                    metrics,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_session_more(window, cx);
+                    this.close_other_tabs(id, cx);
+                })),
+            );
+        }
+
+        Some(
+            super::overlay_layer().child(
+                div()
+                    .relative()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .child(
+                        div()
+                            .id("session.more.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .on_any_mouse_down(cx.listener(|this, _event, window, cx| {
+                                this.close_session_more(window, cx);
+                            })),
+                    )
+                    .child(
+                        gpui::anchored()
+                            .position(clamp_menu(
+                                position,
+                                viewport,
+                                metrics.scale(220.0),
+                                px(0.0),
+                            ))
+                            .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                            .child(div().occlude().child(menu)),
+                    ),
+            ),
+        )
+    }
     /// The right-click handler of a session row.
     pub(super) fn session_row_menu_listener(
         &self,

@@ -666,6 +666,11 @@ pub struct ShelluneView {
     restore_focus_pending: bool,
     /// The session row whose menu is open, and where it was opened.
     session_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
+    /// The head's "more" menu: the session it acts on, and where it was opened (R5).
+    ///
+    /// The actions that are not worth a button of their own live here, so the head keeps
+    /// one line instead of growing a row of controls for every low-frequency command.
+    session_more: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// What X11 forwarding each session last reported (R11).
     ///
     /// Kept beside the session, not in its record: a display bridge ends with the
@@ -953,6 +958,88 @@ impl ShelluneView {
         id
     }
 
+    /// Puts a display-only session of a saved host on screen (R2).
+    ///
+    /// The same pane the application draws for a live connection, with nothing behind
+    /// it: the session record is the remote one, so the head and the tab name the host
+    /// and its target, and the terminal holds the bytes the caller supplies. No SSH
+    /// session, trust decision or keystroke is part of it.
+    #[cfg(feature = "ui-capture")]
+    pub fn attach_capture_remote_session(
+        &mut self,
+        host: &HostConfig,
+        content: &[u8],
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> SessionId {
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let session = self.workspace.register_remote_session(host);
+        let id = session.id();
+        let tag = session.tag();
+        let mode = self.workspace.layout().session_mode(id);
+        let shell = LocalShell::new("ssh", "ssh");
+        let pane = cx.new(|pane_cx| {
+            let mut pane =
+                TerminalPane::without_process(shell, tag, grid, font_size, locale, pane_cx);
+            pane.apply_presentation(mode);
+            if !content.is_empty() {
+                pane.feed_for_test(content, pane_cx);
+            }
+            pane
+        });
+        // A remote session reaches the live state through the identity and the
+        // credentials, so the fixture walks those steps too: what it records is the
+        // session a connected terminal has, not one left halfway through the handshake.
+        self.workspace.session_verified_and_authenticated(id);
+        self.workspace.session_connected(id);
+        self.workspace.clear_session_failure();
+        if let Some(window) = window {
+            let handle = pane.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
+        self.push_pane(tag, pane, cx);
+        id
+    }
+
+    /// Splits the pane on screen and puts a display-only session in the new pane (R5).
+    ///
+    /// The split is the layout's own: the armed split is consumed by the session that
+    /// is registered next, so the two panes are one live leaf and one session with no
+    /// process behind it - which is exactly what a shot of a split needs.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_split_with_session(
+        &mut self,
+        axis: SplitAxis,
+        shell: LocalShell,
+        content: &[u8],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<SessionId> {
+        if !self.workspace.arm_split(axis) {
+            return None;
+        }
+        let id = self.attach_capture_session(shell, content, Some(window), cx);
+        self.pane_of(id).map(|_| id)
+    }
+    /// Records why a capture session ended, the way a lost connection does (R2).
+    ///
+    /// The transport is synthetic, so this is the only thing that turns a display-only
+    /// session into the disconnected one the shot is about. Nothing is retried and no
+    /// network session exists to be told.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_end_session(&mut self, id: SessionId, failure: SessionFailure) {
+        self.workspace.session_failed(id, failure);
+        self.workspace.clear_session_failure();
+    }
+
+    /// Marks a capture session as having rung or finished in the background (R7).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_note_attention(&mut self, id: SessionId, kind: AttentionKind) {
+        self.workspace.note_attention(id, kind);
+    }
+
     /// Builds the shell with every store, the trust file and the credential store
     /// chosen by the caller.
     ///
@@ -1155,6 +1242,7 @@ impl ShelluneView {
             accent_hover: None,
             tab_list_open: false,
             session_menu: None,
+            session_more: None,
             focus_host_dialog: false,
             focus_return: None,
             restore_focus_pending: false,
@@ -7601,6 +7689,85 @@ impl ShelluneView {
         self.rail_collapsed
     }
 
+    /// Closes whatever floats above the page, one layer at a time, and says whether
+    /// anything was closed (R5).
+    ///
+    /// The order is the one a person expects: the newest layer first. The palette and
+    /// the dialogs go before the menus they were opened from, the menus before the
+    /// page, and the file view last, because it takes the terminal's place rather than
+    /// covering it. Escape runs this whether or not the terminal holds the keys: a
+    /// menu is the shell's surface, and the program must not receive an Escape that
+    /// was meant for it. With nothing floating the key goes on to the program.
+    fn dismiss_floating(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+            return true;
+        }
+        if self.custom_shell_open {
+            self.close_custom_shell(window, cx);
+            return true;
+        }
+        if self.host_fields.is_some() {
+            self.close_host_editor(cx);
+            return true;
+        }
+        if self.tab_rename.is_some() {
+            self.close_tab_rename(window, cx);
+            return true;
+        }
+        // The shortcut-command manager gives up one layer at a time: the editor, then
+        // the deletion question, then the dialog itself (R6).
+        if self.snippet_panel.is_editing() {
+            self.close_snippet_editor(cx);
+            return true;
+        }
+        if self.snippet_panel.pending_delete().is_some() {
+            self.snippet_panel.keep();
+            cx.notify();
+            return true;
+        }
+        if self.tool == Some(shell::Tool::Snippets) {
+            self.tool = None;
+            self.restore_focus_pending = true;
+            cx.notify();
+            return true;
+        }
+        if self.tab_list_open {
+            self.close_tab_list(window, cx);
+            return true;
+        }
+        if self.tab_menu.is_some() {
+            self.close_tab_menu(window, cx);
+            return true;
+        }
+        if self.session_menu.is_some() {
+            self.close_session_menu(window, cx);
+            return true;
+        }
+        if self.session_more.is_some() {
+            self.close_session_more(window, cx);
+            return true;
+        }
+        if self.shell_menu_open {
+            self.close_shell_menu(cx);
+            return true;
+        }
+        // A file view's question is inline rather than floating, so it is the last
+        // thing Escape closes: the column it asked about takes the keys back (R4).
+        if self.files_dialog.is_some() {
+            self.files_cancel_change(cx);
+            return true;
+        }
+        // The file view itself is a place the keyboard can leave. It takes the
+        // terminal's place while it is open, so without this a person who never
+        // touches the pointer would be left in it (R4).
+        if let Some(id) = self.active.filter(|id| self.files.is_open(*id)) {
+            self.toggle_files(id, cx);
+            self.reclaim_focus(window, cx);
+            return true;
+        }
+        false
+    }
     fn notice_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
         let notice = self.workspace.notice()?;
         let metrics = self.metrics();
@@ -8078,8 +8245,19 @@ impl ShelluneView {
 
         let mut frame = div().flex().flex_col().flex_1().min_h(px(0.0));
 
+        // What the head cannot hold - a failed bridge, the result of a save - is drawn
+        // here, above the terminal it belongs to (R11).
+        for notice in self.session_notices(id, window, cx) {
+            frame = frame.child(
+                div()
+                    .flex_none()
+                    .px(metrics.scale(spacing::SNUG))
+                    .pt(metrics.scale(spacing::TIGHT))
+                    .child(notice),
+            );
+        }
+
         if let Some(pane) = self.active_pane() {
-            frame = frame.child(self.session_bar(id, window, cx));
             // A shell that ended keeps its last screen, but the reason it stopped is
             // stated above it instead of being left for the user to guess.
             let notice = if let Some((failure, reconnectable)) = ended {
@@ -8108,7 +8286,6 @@ impl ShelluneView {
             // it opened one, or a process that never started. The session still holds
             // the reason, so it is drawn where the terminal would be instead of being
             // recorded and shown nowhere.
-            frame = frame.child(self.session_bar(id, window, cx));
             let notice = if let Some((failure, reconnectable)) = ended {
                 self.failure_notice(&failure, reconnectable)
             } else {
@@ -11898,321 +12075,42 @@ impl ShelluneView {
         row
     }
 
-    /// The state, the object and the actions of the selected session.
-    fn session_bar(
+    /// What the session has to explain above the terminal: a bridge that failed, and
+    /// the result of saving a quick connection (R11).
+    ///
+    /// These used to hang under the session bar. The bar is now the head's second row,
+    /// above the terminal, so the explanation is drawn at the top of the column instead
+    /// of inside the head: the head stays one short band, and the reason keeps the whole
+    /// width of the terminal it belongs to.
+    pub(super) fn session_notices(
         &self,
         id: Option<SessionId>,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<Self>,
-    ) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
+    ) -> Vec<gpui::AnyElement> {
         let Some(session) = id.and_then(|id| self.workspace.session(id)) else {
-            return div();
+            return Vec::new();
         };
         let id = session.id();
-        let kind = PaneKind::of(session.kind());
-        let kind_label = match kind {
-            PaneKind::Local => strings.session_kind_local,
-            PaneKind::Remote => strings.session_kind_remote,
-        };
-        // A live session is the normal case, and its tab already shows the green
-        // dot; the bar only speaks up while connecting, or once it failed or ended.
-        let live = matches!(session.state(), SessionState::Connected);
-        let target = match session.kind() {
-            SessionKind::Local { .. } => program_label(&self.target_of(session)),
-            SessionKind::Remote { .. } => self.target_of(session),
-        };
-        // A local shell's program is often its own title; saying it twice is noise.
-        let label = self.tab_title(id);
-        let target = (target.to_lowercase() != label.to_lowercase()).then_some(target);
-        let state_label = copy::session_state_label(session.state(), self.workspace.locale());
-        let tone = session_tone(session.state());
-        let can_reconnect = may_reconnect(session);
-        // Only a connection that can really browse offers the file view: a local
-        // session has no server to ask, and a session whose connection ended has no
-        // directory left to show.
-        let browsable = self.files.can_browse(id);
-        // A saved host's tunnels are one click away from its terminal.
-        let forward_host = match session.kind() {
-            SessionKind::Remote { host } if self.book.host(*host).is_some() => Some(*host),
-            _ => None,
-        };
-        let files_open = self.files.is_open(id);
-        // Terminal and files are two views of the same connection: a switch, not a
-        // pair of open and close buttons.
-        let files_button = browsable.then(|| {
-            let ux = copy::ux();
-            let view_segment =
-                |selector: &'static str, icon: Icon, label: &'static str, selected: bool| {
-                    let color = theme::swatch(if selected {
-                        palette::TEXT_PRIMARY
-                    } else {
-                        palette::TEXT_SECONDARY
-                    });
-                    components::segment("", selected, metrics)
-                        .flex()
-                        .items_center()
-                        .gap(metrics.scale(spacing::HAIRLINE + 1.0))
-                        .child(icons::icon(icon, metrics.small_icon_size(), color))
-                        .child(label)
-                        .id(selector)
-                        .debug_selector(move || selector.to_owned())
-                };
-            // One line. The shared track wraps so a settings row can shrink, and that
-            // same wrap stacked these two segments until the session bar was tall
-            // enough to leave the file pane shorter than the failure it has to show.
-            components::segmented(metrics)
-                .flex_none()
-                .flex_nowrap()
-                .child(
-                    view_segment(
-                        "files.close",
-                        Icon::Terminal,
-                        ux.settings_terminal,
-                        !files_open,
-                    )
-                    // The way back to the terminal is a stop of the file view's keyboard
-                    // walk, so it can be reached with Tab and pressed with Enter (R4). It
-                    // answers the ring through the same handler the columns use, because
-                    // the walk is one list whichever of its controls holds the keys.
-                    .track_focus(&self.files_close_focus)
-                    .focus(files_focus_ring)
-                    .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
-                        if view.files_key(id, FileSource::Remote, event, window, cx) {
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .on_click(cx.listener(move |view, _event, _window, cx| {
-                        if view.files.is_open(id) {
-                            view.toggle_files(id, cx);
-                            view.reclaim_focus(_window, cx);
-                        }
-                    })),
-                )
-                .child(
-                    view_segment(
-                        "session.files",
-                        Icon::Folder,
-                        strings.files_open,
-                        files_open,
-                    )
-                    .on_click(cx.listener(move |view, _event, _window, cx| {
-                        if !view.files.is_open(id) {
-                            view.toggle_files(id, cx);
-                        }
-                    })),
-                )
-        });
-
-        // One line: who and what on the left, the session's own actions on the right.
-        // The line wraps as a whole, so at 200% text in a small window the actions move
-        // under the identity instead of squeezing the name under a chip (R4).
-        let actions_row = div()
-            .flex()
-            .flex_shrink()
-            .min_w(px(0.0))
-            .max_w_full()
-            .flex_wrap()
-            .items_center()
-            .justify_end()
-            .ml_auto()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .children(self.solo_split_buttons(cx))
-            .when_some(files_button, |row, button| row.child(button))
-            .when_some(forward_host, |row, host| {
-                row.child(self.icon_text_button(
-                    SharedString::from("session.forwards"),
-                    Icon::Forward,
-                    copy::ux().session_forwards,
-                    Variant::Ghost,
-                    cx,
-                    move |view, cx| {
-                        view.show_forwards_scope(
-                            crate::app::forwarding::ForwardScope::Host(host),
-                            cx,
-                        );
-                    },
-                ))
-            })
-            .when(can_reconnect, |row| {
-                row.child(self.icon_text_button(
-                    SharedString::from("session.reconnect"),
-                    Icon::Refresh,
-                    strings.session_reconnect,
-                    Variant::Primary,
-                    cx,
-                    move |view, cx| view.reconnect_session(id, cx),
-                ))
-            })
-            .when(
-                self.unsaved.iter().any(|(session, _)| *session == id),
-                |row| {
-                    row.child(self.icon_text_button(
-                        SharedString::from("session.save_host"),
-                        Icon::Server,
-                        strings.quick_save_host,
-                        Variant::Primary,
-                        cx,
-                        move |view, cx| view.save_quick_host(id, cx),
-                    ))
-                },
-            );
-        let close = components::icon_only_button(Icon::Close, metrics)
-            .id("session.close")
-            .debug_selector(|| "session.close".to_owned())
-            .tooltip(components::tooltip(strings.session_close))
-            .on_click(cx.listener(move |view, _event, _window, cx| {
-                view.request_close_session(id, cx);
-            }));
-        // A wide window has room for one line: identity on the left, every action and
-        // Close on the right. A narrow one (or large text) keeps Close beside the
-        // identity and gives the actions a line of their own, which is the shortest the
-        // bar can be there, so the terminal and the file pane keep their room (R4).
-        let compact = self.viewport_width < metrics.scale(SESSION_BAR_ONE_LINE_WIDTH);
-        let (actions_row, close) = if compact {
-            (
-                actions_row.w_full(),
-                Some(div().flex_none().ml_auto().child(close)),
-            )
-        } else {
-            (
-                actions_row
-                    .child(
-                        components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)),
-                    )
-                    .child(close),
-                None,
-            )
-        };
-
-        let row =
-            div()
-                .flex()
-                .flex_none()
-                .flex_wrap()
-                .items_center()
-                .w_full()
-                .gap_x(metrics.scale(spacing::TIGHT))
-                .gap_y(metrics.scale(spacing::HAIRLINE))
-                .min_h(metrics.session_bar_height())
-                .py(px(1.0))
-                .pl(metrics.scale(spacing::SNUG))
-                .pr(metrics.scale(spacing::HAIRLINE + 2.0))
-                .bg(theme::swatch(palette::SURFACE))
-                .border_b_1()
-                .border_color(theme::swatch(palette::BORDER))
-                .debug_selector(|| "session.bar".to_owned())
-                .child(
-                    div()
-                        .flex()
-                        .flex_grow()
-                        .flex_shrink()
-                        .flex_basis(gpui::auto())
-                        .min_w(px(0.0))
-                        .flex_wrap()
-                        .items_center()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            div()
-                                .id("session.kind")
-                                .flex()
-                                .flex_none()
-                                .items_center()
-                                .justify_center()
-                                .size(metrics.scale(22.0))
-                                .rounded(px(radius::SMALL))
-                                .bg(theme::swatch(palette::ACCENT_TINT))
-                                .tooltip(components::tooltip(kind_label))
-                                .child(icons::icon(
-                                    if kind == PaneKind::Remote {
-                                        Icon::Server
-                                    } else {
-                                        Icon::Terminal
-                                    },
-                                    metrics.small_icon_size(),
-                                    theme::swatch(palette::ACCENT),
-                                )),
-                        )
-                        .child(
-                            div()
-                                // Natural width, then the next line of the cluster: a
-                                // single-line truncate at 200% cut the last glyph in half
-                                // and had no ellipsis (R4).
-                                .flex_none()
-                                .max_w_full()
-                                .whitespace_normal()
-                                .text_size(metrics.label_size())
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .debug_selector(|| "session.identity".to_owned())
-                                // "Current" only tells panes apart; a lone pane is
-                                // simply the session.
-                                .child(SharedString::from(if self.active_tab_is_solo() {
-                                    label.clone()
-                                } else {
-                                    format!("{} · {label}", strings.workspace_current)
-                                })),
-                        )
-                        .children(target.map(|target| {
-                            div()
-                                .flex_none()
-                                .max_w_full()
-                                .whitespace_normal()
-                                .font_family(terminal::monospace_family())
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .debug_selector(|| "session.target".to_owned())
-                                .child(SharedString::from(target))
-                        }))
-                        .when(!live, |row| {
-                            row.child(components::chip(state_label, tone, metrics))
-                        })
-                        .when_some(self.x11.get(&id).cloned(), |row, status| {
-                            row.child(self.x11_chip(&status, metrics))
-                        })
-                        .children(self.unsaved.iter().find(|(session, _)| *session == id).map(
-                            |_| {
-                                div()
-                                    .flex_none()
-                                    .max_w_full()
-                                    .min_w(px(0.0))
-                                    .whitespace_normal()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(strings.quick_unsaved_note)
-                            },
-                        )),
-                )
-                .children(close)
-                .child(actions_row);
-        let notice = self.quick_save_notice.clone();
-        // A failed bridge says why in the bar's tooltip, but a tooltip is a pointer
-        // target: the reason and the next step are repeated as text under the bar so a
-        // keyboard user reads them too (R4, R11).
-        // The notice stays under the terminal, where the short reason fits whole.
-        // While files are open it would sit above that pane and leave a failed
-        // transfer shorter than its reason and Retry, so the chip on the bar is
-        // the state and the body comes back with the terminal (R4).
+        let metrics = self.metrics();
+        let mut notices = Vec::new();
+        // While files are open the failure would sit above that pane and leave a failed
+        // transfer shorter than its reason and Retry, so the chip on the head is the
+        // state and the body comes back with the terminal (R4).
         let x11_failure = match self.x11.get(&id) {
             Some(X11Status::Failed { reason, next_step }) if !self.files.is_open(id) => {
                 Some((reason.clone(), next_step.clone()))
             }
             _ => None,
         };
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w_full()
-            .child(row)
-            .children(x11_failure.map(|(reason, next_step)| {
-                // A failed bridge leaves a working session, so the bar keeps its buttons
-                // and the terminal keeps the room under them. The box is tall enough that
-                // the short reason stays whole on the first screen; a longer one scrolls,
-                // and Page Up/Down do that while this box has the keyboard (R4, R11).
-                let room = window.viewport_size().height * X11_NOTICE_SHARE;
-                let scroll = self.x11_notice_scroll.clone();
+        if let Some((reason, next_step)) = x11_failure {
+            // A failed bridge leaves a working session, so the head keeps its buttons and
+            // the terminal keeps the room under them. The box is tall enough that the
+            // short reason stays whole on the first screen; a longer one scrolls, and
+            // Page Up/Down do that while this box has the keyboard (R4, R11).
+            let room = window.viewport_size().height * X11_NOTICE_SHARE;
+            let scroll = self.x11_notice_scroll.clone();
+            notices.push(
                 div()
                     .id("session.x11.notice.body")
                     .flex()
@@ -12235,10 +12133,16 @@ impl ShelluneView {
                     }))
                     .debug_selector(|| "session.x11.notice.body".to_owned())
                     .child(self.x11_failure_banner(&reason, &next_step, metrics))
-            }))
-            .children(notice.map(|notice| self.quick_save_banner(&notice)))
+                    .into_any_element(),
+            );
+        }
+        notices.extend(
+            self.quick_save_notice
+                .clone()
+                .map(|notice| self.quick_save_banner(&notice).into_any_element()),
+        );
+        notices
     }
-
     /// Why X11 forwarding is unavailable, as text under the session bar (R11).
     ///
     /// The chip next to the session identity carries the state and its tooltip carries
@@ -12288,7 +12192,7 @@ impl ShelluneView {
     /// details for a pointer, and [`Self::x11_failure_banner`] repeats them as text under
     /// the bar for everyone else: a session that failed to forward is still a working
     /// session, so it needs a line of explanation rather than a modal.
-    fn x11_chip(&self, status: &X11Status, metrics: Metrics) -> gpui::Stateful<Div> {
+    pub(super) fn x11_chip(&self, status: &X11Status, metrics: Metrics) -> gpui::Stateful<Div> {
         let strings = self.strings();
         let selector = match status {
             X11Status::Off => "session.x11.off",
@@ -12705,10 +12609,20 @@ impl Render for ShelluneView {
             .capture_any_mouse_down(cx.listener(|this, _event, _window, _cx| {
                 this.pointer_input = true;
             }))
-            .capture_key_down(cx.listener(|this, _event, _window, cx| {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.pointer_input {
                     this.pointer_input = false;
                     cx.notify();
+                }
+                // Escape closes what floats above the terminal, whichever control has
+                // the keys: a menu or a dialog belongs to the shell, and the program
+                // in the terminal must not receive an Escape that was meant for it.
+                // With nothing floating the key goes on to the program, untouched.
+                if event.keystroke.key == "escape"
+                    && event.keystroke.modifiers.number_of_modifiers() == 0
+                    && this.dismiss_floating(window, cx)
+                {
+                    cx.stop_propagation();
                 }
             }))
             .on_action(cx.listener(|this, _: &GoToLocalShells, window, cx| {
@@ -12749,71 +12663,10 @@ impl Render for ShelluneView {
             .on_action(cx.listener(|this, _: &DismissNotice, window, cx| {
                 // Escape closes whatever floats first: the palette, a menu, then the
                 // notice.
-                if this.palette.is_some() {
-                    this.close_palette(window, cx);
-                    return;
-                }
-                if this.custom_shell_open {
-                    this.close_custom_shell(window, cx);
-                    return;
-                }
-                if this.host_fields.is_some() {
-                    this.close_host_editor(cx);
-                    return;
-                }
-                if this.tab_rename.is_some() {
-                    this.close_tab_rename(window, cx);
-                    return;
-                }
-                // The shortcut-command manager gives up one layer at a time: the editor, then
-                // the deletion question, then the dialog itself (R6).
-                if this.snippet_panel.is_editing() {
-                    this.close_snippet_editor(cx);
-                    return;
-                }
-                if this.snippet_panel.pending_delete().is_some() {
-                    this.snippet_panel.keep();
+                if !this.dismiss_floating(window, cx) {
+                    this.workspace.dismiss_notice();
                     cx.notify();
-                    return;
                 }
-                if this.tool == Some(shell::Tool::Snippets) {
-                    this.tool = None;
-                    this.restore_focus_pending = true;
-                    cx.notify();
-                    return;
-                }
-                if this.tab_list_open {
-                    this.close_tab_list(window, cx);
-                    return;
-                }
-                if this.tab_menu.is_some() {
-                    this.close_tab_menu(window, cx);
-                    return;
-                }
-                if this.session_menu.is_some() {
-                    this.close_session_menu(window, cx);
-                    return;
-                }
-                if this.shell_menu_open {
-                    this.close_shell_menu(cx);
-                    return;
-                }
-                // A file view's question is inline rather than floating, so it is the last
-                // thing Escape closes: the column it asked about takes the keys back (R4).
-                if this.files_dialog.is_some() {
-                    this.files_cancel_change(cx);
-                    return;
-                }
-                // The file view itself is a place the keyboard can leave. It takes the
-                // terminal's place while it is open, so without this a person who never
-                // touches the pointer would be left in it (R4).
-                if let Some(id) = this.active.filter(|id| this.files.is_open(*id)) {
-                    this.toggle_files(id, cx);
-                    this.reclaim_focus(window, cx);
-                    return;
-                }
-                this.workspace.dismiss_notice();
-                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &NewLocalShell, window, cx| {
                 this.new_local_shell(window, cx);
@@ -12935,7 +12788,7 @@ impl Render for ShelluneView {
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
-                    .child(self.top_bar(window, cx))
+                    .child(self.session_header(window, cx))
                     .children(notice)
                     .children(self.close_transfer_question(cx))
                     .children(self.close_app_question(cx))
@@ -12956,6 +12809,7 @@ impl Render for ShelluneView {
             .children(self.tab_rename_overlay(window, cx))
             .children(self.tab_list_overlay(window, cx))
             .children(self.session_menu_overlay(window, cx))
+            .children(self.session_more_overlay(window, cx))
             .children(self.palette_overlay(window, cx))
             .children(self.key_capture_overlay(window, cx))
             .children(self.toast_stack(cx))
@@ -13388,10 +13242,6 @@ fn destination_icon(destination: Destination) -> Icon {
         Destination::Settings => Icon::Settings,
     }
 }
-
-/// The product mark, shared with the native application icons.
-/// The window width, before zoom, from which the session bar is one line.
-const SESSION_BAR_ONE_LINE_WIDTH: f32 = 860.0;
 
 /// The widest the home page's column grows, before zoom.
 pub(super) const HOME_MAX_WIDTH: f32 = 1040.0;

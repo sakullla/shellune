@@ -383,17 +383,23 @@ impl ShelluneView {
         } else {
             self.active
         };
-        if session_id.is_some_and(|id| self.workspace.session(id).is_some()) {
-            column = column.child(self.session_bar(session_id, window, cx));
-            if let Some(notice) = self.active_failure_notice(session_id, cx) {
-                column = column.child(
-                    div()
-                        .flex_none()
-                        .px(metrics.scale(spacing::SNUG))
-                        .pt(metrics.scale(spacing::SNUG))
-                        .child(notice),
-                );
-            }
+        // The session's own identity, state and actions are the window's head (R12);
+        // only what the head cannot hold - a failed bridge, the result of a save -
+        // is drawn here, above the terminal it belongs to.
+        for notice in self.session_notices(session_id, window, cx) {
+            // Edge to edge, like the banner it is: the box the reason lives in already
+            // carries its own padding, and another margin around it took the room the
+            // terminal needs at 720x480 with 200% text (R4).
+            column = column.child(div().flex_none().child(notice));
+        }
+        if let Some(notice) = self.active_failure_notice(session_id, cx) {
+            column = column.child(
+                div()
+                    .flex_none()
+                    .px(metrics.scale(spacing::SNUG))
+                    .pt(metrics.scale(spacing::SNUG))
+                    .child(notice),
+            );
         }
         let files = session_id.filter(|id| self.files.is_open(*id));
         if let Some(id) = files {
@@ -775,6 +781,14 @@ impl ShelluneView {
             .child(frame)
     }
 
+    /// What marks one pane of a split tab (R12).
+    ///
+    /// It is not a second session bar. The tab already carries the session's name, its
+    /// colour and its state; repeating them in every pane is what the merge removed, and
+    /// two panes of one session would then write the same sentence twice. A pane is
+    /// marked by its slot - "Pane 1", "Pane 2" - and the active one takes the accent, so
+    /// where the keys are is still visible. The pane's own close and zoom stay on it:
+    /// they belong to that pane, not to the session.
     fn leaf_header(
         &self,
         leaf: &crate::app::layout::Leaf,
@@ -784,20 +798,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let pane = leaf.id();
-        let title = leaf
-            .session()
-            .and_then(|id| {
-                self.workspace
-                    .session(id)
-                    .map(|session| session.title().to_owned())
-            })
-            .unwrap_or_else(|| {
-                self.workspace
-                    .layout()
-                    .active_tab()
-                    .map(|tab| tab.title().to_owned())
-                    .unwrap_or_else(|| strings.pane_pending.to_owned())
-            });
+        let slot = self.pane_slot(pane);
         let zoomed = self
             .workspace
             .layout()
@@ -808,27 +809,42 @@ impl ShelluneView {
             .flex_none()
             .items_center()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .h(metrics.scale(28.0))
+            .h(metrics.scale(26.0))
             .px(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_b_1()
-            .border_color(theme::swatch(palette::BORDER))
+            // The active pane is marked by its own fill and an accent bar, not only by
+            // the weight of a word: the frame around it is the other half of the mark.
+            .when(active, |row| row.bg(theme::swatch(palette::SURFACE_RAISED)))
+            .when(active, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .w(px(2.0))
+                        .h(metrics.scale(14.0))
+                        .rounded_full()
+                        .bg(theme::swatch(palette::ACCENT))
+                        .debug_selector(|| "pane.active.mark".to_owned()),
+                )
+            })
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
+                    .flex_none()
                     .text_size(metrics.caption_size())
-                    .when(active, |title| {
-                        title
+                    .when(active, |label| {
+                        label
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     })
-                    .when(!active, |title| {
-                        title.text_color(theme::swatch(palette::TEXT_MUTED))
+                    .when(!active, |label| {
+                        label.text_color(theme::swatch(palette::TEXT_MUTED))
                     })
-                    .child(SharedString::from(title)),
+                    .debug_selector(move || format!("pane.slot.{pane}"))
+                    .child(SharedString::from(match slot {
+                        Some(slot) => format!("{} {slot}", strings.pane_label),
+                        None => strings.pane_label.to_owned(),
+                    })),
             )
+            // The word, not only the accent: which pane holds the keys is never said by
+            // colour alone (R8).
             .when(active, |row| {
                 row.child(crate::app::components::chip(
                     strings.pane_active,
@@ -837,43 +853,39 @@ impl ShelluneView {
                 ))
             })
             .when(active, |row| {
-                row.child(self.pane_icon(
-                    pane,
-                    "split.right",
-                    Icon::SplitRight,
-                    strings.pane_split_right,
-                    cx,
-                    |this, window, cx| this.split_active(SplitAxis::LeftRight, window, cx),
-                ))
-                .child(self.pane_icon(
-                    pane,
-                    "split.down",
-                    Icon::SplitDown,
-                    strings.pane_split_down,
-                    cx,
-                    |this, window, cx| this.split_active(SplitAxis::TopBottom, window, cx),
-                ))
-                .child(self.pane_icon(
-                    pane,
-                    "zoom",
-                    Icon::Zoom,
-                    if zoomed {
-                        strings.pane_unzoom
-                    } else {
-                        strings.pane_zoom
-                    },
-                    cx,
-                    |this, _window, cx| this.toggle_active_zoom(cx),
-                ))
+                row.child(div().flex_1())
+                    .child(self.pane_icon(
+                        pane,
+                        "zoom",
+                        Icon::Zoom,
+                        if zoomed {
+                            strings.pane_unzoom
+                        } else {
+                            strings.pane_zoom
+                        },
+                        cx,
+                        |this, _window, cx| this.toggle_active_zoom(cx),
+                    ))
+                    .child(self.pane_icon(
+                        pane,
+                        "close",
+                        Icon::Close,
+                        strings.pane_close,
+                        cx,
+                        move |this, _window, cx| this.close_one_pane(pane, cx),
+                    ))
             })
-            .child(self.pane_icon(
-                pane,
-                "close",
-                Icon::Close,
-                strings.pane_close,
-                cx,
-                move |this, _window, cx| this.close_one_pane(pane, cx),
-            ))
+    }
+
+    /// Where one pane sits in its tab, counting from one, as the pane mark writes it.
+    fn pane_slot(&self, pane: PaneId) -> Option<usize> {
+        let tab = self.workspace.layout().active_tab()?;
+        let mut leaves = Vec::new();
+        collect_leaves(tab.root(), &mut leaves);
+        leaves
+            .iter()
+            .position(|leaf| leaf.id() == pane)
+            .map(|index| index + 1)
     }
 
     /// Whether the active tab holds exactly one pane and shows it unzoomed.
@@ -884,11 +896,12 @@ impl ShelluneView {
             .is_some_and(|tab| matches!(tab.root(), Node::Leaf(_)) && tab.zoomed().is_none())
     }
 
-    /// The split buttons, for the session bar of a tab with a single pane.
-    pub(super) fn solo_split_buttons(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        if !self.active_tab_is_solo() {
-            return None;
-        }
+    /// The split buttons, for the head of whichever tab is on screen (R5).
+    ///
+    /// They sit in the head rather than in one pane's own strip: splitting is a
+    /// session-level action that acts on the active pane, and a button drawn inside the
+    /// pane it would split is one more copy of the pane chrome (R12).
+    pub(super) fn split_buttons(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let pane = self.workspace.layout().active_pane()?;
         let strings = self.strings();
         let control = self.metrics().hit_target();

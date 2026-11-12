@@ -23,14 +23,16 @@ use std::path::Path;
 
 use gpui::{App, Context, Window};
 
-use shellune_core::{HostConfig, LocalShell, SnippetBook};
+use shellune_core::{
+    HostConfig, LocalShell, SessionFailure, SessionId, SessionState, SnippetBook, SplitAxis,
+};
 use shellune_storage::{HostEdit, HostStore, SnippetStore};
 
 use crate::app::ShelluneView;
 use crate::app::copy::Locale;
 use crate::app::nav::Destination;
 use crate::app::theme::{self, Motion, Zoom};
-use crate::app::workspace::{SectionState, Workspace};
+use crate::app::workspace::{AttentionKind, SectionState, Workspace};
 
 /// What kind of surface a scenario shows, so the gallery can group them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +335,100 @@ test result: \x1b[32mok\x1b[0m. 42 passed; 0 failed; 0 ignored\r\n\
 部署完成\r\n\
 \x1b[1;36mdeploy@staging\x1b[0m:\x1b[1;34m~/project/release\x1b[0m$ ";
 
+/// A second shell a split shot puts beside the first. Nothing is started from it.
+const SHOT_SPLIT_SHELL: &str = "zsh";
+
+/// The bytes the second pane of a split shows: a short, different transcript, so the
+/// two panes of one shot are told apart at a glance.
+const SPLIT_TRANSCRIPT: &str = "\x1b[1;36mdeploy@staging\x1b[0m:\x1b[1;34m~/project/release\x1b[0m$ systemctl status shellune --no-pager\r\n\
+\x1b[32m●\x1b[0m shellune.service - Shellune terminal host\r\n\
+     Active: \x1b[32mactive (running)\x1b[0m since Thu 2026-11-12 09:14:03 UTC\r\n\
+\x1b[1;36mdeploy@staging\x1b[0m:\x1b[1;34m~/project/release\x1b[0m$ ";
+
+/// Puts one display-only session on screen and returns it.
+fn add_session(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+    program: &str,
+    content: &[u8],
+) -> Result<SessionId, String> {
+    let shell = LocalShell::new(program, program);
+    let id = view.attach_capture_session(shell, content, Some(window), cx);
+    if view.pane_of(id).is_none() {
+        return Err(format!(
+            "the {program} session was recorded without a terminal"
+        ));
+    }
+    Ok(id)
+}
+
+/// Three tabs: two local shells and one saved host, with the second tab carrying a
+/// background bell (R5, R7).
+fn show_tabs(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let first = add_session(view, window, cx, SHOT_SHELL, TRANSCRIPT.as_bytes())?;
+    let second = add_session(
+        view,
+        window,
+        cx,
+        SHOT_SPLIT_SHELL,
+        SPLIT_TRANSCRIPT.as_bytes(),
+    )?;
+    view.capture_note_attention(second, AttentionKind::Bell);
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.attach_capture_remote_session(
+        &host,
+        b"$ uptime\r\n 09:20:11 up 12 days\r\n$ ",
+        Some(window),
+        cx,
+    );
+    // The first tab is the one the shot is about: the other two say what a strip of
+    // several tabs looks like, and one of them is calling from the background.
+    view.activate(first, cx);
+    Ok(())
+}
+
+/// One session in a tab of its own, split left and right, with the new pane active
+/// (R5, R12).
+fn show_split(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    add_session(view, window, cx, SHOT_SHELL, TRANSCRIPT.as_bytes())?;
+    let shell = LocalShell::new(SHOT_SPLIT_SHELL, SHOT_SPLIT_SHELL);
+    view.capture_split_with_session(
+        SplitAxis::LeftRight,
+        shell,
+        SPLIT_TRANSCRIPT.as_bytes(),
+        window,
+        cx,
+    )
+    .ok_or_else(|| "the split did not produce a second pane".to_owned())?;
+    Ok(())
+}
+
+/// A saved host's terminal whose connection ended (R5, R12).
+fn show_disconnected(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    let id = view.attach_capture_remote_session(&host, TRANSCRIPT.as_bytes(), Some(window), cx);
+    view.capture_end_session(id, SessionFailure::ConnectionLost);
+    Ok(())
+}
 /// Puts one display-only session on screen, titled like a real one.
 fn show_terminal(
     view: &mut ShelluneView,
@@ -456,6 +552,67 @@ fn snippets_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     terminal_ready(view, cx)
 }
 
+fn tabs_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    let count = view.workspace().layout().tabs().len();
+    if count != 3 {
+        return Err(format!(
+            "the strip holds {count} tab(s), not the three the fixture opened"
+        ));
+    }
+    let bells = view
+        .workspace()
+        .sessions()
+        .items()
+        .iter()
+        .filter(|session| view.workspace().session_unread(session.id()).bell)
+        .count();
+    if bells != 1 {
+        return Err(format!(
+            "{bells} tab(s) carry a background bell, not the one the fixture rang"
+        ));
+    }
+    Ok(())
+}
+
+fn split_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    on_page(view, Destination::LocalShells, SectionState::Populated)?;
+    let panes = view.workspace().layout().leaves().len();
+    if panes != 2 {
+        return Err(format!(
+            "the tab holds {panes} pane(s), not the two the fixture split into"
+        ));
+    }
+    // The pane the shot is about is the one the split just made, and it holds its own
+    // text: the two panes have to be told apart by what they show, not only by a frame.
+    let Some(pane) = view.pane() else {
+        return Err("the split has no pane on screen".to_owned());
+    };
+    let text = pane.read(cx).visible_text().join("\n");
+    if !text.contains("systemctl status shellune") {
+        return Err(
+            "the active pane does not show its own transcript, so it is not the new pane"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn disconnected_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    let ended = view
+        .workspace()
+        .sessions()
+        .items()
+        .iter()
+        .filter(|session| matches!(session.state(), SessionState::Disconnected(_)))
+        .count();
+    if ended != 1 {
+        return Err(format!(
+            "{ended} session(s) are disconnected, not the one the fixture lost"
+        ));
+    }
+    Ok(())
+}
 // ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
@@ -513,6 +670,54 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: show_terminal,
         ready: terminal_ready,
+    },
+    Scenario {
+        id: "terminal-tabs",
+        title: "终端 · 多标签与后台提醒",
+        category: Category::Terminal,
+        fixture: "two display-only shells and one saved host's terminal, the second tab \
+                  carrying a background bell",
+        evidence: "proves the merged head names the current tab once, and that another tab's \
+                   bell is marked while it is not the one on screen; no shell, SSH session or \
+                   bell from a real program is part of it",
+        quick: true,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_tabs,
+        ready: tabs_ready,
+    },
+    Scenario {
+        id: "terminal-split",
+        title: "终端 · 左右分屏",
+        category: Category::Terminal,
+        fixture: "one session split left and right, the second pane holding a second \
+                  display-only session",
+        evidence: "proves a split marks its panes and its active pane without repeating the \
+                   session; the second pane has no process behind it",
+        quick: true,
+        variants: &[
+            Variant::dark().comfortable().chinese(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_split,
+        ready: split_ready,
+    },
+    Scenario {
+        id: "terminal-disconnected",
+        title: "终端 · 连接断开",
+        category: Category::Terminal,
+        fixture: "a saved host's display-only terminal, ended the way a lost connection ends",
+        evidence: "proves the state, the reason and the next step are readable on the merged \
+                   head; no connection was ever made, so no transport behaviour is shown",
+        quick: true,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_disconnected,
+        ready: disconnected_ready,
     },
     Scenario {
         id: "settings",

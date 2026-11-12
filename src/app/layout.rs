@@ -179,6 +179,10 @@ impl Tab {
     ///
     /// This is the automatic title: what the tab would be called without the user's
     /// own name. Saving writes it, so restoring the automatic title still works.
+    ///
+    /// Only the tests read it now: the strip and the head name a session through its
+    /// `Session`, and a tab without one has no title to show.
+    #[cfg(test)]
     #[must_use]
     pub fn title(&self) -> &str {
         &self.title

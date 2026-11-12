@@ -706,7 +706,6 @@ pub struct Strings {
     /// Palette group: hosts that were really reached, newest first.
     pub palette_group_recent: &'static str,
     /// Label of the current session in the identity bar.
-    pub workspace_current: &'static str,
     /// Quick connect: the port is not a number from 1 to 65535.
     pub quick_port_invalid: &'static str,
     /// Quick connect: what to show when the port field is blank.
@@ -785,6 +784,8 @@ pub struct Strings {
     pub pane_unzoom: &'static str,
     /// Marks the pane that receives the keyboard.
     pub pane_active: &'static str,
+    /// Names one pane of a split by its slot: the word, then the number.
+    pub pane_label: &'static str,
     /// A restored pane that has not been started.
     pub pane_pending: &'static str,
     /// Explains that a pending pane has no process and no old output.
@@ -1290,7 +1291,6 @@ pub static ENGLISH: Strings = Strings {
     attempt_others: "Other connections",
     attempt_cancel: "Cancel",
     palette_group_recent: "Recent connections",
-    workspace_current: "Current",
     quick_port_invalid: "The port is not a whole number from 1 to 65535",
     quick_port_blank: "empty",
     quick_fix_port: "Change the Port field.",
@@ -1330,6 +1330,7 @@ pub static ENGLISH: Strings = Strings {
     pane_zoom: "Zoom pane",
     pane_unzoom: "Show all panes",
     pane_active: "Active",
+    pane_label: "Pane",
     pane_pending: "Not connected",
     pane_pending_body: "This pane is waiting. Nothing was started, and earlier output is not shown.",
     pane_connect: "Connect",
@@ -1739,7 +1740,6 @@ pub static CHINESE: Strings = Strings {
     attempt_others: "其他连接",
     attempt_cancel: "取消",
     palette_group_recent: "最近连接",
-    workspace_current: "当前",
     quick_port_invalid: "端口必须是 1 到 65535 的整数",
     quick_port_blank: "空的",
     quick_fix_port: "请修改端口这一栏。",
@@ -1779,6 +1779,7 @@ pub static CHINESE: Strings = Strings {
     pane_zoom: "放大窗格",
     pane_unzoom: "显示全部分屏",
     pane_active: "活动",
+    pane_label: "窗格",
     pane_pending: "待连接",
     pane_pending_body: "这个窗格在等待。没有启动任何进程，之前的输出也不会显示。",
     pane_connect: "连接",
@@ -2074,7 +2075,7 @@ pub struct UxStrings {
     pub connect_title: &'static str,
     /// Choose how this server checks it is you. A password is only kept if you tick Remember.
     pub connect_hint: &'static str,
-    /// Connect without saving. You can save the host afterwards from the session bar.
+    /// Connect without saving. You can save the host afterwards from the session head.
     pub quick_hint: &'static str,
     /// Close
     pub tool_close: &'static str,
@@ -2480,7 +2481,7 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_version: "Version",
     connect_title: "Connect to",
     connect_hint: "Choose how this server checks it is you. A password is only kept if you tick Remember.",
-    quick_hint: "Connect without saving. You can save the host afterwards from the session bar.",
+    quick_hint: "Connect without saving. You can save the host afterwards from the session head.",
     tool_close: "Close",
     connect_background: "Continue in background",
     tool_forwards_title: "Port forwarding",
@@ -2639,7 +2640,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_version: "版本",
     connect_title: "连接到",
     connect_hint: "选择服务器验证你身份的方式。只有勾选“记住”时才会保存密码。",
-    quick_hint: "不保存直接连接。连接后可以在会话栏中保存为主机。",
+    quick_hint: "不保存直接连接。连接后可以在会话头部保存为主机。",
     tool_close: "关闭",
     connect_background: "转到后台",
     tool_forwards_title: "端口转发",

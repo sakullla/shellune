@@ -9,21 +9,34 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, FontWeight, MouseButton, SharedString, Stateful, Window, div, px,
+    AnyElement, Context, Div, FontWeight, KeyDownEvent, MouseButton, SharedString, Stateful,
+    Window, div, px,
 };
 
-use shellune_core::SnippetId;
+use shellune_core::{SessionKind, SessionState, SnippetId};
 
-use super::{ELLIPSIS, ShelluneView, SnippetNote, brand_mark, host_avatar, program_label};
+use super::{
+    ELLIPSIS, ShelluneView, SnippetNote, brand_mark, files_focus_ring, host_avatar, may_reconnect,
+    program_label, session_tone,
+};
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, Locale};
+use crate::app::files::FileSource;
 use crate::app::icons::{self, Icon};
 use crate::app::nav::{Destination, Platform};
 use crate::app::snippets::{SnippetEditor, body_preview};
+use crate::app::terminal;
 use crate::app::terminal::SnippetOffer;
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Motion, ThemeChoice, Tone, Zoom, palette, radius, spacing};
 use crate::app::workspace::{AttentionKind, SectionState};
+
+/// Width at which the head's second row still holds its target and its actions on
+/// one line.
+///
+/// Below it the actions take a line of their own inside the same band, which is the
+/// shortest that row can be there and leaves the terminal its room (R4).
+const CONTEXT_ONE_LINE_WIDTH: f32 = 860.0;
 
 /// A tool of a host or session that opens over the page instead of being a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,9 +76,34 @@ impl ShelluneView {
         }
     }
 
+    /// The window's head: the tab strip and, in the same surface under it, what the
+    /// current session is doing (R12).
+    ///
+    /// One band, not two. The tab carries the name, its own colour and its state dot;
+    /// this row carries what changes while that tab stays the same - the target, a
+    /// state that is not "connected", a bridge or a save that needs an answer - and the
+    /// session's actions. Drawing the name again under the tabs is what made the old
+    /// window spend two rows on one object.
+    pub(super) fn session_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .bg(theme::swatch(palette::SURFACE))
+            .border_b_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "session.header".to_owned())
+            .child(self.top_bar(window, cx))
+            .children(self.session_context(cx))
+    }
+
     /// The top row: brand, the hosts tab, the terminal tabs, a new-tab control, the
     /// blank caption that drags the window, search, settings and (on Windows) the
     /// window buttons.
+    ///
+    /// It draws no surface of its own: it is the first row of the session header, which
+    /// owns the band's background and its one bottom edge (R12).
     pub(super) fn top_bar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
@@ -153,9 +191,6 @@ impl ShelluneView {
             .items_center()
             .h(height)
             .w_full()
-            .bg(theme::swatch(palette::SURFACE))
-            .border_b_1()
-            .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "topbar".to_owned())
             .child(brand)
             .child(tabs)
@@ -173,6 +208,254 @@ impl ShelluneView {
             .children(controls)
     }
 
+    /// The second row of the head: where the current session stands, and what can be
+    /// done to it (R12).
+    ///
+    /// Nothing here repeats the tab. The name, its colour and its state dot belong to
+    /// the tab; this row carries the target that is not the name, the states that are
+    /// news (connecting, disconnected, ended), the bridge or the save that needs an
+    /// answer, and the actions. The name was drawn here as well, which is exactly the
+    /// duplication this row removes.
+    fn session_context(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.workspace.destination() != Destination::LocalShells
+            || !self.shows_terminal(Destination::LocalShells)
+        {
+            return None;
+        }
+        let id = if self.workspace.layout().active_tab().is_some() {
+            self.workspace.layout().active_session()
+        } else {
+            self.active
+        }?;
+        let session = self.workspace.session(id)?;
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let live = matches!(session.state(), SessionState::Connected);
+        let target = match session.kind() {
+            SessionKind::Local { .. } => program_label(&self.target_of(session)),
+            SessionKind::Remote { .. } => self.target_of(session),
+        };
+        // A local shell's program is often its own title: the tab already says it, so
+        // the row keeps only what the tab does not say.
+        let label = self.tab_title(id);
+        let target = (target.to_lowercase() != label.to_lowercase()).then_some(target);
+        let state_label = copy::session_state_label(session.state(), self.workspace.locale());
+        let tone = session_tone(session.state());
+        let can_reconnect = may_reconnect(session);
+        // Only a connection that can really browse offers the file view: a local
+        // session has no server to ask, and a session whose connection ended has no
+        // directory left to show.
+        let browsable = self.files.can_browse(id);
+        let files_open = self.files.is_open(id);
+        let unsaved = self.unsaved.iter().any(|(session, _)| *session == id);
+        // Terminal and files are two views of the same connection: a switch, not a
+        // pair of open and close buttons.
+        let files_button = browsable.then(|| {
+            let ux = copy::ux();
+            let view_segment =
+                |selector: &'static str, icon: Icon, label: &'static str, selected: bool| {
+                    let color = theme::swatch(if selected {
+                        palette::TEXT_PRIMARY
+                    } else {
+                        palette::TEXT_SECONDARY
+                    });
+                    components::segment("", selected, metrics)
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::HAIRLINE + 1.0))
+                        .child(icons::icon(icon, metrics.small_icon_size(), color))
+                        .child(label)
+                        .id(selector)
+                        .debug_selector(move || selector.to_owned())
+                };
+            // One line. The shared track wraps so a settings row can shrink, and that
+            // same wrap stacked these two segments until the head was tall enough to
+            // leave the file pane shorter than the failure it has to show.
+            components::segmented(metrics)
+                .flex_none()
+                .flex_nowrap()
+                .child(
+                    view_segment(
+                        "files.close",
+                        Icon::Terminal,
+                        ux.settings_terminal,
+                        !files_open,
+                    )
+                    // The way back to the terminal is a stop of the file view's keyboard
+                    // walk, so it can be reached with Tab and pressed with Enter (R4). It
+                    // answers the ring through the same handler the columns use, because
+                    // the walk is one list whichever of its controls holds the keys.
+                    .track_focus(&self.files_close_focus)
+                    .focus(files_focus_ring)
+                    .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
+                        if view.files_key(id, FileSource::Remote, event, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        if view.files.is_open(id) {
+                            view.toggle_files(id, cx);
+                            view.reclaim_focus(_window, cx);
+                        }
+                    })),
+                )
+                .child(
+                    view_segment(
+                        "session.files",
+                        Icon::Folder,
+                        strings.files_open,
+                        files_open,
+                    )
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        if !view.files.is_open(id) {
+                            view.toggle_files(id, cx);
+                        }
+                    })),
+                )
+        });
+
+        // One line: what this session is on the left, its actions on the right. The
+        // line wraps as a whole, so a narrow window or large text moves the actions
+        // under the target instead of squeezing either into a chip (R4).
+        let actions_row = div()
+            .flex()
+            .flex_shrink()
+            .min_w(px(0.0))
+            .max_w_full()
+            .flex_wrap()
+            .items_center()
+            .justify_end()
+            .ml_auto()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .children(self.split_buttons(cx))
+            .when_some(files_button, |row, button| row.child(button))
+            // The two actions that are the reason the user is looking at this row stay
+            // on it; everything else is one menu away (R5).
+            .when(can_reconnect, |row| {
+                row.child(self.icon_text_button(
+                    SharedString::from("session.reconnect"),
+                    Icon::Refresh,
+                    strings.session_reconnect,
+                    Variant::Primary,
+                    cx,
+                    move |view, cx| view.reconnect_session(id, cx),
+                ))
+            })
+            .when(unsaved, |row| {
+                row.child(self.icon_text_button(
+                    SharedString::from("session.save_host"),
+                    Icon::Server,
+                    strings.quick_save_host,
+                    Variant::Primary,
+                    cx,
+                    move |view, cx| view.save_quick_host(id, cx),
+                ))
+            })
+            .child(
+                self.bar_icon(
+                    "session.more",
+                    Icon::More,
+                    strings.session_more.to_owned(),
+                    self.session_more.is_some(),
+                )
+                // Opened on the press, like the tab menu: the head's button is a
+                // control of the shell, and a menu that took the keyboard from the
+                // terminal would leave Escape unanswered (R5).
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        view.open_session_more(id, event.position, window, cx);
+                    }),
+                ),
+            );
+        let close = components::icon_only_button(Icon::Close, metrics)
+            .id("session.close")
+            .debug_selector(|| "session.close".to_owned())
+            .tooltip(components::tooltip(strings.session_close))
+            .on_click(cx.listener(move |view, _event, _window, cx| {
+                view.request_close_session(id, cx);
+            }));
+        // A wide window has room for one line: the target on the left, every action and
+        // Close on the right. A narrow one (or large text) keeps Close beside the target
+        // and gives the actions a line of their own, which is the shortest this row can
+        // be, so the terminal keeps its room (R4).
+        let compact = self.viewport_width < metrics.scale(CONTEXT_ONE_LINE_WIDTH);
+        let (actions_row, close) = if compact {
+            (
+                actions_row.w_full(),
+                Some(div().flex_none().ml_auto().child(close)),
+            )
+        } else {
+            (
+                actions_row
+                    .child(
+                        components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)),
+                    )
+                    .child(close),
+                None,
+            )
+        };
+
+        let row = div()
+            .flex()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .w_full()
+            .gap_x(metrics.scale(spacing::TIGHT))
+            .gap_y(metrics.scale(spacing::HAIRLINE))
+            .min_h(metrics.session_bar_height())
+            .py(px(1.0))
+            .pl(metrics.scale(spacing::SNUG))
+            .pr(metrics.scale(spacing::HAIRLINE + 2.0))
+            .debug_selector(|| "session.context".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .flex_grow()
+                    .flex_shrink()
+                    .flex_basis(gpui::auto())
+                    .min_w(px(0.0))
+                    .flex_wrap()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .when_some(target, |row, target| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .max_w_full()
+                                .whitespace_normal()
+                                .font_family(terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                .debug_selector(|| "session.target".to_owned())
+                                .child(SharedString::from(target)),
+                        )
+                    })
+                    .when(!live, |row| {
+                        row.child(components::chip(state_label, tone, metrics))
+                    })
+                    .when_some(self.x11.get(&id).cloned(), |row, status| {
+                        row.child(self.x11_chip(&status, metrics))
+                    })
+                    .when(unsaved, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .max_w_full()
+                                .min_w(px(0.0))
+                                .whitespace_normal()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(strings.quick_unsaved_note),
+                        )
+                    }),
+            )
+            .children(close)
+            .child(actions_row);
+        Some(row)
+    }
     /// A square icon button of the top bar.
     fn bar_icon(
         &self,
