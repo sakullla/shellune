@@ -1211,6 +1211,14 @@ impl ShelluneView {
             // user chose rather than leaving the next start to assume (R7).
             bell_notice: Some(self.workspace.attention_settings().bell),
             command_notice: Some(self.workspace.attention_settings().finished),
+            // The connection defaults are chosen on the connection page (R20). Every
+            // other field is written on any change, so the saved block is carried
+            // through unchanged: an edit to an unrelated preference must not erase a
+            // host policy the user already chose.
+            connection: self
+                .saved_preferences
+                .as_ref()
+                .and_then(|saved| saved.connection),
         }
     }
 

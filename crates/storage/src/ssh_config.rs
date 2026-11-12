@@ -33,8 +33,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use shellune_core::{
-    DEFAULT_SSH_PORT, Endpoint, ForwardBuildError, ForwardKind, ForwardRule, HostConfig, HostId,
-    X11Forwarding,
+    DEFAULT_SSH_PORT, Endpoint, ForwardBuildError, ForwardKind, ForwardRule, HostConfig,
+    HostConnection, HostId, X11Forwarding,
 };
 
 use crate::book::{HostBook, HostEdit};
@@ -376,6 +376,17 @@ pub struct ImportedHost {
     forward_x11_trusted: Option<bool>,
     /// The line of the first X11 directive, for a note about a bad value.
     x11_line: usize,
+    /// The first `ServerAliveInterval` the file set, in seconds (R20).
+    ///
+    /// `0` is OpenSSH's way of switching the probe off and is kept as written, so the
+    /// preview can say the file turns keepalive off instead of quietly inheriting.
+    alive_interval: Option<u32>,
+    /// The line of that interval, for a superseded or unusable value.
+    alive_interval_line: usize,
+    /// The first `ServerAliveCountMax` the file set (R20).
+    alive_count: Option<u32>,
+    /// The line of that count.
+    alive_count_line: usize,
     /// The network fields must be shown and must not be written.
     withhold: bool,
     outcome: ImportOutcome,
@@ -444,6 +455,18 @@ impl ImportedHost {
         self.x11
     }
 
+    /// The keepalive this host's lines add up to, when the file sets one (R20).
+    ///
+    /// `None` means the file says nothing about keepalive, which is inheritance: the
+    /// global default applies, exactly as it does for a host saved before the choice
+    /// existed. An interval of `0` is an explicit disable and is kept.
+    #[must_use]
+    pub fn connection(&self) -> Option<HostConnection> {
+        HostConnection::new(self.alive_interval, self.alive_count, None)
+            .ok()
+            .filter(|connection| !connection.is_empty())
+    }
+
     /// How this host would be imported.
     #[must_use]
     pub fn outcome(&self) -> ImportOutcome {
@@ -497,6 +520,10 @@ impl ImportedHost {
         if !self.forwards.is_empty() {
             summary.push_str(" · ");
             summary.push_str(&format!("{} forward", self.forwards.len()));
+        }
+        if let Some(connection) = self.connection() {
+            summary.push_str(" · ");
+            summary.push_str(&describe_connection(connection));
         }
         match self.x11 {
             Some(X11Forwarding::Off) => summary.push_str(" · X11 off"),
@@ -838,6 +865,11 @@ impl ImportPreview {
             record.set_proxy_command(host.proxy_command());
             if let Some(mode) = host.x11() {
                 record.set_x11(mode);
+            }
+            // The keepalive the file asked for is the keepalive the record is saved
+            // with, so the preview, the saved host and the next connection agree.
+            if let Some(connection) = host.connection() {
+                record.set_connection(Some(connection));
             }
             created.insert(name.clone(), record.id());
             taken.insert(name);
@@ -1324,6 +1356,8 @@ enum Directive {
     Forwarding,
     /// ForwardX11 and ForwardX11Trusted (R11).
     X11,
+    /// ServerAliveInterval and ServerAliveCountMax (R20).
+    Keepalive,
     Include,
     Ignored,
 }
@@ -1341,6 +1375,7 @@ fn classify(keyword: &str) -> Directive {
         "proxyjump" | "proxycommand" => Directive::Proxy,
         "localforward" | "remoteforward" | "dynamicforward" => Directive::Forwarding,
         "forwardx11" | "forwardx11trusted" => Directive::X11,
+        "serveraliveinterval" | "serveralivecountmax" => Directive::Keepalive,
         "include" => Directive::Include,
         _ => Directive::Ignored,
     }
@@ -1385,6 +1420,10 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
         forward_x11: None,
         forward_x11_trusted: None,
         x11_line: 0,
+        alive_interval: None,
+        alive_interval_line: 0,
+        alive_count: None,
+        alive_count_line: 0,
         withhold: false,
         outcome: ImportOutcome::Ready,
         notes: Vec::new(),
@@ -1430,7 +1469,7 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
                     // Whether a Match block applies is not evaluated, so its X11
                     // preference is unknown: applying it could turn forwarding on
                     // behind the user's back.
-                    Directive::X11 => unknown.push(&setting.keyword),
+                    Directive::X11 | Directive::Keepalive => unknown.push(&setting.keyword),
                     Directive::HostName
                     | Directive::User
                     | Directive::Port
@@ -1497,6 +1536,9 @@ fn resolve_host(blocks: &[Block], alias: &str, alias_line: usize) -> ImportedHos
                 }
                 Directive::X11 => {
                     apply_x11(&mut host, setting, &mut review, &mut reported);
+                }
+                Directive::Keepalive => {
+                    apply_alive(&mut host, setting, &mut review, &mut reported);
                 }
                 Directive::Include => {
                     review = true;
@@ -1794,6 +1836,114 @@ fn settle_x11(host: &ImportedHost) -> Option<X11Forwarding> {
         (_, Some(true)) => Some(X11Forwarding::Trusted),
         (Some(true), _) => Some(X11Forwarding::Restricted),
         _ => Some(X11Forwarding::Off),
+    }
+}
+
+/// Applies one `ServerAliveInterval` or `ServerAliveCountMax` (R20).
+///
+/// The two are independent, exactly as OpenSSH defines them: a file that sets only the
+/// count keeps whatever interval applies, which is why the importer stores the two
+/// numbers separately instead of inventing a pair. First obtained value wins, like the
+/// other scalar directives.
+///
+/// Interval `0` is OpenSSH's spelling of "do not probe" and is kept as an explicit
+/// disable. A count of `0` is not stored: the SSH library reads a maximum of zero as
+/// "never treat this connection as dead", which is the opposite of what the user would
+/// be choosing, so the line is refused with that reason and the host is shown for review.
+fn apply_alive(
+    host: &mut ImportedHost,
+    setting: &Setting,
+    review: &mut bool,
+    reported: &mut HashSet<(NoteKind, String)>,
+) {
+    let is_interval = setting.lower == "serveraliveinterval";
+    let existing = if is_interval {
+        host.alive_interval
+    } else {
+        host.alive_count
+    };
+    if let Some(existing) = existing {
+        if setting.value.parse::<u32>().ok() != Some(existing) {
+            push_once(
+                &mut host.notes,
+                reported,
+                ImportNote::new(
+                    setting.line,
+                    &setting.keyword,
+                    NoteKind::Superseded,
+                    format!(
+                        "line {}: {} {} was ignored because an earlier line already set it to {existing}",
+                        setting.line, setting.keyword, setting.value
+                    ),
+                ),
+            );
+        }
+        return;
+    }
+
+    let Ok(value) = setting.value.parse::<u32>() else {
+        *review = true;
+        push_once(
+            &mut host.notes,
+            reported,
+            ImportNote::new(
+                setting.line,
+                &setting.keyword,
+                NoteKind::InvalidValue,
+                format!(
+                    "line {}: {} {} is not a whole number, so no keepalive value was taken from it",
+                    setting.line, setting.keyword, setting.value
+                ),
+            ),
+        );
+        return;
+    };
+
+    // The bounds are the record's own, so a value the preview accepts is a value the
+    // saved host can hold; the reason shown here is the reason a form would show.
+    let checked = if is_interval {
+        HostConnection::new(Some(value), None, None)
+    } else {
+        HostConnection::new(None, Some(value), None)
+    };
+    if let Err(error) = checked {
+        *review = true;
+        push_once(
+            &mut host.notes,
+            reported,
+            ImportNote::new(
+                setting.line,
+                &setting.keyword,
+                NoteKind::InvalidValue,
+                format!(
+                    "line {}: {} {} was not applied: {error}",
+                    setting.line, setting.keyword, setting.value
+                ),
+            ),
+        );
+        return;
+    }
+
+    if is_interval {
+        host.alive_interval = Some(value);
+        host.alive_interval_line = setting.line;
+    } else {
+        host.alive_count = Some(value);
+        host.alive_count_line = setting.line;
+    }
+}
+
+/// How a preview row describes the keepalive the file asked for (R20).
+fn describe_connection(connection: HostConnection) -> String {
+    match (
+        connection.keepalive_interval_secs(),
+        connection.keepalive_max_misses(),
+    ) {
+        (Some(0), _) => "keepalive off".to_owned(),
+        (Some(interval), Some(misses)) => format!("keepalive {interval}s x {misses}"),
+        (Some(interval), None) => format!("keepalive {interval}s"),
+        (None, Some(misses)) => format!("keepalive after {misses} unanswered"),
+        (None, None) => "keepalive inherited".to_owned(),
     }
 }
 
@@ -2665,7 +2815,7 @@ Host web1 web2 web3 db
 Host web
     HostName web.example.org
     User deploy
-    ServerAliveInterval 30
+    Compression yes
     HostKeyAlgorithms ssh-ed25519
 ",
         );
@@ -2688,6 +2838,191 @@ Host web
                 .reason()
                 .contains("not applied")
         );
+    }
+
+    #[test]
+    fn keepalive_directives_are_read_instead_of_being_ignored() {
+        let preview = parse_preview(
+            "\
+Host web
+    HostName web.example.org
+    User deploy
+    ServerAliveInterval 45
+    ServerAliveCountMax 5
+",
+        );
+        let web = host(&preview, "web");
+        assert_eq!(
+            web.outcome(),
+            ImportOutcome::Ready,
+            "both directives are applied, so nothing is left for review: {:?}",
+            web.notes()
+        );
+        let connection = web.connection().expect("the file sets a keepalive");
+        assert_eq!(connection.keepalive_interval_secs(), Some(45));
+        assert_eq!(connection.keepalive_max_misses(), Some(5));
+        assert!(
+            preview.limits().ignored().is_empty(),
+            "an applied directive is not also listed as unsupported: {:?}",
+            preview.limits().ignored()
+        );
+        assert!(
+            web.summary().contains("keepalive 45s"),
+            "the preview row states what will be applied: {}",
+            web.summary()
+        );
+
+        // The two directives are independent, exactly as in ssh: a file that sets only
+        // the count keeps the interval that applies globally.
+        let preview = parse_preview(
+            "\
+Host web
+    HostName web.example.org
+    User deploy
+    ServerAliveCountMax 2
+",
+        );
+        let web = host(&preview, "web");
+        let connection = web.connection().expect("the count is kept");
+        assert_eq!(connection.keepalive_interval_secs(), None);
+        assert_eq!(connection.keepalive_max_misses(), Some(2));
+        assert!(web.summary().contains("2 unanswered"), "{}", web.summary());
+    }
+
+    #[test]
+    fn an_interval_of_zero_is_an_explicit_off_and_not_an_inherited_default() {
+        let preview = parse_preview(
+            "\
+Host web
+    HostName web.example.org
+    User deploy
+    ServerAliveInterval 0
+",
+        );
+        let web = host(&preview, "web");
+        assert_eq!(
+            web.outcome(),
+            ImportOutcome::Ready,
+            "0 is a value OpenSSH documents: {:?}",
+            web.notes()
+        );
+        let connection = web.connection().expect("the disable is kept");
+        assert_eq!(connection.keepalive_interval_secs(), Some(0));
+        assert!(
+            web.summary().contains("keepalive off"),
+            "the preview says the file turns keepalive off: {}",
+            web.summary()
+        );
+        assert!(
+            !connection.is_empty(),
+            "an explicit off is a choice, not inheritance"
+        );
+        let policy = shellune_core::ConnectionDefaults::default().policy_for(Some(connection));
+        assert!(
+            policy.keepalive().is_none(),
+            "the exported host is dialled with keepalive off"
+        );
+    }
+
+    #[test]
+    fn an_unusable_keepalive_value_is_refused_with_its_reason() {
+        let preview = parse_preview(
+            "\
+Host count-zero
+    HostName a.example.org
+    User deploy
+    ServerAliveCountMax 0
+
+Host interval-word
+    HostName b.example.org
+    User deploy
+    ServerAliveInterval soon
+
+Host interval-huge
+    HostName c.example.org
+    User deploy
+    ServerAliveInterval 99999
+",
+        );
+        let count = host(&preview, "count-zero");
+        assert_eq!(count.outcome(), ImportOutcome::NeedsReview);
+        assert!(count.is_importable(), "one unusable line is a review");
+        assert!(count.connection().is_none(), "nothing was stored");
+        let note = count
+            .notes()
+            .iter()
+            .find(|note| note.keyword() == "ServerAliveCountMax")
+            .expect("the refused line is named");
+        assert_eq!(note.kind(), NoteKind::InvalidValue);
+        assert_eq!(note.line(), 4);
+        assert!(
+            note.reason().contains("silent connection"),
+            "the reason says what a count of 0 would mean: {}",
+            note.reason()
+        );
+
+        let word = host(&preview, "interval-word");
+        assert_eq!(word.outcome(), ImportOutcome::NeedsReview);
+        let note = word
+            .notes()
+            .iter()
+            .find(|note| note.keyword() == "ServerAliveInterval")
+            .expect("the refused line is named");
+        assert!(note.reason().contains("whole number"), "{}", note.reason());
+
+        let huge = host(&preview, "interval-huge");
+        assert_eq!(huge.outcome(), ImportOutcome::NeedsReview);
+        assert!(huge.connection().is_none());
+        let note = huge
+            .notes()
+            .iter()
+            .find(|note| note.keyword() == "ServerAliveInterval")
+            .expect("the refused line is named");
+        assert!(
+            note.reason().contains("above the 3600s"),
+            "the reason states the boundary: {}",
+            note.reason()
+        );
+    }
+
+    #[test]
+    fn tcp_keepalive_is_still_named_as_not_applied() {
+        // TCPKeepAlive is a transport-layer probe that can be forged by a middlebox,
+        // so it is not a substitute for the encrypted-channel probe. The file's line is
+        // reported, not silently treated as keepalive and not silently dropped.
+        let preview = parse_preview(
+            "\
+Host web
+    HostName web.example.org
+    User deploy
+    TCPKeepAlive no
+    ServerAliveInterval 20
+",
+        );
+        let web = host(&preview, "web");
+        assert_eq!(web.outcome(), ImportOutcome::NeedsReview);
+        assert_eq!(
+            web.connection().and_then(|c| c.keepalive_interval_secs()),
+            Some(20),
+            "the supported directive is still applied"
+        );
+        let note = web
+            .notes()
+            .iter()
+            .find(|note| note.keyword() == "TCPKeepAlive")
+            .expect("TCPKeepAlive is reported");
+        assert_eq!(note.kind(), NoteKind::Unsupported);
+        assert!(note.reason().contains("not applied"), "{}", note.reason());
+        assert!(
+            preview
+                .limits()
+                .ignored()
+                .iter()
+                .any(|item| item.keyword() == "TCPKeepAlive"),
+            "the file-level list names it too: {:?}",
+            preview.limits().ignored()
+        );
+        assert!(preview.is_partial());
     }
 
     #[test]

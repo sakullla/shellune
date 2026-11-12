@@ -13,6 +13,7 @@
 //!   [`SecretString`] and errors use fixed, structured variants.
 
 mod auth;
+mod connection;
 mod error;
 mod files;
 pub mod fingerprint;
@@ -27,6 +28,11 @@ mod task;
 mod workspace;
 
 pub use auth::{AuthMethod, AuthMethodKind};
+pub use connection::{
+    ConnectionDefaults, ConnectionPolicy, ConnectionValueError, DEFAULT_CONNECT_TIMEOUT_SECS,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_KEEPALIVE_MAX_MISSES, HostConnection, Keepalive,
+    MAX_CONNECT_TIMEOUT_SECS, MAX_KEEPALIVE_INTERVAL_SECS, MAX_KEEPALIVE_MAX_MISSES,
+};
 pub use error::{AgentKind, SecretString, SecurityError};
 pub use files::{
     BrowseFailure, BrowseRequest, BrowseResponse, BrowseState, DirEntry, DirectoryListing,

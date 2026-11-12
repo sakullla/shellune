@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use russh::client::{self, Handler};
 use russh::{Channel, ChannelMsg, Disconnect};
-use shellune_core::{AuthMethod, HostConfig, HostId, X11Forwarding, connection_jump_fault};
+use shellune_core::{
+    AuthMethod, ConnectionPolicy, HostConfig, HostId, X11Forwarding, connection_jump_fault,
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{oneshot, watch};
 
@@ -31,8 +33,8 @@ use crate::error::{ChainFailure, ConnectError, HopLocation};
 use crate::forwarding::{self, ForwardLink};
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 use crate::session::{
-    self, Command, DialFailure, HandshakeProgress, HandshakeStage, KEEPALIVE_INTERVAL, Material,
-    PtySize, TERM_VALUE, authenticate, finish_dial, open_exec_channel, open_sftp_channel,
+    Command, DialFailure, HandshakeProgress, HandshakeStage, Material, PtySize, TERM_VALUE,
+    authenticate, client_config, finish_dial, open_exec_channel, open_sftp_channel,
 };
 use crate::sftp::{self, FileLink};
 use crate::transfer::{self, TransferLink};
@@ -122,7 +124,13 @@ pub struct ChainRequest {
     target: HostId,
     auth: Vec<HopAuth>,
     size: PtySize,
-    connect_timeout: Duration,
+    /// Keepalive and the per-hop deadline, resolved once for the whole chain (R20).
+    ///
+    /// One policy covers every hop: a chain to a host is one connection attempt, and a
+    /// hop that probed differently from the target would make the reported behaviour
+    /// impossible to explain. The target host's choice is what the caller resolves
+    /// against the global defaults.
+    policy: ConnectionPolicy,
     open_shell: bool,
     /// How this attempt forwards X11, chosen for this connection (R11).
     x11: X11Forwarding,
@@ -137,7 +145,7 @@ impl ChainRequest {
             target,
             auth,
             size,
-            connect_timeout: session::CONNECT_TIMEOUT,
+            policy: ConnectionPolicy::default(),
             open_shell: true,
             x11: X11Forwarding::Off,
         }
@@ -166,9 +174,22 @@ impl ChainRequest {
     }
 
     /// The same request with another deadline for each hop's machine work.
+    ///
+    /// Only the deadline changes; the keepalive stays what the policy already said. The
+    /// window uses [`Self::with_connection_policy`] when a host or the preferences
+    /// chose a value.
     #[must_use]
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+        self.policy = self.policy.with_connect_timeout(timeout);
+        self
+    }
+
+    /// The same chain with a resolved connection policy (R20).
+    ///
+    /// The keepalive and the deadline every hop uses come from this one value.
+    #[must_use]
+    pub fn with_connection_policy(mut self, policy: ConnectionPolicy) -> Self {
+        self.policy = policy;
         self
     }
 }
@@ -228,7 +249,7 @@ impl ChainSession {
             cancel: cancel.clone(),
             open_commands,
             size,
-            timeout: request.connect_timeout,
+            policy: request.policy,
             open_shell: request.open_shell,
             x11: x11_gate,
         };
@@ -661,7 +682,8 @@ struct Attempt {
     cancel: Cancel,
     open_commands: UnboundedSender<Command>,
     size: PtySize,
-    timeout: Duration,
+    /// Keepalive and deadline every hop of this attempt uses (R20).
+    policy: ConnectionPolicy,
     open_shell: bool,
     /// The target's X11 forwarding, shared with its handler.
     x11: Arc<X11Gate>,
@@ -891,7 +913,7 @@ async fn open_hop(
     let trust = &attempt.trust;
     let proxy_slot = &attempt.proxy;
     let cancel = &attempt.cancel;
-    let timeout = attempt.timeout;
+    let timeout = attempt.policy.connect_timeout();
     let location = hop.location.clone();
     if events
         .send(ChainEvent::HopStarted(location.clone()))
@@ -948,11 +970,9 @@ async fn open_hop(
         gate,
         x11,
     };
-    let config = Arc::new(client::Config {
-        nodelay: true,
-        keepalive_interval: Some(KEEPALIVE_INTERVAL),
-        ..Default::default()
-    });
+    // The same mapping a direct session uses, so a hop and a direct connection cannot
+    // probe differently (R20).
+    let config = Arc::new(client_config(&attempt.policy));
     let stream = opened.stream;
     let dial = finish_dial(
         client::connect_stream(config, stream, handler),
@@ -1621,6 +1641,42 @@ async fn release_hop(mut hop: LiveHop) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_hop_is_dialled_with_the_policy_the_chain_was_given() {
+        let bastion = host("bastion", "10.0.0.1", 22);
+        let mut web = host("web", "10.0.0.2", 22);
+        web.set_jumps([bastion.id()]);
+        let own = shellune_core::HostConnection::new(Some(50), Some(4), Some(11)).expect("valid");
+        let policy = shellune_core::ConnectionDefaults::default().policy_for(Some(own));
+        let request = ChainRequest::new(
+            vec![bastion.clone(), web.clone()],
+            web.id(),
+            vec![password(bastion.id()), password(web.id())],
+            PtySize::default(),
+        )
+        .with_connection_policy(policy);
+        assert_eq!(request.policy, policy);
+
+        // The configuration a hop is opened with comes from that policy, through the
+        // same function a direct session uses: one mapping, so the two cannot drift.
+        let config = client_config(&request.policy);
+        assert_eq!(config.keepalive_interval, Some(Duration::from_secs(50)));
+        assert_eq!(config.keepalive_max, 4);
+        assert_eq!(config.inactivity_timeout, None);
+        assert_eq!(request.policy.connect_timeout(), Duration::from_secs(11));
+
+        let deadline_only = request.with_connect_timeout(Duration::from_secs(2));
+        assert_eq!(
+            deadline_only.policy.connect_timeout(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            client_config(&deadline_only.policy).keepalive_interval,
+            Some(Duration::from_secs(50)),
+            "a shorter deadline does not silently change the keepalive"
+        );
+    }
 
     fn host(name: &str, address: &str, port: u16) -> HostConfig {
         HostConfig::new(name, address, port, "deploy").expect("valid host")

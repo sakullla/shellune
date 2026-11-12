@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use shellune_core::ConnectionDefaults;
 
 use crate::error::PersistError;
 use crate::store::save_versioned;
@@ -146,6 +147,15 @@ pub struct Preferences {
     /// Absent means on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_notice: Option<bool>,
+    /// The keepalive and connect timeout every host without its own values inherits
+    /// (R20).
+    ///
+    /// Absent means the documented defaults: probe every 30 seconds, give up after 3
+    /// unanswered probes, and 20 seconds for the machine part of an attempt. A stored
+    /// value is validated as it is read, so a file carrying an unusable number is
+    /// reported as unreadable instead of being applied or quietly corrected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ConnectionDefaults>,
 }
 
 /// A preferences file at a known location.
@@ -253,6 +263,7 @@ mod tests {
             }),
             bell_notice: Some(false),
             command_notice: Some(true),
+            connection: Some(ConnectionDefaults::new(45, 4, 12).expect("valid defaults")),
         };
         store.save(&preferences).expect("saves");
         assert_eq!(store.load(), preferences);
@@ -329,5 +340,105 @@ mod tests {
         );
         keymap.set_for_platform("macos", Vec::new());
         assert!(keymap.is_empty());
+    }
+
+    #[test]
+    fn connection_defaults_are_absent_until_the_user_changes_one() {
+        // Nothing saved: the documented 30 seconds / 3 probes / 20 seconds apply, and
+        // the file says nothing rather than restating them.
+        let store = PreferencesStore::at(scratch("connection-missing"));
+        let preferences = store.load();
+        assert_eq!(preferences.connection, None);
+        let defaults = preferences.connection.unwrap_or_default();
+        assert_eq!(defaults.keepalive_interval_secs(), 30);
+        assert_eq!(defaults.keepalive_max_misses(), 3);
+        assert_eq!(defaults.connect_timeout_secs(), 20);
+        let policy = defaults.policy();
+        assert_eq!(
+            policy.keepalive_interval(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(policy.keepalive_max(), 3);
+        assert_eq!(policy.connect_timeout(), std::time::Duration::from_secs(20));
+        assert_eq!(
+            policy.inactivity_timeout(),
+            None,
+            "a healthy idle session is not closed for silence"
+        );
+    }
+
+    #[test]
+    fn connection_defaults_round_trip_and_a_host_without_one_inherits_them() {
+        let dir = scratch("connection-round-trip");
+        let store = PreferencesStore::at(&dir);
+        let defaults = ConnectionDefaults::new(90, 6, 45).expect("valid defaults");
+        store
+            .save(&Preferences {
+                connection: Some(defaults),
+                ..Preferences::default()
+            })
+            .expect("saves");
+        let loaded = store.load();
+        assert_eq!(loaded.connection, Some(defaults));
+        let json = std::fs::read_to_string(store.path()).expect("the file is readable");
+        assert!(json.contains("\"keepalive_interval_secs\": 90"), "{json}");
+
+        // A host record that states nothing is dialled with these values.
+        let host =
+            shellune_core::HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("valid host");
+        let policy = host.connection_policy(defaults);
+        assert_eq!(
+            policy.keepalive_interval(),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(policy.keepalive_max(), 6);
+        assert_eq!(policy.connect_timeout(), std::time::Duration::from_secs(45));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unusable_connection_default_is_reported_rather_than_applied() {
+        let dir = scratch("connection-damaged");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let store = PreferencesStore::at(&dir);
+        for text in [
+            // A probe count of 0 would mean no silent connection is ever noticed.
+            br#"{"connection":{"keepalive_max_misses":0}}"#.as_slice(),
+            // A deadline of 0 would leave every attempt without one.
+            br#"{"connection":{"connect_timeout_secs":0}}"#.as_slice(),
+            // An interval this build cannot honour is not clamped into something else.
+            br#"{"connection":{"keepalive_interval_secs":99999}}"#.as_slice(),
+            // A value that is not a number at all.
+            br#"{"connection":{"keepalive_interval_secs":"soon"}}"#.as_slice(),
+        ] {
+            std::fs::write(store.path(), text).expect("write");
+            let (preferences, problem) = store.load_reported();
+            assert_eq!(
+                preferences,
+                Preferences::default(),
+                "the file is not half applied: {}",
+                String::from_utf8_lossy(text)
+            );
+            assert_eq!(
+                problem,
+                Some(PreferencesProblem::Unreadable),
+                "the user is told their connection defaults were not applied: {}",
+                String::from_utf8_lossy(text)
+            );
+        }
+
+        // A missing field inside the record keeps the documented default for that field.
+        std::fs::write(
+            store.path(),
+            br#"{"connection":{"keepalive_interval_secs":0}}"#,
+        )
+        .expect("write");
+        let (preferences, problem) = store.load_reported();
+        assert_eq!(problem, None);
+        let defaults = preferences.connection.expect("the record was read");
+        assert_eq!(defaults.keepalive_interval_secs(), 0);
+        assert_eq!(defaults.keepalive_max_misses(), 3);
+        assert_eq!(defaults.connect_timeout_secs(), 20);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

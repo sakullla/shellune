@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use shellune_storage::{HostStore, ImportError, ImportOutcome, ImportPreview};
+use shellune_storage::{HostStore, ImportError, ImportOutcome, ImportPreview, NoteKind};
 
 /// A directory that removes itself, so a failing assertion leaves no state behind.
 struct TempDir {
@@ -602,5 +602,170 @@ Host plain
         std::fs::read(&config).expect("the configuration is readable"),
         before,
         "the import never writes to the client's own configuration"
+    );
+}
+
+#[test]
+fn keepalive_directives_reach_the_saved_host_and_tcp_keepalive_stays_unapplied() {
+    let dir = TempDir::new("keepalive");
+    let config = dir.write_config(
+        "\
+Host probed
+    HostName probed.example.org
+    User deploy
+    ServerAliveInterval 45
+    ServerAliveCountMax 5
+    TCPKeepAlive no
+
+Host quiet
+    HostName quiet.example.org
+    User deploy
+    ServerAliveInterval 0
+
+Host broken
+    HostName broken.example.org
+    User deploy
+    ServerAliveInterval 0seconds
+",
+    );
+    let before = std::fs::read(&config).expect("the configuration is readable");
+    let preview = ImportPreview::from_file(&config).expect("the configuration parses");
+
+    let host = |alias: &str| {
+        preview
+            .hosts()
+            .iter()
+            .find(|host| host.alias() == alias)
+            .unwrap_or_else(|| panic!("{alias} is previewed"))
+    };
+
+    // The two ServerAlive directives are applied, and the preview row says so.
+    let probed = host("probed");
+    let connection = probed
+        .connection()
+        .expect("the file's keepalive is in the preview");
+    assert_eq!(connection.keepalive_interval_secs(), Some(45));
+    assert_eq!(connection.keepalive_max_misses(), Some(5));
+    assert!(
+        probed.summary().contains("45"),
+        "the preview row states the interval it will apply: {}",
+        probed.summary()
+    );
+
+    // TCPKeepAlive is a different, forgeable mechanism and is not silently applied as
+    // keepalive: the line is named, and the file is partial because of it.
+    assert_eq!(
+        probed.outcome(),
+        ImportOutcome::NeedsReview,
+        "a directive that is not applied is shown, not hidden"
+    );
+    let tcp = probed
+        .notes()
+        .iter()
+        .find(|note| note.keyword() == "TCPKeepAlive")
+        .expect("the unapplied line is named");
+    assert_eq!(tcp.kind(), NoteKind::Unsupported);
+    assert!(tcp.reason().contains("not applied"), "{}", tcp.reason());
+    assert_eq!(
+        tcp.line(),
+        6,
+        "the note points at the line the user can edit"
+    );
+    assert!(
+        preview
+            .limits()
+            .ignored()
+            .iter()
+            .any(|note| note.keyword() == "TCPKeepAlive"),
+        "the file-level list names it too: {:?}",
+        preview.limits().ignored()
+    );
+    assert!(
+        !preview
+            .limits()
+            .ignored()
+            .iter()
+            .any(|note| note.keyword() == "ServerAliveInterval"),
+        "an applied directive is no longer reported as unsupported: {:?}",
+        preview.limits().ignored()
+    );
+
+    // Interval 0 is OpenSSH's explicit disable and is kept as one.
+    let quiet = host("quiet");
+    let connection = quiet.connection().expect("the disable is kept");
+    assert_eq!(connection.keepalive_interval_secs(), Some(0));
+    assert!(
+        quiet.summary().contains("keepalive off"),
+        "{}",
+        quiet.summary()
+    );
+
+    // A value that is not a number is refused with the line, and nothing is applied.
+    let broken = host("broken");
+    assert_eq!(broken.outcome(), ImportOutcome::NeedsReview);
+    assert!(broken.connection().is_none(), "nothing was stored");
+    let note = broken
+        .notes()
+        .iter()
+        .find(|note| note.keyword() == "ServerAliveInterval")
+        .expect("the refused line is named");
+    assert_eq!(note.kind(), NoteKind::InvalidValue);
+    assert!(note.reason().contains("whole number"), "{}", note.reason());
+
+    // What the preview showed is what the store keeps, and it survives a restart.
+    let store = dir.store();
+    let mut book = store.load().expect("a first run is not a failure");
+    preview
+        .plan(&book)
+        .apply(&mut book)
+        .expect("the hosts are added");
+    store.save(&book).expect("the book saves");
+
+    let restarted = HostStore::at(dir.path().join("data"))
+        .load()
+        .expect("the file loads");
+    let saved = |name: &str| {
+        restarted
+            .hosts()
+            .iter()
+            .find(|host| host.name() == name)
+            .unwrap_or_else(|| panic!("{name} was saved"))
+            .clone()
+    };
+    let probed = saved("probed");
+    let connection = probed.connection().expect("the keepalive was saved");
+    assert_eq!(connection.keepalive_interval_secs(), Some(45));
+    assert_eq!(connection.keepalive_max_misses(), Some(5));
+
+    // The saved choice is what a connection is dialled with, resolved against the
+    // documented defaults, and the two independent directives stay independent.
+    let defaults = shellune_core::ConnectionDefaults::default();
+    let policy = probed.connection_policy(defaults);
+    assert_eq!(
+        policy.keepalive_interval(),
+        Some(std::time::Duration::from_secs(45))
+    );
+    assert_eq!(policy.keepalive_max(), 5);
+    assert_eq!(
+        policy.connect_timeout(),
+        std::time::Duration::from_secs(20),
+        "the file said nothing about the deadline, so the default applies"
+    );
+    assert_eq!(
+        policy.inactivity_timeout(),
+        None,
+        "an idle but answered session is not closed for silence"
+    );
+
+    let quiet = saved("quiet");
+    assert!(
+        quiet.connection_policy(defaults).keepalive().is_none(),
+        "the file's explicit 0 is an off, not an inherited default"
+    );
+
+    assert_eq!(
+        std::fs::read(&config).expect("the configuration is still readable"),
+        before,
+        "reading and saving never touches the client's own file"
     );
 }

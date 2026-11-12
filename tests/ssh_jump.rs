@@ -174,6 +174,18 @@ fn chain(
     )
 }
 
+/// The same chain, dialled with a resolved connection policy (R20).
+fn chain_with_policy(
+    hosts: Vec<HostConfig>,
+    target: HostId,
+    auth: Vec<HopAuth>,
+    policy: shellune_core::ConnectionPolicy,
+) -> ChainSession {
+    ChainSession::connect(
+        ChainRequest::new(hosts, target, auth, PtySize::new(80, 24)).with_connection_policy(policy),
+    )
+}
+
 fn wait_match(
     session: &mut ChainSession,
     mut matches: impl FnMut(&ChainEvent) -> bool,
@@ -1027,4 +1039,192 @@ fn closing_during_a_trust_question_rejects_a_late_answer() {
     let trust = HostTrust::new();
     // The caller keeps the record only when the answer was delivered. It was not.
     assert!(trust.entry("127.0.0.1", server.port()).is_none());
+}
+
+#[test]
+fn a_policy_deadline_ends_a_handshake_the_peer_never_answers() {
+    // A socket that is accepted and then left silent: the machine part of the attempt
+    // can never finish, so the deadline the policy carries is what ends it. Nothing here
+    // signs in, so no server is needed.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a port can be reserved");
+    let port = listener.local_addr().expect("the port is known").port();
+    let web = host("web", port, "deploy");
+    let policy = shellune_core::ConnectionDefaults::default().policy_for(Some(
+        shellune_core::HostConnection::new(None, None, Some(1)).expect("a valid deadline"),
+    ));
+    assert_eq!(policy.connect_timeout(), Duration::from_secs(1));
+
+    let started = Instant::now();
+    let mut session = chain_with_policy(
+        vec![web.clone()],
+        web.id(),
+        vec![HopAuth::new(
+            web.id(),
+            AuthMethod::password("hunter2"),
+            KnownHostKey::Unknown,
+        )],
+        policy,
+    );
+    let failure = wait_failed(&mut session);
+    let elapsed = started.elapsed();
+    let ChainFailure::Hop { hop, error } = &failure else {
+        panic!("expected a hop failure, got {failure}");
+    };
+    assert_eq!(hop.host_id, web.id());
+    assert!(
+        matches!(error.as_ref(), ConnectError::TimedOut { .. }),
+        "the deadline, not the transport, ended the attempt: {error}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "the one second the policy chose was the deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the default twenty seconds was not used: {elapsed:?}"
+    );
+    assert!(!failure.to_string().contains("hunter2"), "{failure}");
+    drop(listener);
+}
+
+#[test]
+fn a_direct_session_is_dialled_with_the_policy_it_was_given() {
+    if skip_without_server("direct connection policy") {
+        return;
+    }
+    let _gate = ssh_gate();
+    let server = Harness::start("jt-policy", Harness::free_port()).expect("server");
+    server
+        .as_user(&format!(
+            "printf '%s\\n' POLICY-MARKER > '{}/who.txt'",
+            server.home()
+        ))
+        .expect("marker");
+
+    // Keepalive off for this host, a short deadline: the session must still authenticate
+    // and run a shell, because neither value changes what a connection is allowed to do.
+    let policy = shellune_core::ConnectionDefaults::default()
+        .policy_for(Some(shellune_core::HostConnection::keepalive_off()));
+    let request = ConnectRequest::new(
+        "127.0.0.1",
+        server.port(),
+        server.user(),
+        AuthMethod::password(server.password()),
+        PtySize::new(80, 24),
+        trusted(&server.host_key_fingerprint()),
+    )
+    .with_connection_policy(policy);
+    let mut session = RemoteSession::connect(request);
+    wait_direct(&mut session);
+    direct_echo(&mut session, "POLICY-DIRECT");
+    session
+        .write(b"cat \"$HOME/who.txt\"\n")
+        .expect("the shell accepts input");
+    let deadline = Instant::now() + PATIENCE;
+    let mut output = Vec::new();
+    loop {
+        for event in session.drain() {
+            match event {
+                RemoteEvent::Data(bytes) => output.extend_from_slice(&bytes),
+                RemoteEvent::Failed(error) => panic!("the session failed: {error}"),
+                _ => {}
+            }
+        }
+        if String::from_utf8_lossy(&output).contains("POLICY-MARKER") {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "the shell never printed the marker; received {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn both_hops_of_a_chain_are_dialled_with_the_same_policy() {
+    if skip_without_server("chain connection policy") {
+        return;
+    }
+    let _gate = ssh_gate();
+    let jump = Harness::start("jt-policy-j", Harness::free_port()).expect("jump server");
+    let target = Harness::start("jt-policy-t", Harness::free_port()).expect("target server");
+    target
+        .as_user(&format!(
+            "printf '%s\\n' POLICY-TARGET > '{}/who.txt'",
+            target.home()
+        ))
+        .expect("marker");
+
+    let jump_host = host("jump", jump.port(), jump.user());
+    let mut target_host = host("target", target.port(), target.user());
+    target_host.set_jumps([jump_host.id()]);
+    // A host that chose its own keepalive: the chain is one attempt to that host, so the
+    // same value is what each hop is dialled with.
+    let policy = shellune_core::ConnectionDefaults::default().policy_for(Some(
+        shellune_core::HostConnection::new(Some(1), Some(3), Some(20)).expect("valid"),
+    ));
+    assert_eq!(policy.keepalive_interval(), Some(Duration::from_secs(1)));
+
+    let mut session = chain_with_policy(
+        vec![jump_host.clone(), target_host.clone()],
+        target_host.id(),
+        vec![
+            HopAuth::new(
+                jump_host.id(),
+                AuthMethod::password(jump.password()),
+                trusted(&jump.host_key_fingerprint()),
+            ),
+            HopAuth::new(
+                target_host.id(),
+                AuthMethod::password(target.password()),
+                trusted(&target.host_key_fingerprint()),
+            ),
+        ],
+        policy,
+    );
+    let connected = wait_connected(&mut session);
+    assert_eq!(connected.host_id, target_host.id());
+    session
+        .write(b"cat \"$HOME/who.txt\"\n")
+        .expect("the target shell accepts input");
+    let output = wait_output(&mut session, "POLICY-TARGET");
+    assert!(output.contains("POLICY-TARGET"));
+}
+
+#[test]
+fn a_policy_deadline_does_not_expire_while_the_user_compares_a_fingerprint() {
+    if skip_without_server("trust wait under a short deadline") {
+        return;
+    }
+    let _gate = ssh_gate();
+    let server = Harness::start("jt-wait", Harness::free_port()).expect("server");
+    let web = host("web", server.port(), server.user());
+    // Deliberately shorter than the time this test takes to answer: once the identity
+    // question is on screen the clock stops, so a slow comparison is never a timeout.
+    let policy = shellune_core::ConnectionDefaults::new(30, 3, 2)
+        .expect("valid")
+        .policy();
+    let mut session = chain_with_policy(
+        vec![web.clone()],
+        web.id(),
+        vec![HopAuth::new(
+            web.id(),
+            AuthMethod::password(server.password()),
+            KnownHostKey::Unknown,
+        )],
+        policy,
+    );
+    let (hop, prompt) = wait_prompt(&mut session);
+    assert_eq!(hop.host_id, web.id());
+    assert_eq!(prompt.fingerprint(), server.host_key_fingerprint());
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        session.answer_host_key(web.id(), true),
+        "the identity question is still waiting after the machine deadline passed"
+    );
+    let connected = wait_connected(&mut session);
+    assert_eq!(connected.host_id, web.id());
 }

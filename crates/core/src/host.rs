@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use crate::auth::AuthMethodKind;
 use serde::{Deserialize, Serialize};
 
+use crate::connection::{ConnectionDefaults, ConnectionPolicy, HostConnection};
 use crate::group::GroupPath;
 use crate::ids::HostId;
 use crate::task::TransferProtocol;
@@ -213,6 +214,15 @@ pub struct HostConfig {
     /// belongs to the attempt and does not change this record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     x11: Option<X11Forwarding>,
+    /// What this host chose for its own connection behaviour (R20).
+    ///
+    /// Absent means every field inherits the global default, which is also what a
+    /// record written before the choice existed means, so an older file stays
+    /// byte-identical. The record is kept as one value because the three fields are
+    /// read from and written to the same form: a host answers "inherit", "keepalive
+    /// off" or "these numbers" as one decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection: Option<HostConnection>,
 }
 
 /// The stored shape of a host.
@@ -255,6 +265,9 @@ struct HostConfigWire {
     /// Absent in files written before an X11 mode was stored.
     #[serde(default)]
     x11: Option<X11Forwarding>,
+    /// Absent in files written before connection overrides were stored.
+    #[serde(default)]
+    connection: Option<HostConnection>,
 }
 
 impl TryFrom<HostConfigWire> for HostConfig {
@@ -299,6 +312,9 @@ impl TryFrom<HostConfigWire> for HostConfig {
             // The off default is stored as no choice at all, so a record that never
             // asked for X11 keeps the shape an older build wrote.
             x11: wire.x11.filter(|mode| *mode != X11Forwarding::Off),
+            // A record that states nothing is inheritance, and inheritance is stored
+            // as no field at all, so an untouched host keeps the shape it had.
+            connection: wire.connection.filter(|connection| !connection.is_empty()),
         })
     }
 }
@@ -359,6 +375,7 @@ impl HostConfig {
             proxy_command: None,
             transfer_protocol: None,
             x11: None,
+            connection: None,
         })
     }
 
@@ -511,6 +528,26 @@ impl HostConfig {
         self.x11.unwrap_or_default()
     }
 
+    /// What this host chose for its own keepalive and connect timeout (R20).
+    ///
+    /// `None` means the host states nothing and every value inherits the global
+    /// default. A value states at least one field: an interval of `0` is keepalive
+    /// switched off for this host, and an absent field inside the record is that one
+    /// field inheriting.
+    #[must_use]
+    pub fn connection(&self) -> Option<HostConnection> {
+        self.connection
+    }
+
+    /// The policy this host is dialled with, given the global defaults (R20).
+    ///
+    /// This is the only place the two are combined, so a direct session and a jump
+    /// chain cannot resolve the same host differently.
+    #[must_use]
+    pub fn connection_policy(&self, defaults: ConnectionDefaults) -> ConnectionPolicy {
+        defaults.policy_for(self.connection)
+    }
+
     /// `user@address:port`, the form used in confirmation prompts.
     #[must_use]
     pub fn target(&self) -> String {
@@ -651,6 +688,16 @@ impl HostConfig {
     /// connection it was dialled with.
     pub fn set_x11(&mut self, mode: X11Forwarding) {
         self.x11 = (mode != X11Forwarding::Off).then_some(mode);
+    }
+
+    /// Records or clears this host's own connection values (R20).
+    ///
+    /// A record that states nothing clears the field, so a host whose last override was
+    /// removed returns to inheriting and its file shrinks back to what a build without
+    /// the choice wrote. Choosing a value that would mean "inherit" is not stored,
+    /// because a second spelling of the same thing would make an edit look changed.
+    pub fn set_connection(&mut self, connection: Option<HostConnection>) {
+        self.connection = connection.filter(|connection| !connection.is_empty());
     }
 }
 
@@ -1262,6 +1309,91 @@ mod sign_in_tests {
         host.set_group_path(None);
         assert_eq!(host.group(), None, "the old label is cleared");
         assert_eq!(host.group_path(), None);
+    }
+
+    #[test]
+    fn a_host_that_states_no_connection_values_inherits_and_says_so_on_disk() {
+        let host = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("valid");
+        assert_eq!(host.connection(), None);
+        let json = serde_json::to_string(&host).expect("serializes");
+        assert!(
+            !json.contains("connection"),
+            "an older record grows no field: {json}"
+        );
+        let defaults = ConnectionDefaults::default();
+        assert_eq!(
+            host.connection_policy(defaults),
+            defaults.policy(),
+            "a host that says nothing is dialled with the global defaults"
+        );
+    }
+
+    #[test]
+    fn a_host_override_and_an_explicit_off_survive_a_save() {
+        let defaults = ConnectionDefaults::default();
+        let mut host = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("valid");
+        let own = HostConnection::new(Some(120), Some(5), Some(9)).expect("valid");
+        host.set_connection(Some(own));
+        let json = serde_json::to_string(&host).expect("serializes");
+        assert!(json.contains("\"keepalive_interval_secs\":120"), "{json}");
+        let back: HostConfig = serde_json::from_str(&json).expect("reads");
+        assert_eq!(back.connection(), Some(own));
+        let policy = back.connection_policy(defaults);
+        assert_eq!(
+            policy.keepalive_interval(),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(policy.keepalive_max(), 5);
+        assert_eq!(policy.connect_timeout(), std::time::Duration::from_secs(9));
+
+        // An explicit off is a choice, not the absence of one, and it is not the
+        // global default; changing the default must not switch this host back on.
+        let mut off = host.clone();
+        off.set_connection(Some(HostConnection::keepalive_off()));
+        assert!(off.connection_policy(defaults).keepalive().is_none());
+        let other = ConnectionDefaults::new(90, 6, 45).expect("valid");
+        assert!(
+            off.connection_policy(other).keepalive().is_none(),
+            "an explicit off outlives a change to the global default"
+        );
+        assert_eq!(
+            off.connection_policy(other).connect_timeout(),
+            std::time::Duration::from_secs(45),
+            "the fields the host did not state still inherit"
+        );
+
+        // Clearing the last value is inheritance again, and the record shrinks.
+        let mut cleared = host.clone();
+        cleared.set_connection(Some(HostConnection::default()));
+        assert_eq!(cleared.connection(), None);
+        assert!(
+            !serde_json::to_string(&cleared)
+                .expect("serializes")
+                .contains("connection")
+        );
+        cleared.set_connection(None);
+        assert_eq!(cleared.connection(), None);
+    }
+
+    #[test]
+    fn a_stored_connection_value_that_cannot_be_used_fails_the_read() {
+        let host = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("valid");
+        let json = serde_json::to_string(&host).expect("serializes");
+        let broken = json.replacen('{', "{\"connection\":{\"keepalive_max_misses\":0},", 1);
+        let error = serde_json::from_str::<HostConfig>(&broken)
+            .expect_err("a silent-connection count of 0 is not applied");
+        assert!(
+            error.to_string().contains('0'),
+            "the failure names the value: {error}"
+        );
+        assert!(
+            serde_json::from_str::<HostConfig>(&broken.replace(
+                "\"keepalive_max_misses\":0",
+                "\"keepalive_interval_secs\":0"
+            ))
+            .is_ok(),
+            "an interval of 0 is a valid explicit off"
+        );
     }
 }
 

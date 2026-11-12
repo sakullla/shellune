@@ -27,7 +27,10 @@ use std::time::Duration;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg, Disconnect};
-use shellune_core::{AgentKind, AuthMethod, X11Forwarding};
+use shellune_core::{
+    AgentKind, AuthMethod, ConnectionPolicy, DEFAULT_CONNECT_TIMEOUT_SECS,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, X11Forwarding,
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
@@ -46,17 +49,48 @@ use crate::x11::{self, X11Gate, X11Notice, X11Status};
 /// the same over SSH.
 pub const TERM_VALUE: &str = "xterm-256color";
 
-/// How long the machine part of an attempt may take.
+/// The deadline the default connection policy uses for the machine part of an attempt.
 ///
 /// It is a deadline for work no one has to think about: dialling, the key exchange
 /// and the moment the server identity is known. Once the user is asked about an
 /// unknown identity the clock is stopped, because the decision is theirs and no
 /// deadline of ours may overrule it; a session that is still waiting for that answer
 /// is reported as undecided, never as a timeout.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// A host or the global preferences may choose another value (R20); this constant is
+/// the value that applies when neither did, and it is the same number
+/// [`shellune_core::ConnectionDefaults::default`] carries.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS as u64);
 
-/// Keepalive interval, so a silently dropped network is noticed.
-pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// The keepalive interval the default connection policy probes at (R20).
+///
+/// No connection is dialled with this constant any more: a session uses the policy it
+/// was handed, which is this value for a host that says nothing. It stays public
+/// because it is the documented default a reader compares a saved choice against.
+pub const KEEPALIVE_INTERVAL: Duration =
+    Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS as u64);
+
+/// The SSH library configuration one resolved policy produces (R20).
+///
+/// A direct session and every hop of a jump chain build their configuration here, so
+/// the two paths cannot drift: an interval the user chose is the interval each hop
+/// probes at, and a switched-off keepalive is `None` rather than a library default
+/// nobody can see.
+///
+/// The inactivity timeout is written from the policy on purpose, and the policy always
+/// answers `None`: that field closes a session which is merely quiet, while a healthy
+/// idle shell is exactly that. Keepalive is the probe that tells a quiet link from a
+/// dead one.
+#[must_use]
+pub fn client_config(policy: &ConnectionPolicy) -> client::Config {
+    client::Config {
+        nodelay: true,
+        keepalive_interval: policy.keepalive_interval(),
+        keepalive_max: policy.keepalive_max(),
+        inactivity_timeout: policy.inactivity_timeout(),
+        ..Default::default()
+    }
+}
 
 /// Size of a remote pseudo terminal, in characters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,11 +182,12 @@ pub struct ConnectRequest {
     pub size: PtySize,
     /// What the trust records say about this host before the attempt.
     pub known: KnownHostKey,
-    /// How long the machine part of the handshake may take.
+    /// What this attempt is dialled with: keepalive and the connect deadline (R20).
     ///
-    /// [CONNECT_TIMEOUT] unless a test needs the same behaviour without waiting
-    /// twenty real seconds for it.
-    pub connect_timeout: Duration,
+    /// [ConnectionPolicy::default] unless the caller resolved a host's choice against
+    /// the global defaults. The policy is what reaches the SSH library, so a choice the
+    /// window shows is the choice this session actually uses.
+    pub policy: ConnectionPolicy,
     /// Whether this connection opens a shell. A pure forward leaves it false.
     open_shell: bool,
     /// How this attempt forwards X11 to the local display (R11).
@@ -180,7 +215,7 @@ impl ConnectRequest {
             auth,
             size,
             known,
-            connect_timeout: CONNECT_TIMEOUT,
+            policy: ConnectionPolicy::default(),
             open_shell: true,
             x11: X11Forwarding::Off,
         }
@@ -207,9 +242,23 @@ impl ConnectRequest {
     }
 
     /// The same request with another deadline for the machine part.
+    ///
+    /// Only the deadline changes; the keepalive stays what the policy already said.
+    /// A test uses this so it does not wait twenty real seconds, and the window uses
+    /// the policy builder below when a host or the preferences chose a value.
     #[must_use]
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+        self.policy = self.policy.with_connect_timeout(timeout);
+        self
+    }
+
+    /// The same request with a resolved connection policy (R20).
+    ///
+    /// The policy carries the keepalive and the deadline together, because they are
+    /// one answer to one question: this is how the attempt should treat a quiet link.
+    #[must_use]
+    pub fn with_connection_policy(mut self, policy: ConnectionPolicy) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -562,11 +611,7 @@ async fn connect_and_shell(
     let x11_mode = request.x11;
     let material = Material::resolve(request.auth).await?;
 
-    let config = Arc::new(client::Config {
-        nodelay: true,
-        keepalive_interval: Some(KEEPALIVE_INTERVAL),
-        ..Default::default()
-    });
+    let config = Arc::new(client_config(&request.policy));
     let recorded = Arc::new(Mutex::new(None::<ConnectError>));
     let progress = Arc::new(HandshakeProgress::default());
     let mut carrier_lost = gate.subscribe_lost();
@@ -588,7 +633,7 @@ async fn connect_and_shell(
         (request.host.as_str(), request.port),
         handler,
         &progress,
-        request.connect_timeout,
+        request.policy.connect_timeout(),
     )
     .await
     {
@@ -1344,6 +1389,80 @@ impl Default for ScriptedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_policy_is_what_reaches_the_ssh_library() {
+        let defaults = shellune_core::ConnectionDefaults::default();
+        let config = client_config(&defaults.policy());
+        assert_eq!(
+            config.keepalive_interval,
+            Some(Duration::from_secs(30)),
+            "a host that says nothing probes every 30 seconds"
+        );
+        assert_eq!(config.keepalive_max, 3);
+        assert_eq!(
+            config.inactivity_timeout, None,
+            "an idle shell that answers is never closed for silence"
+        );
+
+        let own = shellune_core::HostConnection::new(Some(90), Some(6), Some(9)).expect("valid");
+        let config = client_config(&defaults.policy_for(Some(own)));
+        assert_eq!(config.keepalive_interval, Some(Duration::from_secs(90)));
+        assert_eq!(config.keepalive_max, 6);
+        assert_eq!(config.inactivity_timeout, None);
+
+        let off = defaults.policy_for(Some(shellune_core::HostConnection::keepalive_off()));
+        let config = client_config(&off);
+        assert_eq!(
+            config.keepalive_interval, None,
+            "an explicit off sends no probe at all"
+        );
+        assert_eq!(config.inactivity_timeout, None);
+
+        let disabled = shellune_core::ConnectionDefaults::new(0, 3, 20).expect("valid");
+        assert_eq!(client_config(&disabled.policy()).keepalive_interval, None);
+        assert_eq!(
+            client_config(&disabled.policy()).inactivity_timeout,
+            None,
+            "switching keepalive off does not switch an inactivity timer on"
+        );
+    }
+
+    #[test]
+    fn a_request_carries_the_policy_and_the_deadline_it_implies() {
+        let request = ConnectRequest::new(
+            "web.example.org",
+            2222,
+            "deploy",
+            AuthMethod::password("hunter2"),
+            PtySize::default(),
+            KnownHostKey::Unknown,
+        );
+        assert_eq!(request.policy, ConnectionPolicy::default());
+        assert_eq!(request.policy.connect_timeout(), CONNECT_TIMEOUT);
+
+        let chosen = shellune_core::ConnectionDefaults::new(45, 5, 7)
+            .expect("valid")
+            .policy();
+        let request = request.with_connection_policy(chosen);
+        assert_eq!(
+            request.policy.keepalive_interval(),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(request.policy.connect_timeout(), Duration::from_secs(7));
+
+        let shortened = request.with_connect_timeout(Duration::from_secs(3));
+        assert_eq!(
+            shortened.policy.connect_timeout(),
+            Duration::from_secs(3),
+            "the deadline the dial uses is the policy's"
+        );
+        assert_eq!(
+            shortened.policy.keepalive_interval(),
+            Some(Duration::from_secs(45)),
+            "changing the deadline leaves the keepalive choice alone"
+        );
+    }
 
     #[test]
     fn a_size_is_kept_inside_what_a_terminal_server_accepts() {
