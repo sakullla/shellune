@@ -100,6 +100,8 @@ pub fn main(arguments: Vec<String>) -> i32 {
             return 2;
         }
     };
+    #[cfg(target_os = "windows")]
+    disable_direct_composition();
     run(options)
 }
 
@@ -390,7 +392,6 @@ fn start(
     root: &Path,
     state: Arc<Mutex<ProbeState>>,
 ) -> Result<(), String> {
-    disable_direct_composition();
     let foreground_before = windows::foreground();
     let (min_width, min_height) = super::MIN_WINDOW_SIZE;
     let window_options = WindowOptions {
