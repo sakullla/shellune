@@ -15099,12 +15099,18 @@ async fn changing_a_shortcut_applies_at_once_and_the_palette_shows_it(cx: &mut T
     );
     assert_eq!(
         cx.update(|_window, app| view.read(app).keymap().label("nav.settings")),
-        Some("Ctrl+Alt+S".to_owned())
+        Some(crate::app::keymap::keystroke_label(
+            "ctrl-alt-s",
+            Platform::current()
+        ))
     );
     // The command palette reads the same configuration, so its hint changed too.
     assert_eq!(
         cx.update(|_window, app| view.read(app).palette_shortcut(copy::ux().settings_title)),
-        Some("Ctrl+Alt+S".to_owned()),
+        Some(crate::app::keymap::keystroke_label(
+            "ctrl-alt-s",
+            Platform::current()
+        )),
         "the palette shows the binding in force"
     );
 
@@ -15135,8 +15141,12 @@ async fn a_conflicting_shortcut_is_refused_and_names_both_actions(cx: &mut TestA
     click(cx, "nav.settings");
     click(cx, "settings.keys.change.nav.hosts");
 
-    // Ctrl+Shift+W already closes the current session in the same context.
-    cx.simulate_keystrokes("ctrl-shift-w");
+    // The combination that already closes the current tab, in the same context.
+    let taken = Keymap::defaults(Platform::current())
+        .keystroke("tab.close")
+        .expect("closing a tab has a default shortcut")
+        .to_owned();
+    cx.simulate_keystrokes(&taken);
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_window, app| view.read(app).capturing_for()),
@@ -15205,7 +15215,13 @@ async fn a_saved_keymap_that_cannot_be_used_is_reported_and_the_defaults_answer(
 #[gpui::test]
 async fn unbinding_a_terminal_shortcut_hands_the_key_back_to_the_program(cx: &mut TestAppContext) {
     let (pane, cx) = pane_with("", cx);
-    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    // Paste on Ctrl+Shift+V on every platform, so the unbound combination is one a
+    // shell reads (Ctrl+V) rather than a platform key the terminal does not send.
+    let mut keymap = Keymap::defaults(Platform::current());
+    keymap
+        .set("terminal.paste", "ctrl-shift-v")
+        .expect("a free combination");
+    cx.update(|_window, app| crate::app::apply_keymap(app, &keymap));
     cx.write_to_clipboard(ClipboardItem::new_string("pasted".to_owned()));
 
     cx.simulate_keystrokes("ctrl-shift-v");
@@ -15217,7 +15233,6 @@ async fn unbinding_a_terminal_shortcut_hands_the_key_back_to_the_program(cx: &mu
     );
 
     // Unbind it: the same combination is now the program's own key.
-    let mut keymap = Keymap::defaults(Platform::current());
     keymap.unbind("terminal.paste");
     cx.update(|_window, app| crate::app::apply_keymap(app, &keymap));
     cx.simulate_keystrokes("ctrl-shift-v");
@@ -15534,7 +15549,13 @@ fn the_terminal_toolbar_and_menu_read_the_bindings_in_force() {
         .expect("a free combination");
     let changed = TerminalShortcuts::of(&keymap);
     assert_eq!(changed.copy, None, "an unbound action names no key");
-    assert_eq!(changed.paste.as_deref(), Some("Ctrl+Alt+V"));
+    assert_eq!(
+        changed.paste,
+        Some(crate::app::keymap::keystroke_label(
+            "ctrl-alt-v",
+            Platform::current()
+        ))
+    );
 }
 
 #[gpui::test]
