@@ -1,35 +1,40 @@
-//! The hidden-window capture probe (R1, R11).
+//! The hidden-window capture tool (R1, R2, R9, R11).
 //!
-//! This is the first, smallest capture entry: it proves that the real Shellune view can
-//! be drawn in a window the user never sees and read back as real pixels. Everything
-//! here exists to answer that one question honestly, so it fails loudly rather than
-//! falling back:
+//! This is the second capture entry. The first one proved the question this whole
+//! workflow depends on - can the real Shellune view be drawn in a window the user never
+//! sees and read back as real pixels? - and it is answered: yes, through the hidden
+//! window's own GPU back buffer. This entry turns that probe into a tool:
 //!
-//! * the window is opened with `show: false` and `focus: false` and is never shown,
-//!   activated, moved to the foreground or asked for input;
-//! * the pixels come from the hidden window's own DirectX back buffer through the
-//!   vendored GPUI readback; the screen, the desktop and other applications are never
-//!   read;
-//! * every store is redirected to a temporary directory and credentials live in memory,
-//!   so a run cannot read or write the developer's hosts, trust file or keychain;
-//! * a black, empty, wrong-sized or uniform image, a failed render or a failed write
-//!   ends the process non-zero with a report beside the images it did produce.
+//! * [`scenarios`] registers the states worth photographing, in the real view, each with
+//!   what it was built from and what it cannot prove;
+//! * a run is [`--theme`], [`--size`], [`--only`], [`--quick`] or a full matrix, and
+//!   each shot names its palette, logical and physical size, DPI, language and text size
+//!   in the manifest it writes beside the PNGs;
+//! * a shot is taken only after the scenario says it arrived and after the window drew
+//!   two more frames, and the frame is only accepted when two consecutive readbacks are
+//!   byte-identical, so a fixed sleep is never the reason a shot is right;
+//! * every store lives in a temporary directory that is removed again, credentials are in
+//!   memory, and no PTY, SSH connection, ProxyCommand or user command is started;
+//! * a failure - a missing scenario state, a blank or wrong-sized frame, a write error -
+//!   ends the run non-zero and leaves what it managed to write for the reader. The
+//!   gallery and the previous round's images are published by [`scripts/capture-ui.py`],
+//!   which is also what keeps a failed run from replacing the baseline.
 //!
-//! It is a probe, not the capture tool: scenarios, filters, the manifest and the gallery
-//! belong to the next task. What it prints and writes here is the machine-readable
-//! result the caller can act on.
-//!
-//! `text
-//! cargo run --features ui-capture -- --ui-capture --out target/ui-capture/probe
-//! `
+//! What this tool cannot do is part of the evidence, and it is written into the manifest:
+//! the pixels come from one Windows DirectX readback, the sessions are display-only
+//! fixtures, and a PNG of a page is not proof that the page works.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-// Everything below is the Windows probe: a platform without the hidden-window capture
-// still parses the same arguments, and answers with the one report that cannot be
-// mistaken for a rendering result.
+pub mod scenarios;
+
+use scenarios::{SCENARIOS, Scenario, Variant};
+
+// Everything below the planner is the Windows half: a platform without the hidden-window
+// readback still parses the same arguments, still lists the scenarios, and answers with
+// the one report that cannot be mistaken for a rendering result.
 #[cfg(target_os = "windows")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "windows")]
@@ -50,8 +55,6 @@ use super::nav::Platform;
 #[cfg(target_os = "windows")]
 use super::product;
 #[cfg(target_os = "windows")]
-use super::theme::ThemeChoice;
-#[cfg(target_os = "windows")]
 use super::view;
 #[cfg(target_os = "windows")]
 use super::workspace::Workspace;
@@ -59,38 +62,56 @@ use super::workspace::Workspace;
 #[cfg(target_os = "windows")]
 mod windows;
 
-/// The flag that sends the binary to the probe instead of the application.
+/// The flag that sends the binary to the capture tool instead of the application.
 const FLAG: &str = "--ui-capture";
 
+/// The manifest the gallery and the next run read.
+const MANIFEST_FILE: &str = "capture-ui-manifest.json";
+
 const USAGE: &str = "\
-usage: shellune --ui-capture [--out <directory>] [--size <width>x<height>]
+usage: shellune --ui-capture [--list] [--quick] [--out <directory>]
+                             [--theme dark|light|both] [--size <width>[x<height>]]
+                             [--only <pattern>[,<pattern>...]]
 
-  --out <directory>     where the PNGs, their report and the run's diagnostics go
-                        (default: target/ui-capture/probe)
-  --size <width>x<height>
-                        the window's logical client size (default: the design window,
-                        1120x720)
+  --list                print the scenarios and their shots as JSON, capture nothing
+  --quick               only the main pages, in the dark palette
+  --out <directory>     where the PNGs and their manifest go; the gallery script
+                        passes its own staging directory
+  --theme <choice>      dark, light or both (default: both; quick defaults to dark)
+  --size <width>[x<h>]  keep the shots at this logical width (and height, if given);
+                        repeat the flag to keep more than one
+  --only <pattern>      keep the scenarios whose id matches (glob: * and ?); repeat or
+                        separate with commas
 
-The probe captures the real home page twice - dark, then light - in a window that is
-never shown, and exits non-zero with a report when the render could not be read back.";
+A run draws each scenario in the real shell inside a window that is never shown, waits
+for the state and for two identical GPU frames, reads the frame back and writes it beside
+a manifest. It never shows a window, never reads the screen or the desktop, and never
+starts a shell, a connection or a user command. A shot that cannot be taken ends the run
+non-zero.";
 
-/// Frames the probe lets the shell draw before it reads pixels, and how long it waits
-/// for the platform to deliver them at all.
+/// Frames a shot lets the shell draw after its state is installed, and how long a step
+/// may wait for the platform to deliver them at all.
 const SETTLE_FRAMES: u32 = 3;
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 
-/// How long the whole run may take before the watchdog ends it with a report.
-const WATCHDOG: Duration = Duration::from_secs(120);
+/// How long two identical readbacks must be apart before the shot is called settled.
+///
+/// Two frames a few milliseconds apart can both be drawn before an image asset has been
+/// decoded, so "the same picture twice" alone would accept a frame that is still waiting
+/// for its icons. The window is an observation, not the reason a shot is right: the
+/// condition is still that the pixels stopped changing, and a frame that keeps changing
+/// inside the window is never accepted.
+const STABLE_WINDOW: Duration = Duration::from_millis(150);
+
+/// How long a whole run may take before the watchdog ends it with a report.
+const WATCHDOG_BASE: Duration = Duration::from_secs(120);
+const WATCHDOG_PER_SHOT: Duration = Duration::from_secs(30);
 
 /// A real page is not one colour; this is the floor below which the image is not a page.
 const DISTINCT_COLOR_FLOOR: usize = 16;
 
-/// How much of the page has to change between the two palettes for the theme to count
-/// as reaching the pixels.
-const THEME_PIXEL_FLOOR: f64 = 0.05;
-
-/// Entry point. Returns the process exit status: 0 for a probe that proved itself,
+/// Entry point. Returns the process exit status: 0 for a run that captured every shot,
 /// 1 for one that did not, 2 for a bad invocation, 3 for an unsupported platform.
 pub fn main(arguments: Vec<String>) -> i32 {
     let options = match Options::parse(&arguments) {
@@ -100,33 +121,96 @@ pub fn main(arguments: Vec<String>) -> i32 {
             return 2;
         }
     };
+    if options.list {
+        print_scenarios();
+        return 0;
+    }
+    let shots = match plan(&options) {
+        Ok(shots) => shots,
+        Err(message) => {
+            eprintln!("shellune ui-capture: {message}\n{USAGE}");
+            return 2;
+        }
+    };
     #[cfg(target_os = "windows")]
     disable_direct_composition();
-    run(options)
+    run(options, shots)
 }
 
-/// Whether these arguments ask for the probe.
+/// Whether these arguments ask for the capture tool.
 #[must_use]
 pub fn invoked(arguments: &[String]) -> bool {
     arguments.iter().any(|argument| argument == FLAG)
 }
 
-/// What one probe run was asked to do.
+/// Which palettes a run keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemeFilter {
+    Both,
+    Dark,
+    Light,
+}
+
+impl ThemeFilter {
+    fn keeps(self, theme: super::theme::ThemeChoice) -> bool {
+        match self {
+            Self::Both => true,
+            Self::Dark => theme == super::theme::ThemeChoice::Dark,
+            Self::Light => theme == super::theme::ThemeChoice::Light,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+}
+
+/// What one run was asked to do.
 #[derive(Clone, Debug)]
 struct Options {
-    width: f32,
-    height: f32,
+    /// Whether the run is the quick one (main pages, dark palette).
+    quick: bool,
+    /// Whether it only lists the scenarios.
+    list: bool,
+    /// Which palettes to keep.
+    theme: ThemeFilter,
+    /// Logical sizes to keep: a width, and a height when the caller gave one.
+    sizes: Vec<(f32, Option<f32>)>,
+    /// Scenario id patterns. Empty means every scenario.
+    only: Vec<String>,
+    /// Where the PNGs and the manifest go.
     out: PathBuf,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            quick: false,
+            list: false,
+            theme: ThemeFilter::Both,
+            sizes: Vec::new(),
+            only: Vec::new(),
+            out: default_out(),
+        }
+    }
+}
+
+/// The directory the tool writes to when nobody says otherwise.
+///
+/// The gallery script always passes its staging directory; this default exists so the
+/// binary can be run by hand.
+fn default_out() -> PathBuf {
+    PathBuf::from("target").join("ui-capture").join("shots")
 }
 
 impl Options {
     fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (width, height) = super::DEFAULT_WINDOW_SIZE;
-        let mut options = Self {
-            width,
-            height,
-            out: PathBuf::from("target").join("ui-capture").join("probe"),
-        };
+        let mut options = Self::default();
+        let mut theme_given = false;
         let mut arguments = arguments
             .iter()
             .filter(|argument| argument.as_str() != FLAG)
@@ -139,133 +223,425 @@ impl Options {
                         .ok_or_else(|| "--out needs a directory".to_owned())?;
                     options.out = PathBuf::from(value);
                 }
+                "--quick" => options.quick = true,
+                "--list" => options.list = true,
+                "--theme" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--theme needs dark, light or both".to_owned())?;
+                    options.theme = match value.as_str() {
+                        "dark" => ThemeFilter::Dark,
+                        "light" => ThemeFilter::Light,
+                        "both" => ThemeFilter::Both,
+                        other => {
+                            return Err(format!(
+                                "--theme wants dark, light or both, not {other:?}"
+                            ));
+                        }
+                    };
+                    theme_given = true;
+                }
                 "--size" => {
                     let value = arguments
                         .next()
-                        .ok_or_else(|| "--size needs <width>x<height>".to_owned())?;
-                    let (w, h) = value
-                        .split_once(['x', 'X'])
-                        .ok_or_else(|| format!("--size wants <width>x<height>, not {value:?}"))?;
-                    options.width = w
-                        .parse::<f32>()
-                        .map_err(|_| format!("--size width is not a number: {w:?}"))?;
-                    options.height = h
-                        .parse::<f32>()
-                        .map_err(|_| format!("--size height is not a number: {h:?}"))?;
-                    if !(options.width.is_finite() && options.height.is_finite())
-                        || options.width <= 0.0
-                        || options.height <= 0.0
-                    {
-                        return Err(format!("--size needs positive numbers, not {value:?}"));
+                        .ok_or_else(|| "--size needs <width> or <width>x<height>".to_owned())?;
+                    options.sizes.push(parse_size(value)?);
+                }
+                "--only" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--only needs a scenario pattern".to_owned())?;
+                    let patterns: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|pattern| !pattern.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    if patterns.is_empty() {
+                        return Err("--only needs a scenario pattern".to_owned());
                     }
+                    options.only.extend(patterns);
                 }
                 "--help" | "-h" => return Err("help requested".to_owned()),
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
+        // The quick run is the dark one unless the caller asked for a palette.
+        if options.quick && !theme_given {
+            options.theme = ThemeFilter::Dark;
+        }
         Ok(options)
+    }
+
+    /// `quick` or `full`, as the manifest spells the run.
+    fn mode(&self) -> &'static str {
+        if self.quick { "quick" } else { "full" }
     }
 }
 
-/// What the run has seen so far, shared between the frame callbacks, the capture task
-/// and the watchdog.
-#[cfg(target_os = "windows")]
-#[derive(Default)]
-struct ProbeState {
-    frames: u32,
-    exit_code: Option<i32>,
-    /// The foreground window right after the hidden window took its size, and right
-    /// after the frames were read. Sampled so a focus change can be pinned on a step.
-    foreground_after_fit: Option<isize>,
-    foreground_after_capture: Option<isize>,
+/// Reads `1120` or `1120x720`.
+fn parse_size(value: &str) -> Result<(f32, Option<f32>), String> {
+    let (width, height) = match value.split_once(['x', 'X']) {
+        Some((width, height)) => (width, Some(height)),
+        None => (value, None),
+    };
+    let width =
+        parse_length(width).ok_or_else(|| format!("--size width is not a number: {value:?}"))?;
+    let height = match height {
+        Some(height) => Some(
+            parse_length(height)
+                .ok_or_else(|| format!("--size height is not a number: {value:?}"))?,
+        ),
+        None => None,
+    };
+    Ok((width, height))
 }
 
-/// One captured image and what was measured on it.
-struct Capture {
+fn parse_length(value: &str) -> Option<f32> {
+    let number = value.trim().parse::<f32>().ok()?;
+    (number.is_finite() && number > 0.0).then_some(number)
+}
+
+/// One frame the run will take.
+#[derive(Clone, Copy)]
+struct Shot {
+    scenario: &'static Scenario,
+    variant: Variant,
+}
+
+/// Whether a scenario id matches a glob pattern (only `*` and `?`, which is all the
+/// command line documents).
+fn matches_pattern(pattern: &str, id: &str) -> bool {
+    fn walk(pattern: &[u8], id: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => id.is_empty(),
+            Some((b'*', rest)) => (0..=id.len()).any(|skip| walk(rest, &id[skip..])),
+            Some((b'?', rest)) => !id.is_empty() && walk(rest, &id[1..]),
+            Some((byte, rest)) => id.first() == Some(byte) && walk(rest, &id[1..]),
+        }
+    }
+    walk(pattern.as_bytes(), id.as_bytes())
+}
+
+/// The shots a run takes, in the order it takes them.
+///
+/// Ordered by window size first, so the hidden window is resized as few times as
+/// possible, and by registry order inside a size, so two runs of the same command write
+/// the same list in the same order.
+fn plan(options: &Options) -> Result<Vec<Shot>, String> {
+    let selected: Vec<&'static Scenario> = SCENARIOS
+        .iter()
+        .filter(|scenario| {
+            options.only.is_empty()
+                || options
+                    .only
+                    .iter()
+                    .any(|pattern| matches_pattern(pattern, scenario.id))
+        })
+        .collect();
+    if selected.is_empty() {
+        return Err(format!(
+            "no scenario matches {}; --list shows the ids",
+            options
+                .only
+                .iter()
+                .map(|pattern| format!("{pattern:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if options.quick {
+        let kept: Vec<&'static Scenario> = selected
+            .into_iter()
+            .filter(|scenario| scenario.quick)
+            .collect();
+        if kept.is_empty() {
+            return Err(
+                "no scenario the quick run covers matches --only; --list marks the quick ones"
+                    .to_owned(),
+            );
+        }
+        let variant = if options.theme == ThemeFilter::Light {
+            Variant::light()
+        } else {
+            Variant::dark()
+        };
+        return Ok(kept
+            .into_iter()
+            .map(|scenario| Shot { scenario, variant })
+            .collect());
+    }
+    let mut shots = Vec::new();
+    for scenario in selected {
+        for variant in scenario.shots() {
+            if !options.theme.keeps(variant.theme) {
+                continue;
+            }
+            if !kept_size(options, variant) {
+                continue;
+            }
+            shots.push(Shot { scenario, variant });
+        }
+    }
+    if shots.is_empty() {
+        return Err(format!(
+            "the selected scenarios have no shots at theme {:?} and the sizes asked for; \
+             --list shows every shot",
+            options.theme.name()
+        ));
+    }
+    shots.sort_by(|left, right| {
+        (left.variant.width as u32, left.variant.height as u32)
+            .cmp(&(right.variant.width as u32, right.variant.height as u32))
+    });
+    Ok(shots)
+}
+
+/// Whether a shot survives the `--size` filters.
+fn kept_size(options: &Options, variant: Variant) -> bool {
+    options.sizes.is_empty()
+        || options.sizes.iter().any(|(width, height)| {
+            (variant.width - width).abs() < 0.5
+                && height.is_none_or(|height| (variant.height - height).abs() < 0.5)
+        })
+}
+
+/// Writes the scenario registry as JSON. This is the `--list` answer, and what the
+/// gallery script prints when a person asks what can be captured.
+fn print_scenarios() {
+    let scenarios: Vec<Value> = SCENARIOS
+        .iter()
+        .map(|scenario| {
+            let shots: Vec<Value> = scenario
+                .shots()
+                .into_iter()
+                .map(|variant| {
+                    json!({
+                        "file": format!("{}.png", variant.file_stem(scenario.id)),
+                        "theme": variant.theme_name(),
+                        "logical_width": f64::from(variant.width),
+                        "logical_height": f64::from(variant.height),
+                        "zoom_percent": variant.zoom_percent(),
+                        "language": variant.language_name(),
+                    })
+                })
+                .collect();
+            json!({
+                "id": scenario.id,
+                "title": scenario.title,
+                "category": scenario.category.id(),
+                "quick": scenario.quick,
+                "fixture": scenario.fixture,
+                "evidence": scenario.evidence,
+                "shots": shots,
+            })
+        })
+        .collect();
+    let listed = json!({
+        "tool": "shellune-ui-capture",
+        "schema": 1,
+        "feature": "ui-capture",
+        "platform": std::env::consts::OS,
+        "scenarios": scenarios,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&listed).unwrap_or_default()
+    );
+}
+
+/// What one shot measured about the frame it accepted.
+#[cfg(target_os = "windows")]
+struct Accepted {
+    image: windows::Image,
+    distinct_colors: usize,
+    mean_luminance: f64,
+    /// The colour a blank frame is filled with, so a failure can say what the system
+    /// handed back instead of only that it was uniform.
+    uniform_colour: String,
+    pixel_crc32: u32,
+    window_visible: bool,
+    frames: u32,
+    scale: f64,
+}
+
+/// One shot in the manifest.
+struct Record {
+    file: String,
+    scenario: &'static str,
+    title: &'static str,
+    category: &'static str,
     theme: &'static str,
-    path: PathBuf,
-    width: u32,
-    height: u32,
+    language: &'static str,
+    zoom_percent: u32,
+    logical_width: f32,
+    logical_height: f32,
+    physical_width: u32,
+    physical_height: u32,
+    scale_factor: f64,
     bytes: u64,
     distinct_colors: usize,
     mean_luminance: f64,
+    pixel_crc32: u32,
     window_visible: bool,
-}
-
-/// Everything the report says, whether the run passed or failed.
-#[derive(Default)]
-struct Report {
-    status: &'static str,
-    error: Option<String>,
-    logical_width: f32,
-    logical_height: f32,
-    scale_factor: f64,
     frames: u32,
-    captures: Vec<Capture>,
-    theme_pixel_ratio: Option<f64>,
-    foreground_before: isize,
-    foreground_after_fit: Option<isize>,
-    foreground_after_capture: Option<isize>,
-    elapsed_ms: u128,
+    fixture: &'static str,
+    evidence: &'static str,
 }
 
-impl Report {
-    fn to_json(&self, options: &Options) -> Value {
-        let captures: Vec<Value> = self
-            .captures
-            .iter()
-            .map(|capture| {
-                json!({
-                    "theme": capture.theme,
-                    "path": capture.path.display().to_string(),
-                    "width": capture.width,
-                    "height": capture.height,
-                    "bytes": capture.bytes,
-                    "distinct_colors": capture.distinct_colors,
-                    "mean_luminance": capture.mean_luminance,
-                    "window_visible_during_capture": capture.window_visible,
-                })
-            })
-            .collect();
+impl Record {
+    fn to_json(&self) -> Value {
         json!({
-            "probe": "hidden-window-gpu-readback",
-            "schema": 1,
-            "status": self.status,
-            "error": self.error,
-            "feature": "ui-capture",
-            "platform": std::env::consts::OS,
-            "method": "DirectX back-buffer readback from the hidden GPUI renderer",
-            "window": {
-                "show": false,
-                "focus": false,
-                "logical_width": self.logical_width,
-                "logical_height": self.logical_height,
-                "scale_factor": self.scale_factor,
-                "frames_drawn": self.frames,
-            },
-            "theme_pixel_ratio": self.theme_pixel_ratio,
-            "foreground_window": {
-                "before": self.foreground_before,
-                "after_fit": self.foreground_after_fit,
-                "after_capture": self.foreground_after_capture,
-            },
-            "isolation": {
-                "hosts": "temporary directory",
-                "trust": "temporary directory",
-                "preferences": "temporary directory",
-                "credentials": "memory only",
-            },
-            "output": options.out.display().to_string(),
-            "elapsed_ms": self.elapsed_ms,
-            "captures": captures,
+            "file": self.file,
+            "scenario": self.scenario,
+            "title": self.title,
+            "category": self.category,
+            "theme": self.theme,
+            "language": self.language,
+            "zoom_percent": self.zoom_percent,
+            "logical_width": f64::from(self.logical_width),
+            "logical_height": f64::from(self.logical_height),
+            "physical_width": self.physical_width,
+            "physical_height": self.physical_height,
+            "scale_factor": self.scale_factor,
+            "dpi_percent": (self.scale_factor * 100.0).round(),
+            "bytes": self.bytes,
+            "distinct_colors": self.distinct_colors,
+            "mean_luminance": self.mean_luminance,
+            "pixel_crc32": format!("{:08x}", self.pixel_crc32),
+            "window_visible_during_capture": self.window_visible,
+            "frames_drawn": self.frames,
+            "fixture": self.fixture,
+            "evidence_boundary": self.evidence,
         })
     }
 }
 
-/// Prints one progress line to stderr, so a run that hangs says where it stopped.
-///
-/// The probe is the only writer of this stream, and it is how a caller with no console
-/// (the binary is a window subsystem program) still sees where a run ended up.
+/// One shot that could not be taken.
+struct Failure {
+    scenario: &'static str,
+    theme: &'static str,
+    size: String,
+    reason: String,
+}
+
+impl Failure {
+    fn shot(shot: Shot, reason: impl Into<String>) -> Self {
+        Self {
+            scenario: shot.scenario.id,
+            theme: shot.variant.theme_name(),
+            size: format!(
+                "{}x{}",
+                shot.variant.width as u32, shot.variant.height as u32
+            ),
+            reason: reason.into(),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "scenario": self.scenario,
+            "theme": self.theme,
+            "size": self.size,
+            "reason": self.reason,
+        })
+    }
+}
+
+/// Everything a run reports, whether it passed or failed.
+struct Manifest {
+    status: &'static str,
+    mode: &'static str,
+    planned: usize,
+    started: Option<String>,
+    elapsed_ms: u128,
+    scale_factor: f64,
+    out: String,
+    records: Vec<Record>,
+    failures: Vec<Failure>,
+    /// Why the run stopped before every planned shot was attempted, if it did.
+    stopped: Option<String>,
+    /// The foreground window before the first shot and after the last one. A capture
+    /// that took the focus would change it (R1).
+    foreground: Option<(isize, isize)>,
+}
+
+impl Manifest {
+    fn new(options: &Options, planned: usize) -> Self {
+        Self {
+            status: "ok",
+            mode: options.mode(),
+            planned,
+            started: None,
+            elapsed_ms: 0,
+            scale_factor: 0.0,
+            out: options.out.display().to_string(),
+            records: Vec::new(),
+            failures: Vec::new(),
+            stopped: None,
+            foreground: None,
+        }
+    }
+
+    fn fail(&mut self, failure: Failure) {
+        self.status = "failed";
+        self.failures.push(failure);
+    }
+
+    fn to_json(&self) -> Value {
+        let records: Vec<Value> = self.records.iter().map(Record::to_json).collect();
+        let failures: Vec<Value> = self.failures.iter().map(Failure::to_json).collect();
+        json!({
+            "tool": "shellune-ui-capture",
+            "schema": 1,
+            "status": self.status,
+            "feature": "ui-capture",
+            "platform": std::env::consts::OS,
+            "mode": self.mode,
+            "method": "GPU back-buffer readback of a hidden GPUI window (Window::capture_frame)",
+            "window": {
+                "show": false,
+                "focus": false,
+                "activated": false,
+            },
+            "method_notes": [
+                "the pixels come from the hidden window's own DirectX back buffer; the screen, the desktop and other applications are never read",
+                "the window is created with show:false and focus:false and is never activated, moved to the foreground or asked for input",
+                "a shot is accepted only after the scenario reports its state and two consecutive readbacks are byte-identical",
+            ],
+            "isolation": {
+                "hosts": "per-scenario temporary directory",
+                "trust": "per-scenario temporary directory",
+                "preferences": "per-scenario temporary directory",
+                "workspace": "per-scenario temporary directory",
+                "snippets": "per-scenario temporary directory",
+                "credentials": "MemorySecrets (in memory only)",
+                "network": "nothing dialled: no SSH connection, ProxyCommand, PTY or user command is started",
+            },
+            "evidence_boundary": [
+                "the sessions in the shots are display-only fixtures; a PNG of a page is not proof that the page works",
+                "only the Windows DirectX readback path is exercised; macOS and Linux capture is unverified",
+                "the text is rendered with the fonts installed on this machine, so a pixel comparison across machines is not meaningful",
+                "no layout selector is read: a scenario confirms arrival from the same model the render reads, not from where a pixel landed",
+            ],
+            "foreground_window": self.foreground.map(|(before, after)| json!({
+                "before": before,
+                "after": after,
+                "unchanged": before == after,
+            })),
+            "started": self.started,
+            "elapsed_ms": self.elapsed_ms,
+            "scale_factor": self.scale_factor,
+            "out": self.out,
+            "planned_shots": self.planned,
+            "captured_shots": self.records.len(),
+            "stopped": self.stopped,
+            "shots": records,
+            "failures": failures,
+        })
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn stage(message: &str) {
     use std::io::Write as _;
@@ -273,7 +649,7 @@ fn stage(message: &str) {
     let _ = std::io::stderr().flush();
 }
 
-fn run(options: Options) -> i32 {
+fn run(options: Options, shots: Vec<Shot>) -> i32 {
     if let Err(error) = std::fs::create_dir_all(&options.out) {
         eprintln!(
             "shellune ui-capture: cannot use {}: {error}",
@@ -283,36 +659,31 @@ fn run(options: Options) -> i32 {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let report = Report {
-            status: "failed",
-            error: Some(
-                "hidden-window capture is implemented for Windows only; macOS and Linux are \
-                 unverified and this probe does not fall back to a visible window or a screen \
-                 capture"
-                    .to_owned(),
-            ),
-            logical_width: options.width,
-            logical_height: options.height,
-            ..Report::default()
-        };
-        write_report(&options.out, &report, &options);
+        let mut manifest = Manifest::new(&options, shots.len());
+        manifest.fail(Failure {
+            scenario: "*",
+            theme: options.theme.name(),
+            size: "*".to_owned(),
+            reason: "hidden-window capture is implemented for Windows only; macOS and Linux \
+                     are unverified and this tool does not fall back to a visible window or a \
+                     screen capture"
+                .to_owned(),
+        });
+        write_manifest(&options.out, &manifest);
         eprintln!("shellune ui-capture: hidden-window capture is Windows only and unverified here");
         return 3;
     }
     #[cfg(target_os = "windows")]
     {
-        run_windows(options)
+        run_windows(options, shots)
     }
 }
+
 #[cfg(target_os = "windows")]
-fn run_windows(options: Options) -> i32 {
-    // A run must not touch the developer's data directory, so every store is redirected
-    // before the first window exists.
-    let root = std::env::temp_dir().join(format!(
-        "shellune-ui-capture-{}-{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
+fn run_windows(options: Options, shots: Vec<Shot>) -> i32 {
+    // One root per run: every shot gets a directory under it, and the whole tree is
+    // removed when the run ends, however it ends.
+    let root = std::env::temp_dir().join("shellune-ui-capture").join("run");
     if let Err(error) = std::fs::create_dir_all(&root) {
         eprintln!(
             "shellune ui-capture: cannot create the isolated root {}: {error}",
@@ -322,8 +693,8 @@ fn run_windows(options: Options) -> i32 {
     }
 
     stage(&format!("isolated root {}", root.display()));
-    let state = Arc::new(Mutex::new(ProbeState::default()));
-    start_watchdog(state.clone(), options.clone(), &root);
+    let state = Arc::new(Mutex::new(RunState::default()));
+    start_watchdog(state.clone(), options.clone(), shots.len(), &root);
     stage("application starting");
 
     let app_state = state.clone();
@@ -332,7 +703,7 @@ fn run_windows(options: Options) -> i32 {
     Application::new()
         .with_assets(icons::Assets)
         .run(move |cx| {
-            if let Err(message) = start(cx, &app_options, &app_root, app_state.clone()) {
+            if let Err(message) = start(cx, &app_options, &app_root, shots, app_state.clone()) {
                 fail(cx, &app_options, &app_state, message);
             }
         });
@@ -341,38 +712,45 @@ fn run_windows(options: Options) -> i32 {
     state.lock().map_or(1, |state| state.exit_code.unwrap_or(1))
 }
 
-/// Ends the run with a report when the window system never lets the probe finish.
-///
-/// A hidden window that never paints would otherwise leave the process waiting forever;
-/// this keeps the failure observable and non-zero.
+/// What the run has seen so far, shared by the frame callbacks, the capture task and the
+/// watchdog.
 #[cfg(target_os = "windows")]
-fn start_watchdog(state: Arc<Mutex<ProbeState>>, options: Options, root: &Path) {
+#[derive(Default)]
+struct RunState {
+    frames: u32,
+    exit_code: Option<i32>,
+}
+
+/// Ends the run with a report when the window system never lets it finish.
+#[cfg(target_os = "windows")]
+fn start_watchdog(state: Arc<Mutex<RunState>>, options: Options, planned: usize, root: &Path) {
     let root = root.to_path_buf();
+    let budget = WATCHDOG_BASE + WATCHDOG_PER_SHOT * u32::try_from(planned).unwrap_or(0);
     std::thread::spawn(move || {
-        std::thread::sleep(WATCHDOG);
+        std::thread::sleep(budget);
         if state.lock().is_ok_and(|state| state.exit_code.is_some()) {
             return;
         }
-        let report = Report {
-            status: "failed",
-            error: Some(format!(
-                "the probe did not finish within {} s, so the hidden window never produced a \
-                 capturable frame",
-                WATCHDOG.as_secs()
-            )),
-            logical_width: options.width,
-            logical_height: options.height,
-            frames: state.lock().map_or(0, |state| state.frames),
-            ..Report::default()
-        };
-        write_report(&options.out, &report, &options);
+        let mut manifest = Manifest::new(&options, planned);
+        manifest.elapsed_ms = budget.as_millis();
+        manifest.fail(Failure {
+            scenario: "*",
+            theme: options.theme.name(),
+            size: "*".to_owned(),
+            reason: format!(
+                "the run did not finish within {} s, so the hidden window stopped producing \
+                 capturable frames",
+                budget.as_secs()
+            ),
+        });
+        write_manifest(&options.out, &manifest);
         let _ = std::fs::remove_dir_all(&root);
         std::process::exit(1);
     });
 }
 
-/// DirectComposition gives a window no classic redirection surface for `PrintWindow` to
-/// read, so the probe asks gpui for the plain window swap chain instead (ADR-1).
+/// DirectComposition gives a window no classic redirection surface, so the tool asks
+/// gpui for the plain window swap chain instead (ADR-1).
 ///
 /// The variable is only set when the caller has not set it: an environment that cannot do
 /// this has to fail in the capture step, not be silently overridden.
@@ -381,7 +759,7 @@ fn disable_direct_composition() {
     if std::env::var_os("GPUI_DISABLE_DIRECT_COMPOSITION").is_none() {
         // SAFETY: nothing else runs in this process yet; the platform reads the variable
         // while it creates windows, which happens after this call.
-        unsafe { std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1") };
+        unsafe { std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1") }
     }
 }
 
@@ -390,14 +768,18 @@ fn start(
     cx: &mut App,
     options: &Options,
     root: &Path,
-    state: Arc<Mutex<ProbeState>>,
+    shots: Vec<Shot>,
+    state: Arc<Mutex<RunState>>,
 ) -> Result<(), String> {
-    let foreground_before = windows::foreground();
+    let first = shots
+        .first()
+        .copied()
+        .ok_or_else(|| "the run has no shots".to_owned())?;
     let (min_width, min_height) = super::MIN_WINDOW_SIZE;
     let window_options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
             point(px(0.0), px(0.0)),
-            size(px(options.width), px(options.height)),
+            size(px(first.variant.width), px(first.variant.height)),
         ))),
         window_min_size: Some(size(px(min_width), px(min_height))),
         titlebar: Some(TitlebarOptions {
@@ -406,47 +788,47 @@ fn start(
             traffic_light_position: None,
         }),
         app_id: Some(product::APP_ID.to_string()),
-        // The two options this probe exists to prove (R1): created hidden, and created
+        // The two options this tool exists to keep (R1): created hidden, and created
         // without taking the system's focus.
         show: false,
         focus: false,
         ..Default::default()
     };
 
-    let view_root = root.to_path_buf();
+    let window_root = root.to_path_buf();
     let handle = cx
         .open_window(window_options, move |window, cx| {
-            let view = cx.new(|cx| ShelluneView::for_capture(cx, Workspace::new(), &view_root));
-            // gpui's own focus, not the system's: it decides which element receives keys
-            // and which focus ring a frame draws, and it cannot reach another application.
+            let view = cx.new(|cx| ShelluneView::for_capture(cx, Workspace::new(), &window_root));
             window.focus(view.read(cx).root_focus());
             view
         })
         .map_err(|error| format!("the hidden window could not be created: {error:#}"))?;
 
     stage("hidden window created");
-    let task_options = options.clone();
+    let run_root = root.to_path_buf();
+    let run_options = options.clone();
     handle
         .update(cx, move |_, window, cx| {
             arm_frame_counter(window, state.clone());
             let state = state.clone();
-            let options = task_options;
+            let options = run_options;
+            let root = run_root;
             window
                 .spawn(cx, async move |wx| {
-                    probe(wx, &options, &state, foreground_before).await;
+                    run_shots(wx, &options, &root, &shots, &state).await;
                 })
                 .detach();
         })
-        .map_err(|error| format!("the capture window closed before it was captured: {error:#}"))?;
+        .map_err(|error| format!("the capture window closed before it was used: {error:#}"))?;
     Ok(())
 }
 
 /// Counts the frames the platform actually draws.
 ///
 /// A frame callback is one-shot, so each one arms the next: the count is then the number
-/// of frames the window system delivered, not the number the probe asked for.
+/// of frames the window system delivered, not the number the tool asked for.
 #[cfg(target_os = "windows")]
-fn arm_frame_counter(window: &mut Window, state: Arc<Mutex<ProbeState>>) {
+fn arm_frame_counter(window: &mut Window, state: Arc<Mutex<RunState>>) {
     window.on_next_frame(move |window, _cx| {
         if let Ok(mut state) = state.lock() {
             state.frames = state.frames.saturating_add(1);
@@ -456,177 +838,344 @@ fn arm_frame_counter(window: &mut Window, state: Arc<Mutex<ProbeState>>) {
 }
 
 #[cfg(target_os = "windows")]
-fn frames_drawn(state: &Arc<Mutex<ProbeState>>) -> u32 {
+fn frames_drawn(state: &Arc<Mutex<RunState>>) -> u32 {
     state.lock().map_or(0, |state| state.frames)
 }
 
-/// The whole run: settle, capture dark, capture light, and report what happened.
+/// Takes every shot, then writes the manifest and ends the process.
 #[cfg(target_os = "windows")]
-async fn probe(
+async fn run_shots(
     wx: &mut AsyncWindowContext,
     options: &Options,
-    state: &Arc<Mutex<ProbeState>>,
-    foreground_before: isize,
+    root: &Path,
+    shots: &[Shot],
+    state: &Arc<Mutex<RunState>>,
 ) {
     let started = Instant::now();
-    let mut report = Report {
-        logical_width: options.width,
-        logical_height: options.height,
-        foreground_before,
-        ..Report::default()
-    };
-    let outcome = run_probe(wx, options, state, &mut report).await;
-    report.elapsed_ms = started.elapsed().as_millis();
-    report.frames = frames_drawn(state);
-    report.foreground_after_fit = state
-        .lock()
-        .ok()
-        .and_then(|state| state.foreground_after_fit);
-    report.foreground_after_capture = Some(windows::foreground());
-    if let Ok(mut state) = state.lock() {
-        state.foreground_after_capture = Some(windows::foreground());
+    // The window's own view is drawn once before the first shot: the shell chrome is the
+    // same in every shot, and its images are decoded once per process. Warming it here
+    // means a shot never races an image that is still being decoded.
+    if let Err(error) = settle(wx, state, frames_drawn(state).saturating_add(SETTLE_FRAMES)).await {
+        let (ShotError::Scenario(reason) | ShotError::Window(reason)) = error;
+        stage(&format!("the warm-up frames could not be drawn: {reason}"));
     }
-    match outcome {
-        Ok(()) => report.status = "ok",
-        Err(message) => {
-            report.status = "failed";
-            report.error = Some(message);
+    let foreground_before = windows::foreground();
+    let mut manifest = Manifest::new(options, shots.len());
+    manifest.started = Some(now_text());
+    for (index, shot) in shots.iter().copied().enumerate() {
+        stage(&format!(
+            "shot {}/{}/{} {}-{} at {}x{}",
+            index + 1,
+            shots.len(),
+            shot.scenario.id,
+            shot.variant.theme_name(),
+            shot.variant.language_name(),
+            shot.variant.width as u32,
+            shot.variant.height as u32
+        ));
+        match capture_shot(wx, options, root, shot, index, state).await {
+            Ok(Some(record)) => manifest.records.push(record),
+            Ok(None) => {}
+            Err(ShotError::Scenario(reason)) => {
+                manifest.fail(Failure::shot(shot, reason));
+            }
+            Err(ShotError::Window(reason)) => {
+                // The window itself is gone or unreadable: every later shot would fail
+                // the same way, so the run stops with the reason it has.
+                manifest.fail(Failure::shot(shot, reason.clone()));
+                manifest.stopped = Some(reason);
+                break;
+            }
         }
     }
-    write_report(&options.out, &report, options);
+    let foreground_after = windows::foreground();
+    manifest.foreground = Some((foreground_before, foreground_after));
+    if foreground_after != foreground_before {
+        manifest.fail(Failure {
+            scenario: "*",
+            theme: options.theme.name(),
+            size: "*".to_owned(),
+            reason: format!(
+                "the foreground window changed during the run ({foreground_before} ->                  {foreground_after}); the capture must not touch another application"
+            ),
+        });
+    }
+    manifest.elapsed_ms = started.elapsed().as_millis();
+    manifest.scale_factor = state_scale(wx);
+    write_manifest(&options.out, &manifest);
+    let summary = manifest.to_json();
     println!(
         "{}",
-        serde_json::to_string_pretty(&report.to_json(options)).unwrap_or_default()
+        serde_json::to_string_pretty(&summary).unwrap_or_default()
     );
-    if report.status != "ok" {
-        eprintln!(
-            "shellune ui-capture: failed: {}",
-            report.error.as_deref().unwrap_or("unknown reason")
-        );
+    if manifest.status != "ok" {
+        for failure in &manifest.failures {
+            eprintln!(
+                "shellune ui-capture: failed {} {}-{}: {}",
+                failure.scenario, failure.theme, failure.size, failure.reason
+            );
+        }
     }
     if let Ok(mut state) = state.lock() {
-        state.exit_code = Some(i32::from(report.status != "ok"));
+        state.exit_code = Some(i32::from(manifest.status != "ok"));
     }
     let _ = wx.update(|_, cx| cx.quit());
 }
 
+/// The window's DPI scale, for the manifest's run-level line.
 #[cfg(target_os = "windows")]
-async fn run_probe(
-    wx: &mut AsyncWindowContext,
-    options: &Options,
-    state: &Arc<Mutex<ProbeState>>,
-    report: &mut Report,
-) -> Result<(), String> {
-    fit_window(wx, options).await?;
-    if let Ok(mut state) = state.lock() {
-        state.foreground_after_fit = Some(windows::foreground());
-    }
-    let (dark, dark_image) = grab(wx, options, state, ThemeChoice::Dark, "dark", report).await?;
-    report.captures.push(dark);
-    let (light, light_image) =
-        grab(wx, options, state, ThemeChoice::Light, "light", report).await?;
-    report.captures.push(light);
-
-    stage("both frames captured");
-    let ratio = pixel_difference(&dark_image, &light_image)?;
-    report.theme_pixel_ratio = Some(ratio);
-    if ratio < THEME_PIXEL_FLOOR {
-        return Err(format!(
-            "the two palettes changed only {:.2}% of the pixels (floor {:.0}%), so the theme is \
-             not reaching the rendered frame",
-            ratio * 100.0,
-            THEME_PIXEL_FLOOR * 100.0
-        ));
-    }
-
-    let visible: Vec<&str> = report
-        .captures
-        .iter()
-        .filter(|capture| capture.window_visible)
-        .map(|capture| capture.theme)
-        .collect();
-    if !visible.is_empty() {
-        return Err(format!(
-            "the capture window was reported visible while {} was captured",
-            visible.join(", ")
-        ));
-    }
-    let foreground_after = windows::foreground();
-    if foreground_after != report.foreground_before {
-        return Err(format!(
-            "the foreground window changed during the run ({} -> {foreground_after}); the probe \
-             must not touch another application",
-            report.foreground_before
-        ));
-    }
-    Ok(())
+fn state_scale(wx: &mut AsyncWindowContext) -> f64 {
+    wx.update(|window, _cx| f64::from(window.scale_factor()))
+        .unwrap_or(0.0)
 }
 
-/// Gives the hidden window the client area the run asked for.
-///
-/// A window that is created hidden never receives its initial placement, so it keeps the
-/// size the system chose; the probe sets the size it wants and waits until the system
-/// reports it, instead of assuming the window honoured it.
+/// A step that failed, and whether the window or the scenario is to blame.
 #[cfg(target_os = "windows")]
-async fn fit_window(wx: &mut AsyncWindowContext, options: &Options) -> Result<(), String> {
-    stage("sizing the hidden window");
+enum ShotError {
+    /// The scenario never arrived, or its fixture could not be written.
+    Scenario(String),
+    /// The window could not be sized, painted or read.
+    Window(String),
+}
+
+impl From<String> for ShotError {
+    fn from(reason: String) -> Self {
+        Self::Window(reason)
+    }
+}
+
+/// Takes one shot: fresh view, fresh isolated root, waited-for state, stable frame.
+#[cfg(target_os = "windows")]
+async fn capture_shot(
+    wx: &mut AsyncWindowContext,
+    options: &Options,
+    root: &Path,
+    shot: Shot,
+    index: usize,
+    state: &Arc<Mutex<RunState>>,
+) -> Result<Option<Record>, ShotError> {
+    let shot_root = root.join(format!(
+        "{:02}-{}",
+        index,
+        shot.variant.file_stem(shot.scenario.id)
+    ));
+    // A root that is the same on every run keeps anything the shell renders from the data
+    // directory (a notice naming it, for one) out of the picture as a run-to-run difference.
+    if let Err(error) = std::fs::remove_dir_all(&shot_root)
+        && shot_root.exists()
+    {
+        return Err(ShotError::Scenario(format!(
+            "the isolated root {} from an earlier run could not be cleared: {error}",
+            shot_root.display()
+        )));
+    }
+    std::fs::create_dir_all(&shot_root).map_err(|error| {
+        ShotError::Scenario(format!(
+            "the isolated root {} could not be created: {error}",
+            shot_root.display()
+        ))
+    })?;
+
+    let outcome = capture_in(wx, options, &shot_root, shot, state).await;
+    // The directory goes away whether the shot worked or not: its stores are the
+    // fixture, not the evidence.
+    if let Err(error) = std::fs::remove_dir_all(&shot_root) {
+        stage(&format!(
+            "could not remove the isolated root {}: {error}",
+            shot_root.display()
+        ));
+    }
+    outcome
+}
+
+#[cfg(target_os = "windows")]
+async fn capture_in(
+    wx: &mut AsyncWindowContext,
+    options: &Options,
+    shot_root: &Path,
+    shot: Shot,
+    state: &Arc<Mutex<RunState>>,
+) -> Result<Option<Record>, ShotError> {
+    if let Err(reason) = (shot.scenario.prepare)(shot_root) {
+        return Err(ShotError::Scenario(reason));
+    }
+    fit_window(wx, shot.variant.width, shot.variant.height).await?;
+    install_view(wx, shot, shot_root)?;
+    wait_ready(wx, shot).await?;
+    let Accepted {
+        image,
+        distinct_colors,
+        mean_luminance,
+        uniform_colour,
+        pixel_crc32,
+        window_visible,
+        frames,
+        scale,
+    } = stable_frame(wx, state).await?;
+
+    let file = format!("{}.png", shot.variant.file_stem(shot.scenario.id));
+    let path = options.out.join(&file);
+    let png = encode_png(image.width, image.height, &image.rgb);
+    std::fs::write(&path, &png).map_err(|error| {
+        ShotError::Window(format!(
+            "could not write {}: {error} (the frame itself was read back)",
+            path.display()
+        ))
+    })?;
+
+    let expected_width = (f64::from(shot.variant.width) * scale).round() as u32;
+    let expected_height = (f64::from(shot.variant.height) * scale).round() as u32;
+    let near = |want: u32, got: u32| want.abs_diff(got) <= 1;
+    if !near(expected_width, image.width) || !near(expected_height, image.height) {
+        return Err(ShotError::Window(format!(
+            "the frame is {}x{} physical pixels but a {}x{} logical window at scale {scale} \
+             should be {expected_width}x{expected_height}; {} was kept",
+            image.width,
+            image.height,
+            shot.variant.width as u32,
+            shot.variant.height as u32,
+            path.display()
+        )));
+    }
+    if distinct_colors < DISTINCT_COLOR_FLOOR {
+        return Err(ShotError::Window(format!(
+            "the frame holds only {distinct_colors} distinct colour(s) ({uniform_colour}), so \
+             the GPU back buffer did not contain the page; {} was kept",
+            path.display()
+        )));
+    }
+    if window_visible {
+        return Err(ShotError::Window(format!(
+            "the capture window was visible while the frame was read; {} was kept",
+            path.display()
+        )));
+    }
+    Ok(Some(Record {
+        file,
+        scenario: shot.scenario.id,
+        title: shot.scenario.title,
+        category: shot.scenario.category.id(),
+        theme: shot.variant.theme_name(),
+        language: shot.variant.language_name(),
+        zoom_percent: shot.variant.zoom_percent(),
+        logical_width: shot.variant.width,
+        logical_height: shot.variant.height,
+        physical_width: image.width,
+        physical_height: image.height,
+        scale_factor: scale,
+        bytes: png.len() as u64,
+        distinct_colors,
+        mean_luminance,
+        pixel_crc32,
+        window_visible,
+        frames,
+        fixture: shot.scenario.fixture,
+        evidence: shot.scenario.evidence,
+    }))
+}
+
+/// Builds the shot's shell in the window, with every store under the shot's own root.
+#[cfg(target_os = "windows")]
+fn install_view(
+    wx: &mut AsyncWindowContext,
+    shot: Shot,
+    shot_root: &Path,
+) -> Result<(), ShotError> {
+    let root = shot_root.to_path_buf();
+    let scenario = shot.scenario;
+    let variant = shot.variant;
+    wx.update(|window, cx| {
+        let workspace = (scenario.start)();
+        let view = window.replace_root(cx, move |_window, cx| {
+            ShelluneView::for_capture(cx, workspace, &root)
+        });
+        window.focus(view.read(cx).root_focus());
+        view.update(cx, |view, cx| {
+            scenarios::install(scenario, variant, view, window, cx)
+        })
+    })
+    .map_err(|error| ShotError::Window(format!("the capture window went away: {error:#}")))?
+    .map_err(ShotError::Scenario)
+}
+
+/// Waits until the scenario reports its state, painting the hidden window while it waits.
+///
+/// A hidden window is not painted by the system, so the wait has to keep asking for a
+/// frame; a fixed sleep would be a guess about how slow the machine is.
+#[cfg(target_os = "windows")]
+async fn wait_ready(wx: &mut AsyncWindowContext, shot: Shot) -> Result<(), ShotError> {
     let started = Instant::now();
     loop {
-        let measured = on_window(wx, |window, _cx| {
-            let scale = f64::from(window.scale_factor());
-            let handle = hwnd(window)?;
-            let (width, height) = windows::client_size(handle)?;
-            let expected_width = (f64::from(options.width) * scale).round() as i32;
-            let expected_height = (f64::from(options.height) * scale).round() as i32;
-            if width.abs_diff(expected_width) > 1 || height.abs_diff(expected_height) > 1 {
-                windows::resize_client(handle, expected_width, expected_height)?;
-            }
-            Ok((width, height, scale))
+        // A window that went away is not a scenario that has not arrived yet: the first
+        // ends the shot, the second is waited out.
+        let verdict = on_window(wx, |window, cx| {
+            let Some(view) = window.root::<ShelluneView>().flatten() else {
+                return Err("the capture window lost its shell view".to_owned());
+            };
+            Ok((shot.scenario.ready)(view.read(cx), cx).err())
         })?;
-        let (width, height, scale) = measured;
-        let expected_width = (f64::from(options.width) * scale).round() as i32;
-        let expected_height = (f64::from(options.height) * scale).round() as i32;
-        if width.abs_diff(expected_width) <= 1 && height.abs_diff(expected_height) <= 1 {
+        let Some(reason) = verdict else {
             return Ok(());
-        }
+        };
         if started.elapsed() > SETTLE_TIMEOUT {
-            let logical_width = options.width;
-            let logical_height = options.height;
-            return Err(format!(
-                "the hidden window is {width}x{height} physical pixels after {} ms; a \
-                 {logical_width}x{logical_height} logical window at scale {scale} should be \
-                 {expected_width}x{expected_height}",
+            return Err(ShotError::Scenario(format!(
+                "the scenario never arrived within {} ms: {reason}",
                 SETTLE_TIMEOUT.as_millis()
-            ));
+            )));
         }
+        paint_once(wx)?;
         wx.background_executor().timer(SETTLE_POLL).await;
     }
 }
 
-/// Switches the palette, waits for frames drawn in it, reads the client area and writes it
-/// as a PNG.
+/// Reads the frame back until two consecutive readbacks are byte-identical.
+///
+/// That is what "settled" means here: fonts, layout and the terminal grid have all been
+/// drawn, and the next frame would be the same picture. It is a property observed on the
+/// pixels, not a number of milliseconds.
 #[cfg(target_os = "windows")]
-async fn grab(
+async fn stable_frame(
     wx: &mut AsyncWindowContext,
-    options: &Options,
-    state: &Arc<Mutex<ProbeState>>,
-    choice: ThemeChoice,
-    name: &'static str,
-    report: &mut Report,
-) -> Result<(Capture, windows::Image), String> {
-    stage(&format!("capturing {name}"));
-    set_theme(wx, choice)?;
+    state: &Arc<Mutex<RunState>>,
+) -> Result<Accepted, ShotError> {
+    let started = Instant::now();
     let target = frames_drawn(state).saturating_add(SETTLE_FRAMES);
     settle(wx, state, target).await?;
+    let mut previous = grab(wx, state)?;
+    let mut reference = Instant::now();
+    loop {
+        if started.elapsed() > SETTLE_TIMEOUT {
+            return Err(ShotError::Window(format!(
+                "the frame never stopped changing within {} ms, so the shot cannot be called \
+                 deterministic",
+                SETTLE_TIMEOUT.as_millis()
+            )));
+        }
+        // Keep the hidden window painting while the observation window runs: a hidden
+        // window is not painted by the system, so waiting without asking for frames
+        // would only wait.
+        settle(wx, state, frames_drawn(state).saturating_add(1)).await?;
+        wx.background_executor().timer(SETTLE_POLL).await;
+        if reference.elapsed() < STABLE_WINDOW {
+            continue;
+        }
+        let next = grab(wx, state)?;
+        let same = previous.image.width == next.image.width
+            && previous.image.height == next.image.height
+            && previous.image.rgb == next.image.rgb;
+        if same {
+            return Ok(next);
+        }
+        previous = next;
+        reference = Instant::now();
+    }
+}
 
-    let path = options.out.join(format!(
-        "home-{}x{}-{name}.png",
-        options.width as u32, options.height as u32
-    ));
-    let capture_path = path.clone();
-    let width = options.width;
-    let height = options.height;
-    let (capture, image) = on_window(wx, move |window, _cx| {
+/// Reads the hidden window's frame back and measures it.
+#[cfg(target_os = "windows")]
+fn grab(wx: &mut AsyncWindowContext, state: &Arc<Mutex<RunState>>) -> Result<Accepted, ShotError> {
+    let frames = frames_drawn(state);
+    on_window(wx, |window, _cx| {
         let handle = hwnd(window)?;
         // Read before the capture: the question is what the system said while the pixels
         // were taken, not after.
@@ -638,81 +1187,68 @@ async fn grab(
             rgb: frame.rgb,
         };
         let stats = analyse(&image)?;
-
-        let scale = f64::from(window.scale_factor());
-        report.scale_factor = scale;
-        let expected_width = (f64::from(width) * scale).round() as u32;
-        let expected_height = (f64::from(height) * scale).round() as u32;
-        let near = |want: u32, got: u32| want.abs_diff(got) <= 1;
-
-        // Written before it is judged: a failed run has to leave the image that failed.
-        let png = encode_png(image.width, image.height, &image.rgb);
-        std::fs::write(&capture_path, &png).map_err(|error| {
-            format!(
-                "could not write {}: {error} (the frame itself was read back)",
-                capture_path.display()
-            )
-        })?;
-
-        if !near(expected_width, image.width) || !near(expected_height, image.height) {
-            return Err(format!(
-                "the frame is {}x{} physical pixels but a {width}x{height} logical window at \
-                 scale {scale} should be {expected_width}x{expected_height}; {} was kept",
-                image.width,
-                image.height,
-                capture_path.display()
-            ));
-        }
-        if stats.distinct_colors < DISTINCT_COLOR_FLOOR {
-            return Err(format!(
-                "the frame holds only {} distinct colour(s) ({}), so the GPU back buffer did not \
-                 contain the page; {} was kept",
-                stats.distinct_colors,
-                stats.uniform_colour,
-                capture_path.display()
-            ));
-        }
-
-        Ok((
-            Capture {
-                theme: name,
-                path: capture_path.clone(),
-                width: image.width,
-                height: image.height,
-                bytes: png.len() as u64,
-                distinct_colors: stats.distinct_colors,
-                mean_luminance: stats.mean_luminance,
-                window_visible,
-            },
+        Ok(Accepted {
+            pixel_crc32: Crc32::of(&image.rgb),
             image,
-        ))
-    })?;
-    Ok((capture, image))
+            distinct_colors: stats.distinct_colors,
+            mean_luminance: stats.mean_luminance,
+            uniform_colour: stats.uniform_colour,
+            window_visible,
+            frames,
+            scale: f64::from(window.scale_factor()),
+        })
+    })
 }
 
+/// Gives the hidden window the client area the shot asks for.
+///
+/// A window that is created hidden never receives its initial placement, so it keeps the
+/// size the system chose; the tool sets the size it wants and waits until the system
+/// reports it, instead of assuming the window honoured it.
 #[cfg(target_os = "windows")]
-fn set_theme(wx: &mut AsyncWindowContext, choice: ThemeChoice) -> Result<(), String> {
-    wx.update_root(move |view, _window, cx| {
-        let view = view
-            .downcast::<ShelluneView>()
-            .map_err(|_| "the capture window is not a Shellune view".to_owned())?;
-        view.update(cx, |view, cx| view.set_capture_theme(choice, cx));
-        Ok(())
-    })
-    .map_err(|error| format!("the capture window went away: {error:#}"))?
+async fn fit_window(wx: &mut AsyncWindowContext, width: f32, height: f32) -> Result<(), ShotError> {
+    let started = Instant::now();
+    loop {
+        let measured = on_window(wx, |window, _cx| {
+            let scale = f64::from(window.scale_factor());
+            let handle = hwnd(window)?;
+            let (actual_width, actual_height) = windows::client_size(handle)?;
+            let expected_width = (f64::from(width) * scale).round() as i32;
+            let expected_height = (f64::from(height) * scale).round() as i32;
+            if actual_width.abs_diff(expected_width) > 1
+                || actual_height.abs_diff(expected_height) > 1
+            {
+                windows::resize_client(handle, expected_width, expected_height)?;
+            }
+            Ok((actual_width, actual_height, scale))
+        })?;
+        let (actual_width, actual_height, scale) = measured;
+        let expected_width = (f64::from(width) * scale).round() as i32;
+        let expected_height = (f64::from(height) * scale).round() as i32;
+        if actual_width.abs_diff(expected_width) <= 1
+            && actual_height.abs_diff(expected_height) <= 1
+        {
+            return Ok(());
+        }
+        if started.elapsed() > SETTLE_TIMEOUT {
+            return Err(ShotError::Window(format!(
+                "the hidden window is {actual_width}x{actual_height} physical pixels after {} ms; \
+                 a {width}x{height} logical window at scale {scale} should be \
+                 {expected_width}x{expected_height}",
+                SETTLE_TIMEOUT.as_millis()
+            )));
+        }
+        wx.background_executor().timer(SETTLE_POLL).await;
+    }
 }
 
 /// Asks the window to paint until it has drawn `target` frames.
-///
-/// Each pass marks the window dirty and posts the paint message the platform posts when a
-/// visible window needs a new frame. The message is handled after the closure returns, so
-/// gpui never draws while the caller still holds its state.
 #[cfg(target_os = "windows")]
 async fn settle(
     wx: &mut AsyncWindowContext,
-    state: &Arc<Mutex<ProbeState>>,
+    state: &Arc<Mutex<RunState>>,
     target: u32,
-) -> Result<(), String> {
+) -> Result<(), ShotError> {
     let started = Instant::now();
     loop {
         let drawn = frames_drawn(state);
@@ -720,19 +1256,27 @@ async fn settle(
             return Ok(());
         }
         if started.elapsed() > SETTLE_TIMEOUT {
-            return Err(format!(
-                "the hidden window drew {drawn} frame(s) in {} ms, short of the {target} needed; \
-                 a window that is never shown is not being painted by the system",
+            return Err(ShotError::Window(format!(
+                "the hidden window drew {drawn} frame(s) in {} ms, short of the {target} needed",
                 SETTLE_TIMEOUT.as_millis()
-            ));
+            )));
         }
-        on_window(wx, |window, _cx| {
-            window.refresh();
-            windows::post_paint(hwnd(window)?);
-            Ok(())
-        })?;
+        paint_once(wx)?;
         wx.background_executor().timer(SETTLE_POLL).await;
     }
+}
+
+/// Marks the window dirty and posts the paint message the platform posts for a visible
+/// window. The message is handled after the closure returns, so gpui never draws while
+/// the caller still holds its state.
+#[cfg(target_os = "windows")]
+fn paint_once(wx: &mut AsyncWindowContext) -> Result<(), ShotError> {
+    on_window(wx, |window, _cx| {
+        window.refresh();
+        windows::post_paint(hwnd(window)?);
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Runs a closure against the window, turning a closed window into a readable reason.
@@ -740,10 +1284,12 @@ async fn settle(
 fn on_window<T>(
     wx: &mut AsyncWindowContext,
     work: impl FnOnce(&mut Window, &mut App) -> Result<T, String>,
-) -> Result<T, String> {
+) -> Result<T, ShotError> {
     match wx.update(work) {
-        Ok(result) => result,
-        Err(error) => Err(format!("the capture window went away: {error:#}")),
+        Ok(result) => result.map_err(ShotError::Window),
+        Err(error) => Err(ShotError::Window(format!(
+            "the capture window went away: {error:#}"
+        ))),
     }
 }
 
@@ -760,18 +1306,18 @@ fn hwnd(window: &Window) -> Result<windows::Handle, String> {
     }
 }
 
-/// Ends the run when the probe could not even start.
+/// Ends the run when the tool could not even start.
 #[cfg(target_os = "windows")]
-fn fail(cx: &mut App, options: &Options, state: &Arc<Mutex<ProbeState>>, message: String) {
-    let report = Report {
-        status: "failed",
-        error: Some(message.clone()),
-        logical_width: options.width,
-        logical_height: options.height,
-        frames: frames_drawn(state),
-        ..Report::default()
-    };
-    write_report(&options.out, &report, options);
+fn fail(cx: &mut App, options: &Options, state: &Arc<Mutex<RunState>>, message: String) {
+    let mut manifest = Manifest::new(options, 0);
+    manifest.started = Some(now_text());
+    manifest.fail(Failure {
+        scenario: "*",
+        theme: options.theme.name(),
+        size: "*".to_owned(),
+        reason: message.clone(),
+    });
+    write_manifest(&options.out, &manifest);
     eprintln!("shellune ui-capture: failed: {message}");
     if let Ok(mut state) = state.lock() {
         state.exit_code = Some(1);
@@ -779,10 +1325,10 @@ fn fail(cx: &mut App, options: &Options, state: &Arc<Mutex<ProbeState>>, message
     cx.quit();
 }
 
-fn write_report(out: &Path, report: &Report, options: &Options) {
-    let path = out.join("capture-probe.json");
-    let json = report.to_json(options);
-    match serde_json::to_vec_pretty(&json) {
+/// Writes the manifest beside the images it describes.
+fn write_manifest(out: &Path, manifest: &Manifest) {
+    let path = out.join(MANIFEST_FILE);
+    match serde_json::to_vec_pretty(&manifest.to_json()) {
         Ok(bytes) => {
             if let Err(error) = std::fs::write(&path, bytes) {
                 eprintln!(
@@ -791,8 +1337,42 @@ fn write_report(out: &Path, report: &Report, options: &Options) {
                 );
             }
         }
-        Err(error) => eprintln!("shellune ui-capture: could not encode the report: {error}"),
+        Err(error) => eprintln!("shellune ui-capture: could not encode the manifest: {error}"),
     }
+}
+
+/// The wall clock of the run, so a gallery can say when the baseline was taken.
+#[cfg(target_os = "windows")]
+fn now_text() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let days = seconds / 86_400;
+    let time = seconds % 86_400;
+    // A UTC stamp in the ISO 8601 form, computed without a calendar crate: the gallery
+    // only has to show a consistent, sortable time.
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        time / 3_600,
+        (time % 3_600) / 60,
+        time % 60
+    )
+}
+
+/// Days since 1970-01-01 to a calendar date (Howard Hinnant's civil_from_days).
+#[cfg(target_os = "windows")]
+fn civil_from_days(days: u64) -> (i64, u32, u32) {
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// What a frame holds, in the terms the validation speaks: is it a page at all.
@@ -823,10 +1403,10 @@ fn analyse(image: &windows::Image) -> Result<Stats, String> {
         }
         sum += luminance(pixel);
     }
-    let pixels = (image.rgb.len() / 3) as f64;
+    let count = (image.rgb.len() / 3) as f64;
     Ok(Stats {
         distinct_colors: seen.len(),
-        mean_luminance: sum / pixels,
+        mean_luminance: sum / count,
         uniform_colour: format!("#{:02x}{:02x}{:02x}", first[0], first[1], first[2]),
     })
 }
@@ -839,34 +1419,10 @@ fn luminance(pixel: &[u8]) -> f64 {
     ) / 255.0
 }
 
-/// The share of pixels that differ between two frames of the same size.
-#[cfg(target_os = "windows")]
-fn pixel_difference(left: &windows::Image, right: &windows::Image) -> Result<f64, String> {
-    if left.width != right.width || left.height != right.height {
-        return Err(format!(
-            "the two frames are different sizes ({}x{} and {}x{}), so they cannot be compared",
-            left.width, left.height, right.width, right.height
-        ));
-    }
-    let (lefts, _) = left.rgb.as_chunks::<3>();
-    let (rights, _) = right.rgb.as_chunks::<3>();
-    let mut different = 0usize;
-    for (left, right) in lefts.iter().zip(rights.iter()) {
-        if left
-            .iter()
-            .zip(right)
-            .any(|(left, right)| left.abs_diff(*right) > 8)
-        {
-            different += 1;
-        }
-    }
-    Ok(different as f64 / lefts.len() as f64)
-}
-
-/// A PNG of the frame, encoded here so the probe needs no image crate.
+/// A PNG of the frame, encoded here so the tool needs no image crate.
 ///
-/// The deflate stream uses stored blocks: the probe's job is proving a capture path, not
-/// compressing an image, and a stored stream cannot disagree with the pixels.
+/// The deflate stream uses stored blocks: the job is recording a frame, not compressing
+/// an image, and a stored stream cannot disagree with the pixels.
 #[cfg(target_os = "windows")]
 fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -937,6 +1493,14 @@ impl Crc32 {
         Self(0xffff_ffff)
     }
 
+    /// The CRC of a whole buffer, as the manifest reports it: two runs of the same shot
+    /// can be compared without keeping the PNG.
+    fn of(data: &[u8]) -> u32 {
+        let mut crc = Self::new();
+        crc.update(data);
+        crc.finish()
+    }
+
     fn update(&mut self, data: &[u8]) {
         for byte in data {
             let mut value = (self.0 ^ u32::from(*byte)) & 0xff;
@@ -955,13 +1519,316 @@ impl Crc32 {
         self.0 ^ 0xffff_ffff
     }
 }
-/// The decision logic the probe runs on the pixels it read.
-///
-/// These run without a window: what is left to test on a machine that cannot capture is
-/// whether a blank frame is rejected, whether two palettes are told apart, and whether
-/// the PNG the probe writes is a PNG.
+
+/// The decision logic the tool runs without a window: what a run covers, what a shot is
+/// called, and what the manifest says about it.
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use crate::app::theme::ThemeChoice;
+
+    fn options(args: &[&str]) -> Options {
+        let arguments: Vec<String> = args.iter().map(|argument| (*argument).to_owned()).collect();
+        Options::parse(&arguments).expect("the arguments parse")
+    }
+
+    fn record() -> Record {
+        Record {
+            file: "home-hosts-1120x720-dark.png".to_owned(),
+            scenario: "home-hosts",
+            title: "首页",
+            category: "home",
+            theme: "dark",
+            language: "en",
+            zoom_percent: 100,
+            logical_width: 1120.0,
+            logical_height: 720.0,
+            physical_width: 1120,
+            physical_height: 720,
+            scale_factor: 1.0,
+            bytes: 4096,
+            distinct_colors: 512,
+            mean_luminance: 0.2,
+            pixel_crc32: 0x1234_5678,
+            window_visible: false,
+            frames: 7,
+            fixture: "six saved hosts",
+            evidence: "says nothing about a live shell",
+        }
+    }
+
+    #[test]
+    fn a_pattern_matches_what_the_help_says_it_matches() {
+        assert!(matches_pattern("home-hosts", "home-hosts"));
+        assert!(matches_pattern("home-*", "home-hosts"));
+        assert!(matches_pattern("*", "settings"));
+        assert!(matches_pattern("home-?osts", "home-hosts"));
+        assert!(!matches_pattern("home-*", "settings"));
+        assert!(!matches_pattern("home-hosts", "home-hosts-2"));
+        assert!(!matches_pattern("", "home-hosts"));
+    }
+
+    #[test]
+    fn an_argument_the_help_does_not_list_is_refused() {
+        let arguments = vec!["--nothing".to_owned()];
+        assert!(Options::parse(&arguments).is_err());
+        let arguments = vec!["--theme".to_owned(), "sepia".to_owned()];
+        assert!(Options::parse(&arguments).is_err());
+        let arguments = vec!["--size".to_owned(), "wide".to_owned()];
+        assert!(Options::parse(&arguments).is_err());
+        let arguments = vec!["--size".to_owned(), "0x720".to_owned()];
+        assert!(Options::parse(&arguments).is_err());
+        let arguments = vec!["--only".to_owned()];
+        assert!(Options::parse(&arguments).is_err());
+    }
+
+    #[test]
+    fn the_flags_are_read_as_they_are_written() {
+        let parsed = options(&[
+            "--quick",
+            "--theme",
+            "light",
+            "--size",
+            "1120x720",
+            "--size",
+            "720",
+            "--only",
+            "home-*,settings",
+            "--out",
+            "somewhere/else",
+        ]);
+        assert!(parsed.quick);
+        assert_eq!(parsed.theme, ThemeFilter::Light);
+        assert_eq!(parsed.sizes, vec![(1120.0, Some(720.0)), (720.0, None)]);
+        assert_eq!(
+            parsed.only,
+            vec!["home-*".to_owned(), "settings".to_owned()]
+        );
+        assert_eq!(parsed.mode(), "quick");
+        assert_eq!(parsed.out, PathBuf::from("somewhere/else"));
+    }
+
+    #[test]
+    fn the_quick_run_covers_the_main_pages_in_dark_only() {
+        let parsed = options(&["--quick"]);
+        assert_eq!(parsed.theme, ThemeFilter::Dark);
+        let shots = plan(&parsed).expect("the quick run has shots");
+        let quick: Vec<&str> = SCENARIOS
+            .iter()
+            .filter(|scenario| scenario.quick)
+            .map(|scenario| scenario.id)
+            .collect();
+        assert!(!quick.is_empty());
+        assert_eq!(shots.len(), quick.len(), "one shot per quick page");
+        for shot in &shots {
+            assert!(
+                shot.scenario.quick,
+                "{} is not a quick page",
+                shot.scenario.id
+            );
+            assert_eq!(shot.variant.theme, ThemeChoice::Dark);
+            assert_eq!(shot.variant.width, crate::app::DEFAULT_WINDOW_SIZE.0);
+        }
+        for id in quick {
+            assert!(
+                shots.iter().any(|shot| shot.scenario.id == id),
+                "the quick run left out {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_run_shoots_every_scenario_in_both_palettes() {
+        let parsed = options(&[]);
+        let shots = plan(&parsed).expect("a full run has shots");
+        let expected: usize = SCENARIOS
+            .iter()
+            .map(|scenario| scenario.shots().len())
+            .sum();
+        assert_eq!(shots.len(), expected);
+        for scenario in SCENARIOS {
+            for theme in [ThemeChoice::Dark, ThemeChoice::Light] {
+                assert!(
+                    shots
+                        .iter()
+                        .any(|shot| shot.scenario.id == scenario.id && shot.variant.theme == theme),
+                    "{} is missing its {theme:?} shot",
+                    scenario.id
+                );
+            }
+        }
+        // No shot is ever taken in the palette the machine happens to be in.
+        assert!(
+            shots
+                .iter()
+                .all(|shot| shot.variant.theme != ThemeChoice::System)
+        );
+    }
+
+    #[test]
+    fn the_theme_and_size_flags_narrow_the_matrix_without_inventing_shots() {
+        let light = plan(&options(&["--theme", "light"])).expect("the light run has shots");
+        assert!(
+            light
+                .iter()
+                .all(|shot| shot.variant.theme == ThemeChoice::Light)
+        );
+        assert!(!light.is_empty());
+
+        let smallest = plan(&options(&["--size", "720x480"])).expect("the smallest size has shots");
+        assert!(!smallest.is_empty());
+        assert!(smallest.iter().all(|shot| {
+            shot.variant.width == crate::app::MIN_WINDOW_SIZE.0
+                && shot.variant.height == crate::app::MIN_WINDOW_SIZE.1
+        }));
+
+        let width_only = plan(&options(&["--size", "1120"])).expect("the width has shots");
+        assert!(
+            width_only
+                .iter()
+                .all(|shot| shot.variant.width == crate::app::DEFAULT_WINDOW_SIZE.0)
+        );
+
+        // A size no scenario is shot in is a mistake worth reporting, not an empty run.
+        assert!(plan(&options(&["--size", "4096x2160"])).is_err());
+    }
+
+    #[test]
+    fn only_narrows_to_the_named_scenarios_and_says_so_when_nothing_matches() {
+        let shots = plan(&options(&["--only", "home-*"])).expect("the pattern matches");
+        assert!(!shots.is_empty());
+        assert!(
+            shots
+                .iter()
+                .all(|shot| shot.scenario.id.starts_with("home-"))
+        );
+
+        let both =
+            plan(&options(&["--only", "settings,terminal-local"])).expect("the list matches");
+        let mut ids: Vec<&str> = both.iter().map(|shot| shot.scenario.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids, vec!["settings", "terminal-local"]);
+
+        // A typo must not quietly produce a run of something else.
+        assert!(plan(&options(&["--only", "nope-*"])).is_err());
+        // Quick mode only covers the pages it has shots for.
+        assert!(plan(&options(&["--quick", "--only", "overlay-*"])).is_err());
+    }
+
+    #[test]
+    fn the_plan_is_ordered_by_window_size_so_the_window_is_resized_once() {
+        let shots = plan(&options(&[])).expect("a full run has shots");
+        let sizes: Vec<(u32, u32)> = shots
+            .iter()
+            .map(|shot| (shot.variant.width as u32, shot.variant.height as u32))
+            .collect();
+        let mut sorted = sizes.clone();
+        sorted.sort_unstable();
+        assert_eq!(sizes, sorted, "shots are grouped by window size");
+        // And two runs of the same command produce the same list, in the same order.
+        let again = plan(&options(&[])).expect("a full run has shots");
+        let left: Vec<(String, &'static str)> = shots
+            .iter()
+            .map(|shot| (shot.scenario.id.to_owned(), shot.variant.theme_name()))
+            .collect();
+        let right: Vec<(String, &'static str)> = again
+            .iter()
+            .map(|shot| (shot.scenario.id.to_owned(), shot.variant.theme_name()))
+            .collect();
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn a_file_name_says_theme_size_text_and_language() {
+        let plain = Variant::dark();
+        assert_eq!(plain.file_stem("home-hosts"), "home-hosts-1120x720-dark");
+        let light = Variant::light();
+        assert_eq!(light.file_stem("settings"), "settings-1120x720-light");
+        let named = Variant::dark().smallest().comfortable().chinese();
+        // The private builders are used through a scenario below; this asserts the
+        // spelling of each modifier instead.
+        assert_eq!(named.zoom_percent(), 115);
+        assert_eq!(named.language_name(), "zh");
+        assert_eq!(named.theme_name(), "dark");
+        assert_eq!(named.width, crate::app::MIN_WINDOW_SIZE.0);
+        let expected = format!(
+            "terminal-local-{}x{}-dark-z115-zh",
+            crate::app::MIN_WINDOW_SIZE.0 as u32,
+            crate::app::MIN_WINDOW_SIZE.1 as u32
+        );
+        assert_eq!(named.file_stem("terminal-local"), expected);
+    }
+
+    #[test]
+    fn the_manifest_names_every_fact_a_shot_was_drawn_with() {
+        let mut manifest = Manifest::new(&options(&["--quick"]), 3);
+        manifest.records.push(record());
+        let json = manifest.to_json();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["mode"], "quick");
+        assert_eq!(json["window"]["show"], false);
+        assert_eq!(json["window"]["focus"], false);
+        assert!(
+            json["isolation"]["credentials"]
+                .as_str()
+                .is_some_and(|text| text.contains("Memory"))
+        );
+        assert!(
+            json["evidence_boundary"]
+                .as_array()
+                .is_some_and(|lines| lines.len() >= 3)
+        );
+        let shot = &json["shots"][0];
+        for key in [
+            "theme",
+            "language",
+            "zoom_percent",
+            "logical_width",
+            "logical_height",
+            "physical_width",
+            "physical_height",
+            "scale_factor",
+            "fixture",
+            "evidence_boundary",
+            "pixel_crc32",
+            "window_visible_during_capture",
+        ] {
+            assert!(!shot[key].is_null(), "the shot has no {key}");
+        }
+        assert_eq!(shot["theme"], "dark");
+        assert_eq!(shot["language"], "en");
+        assert_eq!(shot["dpi_percent"], 100.0);
+        assert_eq!(shot["pixel_crc32"], "12345678");
+    }
+
+    #[test]
+    fn a_failed_run_says_which_shot_failed_and_why() {
+        let parsed = options(&["--quick"]);
+        let shots = plan(&parsed).expect("the quick run has shots");
+        let mut manifest = Manifest::new(&parsed, shots.len());
+        manifest.fail(Failure::shot(shots[0], "the scenario never arrived"));
+        let json = manifest.to_json();
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["planned_shots"], shots.len());
+        assert_eq!(json["captured_shots"], 0);
+        assert_eq!(json["failures"][0]["scenario"], shots[0].scenario.id);
+        assert_eq!(json["failures"][0]["reason"], "the scenario never arrived");
+    }
+
+    #[test]
+    fn the_run_stamp_is_a_sortable_utc_time() {
+        // 2026-11-12 is 20767 days after the epoch; the stamp has to be parseable and
+        // ordered, which is all the gallery asks of it.
+        assert_eq!(civil_from_days(20_769), (2026, 11, 12));
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(59), (1970, 3, 1));
+    }
+}
+
+/// The pixel decisions the tool runs on the frames it read.
 #[cfg(all(test, target_os = "windows"))]
-mod tests {
+mod frame_tests {
     use super::*;
 
     fn image(width: u32, height: u32, pixels: impl Fn(u32, u32) -> [u8; 3]) -> windows::Image {
@@ -986,8 +1853,6 @@ mod tests {
 
     #[test]
     fn a_drawn_frame_clears_the_colour_floor_a_blank_one_cannot() {
-        // A page has text, borders and two surfaces: the floor exists to separate that
-        // from the one colour a window with nothing to render answers with.
         let drawn = image(16, 16, |x, y| [x as u8, y as u8, 0x40]);
         let stats = analyse(&drawn).expect("a frame with pixels is analysed");
         assert_eq!(stats.distinct_colors, 256);
@@ -995,20 +1860,12 @@ mod tests {
     }
 
     #[test]
-    fn frames_of_different_palettes_are_counted_apart() {
-        let dark = image(8, 8, |_, _| [0x1a, 0x1b, 0x1d]);
-        let light = image(8, 8, |_, _| [0xf5, 0xf4, 0xf1]);
-        let ratio = pixel_difference(&dark, &light).expect("same size");
-        assert!((ratio - 1.0).abs() < f64::EPSILON);
-        assert!(ratio >= THEME_PIXEL_FLOOR);
-        assert!(pixel_difference(&dark, &dark).is_ok_and(|same| same == 0.0));
-    }
-
-    #[test]
-    fn frames_of_different_sizes_are_refused_rather_than_compared() {
-        let small = image(2, 2, |_, _| [0; 3]);
-        let large = image(3, 2, |_, _| [0; 3]);
-        assert!(pixel_difference(&small, &large).is_err());
+    fn the_same_pixels_give_the_same_checksum() {
+        let frame = image(8, 8, |x, y| [x as u8, y as u8, 0x40]);
+        let other = image(8, 8, |x, y| [x as u8, y as u8, 0x40]);
+        assert_eq!(Crc32::of(&frame.rgb), Crc32::of(&other.rgb));
+        let changed = image(8, 8, |x, y| [x as u8, y as u8, 0x41]);
+        assert_ne!(Crc32::of(&frame.rgb), Crc32::of(&changed.rgb));
     }
 
     #[test]
@@ -1061,9 +1918,9 @@ mod tests {
         assert_eq!(
             raw,
             vec![
-                0, 0, 0, 0x7f, 1, 0, 0x7f, 2, 0,
-                0x7f, // first row: filter byte, then x,y,0x7f
-                0, 0, 1, 0x7f, 1, 1, 0x7f, 2, 1, 0x7f, // second row: y is 1 now
+                // First row: filter byte, then x, y, 0x7f for every pixel.
+                0, 0, 0, 0x7f, 1, 0, 0x7f, 2, 0, 0x7f, // Second row: y is 1 now.
+                0, 0, 1, 0x7f, 1, 1, 0x7f, 2, 1, 0x7f,
             ]
         );
         let stored = u32::from_be_bytes(idat[at..at + 4].try_into().expect("adler"));

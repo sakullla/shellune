@@ -762,8 +762,9 @@ impl TerminalPane {
     /// A pane with a terminal but no process.
     ///
     /// Tests use this to drive the grid deterministically; the application always
-    /// goes through [`TerminalPane::start`].
-    #[cfg(test)]
+    /// goes through [`TerminalPane::start`]. The capture tool uses the same pane with
+    /// bytes it supplies, so a screenshot can show terminal text without a PTY (R2).
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn without_process(
         shell: LocalShell,
         tag: EventTag,
@@ -816,7 +817,7 @@ impl TerminalPane {
     }
 
     /// Feeds bytes as if the shell had produced them.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn feed_for_test(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let was_alternate = self.alternate_screen();
         let effects = self.core.feed(bytes);
@@ -865,7 +866,7 @@ impl TerminalPane {
     }
 
     /// The visible grid as text, row by row.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn visible_text(&self) -> Vec<String> {
         self.core.snapshot().text()
     }

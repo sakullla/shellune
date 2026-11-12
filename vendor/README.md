@@ -1,5 +1,23 @@
 # Patched dependencies
 
+## `gpui` 0.2.2
+
+The capture tool must read the frame the hidden window actually rendered. The
+released crate has no public CPU readback, so this copy adds one small, rendering-
+neutral API:
+
+- `src/platform.rs`: public `FrameImage` and a default
+  `PlatformWindow::capture_frame` that returns `None`.
+- `src/window.rs`: public `Window::capture_frame`.
+- `src/platform/windows/window.rs`: forwards to the DirectX renderer.
+- `src/platform/windows/directx_renderer.rs`: copies the swap-chain back buffer to a
+  staging texture and returns tightly packed RGB.
+
+No drawing, layout, input or platform lifecycle behaviour is changed; other
+platforms keep the default `None`. The root `Cargo.toml` routes `gpui` here with
+`[patch.crates-io]`. On a GPUI upgrade, re-apply this API and re-run the hidden-window
+capture probe before accepting the upgrade.
+
 ## `xattr` 0.2.3
 
 `gpui` 0.2.2 → `gpui_http_client` → `zed-async-tar` (default feature `xattr`) →
