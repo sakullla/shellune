@@ -559,15 +559,25 @@ impl HostConfig {
 
     /// Assigns or clears the single grouping label.
     ///
-    /// Naming a label replaces any hierarchy this host was in, and clearing the label
-    /// clears the path too: a host belongs to one place, and two fields that could
-    /// disagree would make the group counts wrong.
+    /// A label that is actually set replaces any hierarchy this host was in: a host
+    /// belongs to one place, and two fields that could disagree would make the group
+    /// counts wrong. A blank label leaves the hierarchy alone, because a blank is what
+    /// an editor submits for a host whose grouping this field cannot express - a nested
+    /// group, which has a path and no label. Reading that blank as "leave every group"
+    /// would ungroup such a host on every save of any other field of it. Moving a host
+    /// out of every group is the job of [`Self::set_group_path`] with `None`, which
+    /// clears the label as well.
     pub fn set_group(&mut self, group: Option<impl Into<String>>) {
-        self.group = group
+        let group = group
             .map(Into::into)
             .map(|group: String| group.trim().to_owned())
             .filter(|group| !group.is_empty());
-        self.group_path = None;
+        // Only an actual label replaces the hierarchy; a blank one leaves the path
+        // untouched, so editing an unrelated field cannot silently ungroup the host.
+        if group.is_some() {
+            self.group_path = None;
+        }
+        self.group = group;
     }
 
     /// Moves this host into a group path, or out of every group.
@@ -1218,6 +1228,40 @@ mod sign_in_tests {
         let rendered: Vec<String> = X11Forwarding::ALL.iter().map(ToString::to_string).collect();
         assert_eq!(rendered, ["off", "restricted", "trusted"]);
         assert_eq!(X11Forwarding::ALL.len(), 3);
+    }
+
+    #[test]
+    fn a_blank_label_keeps_the_group_path_and_only_a_path_clears_the_label() {
+        let mut host = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("valid host");
+        let nested = GroupPath::parse("Prod/Web").expect("a valid path");
+        host.set_group_path(Some(nested.clone()));
+        assert_eq!(host.group_path(), Some(nested.clone()));
+        assert_eq!(host.group(), None, "a hierarchy has no label to file it by");
+
+        // The host form saves its group box on every edit, and for a nested host that
+        // box is empty: an unrelated edit must not move the host out of its group.
+        host.set_group(Some("   "));
+        assert_eq!(
+            host.group_path(),
+            Some(nested.clone()),
+            "a blank label is not a request to leave the group"
+        );
+
+        // A real label still replaces the hierarchy, so the two fields never disagree.
+        host.set_group(Some(" Lab "));
+        assert_eq!(host.group(), Some("Lab"));
+        assert_eq!(
+            host.group_path(),
+            Some(GroupPath::parse("Lab").expect("a valid path")),
+            "the label is the whole path again, not the old hierarchy"
+        );
+
+        // Leaving every group for real clears a legacy label as well.
+        host.set_group_path(Some(nested));
+        host.set_group(Some("Legacy"));
+        host.set_group_path(None);
+        assert_eq!(host.group(), None, "the old label is cleared");
+        assert_eq!(host.group_path(), None);
     }
 }
 

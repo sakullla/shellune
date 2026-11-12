@@ -1304,6 +1304,63 @@ fn moving_a_host_with_a_legacy_label_out_of_its_group_clears_the_label() {
 }
 
 #[test]
+fn saving_an_edit_of_a_nested_host_through_the_form_keeps_its_group() {
+    // The host form has one group box and saves it with every edit. For a host in a
+    // hierarchy that box is empty, so editing the name must not move the host out of
+    // the group it is in.
+    let dir = TempDir::new("group-form-empty");
+    let service = dir.service();
+    let web = saved(&dir.store(), host("web", "10.0.0.5", 22, "deploy", None));
+    let (book, groups) = service.load().expect("both documents load");
+    let nested = group_path("Prod/Web");
+    let groups = service
+        .create_group(&groups, &nested)
+        .expect("the group is new");
+    let update = service
+        .move_hosts(&book, &groups, &[web.id()], Some(&nested))
+        .expect("the host moves in");
+    let mut edited = update
+        .hosts
+        .host(web.id())
+        .expect("the host is saved")
+        .clone();
+    assert_eq!(edited.group_path(), Some(nested.clone()));
+
+    // Exactly what the form does for an existing host: the name changes and the group
+    // box, which cannot show a hierarchy, submits an empty string.
+    edited.set_name("web-2").expect("a valid name");
+    edited.set_group(Some(String::new()));
+    assert_eq!(
+        edited.group_path(),
+        Some(nested.clone()),
+        "an empty group box is not a request to leave the group"
+    );
+    assert_eq!(
+        edited.group(),
+        None,
+        "the hierarchy carries no legacy label to fall back on"
+    );
+
+    let mut book = update.hosts;
+    book.apply(&HostEdit::replace(edited))
+        .expect("the edited host is stored");
+    dir.store().save(&book).expect("the book saves");
+
+    let reloaded = HostStore::at(dir.path()).load().expect("the file loads");
+    let restored = reloaded.host(web.id()).expect("the host is still there");
+    assert_eq!(restored.name(), "web-2");
+    assert_eq!(
+        restored.group_path(),
+        Some(nested.clone()),
+        "the restart still files the host under its group"
+    );
+    assert_eq!(
+        reloaded.hosts_in_group(&nested),
+        vec![web.id()],
+        "the group still lists the host"
+    );
+}
+#[test]
 fn deleting_a_group_also_moves_out_the_hosts_that_named_it_by_label() {
     let dir = TempDir::new("group-delete-legacy");
     let service = dir.service();
