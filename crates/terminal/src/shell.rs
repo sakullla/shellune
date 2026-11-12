@@ -44,8 +44,27 @@ const ENVIRONMENT_PROBE: &str = "/usr/bin/env -0";
 /// because of that is the failure this bound prevents.
 const ENVIRONMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The variable whose whole value the login shell decides, not just its gaps.
+///
+/// See [`inherited_variables`] for why it is treated apart from the rest.
+const PATH_VARIABLE: &str = "PATH";
+
+/// The separator a macOS PATH uses.
+///
+/// Written out rather than taken from the host: the login environment is only captured
+/// on macOS, and a test on another platform still has to describe what macOS gets.
+const PATH_SEPARATOR: &str = ":";
+
 /// What the user is told when the login shell could not be asked, and nothing else.
 pub const LOGIN_ENVIRONMENT_NOTE: &str = "the login shell did not report its environment; the local shell starts with the \
+     environment the application inherited";
+
+/// What the user is told when the login shell answered with something else.
+///
+/// A banner, an empty answer or a profile that failed halfway is not an environment.
+/// Saying so is the difference between "nothing was needed" and "the login files were
+/// never read".
+pub const LOGIN_ENVIRONMENT_UNREADABLE_NOTE: &str = "the login shell reported no readable environment; the local shell starts with the \
      environment the application inherited";
 
 /// What the user is told when their locale was replaced because it is not UTF-8.
@@ -55,6 +74,36 @@ pub const LOCALE_REPLACED_NOTE: &str =
 /// What the user is told when no locale was inherited at all.
 pub const LOCALE_ADDED_NOTE: &str =
     "no locale was inherited; the local shell starts in a UTF-8 locale";
+
+/// Something a local shell could not be given, in terms a window can present.
+///
+/// Each of these is a degradation the user is meant to see: the shell still starts,
+/// but not with the environment or the locale its own login files describe. None of
+/// them carries a value, so none of them can reveal the environment (R14, R15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellEnvironmentNote {
+    /// The login shell could not be asked for its environment.
+    LoginEnvironmentUnavailable,
+    /// The login shell answered, but with nothing that is an environment.
+    LoginEnvironmentUnreadable,
+    /// The inherited locale was replaced because it cannot encode UTF-8.
+    LocaleReplaced,
+    /// No locale was inherited, so a UTF-8 one was added.
+    LocaleAdded,
+}
+
+impl ShellEnvironmentNote {
+    /// The wording a terminal can show as it is.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::LoginEnvironmentUnavailable => LOGIN_ENVIRONMENT_NOTE,
+            Self::LoginEnvironmentUnreadable => LOGIN_ENVIRONMENT_UNREADABLE_NOTE,
+            Self::LocaleReplaced => LOCALE_REPLACED_NOTE,
+            Self::LocaleAdded => LOCALE_ADDED_NOTE,
+        }
+    }
+}
 
 /// How a shell has to be started so it reads the user's login configuration (R14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +127,33 @@ pub fn login_form(program: &str) -> LoginForm {
     match name {
         "zsh" | "bash" | "fish" | "sh" => LoginForm::Flag(LOGIN_FLAG),
         _ => LoginForm::AsConfigured,
+    }
+}
+
+/// The login flag `program` is started with on this platform, if any (R14).
+///
+/// Only macOS starts an application outside a login session, which is the problem the
+/// flag solves. Linux and Windows keep the command line they always had: their shells
+/// are launched from the session that owns the login environment already, and passing
+/// `-l` there would be an unreviewed change to how they read their profiles.
+#[must_use]
+pub fn login_flag(program: &str) -> Option<&'static str> {
+    login_flag_on(program, cfg!(target_os = "macos"))
+}
+
+/// [`login_flag`] with the platform given.
+///
+/// The parameter exists so both platform behaviours can be asserted from one machine:
+/// a test that could only see its own host could never show that the other platform is
+/// unchanged.
+#[must_use]
+pub fn login_flag_on(program: &str, macos: bool) -> Option<&'static str> {
+    if !macos {
+        return None;
+    }
+    match login_form(program) {
+        LoginForm::Flag(flag) => Some(flag),
+        LoginForm::AsConfigured => None,
     }
 }
 
@@ -134,11 +210,12 @@ pub fn plan_locale(lookup: &dyn Fn(&str) -> Option<String>) -> LocalePlan {
 ///
 /// Only what is missing is added: an environment the application already has —
 /// because it was started from a terminal, or the user set it deliberately — is
-/// never replaced. The notes are worded for the user and never contain a value.
+/// never replaced. `PATH` is the one exception, and the reason this exists at all.
+/// The notes name what the shell did not get and never contain a value.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShellEnvironment {
     variables: Vec<(String, String)>,
-    notes: Vec<String>,
+    notes: Vec<ShellEnvironmentNote>,
 }
 
 impl ShellEnvironment {
@@ -148,9 +225,9 @@ impl ShellEnvironment {
         &self.variables
     }
 
-    /// What could not be done as configured, in wording that is safe to show.
+    /// What could not be done as configured, in an order a window can present.
     #[must_use]
-    pub fn notes(&self) -> &[String] {
+    pub fn notes(&self) -> &[ShellEnvironmentNote] {
         &self.notes
     }
 
@@ -173,9 +250,9 @@ impl ShellEnvironment {
         self.variables.push((key.to_owned(), value.to_owned()));
     }
 
-    fn note(&mut self, note: &str) {
-        if !self.notes.iter().any(|existing| existing == note) {
-            self.notes.push(note.to_owned());
+    fn note(&mut self, note: ShellEnvironmentNote) {
+        if !self.notes.contains(&note) {
+            self.notes.push(note);
         }
     }
 }
@@ -193,13 +270,14 @@ pub fn shell_environment(program: &str) -> ShellEnvironment {
         return environment;
     }
     match login_environment(program) {
-        Some(captured) => {
-            let inherited = inherited_variables(captured, &|key| std::env::var_os(key).is_some());
-            for (key, value) in inherited {
+        Ok(captured) => {
+            let application =
+                |key: &str| std::env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+            for (key, value) in inherited_variables(captured, &application) {
                 environment.set(&key, &value);
             }
         }
-        None => environment.note(LOGIN_ENVIRONMENT_NOTE),
+        Err(note) => environment.note(note),
     }
     let plan = plan_locale(&|variable| {
         std::env::var(variable)
@@ -210,9 +288,9 @@ pub fn shell_environment(program: &str) -> ShellEnvironment {
     if let Some(variable) = plan.variable {
         environment.set(variable, UTF8_FALLBACK_LOCALE);
         environment.note(if plan.replaced {
-            LOCALE_REPLACED_NOTE
+            ShellEnvironmentNote::LocaleReplaced
         } else {
-            LOCALE_ADDED_NOTE
+            ShellEnvironmentNote::LocaleAdded
         });
     }
     environment
@@ -221,16 +299,51 @@ pub fn shell_environment(program: &str) -> ShellEnvironment {
 /// The entries of a login environment the application does not already have.
 ///
 /// A value the application already carries — because it was started from a
-/// terminal, or the user set it for the application — is never replaced, and the
-/// terminal keeps its own `TERM`.
+/// terminal, or the user set it deliberately — is never replaced, and the terminal
+/// keeps its own `TERM`.
+///
+/// `PATH` is the exception, and the reason this module exists at all: an application
+/// opened from the Dock has a `PATH` too — the minimal one the window manager passes
+/// down — so filling in only what is missing would leave the Homebrew directories,
+/// and every tool installed with them, invisible. The login `PATH` therefore wins, and
+/// the directories the application had and the login shell did not are appended: a
+/// directory the user added on purpose survives, one macOS already had is not repeated.
 fn inherited_variables(
     captured: Vec<(String, String)>,
-    present: &dyn Fn(&str) -> bool,
+    application: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
     captured
         .into_iter()
-        .filter(|(key, _)| !TERMINAL_OWNED.contains(&key.as_str()) && !present(key))
+        .filter_map(|(key, value)| {
+            if TERMINAL_OWNED.contains(&key.as_str()) {
+                return None;
+            }
+            if key == PATH_VARIABLE {
+                let merged = merge_path(&value, application(&key).as_deref());
+                return (!merged.is_empty()).then_some((key, merged));
+            }
+            application(&key).is_none().then_some((key, value))
+        })
         .collect()
+}
+
+/// The login `PATH`, followed by the directories only the application had.
+///
+/// The login order is kept as the user's profile wrote it — a Homebrew directory
+/// ahead of `/usr/bin` is deliberate, and sorting would shadow the tools it was put
+/// first for. An empty entry means "the current directory" and is not restored.
+fn merge_path(login: &str, application: Option<&str>) -> String {
+    let mut entries: Vec<&str> = Vec::new();
+    let candidates = login
+        .split(PATH_SEPARATOR)
+        .chain(application.unwrap_or_default().split(PATH_SEPARATOR));
+    for entry in candidates {
+        if entry.is_empty() || entries.contains(&entry) {
+            continue;
+        }
+        entries.push(entry);
+    }
+    entries.join(PATH_SEPARATOR)
 }
 
 /// Asks the login shell for the environment it would give a program (R14).
@@ -240,16 +353,34 @@ fn inherited_variables(
 /// sets is still in place, because the shell started in the PTY is interactive and
 /// reads that file itself.
 ///
-/// Returns `None` when the shell cannot be asked — an unknown program, a profile
-/// that failed, or one that never finished. A missing answer never stops the shell
-/// from starting, and no value that came back is logged.
-fn login_environment(program: &str) -> Option<Vec<(String, String)>> {
+/// Returns the note to show when the shell cannot be asked — an unknown program, a
+/// profile that failed, or one that never finished — and when it answered with
+/// something that is not an environment: a banner, an empty answer, a profile that
+/// printed an error instead. Neither is reported as success, because a shell that
+/// starts in the wrong environment is exactly what the user has to be told about.
+/// A missing answer never stops the shell from starting, and no value that came back
+/// is logged.
+fn login_environment(program: &str) -> Result<Vec<(String, String)>, ShellEnvironmentNote> {
     let LoginForm::Flag(flag) = login_form(program) else {
         // Not a shell this module knows how to ask; the shell still starts.
-        return None;
+        return Err(ShellEnvironmentNote::LoginEnvironmentUnavailable);
     };
-    let output = probe_environment(program, &[flag, "-c", ENVIRONMENT_PROBE])?;
-    Some(parse_environment(&output))
+    let output = probe_environment(program, &[flag, "-c", ENVIRONMENT_PROBE])
+        .ok_or(ShellEnvironmentNote::LoginEnvironmentUnavailable)?;
+    environment_from_output(&output)
+}
+
+/// The environment in what a login shell printed, or the note that says it is not one.
+///
+/// Every environment has at least a `PATH`; an answer with no entry at all is a banner,
+/// an empty line or a profile that failed, and starting silently in the inherited
+/// environment would hide exactly that from the user (R14).
+fn environment_from_output(output: &[u8]) -> Result<Vec<(String, String)>, ShellEnvironmentNote> {
+    let environment = parse_environment(output);
+    if environment.is_empty() {
+        return Err(ShellEnvironmentNote::LoginEnvironmentUnreadable);
+    }
+    Ok(environment)
 }
 
 /// Runs `program` with fixed arguments and returns its standard output.
@@ -712,24 +843,170 @@ mod tests {
     #[test]
     fn only_missing_variables_are_inherited_and_the_terminal_keeps_its_own() {
         let captured = vec![
-            ("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned()),
             ("HOME".to_owned(), "/Users/example".to_owned()),
+            ("LANG".to_owned(), "zh_CN.UTF-8".to_owned()),
             ("TERM".to_owned(), "screen-256color".to_owned()),
             ("COLORTERM".to_owned(), "24bit".to_owned()),
         ];
-        let inherited = inherited_variables(captured, &|key| key == "HOME");
+        let inherited = inherited_variables(captured, &lookup(&[("HOME", "/Users/me")]));
         assert_eq!(
             inherited,
-            vec![("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned())],
-            "only the login PATH is added: HOME is already set, and TERM and \
-             COLORTERM describe this terminal"
+            vec![("LANG".to_owned(), "zh_CN.UTF-8".to_owned())],
+            "only the login LANG is added: HOME is already set, and TERM and COLORTERM \
+             describe this terminal"
         );
     }
 
     #[test]
+    fn a_login_path_replaces_the_minimal_one_a_dock_launch_starts_with() {
+        // A macOS application opened from the Dock already has a PATH: the short list
+        // launchd passes down. Filling in only what is missing would keep that list and
+        // drop the Homebrew directories with it.
+        let captured = vec![(
+            "PATH".to_owned(),
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_owned(),
+        )];
+        let inherited = inherited_variables(
+            captured,
+            &lookup(&[("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]),
+        );
+        assert_eq!(
+            inherited,
+            vec![(
+                "PATH".to_owned(),
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned()
+            )],
+            "the login PATH must win, and the directories only the application had must \
+             not be lost"
+        );
+    }
+
+    #[test]
+    fn a_directory_the_user_added_before_launching_is_kept_after_the_login_path() {
+        let captured = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
+        let inherited = inherited_variables(
+            captured,
+            &lookup(&[("PATH", "/Users/me/.local/bin:/usr/bin")]),
+        );
+        assert_eq!(
+            inherited,
+            vec![(
+                "PATH".to_owned(),
+                "/usr/bin:/bin:/Users/me/.local/bin".to_owned()
+            )],
+            "the login order comes first and the extra directory is appended, not dropped"
+        );
+    }
+
+    #[test]
+    fn a_login_path_is_not_duplicated_when_the_application_already_had_it() {
+        let captured = vec![(
+            "PATH".to_owned(),
+            "/opt/homebrew/bin:/usr/bin:/bin".to_owned(),
+        )];
+        let inherited = inherited_variables(
+            captured,
+            &lookup(&[("PATH", "/opt/homebrew/bin:/usr/bin:/bin")]),
+        );
+        assert_eq!(
+            inherited,
+            vec![(
+                "PATH".to_owned(),
+                "/opt/homebrew/bin:/usr/bin:/bin".to_owned()
+            )],
+            "the same directory must not appear twice"
+        );
+    }
+
+    #[test]
+    fn an_empty_login_path_leaves_the_one_the_application_had_alone() {
+        let captured = vec![("PATH".to_owned(), String::new())];
+        let inherited = inherited_variables(captured, &lookup(&[("PATH", "/usr/bin:/bin")]));
+        assert_eq!(
+            inherited,
+            vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+            "an answer that names nothing must not overwrite what the application had"
+        );
+    }
+
+    #[test]
+    fn the_login_flag_is_only_added_on_macos() {
+        for program in ["/bin/zsh", "/bin/bash", "/opt/homebrew/bin/fish", "/bin/sh"] {
+            assert_eq!(login_flag_on(program, true), Some(LOGIN_FLAG), "{program}");
+            assert_eq!(
+                login_flag_on(program, false),
+                None,
+                "{program} must keep the command line Linux and Windows always used"
+            );
+        }
+        // An unknown program is never given the flag on any platform.
+        assert_eq!(login_flag_on("/opt/tools/nu", true), None);
+        assert_eq!(login_flag_on("/opt/tools/nu", false), None);
+    }
+
+    #[test]
+    fn this_platform_adds_the_login_flag_only_where_it_did() {
+        let expected = if cfg!(target_os = "macos") {
+            Some(LOGIN_FLAG)
+        } else {
+            None
+        };
+        assert_eq!(login_flag("/bin/zsh"), expected);
+    }
+
+    #[test]
     fn a_login_shell_that_cannot_be_asked_never_blocks_the_terminal() {
-        // The program does not exist: the answer is "unknown", not a failure.
-        assert_eq!(login_environment("shellune-no-such-login-shell-4d2"), None);
+        // The program does not exist: the answer is a note, not a failure and not a
+        // silent success.
+        assert_eq!(
+            login_environment("shellune-no-such-login-shell-4d2"),
+            Err(ShellEnvironmentNote::LoginEnvironmentUnavailable)
+        );
+    }
+
+    #[test]
+    fn an_answer_that_is_not_an_environment_is_reported_as_unreadable() {
+        let unreadable: &[&[u8]] = &[
+            b"",
+            b"Last login: Tue Nov 12 on ttys001\n",
+            b"\n\n",
+            b"=no-name\0not an entry\0",
+        ];
+        for &output in unreadable {
+            assert_eq!(
+                environment_from_output(output),
+                Err(ShellEnvironmentNote::LoginEnvironmentUnreadable),
+                "{output:?} is a banner or an empty answer, not an environment"
+            );
+        }
+        assert_eq!(
+            environment_from_output(b"PATH=/usr/bin:/bin\0HOME=/Users/example\0"),
+            Ok(vec![
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                ("HOME".to_owned(), "/Users/example".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn every_note_says_what_happened_without_carrying_a_value() {
+        let notes = [
+            ShellEnvironmentNote::LoginEnvironmentUnavailable,
+            ShellEnvironmentNote::LoginEnvironmentUnreadable,
+            ShellEnvironmentNote::LocaleReplaced,
+            ShellEnvironmentNote::LocaleAdded,
+        ];
+        let mut messages: Vec<&str> = Vec::new();
+        for note in notes {
+            let message = note.message();
+            assert!(!message.trim().is_empty(), "{note:?} has no wording");
+            assert!(!message.contains('='), "{note:?} looks like an assignment");
+            assert!(
+                !messages.contains(&message),
+                "{note:?} repeats another note"
+            );
+            messages.push(message);
+        }
     }
 
     #[cfg(not(target_os = "macos"))]

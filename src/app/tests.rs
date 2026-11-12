@@ -27,6 +27,7 @@ use shellune_storage::{
     ForwardStore, HostBook, HostEdit, HostKey, HostStore, KeymapPreferences, TrustStore,
     WORKSPACE_FILE_NAME, WorkspaceStore,
 };
+use shellune_terminal::shell::ShellEnvironmentNote;
 use shellune_terminal::{BlockStatus, ExitReport, GridSize, TermMode, encode_paste};
 
 use crate::app::actions::{
@@ -1256,6 +1257,10 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_failed,
             terminal_exited,
             terminal_terminated,
+            terminal_environment_unavailable,
+            terminal_environment_unreadable,
+            terminal_environment_locale_replaced,
+            terminal_environment_locale_added,
             terminal_copy,
             hosts_search_placeholder,
             keys_search_placeholder,
@@ -2002,6 +2007,85 @@ fn pane_with<'a>(
     cx.update(|window, app| window.focus(pane.read(app).focus_handle()));
     cx.run_until_parked();
     (pane, cx)
+}
+
+/// A shell that started without its login environment says so, where it can be seen
+/// (R14).
+///
+/// The note has to be on screen while the shell is still usable, and it has to be the
+/// catalogue wording rather than the terminal crate English, or half the interface
+/// would be translated and this line would not.
+#[gpui::test]
+async fn a_degraded_login_environment_is_visible_under_the_grid(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+
+    // A shell that got everything it asked for claims nothing.
+    assert!(
+        cx.debug_bounds("terminal.environment").is_none(),
+        "a healthy start must not show a degradation note"
+    );
+
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.set_environment_notes_for_test(
+                vec![ShellEnvironmentNote::LoginEnvironmentUnavailable],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("terminal.environment").is_some(),
+        "R14: the fallback is only honest if it can be read"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).environment_note_for_test()),
+        Some(ENGLISH.terminal_environment_unavailable.to_owned()),
+        "the bar must read the catalogue, not the English constant of the terminal crate"
+    );
+
+    // The same degradation in the other language: a translated surface, not a log
+    // line that happens to be drawn.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.set_locale(Locale::Chinese, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).environment_note_for_test()),
+        Some(CHINESE.terminal_environment_unavailable.to_owned())
+    );
+}
+
+/// A replaced locale and an environment that could not be read are both stated (R15).
+#[gpui::test]
+async fn a_replaced_locale_and_an_unreadable_environment_are_both_stated(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.set_environment_notes_for_test(
+                vec![
+                    ShellEnvironmentNote::LoginEnvironmentUnreadable,
+                    ShellEnvironmentNote::LocaleReplaced,
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    let note = cx
+        .update(|_window, app| pane.read(app).environment_note_for_test())
+        .expect("both degradations were reported");
+    assert!(
+        note.contains(ENGLISH.terminal_environment_unreadable),
+        "{note}"
+    );
+    assert!(
+        note.contains(ENGLISH.terminal_environment_locale_replaced),
+        "a replaced locale must not be swallowed by the other note: {note}"
+    );
+    assert!(cx.debug_bounds("terminal.environment").is_some());
 }
 
 #[gpui::test]

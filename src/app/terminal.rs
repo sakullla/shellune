@@ -31,6 +31,7 @@ use std::ops::Range;
 use shellune_core::{EventTag, LocalShell, SessionFailure, TerminalMode};
 use shellune_ssh::{ChainEvent, ChainSession, RemoteEvent, RemoteSession, X11Status};
 use shellune_terminal::core::{LineAnchor, SearchOptions};
+use shellune_terminal::shell::ShellEnvironmentNote;
 use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
     GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, MouseAction,
@@ -450,6 +451,13 @@ pub struct TerminalPane {
     /// Taken by the window like the background notices are: the pane only holds
     /// what arrived since the last look.
     x11: Option<X11Status>,
+    /// What the shell could not be given when it started (R14, R15).
+    ///
+    /// Read once from the session and kept, because the notice belongs to this pane
+    /// for as long as it is on screen: the environment of a running shell cannot
+    /// change, and a note that disappeared would leave the user with an unexplained
+    /// locale or an unexplained missing program.
+    environment_notes: Vec<ShellEnvironmentNote>,
 }
 
 /// What a terminal's copy, paste and search controls answer, written the way a
@@ -559,9 +567,14 @@ impl TerminalPane {
         let font_size = sanitize_font_size(font_size);
         let grid = grid.clamped();
         let core = TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK);
-        let (source, state) = match LocalSession::spawn(&shell, grid, None) {
-            Ok(session) => (Some(PaneSource::Local(session)), PaneState::Live),
-            Err(error) => (None, PaneState::Failed(error.session_failure())),
+        let (source, state, environment_notes) = match LocalSession::spawn(&shell, grid, None) {
+            Ok(session) => {
+                // Taken before the session moves: what the shell could not be given is
+                // said once, at startup, and has to reach the bar the user reads.
+                let notes = session.environment().notes().to_vec();
+                (Some(PaneSource::Local(session)), PaneState::Live, notes)
+            }
+            Err(error) => (None, PaneState::Failed(error.session_failure()), Vec::new()),
         };
 
         let mut pane = Self {
@@ -601,6 +614,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            environment_notes,
         };
         pane.start_polling(cx);
         pane
@@ -661,6 +675,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            environment_notes: Vec::new(),
         };
         pane.start_polling(cx);
         pane
@@ -720,6 +735,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            environment_notes: Vec::new(),
         };
         pane.start_polling(cx);
         pane
@@ -795,6 +811,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            environment_notes: Vec::new(),
         }
     }
 
@@ -2240,6 +2257,22 @@ impl TerminalPane {
                                 .debug_selector(|| "terminal.integration".to_owned())
                                 .child(note),
                         )
+                    })
+                    // Said under a running shell, not only after it stopped: a shell
+                    // started without the login environment or in a replaced locale
+                    // still runs, and this is the only place the user learns why a
+                    // tool is missing or Chinese looks wrong (R14, R15).
+                    .when_some(self.environment_note(), |row, note| {
+                        // The whole sentence is in the tooltip: this bar is 28px high,
+                        // and a note the user cannot finish reading is not a notice.
+                        row.child(
+                            div()
+                                .id("terminal.environment")
+                                .truncate()
+                                .debug_selector(|| "terminal.environment".to_owned())
+                                .tooltip(components::tooltip(note.clone()))
+                                .child(note),
+                        )
                     }),
             )
             .child(
@@ -2553,6 +2586,55 @@ impl TerminalPane {
             .on_click(cx.listener(|this, _event, window, cx| {
                 this.toggle_search(window, cx);
             }))
+    }
+
+    /// What the shell could not be given at startup, in the pane's language (R14, R15).
+    ///
+    /// The session reports these once. They are drawn in the bar under the grid,
+    /// because a shell running in the environment the window manager passed down, or
+    /// in a locale that cannot encode Chinese, is a silent degradation the user has to
+    /// be able to see rather than guess at. The wording carries no value of any
+    /// variable, so nothing about the environment is disclosed by showing it.
+    fn environment_note(&self) -> Option<SharedString> {
+        if self.environment_notes.is_empty() {
+            return None;
+        }
+        let strings = self.locale.strings();
+        let messages: Vec<&'static str> = self
+            .environment_notes
+            .iter()
+            .map(|note| match note {
+                ShellEnvironmentNote::LoginEnvironmentUnavailable => {
+                    strings.terminal_environment_unavailable
+                }
+                ShellEnvironmentNote::LoginEnvironmentUnreadable => {
+                    strings.terminal_environment_unreadable
+                }
+                ShellEnvironmentNote::LocaleReplaced => {
+                    strings.terminal_environment_locale_replaced
+                }
+                ShellEnvironmentNote::LocaleAdded => strings.terminal_environment_locale_added,
+            })
+            .collect();
+        Some(SharedString::from(messages.join(" \u{00B7} ")))
+    }
+
+    /// The degradation note the bar is drawing, so a test reads what the user reads.
+    #[cfg(test)]
+    #[must_use]
+    pub fn environment_note_for_test(&self) -> Option<String> {
+        self.environment_note().map(|note| note.to_string())
+    }
+
+    /// Puts the notes a degraded start would report on this pane (R14, R15).
+    #[cfg(test)]
+    pub fn set_environment_notes_for_test(
+        &mut self,
+        notes: Vec<ShellEnvironmentNote>,
+        cx: &mut Context<Self>,
+    ) {
+        self.environment_notes = notes;
+        cx.notify();
     }
 
     fn integration_note(&self) -> Option<&'static str> {

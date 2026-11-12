@@ -149,6 +149,14 @@ pub struct Strings {
     pub terminal_exited: &'static str,
     /// Terminal state: the shell was killed by a signal.
     pub terminal_terminated: &'static str,
+    /// Terminal note: the login shell could not be asked for its environment (R14).
+    pub terminal_environment_unavailable: &'static str,
+    /// Terminal note: the login shell answered with something that is no environment.
+    pub terminal_environment_unreadable: &'static str,
+    /// Terminal note: the locale was not UTF-8 and was replaced (R15).
+    pub terminal_environment_locale_replaced: &'static str,
+    /// Terminal note: no locale was inherited, so a UTF-8 one was added (R15).
+    pub terminal_environment_locale_added: &'static str,
     /// Button that copies the terminal selection.
     pub terminal_copy: &'static str,
     /// Tooltip of the button that makes the terminal text smaller.
@@ -1003,6 +1011,13 @@ pub static ENGLISH: Strings = Strings {
     terminal_failed: "Could not start",
     terminal_exited: "Exited",
     terminal_terminated: "Terminated",
+    terminal_environment_unavailable: "Login environment unavailable: this shell starts with the \
+         environment the application inherited",
+    terminal_environment_unreadable: "The login shell returned no readable environment: this shell \
+         starts with the environment the application inherited",
+    terminal_environment_locale_replaced: "The locale was not UTF-8: this shell starts in a UTF-8 \
+         locale instead",
+    terminal_environment_locale_added: "No locale was inherited: this shell starts in a UTF-8 locale",
     terminal_copy: "Copy",
     terminal_smaller: "Smaller text",
     terminal_larger: "Larger text",
@@ -1448,6 +1463,10 @@ pub static CHINESE: Strings = Strings {
     terminal_failed: "启动失败",
     terminal_exited: "已退出",
     terminal_terminated: "被终止",
+    terminal_environment_unavailable: "未能读取登录环境：这个 Shell 使用应用继承的环境启动",
+    terminal_environment_unreadable: "登录 Shell 没有返回可读的环境：这个 Shell 使用应用继承的环境启动",
+    terminal_environment_locale_replaced: "当前 locale 不是 UTF-8：这个 Shell 改用 UTF-8 启动",
+    terminal_environment_locale_added: "未继承任何 locale：这个 Shell 使用 UTF-8 启动",
     terminal_copy: "复制",
     terminal_smaller: "缩小字号",
     terminal_larger: "放大字号",

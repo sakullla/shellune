@@ -368,6 +368,29 @@ fn a_local_shell_resolves_an_utf8_locale() {
     );
 }
 
+/// What the shell could not be given reaches the window instead of being dropped
+/// (R14, R15).
+///
+/// The session is the only carrier between the environment probe and the bar the user
+/// reads, so the notes drawn there have to be exactly the ones that arrived here.
+#[test]
+fn a_session_hands_the_environment_notes_to_the_window() {
+    let Some(session) = Session::start() else {
+        return;
+    };
+    let expected = shellune_terminal::shell::shell_environment(session.shell.program());
+    assert_eq!(
+        session.pty.environment().notes(),
+        expected.notes(),
+        "the pane can only show what the session kept"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        session.pty.environment().notes().is_empty(),
+        "Linux and Windows ask no login shell, so they report no degradation"
+    );
+}
+
 /// A Chinese file name has to come back as the same text, not as octal escapes or
 /// question marks (R15).
 ///

@@ -23,7 +23,7 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 use shellune_core::{LocalShell, SessionFailure};
 
 use crate::metrics::GridSize;
-use crate::shell::{self, LoginForm, ShellEnvironment};
+use crate::shell::{self, ShellEnvironment};
 
 /// Value of the TERM variable handed to the shell.
 ///
@@ -217,28 +217,7 @@ impl LocalSession {
         grid: GridSize,
         cwd: Option<&Path>,
     ) -> Result<Self, ShellLaunchError> {
-        let mut command = CommandBuilder::new(shell.program());
-        command.env("TERM", TERM_VALUE);
-        command.env("COLORTERM", "truecolor");
-        // macOS starts an application from the Dock or Finder with a minimal
-        // environment: the login PATH that puts Homebrew on it, and the locale that
-        // makes text UTF-8, are both missing there. The shell is asked for its own
-        // environment instead of inheriting what the window manager happened to
-        // pass down (R14, R15); on every other platform this is empty and nothing
-        // changes.
-        let environment = shell::shell_environment(shell.program());
-        for (key, value) in environment.variables() {
-            command.env(key, value);
-        }
-        // A login shell reads the user's own profile, which is what makes tools the
-        // user installed visible. A shell that is not known to accept the flag is
-        // started exactly as configured instead.
-        if let LoginForm::Flag(flag) = shell::login_form(shell.program()) {
-            command.arg(flag);
-        }
-        if let Some(directory) = cwd {
-            command.cwd(directory);
-        }
+        let (command, environment) = shell_command(shell, cwd, cfg!(target_os = "macos"));
         let mut session = Self::spawn_command(command, grid, shell.program())?;
         session.environment = environment;
         Ok(session)
@@ -389,6 +368,41 @@ impl Drop for LocalSession {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// The command and environment a local shell is started with (R14, R15).
+///
+/// `macos` is a parameter rather than a `cfg!` read inside, so that the command line
+/// this platform produces and the one the other platforms keep can both be asserted
+/// from a single test host. Only macOS starts an application outside a login session,
+/// which is the situation the login flag and the captured environment exist for.
+fn shell_command(
+    shell: &LocalShell,
+    cwd: Option<&Path>,
+    macos: bool,
+) -> (CommandBuilder, ShellEnvironment) {
+    let mut command = CommandBuilder::new(shell.program());
+    command.env("TERM", TERM_VALUE);
+    command.env("COLORTERM", "truecolor");
+    // macOS starts an application from the Dock or Finder with a minimal environment:
+    // the login PATH that puts Homebrew on it, and the locale that makes text UTF-8,
+    // are both missing there. The shell is asked for its own environment instead of
+    // inheriting what the window manager happened to pass down (R14, R15); on every
+    // other platform this is empty and nothing changes.
+    let environment = shell::shell_environment(shell.program());
+    for (key, value) in environment.variables() {
+        command.env(key, value);
+    }
+    // A login shell reads the user's own profile, which is what makes tools the user
+    // installed visible. A shell that is not known to accept the flag is started
+    // exactly as configured instead, and no platform other than macOS is given it.
+    if let Some(flag) = shell::login_flag_on(shell.program(), macos) {
+        command.arg(flag);
+    }
+    if let Some(directory) = cwd {
+        command.cwd(directory);
+    }
+    (command, environment)
 }
 
 fn pty_size(grid: GridSize) -> PtySize {
@@ -555,6 +569,67 @@ mod tests {
 
     fn shell(program: &str) -> LocalShell {
         LocalShell::new(program, program)
+    }
+
+    /// The whole command line, so a later addition cannot slip past a test.
+    fn argv(command: &CommandBuilder) -> Vec<String> {
+        command
+            .get_argv()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn only_macos_starts_a_login_shell_and_only_for_a_known_shell() {
+        let zsh = shell("/bin/zsh");
+        assert_eq!(
+            argv(&shell_command(&zsh, None, true).0),
+            vec!["/bin/zsh".to_owned(), "-l".to_owned()],
+            "macOS must read the login files"
+        );
+        assert_eq!(
+            argv(&shell_command(&zsh, None, false).0),
+            vec!["/bin/zsh".to_owned()],
+            "Linux and Windows must start the shell exactly as before"
+        );
+
+        // A program that does not know the flag would exit instead of opening a
+        // terminal, so it is never given one, on any platform.
+        let nu = shell("/opt/tools/nu");
+        assert_eq!(
+            argv(&shell_command(&nu, None, true).0),
+            vec!["/opt/tools/nu".to_owned()]
+        );
+        assert_eq!(
+            argv(&shell_command(&nu, None, false).0),
+            vec!["/opt/tools/nu".to_owned()]
+        );
+    }
+
+    #[test]
+    fn this_platform_starts_the_shell_with_the_command_line_it_always_used() {
+        let zsh = shell("/bin/zsh");
+        let expected: Vec<String> = if cfg!(target_os = "macos") {
+            vec!["/bin/zsh".to_owned(), "-l".to_owned()]
+        } else {
+            vec!["/bin/zsh".to_owned()]
+        };
+        assert_eq!(
+            argv(&shell_command(&zsh, None, cfg!(target_os = "macos")).0),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_terminal_still_describes_itself_to_the_shell() {
+        let zsh = shell("/bin/zsh");
+        let (command, _) = shell_command(&zsh, None, true);
+        let environment: Vec<(&str, &str)> = command.iter_extra_env_as_str().collect();
+        assert!(
+            environment.contains(&("TERM", TERM_VALUE)),
+            "{environment:?}"
+        );
     }
 
     /// Collects events until the shell exits or the deadline passes.
