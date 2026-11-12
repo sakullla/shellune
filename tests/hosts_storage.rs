@@ -928,3 +928,318 @@ fn a_cycle_and_a_deleted_jump_are_local_and_the_book_still_loads() {
     ));
     assert!(after.message().contains("Nothing was connected"));
 }
+
+// ---------------------------------------------------------------------------
+// Hierarchical groups (R18)
+// ---------------------------------------------------------------------------
+
+use shellune_core::{AuthMethodKind, GroupBookError, GroupPath, SecretString};
+use shellune_storage::{GROUP_FILE_NAME, GroupError, GroupService, MemorySecrets, SecretStore};
+
+impl TempDir {
+    fn group_file(&self) -> PathBuf {
+        self.path.join(GROUP_FILE_NAME)
+    }
+
+    fn service(&self) -> GroupService {
+        GroupService::at(&self.path)
+    }
+}
+
+fn group_path(text: &str) -> GroupPath {
+    GroupPath::parse(text).expect("a valid test path")
+}
+
+#[test]
+fn a_legacy_single_group_is_read_as_one_original_segment() {
+    // The file an earlier build wrote: one optional label, no hierarchy anywhere.
+    let dir = TempDir::new("legacy-group");
+    let id = HostId::new();
+    dir.write_file(&format!(
+        "{{\"version\":1,\"hosts\":[{{\"id\":\"{id}\",\"name\":\"web\",\"address\":\"10.0.0.5\",\"port\":22,\"user\":\"deploy\",\"group\":\"Prod/Web\"}}],\"recents\":[]}}"
+    ));
+
+    let store = dir.store();
+    let book = store.load().expect("the legacy file loads");
+    let host = book.hosts().first().cloned().expect("the host is there");
+    assert_eq!(
+        host.group(),
+        Some("Prod/Web"),
+        "the label itself is untouched"
+    );
+    let path = host.group_path().expect("a label has a path form");
+    assert_eq!(
+        path.depth(),
+        1,
+        "the separator was part of the old name, not a level"
+    );
+    assert_eq!(path.segments(), ["Prod/Web"]);
+
+    store.save(&book).expect("the book saves");
+    let text = dir.read_file();
+    assert!(
+        text.contains("\"group\": \"Prod/Web\""),
+        "the label stays in its own field: {text}"
+    );
+    assert!(
+        !text.contains("group_path"),
+        "reading a label does not invent a hierarchy: {text}"
+    );
+}
+
+#[test]
+fn a_canonical_path_and_an_empty_group_survive_a_restart() {
+    let dir = TempDir::new("group-restart");
+    let service = dir.service();
+    let host = saved(
+        &dir.store(),
+        host("web", "10.0.0.5", 22, "deploy", Some("Prod")),
+    );
+    let (book, groups) = service.load().expect("both documents load");
+
+    let prod_web = group_path("Prod/Web");
+    let empty = group_path("Lab/Empty");
+    let groups = service
+        .create_group(&groups, &prod_web)
+        .expect("the group is new");
+    let groups = service
+        .create_group(&groups, &empty)
+        .expect("the empty group is new");
+    let update = service
+        .move_hosts(&book, &groups, &[host.id()], Some(&prod_web))
+        .expect("the host moves");
+
+    assert_eq!(update.hosts_changed, 1);
+    assert_eq!(update.hosts.hosts_in_group(&prod_web), vec![host.id()]);
+
+    // The restart: new stores on the same directory, as the next launch builds them.
+    let (book, groups) = GroupService::at(dir.path())
+        .load()
+        .expect("both documents load again");
+    let restored = book.host(host.id()).expect("the host is still there");
+    assert_eq!(restored.group_path(), Some(prod_web.clone()));
+    assert_eq!(restored.address(), "10.0.0.5");
+    assert!(groups.contains(&prod_web), "the hierarchy is saved");
+    assert!(
+        groups.contains(&empty),
+        "an empty group is saved even without hosts"
+    );
+    assert!(
+        groups.contains(&group_path("Prod")),
+        "its parent is saved beside it"
+    );
+    assert_eq!(book.hosts_in_group(&empty).len(), 0);
+    assert!(dir.group_file().exists());
+}
+
+#[test]
+fn renaming_a_group_keeps_every_host_and_its_credential_reference() {
+    let dir = TempDir::new("group-rename");
+    let service = dir.service();
+
+    let api = saved(&dir.store(), host("api", "10.0.0.6", 22, "deploy", None));
+    let mut web = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
+    web.set_identity_file(Some("keys/web"));
+    web.set_auth(Some(AuthMethodKind::Password));
+    web.set_remember_secret(true);
+    web.set_jumps(vec![api.id()]);
+    let web = saved(&dir.store(), web);
+
+    let secrets = MemorySecrets::new();
+    secrets
+        .save(web.id(), &SecretString::new("hunter2"))
+        .expect("the test store keeps a secret");
+
+    let (book, groups) = service.load().expect("both documents load");
+    let groups = service
+        .create_group(&groups, &group_path("Prod"))
+        .expect("the group is new");
+    let moved = service
+        .move_hosts(&book, &groups, &[web.id()], Some(&group_path("Prod")))
+        .expect("the host moves");
+
+    let renamed = service
+        .rename_group(
+            &moved.hosts,
+            &moved.groups,
+            &group_path("Prod"),
+            &group_path("Production"),
+        )
+        .expect("the rename is valid");
+    assert_eq!(renamed.hosts_changed, 1);
+
+    let (book, groups) = GroupService::at(dir.path())
+        .load()
+        .expect("both documents load after the restart");
+    let restored = book.host(web.id()).expect("the host is still there");
+    assert_eq!(restored.group_path(), Some(group_path("Production")));
+    assert_eq!(restored.address(), "10.0.0.5");
+    assert_eq!(restored.user(), "deploy");
+    assert_eq!(restored.identity_file(), Some("keys/web"));
+    assert_eq!(restored.auth(), Some(AuthMethodKind::Password));
+    assert!(
+        restored.remembers_secret(),
+        "the saved secret still belongs here"
+    );
+    assert_eq!(restored.jumps(), [api.id()], "the jump chain is unchanged");
+    assert!(groups.contains(&group_path("Production")));
+    assert!(!groups.contains(&group_path("Prod")));
+    assert_eq!(
+        secrets
+            .load(web.id())
+            .expect("the test store reads")
+            .expect("the secret is still filed under the same host")
+            .expose(),
+        "hunter2"
+    );
+}
+
+#[test]
+fn deleting_a_group_moves_its_hosts_and_never_removes_them() {
+    let dir = TempDir::new("group-delete");
+    let service = dir.service();
+    let web = saved(&dir.store(), host("web", "10.0.0.5", 22, "deploy", None));
+    let api = saved(&dir.store(), host("api", "10.0.0.6", 22, "deploy", None));
+    let elsewhere = saved(&dir.store(), host("lab", "10.0.0.9", 22, "deploy", None));
+
+    let (book, groups) = service.load().expect("both documents load");
+    let groups = service
+        .create_group(&groups, &group_path("Prod/Web"))
+        .expect("the group is new");
+    let groups = service
+        .create_group(&groups, &group_path("Lab"))
+        .expect("the destination exists");
+    let moved = service
+        .move_hosts(&book, &groups, &[web.id()], Some(&group_path("Prod/Web")))
+        .expect("the host moves");
+
+    let preview = service
+        .preview_deletion(&moved.hosts, &moved.groups, &group_path("Prod"), None)
+        .expect("the preview is available before anything is written");
+    assert_eq!(
+        preview.hosts_moved, 1,
+        "the confirmation counts the hosts inside the group"
+    );
+    assert_eq!(
+        preview.groups_removed,
+        vec![group_path("Prod"), group_path("Prod/Web")],
+        "the confirmation names every group that goes"
+    );
+
+    let (update, deletion) = service
+        .delete_group(&moved.hosts, &moved.groups, &group_path("Prod"), None)
+        .expect("the group is deleted");
+    assert_eq!(deletion.hosts_moved, 1);
+    assert_eq!(update.hosts_changed, 1);
+
+    let (book, groups) = GroupService::at(dir.path())
+        .load()
+        .expect("both documents load after the restart");
+    assert_eq!(
+        book.hosts().len(),
+        3,
+        "deleting a group never deletes a host"
+    );
+    assert_eq!(
+        book.host(web.id())
+            .expect("the host is still saved")
+            .group_path(),
+        None,
+        "its hosts went to where the user chose"
+    );
+    assert_eq!(
+        book.host(api.id())
+            .expect("the untouched host is still saved")
+            .address(),
+        "10.0.0.6"
+    );
+    assert_eq!(
+        book.host(elsewhere.id())
+            .expect("another group is untouched")
+            .group_path(),
+        None
+    );
+    assert!(!groups.contains(&group_path("Prod")));
+
+    // A second deletion, this time of a group with nothing in it.
+    let (update, _) = service
+        .delete_group(&book, &groups, &group_path("Lab"), None)
+        .expect("the empty group is deleted");
+    assert_eq!(update.hosts_changed, 0, "an empty group moves nothing");
+    let (book, groups) = service.load().expect("both documents load");
+    assert_eq!(book.hosts().len(), 3);
+    assert!(!groups.contains(&group_path("Lab")));
+}
+
+#[test]
+fn a_repeated_group_name_or_an_unknown_host_leaves_both_files_as_they_were() {
+    let dir = TempDir::new("group-refused");
+    let service = dir.service();
+    let web = saved(&dir.store(), host("web", "10.0.0.5", 22, "deploy", None));
+    let (book, groups) = service.load().expect("both documents load");
+    let groups = service
+        .create_group(&groups, &group_path("Prod"))
+        .expect("the group is new");
+
+    let hosts_before = dir.read_file();
+    let groups_before = std::fs::read_to_string(dir.group_file()).expect("the group file is there");
+
+    assert_eq!(
+        service.create_group(&groups, &group_path("Prod")),
+        Err(GroupError::Groups(GroupBookError::AlreadyExists {
+            path: group_path("Prod"),
+        }))
+    );
+    assert!(matches!(
+        service.move_hosts(&book, &groups, &[HostId::new()], Some(&group_path("Prod"))),
+        Err(GroupError::Hosts(BookError::UnknownHost { .. }))
+    ));
+    assert_eq!(
+        dir.read_file(),
+        hosts_before,
+        "a refused move does not rewrite the hosts"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.group_file()).expect("the group file is there"),
+        groups_before,
+        "a refused change does not rewrite the tree"
+    );
+    assert_eq!(
+        book.host(web.id()).expect("the host is saved").group_path(),
+        None
+    );
+}
+
+#[test]
+fn a_failed_group_write_puts_the_hosts_back() {
+    let dir = TempDir::new("group-half-written");
+    let service = dir.service();
+    let web = saved(&dir.store(), host("web", "10.0.0.5", 22, "deploy", None));
+    let (book, groups) = service.load().expect("both documents load");
+    let hosts_before = dir.read_file();
+
+    // A directory where the group file belongs: the hosts can be written, the tree
+    // cannot be replaced.
+    std::fs::create_dir_all(dir.group_file()).expect("the test can block the group file");
+
+    match service.move_hosts(&book, &groups, &[web.id()], Some(&group_path("Prod"))) {
+        Err(GroupError::HalfWritten { restored, .. }) => {
+            assert_eq!(restored, "restored", "the hosts were put back");
+        }
+        other => panic!("the change must report the failed tree write, got {other:?}"),
+    }
+
+    assert_eq!(
+        dir.read_file(),
+        hosts_before,
+        "the hosts are what they were"
+    );
+    let reloaded = dir.store().load().expect("the host file still loads");
+    assert_eq!(
+        reloaded
+            .host(web.id())
+            .expect("the host is still there")
+            .group_path(),
+        None
+    );
+}

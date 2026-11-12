@@ -1,5 +1,5 @@
-//! Versioned, atomic storage for saved hosts, forwarding rules and workspace
-//! snapshots (R3, R4, R10, R11).
+//! Versioned, atomic storage for saved hosts, their groups, forwarding rules and
+//! workspace snapshots (R3, R4, R10, R11, R18).
 //!
 //! The crate owns the user-data files:
 //!
@@ -7,6 +7,9 @@
 //!   log. One book, so search, grouping and the recent view can never disagree
 //!   about what a host is called or which address it uses. A host may also name a
 //!   jump chain and a ProxyCommand; those are references and command text.
+//! * `GroupStore` / `GroupService` — the group tree: which paths exist, empty ones
+//!   included, and the changes that keep it and the hosts agreeing when a group is
+//!   moved, renamed or deleted.
 //! * `ForwardStore` — saved local, remote and dynamic forwarding rules.
 //! * `WorkspaceStore` — the workspace snapshot: tabs, pane tree and panel.
 //! * `SnippetStore` — the saved commands: a name and a command body each, in their
@@ -35,6 +38,7 @@ mod book;
 mod credentials;
 mod error;
 mod forwarding;
+mod group;
 mod preferences;
 mod snippets;
 mod ssh_config;
@@ -49,6 +53,9 @@ pub use book::{
 pub use credentials::{MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
 pub use error::{BookError, PersistError, StorageError};
 pub use forwarding::{FILE_NAME as FORWARD_FILE_NAME, ForwardStore};
+pub use group::{
+    FILE_NAME as GROUP_FILE_NAME, GroupDeletion, GroupError, GroupService, GroupStore, GroupUpdate,
+};
 pub use preferences::{
     FILE_NAME as PREFERENCES_FILE_NAME, KeymapEntry, KeymapPreferences, Preferences,
     PreferencesProblem, PreferencesStore,

@@ -17,6 +17,7 @@ mod error;
 mod files;
 pub mod fingerprint;
 mod forward;
+mod group;
 mod host;
 mod ids;
 mod session;
@@ -36,6 +37,10 @@ pub use fingerprint::sha256_fingerprint;
 pub use forward::{
     BindExposure, Endpoint, FORWARD_FORMAT_VERSION, ForwardBook, ForwardBookError,
     ForwardBuildError, ForwardFault, ForwardKind, ForwardRule,
+};
+pub use group::{
+    GROUP_SEPARATOR, GROUPS_FORMAT_VERSION, GroupBook, GroupBookError, GroupPath, GroupPathError,
+    MAX_GROUP_DEPTH, MAX_GROUP_SEGMENT_CHARS,
 };
 pub use host::{
     DEFAULT_SSH_PORT, HostConfig, HostValidationError, JumpFault, Port, X11Forwarding,

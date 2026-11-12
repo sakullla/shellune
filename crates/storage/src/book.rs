@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use shellune_core::{HostConfig, HostId, JumpFault, jump_faults};
+use shellune_core::{GroupPath, HostConfig, HostId, JumpFault, jump_faults};
 
 use crate::error::BookError;
 
@@ -340,16 +340,12 @@ impl HostBook {
         let mut named: BTreeMap<String, Group<'a>> = BTreeMap::new();
         let mut ungrouped = Group::default();
         for host in hosts {
-            match host
-                .group()
-                .map(str::trim)
-                .filter(|label| !label.is_empty())
-            {
+            match host.group_text().filter(|label| !label.trim().is_empty()) {
                 Some(label) => {
                     named
                         .entry(label.to_lowercase())
                         .or_insert_with(|| Group {
-                            label: Some(label.to_owned()),
+                            label: Some(label.clone()),
                             hosts: Vec::new(),
                         })
                         .hosts
@@ -367,16 +363,114 @@ impl HostBook {
 
     /// The group labels in display order, for a group chooser.
     #[must_use]
-    pub fn group_labels(&self) -> Vec<&str> {
-        let mut labels: Vec<&str> = self
+    pub fn group_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
             .hosts
             .iter()
-            .filter_map(|host| host.group().map(str::trim))
+            .filter_map(HostConfig::group_text)
+            .map(|label| label.trim().to_owned())
             .filter(|label| !label.is_empty())
             .collect();
         labels.sort_unstable();
         labels.dedup();
         labels
+    }
+
+    /// The hosts exactly in one group.
+    #[must_use]
+    pub fn hosts_in_group(&self, path: &GroupPath) -> Vec<HostId> {
+        self.hosts
+            .iter()
+            .filter(|host| host.group_path().as_ref() == Some(path))
+            .map(HostConfig::id)
+            .collect()
+    }
+
+    /// The hosts in one group and in every group inside it.
+    ///
+    /// Deleting or renaming a group moves exactly these hosts: the ones above it are
+    /// another place, and the ones beside it are no business of the change.
+    #[must_use]
+    pub fn hosts_under_group(&self, path: &GroupPath) -> Vec<HostId> {
+        self.hosts
+            .iter()
+            .filter(|host| {
+                host.group_path()
+                    .is_some_and(|current| current.starts_with(path))
+            })
+            .map(HostConfig::id)
+            .collect()
+    }
+
+    /// Moves the given hosts into one group, or out of every group.
+    ///
+    /// Returns how many hosts changed. All or nothing: an identifier that names no
+    /// saved host leaves the book exactly as it was, because a half-applied move would
+    /// make the counts the user confirmed disagree with the tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BookError::UnknownHost`] for the first identifier that is not saved.
+    pub fn reassign_group(
+        &mut self,
+        ids: &[HostId],
+        destination: Option<&GroupPath>,
+    ) -> Result<usize, BookError> {
+        for id in ids {
+            if self.host(*id).is_none() {
+                return Err(BookError::UnknownHost { id: *id });
+            }
+        }
+        // A selection can be as large as the list, so membership is a set lookup: one
+        // pass over five thousand hosts must not compare every host with every id.
+        let selected: HashSet<HostId> = ids.iter().copied().collect();
+        let mut changed = 0;
+        for host in &mut self.hosts {
+            if selected.contains(&host.id()) {
+                host.set_group_path(destination.cloned());
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Rewrites the path of every host inside a renamed group.
+    ///
+    /// Returns how many hosts changed. The hosts keep their identifiers, addresses,
+    /// jump chains and credential references: only the group moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BookError::Inconsistent`] when a moved path would be deeper than the
+    /// limit, which leaves the book as it was.
+    pub fn rename_group_paths(
+        &mut self,
+        from: &GroupPath,
+        to: &GroupPath,
+    ) -> Result<usize, BookError> {
+        let mut pending: Vec<(usize, GroupPath)> = Vec::new();
+        for (index, host) in self.hosts.iter().enumerate() {
+            let Some(current) = host.group_path() else {
+                continue;
+            };
+            if !current.starts_with(from) {
+                continue;
+            }
+            let moved = current
+                .rebase(from, to)
+                .ok_or_else(|| BookError::Inconsistent {
+                    reason: format!(
+                        "renaming {from} to {to} would put the host {} below the deepest group that can be shown",
+                        host.name()
+                    ),
+                })?;
+            pending.push((index, moved));
+        }
+        let changed = pending.len();
+        for (index, moved) in pending {
+            self.hosts[index].set_group_path(Some(moved));
+        }
+        Ok(changed)
     }
 
     /// Jump-chain problems in this book.
@@ -447,7 +541,7 @@ fn matches(host: &HostConfig, phrase: &str) -> bool {
         host.name().to_lowercase(),
         host.address().to_lowercase(),
         host.user().to_lowercase(),
-        host.group().unwrap_or_default().to_lowercase(),
+        host.group_text().unwrap_or_default().to_lowercase(),
     ];
     haystacks.iter().any(|value| value.contains(phrase))
 }

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use crate::auth::AuthMethodKind;
 use serde::{Deserialize, Serialize};
 
+use crate::group::GroupPath;
 use crate::ids::HostId;
 use crate::task::TransferProtocol;
 
@@ -147,6 +148,14 @@ pub struct HostConfig {
     port: Port,
     user: String,
     group: Option<String>,
+    /// The hierarchy path of the group this host is in (R18), when the user chose one.
+    ///
+    /// A record carries at most one of this and [`Self::group`]: `group` is the single
+    /// label an earlier build wrote, `group_path` is the hierarchy this build assigns.
+    /// Keeping them apart is what lets the label stay byte-identical on disk and read as
+    /// a path of one segment even when the label itself contains the separator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_path: Option<GroupPath>,
     /// The *path* of a private key file, never its contents.
     ///
     /// An imported SSH configuration sets `IdentityFile`; keeping the path lets a
@@ -221,6 +230,9 @@ struct HostConfigWire {
     port: Port,
     user: String,
     group: Option<String>,
+    /// Absent in files written before groups could nest.
+    #[serde(default)]
+    group_path: Option<GroupPath>,
     /// Absent in files written before an imported key path was stored.
     #[serde(default)]
     identity_file: Option<String>,
@@ -255,16 +267,26 @@ impl TryFrom<HostConfigWire> for HostConfig {
         // The port deserializes as a bare integer, so the range check has to be
         // repeated here; otherwise a stored `port: 0` would become a connectable host.
         let port = Port::new(u32::from(wire.port.get()))?;
+        // One place, never two: a stored hierarchy wins, and the label is the
+        // one-segment path an earlier build wrote. Reading does not guess a
+        // hierarchy out of a label that contains the separator.
+        let (group, group_path) = match wire.group_path {
+            Some(path) => (None, Some(path)),
+            None => (
+                wire.group
+                    .map(|group| group.trim().to_owned())
+                    .filter(|group| !group.is_empty()),
+                None,
+            ),
+        };
         Ok(Self {
             id: wire.id,
             name,
             address,
             port,
             user,
-            group: wire
-                .group
-                .map(|group| group.trim().to_owned())
-                .filter(|group| !group.is_empty()),
+            group_path,
+            group,
             identity_file: normalize_identity_file(wire.identity_file),
             auth: wire.auth,
             remember_secret: wire.remember_secret,
@@ -328,6 +350,7 @@ impl HostConfig {
             port: Port::new(u32::from(port))?,
             user: validate_user(user.into())?,
             group: None,
+            group_path: None,
             identity_file: None,
             auth: None,
             remember_secret: false,
@@ -369,10 +392,40 @@ impl HostConfig {
         &self.user
     }
 
-    /// Optional grouping label.
+    /// The single grouping label an earlier build wrote, when the record has one.
+    ///
+    /// A host in a hierarchy returns `None` here and its path from
+    /// [`Self::group_path`]; use [`Self::group_text`] where one string is needed.
     #[must_use]
     pub fn group(&self) -> Option<&str> {
         self.group.as_deref()
+    }
+
+    /// The group this host is in, as a path, when it is grouped at all.
+    ///
+    /// A record written before groups could nest answers with its label as a path of
+    /// one segment, which is what that label meant. A label that has no path form (it
+    /// carries a control character) answers `None` and stays visible as a label.
+    #[must_use]
+    pub fn group_path(&self) -> Option<GroupPath> {
+        match (&self.group_path, &self.group) {
+            (Some(path), _) => Some(path.clone()),
+            (None, Some(label)) => GroupPath::from_label(label).ok(),
+            (None, None) => None,
+        }
+    }
+
+    /// The group as one string, for search and the flat label view.
+    ///
+    /// A hierarchy is written in its canonical form, so searching `Prod/Web` finds the
+    /// hosts inside it.
+    #[must_use]
+    pub fn group_text(&self) -> Option<String> {
+        match (&self.group_path, &self.group) {
+            (Some(path), _) => Some(path.to_canonical()),
+            (None, Some(label)) => Some(label.clone()),
+            (None, None) => None,
+        }
     }
 
     /// The private key file the next connection should offer, when one was
@@ -489,12 +542,29 @@ impl HostConfig {
         Ok(())
     }
 
-    /// Assigns or clears the grouping label.
+    /// Assigns or clears the single grouping label.
+    ///
+    /// Naming a label replaces any hierarchy this host was in: a host belongs to one
+    /// place, and two fields that could disagree would make the group counts wrong.
     pub fn set_group(&mut self, group: Option<impl Into<String>>) {
         self.group = group
             .map(Into::into)
             .map(|group: String| group.trim().to_owned())
             .filter(|group| !group.is_empty());
+        if self.group.is_some() {
+            self.group_path = None;
+        }
+    }
+
+    /// Moves this host into a group path, or out of every group.
+    ///
+    /// The path was validated when it was built, so this cannot fail. Assigning a path
+    /// clears a legacy label for the same reason [`Self::set_group`] clears a path.
+    pub fn set_group_path(&mut self, path: Option<GroupPath>) {
+        if path.is_some() {
+            self.group = None;
+        }
+        self.group_path = path;
     }
 
     /// Assigns or clears the private key path.
