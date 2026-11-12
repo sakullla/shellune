@@ -15,6 +15,8 @@
 //! * [`components`] — reusable view pieces;
 //! * [`view`] — the composition the user actually sees.
 
+#[cfg(feature = "ui-capture")]
+pub mod capture;
 pub mod components;
 pub mod copy;
 pub mod files;

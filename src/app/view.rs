@@ -795,6 +795,49 @@ impl ShelluneView {
         store: HostStore,
         trust: TrustStore,
     ) -> Self {
+        Self::with_stores(cx, workspace, store, trust, default_secrets())
+    }
+
+    /// Builds the shell the capture probe draws: every store under `root`, a trust
+    /// file beside them, and credentials in memory only.
+    ///
+    /// Nothing here reads or writes the developer's real data directory or the
+    /// system credential store, and no session is started (R1, R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn for_capture(
+        cx: &mut Context<Self>,
+        workspace: Workspace,
+        root: &std::path::Path,
+    ) -> Self {
+        Self::with_stores(
+            cx,
+            workspace,
+            HostStore::at(root.to_path_buf()),
+            TrustStore::at(root.to_path_buf()),
+            std::sync::Arc::new(shellune_storage::MemorySecrets::new()),
+        )
+    }
+
+    /// Chooses the palette the capture draws, without touching saved preferences.
+    #[cfg(feature = "ui-capture")]
+    pub fn set_capture_theme(&mut self, choice: theme::ThemeChoice, cx: &mut Context<Self>) {
+        self.theme_choice = choice;
+        cx.notify();
+    }
+
+    /// Builds the shell with every store, the trust file and the credential store
+    /// chosen by the caller.
+    ///
+    /// Every other store is derived from `store.root()`, so one directory decides
+    /// where this shell reads and writes. The capture probe uses it to keep a run off
+    /// the developer's real hosts, trust file and system credentials (R1, R2).
+    fn with_stores(
+        cx: &mut Context<Self>,
+        workspace: Workspace,
+        store: HostStore,
+        trust: TrustStore,
+        secrets: std::sync::Arc<dyn SecretStore>,
+    ) -> Self {
         let placeholder = workspace.strings().shell_custom_placeholder;
         let search_placeholder = workspace.strings().hosts_search_placeholder;
         let strings = workspace.strings();
@@ -918,7 +961,7 @@ impl ShelluneView {
             trust,
             trust_book: HostTrust::new(),
             trust_error: None,
-            secrets: default_secrets(),
+            secrets,
             files: FileViews::new(),
             transfers: TransferViews::new(),
             forwards: ForwardCenter::new(),

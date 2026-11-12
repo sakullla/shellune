@@ -13,6 +13,10 @@ default-run = "shellune"
 # interrupt tests need is in it, so a build without this feature - including every
 # release build - contains no test program at all.
 test-support = ["dep:libc"]
+# Builds the hidden-window capture probe in src/app/capture.rs (R1, R11). It is off
+# by default: a normal build, let alone a release artifact, contains no capture entry,
+# no scenario fixture and no PrintWindow call.
+ui-capture = ["dep:serde_json"]
 
 [[bin]]
 name = "shellune-flood"
@@ -27,13 +31,19 @@ shellune-core = { path = "crates/core" }
 shellune-ssh = { path = "crates/ssh" }
 shellune-storage = { path = "crates/storage" }
 shellune-terminal = { path = "crates/terminal" }
+# Only the capture probe reports machine-readable results; the feature pulls it in.
+serde_json = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # The custom title bar drives the window through the system: the caption starts the
 # native move loop, and the window buttons send the system's own commands. The
-# test-only flood program also uses it to ignore Ctrl+C.
+# test-only flood program also uses it to ignore Ctrl+C. The capture probe reads a
+# window's client area back through GDI and PrintWindow, the latter declared under
+# Storage::Xps in Windows Sys.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
     "Win32_System_Console",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
