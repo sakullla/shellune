@@ -15,7 +15,9 @@
 //! * **Trust is still the user's decision.** An unknown host identity or a
 //!   ProxyCommand stops *that host* and asks; the question travels to the caller as
 //!   an event and the answer comes back through `BatchRunner::answer_trust`. Nothing
-//!   is accepted on the user's behalf, and the other hosts keep going.
+//!   is accepted on the user's behalf, and the other hosts keep going: a host waiting
+//!   for an answer does not hold a connection slot, so even a run limited to one
+//!   connection at a time keeps its other hosts moving.
 //! * **Pause and cancel are not the same as "stopped".** A pause starts no new step
 //!   and leaves a running command alone. A cancel asks the remote side to stop, marks
 //!   the run `cancelling`, and only records a step as cancelled after the channel has
@@ -28,7 +30,7 @@
 //! one that reuses the existing direct and chain connections, their trust decisions,
 //! their authentication and their resolved connection policy.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -219,6 +221,11 @@ impl HostControl {
     /// The question is written to the run log before the call blocks, which is what
     /// lets the window show it. `None` means the run was cancelled or ended while the
     /// question was still open; a transport must treat that as "do not proceed".
+    ///
+    /// Waiting is not work, so the host gives its connection slot back while the
+    /// question is open and takes it again before the connection continues. One host
+    /// waiting for the user therefore cannot stop the other hosts of a run with a
+    /// concurrency limit of one.
     pub fn ask(&self, question: TrustQuestion) -> Option<bool> {
         let pending = match &question {
             TrustQuestion::HostKey {
@@ -237,6 +244,7 @@ impl HostControl {
                 command: format!("{label}: {command}"),
             },
         };
+        self.control.drop_slot(self.host);
         self.control.emit(pending);
         let answer = self
             .control
@@ -246,6 +254,11 @@ impl HostControl {
             host: self.host,
             accepted: answer == Some(true),
         });
+        if !self.control.take_slot(self.host) {
+            // The run ended while the question was open: this host stops here and holds
+            // no slot to give back.
+            return None;
+        }
         answer
     }
 }
@@ -385,10 +398,12 @@ impl TransportFactory for SshTransports {
 /// How a run bounds its work.
 #[derive(Clone, Copy, Debug)]
 pub struct RunnerOptions {
-    /// How many hosts may have a connection open at the same time.
+    /// How many hosts may be connecting or running a command at the same time.
     ///
     /// It is the task's own concurrency unless the caller lowers it, so the promise in
-    /// the confirmation dialog is the promise the run keeps.
+    /// the confirmation dialog is the promise the run keeps. A host that is only
+    /// waiting for the user's answer to a trust question is not counted, because it is
+    /// doing nothing that another host could need the slot for.
     pub concurrency: u32,
 }
 
@@ -456,6 +471,7 @@ impl BatchRunner {
         for target in task.targets() {
             let worker = Arc::clone(&control);
             let factory = Arc::clone(&factory);
+            let host = target.host_id();
             let target = target.clone();
             let steps: Vec<String> = task
                 .steps()
@@ -466,15 +482,20 @@ impl BatchRunner {
                 .name(format!("shellune-batch-{}", target.label()))
                 .spawn(move || run_host(worker, factory, target, steps))
                 .expect("the batch worker thread can be created");
-            workers.push(handle);
+            workers.push((host, handle));
         }
 
         let coordinator_control = Arc::clone(&control);
         let coordinator = std::thread::Builder::new()
             .name("shellune-batch-run".to_owned())
             .spawn(move || {
-                for worker in workers {
-                    let _ = worker.join();
+                for (host, worker) in workers {
+                    // A worker that panicked never wrote how its host ended. That is
+                    // not a success: the host is marked failed here, and the run cannot
+                    // then be recorded as completed.
+                    if worker.join().is_err() {
+                        coordinator_control.worker_failed(host);
+                    }
                 }
                 coordinator_control.finish();
             })
@@ -491,40 +512,30 @@ impl BatchRunner {
     ///
     /// Hosts that are already connected keep their connection; the pause is about not
     /// starting the next step, which is exactly what R19 promises.
+    ///
+    /// A pause only applies while the run is running. Calling it after a cancel, while
+    /// the run is `cancelling`, or once it is over changes nothing and writes nothing:
+    /// `cancelling` cannot become `paused`, and a scheduler paused under a cancelled run
+    /// would leave its workers waiting for a resume that is never sent.
     pub fn pause(&self) {
-        if self.control.is_finished() {
-            return;
-        }
-        self.control.scheduler.set(SchedState::Paused);
-        self.control.emit(BatchEventKind::RunState {
-            state: RunState::Paused,
-        });
+        self.control.pause();
     }
 
     /// Continues a paused run from the steps that were left.
+    ///
+    /// Like [`Self::pause`], it is only a move a paused run can make: resuming a run
+    /// that is running, cancelling, cancelled, interrupted or finished writes nothing.
     pub fn resume(&self) {
-        if self.control.is_finished() {
-            return;
-        }
-        self.control.scheduler.set(SchedState::Running);
-        self.control.emit(BatchEventKind::RunState {
-            state: RunState::Running,
-        });
+        self.control.resume();
     }
 
     /// Asks the run to stop.
     ///
     /// The run is reported as `cancelling` at once and as `cancelled` only after every
-    /// running command has ended; no new step starts in between.
+    /// running command has ended; no new step starts in between. A second cancel, or a
+    /// cancel after the run ended, is dropped silently.
     pub fn cancel(&self) {
-        if self.control.is_finished() {
-            return;
-        }
-        self.control.scheduler.set(SchedState::Cancelling);
-        self.control.cancel.cancel();
-        self.control.emit(BatchEventKind::RunState {
-            state: RunState::Cancelling,
-        });
+        self.control.cancel_requested();
     }
 
     /// Answers the open question for one host.
@@ -556,10 +567,11 @@ impl BatchRunner {
         self.control.is_finished()
     }
 
-    /// How many hosts this run may have connected at once.
+    /// How many hosts this run may have working at once.
     ///
     /// It is the effective value after the task's own limit and the caller's option
-    /// were applied, which is the number a running page can show.
+    /// were applied, which is the number a running page can show. A host waiting for
+    /// the user to answer a trust question does not occupy one of these places.
     #[must_use]
     pub fn concurrency(&self) -> u32 {
         self.control.concurrency
@@ -703,7 +715,10 @@ impl TrustGate {
     }
 }
 
-/// The connection slots a run shares between its hosts.
+/// The places a run hands out to the hosts that are working.
+///
+/// A host holds one while it connects and while it runs its steps; it gives it back
+/// while it waits for the user, so a question never keeps another host waiting.
 struct Permits {
     free: Mutex<usize>,
     wake: Condvar,
@@ -758,6 +773,13 @@ struct Control {
     cancel: CancelToken,
     trust: TrustGate,
     permits: Permits,
+    /// The state the run is in, kept beside the log so a pause or resume can tell
+    /// whether the move is still one the run can make.
+    run_state: Mutex<RunState>,
+    /// The hosts that currently hold one of the connection slots.
+    slots: Mutex<HashSet<HostId>>,
+    /// The hosts whose final state is already in the log.
+    finished_hosts: Mutex<HashSet<HostId>>,
     concurrency: u32,
     on_failure: FailurePolicy,
     any_failed: AtomicBool,
@@ -779,6 +801,9 @@ impl Control {
             cancel: CancelToken::new(),
             trust: TrustGate::new(),
             permits: Permits::new(usize::try_from(concurrency).unwrap_or(1).max(1)),
+            run_state: Mutex::new(RunState::Running),
+            slots: Mutex::new(HashSet::new()),
+            finished_hosts: Mutex::new(HashSet::new()),
             concurrency: concurrency.max(1),
             on_failure,
             any_failed: AtomicBool::new(false),
@@ -805,10 +830,133 @@ impl Control {
         self.stop_scheduling.load(Ordering::SeqCst) || self.cancel.is_cancelled()
     }
 
+    /// Holds back the next step, when the run is still running.
+    ///
+    /// Returns whether the pause was applied. A pause that arrives after a cancel, or
+    /// once the run is over, is dropped instead of written down: `cancelling` cannot
+    /// become `paused`, and a paused scheduler would leave the workers waiting for a
+    /// resume that a cancelled run never sends.
+    fn pause(&self) -> bool {
+        self.move_state(RunState::Running, RunState::Paused, SchedState::Paused)
+    }
+
+    /// Lets a paused run continue from the steps that were left.
+    ///
+    /// Returns whether the resume was applied; resuming a run that is not paused (it
+    /// was cancelled or already finished) changes nothing.
+    fn resume(&self) -> bool {
+        self.move_state(RunState::Paused, RunState::Running, SchedState::Running)
+    }
+
+    /// Moves the run from one state to the next, with the scheduler under one lock.
+    ///
+    /// The run state, the scheduler and the log move together, so a worker never acts
+    /// on a scheduler value the log contradicts.
+    fn move_state(&self, from: RunState, to: RunState, sched: SchedState) -> bool {
+        let mut state = match self.run_state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *state != from {
+            return false;
+        }
+        *state = to;
+        self.scheduler.set(sched);
+        self.emit(BatchEventKind::RunState { state: to });
+        true
+    }
+
+    /// Reports a cancel at once and lets the commands that are running end.
+    ///
+    /// The run stays `cancelling` until every worker has ended, which is the difference
+    /// between asking the remote side to stop and knowing that it did.
+    fn cancel_requested(&self) {
+        let mut state = match self.run_state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.cancel.cancel();
+        if state.is_finished() || *state == RunState::Cancelling {
+            return;
+        }
+        *state = RunState::Cancelling;
+        self.scheduler.set(SchedState::Cancelling);
+        self.emit(BatchEventKind::RunState {
+            state: RunState::Cancelling,
+        });
+    }
+
+    /// Takes one connection slot for a host, waiting for a free one.
+    ///
+    /// Returns false when the run was cancelled while this host waited.
+    fn take_slot(&self, host: HostId) -> bool {
+        if !self.permits.acquire(&self.cancel) {
+            return false;
+        }
+        match self.slots.lock() {
+            Ok(mut slots) => slots.insert(host),
+            Err(poisoned) => poisoned.into_inner().insert(host),
+        };
+        true
+    }
+
+    /// Gives this host's slot back, at most once.
+    ///
+    /// A host that is waiting for the user has already given its slot back, so the set
+    /// of held slots is what keeps the count right when such a host ends.
+    fn drop_slot(&self, host: HostId) {
+        let held = match self.slots.lock() {
+            Ok(mut slots) => slots.remove(&host),
+            Err(poisoned) => poisoned.into_inner().remove(&host),
+        };
+        if held {
+            self.permits.release();
+        }
+    }
+
+    /// Records how one host ended, once.
+    ///
+    /// A host has one final state per run, so a second record for the same host is
+    /// dropped instead of contradicting the first one in the log.
+    fn finish_host(&self, host: HostId, state: HostState, detail: Option<String>) {
+        let first = match self.finished_hosts.lock() {
+            Ok(mut finished) => finished.insert(host),
+            Err(poisoned) => poisoned.into_inner().insert(host),
+        };
+        if !first {
+            return;
+        }
+        self.emit(BatchEventKind::HostFinished {
+            host,
+            state,
+            detail,
+        });
+    }
+
+    /// Records a host whose worker ended without recording how the host ended.
+    ///
+    /// A worker that panicked left no state behind, and treating that silence as
+    /// success is the one reading a run must never take: the host is marked failed, so
+    /// the run cannot be reported as completed on the strength of the hosts that did
+    /// finish. A host that had already recorded its own end keeps that end; the run is
+    /// still failed.
+    fn worker_failed(&self, host: HostId) {
+        self.any_failed.store(true, Ordering::SeqCst);
+        self.finish_host(
+            host,
+            HostState::Failed,
+            Some("the batch worker for this host stopped before it recorded an end".to_owned()),
+        );
+    }
+
     /// Ends the run: records the state the hosts earned and closes the run.
     fn finish(&self) {
+        let mut state = match self.run_state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         self.scheduler.set(SchedState::Stopped);
-        let state = if self.cancel.is_cancelled() {
+        let next = if self.cancel.is_cancelled() {
             RunState::Cancelled
         } else if self.any_failed.load(Ordering::SeqCst) || self.any_stopped.load(Ordering::SeqCst)
         {
@@ -816,8 +964,25 @@ impl Control {
         } else {
             RunState::Completed
         };
+        *state = next;
         self.finished.store(true, Ordering::SeqCst);
-        self.emit(BatchEventKind::RunState { state });
+        self.emit(BatchEventKind::RunState { state: next });
+    }
+}
+
+/// One host's hold on a connection slot, given back when the worker ends.
+///
+/// It is a guard rather than a call at the end of the worker so a worker that panics
+/// still returns its slot: a leaked slot would keep another host waiting for a
+/// connection that will never be made.
+struct SlotHold {
+    control: Arc<Control>,
+    host: HostId,
+}
+
+impl Drop for SlotHold {
+    fn drop(&mut self) {
+        self.control.drop_slot(self.host);
     }
 }
 
@@ -855,7 +1020,7 @@ fn run_host(
         );
         return;
     }
-    if !control.permits.acquire(&control.cancel) {
+    if !control.take_slot(host) {
         control.any_stopped.store(true, Ordering::SeqCst);
         finish_host(
             &control,
@@ -865,13 +1030,18 @@ fn run_host(
         );
         return;
     }
+    // The slot is held by a guard, so it goes back even when this worker panics;
+    // waiting for the user gives it back and takes it again, which the guard follows.
+    let _slot = SlotHold {
+        control: Arc::clone(&control),
+        host,
+    };
 
     let mut transport = match factory.open(&target) {
         Ok(transport) => transport,
         Err(reason) => {
             control.any_failed.store(true, Ordering::SeqCst);
             finish_host(&control, host, HostState::Failed, Some(reason));
-            control.permits.release();
             return;
         }
     };
@@ -892,7 +1062,6 @@ fn run_host(
             finish_host(&control, host, HostState::Failed, Some(reason));
         }
         transport.disconnect();
-        control.permits.release();
         return;
     }
 
@@ -911,7 +1080,6 @@ fn run_host(
                 Some("the run stopped before the next step started".to_owned()),
             );
             transport.disconnect();
-            control.permits.release();
             return;
         }
 
@@ -954,7 +1122,6 @@ fn run_host(
                 });
                 fail_host(&control, host, detail);
                 transport.disconnect();
-                control.permits.release();
                 return;
             }
             Err(StepFailure::Failed(reason)) => {
@@ -967,7 +1134,6 @@ fn run_host(
                 });
                 fail_host(&control, host, reason);
                 transport.disconnect();
-                control.permits.release();
                 return;
             }
             Err(StepFailure::Cancelled) => {
@@ -986,7 +1152,6 @@ fn run_host(
                     Some("cancelled by the user".to_owned()),
                 );
                 transport.disconnect();
-                control.permits.release();
                 return;
             }
         }
@@ -994,7 +1159,6 @@ fn run_host(
 
     finish_host(&control, host, HostState::Succeeded, None);
     transport.disconnect();
-    control.permits.release();
 }
 
 fn fail_host(control: &Arc<Control>, host: HostId, detail: String) {
@@ -1006,11 +1170,7 @@ fn fail_host(control: &Arc<Control>, host: HostId, detail: String) {
 }
 
 fn finish_host(control: &Arc<Control>, host: HostId, state: HostState, detail: Option<String>) {
-    control.emit(BatchEventKind::HostFinished {
-        host,
-        state,
-        detail,
-    });
+    control.finish_host(host, state, detail);
 }
 
 /// The production transport: one saved host, dialled with the SSH layer the terminal

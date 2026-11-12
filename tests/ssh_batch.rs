@@ -115,6 +115,9 @@ enum Connect {
     Accept,
     AskKey,
     Refuse,
+    /// Panics, the way a transport with a bug does, so the scheduler has to decide
+    /// what a worker that never reported an end means.
+    Panic,
 }
 
 #[derive(Clone)]
@@ -295,6 +298,7 @@ impl HostTransport for FakeTransport {
                 Ok(())
             }
             Connect::Refuse => Err("the connection was refused".to_owned()),
+            Connect::Panic => panic!("this transport panics on purpose"),
         }
     }
 
@@ -895,6 +899,151 @@ fn the_run_log_and_the_run_summary_agree_and_a_restart_marks_the_unfinished_run(
             .state(),
         RunState::Completed,
         "a restart does not touch a finished run"
+    );
+}
+
+#[test]
+fn a_pause_or_a_resume_after_a_cancel_writes_nothing() {
+    let one = host("alpha");
+    let hosts = Arc::new(FakeHosts::default());
+    let mut plan = HostPlan::new(Connect::Accept);
+    plan.hold.insert("long".to_owned());
+    hosts.set_plan(one.id(), plan);
+    let (mut runner, mut run) = runner(task(&["long", "never"], &[&one], 1), &hosts, 1);
+    let mut events = Vec::new();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        step_started(events, one.id(), 0)
+    }));
+    runner.cancel();
+    // A cancel cannot become a pause and a cancel is not a run to resume: both calls
+    // must write nothing, because the run model refuses those moves.
+    runner.pause();
+    runner.resume();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Cancelled)
+    }));
+    events.extend(runner.join());
+    // Folding refuses a state the run cannot hold, so this is also the check that no
+    // refused transition was written.
+    fold(&mut run, &events);
+    assert!(
+        !has_state(&events, RunState::Paused),
+        "a cancel is never a pause"
+    );
+    let cancelling = position_of(&events, |kind| {
+        matches!(
+            kind,
+            BatchEventKind::RunState {
+                state: RunState::Cancelling
+            }
+        )
+    })
+    .expect("the run said it was cancelling");
+    assert!(
+        !events[cancelling..].iter().any(|event| matches!(
+            event.kind(),
+            BatchEventKind::RunState {
+                state: RunState::Running
+            }
+        )),
+        "a cancelled run is not pushed back to running"
+    );
+    assert_eq!(run.state(), RunState::Cancelled);
+}
+
+#[test]
+fn a_pause_or_a_cancel_after_the_run_finished_writes_nothing() {
+    let one = host("alpha");
+    let hosts = Arc::new(FakeHosts::default());
+    let (mut runner, mut run) = runner(task(&["uptime"], &[&one], 1), &hosts, 1);
+    let mut events = Vec::new();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Completed)
+    }));
+    // The run is over, so none of these may be written as a state it refused.
+    runner.pause();
+    runner.resume();
+    runner.cancel();
+    events.extend(runner.join());
+    fold(&mut run, &events);
+    assert_eq!(run.state(), RunState::Completed);
+    assert!(!has_state(&events, RunState::Paused));
+    assert!(!has_state(&events, RunState::Cancelling));
+}
+
+#[test]
+fn a_question_does_not_hold_the_only_connection_slot() {
+    let first = host("alpha");
+    let second = host("beta");
+    let hosts = Arc::new(FakeHosts::default());
+    hosts.set_plan(first.id(), HostPlan::new(Connect::AskKey));
+    hosts.set_plan(second.id(), HostPlan::new(Connect::AskKey));
+    let (mut runner, mut run) = runner(task(&["uptime"], &[&first, &second], 1), &hosts, 1);
+    let asked = |events: &[BatchEvent], host: HostId| {
+        events.iter().any(|event| {
+            matches!(
+                event.kind(),
+                BatchEventKind::TrustPending { host: asked, .. } if *asked == host
+            )
+        })
+    };
+    let mut events = Vec::new();
+    // Both questions arrive before either is answered: a host that is only waiting for
+    // the user cannot hold the single connection slot the other host needs to ask.
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        asked(events, first.id()) && asked(events, second.id())
+    }));
+    assert_eq!(runner.concurrency(), 1);
+    assert!(runner.answer_trust(first.id(), true));
+    assert!(runner.answer_trust(second.id(), true));
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Completed)
+    }));
+    events.extend(runner.join());
+    fold(&mut run, &events);
+    for host in [first.id(), second.id()] {
+        assert_eq!(
+            run.host(host).expect("the host").state(),
+            HostState::Succeeded
+        );
+    }
+}
+
+#[test]
+fn a_worker_that_panics_fails_its_host_and_keeps_the_run_from_completing() {
+    let broken = host("alpha");
+    let other = host("beta");
+    let hosts = Arc::new(FakeHosts::default());
+    hosts.set_plan(broken.id(), HostPlan::new(Connect::Panic));
+    let (mut runner, mut run) = runner(task(&["uptime"], &[&broken, &other], 2), &hosts, 2);
+    let mut events = Vec::new();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        events.iter().any(|event| {
+            matches!(
+                event.kind(),
+                BatchEventKind::RunState { state } if state.is_finished()
+            )
+        })
+    }));
+    events.extend(runner.join());
+    fold(&mut run, &events);
+    assert_eq!(
+        run.state(),
+        RunState::Failed,
+        "a worker that never reported an end is not a completed run"
+    );
+    let failed = run
+        .host(broken.id())
+        .expect("the host whose worker panicked");
+    assert_eq!(failed.state(), HostState::Failed);
+    assert!(
+        failed.detail().expect("a reason").contains("stopped"),
+        "the reason says the worker stopped: {:?}",
+        failed.detail()
+    );
+    assert_eq!(
+        run.host(other.id()).expect("the other host").state(),
+        HostState::Succeeded
     );
 }
 

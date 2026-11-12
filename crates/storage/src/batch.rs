@@ -41,11 +41,15 @@ pub const TASKS_FILE_NAME: &str = "tasks.json";
 /// Directory, inside the batch directory, that holds one summary and one log per run.
 pub const RUNS_DIRECTORY: &str = "runs";
 
-/// How much of a log's end is read to find the last sequence number.
+/// How much of a log's end is read at a time while the store looks for its last line.
 ///
 /// Only the sequence number of the last line is needed to append the next one, so the
 /// store reads the end of the file instead of the whole log: a run with thousands of
 /// hosts must not become slower with every line it writes.
+///
+/// The window is a read size, never a limit on a line. A line longer than the window
+/// is read one window at a time until its start is found, because a long line is still
+/// a line that was written in full.
 const TAIL_WINDOW: u64 = 8 * 1024;
 
 const TASKS_LABEL: &str = "batch tasks";
@@ -298,8 +302,8 @@ impl BatchStore {
     /// Returns the read failure, or corruption for damage that is not the last line.
     pub fn read_events(&self, run: BatchRunId) -> Result<RunLog, PersistError> {
         let path = self.log_path(run);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(RunLog::default()),
             Err(error) => {
                 return Err(PersistError::Read {
@@ -309,6 +313,10 @@ impl BatchStore {
                 });
             }
         };
+        // A crash can cut a line in the middle of a character, so the bytes are
+        // decoded leniently: a fragment that is not even UTF-8 is still only the tail
+        // this reader skips, while damage before it still has to parse as an event.
+        let text = String::from_utf8_lossy(&bytes);
         let mut lines: Vec<&str> = text
             .split('\n')
             .enumerate()
@@ -377,12 +385,59 @@ impl BatchStore {
     }
 }
 
+/// The offset of the last `\n` before `limit`, or `None` when there is none.
+///
+/// The file is read backwards one [`TAIL_WINDOW`] at a time, so a line longer than the
+/// window costs one more read instead of being mistaken for a fragment.
+fn newline_before(file: &mut std::fs::File, limit: u64) -> std::io::Result<Option<u64>> {
+    let mut end = limit;
+    let mut buffer = vec![0u8; usize::try_from(TAIL_WINDOW).unwrap_or(0)];
+    while end > 0 {
+        let window = end.min(TAIL_WINDOW);
+        let start = end - window;
+        let width = usize::try_from(window).unwrap_or(0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..width])?;
+        if let Some(index) = buffer[..width].iter().rposition(|byte| *byte == b'\n') {
+            return Ok(Some(start + index as u64));
+        }
+        end = start;
+    }
+    Ok(None)
+}
+
+/// The bytes of the last complete line that ends at `end`, where `end` is just past a
+/// `\n`.
+///
+/// The line is read in full however long it is, because a long line was still written
+/// completely. Empty lines are stepped over: the store never writes one on purpose, and
+/// a reader only cares about the last event.
+fn last_line_before(file: &mut std::fs::File, end: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut end = end;
+    while end > 1 {
+        let text_end = end - 1;
+        let start = newline_before(file, text_end)?.map_or(0, |index| index + 1);
+        if start < text_end {
+            let mut line = vec![0u8; usize::try_from(text_end - start).unwrap_or(0)];
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(&mut line)?;
+            return Ok(Some(line));
+        }
+        end = start;
+    }
+    Ok(None)
+}
+
 /// Opens a run's log for appending, repairing a line a crash cut off.
 ///
 /// A fragment at the end of the file is not an event: it was never a complete line, so
 /// it is cut off before the next line is written. Damage anywhere before the last
 /// complete line is corruption and is refused, because writing after it would bury the
 /// evidence of what went wrong.
+///
+/// The last complete line is read in full, however long it is. The window is only how
+/// much is read at a time while scanning backwards, so a line longer than the window is
+/// still a line, and is never refused for its length.
 ///
 /// The answer is the open file and the sequence number the next line gets.
 fn open_for_append(path: &Path) -> Result<(std::fs::File, u64), PersistError> {
@@ -410,32 +465,21 @@ fn open_for_append(path: &Path) -> Result<(std::fs::File, u64), PersistError> {
     if length == 0 {
         return Ok((file, 0));
     }
-    let window = length.min(TAIL_WINDOW);
-    let start = length - window;
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| read(error.to_string()))?;
-    let mut buffer = vec![0u8; usize::try_from(window).unwrap_or(0)];
-    file.read_exact(&mut buffer)
-        .map_err(|error| read(error.to_string()))?;
-    let complete = match buffer.iter().rposition(|byte| *byte == b'\n') {
-        Some(index) => start + index as u64 + 1,
-        None if start > 0 => {
-            return Err(read(
-                "the last line is longer than the end of the log this store reads".to_owned(),
-            ));
-        }
-        None => 0,
-    };
+    // Where the last complete line ends. Everything before that newline was written
+    // in full; only the bytes after it were cut off by a crash, so only they are lost.
+    let complete =
+        match newline_before(&mut file, length).map_err(|error| read(error.to_string()))? {
+            Some(index) => index + 1,
+            // Not one complete line: the crash left a fragment and nothing else.
+            None => 0,
+        };
     let mut last_seq = None;
-    if complete > start {
-        let length_in_window = usize::try_from(complete - start).unwrap_or(0);
-        let text = String::from_utf8_lossy(&buffer[..length_in_window]);
-        if let Some(line) = text
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-        {
+    if let Some(bytes) =
+        last_line_before(&mut file, complete).map_err(|error| read(error.to_string()))?
+    {
+        let text = String::from_utf8_lossy(&bytes);
+        let line = text.trim();
+        if !line.is_empty() {
             let event: BatchEvent =
                 serde_json::from_str(line).map_err(|error| PersistError::Corrupt {
                     label: LOG_LABEL,
@@ -504,7 +548,7 @@ mod tests {
 
     use shellune_core::{
         BatchBook, BatchEventKind, BatchRunId, BatchStep, BatchTarget, BatchTask,
-        ConnectionDefaults, HostId, HostState, RunState, StepState,
+        ConnectionDefaults, HostId, HostState, OutputStream, RunState, StepState,
     };
 
     use super::*;
@@ -706,6 +750,163 @@ mod tests {
             .read_events(run.id())
             .expect_err("mid-log damage is refused");
         assert!(matches!(error, PersistError::Corrupt { .. }));
+    }
+
+    /// The text a chunk of bytes that are not UTF-8 becomes in the log.
+    ///
+    /// Output is recorded with the bytes that are not UTF-8 replaced, and every
+    /// replacement is escaped again by JSON, so one such chunk is a single line several
+    /// times longer than the window the store reads.
+    fn replacement_chunk(bytes: usize) -> String {
+        String::from_utf8_lossy(&vec![0x80u8; bytes]).into_owned()
+    }
+
+    fn output(run: &BatchRun, chunk: String) -> BatchEventKind {
+        BatchEventKind::Output {
+            host: run.hosts()[0].target().host_id(),
+            step: 0,
+            stream: OutputStream::Stdout,
+            chunk,
+        }
+    }
+
+    #[test]
+    fn a_line_longer_than_the_read_window_is_a_line_and_not_a_fragment() {
+        let store = BatchStore::at(scratch("long-line"));
+        let run = planned(&task(&["alpha"]));
+        store
+            .append(
+                run.id(),
+                BatchEventKind::RunStarted {
+                    hosts: 1,
+                    steps: 1,
+                    concurrency: 1,
+                },
+                10,
+            )
+            .expect("the first line is written");
+        let long = store
+            .append(run.id(), output(&run, replacement_chunk(4 * 1024)), 11)
+            .expect("a line longer than the window is still one line");
+        assert_eq!(long.seq(), 1);
+        let length = std::fs::metadata(store.log_path(run.id()))
+            .expect("the log has a length")
+            .len();
+        assert!(
+            length > TAIL_WINDOW,
+            "the fixture line is longer than the window the store reads: {length}"
+        );
+        // The next append reads that line in full instead of calling its end damage.
+        let next = store
+            .append(
+                run.id(),
+                BatchEventKind::RunState {
+                    state: RunState::Completed,
+                },
+                12,
+            )
+            .expect("the log stays appendable after a long line");
+        assert_eq!(next.seq(), 2);
+        let log = store.read_events(run.id()).expect("the log reads back");
+        assert_eq!(log.events().len(), 3);
+        assert!(!log.tail_ignored());
+        assert_eq!(log.events()[1].seq(), 1);
+        assert!(matches!(
+            log.events()[1].kind(),
+            BatchEventKind::Output { chunk, .. } if chunk.chars().count() == 4 * 1024
+        ));
+    }
+
+    #[test]
+    fn a_tail_of_bytes_that_are_not_utf8_is_still_only_a_torn_tail() {
+        let store = BatchStore::at(scratch("torn-bytes"));
+        let run = planned(&task(&["alpha"]));
+        store
+            .append(
+                run.id(),
+                BatchEventKind::RunStarted {
+                    hosts: 1,
+                    steps: 1,
+                    concurrency: 1,
+                },
+                10,
+            )
+            .expect("the first line is written");
+        store
+            .append(run.id(), output(&run, replacement_chunk(4 * 1024)), 11)
+            .expect("the long line is written");
+        // A crash in the middle of a character leaves bytes that are not UTF-8 at all.
+        let path = store.log_path(run.id());
+        let mut bytes = std::fs::read(&path).expect("the log is readable");
+        bytes.extend_from_slice(
+            b"{\"seq\": 2, \"at_unix\": 12, \"kind\": {\"event\": \"output\", \"chunk\": \"",
+        );
+        bytes.extend_from_slice(&[0xF0, 0x9F, 0x92]);
+        std::fs::write(&path, &bytes).expect("the log can be rewritten");
+        let log = store
+            .read_events(run.id())
+            .expect("the torn tail is tolerated");
+        assert_eq!(log.events().len(), 2);
+        assert!(log.tail_ignored());
+        let next = store
+            .append(
+                run.id(),
+                BatchEventKind::RunState {
+                    state: RunState::Completed,
+                },
+                13,
+            )
+            .expect("the fragment is cut off and the line is written");
+        assert_eq!(next.seq(), 2);
+        let after = store.read_events(run.id()).expect("the log reads back");
+        assert_eq!(after.events().len(), 3);
+        assert!(!after.tail_ignored());
+    }
+
+    #[test]
+    fn a_restart_appends_after_a_line_longer_than_the_read_window() {
+        let store = BatchStore::at(scratch("long-recovery"));
+        let running_task = task(&["alpha"]);
+        let mut running = planned(&running_task);
+        let host = running.hosts()[0].target().host_id();
+        running
+            .apply(&BatchEvent::new(
+                0,
+                10,
+                BatchEventKind::StepStarted { host, step: 0 },
+            ))
+            .expect("started");
+        store.save_run(&running).expect("the running run saves");
+        store
+            .append(
+                running.id(),
+                BatchEventKind::StepStarted { host, step: 0 },
+                10,
+            )
+            .expect("the log line is written");
+        store
+            .append(
+                running.id(),
+                output(&running, replacement_chunk(4 * 1024)),
+                11,
+            )
+            .expect("the long line is written");
+        let recovered = store.recover_interrupted(30).expect("the restart recovers");
+        assert_eq!(recovered, vec![running.id()]);
+        assert_eq!(
+            store.load_run(running.id()).expect("the run loads").state(),
+            RunState::Interrupted
+        );
+        let log = store.read_events(running.id()).expect("the log reads back");
+        assert_eq!(log.events().len(), 3);
+        assert!(!log.tail_ignored());
+        assert_eq!(log.events().last().map(BatchEvent::seq), Some(2));
+        assert!(matches!(
+            log.events().last().map(BatchEvent::kind),
+            Some(BatchEventKind::RunState {
+                state: RunState::Interrupted
+            })
+        ));
     }
 
     #[test]
