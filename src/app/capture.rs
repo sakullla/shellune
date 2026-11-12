@@ -7,8 +7,9 @@
 //!
 //! * the window is opened with `show: false` and `focus: false` and is never shown,
 //!   activated, moved to the foreground or asked for input;
-//! * the pixels come from the window's own client area through `PrintWindow`; the
-//!   screen, the desktop and other applications are never read;
+//! * the pixels come from the hidden window's own DirectX back buffer through the
+//!   vendored GPUI readback; the screen, the desktop and other applications are never
+//!   read;
 //! * every store is redirected to a temporary directory and credentials live in memory,
 //!   so a run cannot read or write the developer's hosts, trust file or keychain;
 //! * a black, empty, wrong-sized or uniform image, a failed render or a failed write
@@ -225,13 +226,13 @@ impl Report {
             })
             .collect();
         json!({
-            "probe": "hidden-window-printwindow",
+            "probe": "hidden-window-gpu-readback",
             "schema": 1,
             "status": self.status,
             "error": self.error,
             "feature": "ui-capture",
             "platform": std::env::consts::OS,
-            "method": "PrintWindow(PW_RENDERFULLCONTENT) on the probe window's client area",
+            "method": "DirectX back-buffer readback from the hidden GPUI renderer",
             "window": {
                 "show": false,
                 "focus": false,
@@ -629,7 +630,12 @@ async fn grab(
         // Read before the capture: the question is what the system said while the pixels
         // were taken, not after.
         let window_visible = windows::visible(handle);
-        let image = windows::capture_client(handle, true)?;
+        let frame = window.capture_frame()?;
+        let image = windows::Image {
+            width: frame.width,
+            height: frame.height,
+            rgb: frame.rgb,
+        };
         let stats = analyse(&image)?;
 
         let scale = f64::from(window.scale_factor());
@@ -657,23 +663,9 @@ async fn grab(
             ));
         }
         if stats.distinct_colors < DISTINCT_COLOR_FLOOR {
-            // The second reading separates the two reasons a frame can be blank: the
-            // window composed nothing, or the application never answered WM_PRINTCLIENT.
-            let plain = windows::capture_client(handle, false)
-                .and_then(|image| analyse(&image))
-                .map_or_else(
-                    |error| format!("unavailable ({error})"),
-                    |stats| {
-                        format!(
-                            "{} distinct colour(s), {}",
-                            stats.distinct_colors, stats.uniform_colour
-                        )
-                    },
-                );
             return Err(format!(
-                "the frame holds only {} distinct colour(s) ({}) - a blank or unrendered surface - \
-                 so PrintWindow did not return the page; without PW_RENDERFULLCONTENT the same \
-                 window gives {plain}; {} was kept",
+                "the frame holds only {} distinct colour(s) ({}), so the GPU back buffer did not \
+                 contain the page; {} was kept",
                 stats.distinct_colors,
                 stats.uniform_colour,
                 capture_path.display()

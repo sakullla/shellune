@@ -107,6 +107,9 @@ zeroize = "1.8.1"
 # Linux, which current libc releases no longer export; see vendor/README.md.
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
+# The capture tool needs the rendered frame itself. The patch only exposes a
+# CPU readback of the DirectX back buffer; it does not change rendering.
+gpui = { path = "vendor/gpui" }
 
 [profile.release]
 strip = "symbols"
