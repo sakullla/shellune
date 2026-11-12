@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gpui::prelude::*;
 use gpui::{
     ClipboardItem, Entity, IntoElement, Modifiers, MouseButton, Pixels, Render, ScrollDelta,
-    ScrollWheelEvent, Size, TestAppContext, VisualTestContext, div, point, px, size,
+    ScrollWheelEvent, Size, TestAppContext, VisualTestContext, WindowId, div, point, px, size,
 };
 use shellune_core::{
     Endpoint, EventTag, ForwardBook, ForwardRule, HostConfig, LocalShell, PaneNode, PaneTarget,
@@ -49,12 +49,14 @@ use crate::app::terminal::{
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
 };
-use crate::app::view::{AccentRow, KeyRowControl};
+use crate::app::view::{AccentRow, CloseIntent, KeyRowControl, close_intent};
 use crate::app::workspace::{
     AttentionKind, AttentionSettings, Failure, PrimaryOutcome, Recovery, Section, SectionState,
     Workspace,
 };
-use crate::app::{DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ShelluneView, key_bindings};
+use crate::app::{
+    DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ReopenChoice, ShelluneView, key_bindings, reopen_choice,
+};
 
 fn design_window() -> Size<Pixels> {
     size(px(DEFAULT_WINDOW_SIZE.0), px(DEFAULT_WINDOW_SIZE.1))
@@ -11182,6 +11184,124 @@ async fn closing_the_application_lists_the_transfers_and_stopping_is_confirmed(
     });
     assert_eq!(first_transfers.cancels(), vec![first_task]);
     assert_eq!(second_transfers.cancels(), vec![second_task]);
+}
+
+// ---------------------------------------------------------------------------
+// Window lifecycle on macOS (R13)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn closing_the_window_hides_on_macos_and_closes_everywhere_else() {
+    assert_eq!(
+        close_intent(Platform::MacOs, false),
+        CloseIntent::Hide,
+        "the red button on macOS keeps the application running"
+    );
+    assert_eq!(
+        close_intent(Platform::MacOs, true),
+        CloseIntent::Close,
+        "an exit the user confirmed really closes the window"
+    );
+    for platform in [Platform::Windows, Platform::Linux] {
+        assert_eq!(
+            close_intent(platform, false),
+            CloseIntent::Close,
+            "the close semantics of {platform:?} do not change"
+        );
+    }
+}
+
+#[test]
+fn a_reopen_activates_a_surviving_window_and_builds_one_only_without() {
+    let main = WindowId::from(7_u64);
+    let other = WindowId::from(9_u64);
+    assert_eq!(
+        reopen_choice(Some(main), &[other, main]),
+        ReopenChoice::Activate(main),
+        "a window that is still alive is activated"
+    );
+    assert_eq!(
+        reopen_choice(None, &[other]),
+        ReopenChoice::OpenMain,
+        "a shell that kept no window builds the main one"
+    );
+    assert_eq!(
+        reopen_choice(Some(main), &[other]),
+        ReopenChoice::OpenMain,
+        "a remembered window that is gone is stale, not a reason to do nothing"
+    );
+    assert_eq!(
+        reopen_choice(Some(main), &[]),
+        ReopenChoice::OpenMain,
+        "with nothing on screen the main window is created"
+    );
+}
+
+#[gpui::test]
+async fn a_macos_close_hides_the_window_and_keeps_its_sessions(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let Some(session) = start_local_session(cx, &view) else {
+        return;
+    };
+    let before = cx.update(|_window, app| view.read(app).open_sessions());
+    assert_eq!(before, vec![session]);
+
+    // The macOS close request, asked of the same handler the window registered.
+    let closed = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.on_window_should_close(Platform::MacOs, cx)
+        })
+    });
+    assert!(!closed, "hiding is not closing: the window is kept");
+    assert!(
+        cx.update(|_window, app| view.read(app).is_hidden_for_reopen()),
+        "the window is marked hidden, so a reopen knows to bring it back"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).closing_app_for_test()),
+        "hiding never claims that running tasks are about to stop"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_sessions()),
+        before,
+        "the session survives the close"
+    );
+    assert_ne!(
+        session_state(cx, &view, session),
+        Some(SessionState::Closed),
+        "the terminal of the hidden window is still alive"
+    );
+
+    // A Dock click while that window is alive activates it instead of building another.
+    let windows = cx.update(|_window, app| app.windows().len());
+    // The application-level handler, not the window's: the window is checked out for the
+    // duration of a `VisualTestContext` update, and a reopen has to see the real one.
+    cx.cx.update(|app| {
+        let handle = app
+            .windows()
+            .first()
+            .and_then(|handle| handle.downcast::<ShelluneView>())
+            .expect("the test window shows the shell");
+        app.set_global(crate::app::MainWindow(Some(handle)));
+        crate::app::reopen_main_window(app).expect("the hidden window comes back");
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| app.windows().len()),
+        windows,
+        "reopening does not add a second window"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).is_hidden_for_reopen()),
+        "the window is in front again"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_sessions()),
+        before,
+        "no session is started or repeated by the reopen"
+    );
 }
 
 // ---------------------------------------------------------------------------

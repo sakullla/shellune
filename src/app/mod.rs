@@ -47,8 +47,8 @@ pub use keymap::TERMINAL_KEY_CONTEXT;
 pub use view::ShelluneView;
 
 use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
-    px, size,
+    App, AppContext, Application, Bounds, Global, KeyBinding, TitlebarOptions, WindowBounds,
+    WindowHandle, WindowId, WindowOptions, px, size,
 };
 
 use crate::app::keymap::Keymap;
@@ -144,17 +144,98 @@ pub const MIN_WINDOW_SIZE: (f32, f32) = (720.0, 480.0);
 /// Default window size.
 pub const DEFAULT_WINDOW_SIZE: (f32, f32) = (1120.0, 720.0);
 
+/// The main window, for as long as the application keeps it (R13).
+///
+/// macOS hides the window on the red button instead of destroying it, so the handle has
+/// to outlive a frame: a Dock click can ask for the window minutes later. Keeping it here
+/// rather than in the view is what lets "one window, never two" be decided before any
+/// window is built.
+struct MainWindow(Option<WindowHandle<ShelluneView>>);
+
+impl Global for MainWindow {}
+
+/// What tapping the application icon has to do (R13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReopenChoice {
+    /// A window this application still owns is alive: bring it back, do not build one.
+    Activate(WindowId),
+    /// No window survived the close: only now does the one creation path run.
+    OpenMain,
+}
+
+/// Decides between restoring a surviving window and creating the main one (R13).
+///
+/// `open` is what the application still has. A remembered handle that is no longer in it
+/// is stale - that window was really closed - and must not keep a new window from being
+/// opened. Any other answer would either leave the user with no window at all or put a
+/// second one beside the window that is merely hidden or minimised.
+#[must_use]
+pub fn reopen_choice(main: Option<WindowId>, open: &[WindowId]) -> ReopenChoice {
+    match main {
+        Some(id) if open.contains(&id) => ReopenChoice::Activate(id),
+        _ => ReopenChoice::OpenMain,
+    }
+}
+
 /// Starts the Shellune application and opens the main window.
 pub fn run() {
-    Application::new()
-        .with_assets(icons::Assets)
-        .run(|cx: &mut App| {
-            cx.bind_keys(key_bindings(Platform::current()));
-            if let Err(error) = open_main_window(cx) {
-                eprintln!("shellune: failed to open the main window: {error}");
+    let application = Application::new().with_assets(icons::Assets);
+    // A Dock click or a second launch reaches the application, not a window, so the
+    // handler is registered before the first window exists: an early click is not lost.
+    application.on_reopen(|cx| {
+        if let Err(error) = reopen_main_window(cx) {
+            eprintln!("shellune: failed to reopen the main window: {error}");
+        }
+    });
+    application.run(|cx: &mut App| {
+        cx.bind_keys(key_bindings(Platform::current()));
+        if let Err(error) = open_main_window(cx) {
+            eprintln!("shellune: failed to open the main window: {error}");
+        }
+        cx.activate(true);
+    });
+}
+
+/// Brings the main window back after the application icon is clicked (R13).
+///
+/// A window that survived the close - hidden on macOS, or minimised - is activated. Its
+/// view, terminals, transfers and forwards were never dropped, so nothing reconnects and
+/// no tab is duplicated. Only when no window survives does the shared entry create one,
+/// which is also the path a first launch takes.
+pub fn reopen_main_window(cx: &mut App) -> Result<(), String> {
+    let open: Vec<WindowId> = cx
+        .windows()
+        .into_iter()
+        .map(|handle| handle.window_id())
+        .collect();
+    let main = cx.try_global::<MainWindow>().and_then(|main| main.0);
+    match reopen_choice(main.map(|handle| handle.window_id()), &open) {
+        ReopenChoice::Activate(_) => {
+            // The choice only names a window that is in `open`, and every window this
+            // application owns came from `open_main_window`, so the handle is here.
+            let Some(handle) = main else {
+                return Err("the main window handle is missing".to_owned());
+            };
+            match handle.update(cx, |view, window, cx| view.reveal_after_reopen(window, cx)) {
+                Ok(()) => {
+                    cx.activate(true);
+                    Ok(())
+                }
+                // The window went away between the check and the activation. That is the
+                // one case where a reopen still has to create one after all.
+                Err(_) => {
+                    cx.set_global(MainWindow(None));
+                    open_main_window(cx)
+                }
             }
-            cx.activate(true);
-        });
+        }
+        ReopenChoice::OpenMain => {
+            // A stale handle is dropped before the new window exists: keeping it would
+            // make the next reopen look at a window that is gone.
+            cx.set_global(MainWindow(None));
+            open_main_window(cx)
+        }
+    }
 }
 
 fn open_main_window(cx: &mut App) -> Result<(), String> {
@@ -178,13 +259,17 @@ fn open_main_window(cx: &mut App) -> Result<(), String> {
         ..Default::default()
     };
 
-    cx.open_window(options, |window, cx| {
-        let view = cx.new(ShelluneView::new);
-        // Give the shell the keyboard before the user clicks anything, so the
-        // navigation shortcuts work in the first frame.
-        window.focus(view.read(cx).root_focus());
-        view
-    })
-    .map(|_| ())
-    .map_err(|error| format!("{error:#}"))
+    let handle = cx
+        .open_window(options, |window, cx| {
+            let view = cx.new(ShelluneView::new);
+            // Give the shell the keyboard before the user clicks anything, so the
+            // navigation shortcuts work in the first frame.
+            window.focus(view.read(cx).root_focus());
+            view
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    // Remembered so that a Dock click restores this window instead of building another
+    // one, and so a reopen can tell a hidden window from a closed one (R13).
+    cx.set_global(MainWindow(Some(handle)));
+    Ok(())
 }

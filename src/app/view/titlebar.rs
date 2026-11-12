@@ -7,6 +7,11 @@
 //! right end and answer through the system, so snap layouts and the keyboard behave as
 //! in any other window. Linux keeps the system bar: drawing it there would also mean
 //! drawing the window's edges and shadow.
+//!
+//! The macOS traffic lights are the system's, so this module draws none of them. Their
+//! red button does not end the application: it hides the window and everything running
+//! in it, and the Dock icon brings the same window back (R13, see
+//! `ShelluneView::on_window_should_close`).
 
 use gpui::prelude::*;
 use gpui::{Context, Div, MouseButton, Stateful, Window, WindowControlArea, div, px};

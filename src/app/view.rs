@@ -326,6 +326,34 @@ const X11_NOTICE_SHARE: f32 = 0.38;
 /// Ends a menu entry that asks for more input before it acts.
 const ELLIPSIS: &str = "\u{2026}";
 
+/// What closing the main window means on a platform (R13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseIntent {
+    /// macOS: the window leaves the screen but keeps its view, sessions and transfers.
+    Hide,
+    /// A real close: Windows and Linux, and every exit the user confirmed.
+    Close,
+}
+
+/// Chooses between hiding the window and really closing it (R13).
+///
+/// The red button on macOS hides: the application keeps running with its sessions, and
+/// the Dock icon brings the same window back. Windows and Linux keep the semantics they
+/// always had, where a close closes - after the transfer question, which only a real
+/// close can act on. A confirmed exit is a close on every platform.
+///
+/// An explicit quit on macOS (Cmd+Q, the Dock menu's Quit) never reaches this: the
+/// system terminates the application, GPUI's quit hook cannot cancel that, and the
+/// window-closed callback ends the sessions as before. That path is unchanged by R13.
+#[must_use]
+pub(crate) fn close_intent(platform: Platform, app_close_confirmed: bool) -> CloseIntent {
+    if platform == Platform::MacOs && !app_close_confirmed {
+        CloseIntent::Hide
+    } else {
+        CloseIntent::Close
+    }
+}
+
 /// The application shell view.
 pub struct ShelluneView {
     workspace: Workspace,
@@ -463,6 +491,14 @@ pub struct ShelluneView {
     app_close_confirmed: bool,
     /// Whether the window-close callback has been registered.
     watching_close: bool,
+    /// Whether this shell asked to hide the window and is waiting for the icon (R13).
+    ///
+    /// macOS hides instead of closing, so this view - with its sessions, transfers and
+    /// forwards - is still alive when the Dock icon is clicked; the reopen path clears
+    /// the flag when it puts the window back in front. The flag records the shell's own
+    /// intent, not what the window server shows: the platform may also unhide the
+    /// application by itself when its icon is clicked.
+    hidden_for_reopen: bool,
     /// Whether the file views are being polled for answers.
     files_polling: bool,
     /// The change the file view is asking about before anything is sent (R11).
@@ -825,6 +861,89 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Chooses the language the capture draws, without touching saved preferences.
+    ///
+    /// A run states its own language, so each shot's manifest entry names the strings
+    /// that shot really rendered. Nothing here is written to the preferences file.
+    #[cfg(feature = "ui-capture")]
+    pub fn set_capture_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
+        self.workspace.set_locale(locale);
+        self.relabel_fields(cx);
+        cx.notify();
+    }
+
+    /// Chooses the text size the capture draws (R2: 100% and 115% are in the matrix).
+    #[cfg(feature = "ui-capture")]
+    pub fn set_capture_zoom(&mut self, zoom: theme::Zoom, cx: &mut Context<Self>) {
+        self.workspace.set_zoom(zoom);
+        cx.notify();
+    }
+
+    /// Stops short motion for the capture, so no frame is caught mid-animation.
+    #[cfg(feature = "ui-capture")]
+    pub fn set_capture_motion(&mut self, motion: theme::Motion, cx: &mut Context<Self>) {
+        self.workspace.set_motion(motion);
+        cx.notify();
+    }
+
+    /// What the capture reads to confirm a scenario arrived: the tool open over the
+    /// page, named the way the manifest names it.
+    ///
+    /// This is the same state the render reads, not a second copy of it. The capture
+    /// tool never asserts where a pixel was drawn, and it never calls a page captured
+    /// because a command returned (ADR-2).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_overlay(&self) -> Option<&'static str> {
+        if self.palette.is_some() {
+            return Some("palette");
+        }
+        match self.tool {
+            Some(shell::Tool::Forwards) => Some("forwards"),
+            Some(shell::Tool::Transfers) => Some("transfers"),
+            Some(shell::Tool::Snippets) => Some("snippets"),
+            None => None,
+        }
+    }
+
+    /// Puts one session on screen whose terminal bytes the caller supplies.
+    ///
+    /// The pane is the terminal the application really draws; it only has nothing
+    /// behind it. That is what lets a capture show terminal text, a session bar and the
+    /// tab strip without starting a shell: no PTY, no SSH, no user command (R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn attach_capture_session(
+        &mut self,
+        shell: LocalShell,
+        content: &[u8],
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> SessionId {
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let session = self.workspace.register_local_session(&shell);
+        let id = session.id();
+        let tag = session.tag();
+        let mode = self.workspace.layout().session_mode(id);
+        let pane = cx.new(|pane_cx| {
+            let mut pane =
+                TerminalPane::without_process(shell, tag, grid, font_size, locale, pane_cx);
+            pane.apply_presentation(mode);
+            if !content.is_empty() {
+                pane.feed_for_test(content, pane_cx);
+            }
+            pane
+        });
+        self.workspace.session_connected(id);
+        self.workspace.clear_session_failure();
+        if let Some(window) = window {
+            let handle = pane.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
+        self.push_pane(tag, pane, cx);
+        id
+    }
+
     /// Builds the shell with every store, the trust file and the credential store
     /// chosen by the caller.
     ///
@@ -983,6 +1102,7 @@ impl ShelluneView {
             closing_app: false,
             app_close_confirmed: false,
             watching_close: false,
+            hidden_for_reopen: false,
             files_polling: false,
             files_dialog: None,
             files_field: None,
@@ -1609,7 +1729,7 @@ impl ShelluneView {
     /// This is the terminal the user is looking at, not "the only one": several
     /// sessions can be open, and the ones that are not selected keep their processes
     /// and their screens.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn pane(&self) -> Option<&Entity<TerminalPane>> {
         self.active_pane()
     }
@@ -1628,7 +1748,7 @@ impl ShelluneView {
     }
 
     /// The terminal of one session, whether or not it is on screen.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     #[must_use]
     pub fn pane_of(&self, id: SessionId) -> Option<&Entity<TerminalPane>> {
         self.pane_for(id)
@@ -2500,6 +2620,54 @@ impl ShelluneView {
         )
     }
 
+    /// Answers a window close request: hide on macOS, close for real elsewhere (R13).
+    ///
+    /// Returning false keeps the window alive, and with it this view, its terminals,
+    /// transfers and forwards: nothing is stopped and nothing has to reconnect when the
+    /// application icon is clicked. The transfer question belongs to the real close, so
+    /// the hiding path never pretends that tasks are about to stop.
+    pub(crate) fn on_window_should_close(
+        &mut self,
+        platform: Platform,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match close_intent(platform, self.app_close_confirmed) {
+            CloseIntent::Hide => {
+                self.hide_for_reopen(cx);
+                false
+            }
+            CloseIntent::Close => self.refuse_app_close(cx),
+        }
+    }
+
+    /// Takes the window off the screen without destroying it (R13).
+    ///
+    /// The application-level hide is the window-visibility capability the platform
+    /// offers, and it only changes what is drawn: the window object, this view and every
+    /// session running in it stay. Whether the platform later unhides the application by
+    /// itself when its icon is clicked, or delivers a reopen to
+    /// [`crate::app::reopen_main_window`], both end with the same window; the flag only
+    /// says that this shell asked to hide it. The test platform has no window server, so
+    /// a test observes the state below rather than the screen.
+    fn hide_for_reopen(&mut self, cx: &mut Context<Self>) {
+        self.hidden_for_reopen = true;
+        #[cfg(target_os = "macos")]
+        cx.hide();
+        cx.notify();
+    }
+
+    /// Puts a window that survived the close back in front (R13).
+    ///
+    /// Only the window is reordered and refocused. Its sessions were never closed, which
+    /// is why reopening cannot repeat a connection or duplicate a tab.
+    pub(crate) fn reveal_after_reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hidden_for_reopen = false;
+        window.activate_window();
+        let focus = self.root_focus();
+        window.focus(focus);
+        cx.notify();
+    }
+
     /// Refuses to close the window while transfers are still running (R9).
     ///
     /// Returning false keeps the window, and the question lists every task that would
@@ -2814,7 +2982,7 @@ impl ShelluneView {
     }
 
     /// The current workspace state.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
     }
@@ -11206,6 +11374,12 @@ impl ShelluneView {
         self.closing_app
     }
 
+    /// Whether this window is hidden and waiting for the application icon (R13).
+    #[cfg(test)]
+    pub fn is_hidden_for_reopen(&self) -> bool {
+        self.hidden_for_reopen
+    }
+
     /// Confirms the application close without drawing again afterwards.
     ///
     /// The button removes the window, and a test that clicks it cannot read the
@@ -12365,8 +12539,10 @@ impl Render for ShelluneView {
             self.watching_close = true;
             let view = cx.entity().downgrade();
             window.on_window_should_close(cx, move |_window, cx| {
-                view.update(cx, |view, cx| view.refuse_app_close(cx))
-                    .unwrap_or(true)
+                view.update(cx, |view, cx| {
+                    view.on_window_should_close(Platform::current(), cx)
+                })
+                .unwrap_or(true)
             });
         }
         if !self.watching_appearance {
