@@ -673,6 +673,192 @@ fn a_pause_starts_no_new_step_until_the_run_is_resumed() {
 }
 
 #[test]
+fn a_run_paused_when_its_last_step_succeeds_still_replays_as_completed() {
+    let one = host("alpha");
+    let hosts = Arc::new(FakeHosts::default());
+    hosts.block("only");
+    let store = BatchStore::at(scratch("paused-success"));
+    let confirmed = task(&["only"], &[&one], 1)
+        .confirm(1_700_000_000)
+        .expect("a confirmable task");
+    let mut run = BatchRun::planned(&confirmed, BatchRunId::new(), 1_700_000_001);
+    store.save_run(&run).expect("the planned run saves");
+    let mut runner =
+        BatchRunner::start(confirmed, factory(&hosts), RunnerOptions { concurrency: 1 });
+
+    let mut events = Vec::new();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        step_started(events, one.id(), 0)
+    }));
+    runner.pause();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Paused)
+    }));
+    // The paused run finishes its last command; it ends while it is still paused, so
+    // the end has to be written through a state the run model allows.
+    hosts.release("only");
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Completed)
+    }));
+    events.extend(runner.join());
+    for event in &events {
+        store
+            .append(run.id(), event.kind().clone(), event.at_unix())
+            .expect("the line is appended");
+    }
+    // Folding refuses a state the run cannot hold, so this is also the check that no
+    // refused transition reached the log.
+    fold(&mut run, &events);
+    assert_eq!(run.state(), RunState::Completed);
+    assert_eq!(
+        run.host(one.id()).expect("the host").state(),
+        HostState::Succeeded
+    );
+
+    // The end went back through "running": paused -> running -> completed, in that
+    // order, with no leap a replay would have to guess at.
+    let paused = position_of(&events, |kind| {
+        matches!(
+            kind,
+            BatchEventKind::RunState {
+                state: RunState::Paused
+            }
+        )
+    })
+    .expect("the run said it was paused");
+    let running_again = events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event.kind(),
+                BatchEventKind::RunState {
+                    state: RunState::Running
+                }
+            )
+        })
+        .expect("the run went back to running");
+    let completed = position_of(&events, |kind| {
+        matches!(
+            kind,
+            BatchEventKind::RunState {
+                state: RunState::Completed
+            }
+        )
+    })
+    .expect("the run ended as completed");
+    assert!(
+        paused < running_again && running_again < completed,
+        "a paused run that ends goes paused -> running -> completed: {events:?}"
+    );
+
+    // And the log on disk replays into the same run, which is what a result list does
+    // after a restart.
+    let log = store.read_events(run.id()).expect("the log reads back");
+    assert!(!log.tail_ignored());
+    let replayed = log
+        .replay(BatchRun::planned(
+            &run.task().clone().confirm(1).expect("confirmable"),
+            run.id(),
+            run.started_at_unix(),
+        ))
+        .expect("the log folds into a run");
+    assert_eq!(replayed.state(), RunState::Completed);
+    assert_eq!(replayed.hosts(), run.hosts(), "the log and the run agree");
+}
+
+#[test]
+fn a_run_paused_when_a_step_fails_still_replays_as_failed() {
+    let one = host("alpha");
+    let hosts = Arc::new(FakeHosts::default());
+    let mut plan = HostPlan::new(Connect::Accept);
+    plan.fail.insert("bad".to_owned());
+    hosts.set_plan(one.id(), plan);
+    hosts.block("bad");
+    let (mut runner, mut run) = runner(task(&["bad", "later"], &[&one], 1), &hosts, 1);
+    let mut events = Vec::new();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        step_started(events, one.id(), 0)
+    }));
+    runner.pause();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Paused)
+    }));
+    hosts.release("bad");
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Failed)
+    }));
+    events.extend(runner.join());
+    fold(&mut run, &events);
+    assert_eq!(run.state(), RunState::Failed);
+    assert_eq!(
+        run.host(one.id()).expect("the host").state(),
+        HostState::Failed
+    );
+    // The pause still stopped the next step; only the failure ended this host.
+    assert!(
+        !step_started(&events, one.id(), 1),
+        "a paused run starts nothing"
+    );
+    let failed = position_of(&events, |kind| {
+        matches!(
+            kind,
+            BatchEventKind::RunState {
+                state: RunState::Failed
+            }
+        )
+    })
+    .expect("the run ended as failed");
+    assert!(
+        has_state(&events[..failed], RunState::Paused),
+        "the failure was written while the run was paused"
+    );
+}
+
+#[test]
+fn a_cancel_of_a_paused_run_still_ends_as_cancelled() {
+    let one = host("alpha");
+    let hosts = Arc::new(FakeHosts::default());
+    let mut plan = HostPlan::new(Connect::Accept);
+    plan.hold.insert("long".to_owned());
+    hosts.set_plan(one.id(), plan);
+    let (mut runner, mut run) = runner(task(&["long", "never"], &[&one], 1), &hosts, 1);
+    let mut events = Vec::new();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        step_started(events, one.id(), 0)
+    }));
+    runner.pause();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Paused)
+    }));
+    // A pause may become a cancel; the end of the run then goes cancelling -> cancelled
+    // and never back through a state the model refuses.
+    runner.cancel();
+    assert!(wait_for(&mut runner, &mut events, |events| {
+        has_state(events, RunState::Cancelled)
+    }));
+    events.extend(runner.join());
+    fold(&mut run, &events);
+    assert_eq!(run.state(), RunState::Cancelled);
+    let cancelling = position_of(&events, |kind| {
+        matches!(
+            kind,
+            BatchEventKind::RunState {
+                state: RunState::Cancelling
+            }
+        )
+    })
+    .expect("the run said it was cancelling");
+    assert!(
+        has_state(&events[..cancelling], RunState::Paused),
+        "the cancel came from the paused state"
+    );
+    assert!(
+        !step_started(&events, one.id(), 1),
+        "no step starts after a cancel"
+    );
+}
+
+#[test]
 fn a_cancel_is_reported_as_cancelling_until_the_running_command_ends() {
     let one = host("alpha");
     let hosts = Arc::new(FakeHosts::default());
@@ -790,9 +976,15 @@ fn the_stricter_failure_policy_stops_starting_new_steps() {
     let one = host("alpha");
     let two = host("beta");
     let hosts = Arc::new(FakeHosts::default());
-    let mut plan = HostPlan::new(Connect::Accept);
-    plan.fail.insert("check".to_owned());
-    hosts.set_plan(one.id(), plan);
+    // The two workers race for the one connection slot, so either host may be the one
+    // that runs first. Both carry the failing step and the check is written against
+    // whichever host held the slot: the policy under test is what stops the other
+    // host, not the order the workers happened to start in.
+    for each in [&one, &two] {
+        let mut plan = HostPlan::new(Connect::Accept);
+        plan.fail.insert("check".to_owned());
+        hosts.set_plan(each.id(), plan);
+    }
     hosts.block("slow");
 
     let mut task = task(&["slow", "check"], &[&one, &two], 1);
@@ -800,7 +992,7 @@ fn the_stricter_failure_policy_stops_starting_new_steps() {
     let (mut runner, mut run) = runner(task, &hosts, 1);
     let mut events = Vec::new();
     assert!(wait_for(&mut runner, &mut events, |events| {
-        step_started(events, one.id(), 0)
+        step_started(events, one.id(), 0) || step_started(events, two.id(), 0)
     }));
     hosts.release("slow");
     assert!(wait_for(&mut runner, &mut events, |events| {
@@ -816,14 +1008,22 @@ fn the_stricter_failure_policy_stops_starting_new_steps() {
     events.extend(runner.join());
     fold(&mut run, &events);
     assert_eq!(run.state(), RunState::Failed);
+
+    let (started, skipped) = if step_started(&events, one.id(), 0) {
+        (one.id(), two.id())
+    } else {
+        (two.id(), one.id())
+    };
     assert_eq!(
-        run.host(one.id()).expect("the host").state(),
+        run.host(started).expect("the started host").state(),
         HostState::Failed
     );
-    let other = run.host(two.id()).expect("the other host");
-    assert_eq!(other.state(), HostState::Skipped);
+    assert_eq!(
+        run.host(skipped).expect("the skipped host").state(),
+        HostState::Skipped
+    );
     assert!(
-        hosts.steps_of(two.id()).is_empty(),
+        hosts.steps_of(skipped).is_empty(),
         "a stopped run starts nothing else"
     );
 }

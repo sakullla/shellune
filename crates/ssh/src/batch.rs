@@ -950,6 +950,13 @@ impl Control {
     }
 
     /// Ends the run: records the state the hosts earned and closes the run.
+    ///
+    /// The end is written one legal move at a time (`finish_path`), because a run
+    /// paused when its last command ended has no direct edge to `completed` or
+    /// `failed`: writing one anyway would be a state the run model refuses, and a
+    /// log holding a refused transition can never be replayed. The run state, the
+    /// emitted events and the finished flag move together under the same lock, so a
+    /// worker or a caller never sees a state the log contradicts.
     fn finish(&self) {
         let mut state = match self.run_state.lock() {
             Ok(state) => state,
@@ -964,10 +971,43 @@ impl Control {
         } else {
             RunState::Completed
         };
-        *state = next;
+        for step in finish_path(*state, next) {
+            *state = step;
+            self.emit(BatchEventKind::RunState { state: step });
+        }
         self.finished.store(true, Ordering::SeqCst);
-        self.emit(BatchEventKind::RunState { state: next });
     }
+}
+
+/// The states a run walks through to reach `next` from `from`, in the order they
+/// are written.
+///
+/// `paused` is the one state a run can finish from that has no edge to a final
+/// state: a pause stops new steps but leaves a running command alone, so a paused run
+/// whose last command then succeeded or failed still has to end. It goes back to
+/// `running` first, which is a move the run model allows, and only then to
+/// `completed` or `failed`. The moves are read from
+/// [`RunState::can_move_to`] rather than assumed, and a final state the model still
+/// refuses is replaced by `failed`: a run that was asked to stop is never recorded
+/// as having finished cleanly, and nothing refused is ever written to the log.
+fn finish_path(from: RunState, next: RunState) -> Vec<RunState> {
+    // A run that already ended keeps the end it has; there is no second final state.
+    if from.is_finished() {
+        return Vec::new();
+    }
+    let mut path = Vec::new();
+    let mut at = from;
+    if at == RunState::Paused {
+        at = RunState::Running;
+        path.push(at);
+    }
+    let next = if at.can_move_to(next) {
+        next
+    } else {
+        RunState::Failed
+    };
+    path.push(next);
+    path
 }
 
 /// One host's hold on a connection slot, given back when the worker ends.
