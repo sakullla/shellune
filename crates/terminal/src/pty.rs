@@ -23,6 +23,7 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 use shellune_core::{LocalShell, SessionFailure};
 
 use crate::metrics::GridSize;
+use crate::shell::{self, LoginForm, ShellEnvironment};
 
 /// Value of the TERM variable handed to the shell.
 ///
@@ -193,11 +194,18 @@ pub struct LocalSession {
     killer: Box<dyn ChildKiller + Send + Sync>,
     events: Receiver<PtyEvent>,
     grid: GridSize,
+    /// What was added to the shell's own environment, and what could not be.
+    environment: ShellEnvironment,
     closed: bool,
 }
 
 impl LocalSession {
     /// Starts a shell in a new PTY of the given size.
+    ///
+    /// On macOS the shell is started as a login shell and with the environment its
+    /// own login files produce, because an application opened from the Dock has
+    /// neither (R14, R15). Everywhere else the command is the one the caller asked
+    /// for.
     ///
     /// # Errors
     ///
@@ -212,10 +220,28 @@ impl LocalSession {
         let mut command = CommandBuilder::new(shell.program());
         command.env("TERM", TERM_VALUE);
         command.env("COLORTERM", "truecolor");
+        // macOS starts an application from the Dock or Finder with a minimal
+        // environment: the login PATH that puts Homebrew on it, and the locale that
+        // makes text UTF-8, are both missing there. The shell is asked for its own
+        // environment instead of inheriting what the window manager happened to
+        // pass down (R14, R15); on every other platform this is empty and nothing
+        // changes.
+        let environment = shell::shell_environment(shell.program());
+        for (key, value) in environment.variables() {
+            command.env(key, value);
+        }
+        // A login shell reads the user's own profile, which is what makes tools the
+        // user installed visible. A shell that is not known to accept the flag is
+        // started exactly as configured instead.
+        if let LoginForm::Flag(flag) = shell::login_form(shell.program()) {
+            command.arg(flag);
+        }
         if let Some(directory) = cwd {
             command.cwd(directory);
         }
-        Self::spawn_command(command, grid, shell.program())
+        let mut session = Self::spawn_command(command, grid, shell.program())?;
+        session.environment = environment;
+        Ok(session)
     }
 
     /// Starts an arbitrary command in a new PTY.
@@ -274,6 +300,7 @@ impl LocalSession {
             killer,
             events: receiver,
             grid,
+            environment: ShellEnvironment::default(),
             closed: false,
         })
     }
@@ -345,6 +372,16 @@ impl LocalSession {
     #[must_use]
     pub fn grid(&self) -> GridSize {
         self.grid
+    }
+
+    /// What was added to the shell's environment when it started.
+    ///
+    /// The notes say what the user was not given — no login environment, a locale
+    /// that had to be replaced — in wording that carries no value, so a caller can
+    /// show them without leaking the environment (R14, R15).
+    #[must_use]
+    pub fn environment(&self) -> &ShellEnvironment {
+        &self.environment
     }
 }
 

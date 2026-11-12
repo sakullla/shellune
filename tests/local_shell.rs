@@ -38,7 +38,14 @@ struct Session {
 impl Session {
     /// Starts the machine's default shell at a size a shell can work in.
     fn start() -> Option<Self> {
-        let shell = platform_default();
+        Self::start_shell(platform_default())
+    }
+
+    /// Starts a given shell through the same entry point the application uses.
+    ///
+    /// The application's path is the interesting one for a login shell: it is where
+    /// the login flag and the environment are added (R14).
+    fn start_shell(shell: LocalShell) -> Option<Self> {
         if !program_exists(shell.program()) {
             return None;
         }
@@ -299,6 +306,99 @@ fn chinese_input_reaches_the_shell() {
     // half-typed command behind.
     session.wait_for("the echoed input", contains("中文输入"));
     session.write(&[0x03]);
+}
+
+/// Whether this machine can be expected to show Chinese text as text.
+///
+/// macOS is the platform the requirement covers, and there the application has to
+/// supply the UTF-8 locale itself, so the test asserts. Everywhere else the shell can
+/// only show what its own locale allows, so a machine without a UTF-8 locale skips
+/// instead of reporting a failure the product cannot fix there.
+fn chinese_is_expected_to_show() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .any(|value| {
+            value
+                .to_uppercase()
+                .replace(['-', '_'], "")
+                .contains("UTF8")
+        })
+}
+
+/// The login flag the application adds must not stop a shell from starting.
+///
+/// This is the risk of the change: a program that does not know `-l` exits at once,
+/// and the terminal would look closed. The shell here is one macOS actually has.
+#[cfg(unix)]
+#[test]
+fn a_login_shell_starts_and_runs_a_command() {
+    let Some(mut session) = Session::start_shell(LocalShell::new("sh", "/bin/sh")) else {
+        eprintln!("no /bin/sh on this machine, skipping");
+        return;
+    };
+    session.run("echo login-shell-ok");
+    let screen = session.wait_for("the login shell output", contains("login-shell-ok"));
+    assert!(
+        screen.contains("login-shell-ok"),
+        "a login shell did not run a command:\n{screen}"
+    );
+}
+
+/// The locale the shell itself resolved, not the one this test process has (R15).
+#[cfg(unix)]
+#[test]
+fn a_local_shell_resolves_an_utf8_locale() {
+    if !chinese_is_expected_to_show() {
+        eprintln!("this machine has no UTF-8 locale, skipping");
+        return;
+    }
+    let Some(mut session) = Session::start() else {
+        return;
+    };
+    // The strongest variable that is actually set, the way the C library reads it.
+    session.run("printf '%s\\n' \"${LC_ALL:-${LC_CTYPE:-$LANG}}\"");
+    let screen = session.wait_for("the shell's locale", contains("UTF"));
+    assert!(
+        screen.contains("UTF"),
+        "the local shell did not end up in a UTF-8 locale:\n{screen}"
+    );
+}
+
+/// A Chinese file name has to come back as the same text, not as octal escapes or
+/// question marks (R15).
+///
+/// The command contains only the directory, so the file name can reach the screen
+/// only through the listing itself and not through the echo of the typed command.
+#[test]
+fn a_chinese_file_name_survives_a_directory_listing() {
+    if !chinese_is_expected_to_show() {
+        eprintln!("this machine has no UTF-8 locale, skipping");
+        return;
+    }
+    let Some(mut session) = Session::start() else {
+        return;
+    };
+    let directory = std::env::temp_dir().join("shellune-中文目录-5c1");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a temporary directory can be created");
+    std::fs::write(directory.join("说明文件.txt"), b"x").expect("a temporary file can be written");
+    let path = directory.display().to_string();
+    let command = if cfg!(windows) {
+        format!("Get-ChildItem -LiteralPath '{path}' | ForEach-Object Name")
+    } else {
+        format!("ls '{path}'")
+    };
+    session.run(&command);
+    let screen = session.wait_for("the Chinese file name", contains("说明文件.txt"));
+    std::fs::remove_dir_all(&directory).ok();
+    assert!(
+        screen.contains("说明文件.txt"),
+        "the Chinese file name did not survive the listing:\n{screen}"
+    );
 }
 
 #[test]

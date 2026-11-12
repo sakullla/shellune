@@ -1290,6 +1290,67 @@ mod tests {
     }
 
     #[test]
+    fn a_chinese_character_split_across_reads_stays_one_character() {
+        // A read can end anywhere, including in the middle of a three byte
+        // character. The bytes that arrive later must complete it, and the half
+        // character must not be shown in the meantime (R15).
+        let bytes = "中文".as_bytes();
+        for split in 1..bytes.len() {
+            let mut terminal = core();
+            terminal.feed(&bytes[..split]);
+            assert!(
+                !terminal
+                    .snapshot()
+                    .row_text(0)
+                    .is_some_and(|text| text.contains('\u{fffd}')),
+                "a half character was shown as a replacement before the rest arrived \
+                 (split at {split})"
+            );
+            terminal.feed(&bytes[split..]);
+            let snapshot = terminal.snapshot();
+            assert_eq!(
+                snapshot.row_text(0).as_deref(),
+                Some("中文"),
+                "the character did not survive a read boundary at {split}"
+            );
+            assert_eq!(
+                snapshot.cursor.expect("cursor").column,
+                4,
+                "the cursor lost the two columns of a wide character (split at {split})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chinese_character_arriving_one_byte_at_a_time_is_still_whole() {
+        let mut terminal = core();
+        for byte in "中文测试".as_bytes() {
+            terminal.feed(&[*byte]);
+        }
+        let snapshot = terminal.snapshot();
+        assert_eq!(snapshot.row_text(0).as_deref(), Some("中文测试"));
+        assert_eq!(snapshot.cursor.expect("cursor").column, 8);
+    }
+
+    #[test]
+    fn invalid_bytes_show_a_replacement_character_and_the_grid_keeps_working() {
+        // A remote program can send bytes that are not UTF-8 at all. The terminal
+        // shows a replacement and keeps parsing; nothing is dropped silently and
+        // nothing panics (R15).
+        let mut terminal = core();
+        terminal.feed(b"before\xff\xfeafter");
+        let text = terminal.snapshot().row_text(0).expect("the row holds text");
+        assert!(
+            text.starts_with("before") && text.ends_with("after"),
+            "the readable text around an invalid byte was lost: {text:?}"
+        );
+        assert!(
+            text.contains('\u{fffd}'),
+            "an invalid byte must be visible as a replacement: {text:?}"
+        );
+    }
+
+    #[test]
     fn the_alternate_screen_is_separate_from_the_history() {
         let mut terminal = core();
         terminal.feed(b"before\r\n");
