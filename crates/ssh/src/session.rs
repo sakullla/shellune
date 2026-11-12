@@ -547,6 +547,27 @@ impl RemoteSession {
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+
+    /// Opens one session channel that runs one command, for the batch runner (R19).
+    ///
+    /// The channel is opened by the connection's own loop, which is the only owner of
+    /// the connection handle; the caller then drives the channel it was given. It is
+    /// the same path the SCP copy takes, so a batch step cannot invent a second way to
+    /// run a command, and a batch run inherits this session's trust decision,
+    /// authentication and connection policy.
+    pub(crate) fn open_exec(
+        &mut self,
+        command: String,
+    ) -> Result<oneshot::Receiver<Result<Channel<client::Msg>, ChannelFailure>>, String> {
+        if self.closed {
+            return Err("the session is already closed".to_owned());
+        }
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Exec { command, reply })
+            .map_err(|_| "the connection is gone".to_owned())?;
+        Ok(answer)
+    }
 }
 
 impl Drop for RemoteSession {

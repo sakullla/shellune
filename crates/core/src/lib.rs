@@ -13,6 +13,7 @@
 //!   [`SecretString`] and errors use fixed, structured variants.
 
 mod auth;
+mod batch;
 mod connection;
 mod error;
 mod files;
@@ -28,6 +29,13 @@ mod task;
 mod workspace;
 
 pub use auth::{AuthMethod, AuthMethodKind};
+pub use batch::{
+    BATCH_FORMAT_VERSION, BatchBook, BatchEvent, BatchEventKind, BatchProblem, BatchRun,
+    BatchRunId, BatchStep, BatchTarget, BatchTask, BatchTaskId, ConfirmedBatch,
+    DEFAULT_BATCH_CONCURRENCY, FailurePolicy, HostRun, HostState, MAX_BATCH_CONCURRENCY,
+    MAX_BATCH_DETAIL_CHARS, MAX_BATCH_STEPS, MAX_BATCH_TARGETS, MAX_STEP_COMMAND_CHARS,
+    MAX_TARGET_LABEL_CHARS, OutputStream, RunState, StepRun, StepState,
+};
 pub use connection::{
     ConnectionDefaults, ConnectionPolicy, ConnectionValueError, DEFAULT_CONNECT_TIMEOUT_SECS,
     DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_KEEPALIVE_MAX_MISSES, HostConnection, Keepalive,

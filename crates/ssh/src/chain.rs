@@ -36,7 +36,7 @@ use crate::session::{
     Command, DialFailure, HandshakeProgress, HandshakeStage, Material, PtySize, TERM_VALUE,
     authenticate, client_config, finish_dial, open_exec_channel, open_sftp_channel,
 };
-use crate::sftp::{self, FileLink};
+use crate::sftp::{self, ChannelFailure, FileLink};
 use crate::transfer::{self, TransferLink};
 use crate::transport::{self, Cancel, IoStream, ProxyProcess};
 use crate::x11::{self, X11Gate, X11Notice, X11Status};
@@ -407,6 +407,26 @@ impl ChainSession {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Opens one session channel on the target that runs one command, for the batch
+    /// runner (R19).
+    ///
+    /// It is the same channel the SCP copy asks for, opened by the loop that owns the
+    /// target's connection, so a batch step on a jump chain uses exactly the trust and
+    /// authentication the chain already decided.
+    pub(crate) fn open_exec(
+        &mut self,
+        command: String,
+    ) -> Result<oneshot::Receiver<Result<Channel<client::Msg>, ChannelFailure>>, String> {
+        if self.closed {
+            return Err("the chain is already closed".to_owned());
+        }
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Exec { command, reply })
+            .map_err(|_| "the connection is gone".to_owned())?;
+        Ok(answer)
     }
 }
 

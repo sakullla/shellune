@@ -34,6 +34,7 @@
 //! [`HostConfig`]: shellune_core::HostConfig
 
 mod audit;
+mod batch;
 mod book;
 mod credentials;
 mod error;
@@ -47,6 +48,10 @@ mod trust;
 mod workspace;
 
 pub use audit::{CONFIG_KEYS, LOG_FIELDS, StoreEvent};
+pub use batch::{
+    BatchStore, DIRECTORY as BATCH_DIRECTORY, RUNS_DIRECTORY as BATCH_RUNS_DIRECTORY, RunLog,
+    TASKS_FILE_NAME as BATCH_TASKS_FILE_NAME,
+};
 pub use book::{
     FORMAT_VERSION, Group, HostBook, HostEdit, LegacyGroupLabel, RecentConnection, RecentHost,
     host_matches,
