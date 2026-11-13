@@ -2099,6 +2099,26 @@ pub struct UxStrings {
     pub settings_about: &'static str,
     /// Version
     pub settings_version: &'static str,
+    /// Connection
+    pub settings_connection: &'static str,
+    /// Keepalive and timeout
+    pub settings_connection_policy: &'static str,
+    /// The policy below is what every connection is dialled with
+    pub settings_connection_hint: &'static str,
+    /// Keepalive interval
+    pub settings_keepalive_interval: &'static str,
+    /// How long a silent connection waits before a probe
+    pub settings_keepalive_interval_hint: &'static str,
+    /// Unanswered probes
+    pub settings_keepalive_misses: &'static str,
+    /// How many probes may go unanswered before the connection is dropped
+    pub settings_keepalive_misses_hint: &'static str,
+    /// Connect timeout
+    pub settings_connect_timeout: &'static str,
+    /// How long reaching the host may take
+    pub settings_connect_timeout_hint: &'static str,
+    /// A number of seconds, with the count filled in
+    pub settings_seconds: &'static str,
     /// Connect to
     pub connect_title: &'static str,
     /// Choose how this server checks it is you. A password is only kept if you tick Remember.
@@ -2207,6 +2227,12 @@ pub struct UxStrings {
     pub keys_problem_hint: &'static str,
     pub keys_save_failed: &'static str,
     pub keys_save_failed_next: &'static str,
+    /// Label above the scope filter of the shortcut page
+    pub keys_scope_label: &'static str,
+    /// The scope filter's "every scope" choice
+    pub keys_scope_all: &'static str,
+    /// What to do about two actions that answer one combination
+    pub keys_conflict_next: &'static str,
     /// Title of the shortcut-command manager
     pub snippet_manage_title: &'static str,
     /// What filling in and running do
@@ -2350,6 +2376,16 @@ impl UxStrings {
             self.settings_import_hint,
             self.settings_about,
             self.settings_version,
+            self.settings_connection,
+            self.settings_connection_policy,
+            self.settings_connection_hint,
+            self.settings_keepalive_interval,
+            self.settings_keepalive_interval_hint,
+            self.settings_keepalive_misses,
+            self.settings_keepalive_misses_hint,
+            self.settings_connect_timeout,
+            self.settings_connect_timeout_hint,
+            self.settings_seconds,
             self.connect_title,
             self.connect_hint,
             self.quick_hint,
@@ -2419,6 +2455,9 @@ impl UxStrings {
             self.keys_problem_hint,
             self.keys_save_failed,
             self.keys_save_failed_next,
+            self.keys_scope_label,
+            self.keys_scope_all,
+            self.keys_conflict_next,
             self.snippet_manage_title,
             self.snippet_manage_hint,
             self.snippet_storage_note,
@@ -2473,7 +2512,7 @@ impl UxStrings {
 /// English.
 pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_title: "Settings",
-    settings_summary: "Appearance, language and terminal",
+    settings_summary: "Appearance, terminal, shortcuts and data",
     new_tab: "New tab",
     new_tab_menu: "More ways to open a tab",
     search: "Search hosts and commands",
@@ -2513,6 +2552,19 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_import_hint: "Adds hosts from ~/.ssh/config after a preview",
     settings_about: "About",
     settings_version: "Version",
+    settings_connection: "Connection",
+    settings_connection_policy: "Keepalive and timeout",
+    settings_connection_hint: "Every connection is dialled with this policy, the same for every \
+host. These values are read from the SSH layer; this page only states them.",
+    settings_keepalive_interval: "Keepalive interval",
+    settings_keepalive_interval_hint: "A connection silent for this long sends one probe",
+    settings_keepalive_misses: "Unanswered probes",
+    settings_keepalive_misses_hint: "How many probes may go unanswered before the connection is \
+dropped",
+    settings_connect_timeout: "Connect timeout",
+    settings_connect_timeout_hint: "How long reaching the host may take, DNS and authentication \
+included",
+    settings_seconds: "{} s",
     connect_title: "Connect to",
     connect_hint: "Choose how this server checks it is you. A password is only kept if you tick Remember.",
     quick_hint: "Connect without saving. You can save the host afterwards from the session head.",
@@ -2582,6 +2634,9 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     keys_problem_hint: "Saved shortcuts were not applied; every action is at its default.",
     keys_save_failed: "This shortcut works for now but could not be written to the preferences file.",
     keys_save_failed_next: "The next change tries again; a restart shows what was saved.",
+    keys_scope_label: "Scope",
+    keys_scope_all: "Every scope",
+    keys_conflict_next: "Change or unbind one of the two, so one combination answers one action.",
     snippet_manage_title: "Shortcut commands",
     snippet_manage_hint: "Browsing and editing change nothing on screen. Fill in writes the command and runs nothing; Run writes it and submits it once, after a confirmation.",
     snippet_storage_note: "Saved as plain text in snippets.json on this computer. Keep passwords, keys and tokens out of shortcut commands.",
@@ -2634,7 +2689,7 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
 /// Simplified Chinese.
 pub static CHINESE_UX: UxStrings = UxStrings {
     settings_title: "设置",
-    settings_summary: "外观、语言与终端",
+    settings_summary: "外观、终端、快捷键与数据",
     new_tab: "新建标签",
     new_tab_menu: "更多打开方式",
     search: "搜索主机与命令",
@@ -2674,6 +2729,16 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_import_hint: "预览后从 ~/.ssh/config 添加主机",
     settings_about: "关于",
     settings_version: "版本",
+    settings_connection: "连接",
+    settings_connection_policy: "保活与超时",
+    settings_connection_hint: "每条连接都按这组策略保活与计时，对所有主机相同。这些值来自 SSH 层，本页只说明当前生效的数字。",
+    settings_keepalive_interval: "保活间隔",
+    settings_keepalive_interval_hint: "连接静默这么久之后就发一次探测",
+    settings_keepalive_misses: "未响应探测",
+    settings_keepalive_misses_hint: "多少次探测没有回应就判定连接已断开",
+    settings_connect_timeout: "连接超时",
+    settings_connect_timeout_hint: "连到主机最多可以用多久，包含 DNS 与认证",
+    settings_seconds: "{} 秒",
     connect_title: "连接到",
     connect_hint: "选择服务器验证你身份的方式。只有勾选“记住”时才会保存密码。",
     quick_hint: "不保存直接连接。连接后可以在会话头部保存为主机。",
@@ -2743,6 +2808,9 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     keys_problem_hint: "保存的快捷键未生效；所有动作已回到默认键位。",
     keys_save_failed: "快捷键本次已生效，但没能写入偏好文件。",
     keys_save_failed_next: "再改一次会重试；重启后显示的是已保存的状态。",
+    keys_scope_label: "作用范围",
+    keys_scope_all: "全部范围",
+    keys_conflict_next: "改掉或解除其中一个，让每个组合键只对应一个动作。",
     snippet_manage_title: "快捷命令",
     snippet_manage_hint: "浏览和编辑不会改动终端。「填入」只把命令写进当前终端，不执行；「执行」写入后提交一次，且先要确认。",
     snippet_storage_note: "以明文保存在本机 snippets.json 中。不要在快捷命令里写密码、私钥或令牌。",

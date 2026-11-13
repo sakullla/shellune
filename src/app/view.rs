@@ -88,6 +88,7 @@ mod host_dialog;
 mod overlays;
 mod panes;
 mod sessions;
+pub(crate) mod settings;
 mod shell;
 mod titlebar;
 mod toasts;
@@ -672,6 +673,9 @@ pub struct ShelluneView {
     keymap_save_error: Option<String>,
     /// The settings page's action search field.
     keys_search: Entity<TextField>,
+    /// Where the settings page is: its category, the item inside it and the shortcut
+    /// page's scope filter (R16).
+    settings_nav: settings::SettingsNav,
     /// The shortcut row the keyboard is on, which Enter opens for capture.
     ///
     /// The page is navigable with the arrow keys so a binding can be changed, unbound
@@ -1324,6 +1328,7 @@ impl ShelluneView {
             capture_watch: None,
             keymap_save_error: None,
             keys_search,
+            settings_nav: settings::SettingsNav::new(),
             keys_selected: 0,
             keys_control: 0,
             watching_appearance: false,
@@ -1530,21 +1535,21 @@ impl ShelluneView {
 
     /// The bindings in force. The palette, the hints and the settings page read their
     /// shortcut from here, so they can never disagree with what the window answers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     #[must_use]
     pub fn keymap(&self) -> &Keymap {
         &self.keymap
     }
 
     /// The settings page's action search, for the tests that check the list narrows.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     #[must_use]
     pub fn keys_query(&self, cx: &gpui::App) -> String {
         self.keys_search.read(cx).text().to_owned()
     }
 
     /// Why the saved bindings were not applied; `None` when they were.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     #[must_use]
     pub fn keymap_problem(&self) -> Option<&Problem> {
         self.keymap_problem.as_ref()
@@ -1712,8 +1717,7 @@ impl ShelluneView {
 
     /// The row the keyboard is on among the shortcut rows listed now.
     fn selected_key_row(&self, cx: &gpui::App) -> Option<&'static keymap::ActionSpec> {
-        let query = self.keys_search.read(cx).text().to_owned();
-        let matching = self.keymap.matching(&query, self.workspace.locale());
+        let matching = self.key_rows(cx);
         if matching.is_empty() {
             return None;
         }
@@ -1724,8 +1728,7 @@ impl ShelluneView {
 
     /// Moves the keyboard's row and keeps the highlight on a row that exists.
     fn step_key_row(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let query = self.keys_search.read(cx).text().to_owned();
-        let count = self.keymap.matching(&query, self.workspace.locale()).len();
+        let count = self.key_rows(cx).len();
         self.keys_selected = crate::app::palette::step(self.keys_selected, delta, count);
         // The row that is now under the ring may offer fewer controls than the one
         // before it; the cursor stays on the last one it has.

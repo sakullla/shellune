@@ -360,21 +360,37 @@ async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
         }
         cx.run_until_parked();
         assert_eq!(destination_of(&view, cx), page, "{name}");
-        assert_fits_inside(bounds_of(cx, "header.title"), viewport, name);
+        assert_within_width(bounds_of(cx, "header.title"), viewport, name);
         assert_fits_inside(bounds_of(cx, "nav.settings"), viewport, name);
         assert_within_width(bounds_of(cx, "content"), viewport, name);
+        if page == Destination::Settings {
+            // The page is one item at a time and scrolls at this size, so the settings are
+            // reached through the navigation above them: what has to be inside the window is
+            // that navigation, and nothing may be wider than the window (R8).
+            assert_within_width(bounds_of(cx, "settings.crumb"), viewport, name);
+            assert_fits_inside(bounds_of(cx, "settings.picker.category"), viewport, name);
+            assert_within_width(bounds_of(cx, "settings.picker.item"), viewport, name);
+        } else {
+            assert_fits_inside(bounds_of(cx, "header.title"), viewport, name);
+        }
     }
 }
 
-/// At the minimum window with the largest text, every settings row, every control in it
-/// and every part of that control stays inside its card, and every card inside the
-/// window (R4).
+/// At the minimum window with the largest text, every settings page, the card it draws and
+/// every control in that card stay inside the window (R8, R16).
 ///
-/// The card is the box the walkthrough measured: a control drawn past the card's right
-/// edge is drawn past the window too, and the settings page — it scrolls downwards only —
-/// cannot bring it back. Rows wrap and wide controls wrap inside themselves, so nothing
-/// is cut off; this test reads the measured boxes rather than the drawing, so a control
-/// that is squeezed to a stub still has to be inside the box it belongs to.
+/// The page is one item at a time now, so this walks the navigation: the category, then the
+/// item, then the box that item's controls were measured in. A control drawn past the card's
+/// right edge is drawn past the window too, and the page - it scrolls downwards only - cannot
+/// bring it back. The boxes are measured, not photographed, so a control squeezed to a stub
+/// still has to be inside the box it belongs to.
+/// One row of the settings page table: the item, the selector of the row it draws, and the
+/// selectors of the controls in that row.
+type SettingsRow<'a> = (&'static str, &'static str, &'a [&'static str]);
+
+/// One category of the settings page table: its selector, and the items inside it.
+type SettingsCategory<'a> = (&'static str, &'a [SettingsRow<'a>]);
+
 #[gpui::test]
 async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_percent(
     cx: &mut TestAppContext,
@@ -383,9 +399,9 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     show_settings_at_the_minimum_window_in_large_text(&view, cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
-    // The size this test claims to measure: the smallest window the app allows, in
-    // logical pixels. A window that came out larger would make every assertion below
-    // pass while the real minimum window still overflowed.
+    // The size this test claims to measure: the smallest window the app allows, in logical
+    // pixels. A window that came out larger would make every assertion below pass while the
+    // real minimum window still overflowed.
     assert_eq!(
         viewport,
         minimum_window(),
@@ -404,14 +420,14 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
             copy::ux_for(locale).keys_unbind,
         )
     });
-    // The test font draws 「跟随系统」 near 100px. A real UI font at this text size is
-    // four ems plus the segment's padding, and the measured segment has to reserve
-    // that or the same label is cut off at the real window's right edge.
+    // The test font draws the theme labels near 100px. A real UI font at this text size is
+    // four ems plus the segment's padding, and the measured segment has to reserve that or
+    // the same label is cut off at the real window's right edge.
     let theme_floor = crate::app::components::segment_reserved_width(theme_system, metrics);
     let full_em = metrics.label_size() * 4.0 + metrics.scale(theme::spacing::TIGHT + 2.0) * 2.0;
     assert!(
         theme_floor + px(0.5) >= full_em,
-        "the theme floor {theme_floor:?} is below a full-em 「{theme_system}」 ({full_em:?})"
+        "the theme floor {theme_floor:?} is below a full-em '{theme_system}' ({full_em:?})"
     );
 
     let content = bounds_of(cx, "content");
@@ -419,183 +435,149 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
         content.size.width <= viewport.width + px(0.5),
         "the settings scroll grew past the window: {content:?} in {viewport:?}"
     );
-    let page_pad = metrics.scale(theme::spacing::LOOSE + 8.0);
+    let page_pad = metrics.scale(theme::spacing::LOOSE);
 
-    // Every card is inside the window before anything inside it is measured, and it
-    // keeps the page padding instead of sitting flush with the right edge.
-    for (card, name) in [
-        ("settings.card.appearance", "the appearance card"),
-        ("settings.card.terminal", "the terminal card"),
-        ("settings.card.notices", "the notices card"),
-        ("settings.card.keys", "the shortcut card"),
-        ("settings.card.data", "the data card"),
-        ("settings.card.about", "the about card"),
-    ] {
-        let bounds = bounds_of(cx, card);
-        assert_within_width(bounds, viewport, name);
-        assert!(
-            bounds.origin.x + bounds.size.width <= viewport.width - page_pad + px(0.5),
-            "{name} reaches the window edge instead of keeping the page padding: {bounds:?}"
-        );
-    }
-
-    let theme_segment = bounds_of(cx, "settings.theme.0");
+    // At this size the two columns do not fit, so the navigation is the two pickers above the
+    // page. Both are inside the window, and the column they replaced is not drawn (R8).
     assert!(
-        theme_segment.size.width + px(0.5) >= theme_floor,
-        "the theme segment is narrower than a full-em font would draw {theme_system:?}: {theme_segment:?}, floor {theme_floor:?}"
+        cx.debug_bounds("settings.picker.category").is_some(),
+        "the folded navigation does not draw its category picker"
+    );
+    assert!(cx.debug_bounds("settings.picker.item").is_some());
+    assert!(
+        cx.debug_bounds("settings.nav").is_none(),
+        "the navigation column is drawn although the page folded it"
     );
 
-    // Each row, its control and each part of that control: inside the card. The segments
-    // are listed one by one — a track that fits while one of its segments does not would
-    // still put that segment past the card's edge (the walkthrough measured a segment,
-    // not the track).
-    for (card, row, track, segments) in [
+    // Every item of every category: its page, its card and the controls in that card.
+    let mut checked = 0;
+    let pages: &[SettingsCategory] = &[
         (
-            "settings.card.appearance",
-            "settings.row.theme",
-            "settings.theme",
-            &["settings.theme.0", "settings.theme.1", "settings.theme.2"][..],
-        ),
-        (
-            "settings.card.appearance",
-            "settings.row.language",
-            "settings.language",
-            &["settings.language.0", "settings.language.1"][..],
-        ),
-        (
-            "settings.card.appearance",
-            "settings.row.text-size",
-            "settings.zoom",
+            "settings.category.appearance",
             &[
-                "settings.zoom.0",
-                "settings.zoom.1",
-                "settings.zoom.2",
-                "settings.zoom.3",
-            ][..],
+                (
+                    "theme",
+                    "settings.row.theme",
+                    &["settings.theme.0", "settings.theme.1", "settings.theme.2"][..],
+                ),
+                (
+                    "language",
+                    "settings.row.language",
+                    &["settings.language.0", "settings.language.1"][..],
+                ),
+                (
+                    "text-size",
+                    "settings.row.text-size",
+                    &[
+                        "settings.zoom.0",
+                        "settings.zoom.1",
+                        "settings.zoom.2",
+                        "settings.zoom.3",
+                    ][..],
+                ),
+                (
+                    "motion",
+                    "settings.row.motion",
+                    &["settings.motion.0", "settings.motion.1"][..],
+                ),
+            ],
         ),
         (
-            "settings.card.appearance",
-            "settings.row.motion",
-            "settings.motion",
-            &["settings.motion.0", "settings.motion.1"][..],
-        ),
-        (
-            "settings.card.terminal",
-            "settings.row.scheme",
-            "settings.scheme",
+            "settings.category.terminal",
             &[
-                "settings.scheme.0",
-                "settings.scheme.1",
-                "settings.scheme.2",
-            ][..],
+                (
+                    "scheme",
+                    "settings.row.scheme",
+                    &["settings.scheme.0", "settings.scheme.1"][..],
+                ),
+                (
+                    "font-size",
+                    "settings.row.font-size",
+                    &[
+                        "settings.font.less",
+                        "settings.font.value",
+                        "settings.font.more",
+                    ][..],
+                ),
+                ("default-shell", "settings.row.default-shell", &[][..]),
+            ],
         ),
         (
-            "settings.card.terminal",
-            "settings.row.default-shell",
-            "settings.shell",
-            &["settings.shell.0"][..],
+            "settings.category.connection",
+            &[(
+                "policy",
+                "settings.row.keepalive-interval",
+                &["settings.value.keepalive-interval"][..],
+            )],
         ),
         (
-            "settings.card.notices",
-            "settings.row.bell-notice",
-            "settings.notice.bell",
-            &["settings.notice.bell.0", "settings.notice.bell.1"][..],
+            "settings.category.notices",
+            &[
+                (
+                    "bell-notice",
+                    "settings.row.bell-notice",
+                    &["settings.notice.bell.0", "settings.notice.bell.1"][..],
+                ),
+                (
+                    "finished-notice",
+                    "settings.row.finished-notice",
+                    &["settings.notice.finished.0", "settings.notice.finished.1"][..],
+                ),
+            ],
         ),
         (
-            "settings.card.notices",
-            "settings.row.finished-notice",
-            "settings.notice.finished",
-            &["settings.notice.finished.0", "settings.notice.finished.1"][..],
+            "settings.category.data",
+            &[
+                (
+                    "hosts-file",
+                    "settings.row.hosts-file",
+                    &["settings.paths"][..],
+                ),
+                ("import", "settings.row.import", &["settings.import"][..]),
+            ],
         ),
-    ] {
-        let card_bounds = bounds_of(cx, card);
-        let row_bounds = bounds_of(cx, row);
-        assert_inside_box(row_bounds, card_bounds, row);
-        let track_bounds = bounds_of(cx, track);
-        assert_inside_box(track_bounds, card_bounds, track);
-        for segment in segments {
-            assert_inside_box(bounds_of(cx, segment), card_bounds, segment);
+        (
+            "settings.category.about",
+            &[("version", "settings.row.about", &["status.version"][..])],
+        ),
+    ];
+    for (category, items) in pages {
+        click(cx, category);
+        for (item, row, controls) in *items {
+            click(cx, item_selector(item));
+            let card = card_selector(item);
+            let item_name = format!("the {item} card");
+            let card_bounds = bounds_of(cx, card);
+            assert_within_width(card_bounds, viewport, &item_name);
+            assert!(
+                card_bounds.origin.x + card_bounds.size.width
+                    <= viewport.width - page_pad + px(0.5),
+                "{item_name} reaches the window edge instead of keeping the page padding: {card_bounds:?}"
+            );
+            let row_bounds = bounds_of(cx, row);
+            assert_inside_box(row_bounds, card_bounds, row);
+            for control in *controls {
+                assert_inside_box(bounds_of(cx, control), card_bounds, control);
+            }
+            checked += 1;
         }
     }
+    assert_eq!(checked, 13, "not every settings item was measured");
 
-    // The controls that are not a segmented track are rows of their own: the two
-    // text-size buttons, the font size between them, the file path and the import
-    // button.
-    for (card, row, control) in [
-        (
-            "settings.card.terminal",
-            "settings.row.font-size",
-            "settings.font.less",
-        ),
-        (
-            "settings.card.terminal",
-            "settings.row.font-size",
-            "settings.font.value",
-        ),
-        (
-            "settings.card.terminal",
-            "settings.row.font-size",
-            "settings.font.more",
-        ),
-        (
-            "settings.card.data",
-            "settings.row.hosts-file",
-            "settings.paths",
-        ),
-        (
-            "settings.card.data",
-            "settings.row.import",
-            "settings.import",
-        ),
-        (
-            "settings.card.about",
-            "settings.row.about",
-            "status.version",
-        ),
+    // The shortcut page has a card of rows rather than one row: its search, a row, that
+    // row's keys and its controls are inside the card as well.
+    click(cx, "settings.category.keys");
+    click(cx, item_selector("keys"));
+    let keys = bounds_of(cx, "settings.keys");
+    assert_within_width(keys, viewport, "the shortcut card");
+    for part in [
+        "settings.keys.search",
+        "settings.keys.scope",
+        "settings.keys.row.terminal.copy",
+        "settings.keys.keycap.terminal.copy.0",
+        "settings.keys.unbind.terminal.copy",
     ] {
-        let card_bounds = bounds_of(cx, card);
-        assert_inside_box(bounds_of(cx, row), card_bounds, row);
-        assert_inside_box(bounds_of(cx, control), card_bounds, control);
-    }
-
-    // The shortcut list: its search field, a row and that row's key and buttons are all
-    // inside the shortcut card. The rest of the list is the same row built again.
-    let keys_card = bounds_of(cx, "settings.card.keys");
-    assert_inside_box(
-        bounds_of(cx, "settings.keys.search"),
-        keys_card,
-        "the search field",
-    );
-    for (row, parts) in [
-        (
-            "settings.keys.row.terminal.search",
-            &[
-                "settings.keys.keycap.terminal.search.0",
-                "settings.keys.change.terminal.search",
-                "settings.keys.unbind.terminal.search",
-            ][..],
-        ),
-        (
-            "settings.keys.row.terminal.copy",
-            &[
-                "settings.keys.keycap.terminal.copy.0",
-                "settings.keys.change.terminal.copy",
-                "settings.keys.unbind.terminal.copy",
-            ][..],
-        ),
-        (
-            "settings.keys.row.palette.open",
-            &[
-                "settings.keys.keycap.palette.open.0",
-                "settings.keys.change.palette.open",
-                "settings.keys.unbind.palette.open",
-            ][..],
-        ),
-    ] {
-        assert_inside_box(bounds_of(cx, row), keys_card, row);
-        for part in parts {
-            assert_inside_box(bounds_of(cx, part), keys_card, part);
-        }
+        assert_inside_box(bounds_of(cx, part), keys, part);
     }
     let unbind_floor = crate::app::components::compact_label_reserved_width(unbind_label, metrics);
     let unbind = bounds_of(cx, "settings.keys.unbind.terminal.copy");
@@ -603,25 +585,56 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
         unbind.size.width + px(0.5) >= unbind_floor,
         "the unbind control is narrower than a full-em font would draw {unbind_label:?}: {unbind:?}, floor {unbind_floor:?}"
     );
+}
 
-    // The controls are not squeezed into stubs to make that fit: the two text-size
-    // buttons keep the pointer target the rest of the page has (R4).
-    for selector in ["settings.font.less", "settings.font.more"] {
-        let bounds = bounds_of(cx, selector);
-        assert!(
-            bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
-            "{selector} shrank below its pointer target: {bounds:?}"
-        );
+/// The selector of a settings item in the navigation.
+fn item_selector(item: &'static str) -> &'static str {
+    match item {
+        "theme" => "settings.item.theme",
+        "language" => "settings.item.language",
+        "text-size" => "settings.item.text-size",
+        "motion" => "settings.item.motion",
+        "scheme" => "settings.item.scheme",
+        "font-size" => "settings.item.font-size",
+        "default-shell" => "settings.item.default-shell",
+        "policy" => "settings.item.policy",
+        "bell-notice" => "settings.item.bell-notice",
+        "finished-notice" => "settings.item.finished-notice",
+        // The shortcut page is named like its category, so the category is its row.
+        "keys" => "settings.category.keys",
+        "hosts-file" => "settings.item.hosts-file",
+        "import" => "settings.item.import",
+        _ => "settings.item.version",
+    }
+}
+
+/// The card a settings item draws its controls in.
+fn card_selector(item: &'static str) -> &'static str {
+    match item {
+        "theme" => "settings.card.theme",
+        "language" => "settings.card.language",
+        "text-size" => "settings.card.text-size",
+        "motion" => "settings.card.motion",
+        "scheme" => "settings.card.scheme",
+        "font-size" => "settings.card.font-size",
+        "default-shell" => "settings.card.default-shell",
+        "policy" => "settings.card.policy",
+        "bell-notice" => "settings.card.bell-notice",
+        "finished-notice" => "settings.card.finished-notice",
+        "hosts-file" => "settings.card.hosts-file",
+        "import" => "settings.card.import",
+        "keys" => "settings.keys",
+        _ => "settings.card.version",
     }
 }
 
 /// A control that is wider than its row wraps inside it rather than leaving the window
-/// (R4).
+/// (R8).
 ///
-/// The default-shell choice is the case the walkthrough caught: the names of the shells
-/// on this machine are wider than the row at 200% text, and the track used to keep its
-/// full width — drawn past the row and past the window's right edge. The shells are
-/// fixed here so the test measures the layout and not the machine it runs on.
+/// The default-shell choice is the case the walkthrough caught: the names of the shells on
+/// this machine are wider than the row at 200% text, and the track used to keep its full
+/// width - drawn past the row and past the window's right edge. The shells are fixed here so
+/// the test measures the layout and not the machine it runs on.
 #[gpui::test]
 async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_percent(
     cx: &mut TestAppContext,
@@ -636,9 +649,11 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
         cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
     show_settings_at_the_minimum_window_in_large_text(&view, cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
+    click(cx, "settings.category.terminal");
+    click(cx, "settings.item.default-shell");
 
-    let card = bounds_of(cx, "settings.card.terminal");
-    assert_within_width(card, viewport, "the terminal card");
+    let card = bounds_of(cx, "settings.card.default-shell");
+    assert_within_width(card, viewport, "the default-shell card");
     let row = bounds_of(cx, "settings.row.default-shell");
     assert_inside_box(row, card, "the default-shell row");
     let track = bounds_of(cx, "settings.shell");
@@ -653,10 +668,10 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
         "the choice kept its width instead of shrinking to the row: {track:?} in {row:?}"
     );
 
-    // So the shells gain a line inside the same track: the first shell is on the first
-    // line and a later one below it, all of them inside the track and the card. Each
-    // segment is measured on its own: the track being inside the card says nothing about
-    // a segment that hangs over its edge.
+    // So the shells gain a line inside the same track: the first shell is on the first line
+    // and a later one below it, all of them inside the track and the card. Each segment is
+    // measured on its own: the track being inside the card says nothing about a segment that
+    // hangs over its edge.
     let first = bounds_of(cx, "settings.shell.0");
     let later = bounds_of(cx, "settings.shell.1");
     assert!(
@@ -685,12 +700,11 @@ async fn a_settings_control_wider_than_its_row_wraps_inside_it_at_two_hundred_pe
     }
 }
 
-/// A shortcut row keeps its keys and its three controls inside the row at 200% text
-/// (R4).
+/// A shortcut row keeps its keys and its controls inside the page at 200% text (R8).
 ///
-/// A combination as long as a real one takes a wide keycap once the text is doubled, and
-/// the row then holds a name column, the key and three buttons. The row wraps those
-/// parts instead of letting the buttons leave the window.
+/// A combination as long as a real one takes a wide keycap once the text is doubled, and the
+/// row then holds a name column, the key and three buttons. The row wraps those parts instead
+/// of letting the buttons leave the window.
 #[gpui::test]
 async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window(
     cx: &mut TestAppContext,
@@ -707,9 +721,9 @@ async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window
     });
     show_settings_at_the_minimum_window_in_large_text(&view, cx);
     let viewport = cx.update(|window, _app| window.viewport_size());
-
-    let card = bounds_of(cx, "settings.card.keys");
-    assert_within_width(card, viewport, "the shortcut card");
+    click(cx, "settings.category.keys");
+    let card = bounds_of(cx, "settings.keys");
+    assert_within_width(card, viewport, "the shortcut page");
     let row = "settings.keys.row.terminal.copy";
     assert_inside_box(bounds_of(cx, row), card, row);
     for control in [
@@ -736,15 +750,232 @@ async fn the_shortcut_rows_keep_their_keys_and_buttons_inside_the_minimum_window
         keycap.size.width + px(0.5) >= key_floor,
         "the keycap is narrower than a real font would draw {key_label:?}: {keycap:?}, floor {key_floor:?}"
     );
-    // The search field above the list is a control of the same page and stays inside the
-    // card too.
+    // The search and the scope filter above the list are controls of the same page and stay
+    // inside the card too.
     assert_inside_box(
         bounds_of(cx, "settings.keys.search"),
         card,
         "the search field",
     );
+    assert_inside_box(
+        bounds_of(cx, "settings.keys.scope"),
+        card,
+        "the scope filter",
+    );
 }
 
+/// The selector of a settings page.
+fn page_selector(item: &'static str) -> &'static str {
+    match item {
+        "theme" => "settings.page.theme",
+        "language" => "settings.page.language",
+        "text-size" => "settings.page.text-size",
+        "motion" => "settings.page.motion",
+        "scheme" => "settings.page.scheme",
+        "font-size" => "settings.page.font-size",
+        "default-shell" => "settings.page.default-shell",
+        "policy" => "settings.page.policy",
+        "bell-notice" => "settings.page.bell-notice",
+        "finished-notice" => "settings.page.finished-notice",
+        "keys" => "settings.page.keys",
+        "hosts-file" => "settings.page.hosts-file",
+        "import" => "settings.page.import",
+        _ => "settings.page.version",
+    }
+}
+
+/// Opening a category again shows the item that was open there, and only that item (R16).
+#[gpui::test]
+async fn going_back_to_a_category_shows_the_item_that_was_open(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+
+    // The page opens on the appearance category, on its first item, and the row it draws is
+    // the only one: a page per item is the whole point of the second level (R16).
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id()),
+        ("appearance", "theme")
+    );
+    assert!(cx.debug_bounds("settings.card.theme").is_some());
+
+    // The language is the second item of that category.
+    click(cx, "settings.item.language");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id()),
+        ("appearance", "language")
+    );
+    assert!(cx.debug_bounds("settings.card.language").is_some());
+
+    // Another category, and back: the appearance category is still on the language.
+    click(cx, "settings.category.terminal");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id()),
+        ("terminal", "scheme")
+    );
+    click(cx, "settings.category.appearance");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id()),
+        ("appearance", "language"),
+        "the category reopened on its first item instead of the one that was open"
+    );
+    assert!(cx.debug_bounds("settings.card.language").is_some());
+}
+
+/// The shortcut page narrows by action name, by the combination in force and by scope (R16).
+#[gpui::test]
+async fn the_shortcut_page_searches_by_name_by_combination_and_by_scope(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    click(cx, "settings.category.keys");
+    let listed = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).settings_key_rows(app))
+    };
+    assert!(listed(cx).contains(&"nav.hosts"));
+    assert!(listed(cx).contains(&"terminal.copy"));
+
+    // By name.
+    type_into(cx, "settings.keys.search", "copy");
+    assert!(listed(cx).contains(&"terminal.copy"));
+    assert!(
+        !listed(cx).contains(&"nav.hosts"),
+        "the name search left an action that does not match it"
+    );
+    clear_field(cx, "settings.keys.search", 4);
+    assert!(listed(cx).contains(&"nav.hosts"));
+
+    // By the combination in force, spelled the way a person reads it.
+    let combination = Keymap::defaults(Platform::current())
+        .keystroke("terminal.copy")
+        .expect("copy has a default combination")
+        .to_owned();
+    let spelled = crate::app::keymap::keystroke_label(&combination, Platform::current());
+    type_into(cx, "settings.keys.search", &spelled);
+    assert!(
+        listed(cx).contains(&"terminal.copy"),
+        "the combination in force does not find its own action"
+    );
+    assert!(!listed(cx).contains(&"nav.hosts"));
+    clear_field(cx, "settings.keys.search", spelled.chars().count());
+
+    // By scope: an action of the window is not listed while the scope is the terminal.
+    click(cx, "settings.keys.scope.terminal");
+    assert!(listed(cx).contains(&"terminal.copy"));
+    assert!(
+        !listed(cx).contains(&"nav.hosts"),
+        "a window action is listed under the terminal scope"
+    );
+    click(cx, "settings.keys.scope.all");
+    assert!(listed(cx).contains(&"nav.hosts"));
+}
+
+/// A saved set in which two actions answer one combination is explained on the shortcut page
+/// rather than being applied halfway (R16).
+#[gpui::test]
+async fn a_saved_keymap_in_conflict_is_explained_on_the_shortcut_page(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    let saved = saved_for_this_platform(vec![
+        shellune_storage::KeymapEntry::new("nav.hosts", "shell", Some("ctrl-alt-h".to_owned())),
+        shellune_storage::KeymapEntry::new("nav.settings", "shell", Some("ctrl-alt-h".to_owned())),
+    ]);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_saved_keymap_for_test(&saved, cx));
+    });
+    cx.run_until_parked();
+    click(cx, "settings.category.keys");
+
+    assert!(
+        matches!(
+            cx.update(|_window, app| view.read(app).keymap_problem().cloned()),
+            Some(crate::app::keymap::Problem::Conflict { .. })
+        ),
+        "the conflict the saved set holds is kept for the page to show"
+    );
+    assert!(
+        cx.debug_bounds("settings.keys.conflicts").is_some(),
+        "the shortcut page names the two actions that share a combination"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).keymap().clone()),
+        Keymap::defaults(Platform::current()),
+        "the defaults are in force instead of a half-applied set"
+    );
+}
+
+/// The minimum window at 115% text reaches every category and every item by its navigation,
+/// and nothing on the way is clipped (R8, R16).
+#[gpui::test]
+async fn the_minimum_window_reaches_every_settings_category_and_item_at_115_percent(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    cx.dispatch_action(ToggleLanguage);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Comfortable,
+        "one step of text size is 115%"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese
+    );
+    cx.dispatch_action(crate::app::actions::GoToSettings);
+    cx.run_until_parked();
+    let viewport = cx.update(|window, _app| window.viewport_size());
+
+    // Two columns do not fit here, so the navigation is the two pickers above the page: every
+    // category and every item is still one press away.
+    assert!(cx.debug_bounds("settings.nav").is_none());
+    assert!(cx.debug_bounds("settings.picker.category").is_some());
+    let mut reached = 0;
+    for (category, items) in [
+        (
+            "settings.category.appearance",
+            &["theme", "language", "text-size", "motion"][..],
+        ),
+        (
+            "settings.category.terminal",
+            &["scheme", "font-size", "default-shell"][..],
+        ),
+        ("settings.category.connection", &["policy"][..]),
+        (
+            "settings.category.notices",
+            &["bell-notice", "finished-notice"][..],
+        ),
+        ("settings.category.keys", &["keys"][..]),
+        ("settings.category.data", &["hosts-file", "import"][..]),
+        ("settings.category.about", &["version"][..]),
+    ] {
+        assert_within_width(bounds_of(cx, category), viewport, category);
+        click(cx, category);
+        for item in items {
+            click(cx, item_selector(item));
+            assert!(
+                cx.debug_bounds(page_selector(item)).is_some(),
+                "{item} has no page after its navigation entry was pressed"
+            );
+            assert_within_width(bounds_of(cx, page_selector(item)), viewport, item);
+            assert_within_width(bounds_of(cx, card_selector(item)), viewport, item);
+            reached += 1;
+        }
+    }
+    assert_eq!(reached, 14, "not every settings item was reachable");
+
+    // The way out is on the page as it always was, so a person is never stranded here.
+    assert_within_width(bounds_of(cx, "nav.hosts"), viewport, "the hosts entry");
+}
 /// Asserts one measured box stays inside another one, on the left and on the right.
 ///
 /// A settings page that scrolls downwards only cannot reach a control drawn past the
@@ -4603,6 +4834,7 @@ async fn ctrl_l_reaches_the_program_running_in_the_terminal(cx: &mut TestAppCont
     // The settings page is the in-terminal path to the same intent: it has to keep
     // working, or the shortcut above would have made the language unreachable.
     go(cx, crate::app::actions::GoToSettings);
+    click(cx, "settings.item.language");
     click(cx, "settings.language.1");
     go(cx, GoToLocalShells);
     assert_eq!(
@@ -15600,16 +15832,20 @@ async fn the_settings_page_changes_theme_language_and_font_size(cx: &mut TestApp
         cx.update(|_window, app| view.read(app).theme_choice()),
         theme::ThemeChoice::Dark
     );
+    click(cx, "settings.item.language");
     click(cx, "settings.language.1");
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().locale()),
         Locale::Chinese
     );
+    click(cx, "settings.item.text-size");
     click(cx, "settings.zoom.2");
     assert_eq!(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Comfortable
     );
+    click(cx, "settings.category.terminal");
+    click(cx, "settings.item.font-size");
     let before = cx.update(|_window, app| view.read(app).workspace().local_font_size());
     click(cx, "settings.font.more");
     let after = cx.update(|_window, app| view.read(app).workspace().local_font_size());
@@ -15847,6 +16083,7 @@ async fn the_settings_page_lists_every_action_and_narrows_them_by_search(cx: &mu
     cx.simulate_resize(tall_window());
     cx.run_until_parked();
     click(cx, "nav.settings");
+    click(cx, "settings.category.keys");
 
     assert!(
         cx.debug_bounds("settings.keys").is_some(),
@@ -15882,6 +16119,7 @@ async fn changing_a_shortcut_applies_at_once_and_the_palette_shows_it(cx: &mut T
     cx.simulate_resize(tall_window());
     cx.run_until_parked();
     click(cx, "nav.settings");
+    click(cx, "settings.category.keys");
     click(cx, "settings.keys.change.nav.settings");
     assert!(
         cx.debug_bounds("keys.capture").is_some(),
@@ -15949,6 +16187,7 @@ async fn a_conflicting_shortcut_is_refused_and_names_both_actions(cx: &mut TestA
     cx.simulate_resize(tall_window());
     cx.run_until_parked();
     click(cx, "nav.settings");
+    click(cx, "settings.category.keys");
     click(cx, "settings.keys.change.nav.hosts");
 
     // The combination that already closes the current tab, in the same context.
@@ -16007,6 +16246,7 @@ async fn a_saved_keymap_that_cannot_be_used_is_reported_and_the_defaults_answer(
     });
     cx.run_until_parked();
 
+    click(cx, "settings.category.keys");
     assert!(
         cx.update(|_window, app| view.read(app).keymap_problem().is_some()),
         "the reason is kept for the page to show"
@@ -16062,6 +16302,8 @@ async fn icon_controls_keep_a_24_by_24_pointer_target_at_the_smallest_text_size(
     cx.simulate_resize(minimum_window());
     smallest_text_size(&view, cx);
     click(cx, "nav.settings");
+    click(cx, "settings.category.terminal");
+    click(cx, "settings.item.font-size");
     for selector in [
         "settings.font.less",
         "settings.font.more",
@@ -16425,6 +16667,8 @@ async fn a_shortcut_can_be_changed_with_the_keyboard_alone(cx: &mut TestAppConte
     cx.run_until_parked();
     assert_eq!(destination_of(&view, cx), Destination::Settings);
 
+    click(cx, "settings.category.keys");
+
     // The arrow keys pick a row and Enter opens it: no pointer is used here.
     cx.simulate_keystrokes("down");
     cx.simulate_keystrokes("down");
@@ -16467,7 +16711,8 @@ async fn a_shortcut_can_be_unbound_and_restored_with_the_keyboard_alone(cx: &mut
     cx.run_until_parked();
     assert_eq!(destination_of(&view, cx), Destination::Settings);
 
-    // One row, so the arrow keys and Enter are the only inputs this test needs.
+    // The shortcut page holds the list; the keyboard is the only input it needs.
+    click(cx, "settings.category.keys");
     type_into(cx, "settings.keys.search", "copy");
     cx.run_until_parked();
     assert_eq!(
@@ -16541,6 +16786,7 @@ async fn two_hundred_percent_chinese_settings_shortcuts_stay_inside_the_window(
         cx.update(|_window, app| view.read(app).workspace().zoom()),
         Zoom::Largest
     );
+    click(cx, "settings.category.keys");
     let viewport = cx.update(|window, _app| window.viewport_size());
     for selector in [
         "settings.keys",
@@ -16785,16 +17031,20 @@ async fn the_two_reminders_switch_separately_and_are_written_down(cx: &mut TestA
     cx.simulate_resize(tall_window());
     cx.run_until_parked();
     click(cx, "nav.settings");
+    click(cx, "settings.category.notices");
+    click(cx, "settings.item.bell-notice");
     assert!(
         cx.debug_bounds("settings.notice.bell").is_some(),
         "the settings page offers the bell reminder"
     );
+    click(cx, "settings.item.finished-notice");
     assert!(
         cx.debug_bounds("settings.notice.finished").is_some(),
         "and the command-end reminder separately"
     );
 
     // Both start on; switching the bell off leaves the command one alone.
+    click(cx, "settings.item.bell-notice");
     click(cx, "settings.notice.bell.1");
     let settings = cx.update(|_window, app| view.read(app).workspace().attention_settings());
     assert!(!settings.bell, "the bell reminder is off");
@@ -16830,6 +17080,7 @@ async fn the_two_reminders_switch_separately_and_are_written_down(cx: &mut TestA
 
     // And switching it off removes the mark it already made.
     click(cx, "nav.settings");
+    click(cx, "settings.item.finished-notice");
     click(cx, "settings.notice.finished.1");
     assert!(
         unread_of(cx, &view, background).is_empty(),
@@ -17110,6 +17361,7 @@ async fn a_mark_is_still_drawn_when_motion_is_reduced(cx: &mut TestAppContext) {
     cx.simulate_resize(tall_window());
     cx.run_until_parked();
     click(cx, "nav.settings");
+    click(cx, "settings.item.motion");
     click(cx, "settings.motion.1");
     assert!(
         !cx.update(|_window, app| view.read(app).workspace().motion())

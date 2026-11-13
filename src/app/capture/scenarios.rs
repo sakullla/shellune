@@ -26,12 +26,17 @@ use gpui::{App, Context, Window};
 use shellune_core::{
     HostConfig, LocalShell, SessionFailure, SessionId, SessionState, SnippetBook, SplitAxis,
 };
-use shellune_storage::{HostEdit, HostStore, SnippetStore};
+use shellune_storage::{
+    HostEdit, HostStore, KeymapEntry, KeymapPreferences, Preferences, PreferencesStore,
+    SnippetStore,
+};
 
 use crate::app::ShelluneView;
 use crate::app::copy::Locale;
-use crate::app::nav::Destination;
+use crate::app::keymap::Problem;
+use crate::app::nav::{Destination, Platform};
 use crate::app::theme::{self, Motion, Zoom};
+use crate::app::view::settings::Item;
 use crate::app::workspace::{AttentionKind, SectionState, Workspace};
 
 /// What kind of surface a scenario shows, so the gallery can group them.
@@ -301,6 +306,27 @@ fn seed_snippets(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Writes a saved key map in which two actions answer the same combination, the way a
+/// hand-edited preferences file does: the shot shows what the page says about it, and the
+/// defaults that are in force instead.
+fn seed_conflicting_keymap(root: &Path) -> Result<(), String> {
+    let mut saved = KeymapPreferences::default();
+    saved.set_for_platform(
+        Platform::current().id(),
+        vec![
+            KeymapEntry::new("nav.hosts", "shell", Some("ctrl-alt-h".to_owned())),
+            KeymapEntry::new("nav.settings", "shell", Some("ctrl-alt-h".to_owned())),
+        ],
+    );
+    PreferencesStore::at(root)
+        .save(&Preferences {
+            keymap: Some(saved),
+            ..Default::default()
+        })
+        .map_err(|error| format!("the shortcut fixture could not be written: {error}"))?;
+    Ok(())
+}
+
 /// Nothing to prepare: the empty page is what a fresh data directory holds.
 fn nothing(_: &Path) -> Result<(), String> {
     Ok(())
@@ -506,6 +532,38 @@ fn show_connection(
     Ok(())
 }
 
+/// Opens the settings page on one of its items, the way the navigation does (R16).
+fn show_settings_item(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+    item: Item,
+) -> Result<(), String> {
+    view.capture_settings_page(item, cx);
+    Ok(())
+}
+
+/// Opens the shortcut page.
+fn show_settings_keys(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::Shortcuts)
+}
+
+/// Opens the shortcut page with a query in its search, so the shot shows the list narrowed
+/// by a combination rather than the whole catalogue (R16).
+fn show_settings_keys_search(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_keys(view, window, cx)?;
+    view.capture_settings_query("ctrl", cx);
+    Ok(())
+}
+
 /// Shows several tabs, then lists all of them over the terminal (R17).
 fn show_tab_list(
     view: &mut ShelluneView,
@@ -581,11 +639,67 @@ fn terminal_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     Ok(())
 }
 
-fn settings_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+/// Whether a settings page is on screen, and which one.
+fn settings_page_is_on(view: &ShelluneView, wanted: (&str, &str)) -> Result<(), String> {
     if view.workspace().destination() != Destination::Settings {
         return Err("the settings page is not the destination on screen".to_owned());
     }
+    let shown = view.settings_page_id();
+    if shown != wanted {
+        return Err(format!(
+            "the settings page shows {}/{}, not {}/{}",
+            shown.0, shown.1, wanted.0, wanted.1
+        ));
+    }
     Ok(())
+}
+
+fn settings_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("appearance", "theme"))
+}
+
+fn settings_connection_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("connection", "policy"))
+}
+
+/// The shortcut page is on screen, with the actions in force listed.
+fn settings_keys_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("keys", "keys"))?;
+    let listed = view.keymap().matching("", view.workspace().locale()).len();
+    if listed == 0 {
+        return Err("the shortcut page lists no action".to_owned());
+    }
+    Ok(())
+}
+
+/// The shortcut page is on screen, narrowed to the combinations the query names.
+fn settings_keys_search_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    settings_keys_ready(view, cx)?;
+    let query = view.keys_query(cx);
+    if query.is_empty() {
+        return Err("the shortcut search holds no query".to_owned());
+    }
+    let locale = view.workspace().locale();
+    // The page's own list, narrowed by the query it holds, against the whole catalogue.
+    let listed = view.settings_key_rows(cx).len();
+    let all = view.keymap().matching("", locale).len();
+    if listed == 0 || listed >= all {
+        return Err(format!(
+            "the query {query:?} lists {listed} of {all} actions, so it does not narrow them"
+        ));
+    }
+    Ok(())
+}
+
+/// The shortcut page is on screen, saying which two actions share a combination.
+fn settings_keys_conflict_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    settings_keys_ready(view, cx)?;
+    match view.keymap_problem() {
+        Some(Problem::Conflict { .. }) => Ok(()),
+        other => Err(format!(
+            "the shortcut page reports {other:?} instead of a conflict"
+        )),
+    }
 }
 
 fn palette_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
@@ -801,11 +915,11 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "settings",
-        title: "设置",
+        title: "设置 · 分类导航与外观",
         category: Category::Settings,
         fixture: "default preferences; nothing is saved",
-        evidence: "shows the settings this build draws; the section navigation is still the \
-                   single page the redesign replaces",
+        evidence: "shows the category and item navigation and the one page it opens; the values \
+                   are this build's defaults and no preference was written",
         quick: true,
         variants: &[
             Variant::dark().smallest(),
@@ -815,6 +929,71 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: no_state,
         ready: settings_ready,
+    },
+    Scenario {
+        id: "settings-connection",
+        title: "设置 · 连接分类只读策略",
+        category: Category::Settings,
+        fixture: "default preferences; the connection policy the SSH layer applies",
+        evidence: "shows the second level of the navigation on the connection category and the \
+                   values in force; nothing was dialled and no policy was changed",
+        quick: false,
+        variants: &[Variant::dark().chinese().smallest()],
+        start: || page(Destination::Settings),
+        prepare: nothing,
+        install: |view, window, cx| show_settings_item(view, window, cx, Item::Policy),
+        ready: settings_connection_ready,
+    },
+    Scenario {
+        id: "settings-keys",
+        title: "设置 · 快捷键子页",
+        category: Category::Settings,
+        fixture: "default preferences; every action at its default binding",
+        evidence: "shows the search, the scope filter and the bindings in force on the shortcut \
+                   page alone; pressing a control is not part of the shot",
+        quick: true,
+        variants: &[
+            Variant::dark().comfortable(),
+            Variant::dark().chinese().smallest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: nothing,
+        install: show_settings_keys,
+        ready: settings_keys_ready,
+    },
+    Scenario {
+        id: "settings-keys-search",
+        title: "设置 · 快捷键按组合键筛选",
+        category: Category::Settings,
+        fixture: "default preferences, with ctrl in the shortcut search",
+        evidence: "shows the shortcut page narrowed to the actions whose keys contain the query, \
+                   in both languages; the query was typed, no binding was changed",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: nothing,
+        install: show_settings_keys_search,
+        ready: settings_keys_search_ready,
+    },
+    Scenario {
+        id: "settings-keys-conflict",
+        title: "设置 · 快捷键冲突说明",
+        category: Category::Settings,
+        fixture: "a saved key map that binds two actions to one combination",
+        evidence: "shows the shortcut page naming the two actions that collide and that the \
+                   defaults are in force instead; no binding was changed by the shot",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: seed_conflicting_keymap,
+        install: show_settings_keys,
+        ready: settings_keys_conflict_ready,
     },
     Scenario {
         id: "overlay-palette",
