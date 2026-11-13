@@ -29,6 +29,7 @@ use crate::app::snippets::body_preview;
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, Metrics, Tone, palette as colors, radius, spacing};
 use crate::app::workspace::UnreadNotices;
+use shellune_terminal::paste_preview;
 
 /// The background marks of one tab, in the all-tabs list (R7).
 ///
@@ -1573,6 +1574,13 @@ impl ShelluneView {
         self.tab_list_open
     }
 
+    /// The row the all-tabs list has the keyboard on, for the tests that walk it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn tab_list_selected(&self) -> usize {
+        self.tab_list_selected
+    }
+
     /// Whether the tab-name dialog is open.
     #[allow(dead_code)]
     #[must_use]
@@ -1598,8 +1606,52 @@ impl ShelluneView {
         self.shell_menu_open = false;
         self.tab_menu = None;
         self.remember_focus(window, cx);
+        // The list opens with the keyboard on the tab that is on screen, so Up and Down
+        // start from where the user already is and Enter never guesses (R17).
+        self.tab_list_selected = self
+            .workspace
+            .layout()
+            .active_tab_id()
+            .and_then(|active| {
+                (0..self.workspace.layout().tabs().len())
+                    .find(|index| self.workspace.layout().tabs()[*index].id() == active)
+            })
+            .unwrap_or(0);
         self.tab_list_open = true;
+        window.focus(&self.tab_list_focus);
         cx.notify();
+    }
+
+    /// The keys the all-tabs list reads while it has the keyboard.
+    ///
+    /// The list is a dialog of its own: it answers the arrow keys, Enter and Escape
+    /// rather than letting them reach the terminal behind it. The shortcut shown beside
+    /// a row is the binding in force for that position, not a copy of the defaults.
+    fn tab_list_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.workspace.layout().tabs().len();
+        match event.keystroke.key.as_str() {
+            "down" => {
+                self.tab_list_selected = palette::step(self.tab_list_selected, 1, count);
+                cx.notify();
+                cx.stop_propagation();
+            }
+            "up" => {
+                self.tab_list_selected = palette::step(self.tab_list_selected, -1, count);
+                cx.notify();
+                cx.stop_propagation();
+            }
+            "enter" if count > 0 => {
+                let index = self.tab_list_selected.min(count - 1);
+                self.close_tab_list(window, cx);
+                self.select_tab(index, window, cx);
+                cx.stop_propagation();
+            }
+            "escape" => {
+                self.close_tab_list(window, cx);
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
     }
 
     /// Closes the all-tabs list and gives the keyboard back to what was on screen.
@@ -1625,6 +1677,7 @@ impl ShelluneView {
         let locale = self.workspace.locale();
         let count = self.workspace.layout().tabs().len();
         let active = self.workspace.layout().active_tab_id();
+        let selected = self.tab_list_selected.min(count.saturating_sub(1));
         let (header, subtitle) = self.modal_header(
             Some(Icon::Layers),
             strings.tab_list_title.to_owned(),
@@ -1705,6 +1758,11 @@ impl ShelluneView {
             let accent = tab.accent();
             let selector = format!("tabs.list.row.{index}");
             let current = active == Some(tab_id);
+            // The row the keyboard is on, drawn the same way the palette draws its own
+            // highlight, so the two overlays answer the same keys the same way (R7).
+            let on_keyboard = index == selected;
+            let jump = crate::app::keymap::tab_jump_action(index + 1)
+                .and_then(|spec| self.keymap.label(spec.id));
             // What this tab is carrying from the background, spelled out: the strip has
             // room for one word, the list says which news it was and what clears it
             // (R7). Choosing the row shows the tab, which clears the marks.
@@ -1733,7 +1791,18 @@ impl ShelluneView {
                     theme::clear()
                 })
                 .cursor_pointer()
+                .when(on_keyboard, |row| {
+                    row.bg(theme::swatch(colors::SURFACE_SELECTED))
+                })
                 .hover(move |style| style.bg(hover))
+                // The pointer and the arrow keys move the same highlight, so the row a
+                // click would choose is the row Enter would open.
+                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                    if *hovered && this.tab_list_selected != index {
+                        this.tab_list_selected = index;
+                        cx.notify();
+                    }
+                }))
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     this.close_tab_list(window, cx);
                     this.select_tab(index, window, cx);
@@ -1792,6 +1861,13 @@ impl ShelluneView {
                     ))
                 })
                 .children(marks)
+                // The shortcut that reaches this tab from anywhere, read from the
+                // bindings in force rather than written down here (R5, R17).
+                .children(jump.map(|shortcut| {
+                    div()
+                        .debug_selector(move || format!("tabs.list.jump.{index}"))
+                        .child(components::keycap(shortcut, metrics))
+                }))
                 .child(
                     components::icon_only_button(Icon::Pencil, metrics)
                         .id(SharedString::from(format!("tabs.list.rename.{index}")))
@@ -1805,14 +1881,42 @@ impl ShelluneView {
                 );
             rows = rows.child(row);
         }
+        // The list takes the keyboard while it is open, so its arrows and Enter work
+        // without a pointer and no key reaches the terminal behind it (R17).
         let body = div()
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))
+            .track_focus(&self.tab_list_focus)
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.tab_list_key(event, window, cx);
+            }))
             .child(rows)
             .into_any_element();
+        let hint = |keys: &'static str, label: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::HAIRLINE + 1.0))
+                .child(components::keycap(keys, metrics))
+                .child(label)
+        };
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::SNUG))
+            .h(metrics.scale(30.0))
+            .px(metrics.scale(spacing::SNUG))
+            .border_t_1()
+            .border_color(theme::swatch(colors::BORDER))
+            .bg(theme::swatch(colors::SURFACE))
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(colors::TEXT_MUTED))
+            .child(hint("\u{2191}\u{2193}", strings.palette_key_move))
+            .child(hint("\u{21b5}", strings.palette_key_run))
+            .child(hint("Esc", strings.palette_key_close));
         Some(self.modal(
             window,
             "tabs.list.dialog",
@@ -1821,7 +1925,7 @@ impl ShelluneView {
                 header,
                 subtitle,
                 body,
-                footer: None,
+                footer: Some(footer),
             },
         ))
     }
@@ -2002,6 +2106,183 @@ impl ShelluneView {
                     this.toggle_tab_list(window, cx);
                 })),
         )
+    }
+}
+
+impl ShelluneView {
+    // -----------------------------------------------------------------------
+    // Paste confirmation (R17)
+    // -----------------------------------------------------------------------
+
+    /// The confirmation a multi-line or high-risk paste needs, as a centred dialog.
+    ///
+    /// The pane owns the text, the target and the answer; this draws them and nothing
+    /// else, so what the dialog names is exactly the session that would receive the
+    /// bytes. The terminal stays visible behind the dimmed layer but takes no input: a
+    /// click outside does not dismiss the dialog, Escape and Cancel write nothing, and
+    /// confirming writes into the pane that asked for it and into no other (R17).
+    pub(super) fn paste_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        let (id, pane) = self.paste_prompt(cx)?;
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let (target, text, runs) = {
+            let pane = pane.read(cx);
+            (
+                pane.pending_paste_target()?.to_owned(),
+                pane.pending_paste_text()?.to_owned(),
+                pane.pending_paste_runs(),
+            )
+        };
+        let lines = paste_preview(&text, 1).0;
+        let session = self.tab_title(id);
+        let (header, hint) = self.modal_header(
+            Some(Icon::Terminal),
+            strings.terminal_paste_title.to_owned(),
+            Some(format!("{session} · {target}")),
+            "terminal.paste.close",
+            cx,
+            |this, cx| {
+                this.cancel_paste_prompt(cx);
+            },
+        );
+        let labelled = |label: &'static str, selector: &'static str, value: String| {
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(colors::TEXT_MUTED))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .font_family(crate::app::terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(colors::TEXT_PRIMARY))
+                        .debug_selector(move || selector.to_owned())
+                        .child(SharedString::from(value)),
+                )
+        };
+        // The whole block, scrolled inside the dialog: a long paste is read here rather
+        // than cut down to a preview that hides what would be written (R17).
+        let preview = div()
+            .id("terminal.paste.preview")
+            .debug_selector(|| "terminal.paste.preview".to_owned())
+            .w_full()
+            .min_w(px(0.0))
+            .max_h(px(220.0).min(window.viewport_size().height * 0.4))
+            .overflow_y_scroll()
+            .track_scroll(&self.paste_scroll)
+            .rounded(px(radius::MEDIUM))
+            .border_1()
+            .border_color(theme::swatch(colors::BORDER))
+            .bg(theme::swatch(colors::CANVAS))
+            .p(metrics.scale(spacing::TIGHT))
+            .font_family(crate::app::terminal::monospace_family())
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(colors::TEXT_PRIMARY))
+            .child(SharedString::from(text));
+        let body = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w(px(0.0))
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .pb(metrics.scale(spacing::LOOSE))
+            // The dialog holds the keyboard while it is up; the window's keystroke
+            // interceptor turns the keys into answers, so nothing behind it is typed
+            // into and no bound shortcut runs through it (R17).
+            .track_focus(&self.paste_focus)
+            .child(labelled(
+                strings.terminal_paste_target,
+                "terminal.paste.target",
+                target,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::chip(
+                            format!("{lines} {}", strings.terminal_paste_lines),
+                            Tone::Neutral,
+                            metrics,
+                        )
+                        .debug_selector(|| "terminal.paste.lines".to_owned()),
+                    )
+                    // A saved command asked to run says so before it is confirmed: the
+                    // dialog is otherwise the one a paste gets, and what follows differs.
+                    .when(runs, |row| {
+                        row.child(
+                            components::chip(strings.terminal_paste_runs, Tone::Warning, metrics)
+                                .debug_selector(|| "terminal.paste.runs".to_owned()),
+                        )
+                    }),
+            )
+            .child(preview)
+            .child(
+                div()
+                    .debug_selector(|| "terminal.paste.safe".to_owned())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(colors::TEXT_SECONDARY))
+                    .child(strings.terminal_paste_safe),
+            )
+            .into_any_element();
+        let footer = div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::SNUG))
+            .border_t_1()
+            .border_color(theme::swatch(colors::BORDER))
+            .child(self.text_button(
+                SharedString::from("terminal.paste.cancel"),
+                strings.terminal_paste_cancel,
+                Variant::Ghost,
+                cx,
+                |this, cx| {
+                    this.cancel_paste_prompt(cx);
+                },
+            ))
+            .child(
+                components::button(
+                    if runs {
+                        strings.terminal_paste_run_confirm
+                    } else {
+                        strings.terminal_paste_confirm
+                    },
+                    Variant::Primary,
+                    metrics,
+                )
+                .id("terminal.paste.confirm")
+                .debug_selector(|| "terminal.paste.confirm".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.confirm_paste_prompt(cx);
+                })),
+            );
+        Some(self.modal(
+            window,
+            "terminal.paste",
+            620.0,
+            ModalContent {
+                header,
+                subtitle: hint,
+                body,
+                footer: Some(footer),
+            },
+        ))
     }
 }
 

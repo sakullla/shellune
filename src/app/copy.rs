@@ -312,6 +312,16 @@ pub struct Strings {
     pub remote_live: &'static str,
     /// Status of a failed attempt.
     pub remote_failed: &'static str,
+    /// Title of the stage row in the connection dialog.
+    pub remote_stage_title: &'static str,
+    /// Label of the address a connection targets.
+    pub remote_target_label: &'static str,
+    /// Said while the attempt is waiting for the user.
+    pub remote_waiting: &'static str,
+    /// What that wait is about when the server identity is unknown.
+    pub remote_wait_identity: &'static str,
+    /// Ends the attempt the dialog is about.
+    pub remote_cancel_attempt: &'static str,
     /// Title of the unknown host identity question.
     pub trust_title: &'static str,
     /// Explanation shown beside the fingerprint.
@@ -910,6 +920,10 @@ pub struct Strings {
     pub terminal_paste_lines: &'static str,
     /// Line of the confirmation that says a saved command runs once it is confirmed.
     pub terminal_paste_runs: &'static str,
+    /// Confirms a saved command that will run once it is written.
+    pub terminal_paste_run_confirm: &'static str,
+    /// What leaving the confirmation does: nothing is written.
+    pub terminal_paste_safe: &'static str,
     /// Enhanced mode, but the shell has not emitted integration markers.
     pub terminal_no_blocks: &'static str,
     /// Integration was seen and then stopped being trustworthy.
@@ -1096,6 +1110,11 @@ pub static ENGLISH: Strings = Strings {
     remote_verifying: "Waiting for your decision",
     remote_live: "SSH session live",
     remote_failed: "Could not connect",
+    remote_stage_title: "Stage",
+    remote_target_label: "Target",
+    remote_waiting: "Waiting for you",
+    remote_wait_identity: "the server's identity",
+    remote_cancel_attempt: "Cancel connection",
     trust_title: "This server identity is not known yet",
     trust_body: "Compare this fingerprint with the one the server's administrator can print. Nothing is stored until you accept it.",
     trust_algorithm: "Algorithm",
@@ -1393,6 +1412,8 @@ pub static ENGLISH: Strings = Strings {
     terminal_paste_cancel: "Do not paste",
     terminal_paste_lines: "lines",
     terminal_paste_runs: "Runs once you confirm",
+    terminal_paste_run_confirm: "Run this command",
+    terminal_paste_safe: "Esc or Cancel writes nothing and keeps the keyboard in the terminal.",
     terminal_no_blocks: "This shell has not reported command blocks. The grid is unchanged.",
     terminal_blocks_failed: "Shell integration failed. The classic grid was kept.",
     terminal_filter_all: "All commands",
@@ -1545,6 +1566,11 @@ pub static CHINESE: Strings = Strings {
     remote_verifying: "等待你确认服务器身份",
     remote_live: "SSH 会话已连接",
     remote_failed: "连接未建立",
+    remote_stage_title: "阶段",
+    remote_target_label: "目标",
+    remote_waiting: "等待你操作",
+    remote_wait_identity: "服务器身份",
+    remote_cancel_attempt: "取消连接",
     trust_title: "尚未信任该服务器身份",
     trust_body: "请与服务器管理员可打印的指纹核对；在你接受之前不会写入任何记录。",
     trust_algorithm: "算法",
@@ -1842,6 +1868,8 @@ pub static CHINESE: Strings = Strings {
     terminal_paste_cancel: "不粘贴",
     terminal_paste_lines: "行",
     terminal_paste_runs: "确认后执行",
+    terminal_paste_run_confirm: "执行这条命令",
+    terminal_paste_safe: "按 Esc 或「取消」不会写入任何内容，键盘回到终端。",
     terminal_no_blocks: "这个 Shell 没有报告命令块。网格保持原样。",
     terminal_blocks_failed: "Shell 集成已失效。经典网格已保留。",
     terminal_filter_all: "全部命令",
@@ -2181,7 +2209,7 @@ pub struct UxStrings {
     pub keys_save_failed_next: &'static str,
     /// Title of the shortcut-command manager
     pub snippet_manage_title: &'static str,
-    /// What insert and run do
+    /// What filling in and running do
     pub snippet_manage_hint: &'static str,
     /// Where the commands are stored, and what must not be kept there
     pub snippet_storage_note: &'static str,
@@ -2201,10 +2229,14 @@ pub struct UxStrings {
     pub snippet_editor_keys: &'static str,
     /// Button: save the command
     pub snippet_save: &'static str,
-    /// Row button: type the command into the terminal
+    /// Row button: write the command into the terminal without running it
     pub snippet_insert: &'static str,
-    /// Row button: type the command and submit it
+    /// Row button: write the command and submit it once
     pub snippet_run: &'static str,
+    /// Said beside the fill-in action: the text is written and nothing runs
+    pub snippet_fill_hint: &'static str,
+    /// Said beside the run action: it is written and submitted once
+    pub snippet_run_hint: &'static str,
     /// Row button: change the command
     pub snippet_edit: &'static str,
     /// Row button: remove the command
@@ -2400,6 +2432,8 @@ impl UxStrings {
             self.snippet_save,
             self.snippet_insert,
             self.snippet_run,
+            self.snippet_fill_hint,
+            self.snippet_run_hint,
             self.snippet_edit,
             self.snippet_delete,
             self.snippet_delete_title,
@@ -2549,7 +2583,7 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     keys_save_failed: "This shortcut works for now but could not be written to the preferences file.",
     keys_save_failed_next: "The next change tries again; a restart shows what was saved.",
     snippet_manage_title: "Shortcut commands",
-    snippet_manage_hint: "Insert types a command into the active terminal. Run also submits it, once.",
+    snippet_manage_hint: "Browsing and editing change nothing on screen. Fill in writes the command and runs nothing; Run writes it and submits it once, after a confirmation.",
     snippet_storage_note: "Saved as plain text in snippets.json on this computer. Keep passwords, keys and tokens out of shortcut commands.",
     snippet_new: "New shortcut command",
     snippet_edit_title: "Edit shortcut command",
@@ -2559,8 +2593,10 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     snippet_body_placeholder: "make deploy && obsctl status",
     snippet_editor_keys: "Enter saves. Shift+Enter starts a new line, shown as \\n in the field.",
     snippet_save: "Save command",
-    snippet_insert: "Insert",
+    snippet_insert: "Fill in",
     snippet_run: "Run",
+    snippet_fill_hint: "Writes the command into the terminal and runs nothing",
+    snippet_run_hint: "Writes the command and submits it once, after a confirmation",
     snippet_edit: "Edit",
     snippet_delete: "Delete",
     snippet_delete_title: "Delete this shortcut command?",
@@ -2573,10 +2609,10 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     snippet_no_terminal_body: "Inserting and running need an active terminal. Open a local shell or connect a server, then choose the command again.",
     snippet_terminal_ended: "This terminal has no shell running",
     snippet_terminal_ended_body: "Nothing was written. Start a shell in this tab, or open another terminal, then choose the command again.",
-    snippet_inserted: "Inserted into the terminal",
-    snippet_sent: "Sent to the terminal",
-    snippet_waiting: "Waiting for confirmation in the pane",
-    snippet_waiting_body: "Nothing is written yet. Confirm it in the terminal; choosing “{cancel}” writes nothing.",
+    snippet_inserted: "Filled in; nothing was run",
+    snippet_sent: "Ran once in the terminal",
+    snippet_waiting: "Waiting in the paste dialog",
+    snippet_waiting_body: "Nothing is written yet. Confirm it in the dialog; choosing “{cancel}” or pressing Esc writes nothing.",
     snippet_saved: "Shortcut command saved",
     snippet_deleted: "Shortcut command deleted",
     snippet_unreadable_title: "The saved commands could not be read",
@@ -2586,7 +2622,7 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     snippet_count: "{count} saved",
     snippet_manage_action: "Shortcut commands…",
     snippet_new_action: "New shortcut command…",
-    snippet_insert_action: "Insert “{name}”",
+    snippet_insert_action: "Fill in “{name}”",
     snippet_run_action: "Run “{name}”",
     snippet_problem_name_empty: "A shortcut command needs a name.",
     snippet_problem_name_long: "The name is limited to {max} characters.",
@@ -2708,7 +2744,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     keys_save_failed: "快捷键本次已生效，但没能写入偏好文件。",
     keys_save_failed_next: "再改一次会重试；重启后显示的是已保存的状态。",
     snippet_manage_title: "快捷命令",
-    snippet_manage_hint: "「插入」只把命令写进当前终端；「执行」还会提交一次。",
+    snippet_manage_hint: "浏览和编辑不会改动终端。「填入」只把命令写进当前终端，不执行；「执行」写入后提交一次，且先要确认。",
     snippet_storage_note: "以明文保存在本机 snippets.json 中。不要在快捷命令里写密码、私钥或令牌。",
     snippet_new: "新建快捷命令",
     snippet_edit_title: "编辑快捷命令",
@@ -2718,8 +2754,10 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     snippet_body_placeholder: "例如 make deploy && obsctl status",
     snippet_editor_keys: "回车保存；Shift+回车换行，换行在字段里显示为 \\n。",
     snippet_save: "保存命令",
-    snippet_insert: "插入",
+    snippet_insert: "填入",
     snippet_run: "执行",
+    snippet_fill_hint: "只把命令写进终端，不执行",
+    snippet_run_hint: "写入命令后提交一次，提交前需要确认",
     snippet_edit: "编辑",
     snippet_delete: "删除",
     snippet_delete_title: "删除这条快捷命令？",
@@ -2732,10 +2770,10 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     snippet_no_terminal_body: "插入和执行都需要当前终端。先打开本地 Shell 或连接主机，再选这条命令。",
     snippet_terminal_ended: "这条终端没有正在运行的 Shell",
     snippet_terminal_ended_body: "没有写入任何内容。在这个标签里重新启动 Shell，或换一个终端，再选这条命令。",
-    snippet_inserted: "已插入到终端",
-    snippet_sent: "已发送到终端",
-    snippet_waiting: "已在窗格中等待确认",
-    snippet_waiting_body: "还没有写入。请在终端里确认；选「{cancel}」不会写入任何内容。",
+    snippet_inserted: "已填入，未执行",
+    snippet_sent: "已在终端执行一次",
+    snippet_waiting: "已在粘贴弹窗中等待确认",
+    snippet_waiting_body: "还没有写入。请在弹窗里确认；选「{cancel}」或按 Esc 不会写入任何内容。",
     snippet_saved: "已保存快捷命令",
     snippet_deleted: "已删除快捷命令",
     snippet_unreadable_title: "快捷命令文件读取失败",
@@ -2745,7 +2783,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     snippet_count: "已保存 {count} 条",
     snippet_manage_action: "快捷命令…",
     snippet_new_action: "新建快捷命令…",
-    snippet_insert_action: "插入「{name}」",
+    snippet_insert_action: "填入「{name}」",
     snippet_run_action: "执行「{name}」",
     snippet_problem_name_empty: "快捷命令需要名称。",
     snippet_problem_name_long: "名称最多 {max} 个字符。",

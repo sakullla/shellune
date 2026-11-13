@@ -280,12 +280,17 @@ fn seed_hosts(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes two saved commands, so the manager has rows to show.
+/// Writes three saved commands, so the manager has rows to show: two one-liners and one
+/// block, whose line count the row has to say out loud (R17).
 fn seed_snippets(root: &Path) -> Result<(), String> {
     let mut book = SnippetBook::new();
     for (name, body) in [
         ("release", "cargo test --workspace --all-features"),
         ("logs", "journalctl -u shellune -n 200 --no-pager"),
+        (
+            "checks",
+            "cargo fmt --all -- --check\ncargo clippy --workspace --all-targets\ncargo test --workspace",
+        ),
     ] {
         book.create(name, body)
             .map_err(|error| format!("the command fixture could not be built: {error}"))?;
@@ -464,6 +469,54 @@ fn show_palette(
     Ok(())
 }
 
+/// The block the paste confirmation in a capture holds: long enough that the dialog has
+/// to scroll it, and made of the commands this project really runs (R17).
+const PASTE_BLOCK: &str = "cargo fmt --all -- --check\n\
+cargo clippy --workspace --all-targets --all-features -- -D warnings\n\
+cargo test --workspace --all-features\n\
+git status -sb\n\
+git diff --check\n";
+
+/// Shows the terminal, with a paste waiting for its answer as a dialog over it (R17).
+fn show_paste(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_terminal(view, window, cx)?;
+    let pane = view
+        .pane()
+        .ok_or_else(|| "the terminal destination has no pane on screen".to_owned())?
+        .clone();
+    pane.update(cx, |pane, cx| pane.stage_paste(PASTE_BLOCK, cx));
+    Ok(())
+}
+
+/// Shows a saved host's connection dialog while the transport is connecting (R17).
+fn show_connection(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.capture_connection(&host, cx);
+    Ok(())
+}
+
+/// Shows several tabs, then lists all of them over the terminal (R17).
+fn show_tab_list(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_tabs(view, window, cx)?;
+    view.capture_open_tab_list(window, cx);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Readiness
 // ---------------------------------------------------------------------------
@@ -596,6 +649,33 @@ fn split_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn paste_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    if view.capture_paste_open(cx) {
+        Ok(())
+    } else {
+        Err("the paste confirmation is not open".to_owned())
+    }
+}
+
+fn connection_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_overlay() == Some("connect") {
+        Ok(())
+    } else {
+        Err(format!(
+            "the open overlay is {:?}, not the connection dialog",
+            view.capture_overlay()
+        ))
+    }
+}
+
+fn tab_list_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.tab_list_open() {
+        Ok(())
+    } else {
+        Err("the list of every tab is not open".to_owned())
+    }
 }
 
 fn disconnected_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
@@ -754,15 +834,59 @@ pub const SCENARIOS: &[Scenario] = &[
         id: "overlay-snippets",
         title: "浮层 · 快捷命令",
         category: Category::Overlay,
-        fixture: "two saved commands and one display-only session under the manager",
-        evidence: "shows the manager and its list; running or editing a command is not part of \
-                   the shot",
+        fixture: "three saved commands, one of them a block, and one display-only session \
+                  under the manager",
+        evidence: "shows the manager, its fill-in and run actions and the line count of a \
+                   block; pressing either action is not part of the shot",
         quick: false,
         variants: &[],
         start: || page(Destination::LocalShells),
         prepare: seed_snippets,
         install: show_snippets,
         ready: snippets_ready,
+    },
+    Scenario {
+        id: "overlay-connect",
+        title: "浮层 · 连接中的目标与阶段",
+        category: Category::Overlay,
+        fixture: "a saved host whose connection dialog reports the connecting stage; nothing \
+                  was dialled",
+        evidence: "shows the stage, the target, the wait and the two ways out the dialog \
+                   draws; no transport, DNS lookup or authentication is part of it",
+        quick: false,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_connection,
+        ready: connection_ready,
+    },
+    Scenario {
+        id: "overlay-paste",
+        title: "浮层 · 多行粘贴确认",
+        category: Category::Overlay,
+        fixture: "one display-only session with a five-line block held by the paste dialog",
+        evidence: "shows the modal confirmation, its target, its line count and the scrolled \
+                   preview; nothing was pasted into a process, because there is none",
+        quick: false,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_paste,
+        ready: paste_ready,
+    },
+    Scenario {
+        id: "overlay-tabs",
+        title: "浮层 · 全部标签",
+        category: Category::Overlay,
+        fixture: "three tabs, one of them carrying a background bell, listed over the terminal",
+        evidence: "shows every tab with its target, its state and the shortcut that reaches \
+                   it; no shell ran and the bell is a fixture mark",
+        quick: false,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_tab_list,
+        ready: tab_list_ready,
     },
 ];
 

@@ -10,7 +10,7 @@
 
 | 命令 | 轮次目录 | 内容 |
 | --- | --- | --- |
-| `python scripts/capture-ui.py` | `docs/verification/ui/`（根） | 完整矩阵：21 张，两种主题、两种尺寸、100%/115% 文字、中英 |
+| `python scripts/capture-ui.py` | `docs/verification/ui/`（根） | 完整矩阵：42 张，两种主题、两种尺寸、100%/115% 文字、中英 |
 | `python scripts/capture-ui.py --quick` | `docs/verification/ui/quick/` | 三个主页面的深色默认尺寸 |
 | `python scripts/capture-ui.py --only "home-hosts"` | `docs/verification/ui/only-home-hosts/` | 匹配场景的全部变体 |
 | `--theme` / `--size` | `theme-light/`、`size-720x480/` 等 | 该筛选下的全部变体 |
@@ -38,6 +38,16 @@
 - 新增 `quick/` 和 `only-home-hosts/` 两个轮次，作为模式隔离的样例与复验对象。
 - 复验：完整轮次连跑两次全部 21 张字节一致；`quick` 与 `only-home-hosts` 里每个同名 shot 的像素
   与完整轮次完全一致（manifest 的 `pixel_crc32` 相同）。
+
+## 本轮（2026-11-13，T7）的变化
+
+- 根目录的完整轮次重拍：42 张，`status: ok`、无失败。上一轮根目录只有 21 张，`terminal-tabs` / `terminal-split` / `terminal-disconnected` 只存在于代码与场景表里，没有已发布的图像。
+- 新增三张浮层场景：`overlay-connect`（连接中：目标、真实阶段、取消与转后台）、
+  `overlay-paste`（多行粘贴的居中模态：目标会话、行数、可滚动预览、确认/取消）、
+  `overlay-tabs`（全部标签：行程、状态、当前生效的跳转快捷键）。`overlay-snippets` 的 fixture 增加了一条多行命令，
+  用于展示行数 chip 与"填入/执行"两个动作的层级。
+- 这些图证明的是布局、配色与文案的渲染结果；它们不证明粘贴真的被拒绝执行、连接真的会取消——
+  那由 `src/app/tests.rs` 的行为测试覆盖。
 
 ## 证据边界
 

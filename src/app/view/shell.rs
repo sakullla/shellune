@@ -2243,6 +2243,27 @@ impl ShelluneView {
             cx,
             |this, cx| this.close_remote(cx),
         );
+        // What the attempt is really doing, and whether it is waiting for the user:
+        // the stage is the transport's own state, not a progress animation that would
+        // keep claiming to connect while a fingerprint or a ProxyCommand waits (R17).
+        let asking = panel.status().is_asking();
+        // The strip is about an attempt that is in flight or waiting for the user. A
+        // finished attempt already says what happened in the failure banner, and an
+        // idle form has not started anything, so neither gets a line claiming a stage
+        // it does not have (R17).
+        let show_stage = panel.status().is_busy() || asking;
+        let waiting_on = match panel.status() {
+            crate::app::remote::RemoteStatus::VerifyingHost(_) => {
+                Some(strings.remote_wait_identity)
+            }
+            crate::app::remote::RemoteStatus::ConfirmingProxy { .. } => {
+                Some(strings.remote_proxy_title)
+            }
+            crate::app::remote::RemoteStatus::ConfirmingX11 { .. } => {
+                Some(strings.x11_trusted_title)
+            }
+            _ => None,
+        };
         let body = div()
             .flex()
             .flex_col()
@@ -2251,6 +2272,73 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))
+            .when(show_stage, |body| {
+                body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .debug_selector(|| "remote.stage".to_owned())
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(strings.remote_stage_title),
+                        )
+                        .child(components::status_dot(tone, metrics))
+                        .child(
+                            div()
+                                .text_size(metrics.label_size())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(tone.text())
+                                .debug_selector(|| "remote.stage.value".to_owned())
+                                .child(status_label),
+                        )
+                        .when(asking, |row| {
+                            row.child(
+                                components::chip(strings.remote_waiting, Tone::Warning, metrics)
+                                    .debug_selector(|| "remote.waiting".to_owned()),
+                            )
+                        }),
+                )
+            })
+            .children(waiting_on.map(|detail| {
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "remote.waiting.detail".to_owned())
+                    .child(SharedString::from(detail))
+            }))
+            // The address the attempt dials, spelled out beside the host's name so the
+            // dialog never says "connecting" without saying to what (R17).
+            .when(show_stage, |body| {
+                body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .min_w(px(0.0))
+                        .debug_selector(|| "remote.target".to_owned())
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(strings.remote_target_label),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .font_family(crate::app::terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(SharedString::from(host.target())),
+                        ),
+                )
+            })
             .when(choosing, |body| {
                 body.child(
                     div()
@@ -2265,21 +2353,38 @@ impl ShelluneView {
         // A connection that is already running can go on without the dialog: it keeps
         // its tab, and clicking that tab brings the dialog back. A failure is finished,
         // so that button would only take the room the reason and the next step need.
-        let footer = (self.form_session.is_some() && !failed).then(|| {
+        // An attempt that is really in flight can also be ended here, which is the
+        // only place it can be ended while the dialog is still what is on screen.
+        let can_background = self.form_session.is_some() && !failed;
+        let can_cancel = panel.status().is_busy() || asking;
+        let footer = (can_background || can_cancel).then(|| {
             div()
                 .flex()
                 .justify_end()
+                .flex_wrap()
+                .gap(metrics.scale(spacing::TIGHT))
                 .px(metrics.scale(spacing::LOOSE))
                 .py(metrics.scale(spacing::SNUG))
                 .border_t_1()
                 .border_color(theme::swatch(palette::BORDER))
-                .child(self.text_button(
-                    SharedString::from("remote.hide"),
-                    ux.connect_background,
-                    Variant::Ghost,
-                    cx,
-                    |view, cx| view.hide_connection(cx),
-                ))
+                .when(can_cancel, |row| {
+                    row.child(self.text_button(
+                        SharedString::from("remote.cancel"),
+                        strings.remote_cancel_attempt,
+                        Variant::Secondary,
+                        cx,
+                        |view, cx| view.close_remote(cx),
+                    ))
+                })
+                .when(can_background, |row| {
+                    row.child(self.text_button(
+                        SharedString::from("remote.hide"),
+                        ux.connect_background,
+                        Variant::Ghost,
+                        cx,
+                        |view, cx| view.hide_connection(cx),
+                    ))
+                })
         });
         Some(self.modal(
             window,
@@ -3114,9 +3219,13 @@ impl ShelluneView {
                     .items_center()
                     .flex_wrap()
                     .gap(metrics.scale(spacing::TIGHT))
+                    // Filling in is the ordinary action and carries the row's weight;
+                    // running submits the command, so it stays the quieter one and says
+                    // what it will do before it is pressed (R17).
                     .child(self.snippet_row_button(
                         format!("snippet.insert.{index}"),
                         ux.snippet_insert,
+                        ux.snippet_fill_hint,
                         id,
                         false,
                         cx,
@@ -3124,6 +3233,7 @@ impl ShelluneView {
                     .child(self.snippet_row_button(
                         format!("snippet.run.{index}"),
                         ux.snippet_run,
+                        ux.snippet_run_hint,
                         id,
                         true,
                         cx,
@@ -3150,11 +3260,17 @@ impl ShelluneView {
             )
     }
 
-    /// The insert or run button of one row.
+    /// The fill-in or run button of one row.
+    ///
+    /// Filling in writes the command and runs nothing, so it is the row's ordinary
+    /// action; running also submits it, so it is drawn quieter and explains itself in a
+    /// tooltip. The two are never the same control in two moods: a person choosing one
+    /// can tell from the words what will happen to the terminal (R17).
     fn snippet_row_button(
         &self,
         selector: String,
         label: &'static str,
+        hint: &'static str,
         id: SnippetId,
         execute: bool,
         cx: &mut Context<Self>,
@@ -3163,13 +3279,14 @@ impl ShelluneView {
             SharedString::from(selector),
             label,
             if execute {
-                Variant::Secondary
-            } else {
                 Variant::Ghost
+            } else {
+                Variant::Secondary
             },
             cx,
             move |this, cx| this.use_snippet(id, execute, cx),
         )
+        .tooltip(components::tooltip(hint))
     }
 
     /// The editor of one command: its name, its body and what to do with a refused draft.

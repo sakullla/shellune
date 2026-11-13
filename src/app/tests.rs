@@ -1439,6 +1439,11 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             host_proxy_placeholder,
             host_proxy_note,
             host_proxy_conflict,
+            remote_stage_title,
+            remote_target_label,
+            remote_waiting,
+            remote_wait_identity,
+            remote_cancel_attempt,
             remote_asking_hop,
             remote_proxy_title,
             remote_proxy_confirm,
@@ -1491,6 +1496,8 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_paste_cancel,
             terminal_paste_lines,
             terminal_paste_runs,
+            terminal_paste_run_confirm,
+            terminal_paste_safe,
             terminal_no_blocks,
             terminal_blocks_failed,
             terminal_filter_all,
@@ -2236,11 +2243,13 @@ async fn a_multiline_paste_on_the_alternate_screen_shows_its_target_before_it_is
         cx.update(|_window, app| pane.read(app).pending_paste_target().map(str::to_owned)),
         Some("Test shell".to_owned())
     );
-    assert!(
-        cx.debug_bounds("terminal.paste").is_some()
-            && cx.debug_bounds("terminal.paste.target").is_some()
-            && cx.debug_bounds("terminal.paste.preview").is_some(),
-        "the confirmation must be visible before anything is written"
+    // The confirmation is the window's dialog now, not a card inside the pane: a pane
+    // on its own draws none of it, and what it owes is the pending answer itself. The
+    // dialog that draws this text is covered where the window draws it.
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().map(str::to_owned)),
+        Some(paste.to_owned()),
+        "the paste waits in the pane until it is answered"
     );
 
     cx.simulate_keystrokes("escape");
@@ -2261,7 +2270,9 @@ async fn a_multiline_paste_on_the_alternate_screen_shows_its_target_before_it_is
         Some(paste.to_owned())
     );
 
-    click(cx, "terminal.paste.cancel");
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.cancel_paste(cx));
+    });
     assert_eq!(
         cx.update(|_window, app| pane.read(app).sent().to_vec()),
         {
@@ -2295,12 +2306,11 @@ async fn cancelling_a_multiline_paste_writes_nothing_and_program_keys_still_arri
         Some("Test shell".to_owned()),
         "the confirmation names the session that would receive the paste"
     );
+    // A pane alone draws no dialog; the window draws it for the pane that asks.
     assert_eq!(
         cx.update(|_window, app| pane.read(app).pending_paste_text().map(str::to_owned)),
         Some(paste.to_owned())
     );
-    assert!(cx.debug_bounds("terminal.paste").is_some());
-    assert!(cx.debug_bounds("terminal.paste.target").is_some());
 
     cx.simulate_keystrokes("escape");
     cx.simulate_keystrokes("ctrl-l");
@@ -2318,7 +2328,9 @@ async fn cancelling_a_multiline_paste_writes_nothing_and_program_keys_still_arri
     );
 
     let before_cancel = cx.update(|_window, app| pane.read(app).sent().to_vec());
-    click(cx, "terminal.paste.cancel");
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.cancel_paste(cx));
+    });
     assert_eq!(
         cx.update(|_window, app| pane.read(app).sent().to_vec()),
         before_cancel,
@@ -2348,7 +2360,11 @@ async fn confirming_a_multiline_paste_writes_only_the_active_pane(cx: &mut TestA
     );
     assert!(cx.update(|_window, app| right.read(app).pending_paste_target().is_none()));
 
-    click(cx, "terminal.paste.confirm");
+    cx.update(|_window, app| {
+        left.update(app, |pane, cx| {
+            pane.confirm_paste(cx);
+        });
+    });
     let expected = encode_paste(paste, TermMode::empty());
     assert_eq!(
         cx.update(|_window, app| left.read(app).sent().to_vec()),
@@ -2368,7 +2384,11 @@ async fn confirming_a_multiline_paste_writes_only_the_active_pane(cx: &mut TestA
     });
     cx.run_until_parked();
     let left_sent = cx.update(|_window, app| left.read(app).sent().to_vec());
-    click(cx, "terminal.paste.confirm");
+    cx.update(|_window, app| {
+        right.update(app, |pane, cx| {
+            pane.confirm_paste(cx);
+        });
+    });
     assert_eq!(
         cx.update(|_window, app| right.read(app).sent().to_vec()),
         encode_paste(other, TermMode::empty())
@@ -2377,6 +2397,144 @@ async fn confirming_a_multiline_paste_writes_only_the_active_pane(cx: &mut TestA
         cx.update(|_window, app| left.read(app).sent().to_vec()),
         left_sent,
         "confirming the other pane does not write into the first session"
+    );
+}
+
+#[gpui::test]
+async fn the_paste_confirmation_is_a_dialog_over_the_terminal_and_writes_nothing_until_answered(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("paste-dialog");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = snippet_view(cx, &dir);
+    let session = live_remote(cx, &view);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(session).cloned())
+        .expect("the session has a terminal");
+    let paste = "echo one\necho two\n";
+    let before = snippet_sent(cx, &view, session);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_paste(paste, cx));
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        before,
+        "nothing is written before the dialog is answered"
+    );
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let dialog = bounds_of(cx, "terminal.paste");
+    assert_fits_inside(dialog, viewport, "the paste dialog");
+    // Centred over the window, not a card in the corner of the pane (R17).
+    let centre = dialog.origin.y + dialog.size.height / 2.0;
+    assert!(
+        (centre - viewport.height / 2.0).abs() < viewport.height * 0.2,
+        "the dialog is not centred over the window: {dialog:?} in {viewport:?}"
+    );
+    assert!(
+        cx.debug_bounds("terminal.paste.target").is_some()
+            && cx.debug_bounds("terminal.paste.lines").is_some()
+            && cx.debug_bounds("terminal.paste.preview").is_some(),
+        "the dialog names the target, the line count and the whole preview"
+    );
+
+    // The terminal behind the dialog receives no keys while it is up: the words are
+    // spent on the dialog, so a program cannot be typed into through it (R17).
+    cx.simulate_keystrokes("ctrl-l");
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        before,
+        "the terminal behind the dialog takes no input"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).pending_paste_text().map(str::to_owned)),
+        Some(paste.to_owned()),
+        "those keys neither confirm nor cancel the paste"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::English,
+        "Ctrl+L is bound to switching language, but no shortcut runs behind the dialog"
+    );
+
+    // Escape drops it, writes nothing and gives the keyboard back to the terminal.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        before,
+        "cancelling the dialog writes nothing"
+    );
+    assert!(
+        !cx.update(|_w, app| view.read(app).paste_prompt_open_for_test(app)),
+        "the dialog leaves with the answer"
+    );
+    assert!(
+        cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "the keyboard goes back to the terminal that asked"
+    );
+
+    // Confirming writes into the session the dialog named.
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_paste(paste, cx));
+    });
+    cx.run_until_parked();
+    click(cx, "terminal.paste.confirm");
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        encode_paste(paste, TermMode::empty()),
+        "confirming writes the paste into the terminal that asked for it"
+    );
+    assert!(
+        !cx.update(|_w, app| view.read(app).paste_prompt_open_for_test(app))
+            && cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "confirming closes the dialog and gives the keyboard back"
+    );
+}
+
+#[gpui::test]
+async fn the_paste_dialog_writes_only_into_the_session_it_names(cx: &mut TestAppContext) {
+    let dir = TempDir::new("paste-target");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = snippet_view(cx, &dir);
+    let first = live_remote(cx, &view);
+    let second = live_remote_second(cx, &view, first);
+    let first_pane = cx
+        .update(|_window, app| view.read(app).pane_of(first).cloned())
+        .expect("the first session has a terminal");
+    let paste = "echo first\necho only\n";
+    let first_before = snippet_sent(cx, &view, first);
+    let second_before = snippet_sent(cx, &view, second);
+    cx.update(|_window, app| {
+        first_pane.update(app, |pane, cx| pane.stage_paste(paste, cx));
+    });
+    cx.run_until_parked();
+
+    // The session on screen is the second one; the dialog still belongs to the pane
+    // that asked, so an answer cannot be written into the tab that happens to be up.
+    assert!(
+        cx.debug_bounds("terminal.paste.target").is_some(),
+        "the waiting pane's dialog is found even when another tab is on screen"
+    );
+    click(cx, "terminal.paste.confirm");
+    assert_eq!(
+        snippet_sent(cx, &view, first),
+        [first_before.clone(), encode_paste(paste, TermMode::empty())].concat(),
+        "confirming writes into the session the dialog named"
+    );
+    assert_eq!(
+        snippet_sent(cx, &view, second),
+        second_before,
+        "the session on screen receives nothing"
     );
 }
 
@@ -5887,6 +6045,80 @@ async fn an_unknown_identity_is_shown_with_its_algorithm_and_fingerprint(cx: &mu
         assert_eq!(prompt.algorithm(), "ssh-ed25519");
         assert_eq!(prompt.fingerprint(), presented_key(3).fingerprint);
     });
+}
+
+#[gpui::test]
+async fn the_connection_dialog_names_the_target_and_stage_and_offers_cancel_and_background(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("connect-stage");
+    let book = seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let host = book.hosts()[0].clone();
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    click(cx, "hosts.connect.0");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(Vec::new(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("remote.stage").is_some(),
+        "the dialog names the stage the attempt is really in"
+    );
+    assert!(
+        cx.debug_bounds("remote.target").is_some(),
+        "the dialog names the address it is dialling"
+    );
+    assert!(
+        cx.debug_bounds("remote.waiting").is_none(),
+        "connecting is not a wait for the user"
+    );
+    assert!(
+        cx.debug_bounds("remote.cancel").is_some(),
+        "an attempt in flight can be ended from the dialog"
+    );
+    assert!(
+        cx.debug_bounds("remote.hide").is_some(),
+        "and it can go on in the background"
+    );
+
+    // A question from the server is its own stage: the dialog says it is waiting for
+    // the user, and still names what it is waiting about and where it is going.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.show_trust_prompt(host_prompt(&host, 7), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote.waiting").is_some(),
+        "the dialog says the connection waits for the user"
+    );
+    assert!(
+        cx.debug_bounds("remote.waiting.detail").is_some(),
+        "and says what it is waiting about"
+    );
+    assert!(
+        cx.debug_bounds("remote.target").is_some(),
+        "the target is still named while the question is open"
+    );
+
+    // Cancelling ends the attempt and takes the form with it: no terminal appears.
+    click(cx, "remote.cancel");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).remote_state().is_none()),
+        "the cancelled attempt's form is gone"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions().is_empty()),
+        "nothing was connected, so no session was created"
+    );
 }
 
 #[gpui::test]
@@ -12402,6 +12634,61 @@ async fn the_tab_list_shows_every_tab_and_switches_to_it(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn the_tab_list_is_walked_with_the_keyboard_and_shows_the_shortcut_in_force(
+    cx: &mut TestAppContext,
+) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    click(cx, "tabs.list.open");
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_list_open()),
+        "the list is open"
+    );
+    // It opens on the tab that is already on screen, so the arrows start from there.
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_list_selected()),
+        1,
+        "the row the keyboard starts on is the tab on screen"
+    );
+    assert!(
+        cx.debug_bounds("tabs.list.jump.0").is_some(),
+        "a row shows the shortcut that reaches that tab, read from the bindings in force"
+    );
+
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_list_selected()),
+        0,
+        "the arrow keys move the highlight"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).tab_list_open()),
+        "Enter opens the highlighted row and closes the list"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[0]),
+        "the highlighted tab is the one on screen"
+    );
+
+    // Escape closes it without switching anything.
+    click(cx, "tabs.list.open");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).tab_list_open()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[0]),
+        "closing the list did not change the tab on screen"
+    );
+}
+
+#[gpui::test]
 async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_text(
     cx: &mut TestAppContext,
 ) {
@@ -17311,6 +17598,96 @@ async fn a_command_with_no_terminal_explains_and_creates_nothing(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn filling_a_command_in_is_not_reported_as_running_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("snippet-fill");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let id = seed_snippet(&dir, "release", "cargo build --release");
+    let (view, cx) = snippet_view(cx, &dir);
+    live_remote(cx, &view);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(id, false, cx));
+    });
+    cx.run_until_parked();
+    let toasts = cx.update(|_window, app| view.read(app).toast_titles());
+    assert!(
+        toasts
+            .iter()
+            .any(|title| title == copy::ENGLISH_UX.snippet_inserted),
+        "filling in says the command is in the terminal: {toasts:?}"
+    );
+    assert!(
+        toasts
+            .iter()
+            .all(|title| title != copy::ENGLISH_UX.snippet_sent),
+        "filling in never claims the command ran: {toasts:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_multi_line_command_waits_in_the_dialog_and_is_reported_as_waiting(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("snippet-dialog");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let body = "cargo fmt\ncargo test";
+    let id = seed_snippet(&dir, "checks", body);
+    let (view, cx) = snippet_view(cx, &dir);
+    let session = live_remote(cx, &view);
+    let before = snippet_sent(cx, &view, session);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_snippet(id, true, cx));
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        before,
+        "a held command is not in the terminal yet"
+    );
+    assert!(
+        cx.debug_bounds("terminal.paste").is_some()
+            && cx.debug_bounds("terminal.paste.runs").is_some(),
+        "the dialog says the block runs once it is confirmed"
+    );
+    let toasts = cx.update(|_window, app| view.read(app).toast_titles());
+    assert!(
+        toasts
+            .iter()
+            .any(|title| title == copy::ENGLISH_UX.snippet_waiting),
+        "the corner says the command waits rather than that it ran: {toasts:?}"
+    );
+    assert!(
+        toasts
+            .iter()
+            .all(|title| title != copy::ENGLISH_UX.snippet_sent),
+        "a command behind the dialog is never reported as sent: {toasts:?}"
+    );
+
+    click(cx, "terminal.paste.confirm");
+    let sent = snippet_sent(cx, &view, session);
+    let text = String::from_utf8_lossy(&sent).into_owned();
+    assert!(
+        text.contains("cargo fmt") && text.contains("cargo test"),
+        "confirming writes both lines: {text:?}"
+    );
+    assert!(
+        sent.ends_with(b"\r"),
+        "running submits the block, so the last byte is a Return: {text:?}"
+    );
+    assert_eq!(
+        sent.iter().filter(|byte| **byte == b'\r').count(),
+        2,
+        "the block keeps its own line break and running adds exactly one submit: {text:?}"
+    );
+}
+
+#[gpui::test]
 async fn running_a_command_submits_it_once_in_the_active_pane_only(cx: &mut TestAppContext) {
     let dir = TempDir::new("snippet-run");
     seed(
@@ -17436,11 +17813,12 @@ async fn a_multi_line_command_asks_before_it_is_written_and_cancelling_writes_no
         "the confirmation is the paste prompt, holding the same text"
     );
     assert!(
-        cx.debug_bounds("terminal.paste.runs").is_some()
-            && cx.update(|_window, app| pane.read(app).pending_paste_runs_for_test()),
+        cx.update(|_window, app| pane.read(app).pending_paste_runs()),
         "the prompt says the block runs once it is confirmed"
     );
-    click(cx, "terminal.paste.cancel");
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.cancel_paste(cx));
+    });
     assert_eq!(
         cx.update(|_window, app| pane.read(app).sent().to_vec()),
         Vec::<u8>::new(),
@@ -17457,10 +17835,14 @@ async fn a_multi_line_command_asks_before_it_is_written_and_cancelling_writes_no
         "an insert that is held is not reported as inserted either"
     );
     assert!(
-        !cx.update(|_window, app| pane.read(app).pending_paste_runs_for_test()),
+        !cx.update(|_window, app| pane.read(app).pending_paste_runs()),
         "an insert does not claim it will run"
     );
-    click(cx, "terminal.paste.confirm");
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.confirm_paste(cx);
+        });
+    });
     assert_eq!(
         cx.update(|_window, app| pane.read(app).sent().to_vec()),
         encode_paste(body, TermMode::empty()),

@@ -608,6 +608,25 @@ pub struct ShelluneView {
     accent_hover: Option<(AccentRow, TabAccent)>,
     /// Whether the list of every open tab is open.
     tab_list_open: bool,
+    /// The row the keyboard is on in that list.
+    tab_list_selected: usize,
+    /// The keyboard target of that list, so it answers Up, Down, Enter and Escape
+    /// while it is open instead of passing them to the terminal behind it (R17).
+    tab_list_focus: FocusHandle,
+    /// The keyboard target of the paste dialog, so the answer is given with the keys
+    /// and nothing behind the dialog receives them (R17).
+    paste_focus: FocusHandle,
+    /// The interceptor that keeps every keystroke while that dialog is open.
+    ///
+    /// A bound shortcut would otherwise run instead of reaching a key listener, so
+    /// Ctrl+L would switch the language and Ctrl+W would close the tab behind a dialog
+    /// that is waiting for an answer. It exists only while the dialog is up.
+    paste_watch: Option<gpui::Subscription>,
+    /// Where the paste dialog's preview is scrolled to.
+    ///
+    /// The preview holds the whole block, so a long paste is read by scrolling it in
+    /// the dialog rather than by truncating it (R17).
+    paste_scroll: gpui::ScrollHandle,
     /// Whether a user edit may be written. Window close turns this off first.
     layout_persist: bool,
     /// Why the saved layout could not be read. The file is left as it was.
@@ -911,6 +930,9 @@ impl ShelluneView {
         if self.palette.is_some() {
             return Some("palette");
         }
+        if self.showing_connection_form && self.remote.is_some() {
+            return Some("connect");
+        }
         match self.tool {
             Some(shell::Tool::Forwards) => Some("forwards"),
             Some(shell::Tool::Transfers) => Some("transfers"),
@@ -1038,6 +1060,40 @@ impl ShelluneView {
     #[cfg(feature = "ui-capture")]
     pub fn capture_note_attention(&mut self, id: SessionId, kind: AttentionKind) {
         self.workspace.note_attention(id, kind);
+    }
+
+    /// Opens the connection dialog at one stage, for a capture (R2, R17).
+    ///
+    /// Nothing is dialled: the panel reports the stage a real attempt would report, and
+    /// the session behind it is a record with no transport. The address in the dialog is
+    /// the fixture host's, so the shot proves layout and wording and nothing about a
+    /// connection.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_connection(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.chain = None;
+        self.reconnect = None;
+        let id = self.workspace.register_remote_session(host).id();
+        self.form_session = Some(id);
+        self.active = Some(id);
+        self.showing_connection_form = true;
+        self.remote = Some(RemotePanel::new(host));
+        if let Some(panel) = self.remote.as_mut() {
+            panel.set_status(RemoteStatus::Connecting);
+        }
+        cx.notify();
+    }
+
+    /// Whether a paste confirmation is on screen, read the way the window reads it.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_paste_open(&self, cx: &gpui::App) -> bool {
+        self.paste_prompt(cx).is_some()
+    }
+
+    /// Opens the list of every tab, for a capture (R17).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_open_tab_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_tab_list(window, cx);
     }
 
     /// Builds the shell with every store, the trust file and the credential store
@@ -1241,6 +1297,11 @@ impl ShelluneView {
             tab_rename: None,
             accent_hover: None,
             tab_list_open: false,
+            tab_list_selected: 0,
+            tab_list_focus: cx.focus_handle(),
+            paste_focus: cx.focus_handle(),
+            paste_watch: None,
+            paste_scroll: gpui::ScrollHandle::new(),
             session_menu: None,
             session_more: None,
             focus_host_dialog: false,
@@ -1881,6 +1942,95 @@ impl ShelluneView {
 
     fn active_pane(&self) -> Option<&Entity<TerminalPane>> {
         self.active.and_then(|id| self.pane_for(id))
+    }
+
+    /// The terminal whose paste or saved command is waiting for an answer (R17).
+    ///
+    /// The pane keeps the text and the name of the session it would be written into;
+    /// the window only finds it, so the dialog and the write cannot disagree about the
+    /// target. The session on screen is asked first — that is the dialog a person sees —
+    /// and every other pane after it, so an answer cannot be lost behind a dialog that
+    /// is never drawn.
+    fn paste_prompt(&self, cx: &gpui::App) -> Option<(SessionId, Entity<TerminalPane>)> {
+        let waiting = |open: &OpenPane| open.pane.read(cx).awaits_paste_confirmation();
+        if let Some(open) = self
+            .panes
+            .iter()
+            .find(|open| Some(open.tag.session) == self.active && waiting(open))
+        {
+            return Some((open.tag.session, open.pane.clone()));
+        }
+        self.panes
+            .iter()
+            .find(|open| waiting(open))
+            .map(|open| (open.tag.session, open.pane.clone()))
+    }
+
+    /// Whether a paste confirmation is on screen.
+    fn paste_prompt_open(&self, cx: &gpui::App) -> bool {
+        self.paste_prompt(cx).is_some()
+    }
+
+    /// Whether a paste confirmation is on screen, for the tests that check it leaves.
+    #[cfg(test)]
+    pub fn paste_prompt_open_for_test(&self, cx: &gpui::App) -> bool {
+        self.paste_prompt_open(cx)
+    }
+
+    /// Confirms the waiting paste, writing it into the pane that asked for it only.
+    ///
+    /// Returns whether a paste was waiting. Nothing is written when the answer is no.
+    fn confirm_paste_prompt(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((id, pane)) = self.paste_prompt(cx) else {
+            return false;
+        };
+        pane.update(cx, |pane, cx| {
+            pane.confirm_paste(cx);
+        });
+        self.settle_after_paste_answer(id, cx);
+        true
+    }
+
+    /// Drops the waiting paste without writing anything.
+    fn cancel_paste_prompt(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((id, pane)) = self.paste_prompt(cx) else {
+            return false;
+        };
+        pane.update(cx, |pane, cx| pane.cancel_paste(cx));
+        self.settle_after_paste_answer(id, cx);
+        true
+    }
+
+    /// Reads one keystroke while the paste dialog is open.
+    ///
+    /// Escape and Enter are the two answers; every other combination is spent here so
+    /// neither the terminal behind the dialog nor a shortcut of the window acts on a
+    /// key that was pressed at a dialog (R17).
+    fn answer_paste_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
+        if !self.paste_prompt_open(cx) {
+            return false;
+        }
+        match keystroke.key.as_str() {
+            "escape" => {
+                self.cancel_paste_prompt(cx);
+            }
+            "enter" => {
+                self.confirm_paste_prompt(cx);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Takes what an answer to the paste dialog implies.
+    ///
+    /// The corner note about a waiting saved command leaves with the prompt it spoke
+    /// about, and the keyboard goes back to the terminal that asked — not to a page
+    /// and not to the dialog, which no longer exists (R17).
+    fn settle_after_paste_answer(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.settle_snippet_note_if_answered(cx);
+        self.pane_focus_pending = Some(id);
+        cx.notify();
     }
 
     /// Takes the keyboard to the terminal of one session.
@@ -7699,6 +7849,13 @@ impl ShelluneView {
     /// menu is the shell's surface, and the program must not receive an Escape that
     /// was meant for it. With nothing floating the key goes on to the program.
     fn dismiss_floating(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // A paste or a saved command waiting for an answer is the topmost layer. Escape
+        // drops it without writing anything and gives the keyboard back to the terminal
+        // that asked (R17).
+        if self.paste_prompt_open(cx) {
+            self.cancel_paste_prompt(cx);
+            return true;
+        }
         if self.palette.is_some() {
             self.close_palette(window, cx);
             return true;
@@ -12569,6 +12726,33 @@ impl Render for ShelluneView {
         {
             window.focus(&handle);
         }
+        // The paste confirmation holds the keyboard while it is up. Nothing behind it
+        // is typed into, and no key reaches a program through the dialog; the root is
+        // what answers Escape and Enter for it (R17).
+        if self.paste_prompt_open(cx) {
+            if !self.paste_focus.is_focused(window) {
+                window.focus(&self.paste_focus);
+            }
+            if self.paste_watch.is_none() {
+                let view = cx.entity().downgrade();
+                // Everything typed while the dialog is up belongs to the dialog: bound
+                // shortcuts included, so no action runs behind an unanswered paste.
+                let watch = cx.intercept_keystrokes(move |event, _window, app| {
+                    let keystroke = event.keystroke.clone();
+                    let answered = view
+                        .update(app, |view, cx| view.answer_paste_key(&keystroke, cx))
+                        .unwrap_or(false);
+                    // Only a key that reached the dialog is spent on it; once the answer
+                    // is in, the next keystroke belongs to the terminal again.
+                    if answered {
+                        app.stop_propagation();
+                    }
+                });
+                self.paste_watch = Some(watch);
+            }
+        } else {
+            self.paste_watch = None;
+        }
         // A file view's question takes the keyboard in its first field, and gives it back
         // to the column it asked about once it is gone, so a copy can be asked for, typed
         // and confirmed without a pointer (R4). The field is also brought into the column:
@@ -12613,6 +12797,23 @@ impl Render for ShelluneView {
                 if this.pointer_input {
                     this.pointer_input = false;
                     cx.notify();
+                }
+                // A paste confirmation is a modal dialog, so the terminal behind it
+                // receives nothing while it is up: Escape drops the paste, Enter
+                // confirms it, and every other key is spent on the dialog rather than
+                // typed into a program the user cannot see past it (R17).
+                if this.paste_prompt_open(cx) {
+                    match event.keystroke.key.as_str() {
+                        "escape" => {
+                            this.cancel_paste_prompt(cx);
+                        }
+                        "enter" => {
+                            this.confirm_paste_prompt(cx);
+                        }
+                        _ => {}
+                    }
+                    cx.stop_propagation();
+                    return;
                 }
                 // Escape closes what floats above the terminal, whichever control has
                 // the keys: a menu or a dialog belongs to the shell, and the program
@@ -12812,6 +13013,7 @@ impl Render for ShelluneView {
             .children(self.session_more_overlay(window, cx))
             .children(self.palette_overlay(window, cx))
             .children(self.key_capture_overlay(window, cx))
+            .children(self.paste_overlay(window, cx))
             .children(self.toast_stack(cx))
     }
 }

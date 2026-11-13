@@ -38,7 +38,7 @@ use shellune_terminal::{
     MouseButton as TerminalMouseButton, MouseModifiers, PtyEvent, RenderedCell, Rgb, SelectionType,
     Snapshot, TermMode, TerminalCore, TerminalEffects, encode_alternate_scroll, encode_key,
     encode_mouse, encode_paste, encode_text, grid_for, mouse_reporting, palette,
-    paste_needs_confirmation, paste_preview, sanitize_font_size, step_font_size,
+    paste_needs_confirmation, sanitize_font_size, step_font_size,
 };
 
 use crate::app::actions::{TerminalCopy, TerminalPaste, TerminalSearch};
@@ -1403,7 +1403,9 @@ impl TerminalPane {
     }
 
     /// The session a held paste would be sent to, when one is waiting.
-    #[cfg(test)]
+    ///
+    /// The window draws that answer in its dialog, so it is not test-only: the same
+    /// value the pane holds is the value the dialog names and confirms into.
     #[must_use]
     pub fn pending_paste_target(&self) -> Option<&str> {
         self.pending_paste
@@ -1421,16 +1423,14 @@ impl TerminalPane {
     }
 
     /// The text a held paste would send.
-    #[cfg(test)]
     #[must_use]
     pub fn pending_paste_text(&self) -> Option<&str> {
         self.pending_paste.as_ref().map(|paste| paste.text.as_str())
     }
 
     /// Whether the held paste is a saved command that will run once it is confirmed.
-    #[cfg(test)]
     #[must_use]
-    pub fn pending_paste_runs_for_test(&self) -> bool {
+    pub fn pending_paste_runs(&self) -> bool {
         self.pending_paste
             .as_ref()
             .is_some_and(|paste| paste.execute)
@@ -2652,110 +2652,6 @@ impl TerminalPane {
         }
     }
 
-    fn paste_overlay(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
-        let strings = self.locale.strings();
-        let Some(pending) = &self.pending_paste else {
-            return div();
-        };
-        let (count, preview) = paste_preview(&pending.text, 4);
-        let target = pending.target.clone();
-        div()
-            .absolute()
-            .top(px(8.0))
-            .left(px(8.0))
-            .right(px(8.0))
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .p(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(shell_palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(shell_palette::BORDER_STRONG))
-            .rounded(px(theme::radius::MEDIUM))
-            .debug_selector(|| "terminal.paste".to_owned())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .child(
-                div()
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
-                    .child(strings.terminal_paste_title),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "terminal.paste.target".to_owned())
-                    .text_size(metrics.caption_size())
-                    .child(SharedString::from(format!(
-                        "{}: {target}",
-                        strings.terminal_paste_target
-                    ))),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(shell_palette::TEXT_MUTED))
-                    .child(SharedString::from(format!(
-                        "{count} {}",
-                        strings.terminal_paste_lines
-                    ))),
-            )
-            // A saved command that was asked to run says so before it is confirmed: the
-            // prompt is otherwise the same one a paste gets, and what follows it differs.
-            .when(pending.execute, |column| {
-                column.child(
-                    div()
-                        .debug_selector(|| "terminal.paste.runs".to_owned())
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(shell_palette::ACCENT))
-                        .child(strings.terminal_paste_runs),
-                )
-            })
-            .child(
-                div()
-                    .debug_selector(|| "terminal.paste.preview".to_owned())
-                    .font_family(monospace_family())
-                    .text_size(metrics.caption_size())
-                    .child(SharedString::from(preview)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        components::compact_button(
-                            strings.terminal_paste_confirm,
-                            components::Variant::Primary,
-                            metrics,
-                        )
-                        .id("terminal.paste.confirm")
-                        .debug_selector(|| "terminal.paste.confirm".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.confirm_paste(cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        components::compact_button(
-                            strings.terminal_paste_cancel,
-                            components::Variant::Secondary,
-                            metrics,
-                        )
-                        .id("terminal.paste.cancel")
-                        .debug_selector(|| "terminal.paste.cancel".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.cancel_paste(cx);
-                            },
-                        )),
-                    ),
-            )
-    }
-
     /// The blocks the list shows for the current query, filter and switches.
     ///
     /// A query that cannot be read leaves no rows: the bar says why, so the list
@@ -3732,10 +3628,11 @@ impl Render for TerminalPane {
 
         let show_blocks =
             !self.alternate_screen() && (self.search_open || self.core.shows_command_blocks());
-        let show_paste = self.pending_paste.is_some();
-        // The pane's own chrome - the status line, the find bar, the paste prompt,
-        // the menu - is drawn in the terminal's palette, so a dark terminal in a
-        // light window is dark to its edges. The window's palette comes back after.
+        // The pane's own chrome - the status line, the find bar, the menu - is drawn in
+        // the terminal's palette, so a dark terminal in a light window is dark to its
+        // edges. The window's palette comes back after. The paste confirmation is not
+        // here any more: it is a window-level dialog, so the terminal behind it cannot
+        // be typed into while an answer is pending (R17).
         let window_appearance = theme::appearance();
         theme::set_appearance(theme::terminal_appearance());
         let pane = div()
@@ -3759,9 +3656,6 @@ impl Render for TerminalPane {
                     .child(self.viewport(window, cx)),
             )
             .child(self.bar(metrics, cx))
-            .when(show_paste, |column| {
-                column.child(self.paste_overlay(metrics, cx))
-            })
             .when(show_blocks, |column| {
                 column.child(self.block_overlay(metrics, cx))
             })
