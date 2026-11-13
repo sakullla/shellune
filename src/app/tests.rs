@@ -5223,7 +5223,11 @@ async fn a_new_host_is_created_through_the_form_and_reaches_the_file(cx: &mut Te
         assert_eq!(host.address(), "10.0.0.7");
         assert_eq!(host.port().get(), 2222);
         assert_eq!(host.user(), "deploy");
-        assert_eq!(host.group(), Some("Prod"));
+        assert_eq!(
+            host.group_path().map(|path| path.to_string()),
+            Some("Prod".to_owned()),
+            "the form saves the canonical path, not the old label"
+        );
 
         let workspace = view.workspace();
         assert_eq!(
