@@ -212,7 +212,14 @@ impl HostDraft {
             address: host.address().to_owned(),
             port: host.port().to_string(),
             user: host.user().to_owned(),
-            group: host.group().unwrap_or_default().to_owned(),
+            // A host in a nested group stores only its path; the label field is what an
+            // earlier build wrote. Showing the canonical path keeps the form honest and
+            // saving it cannot flatten the host into a look-alike group (R4, ADR-8).
+            group: host
+                .group_path()
+                .map(|path| path.to_string())
+                .or_else(|| host.group().map(str::to_owned))
+                .unwrap_or_default(),
             identity: host.identity_file().unwrap_or_default().to_owned(),
             // A host saved before the choice existed signs in with its key when it has
             // one, and with a password otherwise, which is what its form offered.
@@ -377,7 +384,7 @@ impl HostDraft {
                     .map_err(|error| error.to_string())?;
                 host.set_user(self.user.clone())
                     .map_err(|error| error.to_string())?;
-                host.set_group(Some(self.group.clone()));
+                self.apply_group(&mut host)?;
                 // A blank field clears the path instead of storing an empty string, and
                 // the value is only ever the path to the key.
                 host.set_identity_file(self.identity_for_method());
@@ -393,13 +400,29 @@ impl HostDraft {
                     self.user.clone(),
                 )
                 .map_err(|error| error.to_string())?;
-                host.set_group(Some(self.group.clone()));
+                self.apply_group(&mut host)?;
                 host.set_identity_file(self.identity_for_method());
                 self.apply_sign_in(&mut host);
                 self.apply_route(&mut host);
                 Ok(HostEdit::create(host))
             }
         }
+    }
+
+    /// Applies the group field as the canonical path it names.
+    ///
+    /// A blank field means no group; anything else is parsed with the same rules the
+    /// group tree uses, so `Prod/Web` is two levels rather than one label containing a
+    /// separator (ADR-8). The reason is the form's message when the path is refused.
+    fn apply_group(&self, host: &mut HostConfig) -> Result<(), String> {
+        let text = self.group.trim();
+        if text.is_empty() {
+            host.set_group_path(None);
+            return Ok(());
+        }
+        let path = GroupPath::parse(text).map_err(|error| error.to_string())?;
+        host.set_group_path(Some(path));
+        Ok(())
     }
 
     /// The jump hosts, in dial order.
@@ -786,7 +809,7 @@ impl HostsPanel {
         open: &dyn Fn(HostId) -> bool,
     ) -> HostList {
         let all: Vec<HostId> = book.hosts().iter().map(HostConfig::id).collect();
-        let matched: Vec<HostId> = book
+        let mut matched: Vec<HostId> = book
             .hosts()
             .iter()
             .filter(|host| self.matches(book, host, open))
@@ -802,12 +825,18 @@ impl HostsPanel {
                 }
             }
             HostView::Recent => {
+                // The recent view is itself a filter: a host with no record is not in
+                // the list, so it must not be counted in "current results" either, or
+                // Select would pick hosts the user cannot see (R18).
+                let mut shown = Vec::new();
                 for recent in book.recent_hosts() {
                     let id = recent.host.id();
                     if kept.contains(&id) {
+                        shown.push(id);
                         rows.push(HostListRow::Host(HostRow { id }));
                     }
                 }
+                matched = shown;
             }
             HostView::Groups => {
                 self.push_tree(&mut rows, book, groups, &kept, narrow_search);
@@ -1917,7 +1946,11 @@ mod tests {
         );
 
         panel.set_search("prod");
-        assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 2);
+        assert_eq!(
+            panel.list(&book, &groups, &no_sessions).matched_len(),
+            1,
+            "the recent view is a filter too: current results name only the rows it shows"
+        );
         assert_eq!(
             panel.list(&book, &groups, &no_sessions).rows().len(),
             1,
@@ -1927,6 +1960,29 @@ mod tests {
         panel.set_search("nothing matches this");
         assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 0);
         assert!(panel.list(&book, &groups, &no_sessions).is_empty());
+    }
+
+    #[test]
+    fn the_host_form_keeps_a_nested_group_path_and_a_blank_field_clears_it() {
+        let mut saved = host("web", "10.0.0.5", 22, "deploy", None);
+        saved.set_group_path(Some(GroupPath::parse("Prod/Web").expect("a path")));
+
+        let mut draft = HostDraft::edit(&saved);
+        assert_eq!(draft.group, "Prod/Web", "the form shows the path it stores");
+        let edit = draft.build(Some(&saved)).expect("the host is valid");
+        assert_eq!(
+            edit.host().group_path().map(|path| path.to_string()),
+            Some("Prod/Web".to_owned()),
+            "saving the form must not flatten the host into a look-alike group"
+        );
+
+        draft.group.clear();
+        let cleared = draft.build(Some(&saved)).expect("the host is still valid");
+        assert_eq!(
+            cleared.host().group_path(),
+            None,
+            "a blank field takes the host out of its group"
+        );
     }
 
     #[test]
