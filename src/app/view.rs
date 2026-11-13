@@ -590,6 +590,12 @@ pub struct ShelluneView {
     tool: Option<shell::Tool>,
     /// A terminal that should have the keyboard by the next draw.
     pane_focus_pending: Option<SessionId>,
+    /// Whether the paste dialog already answered this keystroke.
+    ///
+    /// The same key reaches the root capture handler after the dialog's interceptor,
+    /// and a second answer must not be read as "Escape with nothing floating", which
+    /// would close the panel the dialog was opened from (R17).
+    paste_key_spent: bool,
     /// Gives the keyboard back to the page when the focused control leaves the
     /// screen (a dialog that closed, a form that was replaced).
     focus_lost_watch: Option<gpui::Subscription>,
@@ -1290,6 +1296,7 @@ impl ShelluneView {
             pointer_input: false,
             tool: None,
             pane_focus_pending: None,
+            paste_key_spent: false,
             focus_lost_watch: None,
             palette_selected: 0,
             palette_scroll: gpui::ScrollHandle::new(),
@@ -1977,6 +1984,12 @@ impl ShelluneView {
         self.paste_prompt_open(cx)
     }
 
+    /// The manager's keyboard handle, so a test can see where an answer sent it.
+    #[cfg(test)]
+    pub fn snippet_focus_for_test(&self) -> gpui::FocusHandle {
+        self.snippet_focus.clone()
+    }
+
     /// Confirms the waiting paste, writing it into the pane that asked for it only.
     ///
     /// Returns whether a paste was waiting. Nothing is written when the answer is no.
@@ -2019,6 +2032,7 @@ impl ShelluneView {
             }
             _ => {}
         }
+        self.paste_key_spent = true;
         true
     }
 
@@ -2029,7 +2043,18 @@ impl ShelluneView {
     /// and not to the dialog, which no longer exists (R17).
     fn settle_after_paste_answer(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.settle_snippet_note_if_answered(cx);
-        self.pane_focus_pending = Some(id);
+        // A manager that was on screen before the question is still on screen after it:
+        // the keyboard goes back to it, or to the field being edited, and never to the
+        // terminal behind it, which would take input the person cannot see (R17).
+        if self.tool == Some(shell::Tool::Snippets) {
+            let handle = self.snippet_panel.editor().map_or_else(
+                || self.snippet_focus.clone(),
+                |editor| editor.name.read(cx).focus_handle().clone(),
+            );
+            self.snippet_focus_pending = Some(handle);
+        } else {
+            self.pane_focus_pending = Some(id);
+        }
         cx.notify();
     }
 
@@ -12797,6 +12822,13 @@ impl Render for ShelluneView {
                 if this.pointer_input {
                     this.pointer_input = false;
                     cx.notify();
+                }
+                // The dialog's interceptor has already answered this key. Reading it
+                // again here would cancel nothing and then close the panel behind the
+                // dialog, because the paste is no longer waiting (R17).
+                if std::mem::take(&mut this.paste_key_spent) {
+                    cx.stop_propagation();
+                    return;
                 }
                 // A paste confirmation is a modal dialog, so the terminal behind it
                 // receives nothing while it is up: Escape drops the paste, Enter

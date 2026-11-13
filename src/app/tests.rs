@@ -2499,6 +2499,62 @@ async fn the_paste_confirmation_is_a_dialog_over_the_terminal_and_writes_nothing
 }
 
 #[gpui::test]
+async fn answering_a_paste_over_the_manager_gives_the_keyboard_back_to_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("paste-manager-focus");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = snippet_view(cx, &dir);
+    let session = live_remote(cx, &view);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(session).cloned())
+        .expect("the session has a terminal");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.open_snippets(false, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|window, app| view.read(app).snippet_focus_for_test().is_focused(window)),
+        "opening the manager already gives it the keyboard"
+    );
+    let before = snippet_sent(cx, &view, session);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.stage_paste("echo one\necho two\n", cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_w, app| view.read(app).paste_prompt_open_for_test(app)),
+        "the multi-line paste asks first"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_w, app| view.read(app).paste_prompt_open_for_test(app)),
+        "escape answers the dialog rather than the manager behind it"
+    );
+    assert_eq!(
+        cx.update(|_w, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Snippets),
+        "the manager stays open behind the answer"
+    );
+    assert_eq!(
+        snippet_sent(cx, &view, session),
+        before,
+        "cancelling the dialog writes nothing"
+    );
+    assert!(
+        cx.update(|window, app| view.read(app).snippet_focus_for_test().is_focused(window)),
+        "the manager that was still on screen keeps the keyboard"
+    );
+    assert!(
+        !cx.update(|window, app| pane.read(app).focus_handle().is_focused(window)),
+        "the terminal behind the manager does not take input the person cannot see"
+    );
+}
+
+#[gpui::test]
 async fn the_paste_dialog_writes_only_into_the_session_it_names(cx: &mut TestAppContext) {
     let dir = TempDir::new("paste-target");
     seed(
