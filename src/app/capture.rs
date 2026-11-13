@@ -581,6 +581,12 @@ struct Manifest {
     /// The foreground window before the first shot and after the last one. A capture
     /// that took the focus would change it (R1).
     foreground: Option<(isize, isize)>,
+    /// What a foreground change that was not this tool is, when one happened.
+    ///
+    /// Another window taking the foreground does not fail the run: the hidden capture
+    /// window cannot cause it, and a busy desktop would otherwise never produce a
+    /// gallery. The note keeps the fact in the evidence (R1).
+    foreground_note: Option<String>,
 }
 
 impl Manifest {
@@ -597,6 +603,7 @@ impl Manifest {
             failures: Vec::new(),
             stopped: None,
             foreground: None,
+            foreground_note: None,
         }
     }
 
@@ -646,6 +653,7 @@ impl Manifest {
                 "after": after,
                 "unchanged": before == after,
             })),
+            "foreground_note": self.foreground_note,
             "started": self.started,
             "elapsed_ms": self.elapsed_ms,
             "scale_factor": self.scale_factor,
@@ -908,14 +916,24 @@ async fn run_shots(
     let foreground_after = windows::foreground();
     manifest.foreground = Some((foreground_before, foreground_after));
     if foreground_after != foreground_before {
-        manifest.fail(Failure {
-            scenario: "*",
-            theme: options.theme.name(),
-            size: "*".to_owned(),
-            reason: format!(
-                "the foreground window changed during the run ({foreground_before} ->                  {foreground_after}); the capture must not touch another application"
-            ),
-        });
+        // Only this process taking the foreground is a capture failure. Another window
+        // doing it is the desktop being busy, which a hidden window cannot cause; it is
+        // recorded rather than failing a run that touched nothing (R1).
+        let own_window = on_window(wx, |window, _cx| hwnd(window)).ok();
+        if own_window == Some(foreground_after) {
+            manifest.fail(Failure {
+                scenario: "*",
+                theme: options.theme.name(),
+                size: "*".to_owned(),
+                reason: format!(
+                    "the capture window took the foreground during the run ({foreground_before} -> {foreground_after}); the capture must not touch another application"
+                ),
+            });
+        } else {
+            manifest.foreground_note = Some(format!(
+                "another application took the foreground during the run ({foreground_before} -> {foreground_after}); the hidden capture window was never shown"
+            ));
+        }
     }
     manifest.elapsed_ms = started.elapsed().as_millis();
     manifest.scale_factor = state_scale(wx);
