@@ -224,6 +224,12 @@ pub(super) struct SettingsNav {
     category: Category,
     item: [usize; 7],
     scope: Option<keymap::Context>,
+    /// Whether the category column has the keyboard.
+    ///
+    /// The shortcut page uses the arrows for its rows, so without this the categories were
+    /// a keyboard dead end: Escape hands the keyboard to the column, the arrows walk it,
+    /// and Enter opens the page the cursor is on (R16, R8).
+    nav_focus: bool,
 }
 
 impl SettingsNav {
@@ -233,6 +239,7 @@ impl SettingsNav {
             category: Category::Appearance,
             item: [0; 7],
             scope: None,
+            nav_focus: false,
         }
     }
 
@@ -336,7 +343,7 @@ impl ShelluneView {
     fn settings_navigation(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let locale = self.workspace.locale();
-        let ringed = !self.pointer_input;
+        let ringed = !self.pointer_input || self.settings_nav.nav_focus;
         let mut column = div()
             .flex()
             .flex_col()
@@ -393,7 +400,25 @@ impl ShelluneView {
                 }
             }
         }
+        if self.settings_nav.nav_focus {
+            column = column.child(self.settings_nav_hint());
+        }
         column
+    }
+
+    /// The keys that work while the category column has the keyboard.
+    fn settings_nav_hint(&self) -> Div {
+        let metrics = self.metrics();
+        div()
+            .mt(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::SNUG))
+            .w_full()
+            .min_w(px(0.0))
+            .whitespace_normal()
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(palette::TEXT_MUTED))
+            .debug_selector(|| "settings.nav.hint".to_owned())
+            .child(copy::ux().settings_nav_hint)
     }
 
     /// One item under its category: the chosen one carries a bar and a fill, so the state
@@ -546,6 +571,9 @@ impl ShelluneView {
             .when(!Self::single_named_item(category, locale), |column| {
                 column.child(items)
             })
+            .when(self.settings_nav.nav_focus, |column| {
+                column.child(self.settings_nav_hint())
+            })
     }
 
     /// The page of one item: where it sits, its name and its sentence, then its own
@@ -554,7 +582,13 @@ impl ShelluneView {
         let metrics = self.metrics();
         let locale = self.workspace.locale();
         let selector = format!("settings.page.{}", item.id());
-        let hint = item.hint(locale);
+        // A page whose card is one setting already says the name in its row; repeating the
+        // sentence here would print the same words twice (R16). Pages that are a list of
+        // rows keep it, because nothing below repeats it.
+        let hint = match item {
+            Item::Shortcuts | Item::Policy => item.hint(locale),
+            _ => "",
+        };
         div()
             .flex()
             .flex_col()
@@ -636,61 +670,61 @@ impl ShelluneView {
         match item {
             Item::Theme => self.settings_row(
                 "theme",
-                ux.settings_theme,
+                "",
                 ux.settings_theme_hint,
                 self.settings_theme_control(cx),
             ),
             Item::Language => self.settings_row(
                 "language",
-                ux.settings_language,
+                "",
                 ux.settings_language_hint,
                 self.settings_language_control(cx),
             ),
             Item::TextSize => self.settings_row(
                 "text-size",
-                ux.settings_text_size,
+                "",
                 ux.settings_text_size_hint,
                 self.settings_zoom_control(cx),
             ),
             Item::Motion => self.settings_row(
                 "motion",
-                ux.settings_motion,
+                "",
                 ux.settings_motion_hint,
                 self.settings_motion_control(cx),
             ),
             Item::Scheme => self.settings_row(
                 "scheme",
-                ux.settings_scheme,
+                "",
                 ux.settings_scheme_hint,
                 self.settings_scheme_control(cx),
             ),
             Item::FontSize => self.settings_row(
                 "font-size",
-                ux.settings_font_size,
+                "",
                 ux.settings_font_size_hint,
                 self.settings_font_control(cx),
             ),
             Item::DefaultShell => self.settings_row(
                 "default-shell",
-                ux.settings_default_shell,
+                "",
                 ux.settings_default_shell_hint,
                 self.settings_shell_control(cx),
             ),
             Item::BellNotice => self.settings_row(
                 "bell-notice",
-                ux.settings_bell_notice,
+                "",
                 ux.settings_bell_notice_hint,
                 self.settings_notice_control(AttentionKind::Bell, cx),
             ),
             Item::FinishedNotice => self.settings_row(
                 "finished-notice",
-                ux.settings_finished_notice,
+                "",
                 ux.settings_finished_notice_hint,
                 self.settings_notice_control(AttentionKind::CommandFinished, cx),
             ),
             Item::Import => self.settings_row(
                 "import",
-                self.strings().import_open,
+                "",
                 ux.settings_import_hint,
                 components::icon_label_button(
                     crate::app::icons::Icon::Import,
@@ -1520,6 +1554,7 @@ impl ShelluneView {
 
     /// Opens one category, keeping the item it was last on (R16).
     fn settings_select_category(&mut self, category: Category, cx: &mut Context<Self>) {
+        self.settings_nav.nav_focus = false;
         if self.settings_nav.category != category {
             self.settings_nav.category = category;
             cx.notify();
@@ -1530,6 +1565,7 @@ impl ShelluneView {
     fn settings_select_item(&mut self, category: Category, index: usize, cx: &mut Context<Self>) {
         self.settings_nav.category = category;
         self.settings_nav.set_item(category, index);
+        self.settings_nav.nav_focus = false;
         self.keys_selected = 0;
         self.keys_control = 0;
         cx.notify();
@@ -1586,6 +1622,30 @@ impl ShelluneView {
         if modifiers.control || modifiers.alt || modifiers.platform {
             return;
         }
+        // The category column has its own mode: every page, including the shortcut list,
+        // can hand the keyboard back to it with Escape, and the arrows then walk both
+        // levels instead of the page (R16).
+        if self.settings_nav.nav_focus {
+            match event.keystroke.key.as_str() {
+                "up" => self.settings_step_category(-1, cx),
+                "down" => self.settings_step_category(1, cx),
+                "left" => self.settings_step_item(-1, cx),
+                "right" => self.settings_step_item(1, cx),
+                "enter" | "escape" => self.settings_nav.nav_focus = false,
+                _ => return,
+            }
+            window.focus(self.destination_focus(Destination::Settings));
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.key == "escape" {
+            self.settings_nav.nav_focus = true;
+            window.focus(self.destination_focus(Destination::Settings));
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let on_shortcuts = self.settings_nav.category == Category::Keys;
         match event.keystroke.key.as_str() {
             "down" => {
@@ -1631,6 +1691,13 @@ impl ShelluneView {
     #[must_use]
     pub fn settings_key_rows(&self, cx: &App) -> Vec<&'static str> {
         self.key_rows(cx).into_iter().map(|spec| spec.id).collect()
+    }
+
+    /// Whether the category column has the keyboard, for the tests that walk it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn settings_nav_focused_for_test(&self) -> bool {
+        self.settings_nav.nav_focus
     }
 
     /// Which page the settings show, as identifiers, for the capture scenarios and tests.

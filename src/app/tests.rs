@@ -562,7 +562,16 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
             checked += 1;
         }
     }
-    assert_eq!(checked, 13, "not every settings item was measured");
+    assert_eq!(checked, 13, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
+    click(cx, "settings.category.terminal");
+    click(cx, "settings.item.font-size");
+    for selector in ["settings.font.less", "settings.font.more"] {
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.size.width >= px(24.0) && bounds.size.height >= px(24.0),
+            "{selector} is smaller than a 24px pointer target at 200%: {bounds:?}"
+        );
+    }
 
     // The shortcut page has a card of rows rather than one row: its search, a row, that
     // row's keys and its controls are inside the card as well.
@@ -821,6 +830,55 @@ async fn going_back_to_a_category_shows_the_item_that_was_open(cx: &mut TestAppC
         "the category reopened on its first item instead of the one that was open"
     );
     assert!(cx.debug_bounds("settings.card.language").is_some());
+}
+
+/// Escape hands the keyboard from the shortcut list to the categories, so the keys that
+/// page spends on its rows never trap the keyboard (R16, R8).
+#[gpui::test]
+async fn escape_walks_from_the_shortcut_page_to_the_categories_and_their_items(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    click(cx, "settings.category.keys");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id()),
+        ("keys", "keys")
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("settings.nav.hint").is_some(),
+        "the column says which keys work while it has the keyboard"
+    );
+
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id())
+            .0,
+        "data",
+        "the down arrow leaves the shortcut category instead of being spent on its rows"
+    );
+
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id()),
+        ("data", "import"),
+        "the right arrow walks the items of the category under the cursor"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_w, app| view.read(app).settings_nav_focused_for_test()),
+        "Enter closes the column and opens the page it was on"
+    );
+    assert!(cx.debug_bounds("settings.card.import").is_some());
 }
 
 /// The shortcut page narrows by action name, by the combination in force and by scope (R16).
