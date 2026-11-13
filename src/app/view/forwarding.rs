@@ -795,12 +795,12 @@ impl ShelluneView {
             ForwardKind::Remote => format!("{} {}", ux.fwd_there, listen.0),
             ForwardKind::Dynamic => format!("{} {} (SOCKS)", ux.fwd_here, listen.0),
         };
-        let (title, body, confirm_label, danger) = match question {
+        let (title, body, confirm_label, confirm_variant) = match question {
             ForwardConfirm::Stop => (
                 ux.fwd_stop_title,
                 copy::fill(ux.fwd_stop_body, &[("endpoint", &endpoint)]),
-                ux.fwd_stop_title,
-                false,
+                ux.fwd_stop_action,
+                Variant::Primary,
             ),
             ForwardConfirm::Delete => {
                 let rule_text = format!(
@@ -819,8 +819,8 @@ impl ShelluneView {
                         ux.fwd_delete_body,
                         &[("rule", &rule_text), ("running", running)],
                     ),
-                    ux.fwd_delete_title,
-                    true,
+                    ux.fwd_delete_action,
+                    Variant::Danger,
                 )
             }
         };
@@ -852,11 +852,7 @@ impl ShelluneView {
                     .child(self.text_button(
                         SharedString::from("forwards.confirm.yes"),
                         confirm_label,
-                        if danger {
-                            Variant::Danger
-                        } else {
-                            Variant::Secondary
-                        },
+                        confirm_variant,
                         cx,
                         |view, cx| view.confirm_forward(cx),
                     )),

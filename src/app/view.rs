@@ -1216,7 +1216,7 @@ impl ShelluneView {
     #[cfg(feature = "ui-capture")]
     pub fn capture_transfer(&mut self, id: SessionId, running: bool, cx: &mut Context<Self>) {
         if running {
-            self.transfers.seed_for_capture(
+            self.transfers.seed_measured_for_capture(
                 shellune_core::Transfer::queued(
                     id,
                     shellune_core::TransferDirection::Upload,
@@ -1224,8 +1224,8 @@ impl ShelluneView {
                     "/home/deploy/项目 发布/2026-11 版本/构建 产物.tar.zst",
                 ),
                 7_340_032,
+                8_200_000,
                 Some(18_874_368),
-                None,
             );
         } else {
             self.transfers.seed_for_capture(
@@ -1238,6 +1238,13 @@ impl ShelluneView {
                 212_992,
                 Some(2_048_120),
                 Some(shellune_core::TransferFailure::ConnectionLost),
+                Some("/home/deploy/项目 发布/2026-11 版本/部署 记录.log.part".to_owned()),
+                Some(shellune_core::ResumeHint {
+                    partial: "/home/deploy/项目 发布/2026-11 版本/部署 记录.log.part".to_owned(),
+                    record: "/home/deploy/项目 发布/2026-11 版本/.shellune-resume.json".to_owned(),
+                    offset: 212_992,
+                    generation: 1,
+                }),
             );
         }
         cx.notify();
@@ -1304,6 +1311,30 @@ impl ShelluneView {
     pub fn capture_transfer_count(&self) -> usize {
         self.active_session()
             .map_or(0, |id| self.transfers.for_session(id).count())
+    }
+
+    /// Whether the captured task has a speed and a time left the window measured (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_transfer_measured(&self) -> Option<(bool, bool)> {
+        let id = self.active_session()?;
+        let task = self.transfers.for_session(id).next()?;
+        Some((
+            self.transfers.rate(task.id()).is_some(),
+            self.transfers.remaining(task.id()).is_some(),
+        ))
+    }
+
+    /// Whether the captured failed task names its partial file and its checkpoint (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_transfer_residue(&self) -> Option<(bool, bool)> {
+        let id = self.active_session()?;
+        let task = self.transfers.for_session(id).next()?;
+        Some((
+            task.state().residue().is_some(),
+            task.resume_hint().is_some(),
+        ))
     }
 
     /// How many forwarding rows are saved, and how many of them are listening (R2).

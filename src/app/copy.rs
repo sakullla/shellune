@@ -2200,10 +2200,14 @@ pub struct UxStrings {
     pub fwd_cancel: &'static str,
     /// Question before a running tunnel is stopped
     pub fwd_stop_title: &'static str,
+    /// The confirm button's own action, not the question it answers.
+    pub fwd_stop_action: &'static str,
     /// What stopping does, with the endpoint filled in
     pub fwd_stop_body: &'static str,
     /// Question before a tunnel is deleted
     pub fwd_delete_title: &'static str,
+    /// The confirm button's own action, not the question it answers.
+    pub fwd_delete_action: &'static str,
     /// What deleting does, with the tunnel and its state filled in
     pub fwd_delete_body: &'static str,
     /// Said in the delete question of a tunnel that is listening now
@@ -2641,8 +2645,10 @@ included",
     fwd_no_hosts: "Save a host first: every tunnel runs through an SSH host.",
     fwd_cancel: "Cancel",
     fwd_stop_title: "Stop this tunnel?",
+    fwd_stop_action: "Stop tunnel",
     fwd_stop_body: "{endpoint} stops listening now. The rule stays saved and can be started again; nothing on either machine is removed.",
     fwd_delete_title: "Delete this tunnel?",
+    fwd_delete_action: "Delete rule",
     fwd_delete_body: "{rule} is removed from the saved rules. {running}",
     fwd_delete_running: "It is listening now, so it is stopped first.",
     fwd_delete_saved: "It is not listening.",
@@ -2828,8 +2834,10 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     fwd_no_hosts: "请先保存一台主机：每条端口转发都要经由 SSH 主机。",
     fwd_cancel: "取消",
     fwd_stop_title: "停止这条隧道？",
+    fwd_stop_action: "停止隧道",
     fwd_stop_body: "{endpoint} 会立即停止监听。规则仍然保存，可以再次启动；两侧机器上都不会删除任何内容。",
     fwd_delete_title: "删除这条隧道？",
+    fwd_delete_action: "删除规则",
     fwd_delete_body: "{rule} 会从已保存的规则中移除。{running}",
     fwd_delete_running: "它现在正在监听，会先被停止。",
     fwd_delete_saved: "它当前没有监听。",

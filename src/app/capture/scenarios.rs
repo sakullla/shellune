@@ -731,11 +731,25 @@ fn running_transfer_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> 
     if view.capture_transfer_count() == 0 {
         return Err("the transfer strip is empty".to_owned());
     }
-    Ok(())
+    match view.capture_transfer_measured() {
+        Some((true, true)) => Ok(()),
+        other => Err(format!(
+            "the running transfer shows no measured speed and time left: {other:?}"
+        )),
+    }
 }
 
 fn failed_transfer_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
-    running_transfer_ready(view, _cx)
+    files_ready(view, _cx)?;
+    if view.capture_transfer_count() == 0 {
+        return Err("the transfer strip is empty".to_owned());
+    }
+    match view.capture_transfer_residue() {
+        Some((true, true)) => Ok(()),
+        other => Err(format!(
+            "the failed transfer names no partial file or checkpoint: {other:?}"
+        )),
+    }
 }
 
 fn forwards_empty_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {

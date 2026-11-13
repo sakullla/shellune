@@ -572,6 +572,8 @@ impl TransferViews {
         moved: u64,
         total: Option<u64>,
         failed: Option<TransferFailure>,
+        residue: Option<String>,
+        resume: Option<shellune_core::ResumeHint>,
     ) -> TransferId {
         let id = self.queue.add(task);
         let _ = self.queue.apply(&TransferEvent::started(id));
@@ -581,11 +583,37 @@ impl TransferViews {
                 transfer: id,
                 update: TransferUpdate::Failed {
                     failure,
-                    residue: None,
-                    resume: None,
+                    residue,
+                    resume,
                 },
             });
         }
+        id
+    }
+
+    /// Puts one task in the list with two real progress reports, so a capture shows the
+    /// speed and the time left the window measures rather than a made-up number.
+    ///
+    /// The two reports are divided by the same sampler the window uses, at the interval
+    /// the measurement needs; the row a shot draws is therefore the row this build would
+    /// draw from a worker that kept reporting (R2, R6).
+    #[cfg(feature = "ui-capture")]
+    pub fn seed_measured_for_capture(
+        &mut self,
+        task: Transfer,
+        first: u64,
+        second: u64,
+        total: Option<u64>,
+    ) -> TransferId {
+        let id = self.queue.add(task);
+        let _ = self.queue.apply(&TransferEvent::started(id));
+        let _ = self.queue.apply(&TransferEvent::progress(id, first, total));
+        let started = Instant::now();
+        self.sample(started);
+        let _ = self
+            .queue
+            .apply(&TransferEvent::progress(id, second, total));
+        self.sample(started + Duration::from_millis(500));
         id
     }
 
