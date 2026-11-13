@@ -14,7 +14,7 @@
 use gpui::prelude::*;
 use gpui::{
     Context, Div, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent, Render, SharedString,
-    Stateful, Window, div, px,
+    Stateful, UniformListScrollHandle, Window, div, px,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -22,17 +22,18 @@ use std::rc::Rc;
 
 use shellune_core::X11Forwarding;
 use shellune_core::{
-    BrowseFailure, BrowseState, EventTag, FileKind, ForwardId, ForwardRule, HostConfig, HostId,
-    HostValidationError, LocalShell, Session, SessionFailure, SessionId, SessionKind, SessionState,
-    SplitAxis, TabAccent, TabId, Transfer, TransferDirection, TransferProtocol, join_path,
+    BrowseFailure, BrowseState, EventTag, FileKind, ForwardId, ForwardRule, GroupBook, GroupPath,
+    HostConfig, HostId, HostValidationError, LocalShell, Session, SessionFailure, SessionId,
+    SessionKind, SessionState, SplitAxis, TabAccent, TabId, Transfer, TransferDirection,
+    TransferProtocol, join_path,
 };
 #[cfg(test)]
 use shellune_ssh::RemoteEvent;
 use shellune_ssh::{PtySize, X11Status};
 use shellune_storage::{
-    BookError, ForwardStore, HostBook, HostStore, HostTrust, ImportOutcome, ImportPreview,
-    ImportedHost, PreferencesProblem, PreferencesStore, SecretStore, SnippetStore, StorageError,
-    TrustStore,
+    BookError, ForwardStore, GroupService, HostBook, HostStore, HostTrust, ImportOutcome,
+    ImportPreview, ImportedHost, PreferencesProblem, PreferencesStore, SecretStore, SnippetStore,
+    StorageError, TrustStore,
 };
 use shellune_terminal::GridSize;
 
@@ -56,7 +57,7 @@ use crate::app::files::{
 };
 use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
-    HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
+    GroupAction, HostDraft, HostField, HostView, HostsPanel, ImportPanel, group_path_from_text,
     import_message, unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
@@ -84,6 +85,7 @@ use shellune_storage::KeymapPreferences;
 
 mod files_menu;
 mod forwarding;
+mod home;
 mod host_dialog;
 mod overlays;
 mod panes;
@@ -123,6 +125,19 @@ impl PaneKind {
             Self::Local
         }
     }
+}
+
+/// What one group change wrote, once the service accepted it.
+///
+/// A creation touches only the tree, and every other change rewrites the hosts as well;
+/// the outcome carries both so the caller adopts exactly what reached the files.
+struct GroupOutcome {
+    /// The tree as it is now saved.
+    groups: GroupBook,
+    /// The hosts as they are now saved, when the change moved any.
+    hosts: Option<HostBook>,
+    /// What the shell says about it.
+    message: String,
 }
 
 /// One terminal and the session it shows.
@@ -410,6 +425,29 @@ pub struct ShelluneView {
     import: ImportPanel,
     /// The configuration path field, present only while that panel is open.
     import_path: Option<Entity<TextField>>,
+    /// The field that narrows the preview, present only while the panel is open (R18).
+    import_search: Option<Entity<TextField>>,
+    /// The group tree: which paths exist, empty ones included (R18).
+    ///
+    /// The hosts name their group; the tree says which groups there are, so one that
+    /// holds nothing yet still survives a restart. The two are written by one service,
+    /// which is what keeps a rename of a branch and the hosts inside it from parting.
+    groups: GroupBook,
+    /// The service that writes the hosts and the tree together.
+    group_service: GroupService,
+    /// Why the tree could not be read or written, when it could not.
+    group_problem: Option<String>,
+    /// The name field of the group dialog, present only while it is open.
+    group_name_field: Option<Entity<TextField>>,
+    /// The destination field of the group dialog, present only while it is open.
+    group_destination_field: Option<Entity<TextField>>,
+    /// The host list's own scroll, so a row can be brought into view without a pointer.
+    hosts_scroll: UniformListScrollHandle,
+    /// The widest range of rows the list has ever asked one frame to draw (R18).
+    ///
+    /// The list is handed a slice per frame; recording its width is what makes "only the
+    /// visible rows are built" a measured fact rather than a claim about the code.
+    hosts_rows_drawn: std::rc::Rc<std::cell::Cell<usize>>,
     /// The connection form on screen. Other attempts keep theirs on [`Attempt::panel`].
     remote: Option<RemotePanel>,
     /// The jump chain the open form is collecting. Parked with the form.
@@ -583,6 +621,9 @@ pub struct ShelluneView {
     files_rows: Rc<RefCell<Vec<FilesRow>>>,
     /// Last viewport width, which chooses two columns or one.
     viewport_width: gpui::Pixels,
+    /// Last viewport height, which decides how much of the servers page header is shown
+    /// above the list instead of being scrolled.
+    viewport_height: gpui::Pixels,
     /// Forces the file layout in a test. `None` follows the viewport.
     files_layout_override: Option<bool>,
     /// Where remembered passwords and passphrases are kept: the system credential store,
@@ -1354,6 +1395,84 @@ impl ShelluneView {
         (rows.len(), listening)
     }
 
+    /// Draws the host list in one of its views, the way the switch does (R18).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_host_view(&mut self, view: HostView, cx: &mut Context<Self>) {
+        self.hosts.select_view(view);
+        cx.notify();
+    }
+
+    /// Narrows the list to a group, the way the tree does (R18).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_group_filter(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.hosts.set_group_filter(GroupPath::parse(path).ok());
+        cx.notify();
+    }
+
+    /// Selects the first hosts the filters keep, so a shot can show a selection and the
+    /// scope it covers (R18).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_select_hosts(&mut self, count: usize, cx: &mut Context<Self>) {
+        let list = self
+            .hosts
+            .list(&self.book, &self.groups, &|id| self.host_is_open(id));
+        let picked: Vec<HostId> = list
+            .ids_in_scope(self.hosts.scope())
+            .iter()
+            .copied()
+            .take(count)
+            .collect();
+        self.hosts.select(picked);
+        cx.notify();
+    }
+
+    /// How many hosts a shot's selection holds, and which scope it covers.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_selection(&self) -> (usize, &'static str) {
+        (
+            self.hosts.selected_count(),
+            self.hosts.scope().debug_selector(),
+        )
+    }
+
+    /// Which list view a shot was drawn in (R18).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_host_view_id(&self) -> &'static str {
+        self.hosts.view().debug_selector()
+    }
+
+    /// Opens the import panel on a file inside this shell's own data directory (R18).
+    ///
+    /// The run's root is where the scenario wrote its fixture, so the shot reads the file
+    /// the scenario wrote and nothing from the machine it runs on.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_import_local(&mut self, name: &str, cx: &mut Context<Self>) {
+        let path = self.store.root().join(name);
+        self.capture_import(&path, cx);
+    }
+
+    /// How many groups the tree drawing a shot holds (R18).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_group_tree_len(&self) -> usize {
+        self.hosts
+            .group_tree(&self.book, &self.groups, &|id| self.host_is_open(id))
+            .len()
+    }
+
+    /// Opens the import panel on a file and reads it, so a shot shows what the file
+    /// would contribute without saving any of it (R18).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_import(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.open_import_at(path.display().to_string(), cx);
+        self.preview_import(cx);
+    }
+
+    /// How many hosts the import preview a shot drew describes, when it read a file.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_import_count(&self) -> Option<usize> {
+        self.import.preview().map(|preview| preview.hosts().len())
+    }
+
     /// Builds the shell with every store, the trust file and the credential store
     /// chosen by the caller.
     ///
@@ -1439,6 +1558,9 @@ impl ShelluneView {
         // The saved commands live beside the hosts, in the same data directory. Reading
         // them here starts nothing; a damaged file is kept and reported by the library.
         let snippet_store = SnippetStore::at(store.root());
+        // The group tree lives in the same directory as the hosts, and one service
+        // writes both so a moved branch and the hosts in it cannot part.
+        let group_service = GroupService::at(store.root());
 
         let mut view = Self {
             workspace,
@@ -1463,6 +1585,14 @@ impl ShelluneView {
             host_fields: None,
             import: ImportPanel::new(),
             import_path: None,
+            import_search: None,
+            groups: GroupBook::new(),
+            group_service,
+            group_problem: None,
+            group_name_field: None,
+            group_destination_field: None,
+            hosts_scroll: UniformListScrollHandle::new(),
+            hosts_rows_drawn: std::rc::Rc::new(std::cell::Cell::new(0)),
             remote: None,
             chain: None,
             attempts: Vec::new(),
@@ -1543,6 +1673,7 @@ impl ShelluneView {
             files_panel_focus_pending: None,
             files_rows: Rc::new(RefCell::new(Vec::new())),
             viewport_width: px(crate::app::DEFAULT_WINDOW_SIZE.0),
+            viewport_height: px(crate::app::DEFAULT_WINDOW_SIZE.1),
             files_layout_override: None,
             palette: None,
             palette_query: String::new(),
@@ -1594,6 +1725,7 @@ impl ShelluneView {
         view.bind_keys_search(cx);
         view.bind_remote_fields(cx);
         view.restore_hosts(cx);
+        view.restore_groups();
         view.restore_trust();
         view.reload_forwards();
         view.restore_workspace_layout();
@@ -2089,6 +2221,290 @@ impl ShelluneView {
             HostBook::from_hosts(self.workspace.hosts().items().to_vec()).unwrap_or_default();
     }
 
+    /// Reads the group tree from beside the hosts (R18).
+    ///
+    /// A tree that cannot be read leaves the hosts listed and says why: the groups are a
+    /// way to arrange saved records, not a condition for holding them.
+    fn restore_groups(&mut self) {
+        match self.group_service.groups().load() {
+            Ok(book) => {
+                self.groups = book;
+                self.group_problem = None;
+            }
+            Err(error) => {
+                self.groups = GroupBook::new();
+                self.group_problem = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Switches the list view, keeping the selection: it is a set of hosts, not of rows.
+    pub(super) fn select_host_view(&mut self, view: HostView, cx: &mut Context<Self>) {
+        self.hosts.select_view(view);
+        cx.notify();
+    }
+
+    /// Adds or removes one host from the selection (R18).
+    pub(super) fn toggle_host_selection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        self.hosts.toggle_selected(id);
+        cx.notify();
+    }
+
+    /// Replaces the selection with the hosts one scope names.
+    pub(super) fn select_hosts_in_scope(&mut self, ids: Vec<HostId>, cx: &mut Context<Self>) {
+        self.hosts.select(ids);
+        cx.notify();
+    }
+
+    /// Opens the connection form of a saved host, by identifier.
+    pub(super) fn connect_saved_host(&mut self, id: HostId, cx: &mut Context<Self>) {
+        let Some(host) = self.book.host(id).cloned() else {
+            return;
+        };
+        self.open_remote(&host, cx);
+    }
+
+    /// Opens the forwarding page on one saved host.
+    pub(super) fn open_saved_forwards(&mut self, id: HostId, cx: &mut Context<Self>) {
+        self.show_forwards_scope(crate::app::forwarding::ForwardScope::Host(id), cx);
+    }
+
+    /// Opens the editor filled with a saved host, by identifier.
+    pub(super) fn edit_saved_host(&mut self, id: HostId, cx: &mut Context<Self>) {
+        let Some(host) = self.book.host(id).cloned() else {
+            return;
+        };
+        self.open_edit_host(&host, cx);
+    }
+
+    /// Opens or closes one group of the list.
+    ///
+    /// A closed group hides its rows, never its hosts: the count in its header and the
+    /// result a selection covers are the same before and after.
+    pub(super) fn toggle_group_row(&mut self, path: Option<GroupPath>, cx: &mut Context<Self>) {
+        match path {
+            Some(path) => self.hosts.toggle_group(&path),
+            None => self.hosts.toggle_ungrouped(),
+        }
+        cx.notify();
+    }
+
+    /// Chooses one row of the group tree: it becomes the filter of the list, and it
+    /// opens, so the hosts it holds are what the next press can reach.
+    pub(super) fn pick_group_row(&mut self, path: Option<GroupPath>, cx: &mut Context<Self>) {
+        match path {
+            Some(path) => {
+                self.hosts.set_group_filter(Some(path.clone()));
+                self.hosts.set_expanded(&path, true);
+            }
+            None => {
+                self.hosts.set_group_filter(None);
+                self.hosts.set_ungrouped_expanded(true);
+            }
+        }
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // Group changes (R18)
+    // -----------------------------------------------------------------------
+
+    /// Opens the dialog for one group change, with its fields ready to type into.
+    pub(super) fn open_group_dialog(
+        &mut self,
+        action: GroupAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ux = copy::ux();
+        self.hosts.open_group_dialog(action);
+        self.group_problem = None;
+        let start = self
+            .hosts
+            .group_editor()
+            .map(|editor| editor.name().to_owned())
+            .unwrap_or_default();
+        let name = cx.new(|cx| TextField::with_text(ux.hosts_group_name_label, start, cx));
+        let destination = cx.new(|cx| TextField::new(ux.hosts_group_destination_hint, cx));
+
+        // Every keystroke reaches the editor, so what the dialog shows and what a
+        // confirmation would save are the same text. The observer is the view's own, so
+        // it writes the editor directly instead of reaching back into an entity that is
+        // already being updated.
+        cx.observe(&name, |view, field, cx| {
+            let text = field.read(cx).text().to_owned();
+            if let Some(editor) = view.hosts.group_editor_mut() {
+                editor.set_name(text);
+            }
+            cx.notify();
+        })
+        .detach();
+        cx.observe(&destination, |view, field, cx| {
+            let text = field.read(cx).text().to_owned();
+            if let Some(editor) = view.hosts.group_editor_mut() {
+                editor.set_destination(text);
+            }
+            cx.notify();
+        })
+        .detach();
+
+        let handle = name.read(cx).focus_handle().clone();
+        window.focus(&handle);
+        let focus_destination = self
+            .hosts
+            .group_editor()
+            .is_some_and(|editor| !matches!(editor.action(), GroupAction::Create));
+        if focus_destination {
+            let handle = destination.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
+        self.group_name_field = Some(name);
+        self.group_destination_field = Some(destination);
+        cx.notify();
+    }
+
+    /// Closes the group dialog, leaving the tree as it was.
+    pub(super) fn close_group_dialog(&mut self, cx: &mut Context<Self>) {
+        self.hosts.close_group_editor();
+        self.group_name_field = None;
+        self.group_destination_field = None;
+        self.restore_focus_pending = true;
+        cx.notify();
+    }
+
+    /// The tree with one branch made explicit.
+    ///
+    /// A group can exist only because hosts name it: the file records the groups that
+    /// were created or left empty, and an imported or hand-written host may arrive with
+    /// a path nobody created. Renaming or deleting such a branch stages the path and the
+    /// paths under it into the tree first, so the change is one write the model can
+    /// validate instead of a refusal about a group the user can see on screen — and the
+    /// branch that is renamed is the branch that is written, down to its leaves.
+    fn tree_with_branch(&self, path: &GroupPath) -> Result<GroupBook, String> {
+        let mut tree = self.groups.clone();
+        if !tree.contains(path) {
+            tree.insert(path).map_err(|error| error.to_string())?;
+        }
+        for host in self.book.hosts() {
+            if let Some(saved) = host.group_path()
+                && saved.starts_with(path)
+                && !tree.contains(&saved)
+            {
+                tree.insert(&saved).map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(tree)
+    }
+
+    /// Applies the group change the dialog asks about.
+    ///
+    /// Every branch goes through one service call, which writes the hosts and the tree
+    /// together: a refused name, a destination inside the group being changed, or a
+    /// failed write leaves both files as they were and puts the reason in the dialog.
+    pub(super) fn confirm_group_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.hosts.group_editor().cloned() else {
+            return;
+        };
+        let ux = copy::ux();
+        let action = editor.action().clone();
+        let outcome = match &action {
+            GroupAction::Create => group_path_from_text(editor.name())
+                .and_then(|path| path.ok_or_else(|| ux.hosts_group_name_required.to_owned()))
+                .and_then(|path| {
+                    self.group_service
+                        .create_group(&self.groups, &path)
+                        .map(|groups| GroupOutcome {
+                            hosts: None,
+                            groups,
+                            message: ux.hosts_group_created.to_owned(),
+                        })
+                        .map_err(|error| error.to_string())
+                }),
+            GroupAction::Rename(from) => group_path_from_text(editor.name())
+                .and_then(|path| path.ok_or_else(|| ux.hosts_group_name_required.to_owned()))
+                .and_then(|to| {
+                    let tree = self.tree_with_branch(from)?;
+                    self.group_service
+                        .rename_group(&self.book, &tree, from, &to)
+                        .map(|update| GroupOutcome {
+                            message: copy::fill(
+                                ux.hosts_group_renamed,
+                                &[("count", &update.hosts_changed.to_string())],
+                            ),
+                            hosts: Some(update.hosts),
+                            groups: update.groups,
+                        })
+                        .map_err(|error| error.to_string())
+                }),
+            GroupAction::Move => {
+                let ids = self.hosts.selected().ids();
+                if ids.is_empty() {
+                    Err(ux.hosts_select_start.to_owned())
+                } else {
+                    group_path_from_text(editor.destination()).and_then(|destination| {
+                        self.group_service
+                            .move_hosts(&self.book, &self.groups, &ids, destination.as_ref())
+                            .map(|update| GroupOutcome {
+                                message: copy::fill(
+                                    ux.hosts_moved,
+                                    &[("count", &update.hosts_changed.to_string())],
+                                ),
+                                hosts: Some(update.hosts),
+                                groups: update.groups,
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                }
+            }
+            GroupAction::Delete(path) => {
+                group_path_from_text(editor.destination()).and_then(|destination| {
+                    let tree = self.tree_with_branch(path)?;
+                    self.group_service
+                        .delete_group(&self.book, &tree, path, destination.as_ref())
+                        .map(|(update, _preview)| GroupOutcome {
+                            message: copy::fill(
+                                ux.hosts_group_deleted,
+                                &[("count", &update.hosts_changed.to_string())],
+                            ),
+                            hosts: Some(update.hosts),
+                            groups: update.groups,
+                        })
+                        .map_err(|error| error.to_string())
+                })
+            }
+        };
+
+        match outcome {
+            Ok(outcome) => {
+                self.groups = outcome.groups;
+                if let Some(book) = outcome.hosts {
+                    self.book = book;
+                    let items = self.book.hosts().to_vec();
+                    self.workspace.replace_hosts(SectionStatus::Ready, items);
+                    self.recheck_open_hosts();
+                    self.hosts.retain_selected(&self.book);
+                }
+                self.group_problem = None;
+                let message = outcome.message;
+                self.close_group_dialog(cx);
+                // The group the change was about may have been renamed or removed, so a
+                // filter naming it would hide everything afterwards.
+                if let Some(filter) = self.hosts.filter().group().cloned()
+                    && !self.groups.contains(&filter)
+                {
+                    self.hosts.set_group_filter(None);
+                }
+                self.hosts.set_message(message, false);
+            }
+            Err(reason) => {
+                if let Some(editor) = self.hosts.group_editor_mut() {
+                    editor.set_error(reason);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// How many forwarding rules are saved, and whether any is listening.
     #[cfg(test)]
     pub fn forward_restore_state(&self) -> (usize, bool) {
@@ -2105,6 +2521,26 @@ impl ShelluneView {
     #[must_use]
     pub fn book(&self) -> &HostBook {
         &self.book
+    }
+
+    /// The group tree this window last read or wrote (R18).
+    #[cfg(test)]
+    #[must_use]
+    pub fn groups(&self) -> &GroupBook {
+        &self.groups
+    }
+
+    /// The widest slice of rows one frame asked the host list to build (R18).
+    #[cfg(test)]
+    #[must_use]
+    pub fn hosts_rows_drawn(&self) -> usize {
+        self.hosts_rows_drawn.get()
+    }
+
+    /// The host list's scroll, so a test can bring a row into view.
+    #[cfg(test)]
+    pub fn hosts_scroll(&self) -> &UniformListScrollHandle {
+        &self.hosts_scroll
     }
 
     /// The host list views, the open form and the last message.
@@ -4028,6 +4464,22 @@ impl ShelluneView {
             field
         }));
         self.bind_import_path(cx);
+        // The preview can describe thousands of hosts, so it is narrowed by the same
+        // idea the servers page uses: type, and the rows answer (R18).
+        let search = cx.new(|cx| {
+            let mut field = TextField::new(copy::ux().import_search_placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field
+        });
+        cx.observe(&search, |view, field, cx| {
+            let phrase = field.read(cx).text().to_owned();
+            if view.import.search() != phrase {
+                view.import.set_search(phrase);
+                cx.notify();
+            }
+        })
+        .detach();
+        self.import_search = Some(search);
         cx.notify();
     }
 
@@ -4035,6 +4487,7 @@ impl ShelluneView {
     fn close_import(&mut self, cx: &mut Context<Self>) {
         self.import.close();
         self.import_path = None;
+        self.import_search = None;
         cx.notify();
     }
 
@@ -7036,10 +7489,14 @@ impl ShelluneView {
             SectionState::Empty | SectionState::Populated => {}
         }
 
+        // The list fills the rest of the page: a virtualized list has to be given the
+        // height it may use, or it cannot know which rows are the visible ones.
         let mut column = div()
             .flex()
             .flex_col()
+            .flex_1()
             .w_full()
+            .min_h(px(0.0))
             .gap(metrics.scale(spacing::SNUG));
         // A connection in progress belongs at the top of the destination that
         // started it, beside the host it is for. Attempts that are not the form on
@@ -7082,12 +7539,11 @@ impl ShelluneView {
                 .child(self.hosts_storage_line());
         }
 
-        column = column.child(self.hosts_toolbar(cx));
         if let Some(id) = self.hosts.pending_delete() {
             column = column.child(self.host_delete_bar(id, cx));
         }
         column
-            .child(self.hosts_list(cx))
+            .child(self.hosts_management(cx))
             .child(self.hosts_storage_line())
     }
 
@@ -7123,43 +7579,6 @@ impl ShelluneView {
             .tooltip(components::tooltip(SharedString::from(
                 self.store.path().display().to_string(),
             )))
-    }
-
-    /// The search field and the three list views.
-    fn hosts_toolbar(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let mut views = components::segmented(metrics);
-        for view in HostView::ALL {
-            let selected = self.hosts.view() == view;
-            views = views.child(
-                components::segment(view.label(strings), selected, metrics)
-                    .id(view.debug_selector())
-                    .debug_selector(move || view.debug_selector().to_owned())
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.hosts.select_view(view);
-                        cx.notify();
-                    })),
-            );
-        }
-
-        // Importing sits beside the views because it is how a list gets its first
-        // records; the panel it opens states its limits before anything is saved.
-        div()
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .debug_selector(|| "hosts.toolbar".to_owned())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(metrics.scale(180.0))
-                    .debug_selector(|| "hosts.search".to_owned())
-                    .child(self.hosts_search.clone()),
-            )
-            .child(views)
-            .child(self.import_button(cx))
     }
 
     /// The button that opens the import panel.
@@ -7203,6 +7622,7 @@ impl ShelluneView {
     fn import_panel(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
 
         let path_field = match &self.import_path {
             Some(field) => div()
@@ -7286,8 +7706,50 @@ impl ShelluneView {
 
         card = card.child(self.import_limits(preview));
 
-        for (index, host) in preview.hosts().iter().enumerate() {
+        // A file can describe thousands of hosts, so the rows are narrowed by a phrase
+        // rather than listed end to end (R18). The row number is the position in the
+        // file, so a narrowed list does not renumber what it shows.
+        let rows = self.import.matching();
+        let mut search_row = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "hosts.import.search".to_owned());
+        if let Some(field) = &self.import_search {
+            search_row = search_row.child(div().flex_1().min_w(px(0.0)).child(field.clone()));
+        }
+        search_row = search_row.child(
+            div()
+                .flex_none()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .debug_selector(|| "hosts.import.count".to_owned())
+                .child(SharedString::from(copy::fill(
+                    ux.import_count,
+                    &[
+                        ("shown", &rows.len().to_string()),
+                        ("total", &preview.hosts().len().to_string()),
+                    ],
+                ))),
+        );
+        card = card.child(search_row);
+        let total = rows.len();
+        let mut drawn = 0usize;
+        for (index, host) in rows.into_iter().take(crate::app::hosts::IMPORT_ROW_LIMIT) {
             card = card.child(self.import_row(index, host));
+            drawn += 1;
+        }
+        if total > drawn {
+            card = card.child(
+                div()
+                    .debug_selector(|| "hosts.import.limited".to_owned())
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(SharedString::from(copy::fill(
+                        ux.import_row_limit,
+                        &[("shown", &drawn.to_string()), ("total", &total.to_string())],
+                    ))),
+            );
         }
 
         let mut actions = div()
@@ -7551,342 +8013,6 @@ impl ShelluneView {
                         |view, cx| view.cancel_delete_host(cx),
                     )),
             )
-    }
-
-    /// The saved hosts, in the shape the current view selects.
-    fn hosts_list(&self, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        // The number of rows the current view lists is part of the selector, so a
-        // test can tell "the search narrowed the list" from "the list did not
-        // change" without reading text.
-        let entries = match self.hosts.view() {
-            HostView::All => self.hosts.filtered(&self.book).len(),
-            HostView::Groups => self
-                .hosts
-                .groups(&self.book)
-                .iter()
-                .map(shellune_storage::Group::len)
-                .sum(),
-            HostView::Recent => self.hosts.recent(&self.book).len(),
-        };
-        let mut list = div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::SNUG))
-            .w_full()
-            .debug_selector(move || format!("hosts.list.{entries}"));
-
-        match self.hosts.view() {
-            HostView::All => {
-                let hosts = self.hosts.filtered(&self.book);
-                if hosts.is_empty() {
-                    return self.nothing_to_list(list);
-                }
-                let mut grid = self.host_grid();
-                for (index, host) in hosts.into_iter().enumerate() {
-                    grid = grid.child(self.host_row(index, host, cx));
-                }
-                list = list.child(grid);
-            }
-            HostView::Groups => {
-                let groups = self.hosts.groups(&self.book);
-                if groups.is_empty() {
-                    return self.nothing_to_list(list);
-                }
-                // The row numbering comes from one function that runs across the groups,
-                // so two rows of one list can never share an element id.
-                let offsets = group_row_offsets(&groups);
-                for (group_index, (group, offset)) in groups.iter().zip(offsets).enumerate() {
-                    let label = group.label().unwrap_or(strings.hosts_ungrouped);
-                    list = list.child(
-                        div()
-                            .debug_selector(move || format!("hosts.group.{group_index}"))
-                            .flex()
-                            .items_center()
-                            .gap(metrics.scale(spacing::TIGHT))
-                            .pt(metrics.scale(if group_index == 0 {
-                                0.0
-                            } else {
-                                spacing::TIGHT
-                            }))
-                            .child(components::section_label(label.to_owned(), metrics))
-                            .child(components::badge(group.len(), Tone::Neutral, metrics)),
-                    );
-                    let mut grid = self.host_grid();
-                    for (row_index, host) in (offset..).zip(group.hosts()) {
-                        grid = grid.child(self.host_row(row_index, host, cx));
-                    }
-                    list = list.child(grid);
-                }
-            }
-            HostView::Recent => {
-                let recent = self.hosts.recent(&self.book);
-                if recent.is_empty() {
-                    return list.child(self.hosts_recent_empty());
-                }
-                let mut grid = self.host_grid();
-                for (index, entry) in recent.into_iter().enumerate() {
-                    grid = grid.child(self.host_recent_row(index, entry, cx));
-                }
-                list = list.child(grid);
-            }
-        }
-        list
-    }
-
-    /// The grid the host cards sit in: as many columns as the window has room for,
-    /// each at least [`HOST_CARD_MIN_WIDTH`] wide, so a card never squeezes its name
-    /// or its buttons and a narrow window simply lists one card per line (R4).
-    fn host_grid(&self) -> Div {
-        let metrics = self.metrics();
-        let room = self.viewport_width.min(metrics.scale(HOME_MAX_WIDTH))
-            - metrics.scale(HOME_SIDE_PADDING * 2.0);
-        let card = metrics.scale(HOST_CARD_MIN_WIDTH);
-        let columns = ((room / card).floor() as u16).clamp(1, 3);
-        div()
-            .grid()
-            .grid_cols(columns)
-            .w_full()
-            .gap(metrics.scale(spacing::SNUG))
-    }
-
-    /// One saved host as a card: who it is on top, what to do with it underneath.
-    fn host_card(
-        &self,
-        selector: String,
-        avatar: Div,
-        name: String,
-        target: String,
-        footer_note: Option<Div>,
-        actions: [Stateful<Div>; 4],
-    ) -> Div {
-        let metrics = self.metrics();
-        let hover_border = theme::swatch(palette::BORDER_STRONG);
-        let hover_bg = theme::swatch(palette::SURFACE_RAISED);
-        let [connect, forwards, edit, delete] = actions;
-        div()
-            .debug_selector(move || selector.clone())
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::SNUG))
-            .min_w(px(0.0))
-            .p(metrics.scale(spacing::SNUG + 2.0))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .shadow_xs()
-            .hover(move |style| style.bg(hover_bg).border_color(hover_border).shadow_md())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::SNUG))
-                    .min_w(px(0.0))
-                    .child(avatar)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .gap(metrics.scale(2.0))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(metrics.body_size())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(name)),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .font_family(terminal::monospace_family())
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(SharedString::from(target)),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .items_center()
-                            .children(footer_note),
-                    )
-                    .child(forwards)
-                    .child(edit)
-                    .child(delete)
-                    .child(connect.ml(metrics.scale(spacing::HAIRLINE))),
-            )
-    }
-
-    /// One saved host with the buttons that change it.
-    fn host_row(&self, index: usize, host: &HostConfig, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let id = host.id();
-        let edited = host.clone();
-        let target = host.clone();
-        let note = host_group_chip(host).map(|group| components::tag(group, metrics));
-        self.host_card(
-            format!("hosts.row.{index}"),
-            host_avatar(host.name(), false, metrics),
-            host.name().to_owned(),
-            host.target(),
-            note,
-            [
-                self.icon_text_button(
-                    SharedString::from(format!("hosts.connect.{index}")),
-                    Icon::Plug,
-                    strings.remote_connect,
-                    Variant::Soft,
-                    cx,
-                    move |view, cx| view.open_remote(&target, cx),
-                ),
-                self.row_icon_button(
-                    SharedString::from(format!("hosts.forwards.{index}")),
-                    Icon::Forward,
-                    strings.forward_open,
-                    false,
-                    cx,
-                    move |view, cx| {
-                        view.show_forwards_scope(
-                            crate::app::forwarding::ForwardScope::Host(id),
-                            cx,
-                        );
-                    },
-                ),
-                self.row_icon_button(
-                    SharedString::from(format!("hosts.edit.{index}")),
-                    Icon::Pencil,
-                    strings.host_edit,
-                    false,
-                    cx,
-                    move |view, cx| view.open_edit_host(&edited, cx),
-                ),
-                self.row_icon_button(
-                    SharedString::from(format!("hosts.delete.{index}")),
-                    Icon::Trash,
-                    strings.host_delete,
-                    true,
-                    cx,
-                    move |view, cx| view.ask_delete_host(id, cx),
-                ),
-            ],
-        )
-    }
-
-    /// One host that was really reached, with when it happened.
-    fn host_recent_row(
-        &self,
-        index: usize,
-        entry: shellune_storage::RecentHost<'_>,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        let edited = entry.host.clone();
-        let reconnect_target = entry.host.clone();
-        let id = entry.host.id();
-        let last = format!(
-            "{} {} · {} {}",
-            strings.host_last_connected,
-            format_unix(entry.last_connected_unix),
-            entry.connections,
-            strings.host_connection_count
-        );
-        let note = div()
-            .min_w(px(0.0))
-            .whitespace_normal()
-            .text_size(metrics.caption_size())
-            .text_color(theme::swatch(palette::TEXT_MUTED))
-            .child(SharedString::from(last));
-        self.host_card(
-            format!("hosts.recent.{index}"),
-            host_avatar(entry.host.name(), true, metrics),
-            entry.host.name().to_owned(),
-            entry.host.target(),
-            Some(note),
-            [
-                self.icon_text_button(
-                    SharedString::from(format!("hosts.recent.connect.{index}")),
-                    Icon::Plug,
-                    strings.remote_connect,
-                    Variant::Soft,
-                    cx,
-                    move |view, cx| view.open_remote(&reconnect_target, cx),
-                ),
-                self.row_icon_button(
-                    SharedString::from(format!("hosts.recent.forwards.{index}")),
-                    Icon::Forward,
-                    strings.forward_open,
-                    false,
-                    cx,
-                    move |view, cx| {
-                        view.show_forwards_scope(
-                            crate::app::forwarding::ForwardScope::Host(id),
-                            cx,
-                        );
-                    },
-                ),
-                self.row_icon_button(
-                    SharedString::from(format!("hosts.recent.edit.{index}")),
-                    Icon::Pencil,
-                    strings.host_edit,
-                    false,
-                    cx,
-                    move |view, cx| view.open_edit_host(&edited, cx),
-                ),
-                self.row_icon_button(
-                    SharedString::from(format!("hosts.recent.delete.{index}")),
-                    Icon::Trash,
-                    strings.host_delete,
-                    true,
-                    cx,
-                    move |view, cx| view.ask_delete_host(id, cx),
-                ),
-            ],
-        )
-    }
-
-    /// Nothing to list: a search that matched nothing says so, while an empty
-    /// book next to an open form just leaves the form to be filled.
-    fn nothing_to_list(&self, list: Div) -> Div {
-        if self.hosts.search().trim().is_empty() {
-            list
-        } else {
-            list.child(self.hosts_no_match())
-        }
-    }
-
-    fn hosts_no_match(&self) -> Div {
-        let metrics = self.metrics();
-        div()
-            .debug_selector(|| "hosts.nomatch".to_owned())
-            .text_size(metrics.label_size())
-            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-            .child(self.strings().hosts_no_match)
-    }
-
-    fn hosts_recent_empty(&self) -> Div {
-        let metrics = self.metrics();
-        div()
-            .debug_selector(|| "hosts.recent.empty".to_owned())
-            .text_size(metrics.label_size())
-            .text_color(theme::swatch(palette::TEXT_MUTED))
-            .child(self.strings().hosts_recent_empty)
     }
 
     /// A small command button that runs one action.
@@ -13077,6 +13203,7 @@ impl Render for ShelluneView {
             }));
         }
         self.viewport_width = window.viewport_size().width;
+        self.viewport_height = window.viewport_size().height;
         // Opt-in only: a walkthrough can ask the process for its own viewport.
         // A normal launch does not print.
         log_viewport_for_walkthrough(window, zoom_percent(self.workspace.zoom()));
@@ -13433,6 +13560,7 @@ impl Render for ShelluneView {
             .children(self.import_overlay(window, cx))
             .children(self.tool_overlay(window, cx))
             .children(self.host_dialog_overlay(window, cx))
+            .children(self.group_dialog_overlay(window, cx))
             .children(self.custom_shell_overlay(window, cx))
             .children(self.shell_menu_overlay(window, cx))
             .children(self.files_menu_overlay(window, cx))
@@ -13912,8 +14040,6 @@ fn destination_icon(destination: Destination) -> Icon {
 pub(super) const HOME_MAX_WIDTH: f32 = 1040.0;
 /// The home column's padding on either side, before zoom.
 pub(super) const HOME_SIDE_PADDING: f32 = 32.0;
-/// The narrowest a host card may be, before zoom; fewer columns are used instead.
-const HOST_CARD_MIN_WIDTH: f32 = 300.0;
 
 /// The brand's accent-to-cyan gradient, for the few marks that carry the identity:
 /// the shell tiles on the home page and the emblems of empty states. Both stops are
@@ -13978,17 +14104,6 @@ fn host_avatar(name: &str, reached: bool, metrics: Metrics) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(theme::swatch(text))
         .child(SharedString::from(initials))
-}
-
-/// The group label a host row shows, when the host belongs to a group.
-///
-/// A host without a group shows nothing rather than the count unit, which used to
-/// print the word "host" where a group name belongs.
-pub(crate) fn host_group_chip(host: &HostConfig) -> Option<String> {
-    host.group()
-        .map(str::trim)
-        .filter(|group| !group.is_empty())
-        .map(str::to_owned)
 }
 
 /// A muted line of explanation under a row or a heading.

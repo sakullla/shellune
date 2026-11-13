@@ -18,9 +18,10 @@ use gpui::{
     ScrollWheelEvent, Size, TestAppContext, VisualTestContext, WindowId, div, point, px, size,
 };
 use shellune_core::{
-    Endpoint, EventTag, ForwardBook, ForwardRule, HostConfig, LocalShell, PaneNode, PaneTarget,
-    PanelConfig, PanelSection, Session, SessionId, SessionKind, SessionState, SplitAxis,
-    TerminalMode, Transfer, TransferDirection, WorkspaceSnapshot, WorkspaceTab, X11Forwarding,
+    Endpoint, EventTag, ForwardBook, ForwardRule, GroupBook, GroupPath, HostConfig, HostId,
+    LocalShell, PaneNode, PaneTarget, PanelConfig, PanelSection, Session, SessionId, SessionKind,
+    SessionState, SplitAxis, TerminalMode, Transfer, TransferDirection, WorkspaceSnapshot,
+    WorkspaceTab, X11Forwarding,
 };
 use shellune_ssh::X11Status;
 use shellune_storage::{
@@ -2210,20 +2211,32 @@ fn a_live_session_is_the_only_positive_session_state() {
 }
 
 #[test]
-fn a_host_without_a_group_shows_no_group_chip() {
+fn a_host_without_a_group_carries_no_group_path() {
+    // A saved host names its group as a path or not at all; a blank label is not one,
+    // which is what keeps a row from drawing an empty tag where a name belongs.
     let mut host = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("a valid host");
-    assert_eq!(crate::app::view::host_group_chip(&host), None);
-    host.set_group(Some("  "));
-    assert_eq!(
-        crate::app::view::host_group_chip(&host),
-        None,
-        "a blank group is not a group"
-    );
+    assert_eq!(host.group_path(), None);
+    assert_eq!(host.group_text(), None);
     host.set_group(Some("Production"));
     assert_eq!(
-        crate::app::view::host_group_chip(&host).as_deref(),
-        Some("Production")
+        host.group_text().as_deref(),
+        Some("Production"),
+        "the label reads as a path of one segment"
     );
+    // A label an older build saved is one segment even when it contains the separator:
+    // it has to stay readable, not silently become two levels (T9).
+    host.set_group(Some("Prod/Web"));
+    let legacy = host.group_path().expect("the label still reads");
+    assert_eq!(legacy.segments(), ["Prod/Web"]);
+    assert_eq!(legacy.depth(), 1);
+
+    let mut path = shellune_core::GroupPath::parse("Prod/Web").expect("a valid path");
+    host.set_group_path(Some(path.clone()));
+    assert_eq!(host.group_text().as_deref(), Some("Prod/Web"));
+    assert_eq!(host.group_path().expect("the saved path").depth(), 2);
+    path = path.child("api").expect("one level deeper");
+    host.set_group_path(Some(path));
+    assert_eq!(host.group_text().as_deref(), Some("Prod/Web/api"));
 }
 
 // ---------------------------------------------------------------------------
@@ -19964,5 +19977,542 @@ async fn the_tunnel_form_refuses_an_incomplete_endpoint_and_saves_nothing(cx: &m
             .rules()
             .is_empty(),
         "a refused preview saves nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Thousands of hosts (R18)
+// ---------------------------------------------------------------------------
+
+/// Writes the deterministic scale fixture, as a previous run would have left it.
+///
+/// Five thousand is the number R18 asks the list to stay usable at; the fixture is the
+/// same one the capture uses, so the shot and the test describe one list.
+fn seed_many(store: &HostStore, count: usize) -> HostBook {
+    seed(store, crate::app::hosts::deterministic_hosts(count))
+}
+
+/// Mounts the hosts page at a window size of the caller's choosing.
+fn hosts_view_at(
+    cx: &mut TestAppContext,
+    store: HostStore,
+    size: Size<Pixels>,
+) -> (Entity<ShelluneView>, &mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_store(cx, workspace, store));
+    cx.simulate_resize(size);
+    cx.run_until_parked();
+    (view, cx)
+}
+
+#[gpui::test]
+async fn a_list_of_five_thousand_hosts_builds_only_the_rows_the_window_shows(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("scale-rows");
+    let store = dir.store();
+    seed_many(&store, 5_000);
+    let (view, cx) = hosts_view(cx, store);
+
+    assert!(
+        cx.debug_bounds("hosts.list.5000").is_some(),
+        "the list holds every saved host, not a page of them"
+    );
+    let drawn = cx.update(|_window, app| view.read(app).hosts_rows_drawn());
+    assert!(drawn > 0, "the list drew no row at all");
+    assert!(
+        drawn <= 16,
+        "one frame built {drawn} rows of five thousand, so the list is not virtualized"
+    );
+    assert!(
+        cx.debug_bounds("hosts.row.2000").is_none(),
+        "a row far below the window was built although nobody could see it"
+    );
+    // Reading a list is not dialling it: no session and no attempt exists afterwards.
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(view.workspace().item_count(Destination::Sessions), 0);
+        assert!(view.pane().is_none());
+        assert_eq!(view.workspace().item_count(Destination::LocalShells), 0);
+    });
+}
+
+#[gpui::test]
+async fn scrolling_five_thousand_hosts_brings_another_row_in_and_still_connects_nothing(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("scale-scroll");
+    let store = dir.store();
+    seed_many(&store, 5_000);
+    let (view, cx) = hosts_view(cx, store);
+
+    cx.update(|_window, app| {
+        view.read(app)
+            .hosts_scroll()
+            .scroll_to_item(4_000, gpui::ScrollStrategy::Top);
+        // The list applies a scroll request on its next layout, so the frame has to be
+        // asked for rather than assumed.
+        view.update(app, |_view, cx| cx.notify());
+    });
+    cx.run_until_parked();
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("hosts.row.4000").is_some(),
+        "the row scrolled to was not drawn"
+    );
+    let drawn = cx.update(|_window, app| view.read(app).hosts_rows_drawn());
+    assert!(
+        drawn <= 16,
+        "scrolling built {drawn} rows, so the list grew with the scroll"
+    );
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).workspace().item_count(Destination::Sessions),
+            0
+        );
+    });
+}
+
+#[gpui::test]
+async fn the_search_the_group_and_the_status_narrow_one_result_and_say_so(cx: &mut TestAppContext) {
+    let dir = TempDir::new("scale-filter");
+    let store = dir.store();
+    seed_many(&store, 5_000);
+    let (view, cx) = hosts_view(cx, store);
+
+    // Every fifth host is in Prod/Web; every fifth has no group at all.
+    type_into(cx, "hosts.search", "node-0001");
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "the search narrows five thousand hosts to the one it names"
+    );
+    clear_field(cx, "hosts.search", "node-0001".len());
+
+    // The wide window's tree narrows the list to a branch and everything inside it.
+    click(cx, "hosts.tree.0");
+    assert!(
+        cx.debug_bounds("hosts.filter.group").is_some(),
+        "the narrowed list says which group narrows it"
+    );
+    let grouped = cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .hosts()
+            .iter()
+            .filter(|host| {
+                host.group_path()
+                    .is_some_and(|path| path.to_canonical().starts_with("Prod"))
+            })
+            .count()
+    });
+    assert!(
+        cx.debug_bounds("hosts.list.3000").is_some(),
+        "the Prod branch keeps {grouped} hosts and the count is on the list"
+    );
+    assert_eq!(grouped, 3_000);
+
+    // A status nobody has is a filter that keeps nothing, and it says so instead of
+    // looking like an empty book.
+    click(cx, "hosts.status.connected");
+    assert!(
+        cx.debug_bounds("hosts.list.0").is_some(),
+        "no host is connected, so the narrowed result is empty"
+    );
+    assert!(
+        cx.debug_bounds("hosts.nomatch").is_some(),
+        "an empty result names the filters rather than looking like no host was saved"
+    );
+
+    click(cx, "hosts.filter.clear");
+    assert!(
+        cx.debug_bounds("hosts.list.5000").is_some(),
+        "dropping the filters brings every host back"
+    );
+}
+
+#[gpui::test]
+async fn the_narrow_window_folds_the_groups_into_a_filter(cx: &mut TestAppContext) {
+    let dir = TempDir::new("scale-narrow");
+    let store = dir.store();
+    seed_many(&store, 40);
+    let (view, cx) = hosts_view_at(cx, store, minimum_window());
+
+    assert!(
+        !cx.update(|_window, app| view.read(app).group_column_fits()),
+        "a narrow window does not spend a column on the tree"
+    );
+    assert!(
+        cx.debug_bounds("hosts.group.chooser").is_some(),
+        "the same groups are reachable as a filter control"
+    );
+    assert!(
+        cx.debug_bounds("hosts.row.0").is_some(),
+        "the list is still drawn in the minimum window"
+    );
+
+    click(cx, "hosts.group.option.Prod");
+    assert!(
+        cx.debug_bounds("hosts.filter.group").is_some(),
+        "choosing a group on the narrow layout narrows the list"
+    );
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app)
+                .hosts_state()
+                .filter()
+                .group()
+                .map(GroupPath::to_canonical),
+            Some("Prod".to_owned())
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_batch_move_takes_every_host_the_filters_kept_and_keeps_them_saved(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("batch-move");
+    let store = dir.store();
+    seed_many(&store, 20);
+    let (view, cx) = hosts_view(cx, store);
+
+    // The scope says what "select" covers before it covers anything.
+    click(cx, "hosts.select.0");
+    assert!(
+        cx.debug_bounds("hosts.selection").is_some(),
+        "a selection says how many hosts it holds and what it covers"
+    );
+    assert!(
+        cx.debug_bounds("hosts.scope.current").is_some(),
+        "the scope names the current result, not the page"
+    );
+    click(cx, "hosts.select.scope");
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).hosts_state().selected_count(),
+            20,
+            "the current result is every host the filters kept"
+        );
+    });
+
+    click(cx, "hosts.select.move");
+    assert!(
+        cx.debug_bounds("hosts.group.move").is_some(),
+        "moving a selection asks where it goes"
+    );
+    type_into(cx, "hosts.group.destination", "Ops/Edge");
+    click(cx, "hosts.group.confirm");
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(view.book().hosts().len(), 20, "a move never deletes a host");
+        let destination = GroupPath::parse("Ops/Edge").expect("a valid path");
+        assert!(
+            view.groups().contains(&destination),
+            "the destination group is saved, so it survives the restart"
+        );
+        assert!(
+            view.book()
+                .hosts()
+                .iter()
+                .all(|host| host.group_path().as_ref() == Some(&destination)),
+            "every selected host is in the destination"
+        );
+    });
+
+    // What a restart reads is what the window says it saved.
+    let restarted = HostStore::at(dir.path()).load().expect("the file loads");
+    let destination = GroupPath::parse("Ops/Edge").expect("a valid path");
+    assert_eq!(
+        restarted.hosts_under_group(&destination).len(),
+        20,
+        "the move reached the file"
+    );
+    let groups = shellune_storage::GroupStore::at(dir.path())
+        .load()
+        .expect("the tree loads");
+    assert!(groups.contains(&destination));
+}
+
+#[gpui::test]
+async fn deleting_a_group_moves_its_hosts_and_never_deletes_one(cx: &mut TestAppContext) {
+    let dir = TempDir::new("group-delete");
+    let store = dir.store();
+    seed_many(&store, 20);
+    let (view, cx) = hosts_view(cx, store);
+
+    click(cx, "hosts.tree.0");
+    click(cx, "hosts.group.delete.open");
+    assert!(
+        cx.debug_bounds("hosts.group.delete").is_some(),
+        "deleting a group asks where the hosts go first"
+    );
+    assert!(
+        cx.debug_bounds("hosts.group.destination").is_some(),
+        "the confirmation has a destination field"
+    );
+    type_into(cx, "hosts.group.destination", "Staging");
+    click(cx, "hosts.group.confirm");
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(view.book().hosts().len(), 20, "no host was deleted");
+        let deleted = GroupPath::parse("Prod").expect("a valid path");
+        assert!(
+            !view.groups().contains(&deleted),
+            "the group is gone from the tree"
+        );
+        let destination = GroupPath::parse("Staging").expect("a valid path");
+        assert_eq!(
+            view.book().hosts_under_group(&destination).len(),
+            16,
+            "the twelve hosts under the deleted branch moved to a destination that already held four"
+        );
+    });
+}
+
+#[gpui::test]
+async fn renaming_a_group_moves_the_hosts_inside_it_and_the_tree_after_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("group-rename");
+    let store = dir.store();
+    seed_many(&store, 20);
+    let (view, cx) = hosts_view(cx, store);
+
+    click(cx, "hosts.tree.0");
+    click(cx, "hosts.group.rename.open");
+    clear_field(cx, "hosts.group.name", "Prod".len());
+    type_into(cx, "hosts.group.name", "Production");
+    click(cx, "hosts.group.confirm");
+
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let renamed = GroupPath::parse("Production").expect("a valid path");
+        assert!(view.groups().contains(&renamed), "the new name is saved");
+        assert!(
+            !view
+                .groups()
+                .contains(&GroupPath::parse("Prod").expect("a valid path")),
+            "the old name is gone"
+        );
+        assert_eq!(
+            view.book().hosts_under_group(&renamed).len(),
+            12,
+            "every host under the branch moved with it"
+        );
+    });
+
+    // The tree and the hosts agree after a restart, which is what "the structure is
+    // consistent" means for the file a later run has to read.
+    let groups = shellune_storage::GroupStore::at(dir.path())
+        .load()
+        .expect("the tree loads");
+    let book = HostStore::at(dir.path()).load().expect("the hosts load");
+    for path in groups.paths() {
+        let saved = book.hosts_under_group(path).len();
+        assert!(
+            saved > 0 || groups.descendants(path).is_empty() && saved == 0,
+            "a saved group is bound to the hosts it kept"
+        );
+    }
+    let renamed = GroupPath::parse("Production/Web").expect("a valid path");
+    assert!(
+        groups.contains(&renamed),
+        "the child branch moved with its parent"
+    );
+}
+
+#[gpui::test]
+async fn a_preview_of_thousands_of_hosts_builds_a_bounded_number_of_rows(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-limit");
+    let mut config = String::new();
+    for index in 1..=210 {
+        config.push_str(&format!(
+            "Host node-{index:03}\n    HostName 10.1.0.{}\n    User deploy\n\n",
+            index % 250
+        ));
+    }
+    let path = dir.path().join("config");
+    std::fs::write(&path, config).expect("the test writes the configuration");
+
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&path.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).import_state().matching().len(),
+            210,
+            "the preview still describes every host of the file"
+        );
+    });
+    assert!(
+        cx.debug_bounds("hosts.import.limited").is_some(),
+        "a preview longer than the bound says how many rows it drew of how many it has"
+    );
+    assert!(
+        cx.debug_bounds("hosts.import.row.199").is_some(),
+        "the last row inside the bound is drawn"
+    );
+}
+
+#[gpui::test]
+async fn the_import_preview_is_narrowed_by_its_own_search(cx: &mut TestAppContext) {
+    // A configuration file of the size a person really imports: the preview has to be
+    // readable without reading every row (R18).
+    let dir = TempDir::new("import-search");
+    let mut config = String::new();
+    for index in 1..=30 {
+        config.push_str(&format!(
+            "Host web-{index:02}\n    HostName 10.0.0.{index}\n    User deploy\n\n"
+        ));
+    }
+    let path = dir.path().join("config");
+    std::fs::write(&path, config).expect("the test writes the configuration");
+
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.open_import_for_test(&path.display().to_string(), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "hosts.import.preview");
+
+    cx.update(|_window, app| {
+        let imported = view.read(app).import_state();
+        assert_eq!(
+            imported.matching().len(),
+            30,
+            "every described host is listed before anything is typed"
+        );
+    });
+
+    type_into(cx, "hosts.import.search", "web-07");
+    cx.update(|_window, app| {
+        let imported = view.read(app).import_state();
+        let rows = imported.matching();
+        assert_eq!(rows.len(), 1, "the search narrows the preview to one host");
+        assert_eq!(
+            rows[0].1.alias(),
+            "web-07",
+            "and it is the host that was typed"
+        );
+        assert_eq!(
+            rows[0].0, 6,
+            "the row keeps the line it was read from, so a narrowed list is not renumbered"
+        );
+        assert_eq!(
+            imported.preview().map(|preview| preview.hosts().len()),
+            Some(30),
+            "the file still describes thirty hosts"
+        );
+    });
+    assert!(
+        cx.debug_bounds("hosts.import.row.6").is_some(),
+        "the one row the search kept is drawn"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The servers page as a model (R4, R18)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_selection_holds_identifiers_that_survive_a_search_and_a_reload() {
+    let book =
+        HostBook::from_hosts(crate::app::hosts::deterministic_hosts(10)).expect("distinct hosts");
+    let mut panel = crate::app::hosts::HostsPanel::new();
+    let ids: Vec<_> = book.hosts().iter().take(3).map(HostConfig::id).collect();
+    panel.select(ids.clone());
+    assert_eq!(panel.selected_count(), 3);
+    assert!(panel.selected().contains(ids[1]));
+
+    // Toggling one off leaves the others, and a search does not change the set.
+    assert!(!panel.toggle_selected(ids[1]));
+    let left = panel.selected().ids();
+    assert_eq!(left.len(), 2);
+    assert!(left.contains(&ids[0]) && left.contains(&ids[2]));
+    panel.set_search("node-0001");
+    assert_eq!(
+        panel.selected_count(),
+        2,
+        "a search narrows what is listed, not what is selected"
+    );
+
+    // A host that is no longer saved leaves the selection with it.
+    let mut shrunk = book.clone();
+    shrunk.remove(ids[2]).expect("the host is saved");
+    panel.retain_selected(&shrunk);
+    assert_eq!(panel.selected().ids(), vec![ids[0]]);
+}
+
+#[test]
+fn the_scope_of_a_selection_names_what_it_covers() {
+    let book =
+        HostBook::from_hosts(crate::app::hosts::deterministic_hosts(10)).expect("distinct hosts");
+    let groups = GroupBook::new();
+    let no_sessions = |_: HostId| false;
+    let mut panel = crate::app::hosts::HostsPanel::new();
+    panel.set_search("node-0003");
+    let list = panel.list(&book, &groups, &no_sessions);
+
+    assert_eq!(
+        panel.scope(),
+        crate::app::hosts::SelectionScope::CurrentResults
+    );
+    assert_eq!(list.ids_in_scope(panel.scope()).len(), 1);
+    panel.set_scope(crate::app::hosts::SelectionScope::AllHosts);
+    assert_eq!(list.ids_in_scope(panel.scope()).len(), 10);
+    assert_eq!(list.matched_len(), 1, "the result itself did not change");
+    assert_eq!(list.total(), 10);
+}
+
+#[test]
+fn a_status_filter_reads_the_sessions_the_window_already_has() {
+    let book =
+        HostBook::from_hosts(crate::app::hosts::deterministic_hosts(6)).expect("distinct hosts");
+    let groups = GroupBook::new();
+    let open = book.hosts()[2].id();
+    let is_open = move |id: HostId| id == open;
+    let mut panel = crate::app::hosts::HostsPanel::new();
+
+    panel.set_status_filter(crate::app::hosts::HostStatusFilter::Connected);
+    assert_eq!(panel.list(&book, &groups, &is_open).matched_len(), 1);
+    panel.set_status_filter(crate::app::hosts::HostStatusFilter::NeverConnected);
+    assert_eq!(
+        panel.list(&book, &groups, &is_open).matched_len(),
+        6,
+        "nothing was reached before, so every host has never been reached"
+    );
+    panel.set_status_filter(crate::app::hosts::HostStatusFilter::Any);
+    assert_eq!(panel.list(&book, &groups, &is_open).matched_len(), 6);
+}
+
+#[test]
+fn a_group_path_typed_into_the_dialog_is_the_path_that_is_saved() {
+    use crate::app::hosts::group_path_from_text;
+    assert_eq!(
+        group_path_from_text("   ").expect("blank is no group"),
+        None
+    );
+    assert_eq!(
+        group_path_from_text(" Prod/Web ")
+            .expect("a path")
+            .expect("some path")
+            .to_canonical(),
+        "Prod/Web"
+    );
+    let refusal = group_path_from_text("Prod//Web").expect_err("an empty segment is refused");
+    assert!(
+        refusal.contains("position 1"),
+        "the refusal names where to change it: {refusal}"
     );
 }

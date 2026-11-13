@@ -2374,6 +2374,82 @@ pub struct UxStrings {
     pub snippet_problem_body_long: &'static str,
     /// Refusal: the command is no longer in the library
     pub snippet_problem_unknown: &'static str,
+    /// Heading of the group column on a wide window
+    pub hosts_groups_title: &'static str,
+    /// Filter entry that clears the group narrowing
+    pub hosts_groups_all: &'static str,
+    /// Group action: create a group
+    pub hosts_group_new: &'static str,
+    /// Group action: rename a group
+    pub hosts_group_rename: &'static str,
+    /// Group action: move the selected hosts into a group
+    pub hosts_group_move: &'static str,
+    /// Group action: delete a group, moving its hosts somewhere else
+    pub hosts_group_delete: &'static str,
+    /// Placeholder of the field that narrows an import preview
+    pub import_search_placeholder: &'static str,
+    /// How many hosts a preview shows of how many it describes
+    pub import_count: &'static str,
+    /// What an import preview with more rows than it draws says about the rest
+    pub import_row_limit: &'static str,
+    /// Field label: the group name
+    pub hosts_group_name_label: &'static str,
+    /// Refusal: the dialog was confirmed with no name
+    pub hosts_group_name_required: &'static str,
+    /// Field label: where a deletion sends the hosts
+    pub hosts_group_destination_label: &'static str,
+    /// Which destination means "no group at all"
+    pub hosts_group_destination_hint: &'static str,
+    /// Button: create the named group
+    pub hosts_group_create_action: &'static str,
+    /// Button: rename the group
+    pub hosts_group_rename_action: &'static str,
+    /// Button: move the selected hosts
+    pub hosts_group_move_action: &'static str,
+    /// Button: delete the group and keep its hosts
+    pub hosts_group_delete_action: &'static str,
+    /// What deleting a group does to its hosts, with the number filled in
+    pub hosts_group_delete_body: &'static str,
+    /// Toast: the group was created
+    pub hosts_group_created: &'static str,
+    /// Toast: the group was renamed, with the number of hosts filled in
+    pub hosts_group_renamed: &'static str,
+    /// Toast: the group was deleted, with the number of hosts filled in
+    pub hosts_group_deleted: &'static str,
+    /// Toast: hosts were moved, with the number filled in
+    pub hosts_moved: &'static str,
+    /// Label of the status filter
+    pub hosts_status_label: &'static str,
+    /// Status filter: every host
+    pub hosts_status_any: &'static str,
+    /// Status filter: a host with an open session
+    pub hosts_status_connected: &'static str,
+    /// Status filter: a host that was reached before
+    pub hosts_status_recent: &'static str,
+    /// Status filter: a host the book never recorded a connection for
+    pub hosts_status_never: &'static str,
+    /// Label of the selection scope
+    pub hosts_scope_label: &'static str,
+    /// Scope: the hosts the current search and filters keep
+    pub hosts_scope_current: &'static str,
+    /// Scope: every saved host
+    pub hosts_scope_all: &'static str,
+    /// How many hosts are selected, with the number filled in
+    pub hosts_selection_count: &'static str,
+    /// Button: select every host the scope names
+    pub hosts_select_scope: &'static str,
+    /// Button: empty the selection
+    pub hosts_select_none: &'static str,
+    /// Button: turn on the selection boxes
+    pub hosts_select_start: &'static str,
+    /// How many hosts the filters keep, with both numbers filled in
+    pub hosts_result_count: &'static str,
+    /// Button: clear the search and every filter
+    pub hosts_filter_clear: &'static str,
+    /// What a narrowing filter leaves behind when nothing matches
+    pub hosts_no_match_hint: &'static str,
+    /// A group with nothing inside it
+    pub hosts_group_empty: &'static str,
 }
 
 impl UxStrings {
@@ -2553,6 +2629,44 @@ impl UxStrings {
             self.snippet_problem_body_empty,
             self.snippet_problem_body_long,
             self.snippet_problem_unknown,
+            self.hosts_groups_title,
+            self.hosts_groups_all,
+            self.hosts_group_new,
+            self.hosts_group_rename,
+            self.hosts_group_move,
+            self.hosts_group_delete,
+            self.import_search_placeholder,
+            self.import_count,
+            self.import_row_limit,
+            self.hosts_group_name_label,
+            self.hosts_group_name_required,
+            self.hosts_group_destination_label,
+            self.hosts_group_destination_hint,
+            self.hosts_group_create_action,
+            self.hosts_group_rename_action,
+            self.hosts_group_move_action,
+            self.hosts_group_delete_action,
+            self.hosts_group_delete_body,
+            self.hosts_group_created,
+            self.hosts_group_renamed,
+            self.hosts_group_deleted,
+            self.hosts_moved,
+            self.hosts_status_label,
+            self.hosts_status_any,
+            self.hosts_status_connected,
+            self.hosts_status_recent,
+            self.hosts_status_never,
+            self.hosts_scope_label,
+            self.hosts_scope_current,
+            self.hosts_scope_all,
+            self.hosts_selection_count,
+            self.hosts_select_scope,
+            self.hosts_select_none,
+            self.hosts_select_start,
+            self.hosts_result_count,
+            self.hosts_filter_clear,
+            self.hosts_no_match_hint,
+            self.hosts_group_empty,
         ]
     }
 }
@@ -2747,6 +2861,44 @@ included",
     snippet_problem_body_empty: "A shortcut command needs a command body; nothing would be inserted or run.",
     snippet_problem_body_long: "The command body is limited to {max} characters.",
     snippet_problem_unknown: "That command is no longer in the library; reopen the list.",
+    hosts_groups_title: "Groups",
+    hosts_groups_all: "All groups",
+    hosts_group_new: "New group",
+    hosts_group_rename: "Rename group",
+    hosts_group_move: "Move selection here",
+    hosts_group_delete: "Delete group",
+    import_search_placeholder: "Search the hosts this file describes",
+    import_count: "{shown} of {total} host(s)",
+    import_row_limit: "Showing the first {shown} of {total} rows; use the search to narrow them.",
+    hosts_group_name_label: "Group name",
+    hosts_group_name_required: "Type a group name first.",
+    hosts_group_destination_label: "Move hosts to",
+    hosts_group_destination_hint: "Leave blank to keep the hosts without a group",
+    hosts_group_create_action: "Create group",
+    hosts_group_rename_action: "Rename",
+    hosts_group_move_action: "Move hosts",
+    hosts_group_delete_action: "Delete group, keep hosts",
+    hosts_group_delete_body: "{count} host(s) move to the group you name first; no host is deleted.",
+    hosts_group_created: "Group created",
+    hosts_group_renamed: "Group renamed; {count} host(s) moved with it",
+    hosts_group_deleted: "Group deleted; {count} host(s) kept",
+    hosts_moved: "{count} host(s) moved",
+    hosts_status_label: "Status",
+    hosts_status_any: "Any status",
+    hosts_status_connected: "Connected now",
+    hosts_status_recent: "Reached before",
+    hosts_status_never: "Never reached",
+    hosts_scope_label: "Select from",
+    hosts_scope_current: "Current results",
+    hosts_scope_all: "All hosts",
+    hosts_selection_count: "{count} selected",
+    hosts_select_scope: "Select",
+    hosts_select_none: "Clear",
+    hosts_select_start: "Select",
+    hosts_result_count: "{shown} of {total} hosts",
+    hosts_filter_clear: "Clear filters",
+    hosts_no_match_hint: "Change the search or drop a filter to see more hosts.",
+    hosts_group_empty: "No host in this group",
 };
 
 /// Simplified Chinese.
@@ -2936,6 +3088,44 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     snippet_problem_body_empty: "快捷命令需要命令正文，否则插入或执行都是空的。",
     snippet_problem_body_long: "命令正文最多 {max} 个字符。",
     snippet_problem_unknown: "这条命令已不在库中，请重新打开列表。",
+    hosts_groups_title: "分组",
+    hosts_groups_all: "全部分组",
+    hosts_group_new: "新建分组",
+    hosts_group_rename: "重命名分组",
+    hosts_group_move: "把所选主机移到这里",
+    hosts_group_delete: "删除分组",
+    import_search_placeholder: "在这个文件描述的主机里搜索",
+    import_count: "共 {total} 台，当前显示 {shown} 台",
+    import_row_limit: "只绘制前 {shown} 行（共 {total} 行），用上面的搜索收窄。",
+    hosts_group_name_label: "分组名称",
+    hosts_group_name_required: "请先填写分组名称。",
+    hosts_group_destination_label: "主机迁往",
+    hosts_group_destination_hint: "留空表示主机保留，只是不属于任何分组",
+    hosts_group_create_action: "创建分组",
+    hosts_group_rename_action: "重命名",
+    hosts_group_move_action: "移动主机",
+    hosts_group_delete_action: "删除分组并保留主机",
+    hosts_group_delete_body: "先选好去向：{count} 台主机会移过去，一台都不会被删除。",
+    hosts_group_created: "已创建分组",
+    hosts_group_renamed: "已重命名分组，{count} 台主机一起移动",
+    hosts_group_deleted: "已删除分组，{count} 台主机保留",
+    hosts_moved: "已移动 {count} 台主机",
+    hosts_status_label: "状态",
+    hosts_status_any: "所有状态",
+    hosts_status_connected: "当前已连接",
+    hosts_status_recent: "曾经连接过",
+    hosts_status_never: "从未连接",
+    hosts_scope_label: "选择范围",
+    hosts_scope_current: "当前结果",
+    hosts_scope_all: "全部主机",
+    hosts_selection_count: "已选 {count} 台",
+    hosts_select_scope: "全选",
+    hosts_select_none: "清空",
+    hosts_select_start: "选择",
+    hosts_result_count: "共 {total} 台，当前显示 {shown} 台",
+    hosts_filter_clear: "清除筛选",
+    hosts_no_match_hint: "改一下搜索词，或去掉一个筛选条件，就能看到更多主机。",
+    hosts_group_empty: "这个分组里没有主机",
 };
 
 /// The redesigned-shell strings of the current language.

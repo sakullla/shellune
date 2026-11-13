@@ -12,13 +12,24 @@
 //! * a message says what really happened. "Saved" never implies a connection was
 //!   opened, and a failure keeps the reason the storage layer produced.
 
-use shellune_core::{AuthMethodKind, HostConfig, HostId, Port, TransferProtocol, X11Forwarding};
+//!
+//! The list itself is a row model, not a set of elements: a group header and the hosts
+//! the current filters keep are flattened into rows that carry a stable HostId or
+//! GroupPath, so five thousand saved hosts cost five thousand rows of data and only the
+//! visible ones are drawn (R18, ADR-8). Nothing here dials: the connection state a filter
+//! reads is the state the window already holds.
+
+use std::collections::BTreeSet;
+
+use shellune_core::{
+    AuthMethodKind, GroupBook, GroupPath, HostConfig, HostId, Port, TransferProtocol, X11Forwarding,
+};
 use shellune_storage::{
-    DEFAULT_CONFIG_TEXT, Group, HostBook, HostEdit, ImportOutcome, ImportPlan, ImportPreview,
-    RecentHost, host_matches,
+    DEFAULT_CONFIG_TEXT, HostBook, HostEdit, ImportOutcome, ImportPlan, ImportPreview,
+    ImportedHost, host_matches,
 };
 
-use crate::app::copy::Strings;
+use crate::app::copy::{Strings, UxStrings};
 
 /// Which subset of the saved hosts the list shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -503,6 +514,18 @@ pub struct HostsPanel {
     draft: Option<HostDraft>,
     pending_delete: Option<HostId>,
     message: Option<HostsMessage>,
+    /// The group and status the list is narrowed to, beside the search phrase.
+    filter: HostFilter,
+    /// What the selection means while it grows: the current result or every host.
+    scope: SelectionScope,
+    /// The hosts the user picked, by identifier rather than by row (R18).
+    selected: HostSelection,
+    /// The groups the tree draws closed. A group starts open.
+    collapsed: BTreeSet<GroupPath>,
+    /// Whether the hosts without a group are drawn closed.
+    ungrouped_collapsed: bool,
+    /// The group being created, renamed, moved into or deleted, while its dialog is up.
+    group_editor: Option<GroupEditor>,
 }
 
 impl HostsPanel {
@@ -615,25 +638,366 @@ impl HostsPanel {
         self.message = None;
     }
 
-    /// The hosts the current view lists, filtered by the search phrase.
+    /// The group and status filters in force beside the search phrase.
     #[must_use]
-    pub fn filtered<'a>(&self, book: &'a HostBook) -> Vec<&'a HostConfig> {
-        book.search(&self.search)
+    pub fn filter(&self) -> &HostFilter {
+        &self.filter
     }
 
-    /// The groups the current view lists, filtered by the search phrase.
-    #[must_use]
-    pub fn groups<'a>(&self, book: &'a HostBook) -> Vec<Group<'a>> {
-        HostBook::group(book.search(&self.search))
+    /// Narrows the list to one group and everything inside it.
+    ///
+    /// The filter is a place in the tree, not a row: a group that is collapsed or
+    /// hidden by the narrow layout still narrows the list, and dropping the filter is
+    /// the only way back to every group.
+    pub fn set_group_filter(&mut self, group: Option<GroupPath>) {
+        if self.filter.group != group {
+            self.filter.group = group;
+            self.pending_delete = None;
+        }
     }
 
-    /// The reached hosts the recent view lists, filtered by the search phrase.
+    /// Narrows the list by the connection state this window already knows.
+    pub fn set_status_filter(&mut self, status: HostStatusFilter) {
+        if self.filter.status != status {
+            self.filter.status = status;
+            self.pending_delete = None;
+        }
+    }
+
+    /// Drops every narrowing filter, keeping the search phrase as it is.
+    pub fn clear_filters(&mut self) {
+        self.filter = HostFilter::default();
+    }
+
+    /// What the selection covers while it grows.
     #[must_use]
-    pub fn recent<'a>(&self, book: &'a HostBook) -> Vec<RecentHost<'a>> {
-        book.recent_hosts()
-            .into_iter()
-            .filter(|recent| host_matches(recent.host, &self.search))
+    pub fn scope(&self) -> SelectionScope {
+        self.scope
+    }
+
+    /// Chooses what a selection means: the current result, or every saved host.
+    pub fn set_scope(&mut self, scope: SelectionScope) {
+        self.scope = scope;
+    }
+
+    /// The hosts the user picked.
+    #[must_use]
+    pub fn selected(&self) -> &HostSelection {
+        &self.selected
+    }
+
+    /// Adds or removes one host from the selection.
+    ///
+    /// Returns whether the host is selected afterwards.
+    pub fn toggle_selected(&mut self, id: HostId) -> bool {
+        self.selected.toggle(id)
+    }
+
+    /// Replaces the selection with the given hosts.
+    pub fn select(&mut self, ids: impl IntoIterator<Item = HostId>) {
+        self.selected.replace(ids);
+    }
+
+    /// Empties the selection.
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+    }
+
+    /// How many hosts are selected.
+    #[must_use]
+    pub fn selected_count(&self) -> usize {
+        self.selected.len()
+    }
+
+    /// Drops selected hosts the book no longer holds.
+    ///
+    /// A deleted host leaves the selection with it: a count of hosts that are no
+    /// longer saved would promise a move that can never happen.
+    pub fn retain_selected(&mut self, book: &HostBook) {
+        let saved: Vec<HostId> = book.hosts().iter().map(HostConfig::id).collect();
+        self.selected.retain(&saved);
+    }
+
+    /// Whether the tree draws one group open.
+    #[must_use]
+    pub fn is_expanded(&self, path: &GroupPath) -> bool {
+        !self.collapsed.contains(path)
+    }
+
+    /// Opens or closes one group in the tree, changing only what is drawn.
+    pub fn toggle_group(&mut self, path: &GroupPath) {
+        if !self.collapsed.remove(path) {
+            self.collapsed.insert(path.clone());
+        }
+    }
+
+    /// Sets the tree's state for one group without toggling it.
+    pub fn set_expanded(&mut self, path: &GroupPath, expanded: bool) {
+        if expanded {
+            self.collapsed.remove(path);
+        } else {
+            self.collapsed.insert(path.clone());
+        }
+    }
+
+    /// The group change being asked about, while its dialog is open.
+    #[must_use]
+    pub fn group_editor(&self) -> Option<&GroupEditor> {
+        self.group_editor.as_ref()
+    }
+
+    /// The group change being asked about, for the dialog's own fields.
+    pub fn group_editor_mut(&mut self) -> Option<&mut GroupEditor> {
+        self.group_editor.as_mut()
+    }
+
+    /// Opens the dialog for one group change.
+    pub fn open_group_dialog(&mut self, action: GroupAction) {
+        let name = match &action {
+            GroupAction::Rename(path) => path.to_canonical(),
+            _ => String::new(),
+        };
+        self.group_editor = Some(GroupEditor::new(action, name));
+        self.draft = None;
+        self.pending_delete = None;
+        self.clear_message();
+    }
+
+    /// Closes the dialog, leaving the tree as it was.
+    pub fn close_group_editor(&mut self) {
+        self.group_editor = None;
+    }
+
+    /// The flattened rows the list draws, and the hosts the filters keep.
+    ///
+    /// The rows are the same for the wide window and the narrow one: the layout only
+    /// decides where the group chooser is drawn. A collapsed group hides its rows but
+    /// not its hosts, so the count in the header and the result the filters keep always
+    /// agree.
+    ///
+    /// [open] reports whether this window already holds a live session for a host. It
+    /// is a read of existing state, never a request: narrowing by "connected" cannot
+    /// start a connection (R18).
+    #[must_use]
+    pub fn list(
+        &self,
+        book: &HostBook,
+        groups: &GroupBook,
+        open: &dyn Fn(HostId) -> bool,
+    ) -> HostList {
+        let all: Vec<HostId> = book.hosts().iter().map(HostConfig::id).collect();
+        let matched: Vec<HostId> = book
+            .hosts()
+            .iter()
+            .filter(|host| self.matches(book, host, open))
+            .map(HostConfig::id)
+            .collect();
+        let kept: BTreeSet<HostId> = matched.iter().copied().collect();
+        let narrow_search = !self.search.trim().is_empty();
+        let mut rows = Vec::new();
+        match self.view {
+            HostView::All => {
+                for id in &matched {
+                    rows.push(HostListRow::Host(HostRow { id: *id }));
+                }
+            }
+            HostView::Recent => {
+                for recent in book.recent_hosts() {
+                    let id = recent.host.id();
+                    if kept.contains(&id) {
+                        rows.push(HostListRow::Host(HostRow { id }));
+                    }
+                }
+            }
+            HostView::Groups => {
+                self.push_tree(&mut rows, book, groups, &kept, narrow_search);
+            }
+        }
+        HostList { rows, matched, all }
+    }
+
+    /// The group tree on its own, whatever view the list is in (R4, R18).
+    ///
+    /// The column that navigates the tree is not the list: it exists beside a flat view
+    /// too, and it has to name the same groups with the same counts as the list would if
+    /// it were grouped. That is why both are built from one function.
+    #[must_use]
+    pub fn group_tree(
+        &self,
+        book: &HostBook,
+        groups: &GroupBook,
+        open: &dyn Fn(HostId) -> bool,
+    ) -> Vec<HostGroupRow> {
+        // The tree is where the group filter is chosen, so it cannot be narrowed by it:
+        // a tree that shows only the branch already chosen would leave no way to choose
+        // another. The search and the status still count, because they say how much a
+        // branch holds of what the rest of the page is looking at.
+        let kept: BTreeSet<HostId> = book
+            .hosts()
+            .iter()
+            .filter(|host| self.matches_without_group(book, host, open))
+            .map(HostConfig::id)
+            .collect();
+        let narrow_search = !self.search.trim().is_empty();
+        let mut rows = Vec::new();
+        self.push_tree(&mut rows, book, groups, &kept, narrow_search);
+        rows.into_iter()
+            .filter_map(|row| match row {
+                HostListRow::Group(group) => Some(group),
+                HostListRow::Host(_) => None,
+            })
             .collect()
+    }
+
+    /// Writes the headers of the whole tree, in order.
+    fn push_tree(
+        &self,
+        rows: &mut Vec<HostListRow>,
+        book: &HostBook,
+        groups: &GroupBook,
+        kept: &BTreeSet<HostId>,
+        narrow_search: bool,
+    ) {
+        let paths = drawn_paths(book, groups);
+        for path in child_paths(&paths, None) {
+            self.push_group(rows, &paths, book, kept, path, 0, narrow_search);
+        }
+        self.push_ungrouped(rows, book, kept);
+    }
+
+    /// Writes one group of the tree, its children and its own hosts.
+    ///
+    /// Seven arguments: the rows being written, the tree, the hosts, the ones the
+    /// filters keep, the group, its depth, and whether a phrase is typed. Splitting them
+    /// into a struct would only move the same fields behind a name.
+    #[allow(clippy::too_many_arguments)]
+    ///
+    /// A group the search does not reach is left out while a phrase is typed, so the
+    /// tree answers the search instead of listing every group with a zero beside it. A
+    /// group that is only collapsed keeps its row and its count, because closing a
+    /// group is a decision about what to see, not a filter.
+    fn push_group(
+        &self,
+        rows: &mut Vec<HostListRow>,
+        paths: &[GroupPath],
+        book: &HostBook,
+        kept: &BTreeSet<HostId>,
+        path: GroupPath,
+        depth: usize,
+        narrow_search: bool,
+    ) {
+        let hosts = hosts_under(book, kept, &path);
+        if narrow_search && hosts.is_empty() {
+            return;
+        }
+        let expanded = self.is_expanded(&path);
+        rows.push(HostListRow::Group(HostGroupRow {
+            path: Some(path.clone()),
+            depth,
+            hosts: hosts.len(),
+            expanded,
+        }));
+        if !expanded {
+            return;
+        }
+        for child in child_paths(paths, Some(&path)) {
+            self.push_group(rows, paths, book, kept, child, depth + 1, narrow_search);
+        }
+        for id in hosts {
+            rows.push(HostListRow::Host(HostRow { id }));
+        }
+    }
+
+    /// Writes the hosts that belong to no group, under a header of their own.
+    ///
+    /// They are a real place in the list rather than a leftover: a host without a group
+    /// has to be as reachable as one inside a group, and a bulk move has to be able to
+    /// name them.
+    fn push_ungrouped(
+        &self,
+        rows: &mut Vec<HostListRow>,
+        book: &HostBook,
+        kept: &BTreeSet<HostId>,
+    ) {
+        let hosts: Vec<HostId> = book
+            .hosts()
+            .iter()
+            .filter(|host| kept.contains(&host.id()) && host.group_path().is_none())
+            .map(HostConfig::id)
+            .collect();
+        if hosts.is_empty() {
+            return;
+        }
+        let expanded = self.ungrouped_expanded();
+        rows.push(HostListRow::Group(HostGroupRow {
+            path: None,
+            depth: 0,
+            hosts: hosts.len(),
+            expanded,
+        }));
+        if expanded {
+            for id in hosts {
+                rows.push(HostListRow::Host(HostRow { id }));
+            }
+        }
+    }
+
+    /// Whether the ungrouped bucket is drawn open.
+    ///
+    /// It has no path to store in the collapsed set, so the panel keeps its state as a
+    /// flag next to the tree. It starts open, like every group.
+    #[must_use]
+    pub fn ungrouped_expanded(&self) -> bool {
+        !self.ungrouped_collapsed
+    }
+
+    /// Opens or closes the ungrouped bucket.
+    pub fn toggle_ungrouped(&mut self) {
+        self.ungrouped_collapsed = !self.ungrouped_collapsed;
+    }
+
+    /// Sets whether the ungrouped bucket is drawn open.
+    pub fn set_ungrouped_expanded(&mut self, expanded: bool) {
+        self.ungrouped_collapsed = !expanded;
+    }
+
+    /// Whether one host survives the search phrase, the group and the status.
+    fn matches(&self, book: &HostBook, host: &HostConfig, open: &dyn Fn(HostId) -> bool) -> bool {
+        if !host_matches(host, &self.search) {
+            return false;
+        }
+        if let Some(wanted) = &self.filter.group {
+            match host.group_path() {
+                Some(path) if path.starts_with(wanted) => {}
+                _ => return false,
+            }
+        }
+        self.matches_status(book, host, open)
+    }
+
+    /// Whether one host survives everything but the group, for the tree that chooses it.
+    fn matches_without_group(
+        &self,
+        book: &HostBook,
+        host: &HostConfig,
+        open: &dyn Fn(HostId) -> bool,
+    ) -> bool {
+        host_matches(host, &self.search) && self.matches_status(book, host, open)
+    }
+
+    /// Whether one host survives the status filter.
+    fn matches_status(
+        &self,
+        book: &HostBook,
+        host: &HostConfig,
+        open: &dyn Fn(HostId) -> bool,
+    ) -> bool {
+        match self.filter.status {
+            HostStatusFilter::Any => true,
+            HostStatusFilter::Connected => open(host.id()),
+            HostStatusFilter::Recent => book.recent_of(host.id()).is_some(),
+            HostStatusFilter::NeverConnected => book.recent_of(host.id()).is_none(),
+        }
     }
 }
 
@@ -649,6 +1013,11 @@ pub struct ImportPanel {
     path: String,
     preview: Option<ImportPreview>,
     error: Option<String>,
+    /// The phrase the preview is narrowed by (R18).
+    ///
+    /// A configuration file can describe thousands of hosts, and the dialog has to be
+    /// readable at that size: the same "search a list" idea the servers page uses.
+    search: String,
 }
 
 impl Default for ImportPanel {
@@ -658,6 +1027,7 @@ impl Default for ImportPanel {
             path: DEFAULT_CONFIG_TEXT.to_owned(),
             preview: None,
             error: None,
+            search: String::new(),
         }
     }
 }
@@ -724,6 +1094,34 @@ impl ImportPanel {
         self.error.as_deref()
     }
 
+    /// The phrase the preview is narrowed by.
+    #[must_use]
+    pub fn search(&self) -> &str {
+        &self.search
+    }
+
+    /// Narrows the preview to the hosts the phrase names.
+    pub fn set_search(&mut self, phrase: impl Into<String>) {
+        self.search = phrase.into();
+    }
+
+    /// The hosts of the preview the phrase keeps, with the position they were read at.
+    ///
+    /// The position is what the row's selector is built from, so a narrowed list keeps
+    /// the identity of the line the file holds.
+    #[must_use]
+    pub fn matching(&self) -> Vec<(usize, &ImportedHost)> {
+        let Some(preview) = &self.preview else {
+            return Vec::new();
+        };
+        preview
+            .hosts()
+            .iter()
+            .enumerate()
+            .filter(|(_, host)| import_matches(host, &self.search))
+            .collect()
+    }
+
     /// Reports a read or parse failure, which no preview can survive.
     pub fn set_error(&mut self, reason: impl Into<String>) {
         self.error = Some(reason.into());
@@ -745,21 +1143,25 @@ impl ImportPanel {
     }
 }
 
-/// The row number the first host of each group starts at.
+/// How many rows of an import preview are built at once.
 ///
-/// The numbering runs across the groups rather than restarting inside each one: two
-/// rows of one list must not share an element id, or the hover and active state of one
-/// follows the other. Deriving the number here, once, is what keeps a view from
-/// passing a constant by hand.
+/// A row carries every reason the importer wrote for that host, so its height differs
+/// from its neighbours' and the list cannot be a uniform one. The bound is the second
+/// best answer: a file of thousands builds a bounded number of rows, the search narrows
+/// what is left, and the count above the list says both numbers (R18).
+pub const IMPORT_ROW_LIMIT: usize = 200;
+
+/// Whether one host of a preview survives the phrase typed into the import dialog.
+///
+/// The alias and the summary are what the row shows; matching text a person cannot see
+/// on the row would find hosts for a reason nobody could confirm.
 #[must_use]
-pub fn group_row_offsets(groups: &[Group<'_>]) -> Vec<usize> {
-    let mut offsets = Vec::with_capacity(groups.len());
-    let mut next = 0usize;
-    for group in groups {
-        offsets.push(next);
-        next += group.len();
+pub fn import_matches(host: &ImportedHost, phrase: &str) -> bool {
+    let phrase = phrase.trim().to_lowercase();
+    if phrase.is_empty() {
+        return true;
     }
-    offsets
+    host.alias().to_lowercase().contains(&phrase) || host.summary().to_lowercase().contains(&phrase)
 }
 
 /// Hosts the preview did not save, each with the reason the preview or the plan gave.
@@ -870,6 +1272,478 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         month_index - 9
     } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// What a batch selection covers while it grows (R18).
+///
+/// The two answers are kept apart on purpose: "every host the search keeps" and "every
+/// saved host" produce different moves, and a count without its scope would let a
+/// filtered list look like the whole book.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelectionScope {
+    /// The hosts the current search and filters keep, whether or not they are in view.
+    #[default]
+    CurrentResults,
+    /// Every saved host, whatever the filters say.
+    AllHosts,
+}
+
+impl SelectionScope {
+    /// Both scopes, in the order the control shows them.
+    pub const ALL: [Self; 2] = [Self::CurrentResults, Self::AllHosts];
+
+    /// Label of the scope, in the language of the window.
+    #[must_use]
+    pub fn label(self, ux: &UxStrings) -> &'static str {
+        match self {
+            Self::CurrentResults => ux.hosts_scope_current,
+            Self::AllHosts => ux.hosts_scope_all,
+        }
+    }
+
+    /// Debug selector of the scope control, used by the tests.
+    #[must_use]
+    pub fn debug_selector(self) -> &'static str {
+        match self {
+            Self::CurrentResults => "hosts.scope.current",
+            Self::AllHosts => "hosts.scope.all",
+        }
+    }
+}
+
+/// The connection state a host list is narrowed by (R4, R18).
+///
+/// Every answer is read from data this window already holds: the sessions it has open
+/// and the recent-connection log the host file carries. None of them asks a server
+/// anything, so narrowing a list of five thousand hosts cannot start five thousand
+/// connections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostStatusFilter {
+    /// Every host, connected or not.
+    #[default]
+    Any,
+    /// A host this window has an open session to.
+    Connected,
+    /// A host that was reached before, whether or not it is open now.
+    Recent,
+    /// A host the book has never recorded a connection for.
+    NeverConnected,
+}
+
+impl HostStatusFilter {
+    /// Every status, in the order the control shows them.
+    pub const ALL: [Self; 4] = [
+        Self::Any,
+        Self::Connected,
+        Self::Recent,
+        Self::NeverConnected,
+    ];
+
+    /// Label of the status, in the language of the window.
+    #[must_use]
+    pub fn label(self, ux: &UxStrings) -> &'static str {
+        match self {
+            Self::Any => ux.hosts_status_any,
+            Self::Connected => ux.hosts_status_connected,
+            Self::Recent => ux.hosts_status_recent,
+            Self::NeverConnected => ux.hosts_status_never,
+        }
+    }
+
+    /// Debug selector of the status entry, used by the tests.
+    #[must_use]
+    pub fn debug_selector(self) -> &'static str {
+        match self {
+            Self::Any => "hosts.status.any",
+            Self::Connected => "hosts.status.connected",
+            Self::Recent => "hosts.status.recent",
+            Self::NeverConnected => "hosts.status.never",
+        }
+    }
+}
+
+/// The narrowing the list applies beside the search phrase.
+///
+/// A group filter is a place in the tree and includes everything inside it, so picking
+/// a parent is a way to see a whole branch without opening it row by row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostFilter {
+    group: Option<GroupPath>,
+    status: HostStatusFilter,
+}
+
+impl HostFilter {
+    /// The group the list is narrowed to, when it is.
+    #[must_use]
+    pub fn group(&self) -> Option<&GroupPath> {
+        self.group.as_ref()
+    }
+
+    /// The connection state the list is narrowed to.
+    #[must_use]
+    pub fn status(&self) -> HostStatusFilter {
+        self.status
+    }
+
+    /// Whether either filter narrows anything.
+    #[must_use]
+    pub fn is_narrowing(&self) -> bool {
+        self.group.is_some() || self.status != HostStatusFilter::Any
+    }
+}
+
+/// One group header of the flattened list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostGroupRow {
+    /// The group, or nothing for the hosts that belong to no group.
+    pub path: Option<GroupPath>,
+    /// How deep in the tree the header sits, counted from zero.
+    pub depth: usize,
+    /// How many hosts the current filters keep inside it and its children.
+    pub hosts: usize,
+    /// Whether its rows are drawn under it.
+    pub expanded: bool,
+}
+
+/// One saved host of the flattened list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostRow {
+    /// The host, by identifier: a row is never identified by its position (R18).
+    pub id: HostId,
+}
+
+/// One row of the list the window draws.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostListRow {
+    /// A group header, which opens and closes its branch.
+    Group(HostGroupRow),
+    /// A saved host.
+    Host(HostRow),
+}
+
+/// The flattened list: the rows to draw and the hosts the filters keep.
+#[derive(Clone, Debug, Default)]
+pub struct HostList {
+    rows: Vec<HostListRow>,
+    matched: Vec<HostId>,
+    all: Vec<HostId>,
+}
+
+impl HostList {
+    /// The rows to draw, in order.
+    #[must_use]
+    pub fn rows(&self) -> &[HostListRow] {
+        &self.rows
+    }
+
+    /// How many rows there are.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the list has no row at all.
+    ///
+    /// A closed group keeps its header, so this is the emptiness of what is drawn, not
+    /// of what the filters kept.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// How many hosts survive the current search and filters.
+    #[must_use]
+    pub fn matched_len(&self) -> usize {
+        self.matched.len()
+    }
+
+    /// How many hosts are saved.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.all.len()
+    }
+
+    /// The hosts one scope covers.
+    #[must_use]
+    pub fn ids_in_scope(&self, scope: SelectionScope) -> &[HostId] {
+        match scope {
+            SelectionScope::CurrentResults => &self.matched,
+            SelectionScope::AllHosts => &self.all,
+        }
+    }
+}
+
+/// The hosts the user picked, by identifier (R18).
+///
+/// Identifiers survive a search, a filter, a collapse and a reload, so a selection made
+/// in one view means the same hosts in the next one. Nothing here is positional, which
+/// is what keeps a move from using the row numbers of a list that has since changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostSelection {
+    ids: BTreeSet<HostId>,
+}
+
+impl HostSelection {
+    /// Whether a host is selected.
+    #[must_use]
+    pub fn contains(&self, id: HostId) -> bool {
+        self.ids.contains(&id)
+    }
+
+    /// Adds or removes one host; returns whether it is selected afterwards.
+    pub fn toggle(&mut self, id: HostId) -> bool {
+        if self.ids.remove(&id) {
+            false
+        } else {
+            self.ids.insert(id);
+            true
+        }
+    }
+
+    /// Replaces the selection with the given hosts.
+    pub fn replace(&mut self, ids: impl IntoIterator<Item = HostId>) {
+        self.ids = ids.into_iter().collect();
+    }
+
+    /// Empties the selection.
+    pub fn clear(&mut self) {
+        self.ids.clear();
+    }
+
+    /// Drops every host that is not in the allowed list.
+    pub fn retain(&mut self, allowed: &[HostId]) {
+        self.ids.retain(|id| allowed.contains(id));
+    }
+
+    /// How many hosts are selected.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether nothing is selected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// The selected hosts, in identifier order, for a caller that has to send them on.
+    #[must_use]
+    pub fn ids(&self) -> Vec<HostId> {
+        self.ids.iter().copied().collect()
+    }
+}
+
+/// The group change a dialog is asking about (R18).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupAction {
+    /// Create a new group under the current one.
+    Create,
+    /// Rename a group and everything inside it.
+    Rename(GroupPath),
+    /// Move the selected hosts into a group.
+    Move,
+    /// Delete a group, first moving its hosts somewhere else.
+    Delete(GroupPath),
+}
+
+impl GroupAction {
+    /// Debug selector of the dialog, used by the tests.
+    #[must_use]
+    pub fn debug_selector(&self) -> &'static str {
+        match self {
+            Self::Create => "hosts.group.create",
+            Self::Rename(_) => "hosts.group.rename",
+            Self::Move => "hosts.group.move",
+            Self::Delete(_) => "hosts.group.delete",
+        }
+    }
+}
+
+/// What a group dialog holds while it is open.
+///
+/// The name and the destination stay text until the tree accepts them, so a refused
+/// path is shown in the field that produced it instead of being silently rewritten.
+#[derive(Clone, Debug)]
+pub struct GroupEditor {
+    action: GroupAction,
+    name: String,
+    destination: String,
+    error: Option<String>,
+}
+
+impl GroupEditor {
+    /// A dialog for one change, with the name it starts from.
+    #[must_use]
+    pub fn new(action: GroupAction, name: impl Into<String>) -> Self {
+        Self {
+            action,
+            name: name.into(),
+            destination: String::new(),
+            error: None,
+        }
+    }
+
+    /// The change being asked about.
+    #[must_use]
+    pub fn action(&self) -> &GroupAction {
+        &self.action
+    }
+
+    /// The group name as typed.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Replaces the typed name.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+    }
+
+    /// Where the hosts go: a group path, or blank for "no group".
+    #[must_use]
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+
+    /// Replaces the typed destination.
+    pub fn set_destination(&mut self, destination: impl Into<String>) {
+        self.destination = destination.into();
+    }
+
+    /// Why the tree refused the change.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Records a refusal.
+    pub fn set_error(&mut self, reason: impl Into<String>) {
+        self.error = Some(reason.into());
+    }
+}
+
+/// A deterministic set of saved hosts, for the scale tests and the capture (R18).
+///
+/// Names, addresses, users and groups are derived from the position, so the same count
+/// always produces the same list to search, filter and scroll. The identifiers are the
+/// ones the domain generates: nothing here compares them across runs, and a capture that
+/// needs a stable identifier builds its own records from the same fields.
+#[cfg(test)]
+#[must_use]
+pub fn deterministic_hosts(count: usize) -> Vec<HostConfig> {
+    (0..count)
+        .map(|index| {
+            let shape = scale_host_shape(index);
+            let mut host = HostConfig::new(shape.name, shape.address, 22, shape.user)
+                .expect("a valid fixture host");
+            host.set_group_path(shape.group.and_then(|path| GroupPath::parse(path).ok()));
+            host
+        })
+        .collect()
+}
+
+/// What one host of the scale fixture holds, at a position.
+///
+/// The name, the address, the user and the group all come from the position, so a test
+/// and a capture describe the same five thousand hosts. The capture also writes the
+/// identifier, because the list tints a row from it; the tests do not, because they never
+/// compare identifiers across runs.
+#[cfg(any(test, feature = "ui-capture"))]
+#[derive(Clone, Debug)]
+pub struct HostShape {
+    /// The display name.
+    pub name: String,
+    /// The address.
+    pub address: String,
+    /// The login user.
+    pub user: &'static str,
+    /// The group path, when the host is in one.
+    pub group: Option<&'static str>,
+}
+
+/// The shape of one host of the scale fixture.
+#[cfg(any(test, feature = "ui-capture"))]
+#[must_use]
+pub fn scale_host_shape(index: usize) -> HostShape {
+    HostShape {
+        name: format!("node-{:04}", index + 1),
+        address: format!(
+            "10.{}.{}.{}",
+            10 + (index / 1024) % 40,
+            (index / 32) % 32,
+            index % 32 + 1
+        ),
+        user: if index.is_multiple_of(5) {
+            "ops"
+        } else {
+            "deploy"
+        },
+        group: match index % 5 {
+            0 => Some("Prod/Web"),
+            1 => Some("Prod/DB"),
+            2 => Some("Prod/Edge"),
+            3 => Some("Staging"),
+            _ => None,
+        },
+    }
+}
+
+/// Reads a group path from what the user typed.
+///
+/// Blank means "no group": a destination of nothing is how a deletion says the hosts
+/// stay saved and leave the tree. Anything else has to be a path the model accepts, and
+/// the refusal is the model's own sentence, which names the segment to change.
+///
+/// # Errors
+///
+/// Returns the sentence of the path parser when the text is not a path.
+pub fn group_path_from_text(text: &str) -> Result<Option<GroupPath>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    GroupPath::parse(text)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Every group path worth drawing: the saved tree, plus the parents of any path a host
+/// names.
+///
+/// A host can carry a path whose parents were never saved by an older build or a hand
+/// edit; drawing it under a parent that does not exist would hide it, so the parents are
+/// added here instead of being invented again by the renderer.
+fn drawn_paths(book: &HostBook, groups: &GroupBook) -> Vec<GroupPath> {
+    let mut paths: BTreeSet<GroupPath> = groups.paths().iter().cloned().collect();
+    for host in book.hosts() {
+        let mut current = host.group_path();
+        while let Some(path) = current {
+            current = path.parent();
+            paths.insert(path);
+        }
+    }
+    paths.into_iter().collect()
+}
+
+/// The paths directly inside one parent, in order.
+fn child_paths(paths: &[GroupPath], parent: Option<&GroupPath>) -> Vec<GroupPath> {
+    paths
+        .iter()
+        .filter(|path| path.parent().as_ref() == parent)
+        .cloned()
+        .collect()
+}
+
+/// The kept hosts of one group and everything inside it, in saved order.
+fn hosts_under(book: &HostBook, kept: &BTreeSet<HostId>, path: &GroupPath) -> Vec<HostId> {
+    book.hosts()
+        .iter()
+        .filter(|host| kept.contains(&host.id()))
+        .filter(|host| host.group_path().is_some_and(|host| host.starts_with(path)))
+        .map(HostConfig::id)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1022,29 +1896,37 @@ mod tests {
         book.record_connection(web.id(), 1_700_000_000)
             .expect("recorded");
 
+        // No window holds a session here, so the status filter has nothing to find.
+        let no_sessions = |_: HostId| false;
+        let groups = GroupBook::new();
+
         let mut panel = HostsPanel::new();
         assert_eq!(panel.view(), HostView::All);
-        assert_eq!(panel.filtered(&book).len(), 3);
-        assert_eq!(panel.groups(&book).len(), 2);
+        assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 3);
         assert_eq!(
-            panel.recent(&book).len(),
+            panel.list(&book, &groups, &no_sessions).rows().len(),
+            3,
+            "the flat view draws one row per host"
+        );
+
+        panel.select_view(HostView::Recent);
+        assert_eq!(
+            panel.list(&book, &groups, &no_sessions).rows().len(),
             1,
             "only a real connection is recent"
         );
 
         panel.set_search("prod");
-        assert_eq!(panel.filtered(&book).len(), 2);
-        assert_eq!(panel.groups(&book)[0].len(), 2);
+        assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 2);
         assert_eq!(
-            panel.recent(&book).len(),
+            panel.list(&book, &groups, &no_sessions).rows().len(),
             1,
             "the recent view applies the same search"
         );
 
         panel.set_search("nothing matches this");
-        assert!(panel.filtered(&book).is_empty());
-        assert!(panel.groups(&book).is_empty());
-        assert!(panel.recent(&book).is_empty());
+        assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 0);
+        assert!(panel.list(&book, &groups, &no_sessions).is_empty());
     }
 
     #[test]
@@ -1151,18 +2033,64 @@ mod tests {
     }
 
     #[test]
-    fn the_groups_of_a_list_number_their_rows_across_the_whole_list() {
+    fn the_grouped_rows_hold_every_host_once_under_its_own_group() {
+        // The rows are flattened from group headers and hosts; a host that appears twice,
+        // or not at all, is a list that disagrees with the file it was read from.
         let web = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
-        let api = host("api", "api.example.org", 2222, "svc", Some("prod"));
+        let api = host("api", "api.example.org", 2222, "svc", Some("Prod"));
         let lab = host("lab", "lab.internal", 22, "root", None);
-        let groups = HostBook::group(vec![&web, &api, &lab]);
-        assert_eq!(groups.len(), 2, "one named group and the ungrouped one");
+        let mut book = HostBook::from_hosts(vec![web.clone(), api.clone(), lab.clone()])
+            .expect("distinct hosts");
+        let mut groups = GroupBook::new();
+        groups
+            .insert(&GroupPath::parse("Prod").expect("a valid path"))
+            .expect("the tree accepts it");
+
+        let no_sessions = |_: HostId| false;
+        let mut panel = HostsPanel::new();
+        panel.select_view(HostView::Groups);
+        let list = panel.list(&book, &groups, &no_sessions);
+        let hosts: Vec<HostId> = list
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                HostListRow::Host(host) => Some(host.id),
+                HostListRow::Group(_) => None,
+            })
+            .collect();
         assert_eq!(
-            group_row_offsets(&groups),
-            vec![0, 2],
-            "each group starts where the previous one ended, so no two rows share an index"
+            hosts,
+            vec![web.id(), api.id(), lab.id()],
+            "every host is listed once, in saved order, under its own header"
         );
-        assert!(group_row_offsets(&[]).is_empty());
+        let headers: Vec<Option<GroupPath>> = list
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                HostListRow::Group(group) => Some(group.path.clone()),
+                HostListRow::Host(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![Some(GroupPath::parse("Prod").expect("a valid path")), None,],
+            "the named group and the hosts without one each get a header"
+        );
+
+        // Closing a group hides its rows and keeps its hosts in the result: the count in
+        // the header and the set a selection covers are the same either way.
+        panel.toggle_group(&GroupPath::parse("Prod").expect("a valid path"));
+        let closed = panel.list(&book, &groups, &no_sessions);
+        assert_eq!(closed.matched_len(), 3);
+        assert_eq!(
+            closed.rows().len(),
+            3,
+            "two headers and the ungrouped host, without the closed group's hosts"
+        );
+
+        // A host that is edited away leaves the list with it.
+        book.remove(lab.id()).expect("the host is saved");
+        assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 2);
     }
 
     #[test]

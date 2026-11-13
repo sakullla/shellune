@@ -980,6 +980,185 @@ fn disconnected_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
 // The registry
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Thousands of hosts (R18)
+// ---------------------------------------------------------------------------
+
+/// How many hosts the scale fixture holds: the number R18 asks the list to stay usable
+/// at.
+const SCALE_HOSTS: usize = 5_000;
+
+/// The saved hosts of the scale fixture, derived from their position.
+///
+/// The identifiers are written rather than generated because the list draws a row from
+/// the host's identifier: two runs of one shot have to draw the same list. Names,
+/// addresses, users and groups come from the position for the same reason, and the
+/// hierarchy is written as a group path rather than as a label with a separator in it.
+fn scale_hosts(count: usize) -> Result<Vec<HostConfig>, String> {
+    let mut hosts = Vec::with_capacity(count);
+    for index in 0..count {
+        let number = index + 1;
+        let shape = crate::app::hosts::scale_host_shape(index);
+        let record = serde_json::json!({
+            "id": format!("00000000-0000-4000-8000-{number:012}"),
+            "name": shape.name,
+            "address": shape.address,
+            "port": 22,
+            "user": shape.user,
+            "group_path": shape.group,
+        });
+        let host: HostConfig = serde_json::from_value(record).map_err(|error| {
+            format!("the scale fixture host {number} is not a valid record: {error}")
+        })?;
+        hosts.push(host);
+    }
+    Ok(hosts)
+}
+
+/// Writes the scale fixture into the run's own root.
+fn seed_scaled_hosts(root: &Path) -> Result<(), String> {
+    write_hosts(root, scale_hosts(SCALE_HOSTS)?)
+}
+
+/// Writes a book of hosts, as a previous run would have left it.
+fn write_hosts(root: &Path, hosts: Vec<HostConfig>) -> Result<(), String> {
+    let mut book = shellune_storage::HostBook::new();
+    for host in hosts {
+        book.apply(&HostEdit::create(host))
+            .map_err(|error| format!("the host fixture could not be built: {error}"))?;
+    }
+    HostStore::at(root)
+        .save(&book)
+        .map_err(|error| format!("the host fixture could not be written: {error}"))
+}
+
+/// A configuration file with a dozen hosts, two of which need a look.
+///
+/// The two jump through an alias the file never defines, which is what the importer
+/// reports as needing review: the import shot has to show the states a real file
+/// produces instead of a wall of rows that all say the same thing.
+const IMPORT_CONFIG: &str = "\
+Host web-01\n    HostName 192.0.2.11\n    User deploy\n\
+\n\
+Host web-02\n    HostName 192.0.2.12\n    User deploy\n    IdentityFile ~/.ssh/id_ed25519\n\
+\n\
+Host db-01\n    HostName 198.51.100.21\n    User postgres\n\
+\n\
+Host db-02\n    HostName 198.51.100.22\n    User postgres\n\
+\n\
+Host edge-01\n    HostName 203.0.113.31\n    User ops\n\
+\n\
+Host edge-02\n    HostName 203.0.113.32\n    User ops\n\
+\n\
+Host through-bastion\n    HostName 203.0.113.40\n    User deploy\n    ProxyJump bastion.example.org\n\
+\n\
+Host through-unknown\n    HostName 203.0.113.41\n    User deploy\n    ProxyJump nowhere.example.org\n";
+
+/// Writes that configuration into the run's own root.
+fn seed_import_config(root: &Path) -> Result<(), String> {
+    std::fs::write(root.join("config"), IMPORT_CONFIG)
+        .map_err(|error| format!("the import fixture could not be written: {error}"))
+}
+
+/// Nothing to install: the list is what the fixture produced.
+fn show_scale_hosts(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_host_view(crate::app::hosts::HostView::All, cx);
+    Ok(())
+}
+
+/// The grouped view: the list's headers and the group column beside it (R4, R18).
+fn show_group_tree(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_host_view(crate::app::hosts::HostView::Groups, cx);
+    Ok(())
+}
+
+/// A selection of the current result, with the scope and the count it covers (R18).
+fn show_selection(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    // The shot narrows the list first: the selection then covers a result smaller than
+    // the book, which is exactly the difference the scope has to make visible.
+    view.capture_group_filter("Prod", cx);
+    view.capture_select_hosts(250, cx);
+    Ok(())
+}
+
+/// The import panel on the fixture configuration (R18).
+fn show_import(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_import_local("config", cx);
+    Ok(())
+}
+
+/// The list holds five thousand saved hosts and the page shows them.
+fn many_hosts_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    on_page(view, Destination::Hosts, SectionState::Populated)?;
+    let listed = view.book().hosts().len();
+    if listed != SCALE_HOSTS {
+        return Err(format!(
+            "the page holds {listed} host(s), not the {SCALE_HOSTS} the fixture wrote"
+        ));
+    }
+    Ok(())
+}
+
+/// The grouped view is on screen, with the tree open beside it.
+fn group_tree_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    many_hosts_ready(view, _cx)?;
+    let view_id = view.capture_host_view_id();
+    if view_id != "hosts.view.groups" {
+        return Err(format!("the list is in {view_id}, not the grouped view"));
+    }
+    let groups = view.capture_group_tree_len();
+    if groups < 4 {
+        return Err(format!(
+            "the tree holds {groups} group(s), so the shot does not show a hierarchy"
+        ));
+    }
+    Ok(())
+}
+
+/// The shot holds a selection and says what it covers.
+fn selection_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    many_hosts_ready(view, _cx)?;
+    let (count, scope) = view.capture_selection();
+    if count != 250 {
+        return Err(format!("the selection holds {count} host(s), not 250"));
+    }
+    if scope != "hosts.scope.current" {
+        return Err(format!(
+            "the selection covers {scope} rather than the current result"
+        ));
+    }
+    Ok(())
+}
+
+/// The import panel read the fixture and offers its hosts.
+fn import_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    let offered = view
+        .capture_import_count()
+        .ok_or_else(|| "the import panel holds no preview".to_owned())?;
+    if offered != 8 {
+        return Err(format!(
+            "the preview offers {offered} host(s), not the eight the fixture describes"
+        ));
+    }
+    Ok(())
+}
+
 /// Every scenario, in the order the gallery lists them.
 ///
 /// A later task adds its own entry here (the merged header, the host list, the batch
@@ -1015,6 +1194,73 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_hosts,
         install: no_state,
         ready: home_hosts_ready,
+    },
+    Scenario {
+        id: "hosts-5000",
+        title: "主机 · 五千台的可扫描列表",
+        category: Category::Home,
+        fixture: "five thousand saved hosts in four groups, written to the run's own root before \
+                  the view starts",
+        evidence: "shows the list this build draws and the filters above it; the list is asked \
+                   for the rows it shows, so the shot cannot show how many elements exist. No host \
+                   was connected, so no connection state is part of it",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: seed_scaled_hosts,
+        install: show_scale_hosts,
+        ready: many_hosts_ready,
+    },
+    Scenario {
+        id: "hosts-groups",
+        title: "主机 · 层级分组树与分组行",
+        category: Category::Home,
+        fixture: "the same five thousand hosts, grouped Prod/Web, Prod/DB, Prod/Edge and \
+                  Staging in the grouped view",
+        evidence: "shows the group column and the group headers of the list; opening and \
+                   closing a group is not part of the shot, and no group was created or moved by it",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: seed_scaled_hosts,
+        install: show_group_tree,
+        ready: group_tree_ready,
+    },
+    Scenario {
+        id: "hosts-selection",
+        title: "主机 · 批量选择与范围",
+        category: Category::Home,
+        fixture: "the same five thousand hosts with 250 of the current result selected",
+        evidence: "shows the count and the scope of a selection, which is what a batch target \
+                   would use; nothing was moved and no command was prepared",
+        quick: false,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_scaled_hosts,
+        install: show_selection,
+        ready: selection_ready,
+    },
+    Scenario {
+        id: "hosts-import",
+        title: "主机 · 导入结果的可扫描列表",
+        category: Category::Home,
+        fixture: "a configuration file with eight hosts, two of them jumping through an alias \
+                  the file never defines",
+        evidence: "shows the preview, its limits and a row per host with the outcome the importer \
+                   produced; nothing was saved and no host was dialled",
+        quick: false,
+        variants: &[Variant::dark().chinese().smallest()],
+        start: || page(Destination::Hosts),
+        prepare: seed_import_config,
+        install: show_import,
+        ready: import_ready,
     },
     Scenario {
         id: "terminal-local",

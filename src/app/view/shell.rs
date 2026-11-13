@@ -687,42 +687,63 @@ impl ShelluneView {
                     ),
             );
 
-        let mut column = div()
+        // What the page says about itself on top: the heading and the shells of this
+        // computer. It is capped and scrolls on its own, so the servers and their filters
+        // keep the rest of the window instead of being pushed below the fold at the
+        // minimum size (R8).
+        let cap = (self.viewport_height * 0.42)
+            .max(metrics.scale(120.0))
+            .min(metrics.scale(260.0));
+        let header = div()
+            .id("home.header")
             .flex()
             .flex_col()
-            .w_full()
-            .max_w(metrics.scale(super::HOME_MAX_WIDTH))
-            .mx_auto()
-            .px(metrics.scale(super::HOME_SIDE_PADDING))
-            .pt(metrics.scale(spacing::LOOSE + 12.0))
-            .pb(metrics.scale(spacing::LOOSE + 16.0))
-            .gap(metrics.scale(spacing::LOOSE + 4.0))
-            .debug_selector(|| "home".to_owned())
+            .flex_none()
+            .min_h(px(0.0))
+            .max_h(cap)
+            .overflow_y_scroll()
+            .gap(metrics.scale(spacing::SNUG))
             .child(heading)
             .children(
                 self.local_error
                     .as_ref()
                     .map(|reason| self.notice_line(reason.clone(), Tone::Danger)),
             )
-            .child(self.home_local_section(cx));
+            .child(self.home_local_section(!self.group_column_fits(), cx));
 
-        let hosts = match state {
-            SectionState::Loading | SectionState::Failed => self.hosts_destination(cx),
-            SectionState::Empty | SectionState::Populated => {
-                if self.book.hosts().is_empty()
-                    && self.hosts.search().trim().is_empty()
-                    && !self.import.is_open()
-                {
-                    self.home_welcome(cx)
-                } else {
-                    self.hosts_destination(cx)
-                }
-            }
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .max_w(metrics.scale(super::HOME_MAX_WIDTH))
+            .mx_auto()
+            .px(metrics.scale(super::HOME_SIDE_PADDING))
+            .pt(metrics.scale(spacing::SNUG))
+            .pb(metrics.scale(spacing::SNUG + 4.0))
+            .gap(metrics.scale(spacing::SNUG))
+            .debug_selector(|| "home".to_owned())
+            .child(header);
+
+        // The empty first run explains itself in a card; every other state shows the
+        // servers themselves, which is a virtualized list that has to be given the
+        // height left over instead of being scrolled as one long column (R18).
+        let welcome = matches!(state, SectionState::Empty | SectionState::Populated)
+            && self.book.hosts().is_empty()
+            && self.hosts.search().trim().is_empty()
+            && !self.import.is_open();
+        let hosts = if welcome {
+            self.home_welcome(cx)
+        } else {
+            self.hosts_destination(cx)
         };
         column = column.child(
             div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
                 .gap(metrics.scale(spacing::SNUG))
                 .child(components::section_label(ux.home_hosts_section, metrics))
                 .child(hosts),
@@ -730,7 +751,7 @@ impl ShelluneView {
 
         // The page holds the keyboard of whichever destination shows it, so the
         // shortcuts keep working after a click on the page or a page switch.
-        div()
+        let page = div()
             .id("content.scroll")
             .debug_selector(|| "content".to_owned())
             .track_focus(self.destination_focus(self.workspace.destination()))
@@ -738,57 +759,105 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .overflow_y_scroll()
-            .bg(theme::swatch(palette::CANVAS))
-            .child(column)
+            .bg(theme::swatch(palette::CANVAS));
+        if welcome || matches!(state, SectionState::Loading | SectionState::Failed) {
+            // A card or a failure is read by scrolling the page, as before.
+            page.overflow_y_scroll().child(column)
+        } else {
+            page.child(column.flex_1().min_h(px(0.0)).overflow_hidden())
+        }
     }
 
-    /// The shells of this computer, as compact cards that open in one click.
-    fn home_local_section(&self, cx: &mut Context<Self>) -> Div {
+    /// The shells of this computer, as cards that open in one click.
+    ///
+    /// On a narrow window the same choices are drawn as one row of buttons: the servers
+    /// and their filters are the page's main content there, and a card per shell would
+    /// push the list below the fold (R8).
+    fn home_local_section(&self, compact: bool, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
         let mut tiles = div()
             .flex()
             .flex_wrap()
+            .items_center()
             .w_full()
             .gap(metrics.scale(spacing::SNUG))
             .debug_selector(|| "shell.picker".to_owned());
         for (index, shell) in self.workspace.shells().iter().enumerate() {
             let selected = index == self.workspace.shell_choice();
+            if compact {
+                tiles = tiles.child(
+                    components::compact_button(
+                        shell.name().to_owned(),
+                        if selected {
+                            Variant::Secondary
+                        } else {
+                            Variant::Ghost
+                        },
+                        metrics,
+                    )
+                    .id(("shell.choice", index))
+                    .debug_selector(move || format!("shell.choice.{index}"))
+                    .tooltip(components::tooltip(ux.home_local_hint))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.launch_choice(index, window, cx);
+                    })),
+                );
+            } else {
+                tiles = tiles.child(
+                    self.home_card(
+                        Icon::Terminal,
+                        shell.name().to_owned(),
+                        program_label(shell.program()),
+                        selected.then_some(strings.shell_default),
+                    )
+                    .id(("shell.choice", index))
+                    .debug_selector(move || format!("shell.choice.{index}"))
+                    .tooltip(components::tooltip(ux.home_local_hint))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.launch_choice(index, window, cx);
+                    })),
+                );
+            }
+        }
+        if compact {
+            tiles = tiles.child(
+                components::compact_button(
+                    format!("{}{ELLIPSIS}", strings.shell_custom_button),
+                    Variant::Ghost,
+                    metrics,
+                )
+                .id("shell.custom")
+                .debug_selector(|| "shell.custom".to_owned())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.open_custom_shell(window, cx);
+                })),
+            );
+        } else {
             tiles = tiles.child(
                 self.home_card(
-                    Icon::Terminal,
-                    shell.name().to_owned(),
-                    program_label(shell.program()),
-                    selected.then_some(strings.shell_default),
+                    Icon::FolderOpen,
+                    format!("{}{ELLIPSIS}", strings.shell_custom_button),
+                    strings.shell_custom_hint.to_owned(),
+                    None,
                 )
-                .id(("shell.choice", index))
-                .debug_selector(move || format!("shell.choice.{index}"))
-                .tooltip(components::tooltip(ux.home_local_hint))
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.launch_choice(index, window, cx);
+                .id("shell.custom")
+                .debug_selector(|| "shell.custom".to_owned())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.open_custom_shell(window, cx);
                 })),
             );
         }
-        tiles = tiles.child(
-            self.home_card(
-                Icon::FolderOpen,
-                format!("{}{ELLIPSIS}", strings.shell_custom_button),
-                strings.shell_custom_hint.to_owned(),
-                None,
-            )
-            .id("shell.custom")
-            .debug_selector(|| "shell.custom".to_owned())
-            .on_click(cx.listener(|this, _event, window, cx| {
-                this.open_custom_shell(window, cx);
-            })),
-        );
+        // The label is what the cards need to be told apart from the servers; the row of
+        // buttons sits directly under the heading and needs no second title (R4, R8).
         let mut section = div()
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::SNUG))
-            .child(components::section_label(ux.home_local_section, metrics));
+            .when(!compact, |section| {
+                section.child(components::section_label(ux.home_local_section, metrics))
+            });
         if self.workspace.shells().is_empty() {
             section = section.child(
                 components::banner(Tone::Warning, metrics)
