@@ -20817,3 +20817,628 @@ fn a_group_path_typed_into_the_dialog_is_the_path_that_is_saved() {
         "the refusal names where to change it: {refusal}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch tasks (R19, R21)
+// ---------------------------------------------------------------------------
+
+/// Selects the first hosts the filters keep and opens the batch preview, as the list's
+/// button does.
+fn preview_batch(cx: &mut VisualTestContext, view: &Entity<ShelluneView>, count: usize) {
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_select(count, cx);
+            view.capture_batch_preview(cx);
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// Types one command per step into the preview, adding the steps a person would add.
+fn write_commands(cx: &mut VisualTestContext, commands: &[&str]) {
+    for (index, command) in commands.iter().enumerate() {
+        if index > 0 {
+            click(cx, "batch.step.add");
+        }
+        let selector = match index {
+            0 => "batch.step.field.0",
+            1 => "batch.step.field.1",
+            _ => "batch.step.field.2",
+        };
+        type_into(cx, selector, command);
+    }
+}
+
+/// Reads the runner's report until the page reaches the state the caller names.
+fn settle_batch(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    mut done: impl FnMut(&ShelluneView) -> bool,
+) -> bool {
+    let mut settled = false;
+    cx.update(|_window, app| {
+        settled = view.update(app, |view, cx| view.capture_batch_wait(cx, &mut done));
+    });
+    settled
+}
+
+/// Three saved hosts, in one group, for the batch tests.
+fn batch_hosts() -> Vec<HostConfig> {
+    vec![
+        stored_host("build-01", "192.0.2.11", 22, "deploy", Some("Prod")),
+        stored_host("api-02", "192.0.2.24", 22, "deploy", Some("Prod")),
+        stored_host("edge-03", "198.51.100.7", 22, "ops", Some("Prod")),
+    ]
+}
+
+/// The fixture hosts a test raises as the batch's targets, all with the same script.
+fn fixture_plan(
+    labels: &[&str],
+    script: crate::app::view::batch::fixture::HostScript,
+) -> crate::app::view::batch::fixture::Plan {
+    crate::app::view::batch::fixture::Plan::new().every(labels, script)
+}
+
+#[gpui::test]
+async fn the_batch_preview_promises_the_number_of_hosts_the_scope_names(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-scope");
+    let mut hosts = batch_hosts();
+    hosts.push(stored_host("lab-07", "203.0.113.19", 22, "lab", None));
+    seed(&dir.store(), hosts);
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    preview_batch(cx, &view, 2);
+    cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        assert_eq!(panel.target_count(), 2);
+        assert_eq!(
+            panel.scope(),
+            crate::app::hosts::SelectionScope::CurrentResults
+        );
+        assert!(panel.is_previewing());
+    });
+    assert!(
+        cx.debug_bounds("batch.dialog").is_some(),
+        "the preview is a dialog on screen"
+    );
+    assert!(
+        cx.debug_bounds("batch.targets.count").is_some(),
+        "the count of hosts is said before the commands"
+    );
+
+    // With nothing selected, the scope is what decides: the results of a group filter
+    // are three of the four saved hosts, and every host is four.
+    click(cx, "batch.preview.cancel");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_clear_selection(cx);
+            view.capture_batch_filter("Prod", cx);
+            view.capture_batch_preview(cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).batch_panel().target_count(),
+            3,
+            "the filtered result is the target set when nothing is selected"
+        );
+    });
+    click(cx, "batch.scope.hosts.scope.all");
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).batch_panel().target_count(),
+            4,
+            "every saved host, whatever the filter says"
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_preview_without_confirmation_opens_no_connection(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-preview");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 3);
+    write_commands(cx, &["uptime"]);
+
+    // The commands are written, the hosts are listed, and nothing has been reached.
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(view.batch_panel().is_previewing());
+        assert_eq!(
+            view.workspace().sessions().items().len(),
+            0,
+            "a preview is not a connection"
+        );
+    });
+
+    // A confirmation is the only thing that can start a run.
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let (factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                fixture_plan(
+                    &["build-01", "api-02", "edge-03"],
+                    HostScript::new(vec![StepScript::ok("up 12 days\n")]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    assert_eq!(
+        factory.opens(),
+        3,
+        "one transport per host, and only after the confirmation"
+    );
+}
+
+#[gpui::test]
+async fn an_empty_command_is_refused_in_the_preview_and_starts_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-empty-command");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    // Nothing is typed into the one step, so the task has no command.
+    click(cx, "batch.preview.confirm");
+    cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        assert!(
+            panel.is_previewing(),
+            "a refused task keeps the preview open"
+        );
+        let problem = panel.problem().expect("the refusal is said");
+        assert!(problem.contains("step 1"), "{problem}");
+    });
+    assert!(
+        cx.debug_bounds("batch.problem").is_some(),
+        "the refusal is drawn where the task is edited"
+    );
+}
+
+#[gpui::test]
+async fn a_confirmed_task_runs_every_host_and_shows_each_step(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-run");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 3);
+    write_commands(cx, &["uptime", "df -h"]);
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).batch_panel().steps().len(),
+            2,
+            "the second field was added"
+        );
+    });
+
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let script = HostScript::new(vec![
+        StepScript::ok("up 12 days\n"),
+        StepScript::ok("/dev/sda1 40G\n"),
+    ]);
+    let (factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(fixture_plan(&["build-01", "api-02", "edge-03"], script), cx)
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    assert_eq!(factory.opens(), 3);
+
+    cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        let page = panel.run().expect("the run page is what is shown");
+        assert_eq!(page.state(), shellune_core::RunState::Completed);
+        assert_eq!(page.finished_hosts(), 3);
+        for record in page.run().hosts() {
+            assert_eq!(record.state(), shellune_core::HostState::Succeeded);
+            assert!(
+                record
+                    .steps()
+                    .iter()
+                    .all(|step| step.state() == shellune_core::StepState::Succeeded),
+                "every step of {} succeeded",
+                record.target().label()
+            );
+            let log = page
+                .output(record.target().host_id())
+                .expect("the output of the host is kept");
+            assert_eq!(log.lines().len(), 2, "one line per command");
+            assert_eq!(log.lines()[0].text, "up 12 days");
+        }
+        assert_eq!(
+            page.run().hosts()[0].steps()[0].exit(),
+            Some(0),
+            "the exit status the server reported is kept"
+        );
+    });
+    for selector in [
+        "batch.run",
+        "batch.run.status",
+        "batch.run.host.0",
+        "batch.run.output",
+        "batch.run.timeline.0",
+        "batch.run.close.action",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is drawn on the run page"
+        );
+    }
+}
+
+#[gpui::test]
+async fn a_failed_host_skips_only_its_own_remaining_steps(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-failure");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 3);
+    write_commands(cx, &["uptime", "deploy --check"]);
+
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let good = HostScript::new(vec![StepScript::ok("ok\n"), StepScript::ok("ok\n")]);
+    let failing = HostScript::new(vec![
+        StepScript::ok("connected\n"),
+        StepScript::failing(3, "no such release\n"),
+    ]);
+    let (_factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                crate::app::view::batch::fixture::Plan::new()
+                    .host("build-01", good.clone())
+                    .host("api-02", failing)
+                    .host("edge-03", good),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+
+    cx.update(|_window, app| {
+        let page = view.read(app).batch_panel().run().expect("a run page");
+        assert_eq!(page.state(), shellune_core::RunState::Failed);
+        let hosts = page.run().hosts();
+        let failed = hosts
+            .iter()
+            .find(|host| host.target().label() == "api-02")
+            .expect("the failing host");
+        assert_eq!(failed.state(), shellune_core::HostState::Failed);
+        assert_eq!(
+            failed.steps()[0].state(),
+            shellune_core::StepState::Succeeded,
+            "the step before the failure stays succeeded"
+        );
+        assert_eq!(failed.steps()[1].state(), shellune_core::StepState::Failed);
+        assert_eq!(failed.steps()[1].exit(), Some(3));
+        assert!(
+            failed.detail().is_some_and(|detail| detail.contains('3')),
+            "the reason names the status: {:?}",
+            failed.detail()
+        );
+        for host in hosts
+            .iter()
+            .filter(|host| host.target().label() != "api-02")
+        {
+            assert_eq!(
+                host.state(),
+                shellune_core::HostState::Succeeded,
+                "{} was not touched by the other host's failure",
+                host.target().label()
+            );
+        }
+    });
+}
+
+#[gpui::test]
+async fn a_retry_carries_only_the_work_that_did_not_succeed(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-retry");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 3);
+    write_commands(cx, &["uptime", "deploy --check"]);
+
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let good = HostScript::new(vec![StepScript::ok("ok\n"), StepScript::ok("ok\n")]);
+    let failing = HostScript::new(vec![
+        StepScript::ok("connected\n"),
+        StepScript::failing(1, "nope\n"),
+    ]);
+    let (_factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                crate::app::view::batch::fixture::Plan::new()
+                    .host("build-01", good.clone())
+                    .host("api-02", failing)
+                    .host("edge-03", good),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+
+    // The retry is offered on the finished page and opens a preview of what is owed.
+    click(cx, "batch.run.retry");
+    cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        assert!(
+            panel.is_previewing(),
+            "a retry is confirmed like any other task"
+        );
+        assert_eq!(
+            panel.target_count(),
+            1,
+            "only the host that did not succeed is a target"
+        );
+        let target = &panel.targets()[0];
+        assert_eq!(target.label(), "api-02");
+        assert_eq!(
+            target.starts_at(),
+            1,
+            "the step that already succeeded is not run again"
+        );
+        assert!(
+            panel.note().is_some(),
+            "the preview says it is a retry, not a rollback"
+        );
+    });
+    let commands = cx.update(|_window, app| view.read(app).batch_panel().commands(app));
+    assert_eq!(
+        commands,
+        vec!["uptime".to_owned(), "deploy --check".to_owned()],
+        "the task keeps its steps, and the per-host start is what skips the done one"
+    );
+}
+
+#[gpui::test]
+async fn pausing_holds_new_steps_and_cancelling_waits_for_the_command_to_end(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("batch-cancel");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["sleep 1"]);
+
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let holding = HostScript::new(vec![StepScript::holding("started\n")]);
+    let (_factory, gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(fixture_plan(&["build-01", "api-02"], holding), cx)
+        })
+    });
+    // Both hosts are inside the command, which the fixture holds.
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel().run().is_some_and(|page| {
+            page.run()
+                .hosts()
+                .iter()
+                .all(|host| host.state() == shellune_core::HostState::Running)
+        })
+    }));
+
+    click(cx, "batch.run.pause");
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.state() == shellune_core::RunState::Paused)
+    }));
+    assert!(
+        cx.debug_bounds("batch.run.explanation").is_some(),
+        "a pause says what it does not stop"
+    );
+
+    click(cx, "batch.run.cancel");
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.state() == shellune_core::RunState::Cancelling)
+    }));
+    cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        let page = panel.run().expect("a run page");
+        assert!(
+            !page.is_finished(),
+            "a cancel request is not the end of the run"
+        );
+        assert!(
+            page.run()
+                .hosts()
+                .iter()
+                .all(|host| host.state() != shellune_core::HostState::Cancelled),
+            "no host is called cancelled while its command is still running"
+        );
+    });
+
+    // The command ends only when the fixture lets it, and only then is the run cancelled.
+    gate.release();
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    cx.update(|_window, app| {
+        let page = view.read(app).batch_panel().run().expect("a run page");
+        assert_eq!(page.state(), shellune_core::RunState::Cancelled);
+        assert!(page.run().hosts().iter().all(|host| {
+            matches!(
+                host.state(),
+                shellune_core::HostState::Cancelled | shellune_core::HostState::Skipped
+            )
+        }));
+    });
+}
+
+#[gpui::test]
+async fn the_preview_keeps_its_targets_when_the_list_changes(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-snapshot");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 3);
+    write_commands(cx, &["uptime"]);
+
+    // The selection is emptied under the open preview. The targets were frozen when it
+    // opened, so the list cannot change what this task would run on.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_clear_selection(cx));
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).batch_panel().target_count(),
+            3,
+            "the preview kept the hosts it was built from"
+        );
+    });
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let (factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                fixture_plan(
+                    &["build-01", "api-02", "edge-03"],
+                    HostScript::new(vec![StepScript::ok("ok\n")]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    assert_eq!(
+        factory.opens(),
+        3,
+        "the run reached the snapshot, not the list as it is now"
+    );
+}
+
+#[gpui::test]
+async fn escape_closes_the_preview_and_keeps_a_run_on_screen(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-escape");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).batch_panel().page(),
+            crate::app::batch::BatchPage::Closed,
+            "a preview is a question, and escape is not now"
+        );
+    });
+
+    // A run that has not ended keeps its page: escape cannot hide a run that goes on.
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["sleep 1"]);
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let (_factory, gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                fixture_plan(
+                    &["build-01", "api-02"],
+                    HostScript::new(vec![StepScript::holding("started\n")]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.running_hosts() > 0)
+    }));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).batch_panel().page(),
+            crate::app::batch::BatchPage::Run
+        );
+    });
+    gate.release();
+    let _ = settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    });
+}
+
+#[gpui::test]
+async fn the_batch_dialog_fits_the_minimum_window(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-minimum");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    preview_batch(cx, &view, 3);
+    write_commands(cx, &["uptime"]);
+
+    // The dialog is smaller than the window it sits in, and its own body scrolls, so
+    // nothing of it is drawn past the client edge at 720x480 (R8).
+    let dialog = bounds_of(cx, "batch.dialog");
+    assert_fits_inside(dialog, minimum_window(), "the batch dialog");
+    for selector in [
+        "batch.targets.count",
+        "batch.step.field.0",
+        "batch.concurrency",
+        "batch.failure.skip",
+        "batch.preview.confirm",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is drawn at the minimum window"
+        );
+    }
+}
+
+#[test]
+fn a_route_names_why_a_host_cannot_be_reached() {
+    use crate::app::batch::StoredRoutes;
+    use shellune_ssh::batch::RouteSource;
+
+    let book = HostBook::from_hosts(batch_hosts()).expect("distinct hosts");
+    let trust = shellune_storage::HostTrust::new();
+    let secrets = std::sync::Arc::new(shellune_storage::MemorySecrets::new());
+    let routes = StoredRoutes::new(&book, &trust, secrets.clone());
+    let defaults = shellune_core::ConnectionDefaults::default();
+    let target =
+        shellune_core::BatchTarget::snapshot(&book.hosts()[0], defaults).expect("snapshot");
+
+    // The host is saved, but nothing is saved to sign in with: the route says so
+    // instead of dialling without a credential.
+    let error = routes
+        .take_route(&target)
+        .err()
+        .expect("no credential is a refusal");
+    assert!(error.contains("build-01"), "{error}");
+
+    // A host that is no longer saved cannot be reached from a snapshot of it.
+    let mut shrunk = book.clone();
+    shrunk
+        .remove(book.hosts()[0].id())
+        .expect("the host is saved");
+    let routes = StoredRoutes::new(&shrunk, &trust, secrets);
+    let error = routes
+        .take_route(&target)
+        .err()
+        .expect("a missing host is a refusal");
+    assert!(!error.is_empty());
+}

@@ -83,6 +83,7 @@ use crate::app::{components, theme::radius};
 #[cfg(test)]
 use shellune_storage::KeymapPreferences;
 
+pub(crate) mod batch;
 mod files_menu;
 mod forwarding;
 mod home;
@@ -418,6 +419,10 @@ pub struct ShelluneView {
     book: HostBook,
     /// The host list views, the open form and the last message.
     hosts: HostsPanel,
+    /// The batch task panel: its preview, its fields and the run on screen (R19, R21).
+    batch: crate::app::batch::BatchPanel,
+    /// Whether the batch page is already asking the runner what happened.
+    batch_polling: bool,
     hosts_search: Entity<TextField>,
     /// The six form fields, present only while the editor is open.
     host_fields: Option<HostFields>,
@@ -1040,6 +1045,12 @@ impl ShelluneView {
         }
         if self.showing_connection_form && self.remote.is_some() {
             return Some("connect");
+        }
+        // The batch panel is a dialog of its own, drawn above the tools (R19).
+        match self.batch.page() {
+            crate::app::batch::BatchPage::Preview => return Some("batch-preview"),
+            crate::app::batch::BatchPage::Run => return Some("batch-run"),
+            crate::app::batch::BatchPage::Closed => {}
         }
         match self.tool {
             Some(shell::Tool::Forwards) => Some("forwards"),
@@ -1708,6 +1719,8 @@ impl ShelluneView {
             store,
             book: HostBook::new(),
             hosts: HostsPanel::new(),
+            batch: crate::app::batch::BatchPanel::new(),
+            batch_polling: false,
             hosts_search,
             host_fields: None,
             import: ImportPanel::new(),
@@ -8560,6 +8573,13 @@ impl ShelluneView {
             self.close_palette(window, cx);
             return true;
         }
+        // A batch preview is a question, so Escape is "not now". A run that has not
+        // ended keeps its page even so: closing it would leave a run nobody can see,
+        // while the commands it started go on (R19).
+        if self.batch.page().is_open() {
+            self.close_batch(cx);
+            return true;
+        }
         if self.custom_shell_open {
             self.close_custom_shell(window, cx);
             return true;
@@ -13856,6 +13876,7 @@ impl Render for ShelluneView {
             .children(self.connection_overlay(window, cx))
             .children(self.import_overlay(window, cx))
             .children(self.tool_overlay(window, cx))
+            .children(self.batch_overlay(window, cx))
             .children(self.host_dialog_overlay(window, cx))
             .children(self.group_dialog_overlay(window, cx))
             .children(self.custom_shell_overlay(window, cx))

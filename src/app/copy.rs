@@ -2493,6 +2493,148 @@ pub struct UxStrings {
     pub hosts_no_match_hint: &'static str,
     /// A group with nothing inside it
     pub hosts_group_empty: &'static str,
+    /// Button: open the batch task preview for the selected hosts
+    pub hosts_batch_open: &'static str,
+    /// Hint: what a batch task does
+    pub hosts_batch_open_hint: &'static str,
+    /// Title of the batch panel
+    pub batch_title: &'static str,
+    /// Subtitle of the preview: nothing connects before confirmation
+    pub batch_preview_subtitle: &'static str,
+    /// Section label: the hosts the task would run on
+    pub batch_targets_section: &'static str,
+    /// How many hosts would run, with the number filled in
+    pub batch_targets_count: &'static str,
+    /// Scope label inside the preview
+    pub batch_scope_label: &'static str,
+    /// Note above the selected hosts that could not be included
+    pub batch_targets_refused: &'static str,
+    /// How many target rows the preview does not list, with the number filled in
+    pub batch_targets_more: &'static str,
+    /// Section label: the commands, in order
+    pub batch_steps_section: &'static str,
+    /// Button: add one more command step
+    pub batch_step_add: &'static str,
+    /// Button: remove one command step
+    pub batch_step_remove: &'static str,
+    /// Placeholder of a command field
+    pub batch_step_placeholder: &'static str,
+    /// Label of the field that limits how many hosts run at once
+    pub batch_concurrency: &'static str,
+    /// Hint under that field, with the limit filled in
+    pub batch_concurrency_hint: &'static str,
+    /// Label of the failure policy control
+    pub batch_failure: &'static str,
+    /// Failure policy: skip that host, keep the others
+    pub batch_failure_skip: &'static str,
+    /// Failure policy: stop scheduling new hosts
+    pub batch_failure_stop: &'static str,
+    /// Label of the optional task name
+    pub batch_name: &'static str,
+    /// Placeholder of the task name
+    pub batch_name_placeholder: &'static str,
+    /// Button: confirm the task and start the run
+    pub batch_confirm: &'static str,
+    /// Button: put the preview away
+    pub batch_cancel: &'static str,
+    /// Button: close the run page
+    pub batch_close: &'static str,
+    /// Run state: running
+    pub batch_run_running: &'static str,
+    /// Run state: paused, and what a pause leaves alone
+    pub batch_run_paused: &'static str,
+    /// Run state: cancelling, and that the remote command has not ended yet
+    pub batch_run_cancelling: &'static str,
+    /// Run state: cancelled
+    pub batch_run_cancelled: &'static str,
+    /// Run state: completed
+    pub batch_run_completed: &'static str,
+    /// Run state: finished with failures
+    pub batch_run_failed: &'static str,
+    /// Run state: interrupted by a restart
+    pub batch_run_interrupted: &'static str,
+    /// Progress line, with finished, total, running and concurrency filled in
+    pub batch_run_progress: &'static str,
+    /// Button: pause the run
+    pub batch_run_pause: &'static str,
+    /// Button: continue a paused run
+    pub batch_run_resume: &'static str,
+    /// Button: ask the run to stop
+    pub batch_run_cancel: &'static str,
+    /// Button: retry the hosts that did not succeed
+    pub batch_run_retry: &'static str,
+    /// Section label above a host's output
+    pub batch_run_output: &'static str,
+    /// What the output pane says before a host printed anything
+    pub batch_run_output_empty: &'static str,
+    /// Note above a bounded output log, with the number of dropped lines filled in
+    pub batch_run_output_dropped: &'static str,
+    /// Section label above the per-step times
+    pub batch_run_timeline: &'static str,
+    /// One step of the timeline, with the one-based number filled in
+    pub batch_run_step: &'static str,
+    /// What a retry does not do, said where the retry is offered
+    pub batch_no_rollback: &'static str,
+    /// Note on a preview that is a retry
+    pub batch_retry_note: &'static str,
+    /// The question asked about an unknown host identity
+    pub batch_trust_question: &'static str,
+    /// Button: accept the presented identity
+    pub batch_trust_accept: &'static str,
+    /// Button: decline the presented identity
+    pub batch_trust_decline: &'static str,
+    /// The question asked about a local ProxyCommand
+    pub batch_proxy_question: &'static str,
+    /// How many steps the task has, with the number filled in
+    pub batch_count_steps: &'static str,
+    /// One step result, with the exit status filled in
+    pub batch_exit: &'static str,
+    /// A host that starts at a later step, with the number filled in
+    pub batch_from_step: &'static str,
+    /// Prompt shown when a preview has no target at all
+    pub batch_no_targets: &'static str,
+    /// Why a host has no route: no saved sign-in
+    pub batch_reason_no_credential: &'static str,
+    /// Why a host has no route: the saved host is gone
+    pub batch_reason_missing_host: &'static str,
+    /// The task definition could not be saved, with the reason filled in
+    pub batch_save_failed: &'static str,
+    /// A line of the run log could not be written
+    pub batch_log_failed: &'static str,
+    /// Step state: waiting
+    pub batch_step_pending: &'static str,
+    /// Step state: running
+    pub batch_step_running: &'static str,
+    /// Step state: succeeded
+    pub batch_step_succeeded: &'static str,
+    /// Step state: failed
+    pub batch_step_failed: &'static str,
+    /// Step state: skipped
+    pub batch_step_skipped: &'static str,
+    /// Step state: cancelled
+    pub batch_step_cancelled: &'static str,
+    /// Step state: already done by the run this one retries
+    pub batch_step_already_done: &'static str,
+    /// Step state: interrupted by a restart
+    pub batch_step_interrupted: &'static str,
+    /// Host state: queued
+    pub batch_host_queued: &'static str,
+    /// Host state: connecting
+    pub batch_host_connecting: &'static str,
+    /// Host state: running
+    pub batch_host_running: &'static str,
+    /// Host state: waiting for the user's answer
+    pub batch_host_waiting: &'static str,
+    /// Host state: succeeded
+    pub batch_host_succeeded: &'static str,
+    /// Host state: failed
+    pub batch_host_failed: &'static str,
+    /// Host state: cancelled
+    pub batch_host_cancelled: &'static str,
+    /// Host state: skipped
+    pub batch_host_skipped: &'static str,
+    /// Host state: interrupted
+    pub batch_host_interrupted: &'static str,
 }
 
 impl UxStrings {
@@ -2731,6 +2873,77 @@ impl UxStrings {
             self.hosts_filter_clear,
             self.hosts_no_match_hint,
             self.hosts_group_empty,
+            self.hosts_batch_open,
+            self.hosts_batch_open_hint,
+            self.batch_title,
+            self.batch_preview_subtitle,
+            self.batch_targets_section,
+            self.batch_targets_count,
+            self.batch_scope_label,
+            self.batch_targets_refused,
+            self.batch_targets_more,
+            self.batch_steps_section,
+            self.batch_step_add,
+            self.batch_step_remove,
+            self.batch_step_placeholder,
+            self.batch_concurrency,
+            self.batch_concurrency_hint,
+            self.batch_failure,
+            self.batch_failure_skip,
+            self.batch_failure_stop,
+            self.batch_name,
+            self.batch_name_placeholder,
+            self.batch_confirm,
+            self.batch_cancel,
+            self.batch_close,
+            self.batch_run_running,
+            self.batch_run_paused,
+            self.batch_run_cancelling,
+            self.batch_run_cancelled,
+            self.batch_run_completed,
+            self.batch_run_failed,
+            self.batch_run_interrupted,
+            self.batch_run_progress,
+            self.batch_run_pause,
+            self.batch_run_resume,
+            self.batch_run_cancel,
+            self.batch_run_retry,
+            self.batch_run_output,
+            self.batch_run_output_empty,
+            self.batch_run_output_dropped,
+            self.batch_run_timeline,
+            self.batch_run_step,
+            self.batch_no_rollback,
+            self.batch_retry_note,
+            self.batch_trust_question,
+            self.batch_trust_accept,
+            self.batch_trust_decline,
+            self.batch_proxy_question,
+            self.batch_count_steps,
+            self.batch_exit,
+            self.batch_from_step,
+            self.batch_no_targets,
+            self.batch_reason_no_credential,
+            self.batch_reason_missing_host,
+            self.batch_save_failed,
+            self.batch_log_failed,
+            self.batch_step_pending,
+            self.batch_step_running,
+            self.batch_step_succeeded,
+            self.batch_step_failed,
+            self.batch_step_skipped,
+            self.batch_step_cancelled,
+            self.batch_step_already_done,
+            self.batch_step_interrupted,
+            self.batch_host_queued,
+            self.batch_host_connecting,
+            self.batch_host_running,
+            self.batch_host_waiting,
+            self.batch_host_succeeded,
+            self.batch_host_failed,
+            self.batch_host_cancelled,
+            self.batch_host_skipped,
+            self.batch_host_interrupted,
         ]
     }
 }
@@ -2984,6 +3197,77 @@ included",
     hosts_filter_clear: "Clear filters",
     hosts_no_match_hint: "Change the search or drop a filter to see more hosts.",
     hosts_group_empty: "No host in this group",
+    hosts_batch_open: "Batch task",
+    hosts_batch_open_hint: "Run ordered commands on the selected hosts, after you confirm the list",
+    batch_title: "Batch task",
+    batch_preview_subtitle: "Nothing connects until you confirm: this is the list, the commands and the limits a run would use.",
+    batch_targets_section: "Targets",
+    batch_targets_count: "{count} hosts will run these commands",
+    batch_scope_label: "Targets from",
+    batch_targets_refused: "Not included",
+    batch_targets_more: "and {count} more, not listed",
+    batch_steps_section: "Commands, in order",
+    batch_step_add: "Add step",
+    batch_step_remove: "Remove step",
+    batch_step_placeholder: "Command to run on every host",
+    batch_concurrency: "Hosts at once",
+    batch_concurrency_hint: "1 to {max}, counted per connection",
+    batch_failure: "When a host fails",
+    batch_failure_skip: "Skip that host, keep the others",
+    batch_failure_stop: "Stop scheduling new hosts",
+    batch_name: "Task name (optional)",
+    batch_name_placeholder: "Nightly check",
+    batch_confirm: "Confirm and run",
+    batch_cancel: "Cancel",
+    batch_close: "Close",
+    batch_run_running: "Running",
+    batch_run_paused: "Paused: no new step starts, and a command that is running goes on",
+    batch_run_cancelling: "Cancelling: stop was asked for, and the remote command has not ended yet",
+    batch_run_cancelled: "Cancelled",
+    batch_run_completed: "Completed",
+    batch_run_failed: "Finished with failures",
+    batch_run_interrupted: "Interrupted by a restart",
+    batch_run_progress: "{done} of {total} hosts finished · {running} running · {concurrency} at once",
+    batch_run_pause: "Pause",
+    batch_run_resume: "Resume",
+    batch_run_cancel: "Cancel run",
+    batch_run_retry: "Retry failed hosts",
+    batch_run_output: "Output",
+    batch_run_output_empty: "This host has printed nothing yet.",
+    batch_run_output_dropped: "{count} earlier lines are not kept on screen",
+    batch_run_timeline: "Timeline",
+    batch_run_step: "Step {index}",
+    batch_no_rollback: "A retry runs the work still owed; nothing that already ran is undone.",
+    batch_retry_note: "Retry: only the hosts and steps that did not succeed.",
+    batch_trust_question: "The host presented {algorithm} {fingerprint}. Accept it for this run?",
+    batch_trust_accept: "Accept",
+    batch_trust_decline: "Decline",
+    batch_proxy_question: "A ProxyCommand would run on this machine: {command}",
+    batch_count_steps: "{count} steps",
+    batch_exit: "exit {code}",
+    batch_from_step: "starts at step {step}",
+    batch_no_targets: "Select hosts, or choose a scope that covers some, before confirming.",
+    batch_reason_no_credential: "{host} has no saved sign-in; add one on the host form",
+    batch_reason_missing_host: "the saved host is gone",
+    batch_save_failed: "The task definition was not saved",
+    batch_log_failed: "The run log could not be written",
+    batch_step_pending: "waiting",
+    batch_step_running: "running",
+    batch_step_succeeded: "succeeded",
+    batch_step_failed: "failed",
+    batch_step_skipped: "skipped",
+    batch_step_cancelled: "cancelled",
+    batch_step_already_done: "done earlier",
+    batch_step_interrupted: "interrupted",
+    batch_host_queued: "waiting",
+    batch_host_connecting: "connecting",
+    batch_host_running: "running",
+    batch_host_waiting: "needs your answer",
+    batch_host_succeeded: "succeeded",
+    batch_host_failed: "failed",
+    batch_host_cancelled: "cancelled",
+    batch_host_skipped: "skipped",
+    batch_host_interrupted: "interrupted",
 };
 
 /// Simplified Chinese.
@@ -3232,6 +3516,77 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     hosts_filter_clear: "清除筛选",
     hosts_no_match_hint: "改一下搜索词，或去掉一个筛选条件，就能看到更多主机。",
     hosts_group_empty: "这个分组里没有主机",
+    hosts_batch_open: "批量任务",
+    hosts_batch_open_hint: "确认清单后，在选中的主机上按顺序执行命令",
+    batch_title: "批量任务",
+    batch_preview_subtitle: "确认之前不会建立任何连接：这里列出的就是运行会用到的目标、命令和限制。",
+    batch_targets_section: "目标主机",
+    batch_targets_count: "将在 {count} 台主机上执行这些命令",
+    batch_scope_label: "目标来源",
+    batch_targets_refused: "未纳入",
+    batch_targets_more: "还有 {count} 台未列出",
+    batch_steps_section: "命令步骤（按顺序执行）",
+    batch_step_add: "添加步骤",
+    batch_step_remove: "删除步骤",
+    batch_step_placeholder: "在每台主机上执行的命令",
+    batch_concurrency: "并发主机数",
+    batch_concurrency_hint: "1 到 {max}，按连接数计算",
+    batch_failure: "主机失败时",
+    batch_failure_skip: "跳过该主机，其他继续",
+    batch_failure_stop: "停止调度新主机",
+    batch_name: "任务名称（可选）",
+    batch_name_placeholder: "例行检查",
+    batch_confirm: "确认并运行",
+    batch_cancel: "取消",
+    batch_close: "关闭",
+    batch_run_running: "运行中",
+    batch_run_paused: "已暂停：不再开始新步骤，正在执行的命令继续",
+    batch_run_cancelling: "取消中：已请求停止，远端命令尚未退出",
+    batch_run_cancelled: "已取消",
+    batch_run_completed: "已完成",
+    batch_run_failed: "已结束，存在失败",
+    batch_run_interrupted: "应用重启导致中断",
+    batch_run_progress: "{done}/{total} 台已结束 · {running} 台运行中 · 并发 {concurrency}",
+    batch_run_pause: "暂停",
+    batch_run_resume: "继续",
+    batch_run_cancel: "取消任务",
+    batch_run_retry: "重试失败项",
+    batch_run_output: "输出",
+    batch_run_output_empty: "该主机暂无输出。",
+    batch_run_output_dropped: "较早的 {count} 行未保留在界面上",
+    batch_run_timeline: "时间线",
+    batch_run_step: "第 {index} 步",
+    batch_no_rollback: "重试只执行尚未完成的部分，不会撤销已经执行的内容。",
+    batch_retry_note: "重试：只包含未成功的主机与步骤。",
+    batch_trust_question: "该主机出示了 {algorithm} {fingerprint}。本次运行是否接受？",
+    batch_trust_accept: "接受",
+    batch_trust_decline: "拒绝",
+    batch_proxy_question: "将要在本机执行 ProxyCommand：{command}",
+    batch_count_steps: "{count} 个步骤",
+    batch_exit: "退出码 {code}",
+    batch_from_step: "从第 {step} 步开始",
+    batch_no_targets: "请先选择主机，或选择一个包含主机的范围，再确认。",
+    batch_reason_no_credential: "{host} 没有保存的登录信息，请先在主机表单中补上",
+    batch_reason_missing_host: "保存的主机已不存在",
+    batch_save_failed: "任务定义未能保存",
+    batch_log_failed: "运行日志未能写入",
+    batch_step_pending: "等待",
+    batch_step_running: "执行中",
+    batch_step_succeeded: "成功",
+    batch_step_failed: "失败",
+    batch_step_skipped: "跳过",
+    batch_step_cancelled: "已取消",
+    batch_step_already_done: "此前已完成",
+    batch_step_interrupted: "已中断",
+    batch_host_queued: "排队中",
+    batch_host_connecting: "连接中",
+    batch_host_running: "执行中",
+    batch_host_waiting: "等待你确认",
+    batch_host_succeeded: "成功",
+    batch_host_failed: "失败",
+    batch_host_cancelled: "已取消",
+    batch_host_skipped: "已跳过",
+    batch_host_interrupted: "已中断",
 };
 
 /// The redesigned-shell strings of the current language.

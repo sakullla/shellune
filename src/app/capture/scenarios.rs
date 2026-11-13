@@ -1750,6 +1750,84 @@ pub const SCENARIOS: &[Scenario] = &[
         install: show_tab_list,
         ready: tab_list_ready,
     },
+    Scenario {
+        id: "batch-preview",
+        title: "批量任务 · 确认前的目标与命令",
+        category: Category::Overlay,
+        fixture: "six saved hosts with four selected, two ordered commands, concurrency 4 and \
+                  the skip-host policy",
+        evidence: "shows the preview this build draws before anything is confirmed: the count of \
+                   targets, their addresses, the commands and the limits. No session was opened and \
+                   no command was sent, which is what the shot cannot show but the model proves",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_batch_preview,
+        ready: batch_preview_ready,
+    },
+    Scenario {
+        id: "batch-running",
+        title: "批量任务 · 运行中的逐机逐步状态",
+        category: Category::Overlay,
+        fixture: "the real batch runner over four hosts and two commands, two hosts finished and \
+                  two held inside the second command by the fixture gate",
+        evidence: "shows the states, exit results, output and timeline the runner reported; the \
+                   transport is a fixture, so this is not evidence about any SSH server",
+        quick: true,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_batch_running,
+        ready: batch_running_ready,
+    },
+    Scenario {
+        id: "batch-failed",
+        title: "批量任务 · 失败的主机与重试",
+        category: Category::Overlay,
+        fixture: "the same runner over four hosts, where one command exits 3 on one host and \
+                  the other hosts succeed",
+        evidence: "shows the failed host, its exit status and reason, the untouched hosts and the \
+                   retry action; no rollback is claimed, because none happens",
+        quick: true,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_batch_failed,
+        ready: batch_failed_ready,
+    },
+    Scenario {
+        id: "batch-paused",
+        title: "批量任务 · 暂停只停止调度",
+        category: Category::Overlay,
+        fixture: "the runner holding every host inside its command, then paused",
+        evidence: "shows that a pause starts no new step while the commands already running stay \
+                   connected; nothing was stopped by it",
+        quick: false,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_batch_paused,
+        ready: batch_paused_ready,
+    },
+    Scenario {
+        id: "batch-cancelling",
+        title: "批量任务 · 取消中等待远端退出",
+        category: Category::Overlay,
+        fixture: "the runner with a cancel requested while every command is still running",
+        evidence: "shows cancelling rather than cancelled: the page says the request was made and \
+                   that the remote command has not ended, which is the state the run model waits in",
+        quick: false,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_batch_cancelling,
+        ready: batch_cancelling_ready,
+    },
 ];
 
 /// Applies a shot's palette, language, text size and motion, then the scenario's own
@@ -1767,4 +1845,307 @@ pub fn install(
     view.set_capture_zoom(variant.zoom, cx);
     view.set_capture_motion(Motion::Reduced, cx);
     (scenario.install)(view, window, cx)
+}
+
+// ---------------------------------------------------------------------------
+// Batch tasks (R19, R21)
+// ---------------------------------------------------------------------------
+
+/// The gate of the run a batch scenario started, kept alive for the shot.
+///
+/// It lives beside the scenarios because the capture takes its frame after install has
+/// returned: a gate dropped at the end of install would let every held command end before
+/// the shot, and the page would show a finished run where a running one belongs.
+static BATCH_GATE: std::sync::Mutex<Option<BatchGate>> = std::sync::Mutex::new(None);
+
+type BatchGate = crate::app::view::batch::fixture::Gate;
+
+/// The four hosts a batch shot runs on: the first four the fixture writes.
+const BATCH_TARGETS: [&str; 4] = ["build-01", "api-02", "edge-03", "stage-01"];
+
+/// Selects those hosts and opens the preview, with the commands a person would type.
+fn open_batch(
+    view: &mut ShelluneView,
+    commands: &[&str],
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_batch_select(BATCH_TARGETS.len(), cx);
+    view.capture_batch_preview(cx);
+    view.capture_batch_commands(commands, cx)
+}
+
+/// Starts a run whose commands the fixture scripts, and keeps its gate for the shot.
+fn start_batch(
+    view: &mut ShelluneView,
+    plan: crate::app::view::batch::fixture::Plan,
+    cx: &mut Context<ShelluneView>,
+) {
+    let (_, gate) = view.capture_batch_start(plan, cx);
+    let mut slot = match BATCH_GATE.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some(gate);
+}
+
+/// The gate of the run on screen, when the caller has to let a command end.
+fn batch_gate() -> Option<BatchGate> {
+    let mut slot = match BATCH_GATE.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.take()
+}
+
+fn show_batch_preview(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    open_batch(view, &["uptime", "df -h /"], cx)
+}
+
+fn batch_preview_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    on_page(view, Destination::Hosts, SectionState::Populated)?;
+    if view.capture_overlay() != Some("batch-preview") {
+        return Err(format!(
+            "the batch preview is not the surface on screen: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let panel = view.batch_panel();
+    if panel.target_count() != BATCH_TARGETS.len() {
+        return Err(format!(
+            "the preview covers {} host(s), not the {} the shot names",
+            panel.target_count(),
+            BATCH_TARGETS.len()
+        ));
+    }
+    if panel.steps().len() != 2 {
+        return Err(format!(
+            "the preview holds {} step(s), not the two commands the shot writes",
+            panel.steps().len()
+        ));
+    }
+    Ok(())
+}
+
+fn show_batch_running(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    use crate::app::view::batch::fixture::{HostScript, Plan, StepScript};
+    open_batch(view, &["uptime", "journalctl -u shellune -n 40"], cx)?;
+    let finished = HostScript::new(vec![
+        StepScript::ok(" 09:20:11 up 12 days,  load average: 0.08, 0.11, 0.09\n"),
+        StepScript::ok("-- Journal begins --\nNov 12 09:14:03 shellune[418]: listening\n"),
+    ]);
+    let held = HostScript::new(vec![
+        StepScript::ok(" 09:20:14 up 12 days,  load average: 0.12, 0.10, 0.09\n"),
+        StepScript::holding("-- Journal begins --\nNov 12 09:15:41 shellune[421]: syncing\n"),
+    ]);
+    start_batch(
+        view,
+        Plan::new()
+            .host(BATCH_TARGETS[0], finished.clone())
+            .host(BATCH_TARGETS[1], finished)
+            .host(BATCH_TARGETS[2], held.clone())
+            .host(BATCH_TARGETS[3], held),
+        cx,
+    );
+    let ready = view.capture_batch_wait(cx, |view| {
+        view.batch_panel().run().is_some_and(|page| {
+            page.run()
+                .hosts()
+                .iter()
+                .filter(|host| host.state() == shellune_core::HostState::Succeeded)
+                .count()
+                >= 2
+                && page.running_hosts() >= 2
+        })
+    });
+    if !ready {
+        return Err("the run never reached two finished hosts and two running ones".to_owned());
+    }
+    Ok(())
+}
+
+fn batch_running_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_overlay() != Some("batch-run") {
+        return Err(format!(
+            "the batch run page is not the surface on screen: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let panel = view.batch_panel();
+    let page = panel
+        .run()
+        .ok_or_else(|| "the batch run page is not on screen".to_owned())?;
+    if page.state() != shellune_core::RunState::Running {
+        return Err(format!("the run is {:?}, not running", page.state()));
+    }
+    if page.finished_hosts() < 2 || page.running_hosts() < 2 {
+        return Err(format!(
+            "the run reports {} finished and {} running host(s)",
+            page.finished_hosts(),
+            page.running_hosts()
+        ));
+    }
+    Ok(())
+}
+
+fn show_batch_failed(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    use crate::app::view::batch::fixture::{HostScript, Plan, StepScript};
+    open_batch(view, &["uptime", "deploy --check"], cx)?;
+    let good = HostScript::new(vec![
+        StepScript::ok(" 09:20:11 up 12 days\n"),
+        StepScript::ok("release 0.4.0 is deployed\n"),
+    ]);
+    let failing = HostScript::new(vec![
+        StepScript::ok(" 09:20:14 up 12 days\n"),
+        StepScript::failing(3, "deploy: no such release: 0.4.1\n"),
+    ]);
+    start_batch(
+        view,
+        Plan::new()
+            .host(BATCH_TARGETS[0], good.clone())
+            .host(BATCH_TARGETS[1], failing)
+            .host(BATCH_TARGETS[2], good.clone())
+            .host(BATCH_TARGETS[3], good),
+        cx,
+    );
+    let ready = view.capture_batch_wait(cx, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    });
+    if !ready {
+        return Err("the run never finished".to_owned());
+    }
+    // This run is over, so its gate has nothing left to hold.
+    let _ = batch_gate();
+    Ok(())
+}
+
+fn batch_failed_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_overlay() != Some("batch-run") {
+        return Err(format!(
+            "the batch run page is not the surface on screen: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let panel = view.batch_panel();
+    let page = panel
+        .run()
+        .ok_or_else(|| "the batch run page is not on screen".to_owned())?;
+    if !page.is_finished() {
+        return Err("the run page still reports the run as going".to_owned());
+    }
+    if page.state() != shellune_core::RunState::Failed {
+        return Err(format!("the run ended {:?}, not failed", page.state()));
+    }
+    if !page.can_retry() {
+        return Err("the page offers no retry for a run with a failure".to_owned());
+    }
+    Ok(())
+}
+
+/// Starts a run every host is held inside, and leaves it there.
+fn hold_every_host(view: &mut ShelluneView, cx: &mut Context<ShelluneView>) -> Result<(), String> {
+    use crate::app::view::batch::fixture::{HostScript, Plan, StepScript};
+    open_batch(view, &["journalctl -u shellune -f"], cx)?;
+    let held = HostScript::new(vec![StepScript::holding(
+        "Nov 12 09:15:41 shellune[421]: tailing the journal\n",
+    )]);
+    start_batch(view, Plan::new().every(&BATCH_TARGETS, held), cx);
+    let ready = view.capture_batch_wait(cx, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.running_hosts() == BATCH_TARGETS.len())
+    });
+    if !ready {
+        return Err("the run never had every host inside its command".to_owned());
+    }
+    Ok(())
+}
+
+fn show_batch_paused(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    hold_every_host(view, cx)?;
+    view.capture_batch_pause(cx);
+    let ready = view.capture_batch_wait(cx, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.state() == shellune_core::RunState::Paused)
+    });
+    if !ready {
+        return Err("the run never reported the pause".to_owned());
+    }
+    Ok(())
+}
+
+fn batch_paused_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_overlay() != Some("batch-run") {
+        return Err(format!(
+            "the batch run page is not the surface on screen: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let page = view
+        .batch_panel()
+        .run()
+        .ok_or_else(|| "the batch run page is not on screen".to_owned())?;
+    if page.state() != shellune_core::RunState::Paused {
+        return Err(format!("the run is {:?}, not paused", page.state()));
+    }
+    if page.running_hosts() != BATCH_TARGETS.len() {
+        return Err("a pause must leave the commands that are running where they are".to_owned());
+    }
+    Ok(())
+}
+
+fn show_batch_cancelling(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    hold_every_host(view, cx)?;
+    view.capture_batch_cancel(cx);
+    let ready = view.capture_batch_wait(cx, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.state() == shellune_core::RunState::Cancelling)
+    });
+    if !ready {
+        return Err("the run never reported the cancel request".to_owned());
+    }
+    Ok(())
+}
+
+fn batch_cancelling_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_overlay() != Some("batch-run") {
+        return Err(format!(
+            "the batch run page is not the surface on screen: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let page = view
+        .batch_panel()
+        .run()
+        .ok_or_else(|| "the batch run page is not on screen".to_owned())?;
+    if page.state() != shellune_core::RunState::Cancelling {
+        return Err(format!("the run is {:?}, not cancelling", page.state()));
+    }
+    if page.is_finished() {
+        return Err("a cancelling run is not a finished one".to_owned());
+    }
+    Ok(())
 }

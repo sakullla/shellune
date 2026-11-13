@@ -15,6 +15,8 @@
 //! * [`components`] — reusable view pieces;
 //! * [`view`] — the composition the user actually sees.
 
+/// The batch task panel: its model, its preview and its run (R19, R21).
+pub mod batch;
 #[cfg(feature = "ui-capture")]
 pub mod capture;
 pub mod components;

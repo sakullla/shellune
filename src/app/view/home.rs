@@ -196,6 +196,7 @@ impl ShelluneView {
                             .child(self.hosts_search.clone()),
                     )
                     .child(views)
+                    .child(self.batch_entry_button(cx))
                     .child(self.import_button(cx)),
             )
             .child(
@@ -340,6 +341,31 @@ impl ShelluneView {
                         this.open_group_dialog(GroupAction::Move, window, cx);
                     })),
             )
+            .child(
+                components::compact_button(ux.hosts_batch_open, Variant::Secondary, metrics)
+                    .id("hosts.batch.open")
+                    .debug_selector(|| "hosts.batch.open".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.open_batch_preview(cx);
+                    })),
+            )
+    }
+
+    /// The way into a batch task from the list itself.
+    ///
+    /// A task is built from the current results as well as from a selection (R18), so the
+    /// entry sits beside the filters: narrowing the list then pressing once is a whole
+    /// batch target, and the preview is where the count is confirmed.
+    fn batch_entry_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        components::compact_button(ux.hosts_batch_open, Variant::Secondary, metrics)
+            .id("hosts.batch.open.list")
+            .debug_selector(|| "hosts.batch.open.list".to_owned())
+            .tooltip(components::tooltip(ux.hosts_batch_open_hint))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.open_batch_preview(cx);
+            }))
     }
 
     /// The group column and the list on a wide window; the list alone on a narrow one.
