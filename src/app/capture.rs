@@ -477,6 +477,8 @@ struct Accepted {
     pixel_crc32: u32,
     window_visible: bool,
     frames: u32,
+    /// The logical size the shell had laid out for when the pixels were read.
+    viewport: (f32, f32),
     scale: f64,
 }
 
@@ -1020,10 +1022,13 @@ async fn capture_in(
     shot: Shot,
     state: &Arc<Mutex<RunState>>,
 ) -> Result<Option<Record>, ShotError> {
+    // The window takes the shot's size before anything is built in it. The layout is made
+    // for the viewport, so a view or a fixture prepared while the window still had another
+    // size would be photographed as the top-left of the bigger picture.
+    fit_window(wx, state, shot).await?;
     if let Err(reason) = (shot.scenario.prepare)(shot_root) {
         return Err(ShotError::Scenario(reason));
     }
-    fit_window(wx, shot.variant.width, shot.variant.height).await?;
     install_view(wx, shot, shot_root)?;
     wait_ready(wx, shot).await?;
     let Accepted {
@@ -1034,6 +1039,7 @@ async fn capture_in(
         pixel_crc32,
         window_visible,
         frames,
+        viewport,
         scale,
     } = stable_frame(wx, state).await?;
 
@@ -1047,13 +1053,18 @@ async fn capture_in(
         ))
     })?;
 
-    let expected_width = (f64::from(shot.variant.width) * scale).round() as u32;
-    let expected_height = (f64::from(shot.variant.height) * scale).round() as u32;
-    let near = |want: u32, got: u32| want.abs_diff(got) <= 1;
-    if !near(expected_width, image.width) || !near(expected_height, image.height) {
+    // The frame has to be the picture of the layout the manifest will name. A back buffer
+    // that was resized while the shell still laid out for another viewport reads back as
+    // the top-left of that bigger layout, which is a crop, not a shot.
+    let measured = WindowSize {
+        viewport,
+        frame: (image.width, image.height),
+        scale,
+    };
+    if let Some(reason) = measured.problem(shot.variant.width, shot.variant.height) {
         return Err(ShotError::Window(format!(
-            "the frame is {}x{} physical pixels but a {}x{} logical window at scale {scale} \
-             should be {expected_width}x{expected_height}; {} was kept",
+            "the frame is {}x{} physical pixels and cannot be called a {}x{} logical window at \
+             scale {scale}: {reason}; {} was kept",
             image.width,
             image.height,
             shot.variant.width as u32,
@@ -1204,6 +1215,9 @@ fn grab(wx: &mut AsyncWindowContext, state: &Arc<Mutex<RunState>>) -> Result<Acc
         // Read before the capture: the question is what the system said while the pixels
         // were taken, not after.
         let window_visible = windows::visible(handle);
+        // Read while the pixels are taken: the viewport is the size the frame was laid
+        // out for, and it is what tells this shot apart from a crop of a bigger layout.
+        let viewport = window.viewport_size();
         let frame = window.capture_frame()?;
         let image = windows::Image {
             width: frame.width,
@@ -1219,53 +1233,151 @@ fn grab(wx: &mut AsyncWindowContext, state: &Arc<Mutex<RunState>>) -> Result<Acc
             uniform_colour: stats.uniform_colour,
             window_visible,
             frames,
+            viewport: (f32::from(viewport.width), f32::from(viewport.height)),
             scale: f64::from(window.scale_factor()),
         })
     })
 }
 
-/// Gives the hidden window the client area the shot asks for.
+/// How long one size request stands before it is asked for again.
 ///
-/// A window that is created hidden never receives its initial placement, so it keeps the
-/// size the system chose; the tool sets the size it wants and waits until the system
-/// reports it, instead of assuming the window honoured it.
+/// A request is a message to the platform rather than a call that resizes the window, so
+/// it has to be given a turn of the loop before a second one would mean anything.
 #[cfg(target_os = "windows")]
-async fn fit_window(wx: &mut AsyncWindowContext, width: f32, height: f32) -> Result<(), ShotError> {
-    let started = Instant::now();
-    loop {
-        let measured = on_window(wx, |window, _cx| {
-            let scale = f64::from(window.scale_factor());
-            let handle = hwnd(window)?;
-            let (actual_width, actual_height) = windows::client_size(handle)?;
-            let expected_width = (f64::from(width) * scale).round() as i32;
-            let expected_height = (f64::from(height) * scale).round() as i32;
-            if actual_width.abs_diff(expected_width) > 1
-                || actual_height.abs_diff(expected_height) > 1
-            {
-                windows::resize_client(handle, expected_width, expected_height)?;
-            }
-            Ok((actual_width, actual_height, scale))
-        })?;
-        let (actual_width, actual_height, scale) = measured;
-        let expected_width = (f64::from(width) * scale).round() as i32;
-        let expected_height = (f64::from(height) * scale).round() as i32;
-        if actual_width.abs_diff(expected_width) <= 1
-            && actual_height.abs_diff(expected_height) <= 1
-        {
-            return Ok(());
+const FIT_NUDGE: Duration = Duration::from_secs(1);
+
+/// The two sizes a window has to agree on before a shot may be taken.
+///
+/// The client area the system reports is what the GPU draws into: the frame is read from
+/// that back buffer. The viewport is what the shell lays out for. They are not the same
+/// number, and this tool used to check only the first: a window whose back buffer had been
+/// resized while the layout still believed the old size draws the top-left of the bigger
+/// layout, so a 720x480 shot and a 1120x720 shot came out as one picture cut in half.
+/// Comparing both is what tells a shot of a layout apart from a crop of it.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WindowSize {
+    /// The logical size the shell laid out for, as width and height.
+    viewport: (f32, f32),
+    /// The area in physical pixels that was drawn and read back.
+    frame: (u32, u32),
+    /// The DPI scale in force while the shot was taken.
+    scale: f64,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowSize {
+    /// The physical pixels a logical size means at this scale.
+    fn target(self, width: f32, height: f32) -> (u32, u32) {
+        (
+            (f64::from(width) * self.scale).round() as u32,
+            (f64::from(height) * self.scale).round() as u32,
+        )
+    }
+
+    /// What is still wrong with this window for a shot of `width` by `height`, if anything.
+    ///
+    /// A pixel of slack covers the rounding a fractional DPI scale does; anything more is
+    /// the window and the layout disagreeing, which is a picture nobody asked for.
+    fn problem(self, width: f32, height: f32) -> Option<String> {
+        let (want_width, want_height) = self.target(width, height);
+        let mut faults = Vec::new();
+        if self.frame.0.abs_diff(want_width) > 1 || self.frame.1.abs_diff(want_height) > 1 {
+            faults.push(format!(
+                "the frame is {}x{} physical pixels, not {want_width}x{want_height}",
+                self.frame.0, self.frame.1
+            ));
         }
-        if started.elapsed() > SETTLE_TIMEOUT {
-            return Err(ShotError::Window(format!(
-                "the hidden window is {actual_width}x{actual_height} physical pixels after {} ms; \
-                 a {width}x{height} logical window at scale {scale} should be \
-                 {expected_width}x{expected_height}",
-                SETTLE_TIMEOUT.as_millis()
-            )));
+        if (self.viewport.0 - width).abs() > 0.5 || (self.viewport.1 - height).abs() > 0.5 {
+            faults.push(format!(
+                "the shell is laid out for a {}x{} viewport, not {width}x{height}",
+                self.viewport.0, self.viewport.1
+            ));
         }
-        wx.background_executor().timer(SETTLE_POLL).await;
+        (!faults.is_empty()).then(|| faults.join("; "))
     }
 }
 
+/// Reads the window's two sizes back, from the window and from the system.
+#[cfg(target_os = "windows")]
+fn measure(wx: &mut AsyncWindowContext) -> Result<WindowSize, ShotError> {
+    on_window(wx, |window, _cx| {
+        let viewport = window.viewport_size();
+        let (frame_width, frame_height) = windows::client_size(hwnd(window)?)?;
+        Ok(WindowSize {
+            viewport: (f32::from(viewport.width), f32::from(viewport.height)),
+            frame: (frame_width.max(0) as u32, frame_height.max(0) as u32),
+            scale: f64::from(window.scale_factor()),
+        })
+    })
+}
+
+/// Gives the hidden window the size the shot asks for, before anything is built in it.
+///
+/// A window that is created hidden never receives its initial placement, so it keeps the
+/// size the system chose; the tool sets the size it wants and waits until the window
+/// reports it, instead of assuming the window honoured it.
+///
+/// The size is asked for through `Window::resize`, which hands the request to the
+/// platform, and never by moving the window from inside an update. That is the fix: a
+/// `SetWindowPos` from inside an update delivers `WM_SIZE` re-entrantly, the nested
+/// window update cannot run, and the shell keeps the layout it had - the back buffer is
+/// resized, the picture is not, and the shot is a crop. Posted instead, the layout hears
+/// about the new size in its own turn, which is what the viewport read back here checks.
+///
+/// The step ends only when the frame and the viewport both name this shot's size, and only
+/// after the layout has been given frames to run at that size. A window that never gets
+/// there fails the shot, with both numbers in the reason.
+#[cfg(target_os = "windows")]
+async fn fit_window(
+    wx: &mut AsyncWindowContext,
+    state: &Arc<Mutex<RunState>>,
+    shot: Shot,
+) -> Result<(), ShotError> {
+    let width = shot.variant.width;
+    let height = shot.variant.height;
+    let started = Instant::now();
+    let mut asked: Option<Instant> = None;
+    loop {
+        let measured = measure(wx)?;
+        let reason = match measured.problem(width, height) {
+            // Both sizes are this shot's: the frames drawn next are what makes the layout
+            // the shot photographs the one made for this size.
+            None => {
+                settle(wx, state, frames_drawn(state).saturating_add(SETTLE_FRAMES)).await?;
+                let settled = measure(wx)?;
+                match settled.problem(width, height) {
+                    None => return Ok(()),
+                    Some(reason) => {
+                        return Err(ShotError::Window(format!(
+                            "the window changed size again while the frames after the resize \
+                             were drawn: {reason}"
+                        )));
+                    }
+                }
+            }
+            Some(reason) => reason,
+        };
+        // One request stands while it is answered: asking again before then would only post
+        // the same message twice.
+        if asked.is_none_or(|at| at.elapsed() > FIT_NUDGE) {
+            on_window(wx, |window, _cx| {
+                window.resize(size(px(width), px(height)));
+                Ok(())
+            })?;
+            asked = Some(Instant::now());
+        }
+        if started.elapsed() > SETTLE_TIMEOUT {
+            return Err(ShotError::Window(format!(
+                "the hidden window did not take the {width}x{height} logical size within {} \
+                 ms: {reason}",
+                SETTLE_TIMEOUT.as_millis()
+            )));
+        }
+        paint_once(wx)?;
+        wx.background_executor().timer(SETTLE_POLL).await;
+    }
+}
 /// Asks the window to paint until it has drawn `target` frames.
 #[cfg(target_os = "windows")]
 async fn settle(
