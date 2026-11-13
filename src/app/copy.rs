@@ -2155,6 +2155,8 @@ pub struct UxStrings {
     pub host_connection_override: &'static str,
     /// What inheriting means, with the values filled in
     pub host_connection_inherits: &'static str,
+    /// Inheriting a global policy whose keepalive is off; nothing is probed.
+    pub host_connection_inherits_off: &'static str,
     /// What switching keepalive off for one host means
     pub host_connection_off_note: &'static str,
     /// What an override applies to
@@ -2559,6 +2561,7 @@ impl UxStrings {
             self.host_connection_off,
             self.host_connection_override,
             self.host_connection_inherits,
+            self.host_connection_inherits_off,
             self.host_connection_off_note,
             self.host_connection_override_note,
             self.import_connection,
@@ -2797,6 +2800,7 @@ included",
     host_connection_off: "Off",
     host_connection_override: "Override",
     host_connection_inherits: "Inherits the global default: {summary}",
+    host_connection_inherits_off: "Inherits the global default, where keepalive is off for every host and a connection is given up after {timeout}s without a reply.",
     host_connection_off_note: "No keepalive probe is sent for this host, so a link that goes silent is not noticed. The connect timeout still follows the global default.",
     host_connection_override_note: "These numbers apply to this host only; the global default is unchanged.",
     import_connection: "Keepalive: a probe every {interval} s, dropped after {misses} unanswered",
@@ -3044,6 +3048,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     host_connection_off: "禁用",
     host_connection_override: "覆盖",
     host_connection_inherits: "继承全局默认：{summary}",
+    host_connection_inherits_off: "继承全局默认：所有主机都关闭保活，连接在 {timeout} 秒没有响应后放弃。",
     host_connection_off_note: "本主机不发送保活探测，因此静默断开的连接不会被发现。连接超时仍沿用全局默认。",
     host_connection_override_note: "这些数字只用于本主机，全局默认不受影响。",
     import_connection: "保活：每 {interval} 秒探测一次，{misses} 次无回应即断开",

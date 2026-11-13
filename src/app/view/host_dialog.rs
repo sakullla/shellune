@@ -559,6 +559,12 @@ impl ShelluneView {
             ],
         );
         let note = match choice {
+            // With keepalive off everywhere there is no "probes every 0s" to promise;
+            // the sentence names the timeout that still applies (R20).
+            ConnectionChoice::Inherit if defaults.keepalive_interval_secs() == 0 => copy::fill(
+                ux.host_connection_inherits_off,
+                &[("timeout", &defaults.connect_timeout_secs().to_string())],
+            ),
             ConnectionChoice::Inherit => {
                 copy::fill(ux.host_connection_inherits, &[("summary", &inherited)])
             }

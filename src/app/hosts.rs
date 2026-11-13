@@ -532,24 +532,29 @@ impl HostConnectionDraft {
     pub fn of(record: Option<HostConnection>, defaults: ConnectionDefaults) -> Self {
         let stated = record.unwrap_or_default();
         let choice = match stated.keepalive_interval_secs() {
-            Some(0) => ConnectionChoice::Off,
+            // Off is the whole record that turns every keepalive field off. A host that
+            // turns probing off but states its own timeout is an override, and reading it
+            // as Off would drop that timeout when the form is saved (R20).
+            Some(0)
+                if stated.keepalive_max_misses().is_none()
+                    && stated.connect_timeout_secs().is_none() =>
+            {
+                ConnectionChoice::Off
+            }
             _ if !stated.is_empty() => ConnectionChoice::Override,
             _ => ConnectionChoice::Inherit,
         };
         // A host that says nothing, and a keepalive that is off everywhere, both leave the
         // override fields with no usable number to start from; the documented default is
         // the honest starting point, and the field is what changes it.
-        let interval = stated
-            .keepalive_interval_secs()
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| {
-                let configured = defaults.keepalive_interval_secs();
-                if configured == 0 {
-                    DEFAULT_KEEPALIVE_INTERVAL_SECS
-                } else {
-                    configured
-                }
-            });
+        let interval = stated.keepalive_interval_secs().unwrap_or_else(|| {
+            let configured = defaults.keepalive_interval_secs();
+            if configured == 0 {
+                DEFAULT_KEEPALIVE_INTERVAL_SECS
+            } else {
+                configured
+            }
+        });
         Self {
             choice,
             interval: interval.to_string(),
@@ -2797,6 +2802,26 @@ mod tests {
         panel.set_search("nothing matches this");
         assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 0);
         assert!(panel.list(&book, &groups, &no_sessions).is_empty());
+    }
+
+    #[test]
+    fn a_host_that_turns_probing_off_but_keeps_its_timeout_stays_an_override() {
+        let mut record = HostConnection::keepalive_off();
+        record
+            .set_connect_timeout_secs(Some(45))
+            .expect("a stated timeout");
+        let draft = HostConnectionDraft::of(Some(record), ConnectionDefaults::default());
+        assert_eq!(
+            draft.choice(),
+            ConnectionChoice::Override,
+            "turning probing off is not the same record as stating a timeout"
+        );
+        let kept = draft
+            .resolve()
+            .expect("the stated numbers are valid")
+            .expect("the host states them");
+        assert_eq!(kept.keepalive_interval_secs(), Some(0));
+        assert_eq!(kept.connect_timeout_secs(), Some(45));
     }
 
     #[test]
