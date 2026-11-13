@@ -6,10 +6,27 @@
 
 use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetForegroundWindow, IsWindowVisible, PostMessageW, WM_PAINT,
+    GWL_EXSTYLE, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, IsWindowVisible,
+    PostMessageW, SetWindowLongPtrW, WM_PAINT, WS_EX_NOACTIVATE,
 };
 
 pub(super) type Handle = isize;
+
+/// Keeps focus inside the hidden window from making it the foreground window.
+///
+/// A shot may take the keyboard to a field so the caret and the focus ring are drawn;
+/// with `WS_EX_NOACTIVATE` that focus stays inside and the user's window keeps the
+/// foreground (R1).
+pub(super) fn make_non_activating(handle: Handle) {
+    unsafe {
+        let style = GetWindowLongPtrW(handle as _, GWL_EXSTYLE);
+        SetWindowLongPtrW(
+            handle as _,
+            GWL_EXSTYLE,
+            style | (WS_EX_NOACTIVATE as isize),
+        );
+    }
+}
 
 pub(super) fn foreground() -> Handle {
     unsafe { GetForegroundWindow() as Handle }

@@ -656,7 +656,7 @@ Enter/Space 触发当前控件——与指针点击调用同一段代码，所�
 | --- | --- |
 | 外观 | 主题、语言、界面文字大小、动态效果 |
 | 终端 | 终端配色、字号、默认 Shell |
-| 连接 | 保活与超时（只读） |
+| 连接 | 保活与超时 |
 | 提醒 | 响铃、命令结束 |
 | 快捷键 | 快捷键子页 |
 | 数据 | 主机文件、导入 SSH 配置 |
@@ -670,8 +670,35 @@ Enter/Space 触发当前控件——与指针点击调用同一段代码，所�
 - 选中项同时用底色、2px accent 竖条与加粗文字表示，不只靠颜色；最近一次输入来自键盘时另画 accent 焦点环。
 - 键盘：不在快捷键子页时 ↑/↓ 换分类、←/→ 换该分类的子项；在快捷键子页时 ↑/↓ 换动作行、←/→ 换该行控件、
   Enter 执行（见下节）。
-- 连接分类是只读的：本轮只落地一个全局连接策略，所以页面陈述 SSH 层真正使用的保活间隔、未响应次数与连接超时
-  （`shellune_core::ConnectionDefaults::default()`），不提供改了却到不了连接层的控件。
+- 连接分类是可编辑的全局默认（见下节"连接保活与超时"）：页面改的就是下一次连接真正使用的数字，
+  保存进 `preferences.json` 的 `connection`，没有单独设置的主机在重启后仍按它连接。
+### 连接保活与超时（R20）
+
+保活是 OpenSSH 的加密通道探测（`ServerAliveInterval` / `ServerAliveCountMax`）：连接静默一个间隔就发一次探测，
+连续这么多次没有回应才判定断开。TCPKeepAlive 是另一件事，本轮不当作替代品，导入时明示"未应用"。
+
+**设置 → 连接 → 保活与超时**（`view/settings.rs`）从上到下是四行加两条说明：
+
+| 行 | 控件 | 说明 |
+| --- | --- | --- |
+| 保活 | 开 / 关（`settings.keepalive.0` / `.1`） | 关就是把间隔写成 0，与 OpenSSH 的 `ServerAliveInterval 0` 同义 |
+| 保活间隔 | 秒数输入框（`settings.policy.keepalive-interval`） | 静默这么久之后发一次探测；0 表示关闭 |
+| 未响应探测 | 次数输入框（`settings.policy.keepalive-misses`） | 1–100；0 被拒绝，因为"永远不判定断开"不是可达的语义 |
+| 连接超时 | 秒数输入框（`settings.policy.connect-timeout`） | 1–600；只覆盖拨号与密钥交换，不覆盖人工确认指纹的时间 |
+
+- 说明行 `settings.policy.window` 把两个数字换算成人能读的句子（"约 90 秒没有任何回应就判定连接断开"）；保活关闭时改说"不会主动发现静默断开的连接"，不宣称仍在检测。`settings.policy.note` 说明没有单独设置的主机都按这里连接。
+- 拒绝在原字段发生：`settings.policy.error.<字段>` 画在该输入框下面，值留在框里，文件里的值不动，不静默改成相近的数。负数、非数字、间隔超过 3600、次数为 0 或超过 100、超时为 0 或超过 600 都走这条路；间隔 0 不是错误。
+- 关掉再打开保活会恢复上一次用过的间隔，而不是跳回 30 秒。
+- 改动写进 `preferences.json` 的 `connection`；从没改过时该块不写入，因此本版本的默认值不会冻结进用户数据。
+
+**主机表单 → 保活**（`view/host_dialog.rs`）是三态分段：`hosts.editor.connection.inherit` / `.off` / `.override`。
+
+- 继承：记录里不写任何字段，表单说明它继承的是哪组数字（`hosts.connection.note`，"继承全局默认：每 30 秒探测一次…"）。旧主机缺字段即继承，改动全局默认会带动它。
+- 禁用：记录写成 `keepalive_interval_secs = 0`，只影响这一台；连接超时仍继承全局。说明文字直说"不会主动发现静默断开的连接"。
+- 覆盖：三个输入框（`hosts.connection.keepalive-interval` / `-misses` / `-connect-timeout`）以它今天真正生效的数字预填，下面是 `hosts.connection.window` 的判定窗口句子。拒绝同样落在原字段（`hosts.connection.error.<字段>`）；保存被拒绝时表单不关闭，文件里的旧值不变。
+- 保存后由 `ChainDraft::with_connection_defaults` 解析成一份 `ConnectionPolicy` 写进真实的 `ChainRequest`：direct 与跳板链的每一跳使用同一份策略，界面显示的数字就是拨号用的数字。
+
+**导入 SSH 配置**（主机列表的导入面板）在每台主机的一行里多一句保活结果（`hosts.import.connection.<行号>`）：两个指令都拿到时写"每 20 秒探测一次，4 次无回应即断开"，`ServerAliveInterval 0` 写"文件对本主机关闭了保活"，只写了一个指令时说"只设置了其中一部分，其余沿用全局默认"。`TCPKeepAlive` 等不支持的指令仍出现在文件级"未应用"列表里，不会假装生效。
 ### 快捷键子页（`keymap.rs` + `view/settings.rs`）
 
 快捷键是设置页"快捷键"分类下的独立子页，其它设置不再被动作目录挤到下面。页面自上而下是：搜索框、作用范围

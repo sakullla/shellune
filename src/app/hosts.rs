@@ -22,7 +22,9 @@
 use std::collections::BTreeSet;
 
 use shellune_core::{
-    AuthMethodKind, GroupBook, GroupPath, HostConfig, HostId, Port, TransferProtocol, X11Forwarding,
+    AuthMethodKind, ConnectionDefaults, ConnectionValueError, DEFAULT_KEEPALIVE_INTERVAL_SECS,
+    GroupBook, GroupPath, HostConfig, HostConnection, HostId, MAX_CONNECT_TIMEOUT_SECS,
+    MAX_KEEPALIVE_INTERVAL_SECS, MAX_KEEPALIVE_MAX_MISSES, Port, TransferProtocol, X11Forwarding,
 };
 use shellune_storage::{
     DEFAULT_CONFIG_TEXT, HostBook, HostEdit, ImportOutcome, ImportPlan, ImportPreview,
@@ -140,6 +142,539 @@ impl HostField {
     }
 }
 
+/// One of the three numbers a connection policy is made of (R20).
+///
+/// The name exists so a refusal can point at the field that produced it: a page that
+/// silently corrected a number would leave the user with a value they did not choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionField {
+    /// How long a silent connection waits before one probe.
+    KeepaliveInterval,
+    /// How many probes may go unanswered before the link counts as dead.
+    KeepaliveMisses,
+    /// How long the machine part of an attempt may take.
+    ConnectTimeout,
+}
+
+impl ConnectionField {
+    /// The three fields, in the order a page lists them.
+    pub const ALL: [Self; 3] = [
+        Self::KeepaliveInterval,
+        Self::KeepaliveMisses,
+        Self::ConnectTimeout,
+    ];
+
+    /// Stable identifier, used by the selectors and the capture scenarios.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::KeepaliveInterval => "keepalive-interval",
+            Self::KeepaliveMisses => "keepalive-misses",
+            Self::ConnectTimeout => "connect-timeout",
+        }
+    }
+
+    /// The name of the field in one language.
+    #[must_use]
+    pub fn label(self, ux: &UxStrings) -> &'static str {
+        match self {
+            Self::KeepaliveInterval => ux.settings_keepalive_interval,
+            Self::KeepaliveMisses => ux.settings_keepalive_misses,
+            Self::ConnectTimeout => ux.settings_connect_timeout,
+        }
+    }
+
+    /// The field a refused value belongs to.
+    #[must_use]
+    pub fn of_error(error: &ConnectionValueError) -> Self {
+        match error {
+            ConnectionValueError::KeepaliveIntervalOutOfRange { .. } => Self::KeepaliveInterval,
+            ConnectionValueError::KeepaliveMaxMissesOutOfRange { .. } => Self::KeepaliveMisses,
+            ConnectionValueError::ConnectTimeoutOutOfRange { .. } => Self::ConnectTimeout,
+        }
+    }
+}
+
+/// Why a typed connection number was refused.
+///
+/// The text stays in the field: the reason is shown beside it and the value in force
+/// is unchanged, which is the difference between refusing a number and quietly fixing
+/// it (R20).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionInputError {
+    /// The field is empty.
+    Missing,
+    /// The text is not a whole number.
+    NotANumber {
+        /// What was typed.
+        text: String,
+    },
+    /// The text is below zero.
+    Negative {
+        /// What was typed.
+        text: String,
+    },
+    /// The number is outside what the SSH layer stores.
+    Refused(ConnectionValueError),
+}
+
+/// The sentence for a refused connection value, in a language.
+///
+/// The domain crate words its refusals in English so they stay language-neutral; a page
+/// says them in the language of the window, with the limit filled in.
+#[must_use]
+pub fn connection_problem_text(
+    problem: &ConnectionInputError,
+    locale: crate::app::copy::Locale,
+) -> String {
+    let ux = crate::app::copy::ux_for(locale);
+    let fill = crate::app::copy::fill;
+    match problem {
+        ConnectionInputError::Missing => ux.connection_problem_missing.to_owned(),
+        ConnectionInputError::NotANumber { text } => {
+            fill(ux.connection_problem_number, &[("text", text)])
+        }
+        ConnectionInputError::Negative { text } => {
+            fill(ux.connection_problem_negative, &[("text", text)])
+        }
+        ConnectionInputError::Refused(error) => match error {
+            ConnectionValueError::KeepaliveIntervalOutOfRange { value, max } => fill(
+                ux.connection_problem_interval,
+                &[("value", &value.to_string()), ("max", &max.to_string())],
+            ),
+            ConnectionValueError::KeepaliveMaxMissesOutOfRange { value, max } => fill(
+                ux.connection_problem_misses,
+                &[("value", &value.to_string()), ("max", &max.to_string())],
+            ),
+            ConnectionValueError::ConnectTimeoutOutOfRange { value, max } => fill(
+                ux.connection_problem_timeout,
+                &[("value", &value.to_string()), ("max", &max.to_string())],
+            ),
+        },
+    }
+}
+
+/// The refusal a field reports when a number is beyond every value this build stores.
+fn beyond_any_value(field: ConnectionField) -> ConnectionValueError {
+    match field {
+        ConnectionField::KeepaliveInterval => ConnectionValueError::KeepaliveIntervalOutOfRange {
+            value: u32::MAX,
+            max: MAX_KEEPALIVE_INTERVAL_SECS,
+        },
+        ConnectionField::KeepaliveMisses => ConnectionValueError::KeepaliveMaxMissesOutOfRange {
+            value: u32::MAX,
+            max: MAX_KEEPALIVE_MAX_MISSES,
+        },
+        ConnectionField::ConnectTimeout => ConnectionValueError::ConnectTimeoutOutOfRange {
+            value: u32::MAX,
+            max: MAX_CONNECT_TIMEOUT_SECS,
+        },
+    }
+}
+
+/// Asks the domain whether one number is usable, without storing it.
+///
+/// The check is the domain's own: the setters on a host connection record validate one
+/// field at a time and use exactly the bounds the saved records are read with, so a page
+/// cannot accept a number a restart would refuse.
+fn check_connection_value(field: ConnectionField, value: u32) -> Result<(), ConnectionInputError> {
+    let mut record = HostConnection::default();
+    let checked = match field {
+        ConnectionField::KeepaliveInterval => record.set_keepalive_interval_secs(Some(value)),
+        ConnectionField::KeepaliveMisses => record.set_keepalive_max_misses(Some(value)),
+        ConnectionField::ConnectTimeout => record.set_connect_timeout_secs(Some(value)),
+    };
+    checked.map_err(ConnectionInputError::Refused)
+}
+
+/// Reads one field of the connection page.
+///
+/// Zero is a real value for the interval - OpenSSH's way of switching the probe off - and
+/// is therefore not refused. A probe count or a timeout of zero is refused, because
+/// neither has a meaning that could be applied.
+fn parse_connection_number(
+    field: ConnectionField,
+    text: &str,
+) -> Result<u32, ConnectionInputError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(ConnectionInputError::Missing);
+    }
+    if text.starts_with('-') {
+        return Err(ConnectionInputError::Negative {
+            text: text.to_owned(),
+        });
+    }
+    let Ok(digits) = text.parse::<u64>() else {
+        return Err(ConnectionInputError::NotANumber {
+            text: text.to_owned(),
+        });
+    };
+    if digits > u64::from(u32::MAX) {
+        return Err(ConnectionInputError::Refused(beyond_any_value(field)));
+    }
+    let value = u32::try_from(digits).unwrap_or(u32::MAX);
+    check_connection_value(field, value)?;
+    Ok(value)
+}
+
+/// How many seconds may pass without a reply before the connection counts as lost.
+///
+/// It is the interval times the probes: OpenSSH sends one probe per interval and gives up
+/// after that many unanswered ones, which is what "dropped after 3 unanswered probes"
+/// means in seconds (R20).
+#[must_use]
+pub fn detection_window_secs(interval: u32, misses: u32) -> u64 {
+    u64::from(interval) * u64::from(misses)
+}
+
+/// The global keepalive and timeout numbers, as the connection page edits them (R20).
+///
+/// The numbers stay text while they are being typed and the page keeps the reason the
+/// last one was refused, so an unreadable value is visible in the field that produced it
+/// rather than replaced by a nearby one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionDraft {
+    interval: String,
+    misses: String,
+    timeout: String,
+    /// The interval to put back when keepalive is switched on after being off.
+    last_interval: u32,
+    error: Option<(ConnectionField, ConnectionInputError)>,
+}
+
+impl ConnectionDraft {
+    /// The page's copy of the defaults in force.
+    #[must_use]
+    pub fn of(defaults: ConnectionDefaults) -> Self {
+        let mut draft = Self {
+            interval: defaults.keepalive_interval_secs().to_string(),
+            misses: defaults.keepalive_max_misses().to_string(),
+            timeout: defaults.connect_timeout_secs().to_string(),
+            last_interval: DEFAULT_KEEPALIVE_INTERVAL_SECS,
+            error: None,
+        };
+        draft.remember_interval();
+        draft
+    }
+
+    /// The text of one field.
+    #[must_use]
+    pub fn text(&self, field: ConnectionField) -> &str {
+        match field {
+            ConnectionField::KeepaliveInterval => &self.interval,
+            ConnectionField::KeepaliveMisses => &self.misses,
+            ConnectionField::ConnectTimeout => &self.timeout,
+        }
+    }
+
+    /// What the last edit refused, and which field it was.
+    #[must_use]
+    pub fn error(&self) -> Option<(ConnectionField, &ConnectionInputError)> {
+        self.error
+            .as_ref()
+            .map(|(field, problem)| (*field, problem))
+    }
+
+    /// Replaces one field, keeping the reason if the value is unusable.
+    ///
+    /// Returns whether the text changed. Every field is re-read after an edit, so the
+    /// reason names the field the user has to fix and goes away when it is usable.
+    pub fn set_text(&mut self, field: ConnectionField, text: impl Into<String>) -> bool {
+        let text = text.into();
+        let slot = match field {
+            ConnectionField::KeepaliveInterval => &mut self.interval,
+            ConnectionField::KeepaliveMisses => &mut self.misses,
+            ConnectionField::ConnectTimeout => &mut self.timeout,
+        };
+        if *slot == text {
+            return false;
+        }
+        *slot = text;
+        self.revalidate();
+        self.remember_interval();
+        true
+    }
+
+    /// Re-reads every field and keeps the first refusal, so no message outlives its fix.
+    fn revalidate(&mut self) {
+        self.error = ConnectionField::ALL.iter().find_map(|field| {
+            parse_connection_number(*field, self.text(*field))
+                .err()
+                .map(|problem| (*field, problem))
+        });
+    }
+
+    /// Remembers the last usable interval, so switching keepalive off and on again does
+    /// not silently fall back to the documented default.
+    fn remember_interval(&mut self) {
+        if let Ok(value) =
+            parse_connection_number(ConnectionField::KeepaliveInterval, &self.interval)
+            && value > 0
+        {
+            self.last_interval = value;
+        }
+    }
+
+    /// Whether keepalive probes are sent at all.
+    #[must_use]
+    pub fn keepalive_on(&self) -> bool {
+        match parse_connection_number(ConnectionField::KeepaliveInterval, &self.interval) {
+            Ok(value) => value > 0,
+            Err(_) => self.last_interval > 0,
+        }
+    }
+
+    /// Switches keepalive on or off, writing zero for off as OpenSSH does.
+    pub fn set_keepalive(&mut self, on: bool) {
+        let text = if on {
+            self.last_interval.max(1).to_string()
+        } else {
+            "0".to_owned()
+        };
+        self.set_text(ConnectionField::KeepaliveInterval, text);
+    }
+
+    /// The seconds without a reply before a connection counts as lost, when keepalive is
+    /// on and both numbers are usable.
+    #[must_use]
+    pub fn detection_window_secs(&self) -> Option<u64> {
+        let interval =
+            parse_connection_number(ConnectionField::KeepaliveInterval, &self.interval).ok()?;
+        if interval == 0 {
+            return None;
+        }
+        let misses =
+            parse_connection_number(ConnectionField::KeepaliveMisses, &self.misses).ok()?;
+        Some(detection_window_secs(interval, misses))
+    }
+
+    /// The defaults these fields describe.
+    ///
+    /// # Errors
+    ///
+    /// Returns the field and the reason when any of the three is unusable. Nothing is
+    /// corrected on the way: the caller keeps editing the same text.
+    pub fn resolve(&self) -> Result<ConnectionDefaults, (ConnectionField, ConnectionInputError)> {
+        let interval = parse_connection_number(ConnectionField::KeepaliveInterval, &self.interval)
+            .map_err(|problem| (ConnectionField::KeepaliveInterval, problem))?;
+        let misses = parse_connection_number(ConnectionField::KeepaliveMisses, &self.misses)
+            .map_err(|problem| (ConnectionField::KeepaliveMisses, problem))?;
+        let timeout = parse_connection_number(ConnectionField::ConnectTimeout, &self.timeout)
+            .map_err(|problem| (ConnectionField::ConnectTimeout, problem))?;
+        ConnectionDefaults::new(interval, misses, timeout).map_err(|error| {
+            (
+                ConnectionField::of_error(&error),
+                ConnectionInputError::Refused(error),
+            )
+        })
+    }
+}
+
+/// What one host says about its own keepalive (R20).
+///
+/// The three states are kept apart because they mean different things: inheriting
+/// follows the global default wherever it goes, off keeps the default from applying at
+/// all, and an override states its own numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionChoice {
+    /// Nothing is stored; the global default applies.
+    Inherit,
+    /// This host sends no keepalive probe.
+    Off,
+    /// This host states its own interval, probe count and timeout.
+    Override,
+}
+
+impl ConnectionChoice {
+    /// The three choices, in the order the form offers them.
+    pub const ALL: [Self; 3] = [Self::Inherit, Self::Off, Self::Override];
+
+    /// Stable identifier, used by the selectors and the capture scenarios.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Off => "off",
+            Self::Override => "override",
+        }
+    }
+
+    /// The choice in one language.
+    #[must_use]
+    pub fn label(self, ux: &UxStrings) -> &'static str {
+        match self {
+            Self::Inherit => ux.host_connection_inherit,
+            Self::Off => ux.host_connection_off,
+            Self::Override => ux.host_connection_override,
+        }
+    }
+}
+
+/// One host's keepalive choice, as the host form edits it.
+///
+/// The override numbers start from what the host would be dialled with today - its own
+/// value where it states one, the global default otherwise - so choosing "override" on a
+/// host that inherits does not silently change what it does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostConnectionDraft {
+    choice: ConnectionChoice,
+    interval: String,
+    misses: String,
+    timeout: String,
+    last_interval: u32,
+    error: Option<(ConnectionField, ConnectionInputError)>,
+}
+
+impl HostConnectionDraft {
+    /// The form's copy of one host's record, resolved against the global defaults.
+    #[must_use]
+    pub fn of(record: Option<HostConnection>, defaults: ConnectionDefaults) -> Self {
+        let stated = record.unwrap_or_default();
+        let choice = match stated.keepalive_interval_secs() {
+            Some(0) => ConnectionChoice::Off,
+            _ if !stated.is_empty() => ConnectionChoice::Override,
+            _ => ConnectionChoice::Inherit,
+        };
+        // A host that says nothing, and a keepalive that is off everywhere, both leave the
+        // override fields with no usable number to start from; the documented default is
+        // the honest starting point, and the field is what changes it.
+        let interval = stated
+            .keepalive_interval_secs()
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                let configured = defaults.keepalive_interval_secs();
+                if configured == 0 {
+                    DEFAULT_KEEPALIVE_INTERVAL_SECS
+                } else {
+                    configured
+                }
+            });
+        Self {
+            choice,
+            interval: interval.to_string(),
+            misses: stated
+                .keepalive_max_misses()
+                .unwrap_or(defaults.keepalive_max_misses())
+                .to_string(),
+            timeout: stated
+                .connect_timeout_secs()
+                .unwrap_or(defaults.connect_timeout_secs())
+                .to_string(),
+            last_interval: interval,
+            error: None,
+        }
+    }
+
+    /// The choice this form makes.
+    #[must_use]
+    pub fn choice(&self) -> ConnectionChoice {
+        self.choice
+    }
+
+    /// Chooses inherit, off or override.
+    pub fn set_choice(&mut self, choice: ConnectionChoice) -> bool {
+        let changed = self.choice != choice;
+        self.choice = choice;
+        changed
+    }
+
+    /// The text of one override field.
+    #[must_use]
+    pub fn text(&self, field: ConnectionField) -> &str {
+        match field {
+            ConnectionField::KeepaliveInterval => &self.interval,
+            ConnectionField::KeepaliveMisses => &self.misses,
+            ConnectionField::ConnectTimeout => &self.timeout,
+        }
+    }
+
+    /// What the last edit refused, and which field it was.
+    #[must_use]
+    pub fn error(&self) -> Option<(ConnectionField, &ConnectionInputError)> {
+        self.error
+            .as_ref()
+            .map(|(field, problem)| (*field, problem))
+    }
+
+    /// Replaces one override field, keeping the reason if it is unusable.
+    pub fn set_text(&mut self, field: ConnectionField, text: impl Into<String>) -> bool {
+        let text = text.into();
+        let slot = match field {
+            ConnectionField::KeepaliveInterval => &mut self.interval,
+            ConnectionField::KeepaliveMisses => &mut self.misses,
+            ConnectionField::ConnectTimeout => &mut self.timeout,
+        };
+        if *slot == text {
+            return false;
+        }
+        *slot = text;
+        self.error = ConnectionField::ALL.iter().find_map(|field| {
+            parse_connection_number(*field, self.text(*field))
+                .err()
+                .map(|problem| (*field, problem))
+        });
+        if let Ok(value) =
+            parse_connection_number(ConnectionField::KeepaliveInterval, &self.interval)
+            && value > 0
+        {
+            self.last_interval = value;
+        }
+        true
+    }
+
+    /// The seconds without a reply before this connection counts as lost, while the form
+    /// says keepalive is on.
+    #[must_use]
+    pub fn detection_window_secs(&self) -> Option<u64> {
+        if self.choice != ConnectionChoice::Override {
+            return None;
+        }
+        let interval =
+            parse_connection_number(ConnectionField::KeepaliveInterval, &self.interval).ok()?;
+        if interval == 0 {
+            return None;
+        }
+        let misses =
+            parse_connection_number(ConnectionField::KeepaliveMisses, &self.misses).ok()?;
+        Some(detection_window_secs(interval, misses))
+    }
+
+    /// The record this form describes: none for inherit, the switch that turns the probe
+    /// off, or the three numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the field and the reason when an override number is unusable.
+    pub fn resolve(
+        &self,
+    ) -> Result<Option<HostConnection>, (ConnectionField, ConnectionInputError)> {
+        match self.choice {
+            ConnectionChoice::Inherit => Ok(None),
+            ConnectionChoice::Off => Ok(Some(HostConnection::keepalive_off())),
+            ConnectionChoice::Override => {
+                let interval =
+                    parse_connection_number(ConnectionField::KeepaliveInterval, &self.interval)
+                        .map_err(|problem| (ConnectionField::KeepaliveInterval, problem))?;
+                let misses =
+                    parse_connection_number(ConnectionField::KeepaliveMisses, &self.misses)
+                        .map_err(|problem| (ConnectionField::KeepaliveMisses, problem))?;
+                let timeout =
+                    parse_connection_number(ConnectionField::ConnectTimeout, &self.timeout)
+                        .map_err(|problem| (ConnectionField::ConnectTimeout, problem))?;
+                HostConnection::new(Some(interval), Some(misses), Some(timeout))
+                    .map(Some)
+                    .map_err(|error| {
+                        (
+                            ConnectionField::of_error(&error),
+                            ConnectionInputError::Refused(error),
+                        )
+                    })
+            }
+        }
+    }
+}
+
 /// The text of one host form.
 ///
 /// The values stay text until the form is saved: a port of "0" has to be visible in
@@ -177,6 +712,12 @@ pub struct HostDraft {
     /// Off unless chosen here. A single connection may still choose another mode; that
     /// choice belongs to the attempt and does not change this host.
     x11: X11Forwarding,
+    /// What this host says about its own keepalive and timeout (R20).
+    ///
+    /// The record the form opened with is kept beside the three-state choice, so the
+    /// numbers an override starts from can be refreshed once the preferences are known.
+    connection: HostConnectionDraft,
+    connection_record: Option<HostConnection>,
 }
 
 impl HostDraft {
@@ -200,6 +741,8 @@ impl HostDraft {
             proxy: String::new(),
             protocol: TransferProtocol::Sftp,
             x11: X11Forwarding::Off,
+            connection: HostConnectionDraft::of(None, ConnectionDefaults::default()),
+            connection_record: None,
         }
     }
 
@@ -236,6 +779,8 @@ impl HostDraft {
             proxy: host.proxy_command().unwrap_or_default().to_owned(),
             protocol: host.transfer_protocol(),
             x11: host.x11(),
+            connection: HostConnectionDraft::of(host.connection(), ConnectionDefaults::default()),
+            connection_record: host.connection(),
         }
     }
 
@@ -263,6 +808,26 @@ impl HostDraft {
         let changed = self.x11 != mode;
         self.x11 = mode;
         changed
+    }
+
+    /// This host's keepalive choice, as the form edits it (R20).
+    #[must_use]
+    pub fn connection(&self) -> &HostConnectionDraft {
+        &self.connection
+    }
+
+    /// The keepalive choice, to be changed by the form.
+    pub fn connection_mut(&mut self) -> &mut HostConnectionDraft {
+        &mut self.connection
+    }
+
+    /// Re-reads the numbers a host that inherits would be dialled with.
+    ///
+    /// The form is built before the preferences are known in some paths, so the override
+    /// fields are refreshed once from the defaults in force instead of being frozen at
+    /// construction. Nothing the user typed is involved: this runs while the form opens.
+    pub fn refresh_connection_defaults(&mut self, defaults: ConnectionDefaults) {
+        self.connection = HostConnectionDraft::of(self.connection_record, defaults);
     }
 
     /// How the host signs in.
@@ -390,6 +955,7 @@ impl HostDraft {
                 host.set_identity_file(self.identity_for_method());
                 self.apply_sign_in(&mut host);
                 self.apply_route(&mut host);
+                self.apply_connection(&mut host)?;
                 Ok(HostEdit::replace(host))
             }
             None => {
@@ -404,6 +970,7 @@ impl HostDraft {
                 host.set_identity_file(self.identity_for_method());
                 self.apply_sign_in(&mut host);
                 self.apply_route(&mut host);
+                self.apply_connection(&mut host)?;
                 Ok(HostEdit::create(host))
             }
         }
@@ -480,6 +1047,19 @@ impl HostDraft {
         host.set_x11(self.x11);
     }
 
+    /// Writes this host's own keepalive numbers, or clears them when it inherits.
+    ///
+    /// A number the SSH layer would refuse is not stored and not corrected: the form
+    /// stays open with the reason, exactly like a port outside 1-65535 (R20).
+    fn apply_connection(&self, host: &mut HostConfig) -> Result<(), String> {
+        let record = self
+            .connection
+            .resolve()
+            .map_err(|(field, problem)| connection_refusal(field, &problem))?;
+        host.set_connection(record);
+        Ok(())
+    }
+
     /// The key path to store: kept only for a method that reads a key file.
     fn identity_for_method(&self) -> Option<String> {
         self.auth.needs_key_path().then(|| self.identity.clone())
@@ -490,6 +1070,23 @@ impl HostDraft {
         host.set_auth(Some(self.auth));
         host.set_remember_secret(self.keeps_secret());
         host.set_startup_command(Some(self.startup.clone()));
+    }
+}
+
+/// The reason a host form's keepalive numbers were refused, in one sentence.
+///
+/// The sentence names the field, because the form has three numbers and the user has to
+/// know which one to correct. The wording is the domain's own for a range refusal so the
+/// limit it names is the limit that really applies.
+fn connection_refusal(field: ConnectionField, problem: &ConnectionInputError) -> String {
+    let name = field.id().replace('-', " ");
+    match problem {
+        ConnectionInputError::Missing => format!("{name} is empty; type a whole number"),
+        ConnectionInputError::NotANumber { text } => {
+            format!("{name}: {text} is not a whole number")
+        }
+        ConnectionInputError::Negative { text } => format!("{name}: {text} is below zero"),
+        ConnectionInputError::Refused(error) => format!("{name}: {error}"),
     }
 }
 
@@ -602,6 +1199,15 @@ impl HostsPanel {
     }
 
     /// Opens an empty form for a new host.
+    /// Re-reads the numbers a form that inherits would be dialled with (R20).
+    ///
+    /// Called as the dialog opens, before anything is typed.
+    pub fn apply_connection_defaults(&mut self, defaults: ConnectionDefaults) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.refresh_connection_defaults(defaults);
+        }
+    }
+
     pub fn open_create(&mut self) {
         self.draft = Some(HostDraft::create());
         self.pending_delete = None;
@@ -1785,6 +2391,237 @@ mod tests {
         let mut host = HostConfig::new(name, address, port, user).expect("a valid host");
         host.set_group(group);
         host
+    }
+
+    #[test]
+    fn the_connection_page_keeps_the_numbers_it_reads_back() {
+        let defaults = ConnectionDefaults::new(45, 4, 12).expect("valid defaults");
+        let draft = ConnectionDraft::of(defaults);
+        assert_eq!(draft.resolve(), Ok(defaults));
+        assert_eq!(draft.text(ConnectionField::KeepaliveInterval), "45");
+        assert_eq!(draft.error(), None);
+        assert_eq!(
+            draft.detection_window_secs(),
+            Some(180),
+            "45 s times 4 probes is when the link is given up on"
+        );
+    }
+
+    #[test]
+    fn zero_switches_keepalive_off_and_is_not_a_refusal() {
+        let mut draft = ConnectionDraft::of(ConnectionDefaults::default());
+        assert!(draft.keepalive_on());
+        draft.set_keepalive(false);
+        assert_eq!(draft.text(ConnectionField::KeepaliveInterval), "0");
+        assert!(!draft.keepalive_on());
+        assert_eq!(draft.error(), None, "zero is a value, not a mistake");
+        assert_eq!(draft.detection_window_secs(), None);
+        let written = draft.resolve().expect("zero is a usable interval");
+        assert_eq!(written.keepalive_interval_secs(), 0);
+        assert!(written.policy().keepalive().is_none());
+
+        // Switching it back on restores what the user last chose rather than the
+        // documented default.
+        let mut chosen = ConnectionDraft::of(ConnectionDefaults::new(90, 3, 20).expect("valid"));
+        chosen.set_keepalive(false);
+        chosen.set_keepalive(true);
+        assert_eq!(chosen.text(ConnectionField::KeepaliveInterval), "90");
+    }
+
+    #[test]
+    fn an_unusable_number_is_refused_in_its_own_field() {
+        let mut draft = ConnectionDraft::of(ConnectionDefaults::default());
+        draft.set_text(ConnectionField::KeepaliveMisses, "0");
+        let (field, problem) = draft.error().expect("zero probes is refused");
+        assert_eq!(field, ConnectionField::KeepaliveMisses);
+        assert!(
+            matches!(problem, ConnectionInputError::Refused(_)),
+            "the domain refused the range, got {problem:?}"
+        );
+        assert_eq!(
+            draft.text(ConnectionField::KeepaliveMisses),
+            "0",
+            "the refused text stays in the field the user typed it into"
+        );
+        assert!(
+            draft.resolve().is_err(),
+            "an unusable number is not written to the file"
+        );
+
+        draft.set_text(ConnectionField::KeepaliveMisses, "-3");
+        let (field, problem) = draft.error().expect("a negative count is refused");
+        assert_eq!(field, ConnectionField::KeepaliveMisses);
+        assert_eq!(
+            problem,
+            &ConnectionInputError::Negative {
+                text: "-3".to_owned()
+            }
+        );
+
+        draft.set_text(ConnectionField::KeepaliveMisses, "soon");
+        assert_eq!(
+            draft.error().map(|(field, _)| field),
+            Some(ConnectionField::KeepaliveMisses)
+        );
+
+        // A number above the supported interval is refused rather than clamped.
+        draft.set_text(ConnectionField::KeepaliveInterval, "99999");
+        assert_eq!(
+            draft.error().map(|(field, _)| field),
+            Some(ConnectionField::KeepaliveInterval)
+        );
+
+        // Fixing the numbers clears the reason, wherever it pointed.
+        draft.set_text(ConnectionField::KeepaliveInterval, "30");
+        draft.set_text(ConnectionField::KeepaliveMisses, "3");
+        assert_eq!(draft.error(), None);
+        assert_eq!(draft.resolve(), Ok(ConnectionDefaults::default()));
+    }
+
+    #[test]
+    fn the_sentence_about_a_refusal_names_the_limit_in_both_languages() {
+        let problem =
+            ConnectionInputError::Refused(ConnectionValueError::KeepaliveMaxMissesOutOfRange {
+                value: 0,
+                max: MAX_KEEPALIVE_MAX_MISSES,
+            });
+        let english = connection_problem_text(&problem, crate::app::copy::Locale::English);
+        assert!(english.contains("100"), "{english}");
+        assert!(english.contains("dead link"), "{english}");
+        let chinese = connection_problem_text(&problem, crate::app::copy::Locale::Chinese);
+        assert!(chinese.contains("100"), "{chinese}");
+        assert!(chinese.contains("判定断开"), "{chinese}");
+    }
+
+    #[test]
+    fn a_host_says_inherit_off_or_its_own_numbers() {
+        let defaults = ConnectionDefaults::new(45, 4, 12).expect("valid defaults");
+
+        // A host saved before the choice existed inherits, and its form starts from the
+        // numbers it would really be dialled with.
+        let mut draft = HostDraft::create();
+        draft.refresh_connection_defaults(defaults);
+        assert_eq!(draft.connection().choice(), ConnectionChoice::Inherit);
+        assert_eq!(
+            draft.connection().text(ConnectionField::KeepaliveInterval),
+            "45"
+        );
+        assert_eq!(draft.connection().resolve(), Ok(None));
+
+        // Override states all three, and they are what the record keeps.
+        let mut overriding = HostDraft::create();
+        overriding.refresh_connection_defaults(defaults);
+        overriding
+            .connection_mut()
+            .set_choice(ConnectionChoice::Override);
+        overriding
+            .connection_mut()
+            .set_text(ConnectionField::KeepaliveInterval, "15");
+        overriding
+            .connection_mut()
+            .set_text(ConnectionField::KeepaliveMisses, "2");
+        overriding
+            .connection_mut()
+            .set_text(ConnectionField::ConnectTimeout, "9");
+        assert_eq!(overriding.connection().detection_window_secs(), Some(30));
+        let record = overriding
+            .connection()
+            .resolve()
+            .expect("valid numbers")
+            .expect("an override states a record");
+        assert_eq!(record.keepalive_interval_secs(), Some(15));
+        assert_eq!(record.keepalive_max_misses(), Some(2));
+        assert_eq!(record.connect_timeout_secs(), Some(9));
+
+        // Off is the switch, and it is not the same as inheriting.
+        let mut off = HostDraft::create();
+        off.refresh_connection_defaults(defaults);
+        off.connection_mut().set_choice(ConnectionChoice::Off);
+        let record = off
+            .connection()
+            .resolve()
+            .expect("off needs no numbers")
+            .expect("off is a record");
+        assert_eq!(record.keepalive_interval_secs(), Some(0));
+        assert!(
+            defaults.policy_for(Some(record)).keepalive().is_none(),
+            "the host is dialled without a probe even though the default has one"
+        );
+    }
+
+    #[test]
+    fn a_host_form_refuses_an_unusable_override_and_keeps_the_typed_text() {
+        let mut draft = HostDraft::create();
+        draft.set_text(HostField::Name, "web");
+        draft.set_text(HostField::Address, "10.0.0.2");
+        draft.set_text(HostField::User, "deploy");
+        draft
+            .connection_mut()
+            .set_choice(ConnectionChoice::Override);
+        draft
+            .connection_mut()
+            .set_text(ConnectionField::KeepaliveMisses, "0");
+        assert_eq!(
+            draft.connection().error().map(|(field, _)| field),
+            Some(ConnectionField::KeepaliveMisses)
+        );
+        let refusal = draft.build(None).expect_err("the form is refused");
+        assert!(refusal.contains("keepalive misses"), "{refusal}");
+        assert_eq!(
+            draft.connection().text(ConnectionField::KeepaliveMisses),
+            "0",
+            "nothing was corrected behind the user"
+        );
+    }
+
+    #[test]
+    fn a_saved_host_reopens_with_the_choice_it_was_stored_with() {
+        let defaults = ConnectionDefaults::default();
+        let mut host = host("web", "10.0.0.2", 22, "deploy", None);
+        assert_eq!(
+            HostDraft::edit(&host).connection().choice(),
+            ConnectionChoice::Inherit,
+            "a host with no record inherits"
+        );
+
+        host.set_connection(Some(HostConnection::keepalive_off()));
+        let mut draft = HostDraft::edit(&host);
+        draft.refresh_connection_defaults(defaults);
+        assert_eq!(draft.connection().choice(), ConnectionChoice::Off);
+
+        host.set_connection(Some(
+            HostConnection::new(Some(20), Some(5), Some(8)).expect("valid"),
+        ));
+        let mut draft = HostDraft::edit(&host);
+        draft.refresh_connection_defaults(defaults);
+        assert_eq!(draft.connection().choice(), ConnectionChoice::Override);
+        assert_eq!(
+            draft.connection().text(ConnectionField::ConnectTimeout),
+            "8"
+        );
+
+        // A record that states only one field is shown as an override with the others
+        // resolved from the default, so saving it writes what the form shows.
+        host.set_connection(Some(
+            HostConnection::new(None, Some(6), None).expect("valid"),
+        ));
+        let mut partial = HostDraft::edit(&host);
+        partial.refresh_connection_defaults(ConnectionDefaults::new(50, 3, 25).expect("valid"));
+        assert_eq!(partial.connection().choice(), ConnectionChoice::Override);
+        assert_eq!(
+            partial
+                .connection()
+                .text(ConnectionField::KeepaliveInterval),
+            "50"
+        );
+        assert_eq!(
+            partial.connection().text(ConnectionField::KeepaliveMisses),
+            "6"
+        );
+        assert_eq!(
+            partial.connection().text(ConnectionField::ConnectTimeout),
+            "25"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ use shellune_storage::{
 
 use crate::app::ShelluneView;
 use crate::app::copy::Locale;
+use crate::app::hosts::ConnectionChoice;
 use crate::app::keymap::Problem;
 use crate::app::nav::{Destination, Platform};
 use crate::app::theme::{self, Motion, Zoom};
@@ -1032,19 +1033,20 @@ fn write_hosts(root: &Path, hosts: Vec<HostConfig>) -> Result<(), String> {
         .map_err(|error| format!("the host fixture could not be written: {error}"))
 }
 
-/// A configuration file with a dozen hosts, two of which need a look.
+/// A configuration file with eight hosts, three of which need a look.
 ///
-/// The two jump through an alias the file never defines, which is what the importer
-/// reports as needing review: the import shot has to show the states a real file
-/// produces instead of a wall of rows that all say the same thing.
+/// The two that jump through an alias the file never defines are what the importer
+/// reports as needing review, and the alive directives cover what it does with the
+/// keepalive ones (R20): both applied, one interval that switches the probe off, one
+/// count without an interval, and a TCPKeepAlive line that is named as not applied.
 const IMPORT_CONFIG: &str = "\
-Host web-01\n    HostName 192.0.2.11\n    User deploy\n\
+Host web-01\n    HostName 192.0.2.11\n    User deploy\n    ServerAliveInterval 20\n    ServerAliveCountMax 4\n\
 \n\
-Host web-02\n    HostName 192.0.2.12\n    User deploy\n    IdentityFile ~/.ssh/id_ed25519\n\
+Host web-02\n    HostName 192.0.2.12\n    User deploy\n    IdentityFile ~/.ssh/id_ed25519\n    TCPKeepAlive no\n    ServerAliveInterval 60\n\
 \n\
-Host db-01\n    HostName 198.51.100.21\n    User postgres\n\
+Host db-01\n    HostName 198.51.100.21\n    User postgres\n    ServerAliveInterval 0\n\
 \n\
-Host db-02\n    HostName 198.51.100.22\n    User postgres\n\
+Host db-02\n    HostName 198.51.100.22\n    User postgres\n    ServerAliveCountMax 6\n\
 \n\
 Host edge-01\n    HostName 203.0.113.31\n    User ops\n\
 \n\
@@ -1101,6 +1103,114 @@ fn show_import(
 ) -> Result<(), String> {
     view.capture_import_local("config", cx);
     Ok(())
+}
+
+/// Writes the global connection numbers a previous run would have saved (R20).
+///
+/// The page is drawn after a real read of this file, so the shot shows what a restart
+/// shows rather than a value pushed into the view.
+fn seed_connection_defaults(root: &Path) -> Result<(), String> {
+    let defaults = shellune_core::ConnectionDefaults::new(60, 5, 45)
+        .map_err(|error| format!("the connection fixture is not a valid policy: {error}"))?;
+    PreferencesStore::at(root)
+        .save(&Preferences {
+            connection: Some(defaults),
+            ..Default::default()
+        })
+        .map_err(|error| format!("the connection fixture could not be written: {error}"))
+}
+
+/// The connection page, with the numbers in force (R20).
+fn show_settings_connection(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::Policy)
+}
+
+/// A saved host in the editor, with its keepalive choice (R20).
+fn show_host_connection(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+    choice: ConnectionChoice,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.capture_host_connection(&host, choice, cx);
+    // The policy section is the last block of the form; a shot that claims to show it
+    // has to be scrolled to it (R20).
+    view.capture_scroll_host_form_to_bottom();
+    Ok(())
+}
+
+fn show_host_connection_inherit(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_host_connection(view, window, cx, ConnectionChoice::Inherit)
+}
+
+fn show_host_connection_off(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_host_connection(view, window, cx, ConnectionChoice::Off)
+}
+
+fn show_host_connection_override(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_host_connection(view, window, cx, ConnectionChoice::Override)
+}
+
+/// The connection page is on screen, showing the numbers the preferences file held.
+fn settings_connection_custom_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("connection", "policy"))?;
+    let defaults = view.connection_defaults();
+    let shown = (
+        defaults.keepalive_interval_secs(),
+        defaults.keepalive_max_misses(),
+        defaults.connect_timeout_secs(),
+    );
+    if shown != (60, 5, 45) {
+        return Err(format!(
+            "the page shows {shown:?}, not the (60, 5, 45) the file holds"
+        ));
+    }
+    Ok(())
+}
+
+/// The host form is open and says one of the three keepalive choices (R20).
+fn host_connection_ready_for(view: &ShelluneView, choice: &str) -> Result<(), String> {
+    on_page(view, Destination::Hosts, SectionState::Populated)?;
+    match view.host_connection_choice() {
+        Some(current) if current != choice => Err(format!(
+            "the host form says {current}, not the {choice} the shot is about"
+        )),
+        Some(_) if view.capture_host_form_scrolled() => Ok(()),
+        Some(_) => Err("the host form is still at its top; the policy section is below".to_owned()),
+        None => Err("the host form is not open".to_owned()),
+    }
+}
+
+fn host_connection_inherit_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    host_connection_ready_for(view, "inherit")
+}
+
+fn host_connection_off_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    host_connection_ready_for(view, "off")
+}
+
+fn host_connection_override_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    host_connection_ready_for(view, "override")
 }
 
 /// The list holds five thousand saved hosts and the page shows them.
@@ -1251,16 +1361,65 @@ pub const SCENARIOS: &[Scenario] = &[
         id: "hosts-import",
         title: "主机 · 导入结果的可扫描列表",
         category: Category::Home,
-        fixture: "a configuration file with eight hosts, two of them jumping through an alias \
-                  the file never defines",
+        fixture: "a configuration file with eight hosts: two jumping through an alias the file \
+                  never defines, one turning keepalive off, one setting only a probe count and one \
+                  whose TCPKeepAlive is not applied",
         evidence: "shows the preview, its limits and a row per host with the outcome the importer \
-                   produced; nothing was saved and no host was dialled",
+                   produced, including the keepalive it would apply; nothing was saved and no host \
+                   was dialled",
         quick: false,
-        variants: &[Variant::dark().chinese().smallest()],
+        variants: &[Variant::dark().chinese()],
         start: || page(Destination::Hosts),
         prepare: seed_import_config,
         install: show_import,
         ready: import_ready,
+    },
+    Scenario {
+        id: "hosts-connection-inherit",
+        title: "主机表单 · 继承全局保活",
+        category: Category::Home,
+        fixture: "six saved hosts, none of them stating its own keepalive; the editor open on the \
+                  first",
+        evidence: "shows the three-way choice on inherit and the numbers it inherits; nothing was \
+                   saved and no connection was made",
+        quick: false,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_host_connection_inherit,
+        ready: host_connection_inherit_ready,
+    },
+    Scenario {
+        id: "hosts-connection-off",
+        title: "主机表单 · 关闭这一台的保活",
+        category: Category::Home,
+        fixture: "the same hosts, with the editor on the off choice",
+        evidence: "shows what switching keepalive off for one host means and that the connect \
+                   timeout still follows the default; nothing was saved",
+        quick: false,
+        variants: &[Variant::dark().chinese().smallest()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_host_connection_off,
+        ready: host_connection_off_ready,
+    },
+    Scenario {
+        id: "hosts-connection-override",
+        title: "主机表单 · 覆盖保活与超时",
+        category: Category::Home,
+        fixture: "the same hosts, with the editor on the override choice and the three numbers it \
+                  would save",
+        evidence: "shows the three numbers, the detection window they add up to and that they apply \
+                   to this host alone; no value was typed and nothing was saved",
+        quick: false,
+        variants: &[
+            Variant::light().chinese().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_host_connection_override,
+        ready: host_connection_override_ready,
     },
     Scenario {
         id: "terminal-local",
@@ -1440,17 +1599,33 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "settings-connection",
-        title: "设置 · 连接分类只读策略",
+        title: "设置 · 连接分类的保活与超时",
         category: Category::Settings,
-        fixture: "default preferences; the connection policy the SSH layer applies",
-        evidence: "shows the second level of the navigation on the connection category and the \
-                   values in force; nothing was dialled and no policy was changed",
+        fixture: "default preferences; the keepalive and timeout numbers nothing has changed",
+        evidence: "shows the switch, the three numbers and the sentence saying how long a silent \
+                   link takes to be noticed; nothing was dialled and the numbers are this build's \
+                   defaults",
         quick: false,
         variants: &[Variant::dark().chinese().smallest()],
         start: || page(Destination::Settings),
         prepare: nothing,
-        install: |view, window, cx| show_settings_item(view, window, cx, Item::Policy),
+        install: show_settings_connection,
         ready: settings_connection_ready,
+    },
+    Scenario {
+        id: "settings-connection-custom",
+        title: "设置 · 保存过的保活默认值",
+        category: Category::Settings,
+        fixture: "a preferences file that already holds 60 s, 5 probes and a 45 s timeout",
+        evidence: "shows the page as a restart reads it back from the file; the numbers were \
+                   written before the window started, so the shot proves the file reaches the \
+                   fields, not that a keystroke did",
+        quick: false,
+        variants: &[Variant::light().chinese(), Variant::dark().comfortable()],
+        start: || page(Destination::Settings),
+        prepare: seed_connection_defaults,
+        install: show_settings_connection,
+        ready: settings_connection_custom_ready,
     },
     Scenario {
         id: "settings-keys",

@@ -2134,8 +2134,49 @@ pub struct UxStrings {
     pub settings_connect_timeout: &'static str,
     /// How long reaching the host may take
     pub settings_connect_timeout_hint: &'static str,
-    /// A number of seconds, with the count filled in
-    pub settings_seconds: &'static str,
+    /// The policy in one line, with the three numbers filled in
+    pub connection_summary: &'static str,
+    /// The number of seconds without a reply before the connection counts as lost, with
+    /// that number filled in
+    pub connection_window: &'static str,
+    /// Keepalive is off, so a silent link is not noticed
+    pub connection_window_off: &'static str,
+    /// What the interval and the probe count add up to
+    pub connection_window_hint: &'static str,
+    /// The global values are what a host without its own numbers is dialled with
+    pub connection_defaults_note: &'static str,
+    /// Keepalive
+    pub host_connection_title: &'static str,
+    /// Inherit the global default
+    pub host_connection_inherit: &'static str,
+    /// Off
+    pub host_connection_off: &'static str,
+    /// Override
+    pub host_connection_override: &'static str,
+    /// What inheriting means, with the values filled in
+    pub host_connection_inherits: &'static str,
+    /// What switching keepalive off for one host means
+    pub host_connection_off_note: &'static str,
+    /// What an override applies to
+    pub host_connection_override_note: &'static str,
+    /// What an import applied, with the numbers filled in
+    pub import_connection: &'static str,
+    /// An import that turned keepalive off
+    pub import_connection_off: &'static str,
+    /// An import that set only part of the policy
+    pub import_connection_partial: &'static str,
+    /// A field was left empty
+    pub connection_problem_missing: &'static str,
+    /// The text is not a whole number
+    pub connection_problem_number: &'static str,
+    /// The text is below zero
+    pub connection_problem_negative: &'static str,
+    /// The interval is above what this build stores
+    pub connection_problem_interval: &'static str,
+    /// The probe count is below one or above what this build stores
+    pub connection_problem_misses: &'static str,
+    /// The connect timeout is below one or above what this build stores
+    pub connection_problem_timeout: &'static str,
     /// Connect to
     pub connect_title: &'static str,
     /// Choose how this server checks it is you. A password is only kept if you tick Remember.
@@ -2508,7 +2549,27 @@ impl UxStrings {
             self.settings_keepalive_misses_hint,
             self.settings_connect_timeout,
             self.settings_connect_timeout_hint,
-            self.settings_seconds,
+            self.connection_summary,
+            self.connection_window,
+            self.connection_window_off,
+            self.connection_window_hint,
+            self.connection_defaults_note,
+            self.host_connection_title,
+            self.host_connection_inherit,
+            self.host_connection_off,
+            self.host_connection_override,
+            self.host_connection_inherits,
+            self.host_connection_off_note,
+            self.host_connection_override_note,
+            self.import_connection,
+            self.import_connection_off,
+            self.import_connection_partial,
+            self.connection_problem_missing,
+            self.connection_problem_number,
+            self.connection_problem_negative,
+            self.connection_problem_interval,
+            self.connection_problem_misses,
+            self.connection_problem_timeout,
             self.connect_title,
             self.connect_hint,
             self.quick_hint,
@@ -2716,8 +2777,8 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_version: "Version",
     settings_connection: "Connection",
     settings_connection_policy: "Keepalive and timeout",
-    settings_connection_hint: "Every connection is dialled with this policy, the same for every \
-host. These values are read from the SSH layer; this page only states them.",
+    settings_connection_hint: "Every host is dialled with these numbers unless it sets its own. \
+Nothing here is applied to a connection that is already open.",
     settings_keepalive_interval: "Keepalive interval",
     settings_keepalive_interval_hint: "A connection silent for this long sends one probe",
     settings_keepalive_misses: "Unanswered probes",
@@ -2726,7 +2787,27 @@ dropped",
     settings_connect_timeout: "Connect timeout",
     settings_connect_timeout_hint: "How long reaching the host may take, DNS and authentication \
 included",
-    settings_seconds: "{} s",
+    connection_summary: "A probe every {interval} s, dropped after {misses} unanswered, connect timeout {timeout} s",
+    connection_window: "{seconds} s without a reply before the connection is treated as lost",
+    connection_window_off: "Keepalive is off: Shellune will not notice a link that went silent",
+    connection_window_hint: "One probe is sent per interval, and the link is dropped once the probes above have gone unanswered",
+    connection_defaults_note: "Hosts that do not override these numbers are dialled with them. An interval of 0 turns keepalive off.",
+    host_connection_title: "Keepalive",
+    host_connection_inherit: "Inherit",
+    host_connection_off: "Off",
+    host_connection_override: "Override",
+    host_connection_inherits: "Inherits the global default: {summary}",
+    host_connection_off_note: "No keepalive probe is sent for this host, so a link that goes silent is not noticed. The connect timeout still follows the global default.",
+    host_connection_override_note: "These numbers apply to this host only; the global default is unchanged.",
+    import_connection: "Keepalive: a probe every {interval} s, dropped after {misses} unanswered",
+    import_connection_off: "Keepalive: the file turns it off for this host",
+    import_connection_partial: "Keepalive: the file sets only part of it, the rest follows the global default",
+    connection_problem_missing: "Type a whole number; a keepalive interval of 0 turns the probe off",
+    connection_problem_number: "{text} is not a whole number",
+    connection_problem_negative: "{text} is below zero; use 0 to turn keepalive off",
+    connection_problem_interval: "{value} s is above the {max} s Shellune keeps; 0 turns keepalive off",
+    connection_problem_misses: "{value} unanswered probes is outside 1-{max}; 0 would never notice a dead link",
+    connection_problem_timeout: "{value} s is outside 1-{max} for the connect timeout",
     connect_title: "Connect to",
     connect_hint: "Choose how this server checks it is you. A password is only kept if you tick Remember.",
     quick_hint: "Connect without saving. You can save the host afterwards from the session head.",
@@ -2946,14 +3027,34 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_version: "版本",
     settings_connection: "连接",
     settings_connection_policy: "保活与超时",
-    settings_connection_hint: "每条连接都按这组策略保活与计时，对所有主机相同。这些值来自 SSH 层，本页只说明当前生效的数字。",
+    settings_connection_hint: "没有单独设置的主机都按这里的数字连接。改动不会影响已经打开的连接。",
     settings_keepalive_interval: "保活间隔",
     settings_keepalive_interval_hint: "连接静默这么久之后就发一次探测",
     settings_keepalive_misses: "未响应探测",
     settings_keepalive_misses_hint: "多少次探测没有回应就判定连接已断开",
     settings_connect_timeout: "连接超时",
     settings_connect_timeout_hint: "连到主机最多可以用多久，包含 DNS 与认证",
-    settings_seconds: "{} 秒",
+    connection_summary: "每 {interval} 秒探测一次，{misses} 次无回应即判定断开，连接超时 {timeout} 秒",
+    connection_window: "{seconds} 秒没有任何回应就判定连接断开",
+    connection_window_off: "保活已关闭：Shellune 不会主动发现静默断开的连接",
+    connection_window_hint: "每个间隔发一次探测，上面的次数都用完仍无回应就判定断开",
+    connection_defaults_note: "没有单独设置的主机都按这里的数字连接。间隔填 0 表示关闭保活。",
+    host_connection_title: "保活",
+    host_connection_inherit: "继承全局",
+    host_connection_off: "禁用",
+    host_connection_override: "覆盖",
+    host_connection_inherits: "继承全局默认：{summary}",
+    host_connection_off_note: "本主机不发送保活探测，因此静默断开的连接不会被发现。连接超时仍沿用全局默认。",
+    host_connection_override_note: "这些数字只用于本主机，全局默认不受影响。",
+    import_connection: "保活：每 {interval} 秒探测一次，{misses} 次无回应即断开",
+    import_connection_off: "保活：文件对本主机关闭了保活",
+    import_connection_partial: "保活：文件只设置了其中一部分，其余沿用全局默认",
+    connection_problem_missing: "请填写整数；保活间隔填 0 表示关闭探测",
+    connection_problem_number: "{text} 不是整数",
+    connection_problem_negative: "{text} 是负数；想关闭保活请填 0",
+    connection_problem_interval: "{value} 秒超过了 Shellune 支持的 {max} 秒；想关闭保活请填 0",
+    connection_problem_misses: "{value} 次不在 1-{max} 之间；填 0 就永远不会判定断开",
+    connection_problem_timeout: "{value} 秒不在连接超时允许的 1-{max} 秒之间",
     connect_title: "连接到",
     connect_hint: "选择服务器验证你身份的方式。只有勾选“记住”时才会保存密码。",
     quick_hint: "不保存直接连接。连接后可以在会话头部保存为主机。",

@@ -57,8 +57,8 @@ use crate::app::files::{
 };
 use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
-    GroupAction, HostDraft, HostField, HostView, HostsPanel, ImportPanel, group_path_from_text,
-    import_message, unimported_hosts,
+    ConnectionChoice, ConnectionDraft, ConnectionField, GroupAction, HostDraft, HostField,
+    HostView, HostsPanel, ImportPanel, group_path_from_text, import_message, unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
 use crate::app::keymap::{self, Keymap, Problem};
@@ -421,6 +421,9 @@ pub struct ShelluneView {
     hosts_search: Entity<TextField>,
     /// The six form fields, present only while the editor is open.
     host_fields: Option<HostFields>,
+    /// The host form's three override numbers, present only while the editor is open
+    /// (R20).
+    host_connection_fields: Option<HostConnectionFields>,
     /// The SSH configuration import panel and what the last read of a file showed.
     import: ImportPanel,
     /// The configuration path field, present only while that panel is open.
@@ -702,6 +705,16 @@ pub struct ShelluneView {
     theme_choice: theme::ThemeChoice,
     /// The terminal's palette: the window's, or always dark or light.
     terminal_scheme: theme::TerminalScheme,
+    /// The global keepalive and timeout numbers (R20).
+    ///
+    /// `None` until the user changes one, so a preferences file written by this build
+    /// does not freeze today's defaults into the user's data; the effective values are
+    /// `connection_defaults`.
+    connection_choice: Option<shellune_core::ConnectionDefaults>,
+    /// The three numbers the connection page is editing, with the reason it refused one.
+    connection_draft: crate::app::hosts::ConnectionDraft,
+    /// The form controls of the connection page, in field order.
+    connection_fields: ConnectionFields,
     /// The preferences last written (or read), so a draw only writes a change.
     /// `None` while preferences are not kept, as in the unit tests, which share
     /// one scratch directory per process.
@@ -726,6 +739,8 @@ pub struct ShelluneView {
     /// Where the settings page is: its category, the item inside it and the shortcut
     /// page's scope filter (R16).
     settings_nav: settings::SettingsNav,
+    /// The host editor's scrolling body, so a capture can show a section below the fold.
+    host_body_scroll: gpui::ScrollHandle,
     /// The shortcut row the keyboard is on, which Enter opens for capture.
     ///
     /// The page is navigable with the arrow keys so a binding can be changed, unbound
@@ -896,6 +911,39 @@ impl HostFields {
     }
 }
 
+/// The three numbers of the connection page, in field order (R20).
+struct ConnectionFields {
+    interval: Entity<TextField>,
+    misses: Entity<TextField>,
+    timeout: Entity<TextField>,
+}
+
+impl ConnectionFields {
+    fn get(&self, field: ConnectionField) -> &Entity<TextField> {
+        match field {
+            ConnectionField::KeepaliveInterval => &self.interval,
+            ConnectionField::KeepaliveMisses => &self.misses,
+            ConnectionField::ConnectTimeout => &self.timeout,
+        }
+    }
+}
+
+/// The override numbers of the host form, present only while that form is open (R20).
+struct HostConnectionFields {
+    interval: Entity<TextField>,
+    misses: Entity<TextField>,
+    timeout: Entity<TextField>,
+}
+
+impl HostConnectionFields {
+    fn get(&self, field: ConnectionField) -> &Entity<TextField> {
+        match field {
+            ConnectionField::KeepaliveInterval => &self.interval,
+            ConnectionField::KeepaliveMisses => &self.misses,
+            ConnectionField::ConnectTimeout => &self.timeout,
+        }
+    }
+}
 impl ShelluneView {
     /// Builds the shell in its initial state, reading the saved hosts.
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -1143,6 +1191,47 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// What the connection page is refusing, for the tests (R20).
+    #[cfg(test)]
+    #[must_use]
+    pub fn connection_refusal_for_test(&self) -> Option<(&'static str, String)> {
+        self.connection_draft.error().map(|(field, problem)| {
+            (
+                field.id(),
+                crate::app::hosts::connection_problem_text(problem, self.workspace.locale()),
+            )
+        })
+    }
+
+    /// The text one field of the connection page is showing, for the tests (R20).
+    #[cfg(test)]
+    #[must_use]
+    pub fn connection_field_text(&self, field: ConnectionField, cx: &gpui::App) -> String {
+        self.connection_fields.get(field).read(cx).text().to_owned()
+    }
+
+    /// The keepalive choice of the open host form, for the tests and the captures (R20).
+    #[cfg(any(test, feature = "ui-capture"))]
+    #[must_use]
+    pub fn host_connection_choice(&self) -> Option<&'static str> {
+        self.hosts
+            .draft()
+            .map(|draft| draft.connection().choice().id())
+    }
+
+    /// Opens a saved host in the editor and chooses what it says about keepalive, for a
+    /// capture (R2, R20). Nothing is saved and nothing is dialled.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_host_connection(
+        &mut self,
+        host: &HostConfig,
+        choice: ConnectionChoice,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_edit_host(host, cx);
+        self.set_host_connection_choice(choice, cx);
+    }
+
     /// Whether a paste confirmation is on screen, read the way the window reads it.
     #[cfg(feature = "ui-capture")]
     #[must_use]
@@ -1366,6 +1455,19 @@ impl ShelluneView {
         ))
     }
 
+    /// Scrolls the host editor to its last section, for a capture (R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_scroll_host_form_to_bottom(&self) {
+        self.host_body_scroll.scroll_to_bottom();
+    }
+
+    /// Whether the host editor has been scrolled away from its top, for a capture.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_host_form_scrolled(&self) -> bool {
+        self.host_body_scroll.offset().y < px(0.0)
+    }
+
     /// Whether the captured failed task names its partial file and its checkpoint (R2).
     #[cfg(feature = "ui-capture")]
     #[must_use]
@@ -1503,6 +1605,31 @@ impl ShelluneView {
             let mut field = TextField::new(strings.keys_search_placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
             field
+        });
+        // The connection page's three numbers are created once: a field rebuilt per draw
+        // would drop the caret on every keystroke that redraws the page (R20).
+        let connection_defaults = shellune_core::ConnectionDefaults::default();
+        let connection_draft = ConnectionDraft::of(connection_defaults);
+        let connection_interval = cx.new(|cx| {
+            TextField::with_text(
+                "",
+                connection_draft.text(ConnectionField::KeepaliveInterval),
+                cx,
+            )
+        });
+        let connection_misses = cx.new(|cx| {
+            TextField::with_text(
+                "",
+                connection_draft.text(ConnectionField::KeepaliveMisses),
+                cx,
+            )
+        });
+        let connection_timeout = cx.new(|cx| {
+            TextField::with_text(
+                "",
+                connection_draft.text(ConnectionField::ConnectTimeout),
+                cx,
+            )
         });
 
         // The credentials fields are created once and reused: a field that is
@@ -1699,8 +1826,16 @@ impl ShelluneView {
             focus_return: None,
             restore_focus_pending: false,
             rail_collapsed: false,
+            host_connection_fields: None,
             theme_choice: theme::ThemeChoice::default(),
             terminal_scheme: theme::TerminalScheme::default(),
+            connection_choice: None,
+            connection_draft,
+            connection_fields: ConnectionFields {
+                interval: connection_interval,
+                misses: connection_misses,
+                timeout: connection_timeout,
+            },
             saved_preferences: None,
             keymap: Keymap::defaults(Platform::current()),
             keymap_problem: None,
@@ -1709,6 +1844,7 @@ impl ShelluneView {
             keymap_save_error: None,
             keys_search,
             settings_nav: settings::SettingsNav::new(),
+            host_body_scroll: gpui::ScrollHandle::new(),
             keys_selected: 0,
             keys_control: 0,
             watching_appearance: false,
@@ -1723,6 +1859,7 @@ impl ShelluneView {
         view.bind_shell_path(cx);
         view.bind_host_search(cx);
         view.bind_keys_search(cx);
+        view.bind_connection_fields(cx);
         view.bind_remote_fields(cx);
         view.restore_hosts(cx);
         view.restore_groups();
@@ -1820,6 +1957,10 @@ impl ShelluneView {
         }
         // A reminders file written before these fields existed keeps both on, which is
         // what the defaults say; a file that names one applies it (R7).
+        // The connection numbers every host without its own is dialled with (R20). A file
+        // written before the block existed leaves them at the documented default.
+        self.connection_choice = saved.connection;
+        self.sync_connection_draft(cx);
         if let Some(bell) = saved.bell_notice {
             self.workspace.set_attention(AttentionKind::Bell, bell);
         }
@@ -1883,14 +2024,15 @@ impl ShelluneView {
             // user chose rather than leaving the next start to assume (R7).
             bell_notice: Some(self.workspace.attention_settings().bell),
             command_notice: Some(self.workspace.attention_settings().finished),
-            // The connection defaults are chosen on the connection page (R20). Every
-            // other field is written on any change, so the saved block is carried
-            // through unchanged: an edit to an unrelated preference must not erase a
-            // host policy the user already chose.
-            connection: self
-                .saved_preferences
-                .as_ref()
-                .and_then(|saved| saved.connection),
+            // The connection numbers are chosen on the connection page (R20). A page the
+            // user never changed writes nothing, so this build's defaults are not frozen
+            // into the user's file; a block that was already there is carried through an
+            // unrelated edit unchanged.
+            connection: self.connection_choice.or_else(|| {
+                self.saved_preferences
+                    .as_ref()
+                    .and_then(|saved| saved.connection)
+            }),
         }
     }
 
@@ -4145,6 +4287,110 @@ impl ShelluneView {
         .detach();
     }
 
+    /// The global keepalive and timeout numbers in force (R20).
+    ///
+    /// The settings page, the host form and the dial path all read them here, so what a
+    /// connection is dialled with is the number the interface showed.
+    #[must_use]
+    pub fn connection_defaults(&self) -> shellune_core::ConnectionDefaults {
+        self.connection_choice.unwrap_or_default()
+    }
+
+    /// Keeps the page's three fields and the numbers in force in step with the saved
+    /// preferences.
+    fn sync_connection_draft(&mut self, cx: &mut Context<Self>) {
+        self.connection_draft = ConnectionDraft::of(self.connection_defaults());
+        for field in ConnectionField::ALL {
+            let text = self.connection_draft.text(field).to_owned();
+            let entity = self.connection_fields.get(field).clone();
+            entity.update(cx, |text_field, cx| text_field.set_text(text, cx));
+        }
+    }
+
+    /// Reads one number of the connection page, keeping the reason it was refused.
+    ///
+    /// A number that is not usable is not written: the file keeps the last value the user
+    /// chose and the page says which field has to change (R20).
+    fn set_connection_value(
+        &mut self,
+        field: ConnectionField,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.connection_draft.set_text(field, text) {
+            return;
+        }
+        if let Ok(defaults) = self.connection_draft.resolve() {
+            self.connection_choice = Some(defaults);
+        }
+        cx.notify();
+    }
+
+    /// Switches keepalive on or off for every host that does not override it.
+    fn set_connection_keepalive(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.connection_draft.set_keepalive(on);
+        let text = self
+            .connection_draft
+            .text(ConnectionField::KeepaliveInterval)
+            .to_owned();
+        let interval = self.connection_fields.interval.clone();
+        interval.update(cx, |text_field, cx| text_field.set_text(text, cx));
+        if let Ok(defaults) = self.connection_draft.resolve() {
+            self.connection_choice = Some(defaults);
+        }
+        cx.notify();
+    }
+
+    /// Watches the connection page's three fields.
+    fn bind_connection_fields(&mut self, cx: &mut Context<Self>) {
+        for field in ConnectionField::ALL {
+            let entity = self.connection_fields.get(field).clone();
+            cx.observe(&entity, move |view, text_field, cx| {
+                let text = text_field.read(cx).text().to_owned();
+                view.set_connection_value(field, text, cx);
+            })
+            .detach();
+        }
+    }
+
+    /// Chooses what a host says about its own keepalive (R20).
+    fn set_host_connection_choice(&mut self, choice: ConnectionChoice, cx: &mut Context<Self>) {
+        if let Some(draft) = self.hosts.draft_mut()
+            && draft.connection_mut().set_choice(choice)
+        {
+            cx.notify();
+        }
+    }
+
+    /// Reads one override number of the host form, keeping the reason it was refused.
+    fn set_host_connection_value(
+        &mut self,
+        field: ConnectionField,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(draft) = self.hosts.draft_mut()
+            && draft.connection_mut().set_text(field, text)
+        {
+            cx.notify();
+        }
+    }
+
+    /// Watches the host form's three override fields.
+    fn bind_host_connection_fields(&mut self, cx: &mut Context<Self>) {
+        let Some(fields) = self.host_connection_fields.as_ref() else {
+            return;
+        };
+        for field in ConnectionField::ALL {
+            let entity = fields.get(field).clone();
+            cx.observe(&entity, move |view, text_field, cx| {
+                let text = text_field.read(cx).text().to_owned();
+                view.set_host_connection_value(field, text, cx);
+            })
+            .detach();
+        }
+    }
+
     /// Reads the host file again and reports what it really holds.
     fn reload_hosts(&mut self, cx: &mut Context<Self>) {
         match self.store.load() {
@@ -4190,6 +4436,10 @@ impl ShelluneView {
     }
 
     fn open_host_fields(&mut self, cx: &mut Context<Self>) {
+        // The form is built before anything is typed, so this is where the numbers an
+        // override starts from are read from the defaults in force (R20).
+        self.hosts
+            .apply_connection_defaults(self.connection_defaults());
         let draft = self
             .hosts
             .draft()
@@ -4265,6 +4515,20 @@ impl ShelluneView {
         for field in HostField::ALL {
             self.bind_host_field(field, cx);
         }
+        let connection = draft.connection();
+        let host_connection_fields = HostConnectionFields {
+            interval: cx.new(|cx| {
+                TextField::with_text("", connection.text(ConnectionField::KeepaliveInterval), cx)
+            }),
+            misses: cx.new(|cx| {
+                TextField::with_text("", connection.text(ConnectionField::KeepaliveMisses), cx)
+            }),
+            timeout: cx.new(|cx| {
+                TextField::with_text("", connection.text(ConnectionField::ConnectTimeout), cx)
+            }),
+        };
+        self.host_connection_fields = Some(host_connection_fields);
+        self.bind_host_connection_fields(cx);
         self.focus_host_dialog = true;
         cx.notify();
     }
@@ -4273,6 +4537,7 @@ impl ShelluneView {
     fn close_host_editor(&mut self, cx: &mut Context<Self>) {
         self.hosts.close_editor();
         self.host_fields = None;
+        self.host_connection_fields = None;
         self.restore_focus_pending = true;
         cx.notify();
     }
@@ -5365,6 +5630,10 @@ impl ShelluneView {
         let Some(draft) = self.chain.take() else {
             return;
         };
+        // The numbers the settings page shows are the ones the attempt is dialled with:
+        // the target's own values where it states them, these defaults everywhere else
+        // (R20).
+        let draft = draft.with_connection_defaults(self.connection_defaults());
         let Some(target_host) = draft.target_host().cloned() else {
             self.chain = Some(draft);
             return;
@@ -7951,6 +8220,34 @@ impl ShelluneView {
                 format!("{}: {}", strings.import_forward_label, forward.summary()),
                 metrics,
             ));
+        }
+        // What the file's ServerAliveInterval/ServerAliveCountMax come to (R20). An
+        // interval of zero is OpenSSH's way of switching the probe off, so it is shown as
+        // off rather than as an inheritance; a file that sets only one of the two says so
+        // instead of implying the other.
+        if let Some(connection) = host.connection() {
+            let ux = copy::ux();
+            let line = match (
+                connection.keepalive_interval_secs(),
+                connection.keepalive_max_misses(),
+            ) {
+                (Some(0), _) => ux.import_connection_off.to_owned(),
+                (Some(interval), Some(misses)) => copy::fill(
+                    ux.import_connection,
+                    &[
+                        ("interval", &interval.to_string()),
+                        ("misses", &misses.to_string()),
+                    ],
+                ),
+                _ => ux.import_connection_partial.to_owned(),
+            };
+            row = row.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(move || format!("hosts.import.connection.{index}"))
+                    .child(SharedString::from(line)),
+            );
         }
         row
     }

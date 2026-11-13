@@ -834,6 +834,11 @@ fn start(
     let run_options = options.clone();
     handle
         .update(cx, move |_, window, cx| {
+            // Focusing a field is part of what a shot shows; without this the hidden
+            // window would become the foreground window when it did (R1).
+            if let Ok(handle) = hwnd(window) {
+                windows::make_non_activating(handle);
+            }
             arm_frame_counter(window, state.clone());
             let state = state.clone();
             let options = run_options;

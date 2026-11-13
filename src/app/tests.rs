@@ -508,7 +508,13 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
             &[(
                 "policy",
                 "settings.row.keepalive-interval",
-                &["settings.value.keepalive-interval"][..],
+                &[
+                    "settings.keepalive.0",
+                    "settings.keepalive.1",
+                    "settings.policy.keepalive-interval",
+                    "settings.policy.keepalive-misses",
+                    "settings.policy.connect-timeout",
+                ][..],
             )],
         ),
         (
@@ -5184,6 +5190,297 @@ fn seed(store: &HostStore, hosts: Vec<HostConfig>) -> HostBook {
     book
 }
 
+/// A window on the settings page, with the stores in a scratch directory.
+fn settings_view<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Settings);
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_store(cx, workspace, dir.store()));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+#[gpui::test]
+async fn the_connection_page_edits_the_numbers_and_refuses_zero_probes(cx: &mut TestAppContext) {
+    let dir = TempDir::new("connection-page");
+    let (view, cx) = settings_view(cx, &dir);
+    click(cx, "settings.category.connection");
+    click(cx, "settings.item.policy");
+    assert!(
+        cx.debug_bounds("settings.row.keepalive").is_some(),
+        "the page offers the keepalive switch"
+    );
+    for selector in [
+        "settings.policy.keepalive-interval",
+        "settings.policy.keepalive-misses",
+        "settings.policy.connect-timeout",
+        "settings.policy.window",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the connection page does not draw {selector}"
+        );
+    }
+    let defaults = cx.update(|_window, app| view.read(app).connection_defaults());
+    assert_eq!(defaults.keepalive_interval_secs(), 30);
+    assert_eq!(defaults.keepalive_max_misses(), 3);
+    assert_eq!(defaults.connect_timeout_secs(), 20);
+
+    // Zero is a value: the switch writes it, and the page stops claiming the link is
+    // being watched.
+    click(cx, "settings.keepalive.1");
+    let off = cx.update(|_window, app| view.read(app).connection_defaults());
+    assert_eq!(off.keepalive_interval_secs(), 0);
+    assert!(off.policy().keepalive().is_none());
+    let written = cx.update(|_window, app| view.read(app).current_preferences_for_test());
+    assert_eq!(
+        written
+            .connection
+            .map(|saved| saved.keepalive_interval_secs()),
+        Some(0),
+        "the switch is what a restart reads back"
+    );
+
+    // Switching it on again restores the interval that was last in force.
+    click(cx, "settings.keepalive.0");
+    let on = cx.update(|_window, app| view.read(app).connection_defaults());
+    assert_eq!(on.keepalive_interval_secs(), 30);
+
+    // A typed number is what the next attempt is dialled with.
+    clear_field(cx, "settings.policy.keepalive-interval", 2);
+    type_into(cx, "settings.policy.keepalive-interval", "45");
+    let changed = cx.update(|_window, app| view.read(app).connection_defaults());
+    assert_eq!(changed.keepalive_interval_secs(), 45);
+    let written = cx.update(|_window, app| view.read(app).current_preferences_for_test());
+    assert_eq!(
+        written
+            .connection
+            .map(|saved| saved.keepalive_interval_secs()),
+        Some(45)
+    );
+
+    // A probe count of zero is refused where it was typed: the message names that field
+    // and the value in force does not move.
+    clear_field(cx, "settings.policy.keepalive-misses", 1);
+    type_into(cx, "settings.policy.keepalive-misses", "0");
+    assert!(
+        cx.debug_bounds("settings.policy.error.keepalive-misses")
+            .is_some(),
+        "the refusal appears in the field that produced it"
+    );
+    let refused = cx.update(|_window, app| view.read(app).connection_defaults());
+    assert_eq!(
+        refused.keepalive_max_misses(),
+        3,
+        "nothing was silently corrected and nothing was written"
+    );
+    let written = cx.update(|_window, app| view.read(app).current_preferences_for_test());
+    assert_eq!(
+        written.connection.map(|saved| saved.keepalive_max_misses()),
+        Some(3)
+    );
+
+    // Fixing it clears the reason and is written. The reason is read from the page's own
+    // model rather than from a selector: this harness keeps every selector it has ever
+    // recorded, so a control that stopped being drawn would still be found.
+    clear_field(cx, "settings.policy.keepalive-misses", 1);
+    type_into(cx, "settings.policy.keepalive-misses", "6");
+    let refusal = cx.update(|_window, app| view.read(app).connection_refusal_for_test());
+    assert_eq!(
+        refusal, None,
+        "the refusal goes away with the value that caused it"
+    );
+    let fixed = cx.update(|_window, app| view.read(app).connection_defaults());
+    assert_eq!(fixed.keepalive_max_misses(), 6);
+    assert_eq!(fixed.keepalive_interval_secs(), 45);
+}
+
+#[gpui::test]
+async fn a_saved_connection_default_is_what_the_page_starts_with(cx: &mut TestAppContext) {
+    let dir = TempDir::new("connection-restart");
+    let (view, cx) = settings_view(cx, &dir);
+    click(cx, "settings.category.connection");
+    click(cx, "settings.item.policy");
+    let saved = shellune_storage::Preferences {
+        connection: Some(shellune_core::ConnectionDefaults::new(60, 5, 45).expect("valid")),
+        ..Default::default()
+    };
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.use_saved_preferences_for_test(&saved, cx)
+        });
+    });
+    cx.run_until_parked();
+    let defaults = cx.update(|_window, app| view.read(app).connection_defaults());
+    assert_eq!(defaults.keepalive_interval_secs(), 60);
+    assert_eq!(defaults.keepalive_max_misses(), 5);
+    assert_eq!(defaults.connect_timeout_secs(), 45);
+    // The fields show the file, not the build defaults.
+    let text = cx.update(|_window, app| {
+        view.read(app)
+            .connection_field_text(crate::app::hosts::ConnectionField::KeepaliveInterval, app)
+    });
+    assert_eq!(text, "60");
+
+    // A file written before the block existed keeps the documented defaults.
+    let older = shellune_storage::Preferences::default();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.use_saved_preferences_for_test(&older, cx)
+        });
+    });
+    cx.run_until_parked();
+    let defaults = cx.update(|_window, app| view.read(app).connection_defaults());
+    assert_eq!(defaults, shellune_core::ConnectionDefaults::default());
+}
+
+#[gpui::test]
+async fn a_host_inherits_switches_off_or_overrides_the_keepalive(cx: &mut TestAppContext) {
+    let dir = TempDir::new("host-connection");
+    let store = dir.store();
+    let book = seed(
+        &store,
+        vec![stored_host("web", "10.0.0.2", 22, "deploy", None)],
+    );
+    let id = book.hosts()[0].id();
+    let (view, cx) = hosts_view(cx, HostStore::at(dir.path()));
+    // A default that differs from the build default, so an inherited value is
+    // distinguishable from a written one.
+    let saved = shellune_storage::Preferences {
+        connection: Some(shellune_core::ConnectionDefaults::new(45, 4, 12).expect("valid")),
+        ..Default::default()
+    };
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.use_saved_preferences_for_test(&saved, cx)
+        });
+    });
+    // A window tall enough for the whole form: the keepalive choice sits near its
+    // bottom, and a click on a control the dialog has scrolled out of sight would land
+    // on the backdrop instead.
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+
+    click(cx, "hosts.edit.0");
+    assert!(
+        cx.debug_bounds("hosts.editor.connection").is_some(),
+        "the host form offers the keepalive choice"
+    );
+    for selector in [
+        "hosts.editor.connection.inherit",
+        "hosts.editor.connection.off",
+        "hosts.editor.connection.override",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the form does not offer {selector}"
+        );
+    }
+    let choice = cx.update(|_window, app| view.read(app).host_connection_choice());
+    assert_eq!(choice, Some("inherit"), "a host with no record inherits");
+    assert!(
+        cx.debug_bounds("hosts.connection.note").is_some(),
+        "the form says where the inherited numbers come from"
+    );
+    assert!(
+        cx.debug_bounds("hosts.connection.keepalive-interval")
+            .is_none(),
+        "inherit draws no numbers of its own"
+    );
+
+    // Off is its own state, and it is what the record keeps.
+    click(cx, "hosts.editor.connection.off");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).host_connection_choice()),
+        Some("off")
+    );
+    click(cx, "hosts.save");
+    let saved_off = HostStore::at(dir.path()).load().expect("the file loads");
+    let record = saved_off.host(id).expect("the same record");
+    let connection = record.connection().expect("the host says keepalive is off");
+    assert_eq!(connection.keepalive_interval_secs(), Some(0));
+    assert!(
+        shellune_core::ConnectionDefaults::default()
+            .policy_for(record.connection())
+            .keepalive()
+            .is_none(),
+        "the saved host is dialled without a probe"
+    );
+
+    // Override states the three numbers, and they reach the file.
+    click(cx, "hosts.edit.0");
+    click(cx, "hosts.editor.connection.override");
+    assert!(
+        cx.debug_bounds("hosts.connection.keepalive-interval")
+            .is_some(),
+        "an override draws the three numbers"
+    );
+    assert!(
+        cx.debug_bounds("hosts.connection.window").is_some(),
+        "and the sentence about when the connection is given up on"
+    );
+    clear_field(cx, "hosts.connection.keepalive-interval", 2);
+    type_into(cx, "hosts.connection.keepalive-interval", "15");
+    clear_field(cx, "hosts.connection.keepalive-misses", 1);
+    type_into(cx, "hosts.connection.keepalive-misses", "2");
+    click(cx, "hosts.save");
+    let saved_over = HostStore::at(dir.path()).load().expect("the file loads");
+    let connection = saved_over
+        .host(id)
+        .expect("the same record")
+        .connection()
+        .expect("the host states its numbers");
+    assert_eq!(connection.keepalive_interval_secs(), Some(15));
+    assert_eq!(connection.keepalive_max_misses(), Some(2));
+    assert_eq!(
+        connection.connect_timeout_secs(),
+        Some(12),
+        "the timeout the form showed was the one that was saved"
+    );
+
+    // A count of zero is refused in its field and the form stays open.
+    click(cx, "hosts.edit.0");
+    clear_field(cx, "hosts.connection.keepalive-misses", 1);
+    type_into(cx, "hosts.connection.keepalive-misses", "0");
+    assert!(
+        cx.debug_bounds("hosts.connection.error.keepalive-misses")
+            .is_some(),
+        "the refusal sits under the field that produced it"
+    );
+    click(cx, "hosts.save");
+    assert!(
+        cx.debug_bounds("hosts.editor").is_some(),
+        "a refused form stays open with what was typed"
+    );
+    cx.update(|_window, app| {
+        let draft = view
+            .read(app)
+            .hosts_state()
+            .draft()
+            .expect("the form is still open");
+        assert_eq!(
+            draft
+                .connection()
+                .text(crate::app::hosts::ConnectionField::KeepaliveMisses),
+            "0",
+            "nothing was corrected behind the user"
+        );
+    });
+    let unchanged = HostStore::at(dir.path()).load().expect("the file loads");
+    assert_eq!(
+        unchanged
+            .host(id)
+            .expect("the same record")
+            .connection()
+            .and_then(|connection| connection.keepalive_max_misses()),
+        Some(2),
+        "the refused form wrote nothing"
+    );
+}
 #[gpui::test]
 async fn a_new_host_is_created_through_the_form_and_reaches_the_file(cx: &mut TestAppContext) {
     let dir = TempDir::new("create");

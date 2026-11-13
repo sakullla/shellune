@@ -12,7 +12,10 @@ use shellune_core::{AuthMethodKind, HostId, TransferProtocol, X11Forwarding};
 
 use super::{HostFields, ShelluneView};
 use crate::app::components::{self, Variant};
-use crate::app::hosts::{HostDraft, HostField};
+use crate::app::copy;
+use crate::app::hosts::{
+    ConnectionChoice, ConnectionField, HostDraft, HostField, connection_problem_text,
+};
 use crate::app::icons::{self, Icon};
 use crate::app::remote::MethodChoice;
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
@@ -517,7 +520,183 @@ impl ShelluneView {
             })
     }
 
+    /// The host's own keepalive choice: inherit the global default, switch the probe off,
+    /// or state its own numbers (R20).
+    ///
+    /// The three states are not two: "inherit" follows a default that can change later,
+    /// "off" keeps that default from applying to this host at all, and an override states
+    /// what it does. The note under the switch says which of the three is in force, and
+    /// how long a silent connection would take to be noticed.
+    fn connection_section(
+        &self,
+        draft: &HostDraft,
+        metrics: Metrics,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let ux = copy::ux();
+        let connection = draft.connection();
+        let choice = connection.choice();
+        let defaults = self.connection_defaults();
+        let mut row =
+            components::segmented(metrics).debug_selector(|| "hosts.editor.connection".to_owned());
+        for candidate in ConnectionChoice::ALL {
+            let selector = format!("hosts.editor.connection.{}", candidate.id());
+            row = row.child(
+                components::segment(candidate.label(ux), candidate == choice, metrics)
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.set_host_connection_choice(candidate, cx);
+                    })),
+            );
+        }
+        let inherited = copy::fill(
+            ux.connection_summary,
+            &[
+                ("interval", &defaults.keepalive_interval_secs().to_string()),
+                ("misses", &defaults.keepalive_max_misses().to_string()),
+                ("timeout", &defaults.connect_timeout_secs().to_string()),
+            ],
+        );
+        let note = match choice {
+            ConnectionChoice::Inherit => {
+                copy::fill(ux.host_connection_inherits, &[("summary", &inherited)])
+            }
+            ConnectionChoice::Off => ux.host_connection_off_note.to_owned(),
+            ConnectionChoice::Override => ux.host_connection_override_note.to_owned(),
+        };
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .child(
+                div()
+                    .pt(metrics.scale(spacing::HAIRLINE))
+                    .text_size(metrics.caption_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(ux.host_connection_title),
+            )
+            .child(div().flex().child(row))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "hosts.connection.note".to_owned())
+                    .child(SharedString::from(note)),
+            );
+        if choice == ConnectionChoice::Override {
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .gap(metrics.scale(spacing::SNUG))
+                    .child(self.host_connection_field(
+                        draft,
+                        ConnectionField::KeepaliveInterval,
+                        metrics,
+                    ))
+                    .child(self.host_connection_field(
+                        draft,
+                        ConnectionField::KeepaliveMisses,
+                        metrics,
+                    ))
+                    .child(self.host_connection_field(
+                        draft,
+                        ConnectionField::ConnectTimeout,
+                        metrics,
+                    )),
+            );
+        }
+        // The sentence a person needs is about time, not probe counts: how long the
+        // connection may go without a reply before it is treated as lost. Inheriting shows
+        // the window the defaults add up to, so the three states are comparable at a
+        // glance (R20).
+        let window = match choice {
+            ConnectionChoice::Off => None,
+            ConnectionChoice::Inherit => {
+                if defaults.keepalive_interval_secs() == 0 {
+                    None
+                } else {
+                    Some(crate::app::hosts::detection_window_secs(
+                        defaults.keepalive_interval_secs(),
+                        defaults.keepalive_max_misses(),
+                    ))
+                }
+            }
+            ConnectionChoice::Override => connection.detection_window_secs(),
+        };
+        let window = match window {
+            Some(seconds) => copy::fill(ux.connection_window, &[("seconds", &seconds.to_string())]),
+            None => ux.connection_window_off.to_owned(),
+        };
+        column.child(
+            div()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .debug_selector(|| "hosts.connection.window".to_owned())
+                .child(SharedString::from(window)),
+        )
+    }
+
+    /// One override number of the host form, with the reason it was refused.
+    fn host_connection_field(
+        &self,
+        draft: &HostDraft,
+        field: ConnectionField,
+        metrics: Metrics,
+    ) -> Div {
+        let locale = self.workspace.locale();
+        let ux = copy::ux();
+        let Some(fields) = self.host_connection_fields.as_ref() else {
+            return div();
+        };
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .flex_grow()
+            .flex_basis(gpui::relative(0.33))
+            .min_w(metrics.scale(120.0))
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(field.label(ux)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .debug_selector(move || format!("hosts.connection.{}", field.id()))
+                    .child(fields.get(field).clone()),
+            );
+        if let Some((refused, problem)) = draft.connection().error()
+            && refused == field
+        {
+            column = column.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Danger.text())
+                    .debug_selector(move || format!("hosts.connection.error.{}", field.id()))
+                    .child(SharedString::from(connection_problem_text(problem, locale))),
+            );
+        }
+        column
+    }
+
     /// The dialog over a dimmed window, while a host is being created or edited.
+    ///
+    /// # Keepalive
+    ///
+    /// The keepalive choice sits beside the X11 mode: both are facts about how this host
+    /// is reached, and both apply to the next connection rather than to a live one. The
+    /// numbers are the same three the settings page shows, resolved against the defaults
+    /// in force, so an override never starts from a number nobody chose.
     ///
     /// # The copy protocol
     ///
@@ -564,6 +743,7 @@ impl ShelluneView {
             .px(metrics.scale(spacing::LOOSE))
             .py(metrics.scale(spacing::BASE))
             .overflow_y_scroll()
+            .track_scroll(&self.host_body_scroll)
             .child(line(
                 self.dialog_field(fields, HostField::Name, None, 0.5),
                 self.dialog_field(fields, HostField::Group, None, 0.5),
@@ -581,6 +761,8 @@ impl ShelluneView {
             .child(self.copy_protocol_section(&draft, metrics, strings, cx))
             .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
             .child(self.x11_section(&draft, metrics, strings, cx))
+            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
+            .child(self.connection_section(&draft, metrics, cx))
             .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
             .child(section(strings.host_startup_label))
             .child(

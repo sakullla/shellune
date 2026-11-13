@@ -16,6 +16,7 @@ use gpui::{App, Context, Div, FontWeight, SharedString, Stateful, Window, div, p
 use super::ShelluneView;
 use crate::app::components::{self, ControlState};
 use crate::app::copy::{self, Locale};
+use crate::app::hosts::{ConnectionField, connection_problem_text};
 use crate::app::keymap;
 use crate::app::nav::Destination;
 use crate::app::terminal;
@@ -633,7 +634,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         match item {
             Item::Shortcuts => self.settings_keys_page(cx),
-            Item::Policy => self.settings_connection_page(),
+            Item::Policy => self.settings_connection_page(cx),
             Item::HostsFile => self.settings_card(
                 item.id(),
                 vec![
@@ -943,103 +944,109 @@ impl ShelluneView {
         )
     }
 
-    /// The connection policy in force: the values every connection is dialled with (R20).
+    /// The connection page: the keepalive and timeout numbers every host is dialled with
+    /// unless it says something of its own (R20).
     ///
-    /// This build dials with one policy for every host, so the page states the numbers
-    /// instead of offering controls that would not reach the SSH layer.
-    fn settings_connection_page(&self) -> Div {
+    /// The numbers are edited where they are read: a change here is what the next attempt
+    /// is dialled with, and a field keeps the reason it refused a value instead of being
+    /// corrected silently. Zero in the interval is OpenSSH's way of switching the probe
+    /// off, so it is a value rather than an error.
+    fn settings_connection_page(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
-        let defaults = shellune_core::ConnectionDefaults::default();
-        let seconds = |value: u32| ux.settings_seconds.replace("{}", &value.to_string());
+        let on = self.connection_draft.keepalive_on();
+        let switching = self.segments(
+            "settings.keepalive",
+            vec![
+                (ux.notice_on.to_owned(), on),
+                (ux.notice_off.to_owned(), !on),
+            ],
+            cx,
+            |view, index, cx| view.set_connection_keepalive(index == 0, cx),
+        );
+        let window = match self.connection_draft.detection_window_secs() {
+            Some(seconds) => copy::fill(ux.connection_window, &[("seconds", &seconds.to_string())]),
+            None => ux.connection_window_off.to_owned(),
+        };
+        let keepalive_row = self.settings_row(
+            "keepalive",
+            ux.host_connection_title,
+            ux.connection_window_hint,
+            switching,
+        );
+        let interval_row = self.settings_connection_row(
+            ConnectionField::KeepaliveInterval,
+            ux.settings_keepalive_interval_hint,
+        );
+        let misses_row = self.settings_connection_row(
+            ConnectionField::KeepaliveMisses,
+            ux.settings_keepalive_misses_hint,
+        );
+        let timeout_row = self.settings_connection_row(
+            ConnectionField::ConnectTimeout,
+            ux.settings_connect_timeout_hint,
+        );
         self.settings_card(
             "policy",
             vec![
-                self.settings_fact_row(
-                    "keepalive-interval",
-                    ux.settings_keepalive_interval,
-                    seconds(defaults.keepalive_interval_secs()),
-                    ux.settings_keepalive_interval_hint,
-                ),
-                self.settings_fact_row(
-                    "keepalive-misses",
-                    ux.settings_keepalive_misses,
-                    defaults.keepalive_max_misses().to_string(),
-                    ux.settings_keepalive_misses_hint,
-                ),
-                self.settings_fact_row(
-                    "connect-timeout",
-                    ux.settings_connect_timeout,
-                    seconds(defaults.connect_timeout_secs()),
-                    ux.settings_connect_timeout_hint,
-                ),
+                keepalive_row,
+                interval_row,
+                misses_row,
+                timeout_row,
                 div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .px(metrics.scale(spacing::BASE))
+                    .py(metrics.scale(spacing::TIGHT))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "settings.policy.window".to_owned())
+                    .child(SharedString::from(window)),
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
                     .px(metrics.scale(spacing::BASE))
                     .py(metrics.scale(spacing::TIGHT))
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .debug_selector(|| "settings.policy.note".to_owned())
-                    .child(ux.settings_connection_hint),
+                    .child(ux.connection_defaults_note),
             ],
         )
     }
 
-    /// One value that is stated rather than chosen: its name and sentence on the left, the
-    /// number in force on the right.
-    fn settings_fact_row(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        value: String,
-        hint: &'static str,
-    ) -> Div {
+    /// One number of the connection page: its field, and the reason a value was refused.
+    ///
+    /// The refusal sits under the field that produced it and nowhere else, so a person
+    /// correcting a number reads the sentence about that number (R20).
+    fn settings_connection_row(&self, field: ConnectionField, hint: &'static str) -> Div {
         let metrics = self.metrics();
-        let value_selector = format!("settings.value.{id}");
-        div()
+        let locale = self.workspace.locale();
+        let ux = copy::ux();
+        let mut control = div()
             .flex()
-            .items_center()
-            .justify_between()
-            .flex_wrap()
-            .w_full()
-            .min_w(px(0.0))
-            .gap(metrics.scale(spacing::SNUG))
-            .px(metrics.scale(spacing::BASE))
-            .py(metrics.scale(spacing::SNUG))
-            .debug_selector(move || format!("settings.row.{id}"))
+            .flex_col()
+            .items_end()
+            .gap(metrics.scale(2.0))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(metrics.scale(200.0))
-                    .max_w_full()
-                    .gap(metrics.scale(2.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .text_size(metrics.body_size())
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(hint),
-                    ),
-            )
-            .child(
+                    .w(metrics.scale(84.0))
+                    .debug_selector(move || format!("settings.policy.{}", field.id()))
+                    .child(self.connection_fields.get(field).clone()),
+            );
+        if let Some((refused, problem)) = self.connection_draft.error()
+            && refused == field
+        {
+            control = control.child(
                 div()
-                    .whitespace_nowrap()
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .debug_selector(move || value_selector.clone())
-                    .child(SharedString::from(value)),
-            )
+                    .max_w(metrics.scale(220.0))
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::Tone::Danger.text())
+                    .debug_selector(move || format!("settings.policy.error.{}", field.id()))
+                    .child(SharedString::from(connection_problem_text(problem, locale))),
+            );
+        }
+        self.settings_row(field.id(), field.label(ux), hint, control)
     }
 
     /// The about row: what this build is and the version it reports.

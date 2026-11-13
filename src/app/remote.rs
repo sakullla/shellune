@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 
 use shellune_core::{
-    AgentKind, AuthMethod, AuthMethodKind, HostConfig, HostId, SecretString, X11Forwarding,
-    connection_jump_fault,
+    AgentKind, AuthMethod, AuthMethodKind, ConnectionDefaults, ConnectionPolicy, HostConfig,
+    HostId, SecretString, X11Forwarding, connection_jump_fault,
 };
 use shellune_ssh::{
     ChainEvent, ChainFailure, ChainRequest, ChainSession, ConnectError, FileLink, HopAuth,
@@ -648,6 +648,12 @@ pub struct ChainDraft {
     order: Vec<HostId>,
     auths: Vec<HopAuth>,
     fault: Option<String>,
+    /// The global keepalive and timeout numbers this attempt is resolved against (R20).
+    ///
+    /// The window hands them over when it starts the chain, so the policy written into
+    /// the request is the one the settings page and the host form show - not the
+    /// documented default the SSH layer would otherwise fall back to.
+    defaults: ConnectionDefaults,
 }
 
 impl ChainDraft {
@@ -675,7 +681,30 @@ impl ChainDraft {
             order,
             auths: Vec::new(),
             fault,
+            defaults: ConnectionDefaults::default(),
         }
+    }
+
+    /// The same chain, resolved against the global connection defaults (R20).
+    ///
+    /// The target host's own record decides the rest: a host that states numbers - or
+    /// switches keepalive off - keeps them, and one that says nothing follows these
+    /// defaults. The whole chain is dialled with the one policy that comes out.
+    #[must_use]
+    pub fn with_connection_defaults(mut self, defaults: ConnectionDefaults) -> Self {
+        self.defaults = defaults;
+        self
+    }
+
+    /// The keepalive and the deadline this chain would be dialled with (R20).
+    #[must_use]
+    pub fn connection_policy(&self) -> ConnectionPolicy {
+        let connection = self
+            .hosts
+            .iter()
+            .find(|host| host.id() == self.target)
+            .and_then(HostConfig::connection);
+        self.defaults.policy_for(connection)
     }
 
     /// A chain of one host that is not in the saved book.
@@ -739,8 +768,9 @@ impl ChainDraft {
         if self.fault.is_some() || self.next_needed().is_some() {
             return None;
         }
+        let policy = self.connection_policy();
         let (hosts, target, auth) = self.into_parts();
-        Some(ChainRequest::new(hosts, target, auth, size))
+        Some(ChainRequest::new(hosts, target, auth, size).with_connection_policy(policy))
     }
 }
 
@@ -1208,5 +1238,74 @@ mod tests {
         assert!(fault.contains("no command was run"), "{fault}");
         assert!(draft.order().is_empty());
         assert!(draft.into_request(PtySize::new(80, 24)).is_none());
+    }
+    #[test]
+    fn the_policy_a_chain_is_requested_with_is_the_one_the_pages_show() {
+        use shellune_core::{ConnectionDefaults, HostConnection};
+        let plain = HostConfig::new("web", "10.0.0.2", 22, "deploy").expect("a target");
+        let defaults = ConnectionDefaults::new(45, 4, 12).expect("valid defaults");
+        let inherited = ChainDraft::single(plain.clone()).with_connection_defaults(defaults);
+        assert_eq!(
+            inherited.connection_policy(),
+            defaults.policy_for(None),
+            "a host that says nothing is dialled with the numbers the settings page shows"
+        );
+
+        // The host's own record wins over the same defaults, and an explicit off is not
+        // read as an inheritance.
+        let mut own = plain.clone();
+        own.set_connection(Some(
+            HostConnection::new(Some(90), Some(6), Some(30)).expect("valid"),
+        ));
+        let overriding = ChainDraft::single(own).with_connection_defaults(defaults);
+        let policy = overriding.connection_policy();
+        assert_eq!(
+            policy.keepalive_interval(),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(policy.keepalive_max(), 6);
+        assert_eq!(policy.connect_timeout(), std::time::Duration::from_secs(30));
+
+        let mut quiet = plain;
+        quiet.set_connection(Some(HostConnection::keepalive_off()));
+        let off = ChainDraft::single(quiet).with_connection_defaults(defaults);
+        assert!(
+            off.connection_policy().keepalive().is_none(),
+            "a host that turned keepalive off keeps it off whatever the default says"
+        );
+    }
+
+    #[test]
+    fn a_jump_chain_is_requested_with_one_policy_for_every_hop() {
+        let bastion = HostConfig::new("bastion", "10.0.0.1", 22, "jump").expect("a hop");
+        let mut web = HostConfig::new("web", "10.0.0.2", 22, "deploy").expect("a target");
+        web.set_jumps([bastion.id()]);
+        web.set_connection(Some(
+            shellune_core::HostConnection::new(Some(15), Some(2), Some(9)).expect("valid"),
+        ));
+        let mut draft = ChainDraft::prepare(&[bastion.clone(), web.clone()], &web);
+        draft.push_auth(HopAuth {
+            host_id: bastion.id(),
+            auth: AuthMethod::password("secret".to_owned()),
+            known: KnownHostKey::Unknown,
+        });
+        draft.push_auth(HopAuth {
+            host_id: web.id(),
+            auth: AuthMethod::password("secret".to_owned()),
+            known: KnownHostKey::Unknown,
+        });
+        let policy = draft.connection_policy();
+        // The target's own numbers decide the policy, and the same one covers the hop:
+        // a chain that probed one way through the bastion and another to the target
+        // would make its reported behaviour impossible to explain (R20).
+        assert_eq!(
+            policy.keepalive_interval(),
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(policy.connect_timeout(), std::time::Duration::from_secs(9));
+        assert!(
+            draft.into_request(PtySize::new(80, 24)).is_some(),
+            "every hop has credentials, so the request is built from that policy"
+        );
     }
 }
