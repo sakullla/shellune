@@ -19523,3 +19523,446 @@ async fn a_transfer_failure_stays_whole_while_x11_failed_at_two_hundred_percent(
     }
     assert_fits_inside(bounds_of(cx, "session.close"), viewport, "session.close");
 }
+
+// ---------------------------------------------------------------------------
+// A window that changes size keeps what the user was doing (R6, R8)
+// ---------------------------------------------------------------------------
+
+/// The path each source shows, or None when it has not been listed.
+fn both_paths(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+) -> (Option<String>, Option<String>) {
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        let path = |source: FileSource| match source {
+            FileSource::Remote => view
+                .files_browser(id)
+                .and_then(|browser| browser.path().map(str::to_owned)),
+            FileSource::Local => view
+                .files_local_browser(id)
+                .and_then(|browser| browser.path().map(str::to_owned)),
+        };
+        (path(FileSource::Remote), path(FileSource::Local))
+    })
+}
+
+#[gpui::test]
+async fn a_window_that_widens_and_narrows_again_keeps_the_source_and_both_paths(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    cx.simulate_resize(size(px(760.0), px(720.0)));
+    cx.run_until_parked();
+    let (_remote, _local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[("报告.txt", shellune_core::FileKind::File)],
+    );
+    click(cx, "files.show.local");
+    assert!(
+        cx.debug_bounds("files.layout.single").is_some(),
+        "a narrow window shows one side"
+    );
+    assert!(
+        cx.debug_bounds("files.other").is_some(),
+        "the side that is not drawn is still named, with its folder"
+    );
+    let narrow = both_paths(cx, &view, id);
+    let shown = cx.update(|_window, app| view.read(app).files_shown(id));
+    assert_eq!(shown, Some(FileSource::Local));
+
+    // Wide: both sides are drawn, and the side that was chosen stays the chosen one.
+    cx.simulate_resize(size(px(2400.0), px(900.0)));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("files.layout.dual").is_some(),
+        "a wide window draws this computer and the server side by side"
+    );
+    assert!(cx.debug_bounds("files.local.panel").is_some());
+    assert!(cx.debug_bounds("files.panel").is_some());
+    // No switch row above the columns: with both sides drawn there is no hidden side
+    // to name, and the two columns start at the same edge.
+    assert_eq!(
+        bounds_of(cx, "files.local.panel").origin.y,
+        bounds_of(cx, "files.panel").origin.y,
+        "the two columns of a wide window start at the same height"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_shown(id)),
+        Some(FileSource::Local),
+        "widening the window does not move the choice back to the server"
+    );
+    assert_eq!(
+        both_paths(cx, &view, id),
+        narrow,
+        "both paths survive widening"
+    );
+
+    // Narrow again: the same side, the same two paths.
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("files.layout.single").is_some());
+    assert!(
+        cx.debug_bounds("files.local.panel").is_some(),
+        "the side that was chosen is the one the narrow window draws"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_shown(id)),
+        Some(FileSource::Local)
+    );
+    assert_eq!(
+        both_paths(cx, &view, id),
+        narrow,
+        "narrowing the window again keeps both directories where they were"
+    );
+}
+
+#[gpui::test]
+async fn a_deep_path_is_drawn_inside_its_column_at_two_hundred_percent(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let remote = FileAnswers::accepting();
+    let local = FileAnswers::accepting();
+    let remote_channel = remote.clone();
+    let local_channel = local.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(
+                id,
+                "web",
+                "deploy@10.0.0.5:22",
+                Box::new(remote_channel),
+                cx,
+            );
+            view.attach_local_files_for_test(id, Box::new(local_channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+    remote.reply(
+        1,
+        "/home/deploy/2026-11 发布 版本 目录/后端 服务/构建 产物 与 校验 记录",
+        &[(
+            "构建 产物 与 校验 记录.tar.zst",
+            shellune_core::FileKind::File,
+        )],
+    );
+    local.reply(1, "/C:/work", &[]);
+    pump_files(cx, &view);
+
+    focus_root(&view, cx);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
+
+    // The path is one segment per folder, and every segment stays inside the column:
+    // wrapping decides where a long path goes, never a clip at the edge (R6, R8).
+    let panel = bounds_of(cx, "files.panel");
+    let mut seen = 0;
+    for selector in [
+        "files.crumb.0",
+        "files.crumb.1",
+        "files.crumb.2",
+        "files.crumb.3",
+        "files.crumb.4",
+        "files.crumb.5",
+    ] {
+        let Some(crumb) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        seen += 1;
+        assert!(
+            crumb.origin.x >= panel.origin.x - px(0.5)
+                && crumb.origin.x + crumb.size.width <= panel.origin.x + panel.size.width + px(0.5),
+            "{selector} is outside the column: {crumb:?} in {panel:?}"
+        );
+    }
+    assert!(
+        seen >= 5,
+        "the deep path is drawn as its own segments, not one clipped label: {seen}"
+    );
+    // Each segment is bounded, so one long folder name cannot take the whole column and
+    // the segments after it still get room at the largest text size.
+    let room = f32::from(px(240.0)) * 2.0 + 8.0;
+    let more = cx.debug_bounds("files.crumb.1");
+    if let Some(crumb) = more {
+        assert!(
+            f32::from(crumb.size.width) <= room,
+            "one segment is bounded: {crumb:?}"
+        );
+    }
+
+    // At the design window the whole path is readable: every segment is inside the
+    // column, the last one included - which is the part a reader looks for (R6).
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let panel = bounds_of(cx, "files.panel");
+    for selector in [
+        "files.crumb.0",
+        "files.crumb.1",
+        "files.crumb.2",
+        "files.crumb.3",
+        "files.crumb.4",
+        "files.crumb.5",
+    ] {
+        let Some(crumb) = cx.debug_bounds(selector) else {
+            continue;
+        };
+        assert!(
+            crumb.origin.x >= panel.origin.x - px(0.5)
+                && crumb.origin.x + crumb.size.width <= panel.origin.x + panel.size.width + px(0.5)
+                && crumb.origin.y + crumb.size.height
+                    <= panel.origin.y + panel.size.height + px(0.5),
+            "{selector} is outside the column: {crumb:?} in {panel:?}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn a_queued_transfer_says_it_is_queued_and_only_a_known_total_draws_a_bar(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (_files, transfers) = open_transfers(cx, &view, id);
+
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/报告 终稿.txt");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let first = transfers.starts()[0].transfer;
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_tasks()[0].state().clone()),
+        shellune_core::TransferState::Queued,
+        "a task the connection has taken is queued until the worker starts it"
+    );
+    let detail = cx
+        .update(|_window, app| view.read(app).transfer_detail_for_test(first))
+        .expect("the task is listed");
+    assert!(
+        detail.contains(ENGLISH.transfers_queued_note),
+        "the row says the task is waiting for its first byte: {detail}"
+    );
+    assert!(
+        cx.debug_bounds("transfers.progress.0").is_none(),
+        "a queued task has no share to draw"
+    );
+
+    // The worker starts and reports both halves of the fraction.
+    transfers.push(shellune_core::TransferEvent::started(first));
+    transfers.push(shellune_core::TransferEvent::progress(
+        first,
+        1024,
+        Some(4096),
+    ));
+    pump_files(cx, &view);
+    let detail = cx
+        .update(|_window, app| view.read(app).transfer_detail_for_test(first))
+        .expect("the task is listed");
+    assert!(
+        detail.contains("25%") && detail.contains("1024/4096"),
+        "the row shows the worker's own fraction: {detail}"
+    );
+    assert!(
+        !detail.contains(ENGLISH.transfers_queued_note),
+        "a running task is not described as queued: {detail}"
+    );
+    assert!(
+        cx.debug_bounds("transfers.progress.0").is_some(),
+        "a running task with a known total draws the share it has written"
+    );
+
+    // A second task whose size the worker cannot know: bytes, no percentage, no bar.
+    click(cx, "files.upload");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_question_set_text_for_test("C:/work/发布 目录");
+            view.submit_files_change_for_test(cx);
+        });
+    });
+    cx.run_until_parked();
+    let second = transfers.starts()[1].transfer;
+    transfers.push(shellune_core::TransferEvent::started(second));
+    transfers.push(shellune_core::TransferEvent::progress(second, 500, None));
+    pump_files(cx, &view);
+    let detail = cx
+        .update(|_window, app| view.read(app).transfer_detail_for_test(second))
+        .expect("the second task is listed");
+    assert!(
+        detail.contains("500 B") && !detail.contains('%'),
+        "an unknown total is bytes, not a share: {detail}"
+    );
+    assert!(
+        cx.debug_bounds("transfers.progress.1").is_none(),
+        "a bar needs a whole to be a share of"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Port forwarding: what it is, and what a click is allowed to end (R6)
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn stopping_or_deleting_a_tunnel_asks_first_and_the_answer_is_what_changes_it(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("forward-confirm");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (view, cx) = hosts_view(cx, dir.store());
+    click(cx, "hosts.forwards.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tool_for_test()),
+        Some(crate::app::view::Tool::Forwards)
+    );
+
+    let host = cx.update(|_window, app| view.read(app).book().hosts()[0].id());
+    let port = layout_port();
+    let rule = ForwardRule::local(
+        host,
+        Endpoint::loopback(port).expect("listen"),
+        Endpoint::new("db.internal", 5432).expect("target"),
+    );
+    let id = rule.id();
+    let (mut observed, session) = cx.update(|_window, app| {
+        let session = SessionId::new();
+        let observed = view.update(app, |view, cx| {
+            let observed =
+                view.install_listening_forward_for_test(session, rule, "127.0.0.1", port);
+            cx.notify();
+            observed
+        });
+        (observed, session)
+    });
+    let _ = session;
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("forwards.row.0").is_some());
+    assert!(
+        cx.debug_bounds("forwards.listening.0").is_some(),
+        "the row says it is listening"
+    );
+
+    // Stopping is asked about, and nothing stops while the question is open.
+    click(cx, "forwards.start.0");
+    assert!(
+        cx.debug_bounds("forwards.confirm").is_some(),
+        "stopping a listening tunnel is a question, not a click"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).forward_listening_for_test(id)),
+        "nothing is stopped before the answer"
+    );
+    assert!(
+        observed.commands().is_empty(),
+        "no command reached the connection while the question was open: {:?}",
+        observed.commands()
+    );
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_confirm_for_test()),
+        Some((id, crate::app::forwarding::ForwardConfirm::Stop)),
+        "the question is about this rule and this action"
+    );
+    click(cx, "forwards.confirm.no");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_confirm_for_test()),
+        None,
+        "cancelling puts the question away"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).forward_listening_for_test(id)),
+        "cancelling leaves the tunnel listening"
+    );
+    assert!(observed.commands().is_empty());
+
+    click(cx, "forwards.start.0");
+    click(cx, "forwards.confirm.yes");
+    assert!(
+        !cx.update(|_window, app| view.read(app).forward_listening_for_test(id)),
+        "the confirmed answer is what stops the listener"
+    );
+    assert_eq!(
+        observed.commands(),
+        vec![shellune_ssh::ForwardCommand::Stop { id }]
+    );
+
+    // Deleting is asked about too, and the rule stays listed until the answer.
+    click(cx, "forwards.delete.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).forward_confirm_for_test()),
+        Some((id, crate::app::forwarding::ForwardConfirm::Delete))
+    );
+    click(cx, "forwards.confirm.no");
+    assert!(
+        cx.update(|_window, app| view.read(app).forward_row_summary_for_test(0))
+            .is_some(),
+        "cancelling keeps the rule in the list"
+    );
+
+    click(cx, "forwards.delete.0");
+    click(cx, "forwards.confirm.yes");
+    assert!(
+        cx.update(|_window, app| view.read(app).forward_row_summary_for_test(0))
+            .is_none(),
+        "the confirmed answer removes the rule from the list"
+    );
+    assert!(
+        ForwardStore::at(dir.path())
+            .load()
+            .expect("rules")
+            .rule(id)
+            .is_none(),
+        "and from the file"
+    );
+}
+
+#[gpui::test]
+async fn the_tunnel_form_refuses_an_incomplete_endpoint_and_saves_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("forward-validation");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (_view, cx) = hosts_view(cx, dir.store());
+    click(cx, "hosts.forwards.0");
+    click(cx, "forwards.new");
+    assert!(cx.debug_bounds("forwards.form").is_some());
+
+    // The listen port is empty: the form says so where the fields are, and the file is
+    // not written.
+    click(cx, "forwards.save");
+    assert!(
+        cx.debug_bounds("forwards.error").is_some(),
+        "the form names what is missing instead of closing"
+    );
+    assert!(
+        cx.debug_bounds("forwards.form").is_some(),
+        "the form the user typed into stays open"
+    );
+    assert!(
+        ForwardStore::at(dir.path())
+            .load()
+            .expect("rules")
+            .rules()
+            .is_empty(),
+        "a refused preview saves nothing"
+    );
+}

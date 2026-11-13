@@ -102,6 +102,19 @@ pub struct ForwardEditor {
     pub error: Option<String>,
 }
 
+/// An action on a saved rule that the user has to confirm first.
+///
+/// Stopping a listener and deleting a rule both end something the user can see: a port
+/// that was open, or a rule they may still want. What each one does is stated before it
+/// happens, and neither is done by a single click on a row (R6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardConfirm {
+    /// Close the listener, keeping the rule.
+    Stop,
+    /// Remove the rule, stopping its listener first when one is running.
+    Delete,
+}
+
 /// What starting a rule still needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ForwardStart {
@@ -606,8 +619,9 @@ impl ForwardCenter {
             .is_none_or(|current| current == generation)
     }
 
-    /// Marks one saved rule as listening, for a test that cannot bind a socket.
-    #[cfg(test)]
+    /// Marks one saved rule as listening, for a test or a capture that cannot bind a
+    /// socket.
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn note_listening_for_test(
         &mut self,
         id: ForwardId,
@@ -627,7 +641,7 @@ impl ForwardCenter {
     }
 
     /// Attaches a link whose commands the caller can read. Nothing is bound.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn attach_observed_for_test(
         &mut self,
         session: SessionId,

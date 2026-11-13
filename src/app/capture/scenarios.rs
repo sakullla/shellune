@@ -564,6 +564,101 @@ fn show_settings_keys_search(
     Ok(())
 }
 
+/// A saved host's session with the file view open on fixture listings (R2, R6).
+///
+/// Both columns answer from the fixture, so the shot shows the dual view this build
+/// draws and says nothing about a server or about this computer's own disk.
+fn show_files(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_files_of(view, window, cx, false)
+}
+
+/// The same view on a directory that really is empty (R6).
+fn show_empty_files(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_files_of(view, window, cx, true)
+}
+
+fn show_files_of(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+    empty: bool,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    let id = view.attach_capture_remote_session(&host, TRANSCRIPT.as_bytes(), Some(window), cx);
+    view.capture_files(id, empty, cx);
+    if !view.files_visible(id) {
+        return Err("the file view did not open".to_owned());
+    }
+    Ok(())
+}
+
+/// The file view with a transfer in flight (R6).
+fn show_running_transfer(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_files(view, window, cx)?;
+    let id = view
+        .active_session()
+        .ok_or_else(|| "no session".to_owned())?;
+    view.capture_transfer(id, true, cx);
+    Ok(())
+}
+
+/// The file view with a transfer that stopped because the connection ended (R6).
+fn show_failed_transfer(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_files(view, window, cx)?;
+    let id = view
+        .active_session()
+        .ok_or_else(|| "no session".to_owned())?;
+    view.capture_transfer(id, false, cx);
+    Ok(())
+}
+
+/// The forwarding page with no saved rule (R6).
+fn show_forwards_empty(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.capture_forwards(&host, false, cx);
+    Ok(())
+}
+
+/// The forwarding page with all three kinds, one of them listening (R6).
+fn show_forwards_running(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.capture_forwards(&host, true, cx);
+    Ok(())
+}
+
 /// Shows several tabs, then lists all of them over the terminal (R17).
 fn show_tab_list(
     view: &mut ShelluneView,
@@ -595,6 +690,66 @@ fn on_page(
     if actual != state {
         return Err(format!(
             "the {destination:?} section is {actual:?}, not {state:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the file view is open on the fixture directory, with the entries it holds.
+fn files_ready_at(view: &ShelluneView, expected: (&str, usize)) -> Result<(), String> {
+    let (open, path, entries) = view
+        .capture_files_listing()
+        .ok_or_else(|| "no file view is open".to_owned())?;
+    if !open {
+        return Err("the file view is not open".to_owned());
+    }
+    if path != expected.0 {
+        return Err(format!(
+            "the file view shows {path:?}, not {:?}",
+            expected.0
+        ));
+    }
+    if entries != expected.1 {
+        return Err(format!(
+            "the listing holds {entries} entries, not {}",
+            expected.1
+        ));
+    }
+    Ok(())
+}
+
+fn files_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    files_ready_at(view, ("/home/deploy/项目 发布/2026-11 版本", 4))
+}
+
+fn empty_files_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    files_ready_at(view, ("/home/deploy/备份/2026-10", 0))
+}
+
+fn running_transfer_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    files_ready(view, _cx)?;
+    if view.capture_transfer_count() == 0 {
+        return Err("the transfer strip is empty".to_owned());
+    }
+    Ok(())
+}
+
+fn failed_transfer_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    running_transfer_ready(view, _cx)
+}
+
+fn forwards_empty_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_forward_counts().0 != 0 {
+        return Err("the forwarding page has saved rules".to_owned());
+    }
+    Ok(())
+}
+
+fn forwards_running_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    let (rows, listening) = view.capture_forward_counts();
+    if rows != 3 || listening != 1 {
+        return Err(format!(
+            "the forwarding page shows {rows} rules and {listening} listening, not 3 and 1"
         ));
     }
     Ok(())
@@ -912,6 +1067,99 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_hosts,
         install: show_disconnected,
         ready: disconnected_ready,
+    },
+    Scenario {
+        id: "files-dual",
+        title: "文件 · 本机与服务器双栏",
+        category: Category::Terminal,
+        fixture: "both file sources answered from fixture listings; nothing was read from disk or a server",
+        evidence: "shows the two columns, their own paths, the actions each row offers and the direction \
+                   between them; no directory was really listed, so no permission or server behaviour is shown",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_files,
+        ready: files_ready,
+    },
+    Scenario {
+        id: "files-empty",
+        title: "文件 · 空目录",
+        category: Category::Terminal,
+        fixture: "a remote directory with no entries, answered from a fixture",
+        evidence: "shows what an empty directory says and the actions still offered beside it; nothing \
+                   was listed on a server",
+        quick: false,
+        variants: &[Variant::dark().chinese().smallest()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_empty_files,
+        ready: empty_files_ready,
+    },
+    Scenario {
+        id: "transfers-running",
+        title: "传输 · 进行中与速率",
+        category: Category::Overlay,
+        fixture: "one transfer in the strip, started and progressed through the queue's own events",
+        evidence: "shows the share, the measured speed and the time left of a task this build holds; \
+                   no byte was moved and no connection took part",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_running_transfer,
+        ready: running_transfer_ready,
+    },
+    Scenario {
+        id: "transfers-failed",
+        title: "传输 · 失败与重试",
+        category: Category::Overlay,
+        fixture: "one transfer failed the way a lost connection stops it: it left a partial file",
+        evidence: "shows the reason, the partial file and the retry actions of a task the queue really \
+                   holds; no transfer was attempted",
+        quick: true,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_failed_transfer,
+        ready: failed_transfer_ready,
+    },
+    Scenario {
+        id: "forwards-empty",
+        title: "转发 · 尚未保存规则",
+        category: Category::Overlay,
+        fixture: "one saved host and an empty rule book",
+        evidence: "shows the empty forwarding page and how a tunnel is created; nothing was bound or \
+                   dialled",
+        quick: false,
+        variants: &[Variant::dark().chinese().smallest()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_forwards_empty,
+        ready: forwards_empty_ready,
+    },
+    Scenario {
+        id: "forwards-running",
+        title: "转发 · 三种类型与运行状态",
+        category: Category::Overlay,
+        fixture: "three saved rules - local, remote and SOCKS - with the first marked as listening",
+        evidence: "shows the kind, the host each rule goes through, which side each endpoint is on and \
+                   the state of every row; no socket was bound and no connection exists",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_forwards_running,
+        ready: forwards_running_ready,
     },
     Scenario {
         id: "settings",

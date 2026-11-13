@@ -1744,6 +1744,8 @@ impl ShelluneView {
             this.tool = None;
             this.forwards.close_editor();
             this.pending_exposure = None;
+            // A question about one rule is about a page that is no longer on screen.
+            this.forward_confirm = None;
             this.snippet_panel.keep();
             this.snippet_panel.end_edit();
             cx.notify();

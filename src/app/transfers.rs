@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use shellune_core::{
     OverwriteChoice, SessionId, Transfer, TransferDirection, TransferEvent, TransferFailure,
@@ -97,6 +98,34 @@ pub enum PathProblem {
     DirectoryNeedsScp,
 }
 
+/// How fast one task moved, measured from the bytes it reported.
+///
+/// The queue knows the bytes; only the window knows when it read them. Keeping the two
+/// apart is what lets the list say "1.2 MB/s" and "0:12 left" without the core inventing
+/// a clock: a speed exists only after two real samples of a running task, and every
+/// sample is a number the worker sent.
+#[derive(Clone, Copy, Debug)]
+struct Pace {
+    /// When the last sample was taken.
+    at: Instant,
+    /// The bytes reported at that sample.
+    bytes: u64,
+    /// Bytes per second, smoothed across samples. Zero until two samples exist.
+    rate: f64,
+}
+
+/// How long two samples have to be apart before they are a measurement.
+///
+/// A shorter gap turns the rounding of two neighbouring progress reports into a wild
+/// speed; a longer one makes the number lag behind the bytes on screen.
+const PACE_SAMPLE: Duration = Duration::from_millis(400);
+
+/// The speed a task has to be moving at before an estimate is worth printing.
+///
+/// A rate of a few bytes per second is a stall, not a speed: dividing the remaining
+/// bytes by it would promise hours, which is a number no one can act on.
+const PACE_FLOOR: f64 = 1024.0;
+
 /// The transfers of every session this window can move files on.
 #[derive(Default)]
 pub struct TransferViews {
@@ -105,6 +134,8 @@ pub struct TransferViews {
     settling: HashMap<SessionId, Box<dyn TransferChannel>>,
     /// Tasks whose worker has not yet reported the flush it was in the middle of.
     pending_settlement: HashMap<SessionId, Vec<TransferId>>,
+    /// The speed each running task was last seen moving at.
+    paces: HashMap<TransferId, Pace>,
     queue: TransferQueue,
 }
 
@@ -148,6 +179,31 @@ impl TransferViews {
     #[must_use]
     pub fn active_count(&self, session: SessionId) -> usize {
         self.queue.active_count(session)
+    }
+
+    /// The speed one running task was last measured at, in bytes per second.
+    ///
+    /// None before there are two samples, and for a task that is not moving bytes: a
+    /// queued task has not been measured at all, and a finished one has no speed left.
+    #[must_use]
+    pub fn rate(&self, id: TransferId) -> Option<f64> {
+        let pace = self.paces.get(&id)?;
+        (pace.rate >= PACE_FLOOR).then_some(pace.rate)
+    }
+
+    /// How long the bytes still missing take at the measured speed.
+    ///
+    /// None when either half of the estimate is unknown: a task whose size the worker
+    /// has not reported has no remainder, and one with no measured speed has no forecast.
+    /// Nothing here is a guess from a partial file or from the size of one file in a tree.
+    #[must_use]
+    pub fn remaining(&self, id: TransferId) -> Option<Duration> {
+        let rate = self.rate(id)?;
+        let task = self.queue.get(id)?;
+        let total = task.state().total()?;
+        let done = task.state().transferred()?;
+        let left = total.saturating_sub(done) as f64;
+        Some(Duration::from_secs_f64((left / rate).max(0.0)))
     }
 
     /// Tasks whose target exists and that wait for the user's decision.
@@ -442,7 +498,104 @@ impl TransferViews {
             self.pending_settlement.remove(&session);
             self.settling.remove(&session);
         }
+        self.sample(Instant::now());
         changed
+    }
+
+    /// Measures the speed of every running task from the bytes it has reported.
+    ///
+    /// Reading the clock here, on the frame that applied the bytes, is what makes the
+    /// number a measurement: two samples of the same task are divided by the time between
+    /// them. A task that reported no new bytes in the gap measures zero, so a stalled
+    /// transfer loses its speed instead of keeping the last one it had - and with it the
+    /// estimate built on it.
+    fn sample(&mut self, now: Instant) {
+        let running: Vec<(TransferId, u64)> = self
+            .queue
+            .transfers()
+            .iter()
+            .filter_map(|task| match task.state() {
+                shellune_core::TransferState::Running { transferred, .. } => {
+                    Some((task.id(), *transferred))
+                }
+                _ => None,
+            })
+            .collect();
+        self.paces
+            .retain(|id, _| running.iter().any(|(other, _)| other == id));
+        for (id, bytes) in running {
+            match self.paces.get_mut(&id) {
+                Some(pace) => {
+                    let elapsed = now.saturating_duration_since(pace.at);
+                    if elapsed < PACE_SAMPLE {
+                        continue;
+                    }
+                    let seconds = elapsed.as_secs_f64();
+                    let moved = bytes.saturating_sub(pace.bytes) as f64;
+                    // No byte in the whole gap is a stall, not a slow transfer: keeping
+                    // the last speed would keep an estimate that is no longer true.
+                    pace.rate = if moved == 0.0 {
+                        0.0
+                    } else if pace.rate > 0.0 {
+                        // The first measured rate is taken as it is; later ones are
+                        // averaged, so one fast or slow report does not become the speed.
+                        pace.rate * 0.5 + (moved / seconds) * 0.5
+                    } else {
+                        moved / seconds
+                    };
+                    pace.at = now;
+                    pace.bytes = bytes;
+                }
+                None => {
+                    self.paces.insert(
+                        id,
+                        Pace {
+                            at: now,
+                            bytes,
+                            rate: 0.0,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Puts one task in the list in a state a capture can photograph.
+    ///
+    /// No connection is asked and no byte is written: the task, its progress and its
+    /// failure are applied to the queue exactly as a worker's events would be, so the row
+    /// a shot shows is the row this build draws from real state (R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn seed_for_capture(
+        &mut self,
+        task: Transfer,
+        moved: u64,
+        total: Option<u64>,
+        failed: Option<TransferFailure>,
+    ) -> TransferId {
+        let id = self.queue.add(task);
+        let _ = self.queue.apply(&TransferEvent::started(id));
+        let _ = self.queue.apply(&TransferEvent::progress(id, moved, total));
+        if let Some(failure) = failed {
+            let _ = self.queue.apply(&TransferEvent {
+                transfer: id,
+                update: TransferUpdate::Failed {
+                    failure,
+                    residue: None,
+                    resume: None,
+                },
+            });
+        }
+        id
+    }
+
+    /// Measures every running task at a stated moment, for a test.
+    ///
+    /// The window samples on its own frame timer; a test cannot wait for one, so it
+    /// states the moments instead. Nothing else about the measurement changes.
+    #[cfg(test)]
+    pub fn sample_at_for_test(&mut self, now: Instant) {
+        self.sample(now);
     }
 
     /// Forgets a task whose worker has reported that it stopped.
@@ -1175,5 +1328,92 @@ mod tests {
             Some(32)
         );
         assert_eq!(views.active_count(second), 1);
+    }
+
+    #[test]
+    fn a_queued_task_has_no_measured_speed_and_a_running_one_only_after_two_samples() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = views(session, channel.clone());
+        let id = views
+            .upload(session, "C:/work/report.txt", Some("/home/deploy"))
+            .expect("the upload starts");
+        assert_eq!(
+            views.get(id).map(|task| task.state().clone()),
+            Some(shellune_core::TransferState::Queued),
+            "a task whose worker has not started is queued"
+        );
+        assert_eq!(
+            views.rate(id),
+            None,
+            "nothing has moved, so nothing was measured"
+        );
+        assert_eq!(views.remaining(id), None);
+
+        let first = Instant::now();
+        // The worker has started and moved two megabytes in four seconds.
+        channel.push(TransferEvent::started(id));
+        channel.push(TransferEvent::progress(
+            id,
+            1024 * 1024,
+            Some(8 * 1024 * 1024),
+        ));
+        views.pump();
+        views.sample_at_for_test(first);
+        assert_eq!(
+            views.rate(id),
+            None,
+            "one sample is a position, not a speed"
+        );
+
+        channel.push(TransferEvent::progress(
+            id,
+            5 * 1024 * 1024,
+            Some(8 * 1024 * 1024),
+        ));
+        views.pump();
+        views.sample_at_for_test(first + Duration::from_secs(4));
+        let rate = views.rate(id).expect("two samples are a speed");
+        assert!(
+            (rate - (4.0 * 1024.0 * 1024.0) / 4.0).abs() < 64.0 * 1024.0,
+            "the speed is the bytes between the samples over the time between them: {rate}"
+        );
+        let left = views.remaining(id).expect("three megabytes are left");
+        assert!(
+            left.as_secs_f64() > 2.0 && left.as_secs_f64() < 4.0,
+            "the remainder is the missing bytes at that speed: {left:?}"
+        );
+
+        // A stalled transfer stops claiming a speed: the same bytes over the next gap.
+        views.sample_at_for_test(first + Duration::from_secs(12));
+        assert!(
+            views.rate(id).is_none(),
+            "a task that reported no bytes has no measured speed"
+        );
+        assert_eq!(views.remaining(id), None);
+    }
+
+    #[test]
+    fn a_task_whose_size_is_unknown_reports_bytes_but_no_remaining_time() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = views(session, channel.clone());
+        let id = views
+            .upload(session, "C:/work/tree", Some("/home/deploy"))
+            .expect("the upload starts");
+        let start = Instant::now();
+        channel.push(TransferEvent::started(id));
+        channel.push(TransferEvent::progress(id, 0, None));
+        views.pump();
+        views.sample_at_for_test(start);
+        channel.push(TransferEvent::progress(id, 2048 * 1024, None));
+        views.pump();
+        views.sample_at_for_test(start + Duration::from_secs(2));
+        assert!(views.rate(id).is_some(), "the bytes moved are measured");
+        assert_eq!(
+            views.remaining(id),
+            None,
+            "a tree whose size the worker does not know has no remainder to estimate"
+        );
     }
 }

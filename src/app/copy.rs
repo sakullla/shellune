@@ -369,6 +369,11 @@ pub struct Strings {
     pub files_loading: &'static str,
     /// Shown when a directory is really empty.
     pub files_empty: &'static str,
+    /// Next step under the empty-directory line.
+    pub files_empty_hint: &'static str,
+    /// Names the folder the other side of the file view is showing while one side is
+    /// hidden (a narrow window).
+    pub files_other_side: &'static str,
     /// Shown while no path is known yet.
     pub files_unknown_path: &'static str,
     /// Shown when a directory could not be read.
@@ -469,6 +474,10 @@ pub struct Strings {
     pub files_local_root: &'static str,
     /// Heading of the transfer list of a session.
     pub transfers_heading: &'static str,
+    /// Said of a task the connection has taken but whose first byte has not arrived.
+    pub transfers_queued_note: &'static str,
+    /// The time the missing bytes take at the measured speed; the duration is filled in.
+    pub transfers_remaining: &'static str,
     /// Said when a session has no transfer yet.
     pub transfers_empty: &'static str,
     /// Button that asks for the local file to upload.
@@ -1138,6 +1147,8 @@ pub static ENGLISH: Strings = Strings {
     files_parent_row: "Parent directory",
     files_loading: "Reading the directory…",
     files_empty: "This directory is empty.",
+    files_empty_hint: "Drag a file from the other side to copy it here, or use New folder above.",
+    files_other_side: "Other side",
     files_unknown_path: "Waiting for the server",
     files_failed: "The directory could not be read",
     files_terminal_note: "The terminal keeps running. Only this source is affected.",
@@ -1187,6 +1198,8 @@ pub static ENGLISH: Strings = Strings {
     files_local_unavailable: "This folder cannot be listed:",
     files_local_root: "This computer",
     transfers_heading: "Transfers",
+    transfers_queued_note: "Queued at the connection; no byte has moved yet.",
+    transfers_remaining: "{time} left",
     transfers_empty: "Nothing is being moved for this session.",
     transfers_upload: "Upload",
     transfers_upload_confirm: "Upload",
@@ -1594,6 +1607,8 @@ pub static CHINESE: Strings = Strings {
     files_parent_row: "上级目录",
     files_loading: "正在读取目录…",
     files_empty: "这个目录是空的。",
+    files_empty_hint: "从另一侧把文件拖过来即可复制到这里，或使用上面的新建文件夹。",
+    files_other_side: "另一侧",
     files_unknown_path: "等待服务器返回",
     files_failed: "无法读取这个目录",
     files_terminal_note: "终端仍在运行，只有这个来源受影响。",
@@ -1643,6 +1658,8 @@ pub static CHINESE: Strings = Strings {
     files_local_unavailable: "无法列出这个文件夹：",
     files_local_root: "这台电脑",
     transfers_heading: "传输",
+    transfers_queued_note: "已交给连接排队，还没有开始传字节。",
+    transfers_remaining: "剩余 {time}",
     transfers_empty: "这个会话当前没有传输。",
     transfers_upload: "上传",
     transfers_upload_confirm: "上传",
@@ -2181,6 +2198,30 @@ pub struct UxStrings {
     pub fwd_no_hosts: &'static str,
     /// Cancel
     pub fwd_cancel: &'static str,
+    /// Question before a running tunnel is stopped
+    pub fwd_stop_title: &'static str,
+    /// What stopping does, with the endpoint filled in
+    pub fwd_stop_body: &'static str,
+    /// Question before a tunnel is deleted
+    pub fwd_delete_title: &'static str,
+    /// What deleting does, with the tunnel and its state filled in
+    pub fwd_delete_body: &'static str,
+    /// Said in the delete question of a tunnel that is listening now
+    pub fwd_delete_running: &'static str,
+    /// Said in the delete question of a tunnel that is not listening
+    pub fwd_delete_saved: &'static str,
+    /// Said of the side that holds the listening port of a local forward
+    pub fwd_here: &'static str,
+    /// Said of the side the connection reaches for a local forward
+    pub fwd_there: &'static str,
+    /// Failure: the local port belongs to another program
+    pub fwd_failure_in_use: &'static str,
+    /// Failure: this account may not listen on that port
+    pub fwd_failure_denied: &'static str,
+    /// Failure: the server refused the tunnel; the reason is filled in
+    pub fwd_failure_server: &'static str,
+    /// Failure: the target did not accept a connection; the target is filled in
+    pub fwd_failure_target: &'static str,
     /// Duplicate
     pub fwd_more: &'static str,
     /// Name
@@ -2599,6 +2640,18 @@ included",
     fwd_empty_body: "A tunnel carries one port through an SSH host, so a service on one side can be used from the other.",
     fwd_no_hosts: "Save a host first: every tunnel runs through an SSH host.",
     fwd_cancel: "Cancel",
+    fwd_stop_title: "Stop this tunnel?",
+    fwd_stop_body: "{endpoint} stops listening now. The rule stays saved and can be started again; nothing on either machine is removed.",
+    fwd_delete_title: "Delete this tunnel?",
+    fwd_delete_body: "{rule} is removed from the saved rules. {running}",
+    fwd_delete_running: "It is listening now, so it is stopped first.",
+    fwd_delete_saved: "It is not listening.",
+    fwd_here: "This computer",
+    fwd_there: "Server",
+    fwd_failure_in_use: "Port {port} on {host} is already in use by another program. The tunnel was not started; pick another port, or stop what holds this one.",
+    fwd_failure_denied: "This account may not listen on {host}:{port}. The tunnel was not started.",
+    fwd_failure_server: "The server refused this tunnel: {detail}",
+    fwd_failure_target: "Nothing accepted a connection at {host}:{port}: {detail}",
     fwd_more: "Duplicate",
     files_name: "Name",
     files_size: "Size",
@@ -2774,6 +2827,18 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     fwd_empty_body: "端口转发经由一台 SSH 主机传递一个端口，让一侧的服务可以在另一侧使用。",
     fwd_no_hosts: "请先保存一台主机：每条端口转发都要经由 SSH 主机。",
     fwd_cancel: "取消",
+    fwd_stop_title: "停止这条隧道？",
+    fwd_stop_body: "{endpoint} 会立即停止监听。规则仍然保存，可以再次启动；两侧机器上都不会删除任何内容。",
+    fwd_delete_title: "删除这条隧道？",
+    fwd_delete_body: "{rule} 会从已保存的规则中移除。{running}",
+    fwd_delete_running: "它现在正在监听，会先被停止。",
+    fwd_delete_saved: "它当前没有监听。",
+    fwd_here: "本机",
+    fwd_there: "服务器",
+    fwd_failure_in_use: "端口 {port}（{host}）已被其它程序占用，这条隧道没有启动；请换一个端口，或先停止占用它的程序。",
+    fwd_failure_denied: "没有权限在 {host}:{port} 上监听，这条隧道没有启动。",
+    fwd_failure_server: "服务器拒绝了这条隧道：{detail}",
+    fwd_failure_target: "无法连接到 {host}:{port}：{detail}",
     fwd_more: "复制一份",
     files_name: "名称",
     files_size: "大小",

@@ -48,13 +48,13 @@ use crate::app::actions::{
 };
 use crate::app::components::Variant;
 use crate::app::copy::{self, Locale, Strings};
-#[cfg(test)]
+#[cfg(any(test, feature = "ui-capture"))]
 use crate::app::files::BrowseChannel;
 use crate::app::files::{
     FileSource, FileViews, FilesDialog, FilesStop, browse_failure_text, display_path, kind_label,
     local_protocol_to_os, path_crumbs, path_problem_text, problem_text, transfer_problem_text,
 };
-use crate::app::forwarding::ForwardCenter;
+use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
     HostDraft, HostField, HostView, HostsPanel, ImportPanel, format_unix, group_row_offsets,
     import_message, unimported_hosts,
@@ -302,6 +302,13 @@ pub const REMOTE_TERMINAL_HEIGHT: f32 = 340.0;
 /// when only one column fits.
 pub const FILES_PANEL_WIDTH: f32 = 340.0;
 
+/// The widest one breadcrumb of a long path is drawn.
+///
+/// A folder name is data, not a label: it can be longer than the column. Bounding one
+/// segment keeps the others on the same row and leaves the full path in the segment's
+/// tooltip, so a deep directory is readable instead of being cut off at the edge (R6).
+const CRUMB_ROOM: f32 = 240.0;
+
 /// How often the shell looks for answers from a file view.
 ///
 /// Short enough that a directory appears as soon as the server answers, long enough
@@ -473,6 +480,8 @@ pub struct ShelluneView {
     pending_forward_rules: Vec<ForwardId>,
     /// A non-loopback listen waiting for confirmation. Nothing is bound.
     pending_exposure: Option<ForwardId>,
+    /// A stop or a delete the user has been asked about and not answered yet.
+    forward_confirm: Option<(ForwardId, ForwardConfirm)>,
     /// Pure-forward connections, kept alive without a terminal pane.
     forward_carriers: HashMap<SessionId, AttemptLink>,
     /// Why the last upload or download could not start at all (R10).
@@ -1106,6 +1115,214 @@ impl ShelluneView {
         self.toggle_tab_list(window, cx);
     }
 
+    /// A file source a capture scripts: fixed listings, no disk and no server (R2).
+    ///
+    /// Every request is answered from the fixture, so a shot of a directory really is the
+    /// interface this build draws for that listing, and nothing outside the temporary
+    /// capture root is read.
+    #[cfg(feature = "ui-capture")]
+    fn capture_browse(
+        root: &'static str,
+        entries: &'static [(&'static str, shellune_core::FileKind, Option<u64>)],
+    ) -> Box<dyn BrowseChannel> {
+        struct Fixture {
+            root: &'static str,
+            entries: &'static [(&'static str, shellune_core::FileKind, Option<u64>)],
+            answers: Vec<shellune_core::BrowseResponse>,
+        }
+        impl BrowseChannel for Fixture {
+            fn send(&mut self, request: shellune_core::BrowseRequest) -> bool {
+                let request = match request {
+                    shellune_core::BrowseRequest::Home { request }
+                    | shellune_core::BrowseRequest::List { request, .. } => request,
+                    // A capture never changes a directory: there is nothing behind it.
+                    _ => return false,
+                };
+                let entries = self
+                    .entries
+                    .iter()
+                    .filter_map(|(name, kind, size)| {
+                        shellune_core::DirEntry::new(*name, *kind, *size)
+                    })
+                    .collect();
+                self.answers.push(shellune_core::BrowseResponse::Listed {
+                    request,
+                    path: self.root.to_owned(),
+                    entries,
+                });
+                true
+            }
+
+            fn drain(&mut self) -> Vec<shellune_core::BrowseResponse> {
+                std::mem::take(&mut self.answers)
+            }
+        }
+        Box::new(Fixture {
+            root,
+            entries,
+            answers: Vec::new(),
+        })
+    }
+
+    /// Opens the file view of a capture session on scripted listings (R2, R6).
+    ///
+    /// The lists are fixtures, and both sides ask a channel that answers from them, so
+    /// the shot proves the layout of a real dual view and an empty directory - and proves
+    /// nothing about a server or about this computer's own disk.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_files(&mut self, id: SessionId, empty: bool, cx: &mut Context<Self>) {
+        const FILES: &[(&str, shellune_core::FileKind, Option<u64>)] = &[
+            (
+                "构建 产物.tar.zst",
+                shellune_core::FileKind::File,
+                Some(18_874_368),
+            ),
+            ("2026-11 版本", shellune_core::FileKind::Directory, None),
+            (
+                "部署 记录.log",
+                shellune_core::FileKind::File,
+                Some(2_048_120),
+            ),
+            ("发布 说明.md", shellune_core::FileKind::File, Some(4_096)),
+        ];
+        const HOME: &[(&str, shellune_core::FileKind, Option<u64>)] = &[
+            ("下载", shellune_core::FileKind::Directory, None),
+            ("项目 发布", shellune_core::FileKind::Directory, None),
+            ("草稿.txt", shellune_core::FileKind::File, Some(1_024)),
+        ];
+        let (remote_root, remote_entries) = if empty {
+            ("/home/deploy/备份/2026-10", &[][..])
+        } else {
+            ("/home/deploy/项目 发布/2026-11 版本", FILES)
+        };
+        self.files.attach(
+            id,
+            "prod-web",
+            "deploy@10.0.0.12:22",
+            Self::capture_browse(remote_root, remote_entries),
+        );
+        self.files
+            .attach_local_for_test(id, Self::capture_browse("/C:/Users/me/项目 发布", HOME));
+        if self.files.open(id) {
+            self.files.pump();
+        }
+        cx.notify();
+    }
+
+    /// Puts one transfer in the session's strip, running or failed (R2, R6).
+    ///
+    /// The queue holds it exactly as a worker's own events would leave it: no socket is
+    /// opened and no file is written, so the row is this build's row for that state.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_transfer(&mut self, id: SessionId, running: bool, cx: &mut Context<Self>) {
+        if running {
+            self.transfers.seed_for_capture(
+                shellune_core::Transfer::queued(
+                    id,
+                    shellune_core::TransferDirection::Upload,
+                    "C:/Users/me/项目 发布/构建 产物.tar.zst",
+                    "/home/deploy/项目 发布/2026-11 版本/构建 产物.tar.zst",
+                ),
+                7_340_032,
+                Some(18_874_368),
+                None,
+            );
+        } else {
+            self.transfers.seed_for_capture(
+                shellune_core::Transfer::queued(
+                    id,
+                    shellune_core::TransferDirection::Download,
+                    "/home/deploy/项目 发布/2026-11 版本/部署 记录.log",
+                    "C:/Users/me/下载/部署 记录.log",
+                ),
+                212_992,
+                Some(2_048_120),
+                Some(shellune_core::TransferFailure::ConnectionLost),
+            );
+        }
+        cx.notify();
+    }
+
+    /// Opens the forwarding page of a capture host with its saved rules (R2, R6).
+    ///
+    /// One rule is marked as listening without binding anything, so the shot shows the
+    /// running state and its endpoint direction; the others are saved and not started.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_forwards(&mut self, host: &HostConfig, running: bool, cx: &mut Context<Self>) {
+        self.show_forwards_scope(crate::app::forwarding::ForwardScope::Host(host.id()), cx);
+        if !running {
+            return;
+        }
+        let local = shellune_core::ForwardRule::local(
+            host.id(),
+            shellune_core::Endpoint::loopback(8080).expect("a listen endpoint"),
+            shellune_core::Endpoint::new("db.internal", 5432).expect("a target"),
+        );
+        let remote = shellune_core::ForwardRule::remote(
+            host.id(),
+            shellune_core::Endpoint::loopback(9000).expect("a listen endpoint"),
+            shellune_core::Endpoint::new("127.0.0.1", 3000).expect("a target"),
+        );
+        let dynamic = shellune_core::ForwardRule::dynamic(
+            host.id(),
+            shellune_core::Endpoint::loopback(1080).expect("a listen endpoint"),
+        );
+        let listening = local.id();
+        let mut book = self.forwards.book().clone();
+        for rule in [local, remote, dynamic] {
+            let _ = book.insert(rule);
+        }
+        self.forwards.replace_book(book);
+        let session = SessionId::new();
+        self.forwards
+            .note_listening_for_test(listening, session, "127.0.0.1", 8080);
+        self.forwards.attach_observed_for_test(session);
+        self.sync_forward_section();
+        cx.notify();
+    }
+
+    /// What the file view of the session on screen is showing, for a capture (R2).
+    ///
+    /// The path and the number of entries are read from the same browser the render
+    /// reads, so a shot that has not arrived cannot be called arrived.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_files_listing(&self) -> Option<(bool, String, usize)> {
+        let id = self.active_session()?;
+        let browser = self.files_browser(id)?;
+        let path = browser.path()?.to_owned();
+        let entries = browser
+            .state()
+            .listing()
+            .map_or(0, |listing| listing.entries().len());
+        Some((self.files_visible(id), path, entries))
+    }
+
+    /// How many tasks this session's transfer strip holds, for a capture (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_transfer_count(&self) -> usize {
+        self.active_session()
+            .map_or(0, |id| self.transfers.for_session(id).count())
+    }
+
+    /// How many forwarding rows are saved, and how many of them are listening (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_forward_counts(&self) -> (usize, usize) {
+        let rows = self.forwards.rows();
+        let listening = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.phase,
+                    crate::app::forwarding::ForwardPhase::Listening { .. }
+                )
+            })
+            .count();
+        (rows.len(), listening)
+    }
+
     /// Builds the shell with every store, the trust file and the credential store
     /// chosen by the caller.
     ///
@@ -1258,6 +1475,7 @@ impl ShelluneView {
             forward_only_dial: false,
             pending_forward_rules: Vec::new(),
             pending_exposure: None,
+            forward_confirm: None,
             forward_carriers: HashMap::new(),
             transfer_problem: None,
             closing: None,
@@ -1904,7 +2122,7 @@ impl ShelluneView {
     }
 
     /// The session whose terminal is on screen.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     #[must_use]
     pub fn active_session(&self) -> Option<SessionId> {
         self.active
@@ -8557,18 +8775,52 @@ impl ShelluneView {
                     FileSource::Remote,
                 ))
         });
+        // A narrow window shows one source at a time, but never forgets the other one:
+        // beside the switch, the line names the folder the hidden side is showing. A
+        // window that gets narrower and wider again therefore keeps both paths and the
+        // side that was chosen, instead of starting over on the remote one (R6).
+        let other_side = (!wide).then(|| {
+            let hidden = match shown {
+                FileSource::Local => FileSource::Remote,
+                FileSource::Remote => FileSource::Local,
+            };
+            let label = self
+                .files
+                .browser_in(id, hidden)
+                .map(|browser| {
+                    let path = browser
+                        .path()
+                        .map(|path| display_path(hidden, path))
+                        .unwrap_or_else(|| strings.files_unknown_path.to_owned());
+                    format!("{} · {}: {path}", strings.files_other_side, browser.host())
+                })
+                .unwrap_or_else(|| strings.files_other_side.to_owned());
+            let full = label.clone();
+            div().flex().flex_1().justify_end().min_w(px(0.0)).child(
+                div()
+                    .id("files.other")
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "files.other".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(full)))
+                    .child(SharedString::from(label)),
+            )
+        });
         // The switch is only needed when the window is too narrow for both sides.
         let toolbar = switch.map(|switch| {
             div()
                 .flex()
                 .flex_none()
                 .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
                 .h(metrics.scale(40.0))
                 .px(metrics.scale(spacing::SNUG))
                 .bg(theme::swatch(palette::SURFACE))
                 .border_b_1()
                 .border_color(theme::swatch(palette::BORDER))
                 .child(switch)
+                .children(other_side)
         });
 
         // The transfer strip takes room only while there is something to show.
@@ -10297,7 +10549,12 @@ impl ShelluneView {
             .flex()
             .flex_none()
             .items_center()
+            // The path wraps rather than losing its end, which is what a reader of a deep
+            // directory needs; each segment is bounded and shrinking, so no single name
+            // can claim the whole column, and every segment carries its full path in a
+            // tooltip (R6, R8).
             .flex_wrap()
+            .overflow_hidden()
             .gap(metrics.scale(2.0))
             .px(metrics.scale(spacing::HAIRLINE + 2.0))
             .py(metrics.scale(3.0))
@@ -10309,7 +10566,6 @@ impl ShelluneView {
                 let path_id = path_id.clone();
                 move || path_id.to_string()
             });
-        let _ = &shown_path;
         let last = crumbs.len().saturating_sub(1);
         for (index, crumb) in crumbs.iter().enumerate() {
             let crumb_path = crumb.path.clone();
@@ -10327,10 +10583,23 @@ impl ShelluneView {
                     theme::swatch(palette::TEXT_MUTED),
                 ));
             }
+            // One segment of a long path is bounded, and carries the whole path it
+            // leads to in its tooltip: a deep folder at 200% text otherwise pushes the
+            // rest of the breadcrumbs out of the column (R6, R8). The row wraps, so
+            // every ancestor stays reachable and none of them is cut to nothing.
+            let crumb_tooltip = if index == last {
+                shown_path.clone()
+            } else {
+                crumb.path.clone()
+            };
             crumb_row = crumb_row.child(
                 div()
                     .id(crumb_id.clone())
                     .debug_selector(move || crumb_id.to_string())
+                    .flex()
+                    .flex_none()
+                    .min_w(px(0.0))
+                    .max_w(metrics.scale(CRUMB_ROOM))
                     .px(metrics.scale(spacing::HAIRLINE + 1.0))
                     .py(metrics.scale(1.0))
                     .rounded(px(radius::SMALL))
@@ -10343,10 +10612,19 @@ impl ShelluneView {
                     .when(index == last, |crumb| crumb.font_weight(FontWeight::MEDIUM))
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
+                    .tooltip(components::tooltip(SharedString::from(crumb_tooltip)))
                     .on_click(cx.listener(move |view, _event, _window, cx| {
                         view.files_go(id, source, &crumb_path, cx);
                     }))
-                    .child(SharedString::from(label)),
+                    // The name itself wraps inside its bounded box: a long folder is
+                    // read in full, not shortened to an ellipsis.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
+                            .child(SharedString::from(label)),
+                    ),
             );
         }
 
@@ -10410,15 +10688,42 @@ impl ShelluneView {
                     list = list.child(self.files_parent_row(id, source, cx));
                 }
                 if listing.is_empty() {
+                    // An empty directory is a state, not a missing list: it says what it
+                    // is and what to do next, the way every other empty section does
+                    // (R6, R8). The icon carries the meaning as well as the words do.
                     let empty_id = files_element_id(source, "empty");
+                    let empty_hint_id = files_element_id(source, "empty.hint");
                     list = list.child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_none()
+                            .gap(metrics.scale(spacing::HAIRLINE))
                             .p(metrics.scale(spacing::SNUG))
-                            .text_size(metrics.label_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
                             .debug_selector(move || empty_id.to_string())
-                            .child(SharedString::from(strings.files_empty)),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(metrics.scale(spacing::TIGHT))
+                                    .text_size(metrics.label_size())
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(icons::icon(
+                                        if remote { Icon::Server } else { Icon::Folder },
+                                        metrics.small_icon_size(),
+                                        theme::swatch(palette::TEXT_MUTED),
+                                    ))
+                                    .child(SharedString::from(strings.files_empty)),
+                            )
+                            .child(
+                                div()
+                                    .max_w(metrics.scale(CRUMB_ROOM * 2.0))
+                                    .whitespace_normal()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .debug_selector(move || empty_hint_id.to_string())
+                                    .child(SharedString::from(strings.files_empty_hint)),
+                            ),
                     );
                 }
                 for (index, entry) in listing.entries().iter().enumerate() {
@@ -10677,6 +10982,39 @@ impl ShelluneView {
             )
     }
 
+    /// The bar under a running transfer: the share of the whole it has written.
+    ///
+    /// It is drawn only when the worker reported a total, because a bar needs a whole to
+    /// be a share of. Its track and fill are the loading tokens, so the same progress
+    /// reads the same way in both themes (R3, R8).
+    fn transfer_progress_bar(&self, index: usize, task: &Transfer) -> Option<Div> {
+        let shellune_core::TransferState::Running { total: Some(_), .. } = task.state() else {
+            return None;
+        };
+        let metrics = self.metrics();
+        let permille = task.state().permille().unwrap_or(0).min(1000) as f32;
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .w_full()
+                .min_w(px(0.0))
+                .h(metrics.scale(4.0))
+                .rounded_full()
+                .overflow_hidden()
+                .bg(theme::swatch(palette::LOADING_TRACK))
+                .debug_selector(move || format!("transfers.progress.{index}"))
+                .child(
+                    div()
+                        .flex_none()
+                        .h_full()
+                        .w(gpui::relative(permille / 1000.0))
+                        .bg(theme::swatch(palette::LOADING_FILL)),
+                ),
+        )
+    }
+
     /// One transfer's detail line: what it is doing, why it stopped and what it left.
     ///
     /// The session's own list and the transfers page draw the same line. They have to:
@@ -10694,10 +11032,35 @@ impl ShelluneView {
                 // The share is printed only when the whole is known: a percentage
                 // beside no total would be a guess about how much is left.
                 let percent = task.state().permille().map_or(0, |permille| permille / 10);
-                format!("{state_label} · {percent}% · {transferred}/{total} B")
+                let mut line = format!("{state_label} · {percent}% · {transferred}/{total} B");
+                // Speed and the time still needed are measurements, so they are printed
+                // only once the window has two real progress reports to divide: nothing
+                // is extrapolated from the size of a file or from a single sample.
+                if let Some(rate) = self.transfers.rate(task.id()) {
+                    line.push_str(&format!(" · {}/s", bytes_text(rate.round() as u64)));
+                }
+                if let Some(left) = self.transfers.remaining(task.id()) {
+                    line.push_str(&format!(
+                        " · {}",
+                        copy::fill(strings.transfers_remaining, &[("time", &clock_text(left))])
+                    ));
+                }
+                line
             }
             shellune_core::TransferState::Running { transferred, .. } => {
-                format!("{state_label} · {transferred} B")
+                // A tree whose size the worker cannot know has no percentage and no
+                // estimate - only the bytes it has really written, and the speed they
+                // were written at.
+                let mut line = format!("{state_label} · {transferred} B");
+                if let Some(rate) = self.transfers.rate(task.id()) {
+                    line.push_str(&format!(" · {}/s", bytes_text(rate.round() as u64)));
+                }
+                line
+            }
+            shellune_core::TransferState::Queued => {
+                // A task the connection has taken but not started is queued, and saying
+                // so is what keeps a waiting task from reading as a running one (R6).
+                format!("{state_label} · {}", strings.transfers_queued_note)
             }
             shellune_core::TransferState::Failed { failure, .. } => {
                 format!("{state_label} · {}", self.transfer_failure_text(failure))
@@ -10877,6 +11240,7 @@ impl ShelluneView {
                     .debug_selector(move || format!("transfers.state.{index}"))
                     .child(SharedString::from(detail)),
             )
+            .children(self.transfer_progress_bar(index, task))
             .child(actions)
             .child(
                 div()
@@ -11841,7 +12205,7 @@ impl ShelluneView {
     }
 
     /// The file view of one session, as the window holds it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn files_browser(&self, id: SessionId) -> Option<&shellune_core::FileBrowser> {
         self.files.browser(id)
     }
@@ -11927,7 +12291,7 @@ impl ShelluneView {
     }
 
     /// Whether the file view of a session is open.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn files_visible(&self, id: SessionId) -> bool {
         self.files.is_open(id)
     }
@@ -13252,6 +13616,39 @@ fn quick_method_selector(choice: MethodChoice) -> &'static str {
 ///
 /// The full path is still in the line's tooltip; this only keeps the visible line short
 /// enough to be read at a glance instead of being cut off.
+/// Bytes the way a transfer list counts them: whole bytes under a kilobyte, then one
+/// decimal of the next unit.
+///
+/// One spelling for both the amount moved and the speed, so "1.2 MB / 8.0 MB" and
+/// "1.2 MB/s" are read the same way (R6).
+fn bytes_text(bytes: u64) -> String {
+    const STEP: f64 = 1024.0;
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let value = bytes as f64;
+    let (scaled, unit) = if value < STEP * STEP {
+        (value / STEP, "KB")
+    } else if value < STEP * STEP * STEP {
+        (value / (STEP * STEP), "MB")
+    } else {
+        (value / (STEP * STEP * STEP), "GB")
+    };
+    format!("{scaled:.1} {unit}")
+}
+
+/// A duration as a clock, so a remaining time needs no words to be understood:
+/// 0:08, 3:20 or 1:04:09.
+fn clock_text(left: std::time::Duration) -> String {
+    let seconds = left.as_secs();
+    let (hours, minutes, seconds) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 fn home_relative(path: &str) -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))

@@ -12,7 +12,9 @@ use shellune_storage::ForwardStore;
 use super::ShelluneView;
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, Strings};
-use crate::app::forwarding::{ForwardEditor, ForwardPhase, ForwardScope, ForwardStart};
+use crate::app::forwarding::{
+    ForwardConfirm, ForwardEditor, ForwardPhase, ForwardScope, ForwardStart,
+};
 use crate::app::icons::{self, Icon};
 use crate::app::theme::{self, Tone, palette, radius, spacing};
 
@@ -381,6 +383,9 @@ impl ShelluneView {
         if let Some(id) = self.pending_exposure {
             list = list.child(self.exposure_question(id, cx));
         }
+        if let Some((id, question)) = self.forward_confirm {
+            list = list.child(self.forward_question(id, question, cx));
+        }
         if let Some(editor) = self.forwards.editor().cloned() {
             return list.child(self.forward_form(&editor, cx));
         }
@@ -484,9 +489,20 @@ impl ShelluneView {
                 }
                 _ => None,
             });
+            // Which side each endpoint is on is part of what a tunnel is: a local
+            // forward listens here and reaches through the server, a remote one is the
+            // other way round. Naming the sides makes the same "8080 -> 5432" text mean
+            // the right thing in both rows (R6).
             let mapping = match row.rule.kind() {
-                ForwardKind::Dynamic => format!("SOCKS {listen}"),
-                _ => format!("{listen}  \u{2192}  {target}"),
+                ForwardKind::Local => format!(
+                    "{} {listen}  \u{2192}  {} {target}",
+                    ux.fwd_here, ux.fwd_there
+                ),
+                ForwardKind::Remote => format!(
+                    "{} {listen}  \u{2192}  {} {target}",
+                    ux.fwd_there, ux.fwd_here
+                ),
+                ForwardKind::Dynamic => format!("{} {listen} · SOCKS", ux.fwd_here),
             };
             list = list.child(
                 components_row(self, index, cx)
@@ -589,7 +605,7 @@ impl ShelluneView {
                                     cx,
                                     move |view, cx| {
                                         if active {
-                                            view.stop_forward(id, cx);
+                                            view.ask_forward(id, ForwardConfirm::Stop, cx);
                                         } else {
                                             view.start_forward(id, cx);
                                         }
@@ -619,7 +635,7 @@ impl ShelluneView {
                                 strings.forward_delete,
                                 true,
                                 cx,
-                                move |view, cx| view.delete_forward(id, cx),
+                                move |view, cx| view.ask_forward(id, ForwardConfirm::Delete, cx),
                             )),
                     ),
             );
@@ -693,6 +709,12 @@ impl ShelluneView {
             .update(cx, |field, cx| field.set_text(port, cx));
     }
 
+    /// The stop or delete the user is being asked about, for a test.
+    #[cfg(test)]
+    pub fn forward_confirm_for_test(&self) -> Option<(ForwardId, ForwardConfirm)> {
+        self.forward_confirm
+    }
+
     /// The kind the open tunnel form has chosen, for a test.
     #[cfg(test)]
     pub fn forward_editor_kind_for_test(&self) -> Option<ForwardKind> {
@@ -705,6 +727,141 @@ impl ShelluneView {
         self.save_forward(cx);
     }
 
+    /// Asks before a stop or a delete, without doing anything yet (R6).
+    ///
+    /// One click on a row used to close a listener or remove a rule. Both end something
+    /// the user can see, so both are asked about, and the question names the tunnel, the
+    /// side its port is on and what the answer will do.
+    pub(super) fn ask_forward(
+        &mut self,
+        id: ForwardId,
+        question: ForwardConfirm,
+        cx: &mut Context<Self>,
+    ) {
+        self.forward_confirm = Some((id, question));
+        cx.notify();
+    }
+
+    /// Puts the question away without stopping or deleting anything.
+    pub(super) fn cancel_forward_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.forward_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Carries out the action the question asked about.
+    pub(super) fn confirm_forward(&mut self, cx: &mut Context<Self>) {
+        let Some((id, question)) = self.forward_confirm.take() else {
+            return;
+        };
+        match question {
+            ForwardConfirm::Stop => self.stop_forward(id, cx),
+            ForwardConfirm::Delete => self.delete_forward(id, cx),
+        }
+        cx.notify();
+    }
+
+    /// The question before a stop or a delete: what it is, and what the answer does.
+    fn forward_question(
+        &self,
+        id: ForwardId,
+        question: ForwardConfirm,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let Some(rule) = self.forwards.book().rule(id) else {
+            // The rule was removed while the question was on screen; the answer has
+            // nothing left to name.
+            return div();
+        };
+        let listen = self
+            .forwards
+            .rows()
+            .into_iter()
+            .find(|row| row.rule.id() == id)
+            .map(|row| {
+                let active = row.phase.is_active();
+                (displayed_listen(&row.rule, &row.phase), active)
+            })
+            .unwrap_or_else(|| (rule.listen().to_string(), false));
+        let host_name = self
+            .book
+            .host(rule.host())
+            .map_or_else(|| "?".to_owned(), |host| host.name().to_owned());
+        let endpoint = match rule.kind() {
+            ForwardKind::Local => format!("{} {}", ux.fwd_here, listen.0),
+            ForwardKind::Remote => format!("{} {}", ux.fwd_there, listen.0),
+            ForwardKind::Dynamic => format!("{} {} (SOCKS)", ux.fwd_here, listen.0),
+        };
+        let (title, body, confirm_label, danger) = match question {
+            ForwardConfirm::Stop => (
+                ux.fwd_stop_title,
+                copy::fill(ux.fwd_stop_body, &[("endpoint", &endpoint)]),
+                ux.fwd_stop_title,
+                false,
+            ),
+            ForwardConfirm::Delete => {
+                let rule_text = format!(
+                    "{} · {} · {endpoint}",
+                    kind_label(rule.kind(), strings),
+                    host_name
+                );
+                let running = if listen.1 {
+                    ux.fwd_delete_running
+                } else {
+                    ux.fwd_delete_saved
+                };
+                (
+                    ux.fwd_delete_title,
+                    copy::fill(
+                        ux.fwd_delete_body,
+                        &[("rule", &rule_text), ("running", running)],
+                    ),
+                    ux.fwd_delete_title,
+                    true,
+                )
+            }
+        };
+        components::banner(Tone::Warning, metrics)
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "forwards.confirm".to_owned())
+            .child(SharedString::from(title))
+            .child(
+                div()
+                    .whitespace_normal()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "forwards.confirm.body".to_owned())
+                    .child(SharedString::from(body)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .child(self.text_button(
+                        SharedString::from("forwards.confirm.no"),
+                        strings.files_cancel,
+                        Variant::Secondary,
+                        cx,
+                        |view, cx| view.cancel_forward_confirm(cx),
+                    ))
+                    .child(self.text_button(
+                        SharedString::from("forwards.confirm.yes"),
+                        confirm_label,
+                        if danger {
+                            Variant::Danger
+                        } else {
+                            Variant::Secondary
+                        },
+                        cx,
+                        |view, cx| view.confirm_forward(cx),
+                    )),
+            )
+    }
     fn exposure_question(&self, id: ForwardId, cx: &mut Context<Self>) -> gpui::Div {
         let metrics = self.metrics();
         let strings = self.strings();
@@ -1035,9 +1192,36 @@ fn phase_text(
     (label, tone, detail)
 }
 
+/// Why a tunnel is not listening, in the interface language.
+///
+/// The transport words its own failures in English and has no idea which language the
+/// window is drawn in. The reasons a user meets most - a port another program holds, a
+/// port this account may not bind, a server that refused, a target that is not there -
+/// are said here, with the endpoint filled in. A reason this table does not know is
+/// printed as it came, so a new failure is never hidden (R6).
 fn failure_text(failure: &ForwardFailure, strings: &Strings) -> String {
+    let ux = copy::ux();
     match failure {
         ForwardFailure::CarrierLost => strings.forward_carrier_lost.to_owned(),
+        ForwardFailure::PortInUse { host, port } => copy::fill(
+            ux.fwd_failure_in_use,
+            &[("host", host), ("port", &port.to_string())],
+        ),
+        ForwardFailure::PermissionDenied { host, port } => copy::fill(
+            ux.fwd_failure_denied,
+            &[("host", host), ("port", &port.to_string())],
+        ),
+        ForwardFailure::ServerRefused { detail } => {
+            copy::fill(ux.fwd_failure_server, &[("detail", detail)])
+        }
+        ForwardFailure::TargetUnreachable { host, port, detail } => copy::fill(
+            ux.fwd_failure_target,
+            &[
+                ("host", host),
+                ("port", &port.to_string()),
+                ("detail", detail),
+            ],
+        ),
         other => other.to_string(),
     }
 }

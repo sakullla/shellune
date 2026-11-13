@@ -162,11 +162,11 @@ impl FileViews {
         );
     }
 
-    /// Replaces the local channel, for a test that scripts this computer.
+    /// Replaces the local channel, for a test or a capture that scripts this computer.
     ///
     /// The remote channel is left as it was: a script for one source must not become
     /// the other source's answers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn attach_local_for_test(&mut self, session: SessionId, channel: Box<dyn BrowseChannel>) {
         if let Some(files) = self.sessions.get_mut(&session) {
             files.local = channel;
