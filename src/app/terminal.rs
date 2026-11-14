@@ -1628,6 +1628,25 @@ impl TerminalPane {
     }
 
     /// Adds text to the query, the way typing or pasting into the bar does.
+    /// Opens the find bar with a query, for a capture (R2).
+    ///
+    /// The bar is the one the keyboard opens; only its query is supplied, so the shot
+    /// shows the real bar over the real grid and nothing is searched on a server.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_search(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_open {
+            self.open_search(window, cx);
+        }
+        self.append_search_query(text, cx);
+    }
+
+    /// Whether the find bar is open with a query, for a capture (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_search_open(&self) -> bool {
+        self.search_open && !self.search_query.is_empty()
+    }
+
     fn append_search_query(&mut self, text: &str, cx: &mut Context<Self>) {
         if text.is_empty() {
             return;

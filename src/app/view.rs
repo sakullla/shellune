@@ -1202,6 +1202,68 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Opens the find bar with a query, for a capture (R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_open_search(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_pane() {
+            pane.update(cx, |pane, cx| pane.capture_search(text, window, cx));
+        }
+    }
+
+    /// Whether the terminal on screen has its find bar open with a query (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_search_open(&self, cx: &gpui::App) -> bool {
+        self.active_pane()
+            .is_some_and(|pane| pane.read(cx).capture_search_open())
+    }
+
+    /// Opens the connection dialog on its failure stage, for a capture (R2, R7).
+    ///
+    /// The failure is the one a refused sign-in reports; no transport, DNS lookup or
+    /// authentication is part of it.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_fail_connection(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.capture_connection(host, cx);
+        if let Some(panel) = self.remote.as_mut() {
+            panel.fail(RemoteFailure::new(
+                "authentication failed",
+                "check the user name and the key",
+                true,
+            ));
+        }
+        cx.notify();
+    }
+
+    /// Whether the connection dialog is showing a failure (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_connection_failed(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|panel| panel.status().failure().is_some())
+    }
+
+    /// Asks the deletion question for the first saved host, for a capture (R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_ask_delete_first(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.book.hosts().first().map(HostConfig::id) {
+            self.ask_delete_host(id, cx);
+        }
+    }
+
+    /// Whether the host deletion question is on screen (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_delete_question(&self) -> bool {
+        self.hosts.pending_delete().is_some()
+    }
+
     /// What the connection page is refusing, for the tests (R20).
     #[cfg(test)]
     #[must_use]

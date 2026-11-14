@@ -10,7 +10,7 @@
 
 | 命令 | 轮次目录 | 内容 |
 | --- | --- | --- |
-| `python scripts/capture-ui.py` | `docs/verification/ui/`（根） | 完整矩阵：42 张，两种主题、两种尺寸、100%/115% 文字、中英 |
+| `python scripts/capture-ui.py` | `docs/verification/ui/`（根） | 完整矩阵：当前 125 张，两种主题、两种尺寸、100%/115% 文字、中英 |
 | `python scripts/capture-ui.py --quick` | `docs/verification/ui/quick/` | 三个主页面的深色默认尺寸 |
 | `python scripts/capture-ui.py --only "home-hosts"` | `docs/verification/ui/only-home-hosts/` | 匹配场景的全部变体 |
 | `--theme` / `--size` | `theme-light/`、`size-720x480/` 等 | 该筛选下的全部变体 |
@@ -49,9 +49,21 @@
 - 这些图证明的是布局、配色与文案的渲染结果；它们不证明粘贴真的被拒绝执行、连接真的会取消——
   那由 `src/app/tests.rs` 的行为测试覆盖。
 
+## 本轮（2026-11-14，交付）的变化
+
+- 根目录的完整轮次为 125 张，status: ok、无失败；新增四类此前缺失的场景族：
+  terminal-search（终端搜索打开）、connect-failed（认证失败与原因）、
+  confirm-delete-host（危险确认对话框）、notification（toast 通知），
+  每类都覆盖深/浅色，搜索与确认另有中文或 115% 文字变体。
+- quick/ 为 16 张，only-home-hosts/ 为 5 张；各轮次只替换自己的目录。
+
 ## 证据边界
 
 - 只有 Windows 的 DirectX 后缓冲读回被实测；macOS 与 Linux 的隐藏窗口捕获仍未验证。
 - 文字用这台机器上安装的字体渲染，跨机器的像素比较没有意义。
 - 会话是只读 fixture，没有启动任何 shell、连接或用户命令；截图不证明这些页面可以工作。
-- 基线尚未逐张人眼评审。
+- 本轮没有逐张人眼视觉评审：验收依据是 manifest（尺寸、DPI、主题、语言、像素统计）
+  与场景就绪断言，而不是人工看图。
+- 没有做“真实可见窗口”的交互走查（焦点归还、终端按键、窗口控制、一条主任务路径）：
+  这些行为由 src/app/tests.rs 的窗口测试覆盖，但测试替身窗口不能代替真机走查。
+- 真实 SSH/SFTP、真实网络断线与 macOS 真机同样未验证；连接与传输页面都是状态夹具。

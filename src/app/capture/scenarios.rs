@@ -533,6 +533,88 @@ fn show_connection(
     Ok(())
 }
 
+/// The local terminal with its find bar open on a query (R5).
+fn show_terminal_search(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_terminal(view, window, cx)?;
+    view.capture_open_search("deploy", window, cx);
+    Ok(())
+}
+
+fn terminal_search_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    if !view.capture_search_open(cx) {
+        return Err("the find bar is not open with a query".to_owned());
+    }
+    Ok(())
+}
+
+/// The connection dialog after a refused sign-in (R7).
+fn show_connection_failed(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.capture_fail_connection(&host, cx);
+    Ok(())
+}
+
+fn connection_failed_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_overlay() != Some("connect") {
+        return Err("the connection dialog is not on screen".to_owned());
+    }
+    if !view.capture_connection_failed() {
+        return Err("the dialog is not showing a failure".to_owned());
+    }
+    Ok(())
+}
+
+/// The deletion question before a host is removed (R2, R7).
+fn show_delete_question(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_ask_delete_first(cx);
+    Ok(())
+}
+
+fn delete_question_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if !view.capture_delete_question() {
+        return Err("the deletion question is not open".to_owned());
+    }
+    Ok(())
+}
+
+/// A notification over the terminal, as an action would raise it (R2).
+fn show_notification(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_terminal(view, window, cx)?;
+    view.capture_toast(
+        theme::Tone::Positive,
+        "Host saved",
+        Some("web · 10.0.0.5"),
+        cx,
+    );
+    Ok(())
+}
+
+fn notification_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_toast_count() == 0 {
+        return Err("no notification is on screen".to_owned());
+    }
+    Ok(())
+}
+
 /// Opens the settings page on one of its items, the way the navigation does (R16).
 fn show_settings_item(
     view: &mut ShelluneView,
@@ -1438,6 +1520,73 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: show_terminal,
         ready: terminal_ready,
+    },
+    Scenario {
+        id: "terminal-search",
+        title: "终端 · 搜索打开",
+        category: Category::Terminal,
+        fixture: "one display-only session fed a fixed transcript, with the find bar open on a query",
+        evidence: "shows the find bar, its query and the match count over the real grid; nothing was \
+                   searched on a server",
+        quick: false,
+        variants: &[
+            Variant::dark().comfortable(),
+            Variant::light().comfortable(),
+            Variant::dark().chinese(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_terminal_search,
+        ready: terminal_search_ready,
+    },
+    Scenario {
+        id: "connect-failed",
+        title: "连接 · 认证失败",
+        category: Category::Overlay,
+        fixture: "a saved host whose connection dialog reports a refused sign-in; nothing was dialled",
+        evidence: "shows the failure, its reason and the way back; no transport, DNS lookup or \
+                   authentication is part of it",
+        quick: false,
+        variants: &[Variant::dark().comfortable(), Variant::light().comfortable()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_connection_failed,
+        ready: connection_failed_ready,
+    },
+    Scenario {
+        id: "confirm-delete-host",
+        title: "确认 · 删除主机",
+        category: Category::Home,
+        fixture: "six saved hosts and the question shown before one of them is removed",
+        evidence: "shows the destructive question, the host it names and the way out; nothing was \
+                   deleted and no connection was made",
+        quick: false,
+        variants: &[
+            Variant::dark().comfortable(),
+            Variant::light().comfortable(),
+            Variant::dark().chinese(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_delete_question,
+        ready: delete_question_ready,
+    },
+    Scenario {
+        id: "notification",
+        title: "通知 · 保存成功",
+        category: Category::Overlay,
+        fixture: "the local terminal with one saved notification over it",
+        evidence: "shows the notification stack and its wording; nothing was saved by the shot",
+        quick: false,
+        variants: &[
+            Variant::dark().comfortable(),
+            Variant::light().comfortable(),
+            Variant::dark().smallest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_notification,
+        ready: notification_ready,
     },
     Scenario {
         id: "terminal-tabs",
