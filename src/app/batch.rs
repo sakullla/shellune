@@ -306,6 +306,21 @@ impl BatchRunPage {
         self.times.get(&(host, step)).copied().unwrap_or_default()
     }
 
+    /// Rewrites the step times to fixed offsets from the run's start, for a capture.
+    ///
+    /// The timeline is drawn from the runner's real clock, which makes the last digit of
+    /// an offset differ between two runs of the same revision. A shot has to be
+    /// comparable with the next one, so the fixture states the offsets instead (R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn normalize_times_for_capture(&mut self) {
+        let start = self.run.started_at_unix();
+        for ((_, step), time) in self.times.iter_mut() {
+            let offset = u64::from(*step);
+            time.started = time.started.map(|_| start + offset);
+            time.finished = time.finished.map(|_| start + offset + 1);
+        }
+    }
+
     /// The question one host is waiting on, when it is waiting.
     #[must_use]
     pub fn question(&self, host: HostId) -> Option<&BatchQuestion> {
@@ -476,6 +491,14 @@ impl BatchPanel {
 
     /// Which surface is on screen.
     #[must_use]
+    /// Rewrites the run's step times to fixed offsets, for a capture (R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn normalize_times_for_capture(&mut self) {
+        if let Some(run) = self.run.as_mut() {
+            run.normalize_times_for_capture();
+        }
+    }
+
     pub fn page(&self) -> BatchPage {
         self.page
     }

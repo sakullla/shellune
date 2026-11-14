@@ -802,8 +802,10 @@ fn start(
         .ok_or_else(|| "the run has no shots".to_owned())?;
     let (min_width, min_height) = super::MIN_WINDOW_SIZE;
     let window_options = WindowOptions {
+        // Created far outside the desktop: a window at (0, 0) can sit under the pointer,
+        // and the hover that implies differs from one run to the next (R2).
         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-            point(px(0.0), px(0.0)),
+            point(px(-30_000.0), px(-30_000.0)),
             size(px(first.variant.width), px(first.variant.height)),
         ))),
         window_min_size: Some(size(px(min_width), px(min_height))),

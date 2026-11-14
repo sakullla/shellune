@@ -1624,11 +1624,16 @@ impl ShelluneView {
     ) -> bool {
         for _ in 0..600 {
             if done(self) {
+                self.batch.normalize_times_for_capture();
                 return true;
             }
             self.poll_batch(cx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        done(self)
+        let arrived = done(self);
+        if arrived {
+            self.batch.normalize_times_for_capture();
+        }
+        arrived
     }
 }
