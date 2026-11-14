@@ -1,0 +1,149 @@
+.SH "EXAMPLES"
+.PP
+\fB@MANPAGE_NAME@ connection\&.rdp /p:Pwd123! /f\fR
+.RS 4
+Connect in fullscreen mode using a stored configuration
+\fIconnection\&.rdp\fR
+and the password
+\fIPwd123!\fR
+.RE
+.PP
+\fB@MANPAGE_NAME@ /u:USER /size:50%h /v:rdp\&.contoso\&.com\fR
+.RS 4
+Connect to host
+\fIrdp\&.contoso\&.com\fR
+with user
+\fIUSER\fR
+and a size of
+\fI50 percent of the height\fR\&. If width (w) is set instead of height (h) like /size:50%w\&. 50 percent of the width is used\&.
+.RE
+.PP
+\fB@MANPAGE_NAME@ /u:CONTOSO\e\eJohnDoe /p:Pwd123! /v:rdp\&.contoso\&.com\fR
+.RS 4
+Connect to host
+\fIrdp\&.contoso\&.com\fR
+with user
+\fICONTOSO\e\eJohnDoe\fR
+and password
+\fIPwd123!\fR
+.RE
+.PP
+\fB@MANPAGE_NAME@ /u:JohnDoe /p:Pwd123! /w:1366 /h:768 /v:192\&.168\&.1\&.100:4489\fR
+.RS 4
+Connect to host
+\fI192\&.168\&.1\&.100\fR
+on port
+\fI4489\fR
+with user
+\fIJohnDoe\fR, password
+\fIPwd123!\fR\&. The screen width is set to
+\fI1366\fR
+and the height to
+\fI768\fR
+.RE
+.PP
+\fB@MANPAGE_NAME@ /u:JohnDoe /p:Pwd123! /vmconnect:C824F53E\-95D2\-46C6\-9A18\-23A5BB403532 /v:192\&.168\&.1\&.100\fR
+.RS 4
+Establish a connection to host
+\fI192\&.168\&.1\&.100\fR
+with user
+\fIJohnDoe\fR, password
+\fIPwd123!\fR
+and connect to Hyper\-V console (use port 2179, disable negotiation) with VMID
+\fIC824F53E\-95D2\-46C6\-9A18\-23A5BB403532\fR
+.RE
+.PP
+\fB+clipboard\fR
+.RS 4
+Activate clipboard redirection
+.RE
+.PP
+\fB/drive:home,/home/user\fR
+.RS 4
+Activate drive redirection of
+\fI/home/user\fR
+as home drive
+.RE
+.PP
+\fB/smartcard:<device>\fR
+.RS 4
+Activate smartcard redirection for device
+\fIdevice\fR
+.RE
+.PP
+\fB/printer:<device>,<driver>\fR
+.RS 4
+Activate printer redirection for printer
+\fIdevice\fR
+using driver
+\fIdriver\fR
+.RE
+.PP
+\fB/serial:<device>\fR
+.RS 4
+Activate serial port redirection for port
+\fIdevice\fR
+.RE
+.PP
+\fB/parallel:<device>\fR
+.RS 4
+Activate parallel port redirection for port
+\fIdevice\fR
+.RE
+.PP
+\fB/sound:sys:alsa\fR
+.RS 4
+Activate audio output redirection using device
+\fIsys:alsa\fR
+.RE
+.PP
+\fB/microphone:sys:alsa\fR
+.RS 4
+Activate audio input redirection using device
+\fIsys:alsa\fR
+.RE
+.PP
+\fB/dvc:rdpecam,sys:v4l\fR
+.RS 4
+Activate camera redirection using the
+\fIsys:v4l\fR
+backend (the platform default when
+\fIsys\fR
+is omitted)
+.RE
+.PP
+\fB/dvc:rdpecam,sys:movie,file:/path/to/movie.ogv,name:Webcam\fR
+.RS 4
+Announce a camera named
+\fIWebcam\fR
+that plays the given movie file in a loop instead of capturing a real camera\&. The only mode announced is the size (cropped to even dimensions) and frame rate of the movie\&.
+\fIname\fR
+is optional and defaults to
+\fIMovie: <file name>\fR\&. Requires a build with FFmpeg\&.
+.RE
+.PP
+\fB/dvc:rdpecam,sys:gst,pipeline-file:/path/to/pipeline.txt,name:Webcam\fR
+.RS 4
+Announce a camera named
+\fIWebcam\fR
+whose frames come from the GStreamer pipeline (gst\-launch syntax) stored in the given file, for instance
+\fIpipewiresrc target\-object=<serial> ! video/x\-raw,width=640,height=480\fR\&. The pipeline can also be given inline with
+\fIpipeline:<pipeline>\fR\&; as it usually contains commas, the whole option must then be quoted, e\&.g\&.
+\fI\*(Aq"pipeline:videotestsrc ! video/x\-raw,width=640"\*(Aq\fR\&.
+\fIfile:<path>\fR
+plays a media file instead\&. The only mode announced is the size (cropped to even dimensions) and frame rate the pipeline negotiates\&. A pipeline that ends is played again unless
+\fIloop:off\fR
+is given\&. Requires a build with GStreamer\&.
+.RE
+.PP
+\fB/multimedia:sys:alsa\fR
+.RS 4
+Activate multimedia redirection using device
+\fIsys:alsa\fR
+.RE
+.PP
+\fB/usb:id,dev:054c:0268\fR
+.RS 4
+Activate USB device redirection for the device identified by
+\fI054c:0268\fR
+.RE
