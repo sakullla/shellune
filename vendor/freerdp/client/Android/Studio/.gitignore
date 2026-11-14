@@ -1,5 +1,0 @@
-freeRDPCore/src/main/jniLibs/
-freeRDPCore/src/main/cpp/external/
-.gradle/
-.idea/
-freeRDPCore/.cxx/
