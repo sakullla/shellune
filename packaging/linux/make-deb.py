@@ -3,7 +3,7 @@
 
 Usage:
     python3 packaging/linux/make-deb.py --binary <path to shellune> \
-        [--version 0.4.0] [--arch amd64] [--out dist]
+        [--version 0.4.1] [--arch amd64] [--out dist]
 
 Result: dist/shellune_<version>_<arch>.deb, which installs /usr/bin/shellune,
 the desktop entry and the hicolor icon. dpkg-shlibdeps computes Depends from the
@@ -64,7 +64,7 @@ def shlib_depends(binary):
 def main():
     parser = argparse.ArgumentParser(description="package Shellune as a deb")
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--version", default="0.4.0")
+    parser.add_argument("--version", default="0.4.1")
     parser.add_argument("--arch", default="amd64")
     parser.add_argument("--maintainer", default=DEFAULT_MAINTAINER)
     parser.add_argument("--out", default=os.path.join(REPO, "dist"))
