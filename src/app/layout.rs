@@ -1672,6 +1672,43 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_pane_whose_connection_is_saved_is_not_marked_missing() {
+        let office = HostId::new();
+        let root = PaneNode::leaf(PaneTarget::rdp(office), TerminalMode::Integrated);
+        let tab = WorkspaceTab::new("Desktops", root).expect("title");
+        let snapshot = WorkspaceSnapshot::new(vec![tab], PanelConfig::default()).expect("snapshot");
+
+        // The connection is a saved record, so restoring a pane that names it is not a
+        // problem: the pane waits for the user and carries no mark.
+        let restored = snapshot.restore(|id| id == office);
+        let mut layout = SessionLayout::new();
+        layout.install_restored(restored);
+        let leaves = layout.leaves();
+        assert_eq!(leaves.len(), 1, "the pane is in the tree");
+        assert!(leaves[0].is_pending(), "nothing is started by a restore");
+        assert!(
+            leaves[0].mark().is_none(),
+            "a saved connection is not a missing host"
+        );
+        assert_eq!(leaves[0].target().host(), Some(office));
+
+        // Deleting the record marks the pane and keeps it: the rest of the workspace is
+        // still usable, and the pane stays where the user put it.
+        layout.recheck_hosts(|_| false);
+        let leaves = layout.leaves();
+        assert_eq!(leaves.len(), 1, "the pane is kept");
+        assert!(matches!(
+            leaves[0].mark(),
+            Some(LeafMark::MissingHost { host }) if *host == office
+        ));
+
+        // Bringing the record back clears the mark without starting anything.
+        layout.recheck_hosts(|id| id == office);
+        let leaves = layout.leaves();
+        assert!(leaves[0].mark().is_none());
+        assert!(leaves[0].is_pending());
+    }
+    #[test]
     fn restore_is_pending_and_a_missing_host_marks_only_that_leaf() {
         let host = HostId::new();
         let gone = HostId::new();

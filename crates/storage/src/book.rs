@@ -579,7 +579,9 @@ impl HostBook {
     /// The hosts in one group and in every group inside it.
     ///
     /// Deleting or renaming a group moves exactly these hosts: the ones above it are
-    /// another place, and the ones beside it are no business of the change.
+    /// another place, and the ones beside it are no business of the change. A
+    /// connection of another protocol is in a group the same way, so
+    /// [`Self::connections_under_group`] answers the same question for those records.
     #[must_use]
     pub fn hosts_under_group(&self, path: &GroupPath) -> Vec<HostId> {
         self.hosts
@@ -589,6 +591,24 @@ impl HostBook {
                     .is_some_and(|current| current.starts_with(path))
             })
             .map(HostConfig::id)
+            .collect()
+    }
+
+    /// The connections of another protocol in one group and in every group inside it.
+    ///
+    /// Listed apart from [`Self::hosts_under_group`] because the two are stored in
+    /// different lists, but they are moved by the same group change: a group that is
+    /// renamed or deleted has to carry both, or a connection keeps a path no tree holds.
+    #[must_use]
+    pub fn connections_under_group(&self, path: &GroupPath) -> Vec<HostId> {
+        self.connections
+            .iter()
+            .filter(|connection| {
+                connection
+                    .group_path()
+                    .is_some_and(|current| current.starts_with(path))
+            })
+            .map(ConnectionRecord::id)
             .collect()
     }
 
@@ -608,7 +628,7 @@ impl HostBook {
         destination: Option<&GroupPath>,
     ) -> Result<usize, BookError> {
         for id in ids {
-            if self.host(*id).is_none() {
+            if !self.contains_connection(*id) {
                 return Err(BookError::UnknownHost { id: *id });
             }
         }
@@ -621,6 +641,20 @@ impl HostBook {
                 continue;
             }
             host.set_group_path(destination.cloned());
+            changed += 1;
+        }
+        // A desktop or serial connection is moved by the same operation, so a group
+        // deletion cannot leave one behind in a group that no longer exists.
+        for index in 0..self.connections.len() {
+            let connection = self.connections[index].clone();
+            // A connection already where it is being moved to is not a change, the same
+            // way [`already_in`] answers for a host.
+            if !selected.contains(&connection.id())
+                || connection.group_path().as_ref() == destination
+            {
+                continue;
+            }
+            self.connections[index] = connection.with_group_path(destination.cloned());
             changed += 1;
         }
         Ok(changed)
@@ -679,9 +713,34 @@ impl HostBook {
                 })?;
             pending.push((index, moved));
         }
-        let changed = pending.len();
+        // A connection of another protocol is in a group the same way a host is, so a
+        // rename has to move it too: leaving it behind would show the old name in the
+        // list and hide it from a filter on the new one.
+        let mut pending_connections: Vec<(usize, GroupPath)> = Vec::new();
+        for (index, connection) in self.connections.iter().enumerate() {
+            let Some(current) = connection.group_path() else {
+                continue;
+            };
+            if !current.starts_with(from) {
+                continue;
+            }
+            let moved = current
+                .rebase(from, to)
+                .ok_or_else(|| BookError::Inconsistent {
+                    reason: format!(
+                        "renaming {from} to {to} would put the connection {} below the deepest group that can be shown",
+                        connection.name()
+                    ),
+                })?;
+            pending_connections.push((index, moved));
+        }
+        let changed = pending.len() + pending_connections.len();
         for (index, moved) in pending {
             self.hosts[index].set_group_path(Some(moved));
+        }
+        for (index, moved) in pending_connections {
+            let connection = self.connections[index].clone();
+            self.connections[index] = connection.with_group_path(Some(moved));
         }
         Ok(changed)
     }

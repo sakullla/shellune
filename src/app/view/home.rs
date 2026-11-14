@@ -926,7 +926,12 @@ impl ShelluneView {
             );
         if matches!(action, GroupAction::Delete(_) | GroupAction::Move) {
             let hosts = match &action {
-                GroupAction::Delete(path) => self.book.hosts_under_group(path).len(),
+                // Every connection the group holds: the servers and the desktop or
+                // serial records, which move with it.
+                GroupAction::Delete(path) => {
+                    self.book.hosts_under_group(path).len()
+                        + self.book.connections_under_group(path).len()
+                }
                 _ => self.hosts.selected_count(),
             };
             body = body

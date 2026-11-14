@@ -4681,8 +4681,10 @@ impl ShelluneView {
     ///
     /// Clearing a mark does not connect the pane.
     fn recheck_open_hosts(&mut self) {
-        let ids: Vec<HostId> = self.book.hosts().iter().map(HostConfig::id).collect();
-        self.workspace.recheck_layout_hosts(|id| ids.contains(&id));
+        // A pane names a saved connection of any protocol, so the check asks whether the
+        // record is still there rather than whether it is an SSH host.
+        self.workspace
+            .recheck_layout_hosts(|id| self.book.contains_connection(id));
     }
 
     /// Opens an empty form for a new host.

@@ -335,7 +335,10 @@ impl GroupService {
         let mut removed = vec![path.clone()];
         removed.extend(groups.descendants(path).into_iter().cloned());
         Ok(GroupDeletion {
-            hosts_moved: hosts.hosts_under_group(path).len(),
+            // Hosts and connections are both moved by the change, so the number the
+            // confirmation shows is everything that would move, not only the servers.
+            hosts_moved: hosts.hosts_under_group(path).len()
+                + hosts.connections_under_group(path).len(),
             groups_removed: removed,
             destination: destination.cloned(),
             labels_without_group: hosts.legacy_group_labels(),
@@ -359,7 +362,10 @@ impl GroupService {
         destination: Option<&GroupPath>,
     ) -> Result<(GroupUpdate, GroupDeletion), GroupError> {
         let preview = self.preview_deletion(hosts, groups, path, destination)?;
-        let ids = hosts.hosts_under_group(path);
+        // Both lists: a desktop or serial connection must not be left pointing at a
+        // group that is about to be removed.
+        let mut ids = hosts.hosts_under_group(path);
+        ids.extend(hosts.connections_under_group(path));
         let mut next_hosts = hosts.clone();
         let moved = next_hosts.reassign_group(&ids, destination)?;
         let mut next_groups = groups.clone();

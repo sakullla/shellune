@@ -2021,6 +2021,33 @@ impl ConnectionRecord {
         }
     }
 
+    /// The same connection in another group, or in none.
+    ///
+    /// Only the grouping changes: the identifier, the endpoint and any credential
+    /// reference stay, which is what lets a group rename or a group deletion move a
+    /// desktop or serial connection exactly the way it moves a host.
+    #[must_use]
+    pub fn with_group_path(self, path: Option<GroupPath>) -> Self {
+        match self {
+            Self::Ssh(mut host) => {
+                host.set_group_path(path);
+                Self::Ssh(host)
+            }
+            Self::Rdp(mut config) => {
+                config.set_group_path(path);
+                Self::Rdp(config)
+            }
+            Self::Vnc(mut config) => {
+                config.set_group_path(path);
+                Self::Vnc(config)
+            }
+            Self::Serial(mut config) => {
+                config.set_group_path(path);
+                Self::Serial(config)
+            }
+        }
+    }
+
     /// Renames the connection.
     ///
     /// # Errors

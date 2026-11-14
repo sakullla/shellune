@@ -1039,6 +1039,122 @@ fn a_canonical_path_and_an_empty_group_survive_a_restart() {
 }
 
 #[test]
+fn renaming_a_group_moves_the_desktop_connection_with_it() {
+    let dir = TempDir::new("group-rename-connection");
+    let service = dir.service();
+    let web = saved(
+        &dir.store(),
+        host("web", "10.0.0.5", 22, "deploy", Some("Prod")),
+    );
+
+    let store = dir.store();
+    let mut book = store.load().expect("the book loads");
+    let mut office = RdpConfig::new("Office", "10.0.0.9", Some("alice")).expect("valid");
+    office.set_group_path(Some(group_path("Prod")));
+    let office = ConnectionRecord::Rdp(office);
+    book.insert_connection(office.clone())
+        .expect("the desktop connection is inserted");
+    store.save(&book).expect("the book saves");
+
+    let (book, groups) = service.load().expect("both documents load");
+    let groups = service
+        .create_group(&groups, &group_path("Prod"))
+        .expect("the group is new");
+    let renamed = service
+        .rename_group(
+            &book,
+            &groups,
+            &group_path("Prod"),
+            &group_path("Production"),
+        )
+        .expect("the rename is valid");
+    assert_eq!(
+        renamed.hosts_changed, 2,
+        "the host and the desktop connection both moved"
+    );
+
+    let (book, groups) = GroupService::at(dir.path())
+        .load()
+        .expect("both documents load after the restart");
+    assert!(groups.contains(&group_path("Production")));
+    assert!(!groups.contains(&group_path("Prod")));
+    let moved = book
+        .connection(office.id())
+        .expect("the connection is still saved");
+    assert_eq!(
+        moved.group_path().map(|path| path.to_string()),
+        Some("Production".to_owned()),
+        "the connection followed the rename instead of keeping the old path"
+    );
+    assert_eq!(
+        book.connections_under_group(&group_path("Production")),
+        vec![office.id()],
+        "a filter on the new name finds it"
+    );
+    assert!(
+        book.connections_under_group(&group_path("Prod")).is_empty(),
+        "and nothing is left under the old one"
+    );
+    assert_eq!(
+        book.hosts_under_group(&group_path("Production")),
+        vec![web.id()]
+    );
+}
+
+#[test]
+fn deleting_a_group_takes_the_serial_connection_out_of_it() {
+    let dir = TempDir::new("group-delete-connection");
+    let service = dir.service();
+    let web = saved(
+        &dir.store(),
+        host("web", "10.0.0.5", 22, "deploy", Some("Prod")),
+    );
+
+    let store = dir.store();
+    let mut book = store.load().expect("the book loads");
+    let mut console = SerialConfig::new("Console", "COM3").expect("valid");
+    console.set_group_path(Some(group_path("Prod")));
+    let console = ConnectionRecord::Serial(console);
+    book.insert_connection(console.clone())
+        .expect("the serial connection is inserted");
+    store.save(&book).expect("the book saves");
+
+    let (book, groups) = service.load().expect("both documents load");
+    let groups = service
+        .create_group(&groups, &group_path("Prod"))
+        .expect("the group is new");
+    let preview = service
+        .preview_deletion(&book, &groups, &group_path("Prod"), None)
+        .expect("the preview is available");
+    assert_eq!(
+        preview.hosts_moved, 2,
+        "the confirmation counts the host and the serial connection"
+    );
+
+    let (update, _) = service
+        .delete_group(&book, &groups, &group_path("Prod"), None)
+        .expect("the group is deleted");
+    assert_eq!(update.hosts_changed, 2);
+
+    let (book, groups) = GroupService::at(dir.path())
+        .load()
+        .expect("both documents load after the restart");
+    assert!(!groups.contains(&group_path("Prod")));
+    let kept = book
+        .connection(console.id())
+        .expect("the connection is kept, not deleted with the group");
+    assert_eq!(
+        kept.group_path(),
+        None,
+        "it left the group instead of keeping a path no tree holds"
+    );
+    assert!(
+        book.connections_under_group(&group_path("Prod")).is_empty(),
+        "no connection still points at the deleted group"
+    );
+    assert_eq!(book.host(web.id()).map(HostConfig::group_path), Some(None));
+}
+#[test]
 fn renaming_a_group_keeps_every_host_and_its_credential_reference() {
     let dir = TempDir::new("group-rename");
     let service = dir.service();
@@ -2042,9 +2158,60 @@ fn a_document_with_desktop_connections_still_has_no_place_for_a_secret() {
             );
         }
     }
+    for key in &keys {
+        assert!(
+            CONFIG_KEYS.contains(&key.as_str()),
+            "the saved document uses the key {key:?}, which is not on the allowlist"
+        );
+        // The flag is the one key whose name says "secret", and it holds no value; every
+        // other key is held to the full list of words that would mean a credential.
+        if key == "remember_secret" {
+            assert_eq!(
+                document["connections"][0]["remember_secret"],
+                serde_json::Value::Bool(true),
+                "the flag says a credential may be in the system store, and nothing more"
+            );
+            continue;
+        }
+        let lower = key.to_lowercase();
+        for forbidden in [
+            "password",
+            "passphrase",
+            "secret",
+            "token",
+            "credential",
+            "private",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "the saved document has a key that names a secret: {key:?}"
+            );
+        }
+    }
     let stored = document["connections"][0].to_string();
     assert!(
         !stored.contains("alice-password"),
         "no value of a credential is written beside the record"
     );
+}
+
+#[test]
+fn a_forged_credential_key_is_still_refused_by_the_audit() {
+    let dir = TempDir::new("forged-key");
+    let store = dir.store();
+    let id = HostId::new();
+    // The allowlist is not a formality: a file that carries a credential field is not a
+    // document this build wrote, and loading it fails instead of quietly accepting it.
+    for forged in ["password", "token", "credential"] {
+        dir.write_file(&format!(
+            r#"{{"version":{FORMAT_VERSION},"hosts":[],"connections":[{{"protocol":"vnc","id":"{id}","name":"wall","address":"10.0.0.7","port":5900,"{forged}":"hunter2"}}],"recents":[]}}"#
+        ));
+        let error = store
+            .load()
+            .expect_err("a credential field is not part of a saved connection");
+        assert!(
+            error.to_string().contains(forged) || error.to_string().contains("unknown field"),
+            "the refusal names what it found: {error}"
+        );
+    }
 }

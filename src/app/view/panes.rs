@@ -11,8 +11,8 @@ use gpui::{
     SharedString, Window, div, px,
 };
 use shellune_core::{
-    HostConfig, HostId, LocalShell, PaneId, PaneTarget, PanelSection, SessionId, SessionKind,
-    SessionState, SplitAxis, TabId, TerminalMode, WorkspaceSnapshot,
+    LocalShell, PaneId, PaneTarget, PanelSection, SessionId, SessionKind, SessionState, SplitAxis,
+    TabId, TerminalMode, WorkspaceSnapshot,
 };
 use shellune_storage::WorkspaceStore;
 
@@ -41,8 +41,9 @@ impl ShelluneView {
                 if snapshot_is_blank(&snapshot) {
                     return;
                 }
-                let ids: Vec<HostId> = self.book.hosts().iter().map(HostConfig::id).collect();
-                let restored = snapshot.restore(|id| ids.contains(&id));
+                // A pane may name a host or a connection of another protocol; both are
+                // saved records, so a restore asks the book about either one.
+                let restored = snapshot.restore(|id| self.book.contains_connection(id));
                 let section = restored.panel().section();
                 let visible = restored.panel().visible();
                 self.workspace.install_restored(restored);
@@ -1427,7 +1428,7 @@ impl ShelluneView {
             .count()
     }
 
-    pub fn missing_host_panes_for_test(&self) -> Vec<HostId> {
+    pub fn missing_host_panes_for_test(&self) -> Vec<shellune_core::HostId> {
         self.workspace
             .layout()
             .leaves()

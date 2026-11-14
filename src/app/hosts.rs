@@ -1007,13 +1007,6 @@ impl HostDraft {
         true
     }
 
-    /// The validated change this form describes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the reason the domain rejected the values: an empty name, address or
-    /// user, an address with whitespace, or a port outside `1..=65535`. The text is
-    /// not changed, so the user can correct the field that was refused.
     /// Turns this form into a copy of a saved host (R9).
     ///
     /// The copy keeps every editable field, gets the name the caller chose, and holds
@@ -1027,6 +1020,13 @@ impl HostDraft {
         self.secret.clear();
     }
 
+    /// The validated change this form describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the domain rejected the values: an empty name, address or
+    /// user, an address with whitespace, or a port outside `1..=65535`. The text is
+    /// not changed, so the user can correct the field that was refused.
     pub fn build(&self, existing: Option<&HostConfig>) -> Result<HostEdit, String> {
         let port = parse_port(&self.port)?;
         match existing {
