@@ -136,6 +136,8 @@ pub struct TransferViews {
     pending_settlement: HashMap<SessionId, Vec<TransferId>>,
     /// The speed each running task was last seen moving at.
     paces: HashMap<TransferId, Pace>,
+    /// Whether the capture fixture fixed the pace and no frame may resample it.
+    frozen: bool,
     queue: TransferQueue,
 }
 
@@ -510,6 +512,9 @@ impl TransferViews {
     /// transfer loses its speed instead of keeping the last one it had - and with it the
     /// estimate built on it.
     fn sample(&mut self, now: Instant) {
+        if self.frozen {
+            return;
+        }
         let running: Vec<(TransferId, u64)> = self
             .queue
             .transfers()
@@ -608,12 +613,30 @@ impl TransferViews {
         let id = self.queue.add(task);
         let _ = self.queue.apply(&TransferEvent::started(id));
         let _ = self.queue.apply(&TransferEvent::progress(id, first, total));
-        let started = Instant::now();
-        self.sample(started);
+        // The pace is fixed rather than sampled: a wall clock would make the speed and
+        // the time left differ between two runs of the same revision, and a baseline
+        // that drifts cannot be compared (R2).
+        let at = Instant::now();
+        self.paces.insert(
+            id,
+            Pace {
+                at,
+                bytes: first,
+                rate: 0.0,
+            },
+        );
+        self.paces.insert(
+            id,
+            Pace {
+                at: at + Duration::from_millis(500),
+                bytes: second,
+                rate: (second.saturating_sub(first) as f64 / 0.5).max(1.0),
+            },
+        );
         let _ = self
             .queue
             .apply(&TransferEvent::progress(id, second, total));
-        self.sample(started + Duration::from_millis(500));
+        self.frozen = true;
         id
     }
 

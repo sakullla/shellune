@@ -1257,6 +1257,30 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) {
         self.toast(tone, title, detail.map(str::to_owned), cx);
+        // A real toast lives four seconds; the frame settles on its own schedule. While
+        // the capture window exists, a missing toast is put back, so the shot is of the
+        // notification rather than of the terminal after it expired (R2).
+        let view = cx.entity().downgrade();
+        let title = title.to_owned();
+        let detail = detail.map(str::to_owned);
+        cx.spawn(async move |_, cx| {
+            for _ in 0..20 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                let alive = view
+                    .update(cx, |view, cx| {
+                        if view.toasts.is_empty() {
+                            view.toast(tone, title.clone(), detail.clone(), cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// How many notifications are on screen, for a capture (R2).

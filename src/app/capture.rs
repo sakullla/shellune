@@ -838,6 +838,7 @@ fn start(
             // window would become the foreground window when it did (R1).
             if let Ok(handle) = hwnd(window) {
                 windows::make_non_activating(handle);
+                windows::park_offscreen(handle);
             }
             arm_frame_counter(window, state.clone());
             let state = state.clone();
@@ -1065,6 +1066,12 @@ async fn capture_in(
         viewport,
         scale,
     } = stable_frame(wx, state).await?;
+    // A notice has a timer, so the frame is accepted only if the notice is still the
+    // scenario's state in it; a shot of the terminal after it expired must fail (R2).
+    // Other scenes keep state that only the shot itself ends, so they are not re-read.
+    if shot.scenario.id == "notification" {
+        wait_ready(wx, shot).await?;
+    }
 
     let file = format!("{}.png", shot.variant.file_stem(shot.scenario.id));
     let path = options.out.join(&file);

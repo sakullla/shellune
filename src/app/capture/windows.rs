@@ -7,7 +7,8 @@
 use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, IsWindowVisible,
-    PostMessageW, SetWindowLongPtrW, WM_PAINT, WS_EX_NOACTIVATE,
+    PostMessageW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW,
+    SetWindowPos, WM_PAINT, WS_EX_NOACTIVATE,
 };
 
 pub(super) type Handle = isize;
@@ -24,6 +25,25 @@ pub(super) fn make_non_activating(handle: Handle) {
             handle as _,
             GWL_EXSTYLE,
             style | (WS_EX_NOACTIVATE as isize),
+        );
+    }
+}
+
+/// Parks the hidden window far outside the desktop.
+///
+/// A window at (0, 0) can sit under the pointer, and the shell then draws whatever
+/// hover the pointer implies. Parked off-screen it has no pointer over it, so two runs
+/// of the same shot draw the same pixels (R2).
+pub(super) fn park_offscreen(handle: Handle) {
+    unsafe {
+        SetWindowPos(
+            handle as _,
+            std::ptr::null_mut(),
+            -30_000,
+            -30_000,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
         );
     }
 }
