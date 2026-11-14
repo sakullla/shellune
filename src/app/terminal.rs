@@ -448,6 +448,11 @@ pub struct TerminalPane {
     /// settle — a whole line of its own, which reads as the view scrolling by
     /// itself. The fraction waits until it adds up.
     scroll_fraction: f32,
+    /// A phased trackpad gesture stays at the bottom once it reaches it. Its
+    /// settling/momentum events can reverse direction; only a new gesture may
+    /// leave the bottom again. Unphased mouse wheels do not use this latch.
+    scroll_gesture_active: bool,
+    scroll_gesture_pinned: bool,
     block_filter: BlockFilter,
     /// The shortcuts the pane's own controls answer, as the bindings in force show
     /// them (R5). The view keeps this in step with the settings page.
@@ -623,6 +628,8 @@ impl TerminalPane {
             search_options: SearchOptions::literal(),
             search_scroll: None,
             scroll_fraction: 0.0,
+            scroll_gesture_active: false,
+            scroll_gesture_pinned: false,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
@@ -686,6 +693,8 @@ impl TerminalPane {
             search_options: SearchOptions::literal(),
             search_scroll: None,
             scroll_fraction: 0.0,
+            scroll_gesture_active: false,
+            scroll_gesture_pinned: false,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
@@ -748,6 +757,8 @@ impl TerminalPane {
             search_options: SearchOptions::literal(),
             search_scroll: None,
             scroll_fraction: 0.0,
+            scroll_gesture_active: false,
+            scroll_gesture_pinned: false,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
@@ -827,6 +838,8 @@ impl TerminalPane {
             search_options: SearchOptions::literal(),
             search_scroll: None,
             scroll_fraction: 0.0,
+            scroll_gesture_active: false,
+            scroll_gesture_pinned: false,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
@@ -1095,6 +1108,23 @@ impl TerminalPane {
         }
     }
 
+    fn reveal_input(&mut self, cx: &mut Context<Self>) {
+        self.core.scroll_to_bottom();
+        self.scroll_fraction = 0.0;
+        self.scroll_gesture_pinned = self.scroll_gesture_active;
+        cx.notify();
+    }
+
+    /// User input reveals the live cursor. Protocol replies and mouse reports
+    /// use `write` directly so they cannot disturb someone reading history.
+    fn write_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if bytes.is_empty() || !self.state.accepts_input() {
+            return;
+        }
+        self.reveal_input(cx);
+        self.write(bytes, cx);
+    }
+
     /// Sends what a key press means, or scrolls for the view-only combinations.
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() && event.keystroke.key == "escape" {
@@ -1209,7 +1239,7 @@ impl TerminalPane {
         if let Some(key) = Key::from_name(&keystroke.key)
             && let Some(bytes) = encode_key(key, modifiers, self.core.mode())
         {
-            self.write(&bytes, cx);
+            self.write_input(&bytes, cx);
             // The key was consumed as a terminal key, so the text-input path must not
             // run for it as well: Return would otherwise be sent twice.
             cx.stop_propagation();
@@ -1219,7 +1249,7 @@ impl TerminalPane {
 
     /// Sends text to the program as if it had been typed.
     pub fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.write(text.as_bytes(), cx);
+        self.write_input(text.as_bytes(), cx);
     }
 
     /// Takes the shortcuts in force, so the toolbar describes the keys the window
@@ -1283,7 +1313,7 @@ impl TerminalPane {
             return;
         };
         match self.origin {
-            PaneOrigin::Local(_) => self.write(&[0x16], cx),
+            PaneOrigin::Local(_) => self.write_input(&[0x16], cx),
             PaneOrigin::Remote { .. } => cx.emit(PaneRequest::PasteImage(image)),
         }
     }
@@ -1475,14 +1505,14 @@ impl TerminalPane {
         if !bytes.ends_with(b"\r") {
             bytes.push(b'\r');
         }
-        self.write(&bytes, cx);
+        self.write_input(&bytes, cx);
         debug_assert_eq!(self.core.command_blocks(), before);
         cx.notify();
     }
 
     fn write_paste(&mut self, text: &str, cx: &mut Context<Self>) {
         let bytes = encode_paste(text, self.core.mode());
-        self.write(&bytes, cx);
+        self.write_input(&bytes, cx);
     }
 
     /// Types a saved command, and submits it when `execute` says so.
@@ -1494,7 +1524,7 @@ impl TerminalPane {
         if execute {
             bytes.push(b'\r');
         }
-        self.write(&bytes, cx);
+        self.write_input(&bytes, cx);
     }
 
     fn alternate_screen(&self) -> bool {
@@ -2045,6 +2075,17 @@ impl TerminalPane {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        if matches!(event.delta, ScrollDelta::Lines(_)) {
+            self.scroll_gesture_active = false;
+            self.scroll_gesture_pinned = false;
+        } else if matches!(event.touch_phase, gpui::TouchPhase::Started) {
+            self.scroll_gesture_active = true;
+            self.scroll_gesture_pinned = false;
+            self.scroll_fraction = 0.0;
+        }
+        if self.scroll_gesture_pinned {
+            return;
+        }
         let scrolled = match event.delta {
             ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.cell.sanitized().height,
@@ -2090,6 +2131,10 @@ impl TerminalPane {
         }
         let before = self.core.display_offset();
         self.core.scroll(lines);
+        if self.core.display_offset() == 0 && lines < 0 {
+            self.scroll_gesture_pinned = self.scroll_gesture_active;
+            self.scroll_fraction = 0.0;
+        }
         // A scroll the history could not take leaves nothing behind: the next event
         // starts from where the view really is instead of from where a gesture that
         // ran past an end wanted it to be.
@@ -3843,7 +3888,7 @@ impl EntityInputHandler for TerminalPane {
         // A commit is program input, including one command that ends in a newline.
         // Multi-line and high-risk confirmation belongs to clipboard paste.
         let bytes = encode_text(text);
-        self.write(&bytes, cx);
+        self.write_input(&bytes, cx);
         cx.notify();
     }
 
@@ -3855,6 +3900,9 @@ impl EntityInputHandler for TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !new_text.is_empty() && !self.search_focused && self.state.accepts_input() {
+            self.reveal_input(cx);
+        }
         // Composition is shown next to the caret but nothing is sent until the
         // input method commits, which is what makes Chinese input usable.
         self.marked = if new_text.is_empty() {

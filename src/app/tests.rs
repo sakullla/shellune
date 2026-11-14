@@ -4276,9 +4276,8 @@ async fn a_scroll_smaller_than_a_line_waits_until_it_adds_up(cx: &mut TestAppCon
     let (pane, cx) = pane_with(&needle_lines(400), cx);
     let center = bounds_of(cx, "terminal.viewport").center();
     let cell = cx.update(|_window, app| pane.read(app).cell_size());
-    let offset = |cx: &mut VisualTestContext| {
-        cx.update(|_window, app| pane.read(app).display_offset())
-    };
+    let offset =
+        |cx: &mut VisualTestContext| cx.update(|_window, app| pane.read(app).display_offset());
     let scroll = |cx: &mut VisualTestContext, pixels: f32| {
         cx.simulate_event(ScrollWheelEvent {
             position: center,
@@ -4292,7 +4291,11 @@ async fn a_scroll_smaller_than_a_line_waits_until_it_adds_up(cx: &mut TestAppCon
     // A pixel is a fraction of a line, not a line: the view stays on the live
     // bottom and the fraction is kept instead of being rounded up.
     scroll(cx, 1.0);
-    assert_eq!(offset(cx), 0, "a sub-line scroll must not jump a whole line");
+    assert_eq!(
+        offset(cx),
+        0,
+        "a sub-line scroll must not jump a whole line"
+    );
 
     // The same downward, at the bottom the history cannot take: nothing is left
     // over, so a gesture that ran past the end cannot pull the view back up.
@@ -4306,6 +4309,136 @@ async fn a_scroll_smaller_than_a_line_waits_until_it_adds_up(cx: &mut TestAppCon
         scroll(cx, 2.0);
     }
     assert_eq!(offset(cx), 1, "the fractions add up to exactly one line");
+}
+
+#[gpui::test]
+async fn a_full_terminal_keeps_the_prompt_visible_after_a_scroll_rebound(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("", cx);
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.feed_for_test(format!("{}\r\nprompt> ", needle_lines(400)).as_bytes(), cx);
+        });
+    });
+    cx.run_until_parked();
+    let center = bounds_of(cx, "terminal.viewport").center();
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    let scroll = |cx: &mut VisualTestContext, lines: f32, phase| {
+        cx.simulate_event(ScrollWheelEvent {
+            position: center,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(lines * cell.height))),
+            touch_phase: phase,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    };
+
+    scroll(cx, 3.0, gpui::TouchPhase::Started);
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 3);
+    scroll(cx, -3.0, gpui::TouchPhase::Started);
+    assert!(cx.debug_bounds("terminal.cursor").is_some());
+    scroll(cx, 0.0, gpui::TouchPhase::Ended);
+    // The tail of the same gesture reverses by a line after reaching the bottom.
+    for _ in 0..4 {
+        scroll(cx, 0.3, gpui::TouchPhase::Moved);
+    }
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 0);
+    assert!(cx.debug_bounds("terminal.cursor").is_some());
+    assert!(cx.update(|_window, app| {
+        pane.read(app)
+            .visible_text()
+            .last()
+            .unwrap()
+            .contains("prompt>")
+    }));
+
+    // Lifting and starting another gesture still allows reading history.
+    scroll(cx, 1.0, gpui::TouchPhase::Started);
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 1);
+}
+
+#[gpui::test]
+async fn a_full_terminal_reveals_the_prompt_for_text_keys_and_paste(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with(&needle_lines(400), cx);
+    let center = bounds_of(cx, "terminal.viewport").center();
+    for input in ["text", "key", "paste"] {
+        cx.simulate_event(ScrollWheelEvent {
+            position: center,
+            delta: ScrollDelta::Lines(point(0.0, 3.0)),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| pane.read(app).display_offset()) > 0);
+        match input {
+            "text" => cx.simulate_input("echo"),
+            "key" => cx.simulate_keystrokes("enter"),
+            _ => {
+                cx.update(|_window, app| {
+                    app.write_to_clipboard(ClipboardItem::new_string("pasted".to_owned()));
+                });
+                cx.dispatch_action(crate::app::actions::TerminalPaste);
+            }
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_window, app| pane.read(app).display_offset()),
+            0,
+            "{input} reveals the prompt"
+        );
+        assert!(cx.debug_bounds("terminal.cursor").is_some());
+    }
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"echo\rpasted"
+    );
+}
+
+#[gpui::test]
+async fn a_full_terminal_keeps_protocol_replies_parked_but_reveals_ime_input(
+    cx: &mut TestAppContext,
+) {
+    use gpui::EntityInputHandler;
+
+    let (pane, cx) = pane_with(&needle_lines(400), cx);
+    let center = bounds_of(cx, "terminal.viewport").center();
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Pixels(point(px(0.0), px(3.0 * cell.height))),
+        touch_phase: gpui::TouchPhase::Started,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| pane.feed_for_test(b"\x1b[5n", cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 3);
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"\x1b[0n"
+    );
+
+    cx.update(|window, app| {
+        pane.update(app, |pane, cx| {
+            pane.replace_and_mark_text_in_range(None, "nihao", None, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 0);
+    // Residual events from the gesture cannot hide the composition or prompt.
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Pixels(point(px(0.0), px(cell.height))),
+        touch_phase: gpui::TouchPhase::Moved,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 0);
+    cx.simulate_input("你好");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        "\x1b[0n你好".as_bytes()
+    );
 }
 
 #[gpui::test]

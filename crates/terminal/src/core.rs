@@ -1254,7 +1254,10 @@ mod tests {
         let short = snapshot.row_text(0).expect("row 0");
         let long = snapshot.row_text(1).expect("row 1");
 
-        assert!(!short.contains('\t'), "a tab is drawn as a blank: {short:?}");
+        assert!(
+            !short.contains('\t'),
+            "a tab is drawn as a blank: {short:?}"
+        );
         assert_eq!(
             short.find("--"),
             long.find("--"),
