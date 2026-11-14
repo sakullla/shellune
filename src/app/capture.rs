@@ -27,6 +27,9 @@
 //! What this tool cannot do is part of the evidence, and it is written into the manifest:
 //! the pixels come from one Windows DirectX readback, the sessions are display-only
 //! fixtures, and a PNG of a page is not proof that the page works.
+// Off Windows the probe only plans and lists: the scenarios and the shell's capture
+// hooks are compiled so the planner is checked everywhere, but nothing draws them.
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 
@@ -696,7 +699,7 @@ fn run(options: Options, shots: Vec<Shot>) -> i32 {
         });
         write_manifest(&options.out, &manifest);
         eprintln!("shellune ui-capture: hidden-window capture is Windows only and unverified here");
-        return 3;
+        3
     }
     #[cfg(target_os = "windows")]
     {
@@ -981,6 +984,7 @@ enum ShotError {
     Window(String),
 }
 
+#[cfg(target_os = "windows")]
 impl From<String> for ShotError {
     fn from(reason: String) -> Self {
         Self::Window(reason)

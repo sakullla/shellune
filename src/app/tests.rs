@@ -16043,11 +16043,27 @@ async fn the_head_is_one_band_that_names_the_session_once(cx: &mut TestAppContex
     let header = bounds_of(cx, "session.header");
     let tabs = bounds_of(cx, "session.tabs");
     let context = bounds_of(cx, "session.context");
+    let topbar = bounds_of(cx, "topbar");
     assert_fits_inside(tabs, header.size, "the tab strip in the head");
-    assert_fits_inside(context, header.size, "the session's own row in the head");
+    assert_fits_inside(
+        context,
+        header.size,
+        "the session's target and actions in the head",
+    );
+    // A running session has no news, so its target and actions sit on the tab row and
+    // the head is that one row: no second band above the terminal.
     assert!(
-        context.origin.y >= tabs.origin.y + tabs.size.height - px(1.0),
-        "the session row is under the strip, in the same band: {context:?} vs {tabs:?}"
+        context.origin.y >= topbar.origin.y
+            && context.origin.y + context.size.height <= topbar.origin.y + topbar.size.height,
+        "a running session's actions share the tab row: {context:?} vs {topbar:?}"
+    );
+    assert!(
+        header.size.height <= topbar.size.height + px(1.0),
+        "the head of a running session is one row: {header:?} vs {topbar:?}"
+    );
+    assert!(
+        cx.debug_bounds("session.close").is_none(),
+        "the tab closes the session; the head does not draw a second Close beside it"
     );
     // The name is the tab's. Node that repeated it below is gone.
     assert!(
@@ -16068,10 +16084,9 @@ async fn the_head_is_one_band_that_names_the_session_once(cx: &mut TestAppContex
         terminal.origin.y - (header.origin.y + header.size.height) < px(16.0),
         "a band was left between the head and the terminal: {terminal:?} vs {header:?}"
     );
-    // One close button for the session, not one per strip.
-    assert!(cx.debug_bounds("session.close").is_some());
+    // One close button for the session: the tab's.
     assert_fits_inside(
-        bounds_of(cx, "session.close"),
+        bounds_of(cx, "session.tab.close.0"),
         header.size,
         "the session's close button in the head",
     );
@@ -16783,12 +16798,7 @@ async fn the_session_bar_and_file_row_controls_are_pointer_targets_too(cx: &mut 
     smallest_text_size(&view, cx);
     // The session bar: closing the session, splitting the pane it shows, and the tab
     // that holds it.
-    for selector in [
-        "session.close",
-        "session.tab.close.0",
-        "pane.split.right",
-        "pane.split.down",
-    ] {
+    for selector in ["session.tab.close.0", "pane.split.right", "pane.split.down"] {
         assert_pointer_target(cx, selector);
     }
 

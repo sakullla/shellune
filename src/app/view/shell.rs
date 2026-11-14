@@ -96,7 +96,40 @@ impl ShelluneView {
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "session.header".to_owned())
             .child(self.top_bar(window, cx))
-            .children(self.session_context(cx))
+            .when(!self.session_fused(), |head| {
+                head.children(self.session_context(false, cx))
+            })
+    }
+
+    /// Whether the current session's row folds into the tab row (R12).
+    ///
+    /// A session that is simply running has nothing to report: its name, colour and
+    /// state are on the tab, and the row under it held only a target and a handful of
+    /// icons - a whole band of chrome above the terminal for no news. Such a session
+    /// gives the band back and its target and actions move to the right of the tabs.
+    /// The row returns as soon as it has something to say - connecting, ended, a
+    /// reconnect, an unsaved quick connection, an X11 bridge - or when the window is
+    /// too narrow to hold both on one line.
+    pub(super) fn session_fused(&self) -> bool {
+        if self.workspace.destination() != Destination::LocalShells
+            || !self.shows_terminal(Destination::LocalShells)
+            || self.viewport_width < self.metrics().scale(CONTEXT_ONE_LINE_WIDTH)
+        {
+            return false;
+        }
+        let id = if self.workspace.layout().active_tab().is_some() {
+            self.workspace.layout().active_session()
+        } else {
+            self.active
+        };
+        let Some(session) = id.and_then(|id| self.workspace.session(id)) else {
+            return false;
+        };
+        let id = session.id();
+        matches!(session.state(), SessionState::Connected)
+            && !may_reconnect(session)
+            && !self.unsaved.iter().any(|(unsaved, _)| *unsaved == id)
+            && !self.x11.contains_key(&id)
     }
 
     /// The top row: brand, the hosts tab, the terminal tabs, a new-tab control, the
@@ -205,6 +238,11 @@ impl ShelluneView {
                     .h_full()
                     .min_w(metrics.scale(24.0)),
             )
+            .when(self.session_fused(), |bar| {
+                bar.children(self.session_context(true, cx)).child(
+                    components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)),
+                )
+            })
             .child(trailing)
             .children(controls)
     }
@@ -217,7 +255,11 @@ impl ShelluneView {
     /// news (connecting, disconnected, ended), the bridge or the save that needs an
     /// answer, and the actions. The name was drawn here as well, which is exactly the
     /// duplication this row removes.
-    fn session_context(&self, cx: &mut Context<Self>) -> Option<Div> {
+    ///
+    /// `inline` draws the same target and actions as one quiet cluster for the tab row,
+    /// without the kind mark, the state chip or a second Close: a running session needs
+    /// none of them there, and the tab already closes it.
+    fn session_context(&self, inline: bool, cx: &mut Context<Self>) -> Option<Div> {
         if self.workspace.destination() != Destination::LocalShells
             || !self.shows_terminal(Destination::LocalShells)
         {
@@ -370,6 +412,29 @@ impl ShelluneView {
                     }),
                 ),
             );
+        if inline {
+            return Some(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .debug_selector(|| "session.context".to_owned())
+                    .when_some(target, |row, target| {
+                        row.child(
+                            div()
+                                .max_w(metrics.scale(260.0))
+                                .truncate()
+                                .font_family(terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .debug_selector(|| "session.target".to_owned())
+                                .child(SharedString::from(target)),
+                        )
+                    })
+                    .child(actions_row.flex_nowrap().ml_0()),
+            );
+        }
         let close = components::icon_only_button(Icon::Close, metrics)
             .id("session.close")
             .debug_selector(|| "session.close".to_owned())

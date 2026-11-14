@@ -986,6 +986,7 @@ impl ShelluneView {
     /// Nothing here reads or writes the developer's real data directory or the
     /// system credential store, and no session is started (R1, R2).
     #[cfg(feature = "ui-capture")]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn for_capture(
         cx: &mut Context<Self>,
         workspace: Workspace,
@@ -1002,6 +1003,7 @@ impl ShelluneView {
 
     /// Chooses the palette the capture draws, without touching saved preferences.
     #[cfg(feature = "ui-capture")]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_capture_theme(&mut self, choice: theme::ThemeChoice, cx: &mut Context<Self>) {
         self.theme_choice = choice;
         cx.notify();
@@ -1012,6 +1014,7 @@ impl ShelluneView {
     /// A run states its own language, so each shot's manifest entry names the strings
     /// that shot really rendered. Nothing here is written to the preferences file.
     #[cfg(feature = "ui-capture")]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_capture_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
         self.workspace.set_locale(locale);
         self.relabel_fields(cx);
@@ -1020,6 +1023,7 @@ impl ShelluneView {
 
     /// Chooses the text size the capture draws (R2: 100% and 115% are in the matrix).
     #[cfg(feature = "ui-capture")]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_capture_zoom(&mut self, zoom: theme::Zoom, cx: &mut Context<Self>) {
         self.workspace.set_zoom(zoom);
         cx.notify();
@@ -1027,6 +1031,7 @@ impl ShelluneView {
 
     /// Stops short motion for the capture, so no frame is caught mid-animation.
     #[cfg(feature = "ui-capture")]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_capture_motion(&mut self, motion: theme::Motion, cx: &mut Context<Self>) {
         self.workspace.set_motion(motion);
         cx.notify();
