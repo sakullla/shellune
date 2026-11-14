@@ -292,9 +292,9 @@ void sd_rdp_run(sd_client *client) {
       goto teardown;
     }
 
-    EnterCriticalSection(&client->lock);
-    client->backend = session;
-    LeaveCriticalSection(&client->lock);
+    /* Published before the blocking connect, so an abort from another thread finds
+     * the context it has to cancel instead of arriving too early. */
+    sd_backend_publish(client, session);
 
     if (!freerdp_connect(instance)) {
       if (sd_is_cancelled(client)) {
@@ -347,11 +347,12 @@ void sd_rdp_run(sd_client *client) {
   }
 
 teardown:
-  /* Nothing calls into the context between clearing \`backend\` and freeing it: abort
-   * and the input path both read that pointer under the same lock. */
-  EnterCriticalSection(&client->lock);
-  client->backend = NULL;
-  LeaveCriticalSection(&client->lock);
+  /* sd_backend_retire clears the published pointer and then waits until no reader
+   * still holds a reference, so no thread can be inside
+   * freerdp_abort_connect_context while the context is freed below. The input path
+   * is not part of that protocol because it runs on this same worker thread, which
+   * is already past its loop. */
+  sd_backend_retire(client);
 
   if (session->context != NULL) {
     if (session->connected && session->instance != NULL) {
@@ -384,17 +385,23 @@ teardown:
 }
 
 void sd_rdp_abort(sd_client *client) {
-  EnterCriticalSection(&client->lock);
-  sd_rdp_session *session = (sd_rdp_session *)client->backend;
-  rdpContext *context = session != NULL ? session->context : NULL;
-  LeaveCriticalSection(&client->lock);
+  /* The reference is held across the freerdp call, not just the pointer load:
+   * teardown frees the context only after this reference is released. */
+  sd_rdp_session *session = (sd_rdp_session *)sd_backend_acquire(client);
+  if (session == NULL) return;
+  rdpContext *context = session->context;
   if (context != NULL) freerdp_abort_connect_context(context);
+  sd_backend_release(client);
 }
 
 static rdpInput *sd_rdp_input(sd_client *client, sd_rdp_session **out_session) {
-  EnterCriticalSection(&client->lock);
+  /* Reached from sd_flush_input only, which runs on the worker thread - the same
+   * thread that retires the session - so the returned pointer cannot be freed
+   * underneath the caller. It is read under backend_lock so it is never a value
+   * published by another thread without that lock. */
+  EnterCriticalSection(&client->backend_lock);
   sd_rdp_session *session = (sd_rdp_session *)client->backend;
-  LeaveCriticalSection(&client->lock);
+  LeaveCriticalSection(&client->backend_lock);
   if (out_session != NULL) *out_session = session;
   if (session == NULL || session->context == NULL) return NULL;
   return session->context->input;

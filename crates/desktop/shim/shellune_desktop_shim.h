@@ -147,6 +147,9 @@ sd_status sd_client_set_credentials(sd_client *client, const char *user,
 /* Requested desktop size for RDP, and the initial framebuffer request for VNC. */
 sd_status sd_client_set_size(sd_client *client, uint32_t width, uint32_t height);
 sd_status sd_client_set_vnc_security(sd_client *client, uint32_t allowed_mask);
+/* The only accepted value is 4: the VNC backend pins a 32bpp pixel format, so every
+ * frame it emits is BGRA with stride == width * 4. Any other value returns
+ * SD_ERR_ARGUMENT instead of configuring a depth that could never arrive. */
 sd_status sd_client_set_vnc_colour_depth(sd_client *client, uint32_t bytes_per_pixel);
 
 /* Starts the worker thread. Returns once the attempt is queued, not connected. */

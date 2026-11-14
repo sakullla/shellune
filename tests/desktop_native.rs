@@ -385,8 +385,22 @@ fn both_backends_report_the_libraries_they_link() {
     assert!(rdp.contains("tls=openssl"), "{rdp}");
     let vnc = backend_info(Protocol::Vnc).expect("vnc info");
     assert!(vnc.contains("libvncclient="), "{vnc}");
-    // The build must say which security types it can negotiate, not imply more.
-    assert!(vnc.contains("security="), "{vnc}");
+    // The build must say which security types it can negotiate, not imply more, and
+    // the names must be the RFB ones: "vencrypt" is a security type,
+    // "vencrypt-auth" is not.
+    assert!(vnc.contains("security=none,vncauth"), "{vnc}");
+    assert!(!vnc.contains("vencrypt-auth"), "{vnc}");
+    if vnc.contains("tls=none") {
+        assert!(
+            !vnc.contains(",tls,vencrypt"),
+            "a build without a TLS backend must not advertise TLS or VeNCrypt: {vnc}"
+        );
+    } else {
+        assert!(
+            vnc.contains("security=none,vncauth,tls,vencrypt"),
+            "a build with a TLS backend must advertise both: {vnc}"
+        );
+    }
 }
 
 #[test]
@@ -515,6 +529,48 @@ fn an_unsupported_vnc_security_type_fails_instead_of_downgrading() {
         states(&events).last(),
         Some(&State::Failed(Failure::UnsupportedSecurity)),
         "{events:?}"
+    );
+}
+
+/// The ABI accepts exactly one VNC pixel depth. The shim pins a 32bpp pixel format
+/// and always hands out four-byte pixels, so a three-byte request must be refused
+/// rather than accepted and then silently produce no frames.
+#[test]
+fn the_vnc_pixel_depth_is_fixed_at_four_bytes() {
+    if !backends_built() {
+        return;
+    }
+    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+    assert!(
+        matches!(client.set_vnc_colour_depth(3), Err(Error::Argument)),
+        "three bytes per pixel is not a depth this backend can deliver"
+    );
+    assert!(matches!(client.set_vnc_colour_depth(0), Err(Error::Argument)));
+    assert!(matches!(client.set_vnc_colour_depth(4), Ok(())));
+}
+
+/// Clipboard text is only forwarded by the VNC backend. An RDP session says so
+/// instead of accepting text the shim would drop, and the VNC answer is still the
+/// state check, so the two are not conflated.
+#[test]
+fn an_rdp_session_reports_that_it_cannot_forward_clipboard_text() {
+    if !backends_built() {
+        return;
+    }
+    let mut rdp = DesktopClient::new(Protocol::Rdp).expect("rdp client");
+    rdp.set_server("127.0.0.1", a_closed_port()).expect("server");
+    match rdp.clipboard("hello") {
+        Err(Error::Unavailable(reason)) => {
+            assert!(reason.contains("clipboard"), "{reason}");
+        }
+        other => panic!("an RDP session must report the missing channel, not {other:?}"),
+    }
+
+    let mut vnc = DesktopClient::new(Protocol::Vnc).expect("vnc client");
+    vnc.set_server("127.0.0.1", a_closed_port()).expect("server");
+    assert!(
+        matches!(vnc.clipboard("hello"), Err(Error::State)),
+        "a VNC session that is not connected reports the state, not the capability"
     );
 }
 
@@ -691,12 +747,11 @@ fn a_panicking_consumer_callback_cannot_unwind_into_the_library() {
     );
 }
 
-/// Ignored for the same reason as the frame test: it needs a live scripted session,
-/// and that fixture does not yet complete a handshake reliably enough to gate on.
-/// The close ordering is still exercised by the panic test and by every test that
-/// drops a session, but a full "connected then dropped" path needs the T5 endpoint.
+/// A live session is cancelled, its callback unregistered and its context freed in
+/// that order, and the whole sequence finishes without waiting for a protocol
+/// timeout. That the detach comes before the wait is what the crate documents; the
+/// observable part here is that the drop is prompt and the handle is released.
 #[test]
-#[ignore = "the scripted session fixture is not stable enough to gate close ordering; see the frame test"]
 fn dropping_a_session_detaches_before_it_frees() {
     if !backends_built() {
         return;
@@ -724,8 +779,52 @@ fn dropping_a_session_detaches_before_it_frees() {
     assert_eq!(leaked_handles(), 0, "the handle was released");
 }
 
-/// The scripted peer never becomes a real one; this test only documents that the
-/// client accepts a server that closes immediately after the handshake.
+/// A handshake that fails must not leave a pointer to the freed session behind.
+/// The cancel lands while the failure is being classified, which is exactly the
+/// window where the old code left client->backend dangling: the shim must clear the
+/// pointer before it frees, and an abort that arrives anyway must do nothing.
+#[test]
+fn cancelling_a_failing_vnc_handshake_touches_no_freed_session() {
+    if !backends_built() {
+        return;
+    }
+    // 18 is TLS; a build without a TLS backend refuses it, so the handshake fails
+    // quickly and deterministically.
+    for attempt in 0..3 {
+        let peer = Scripted::start(Script::SecurityTypes(vec![18]));
+        let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+        client.set_server("127.0.0.1", peer.port).expect("server");
+        client
+            .set_vnc_security(VncSecurity::DEFAULT)
+            .expect("security mask");
+        client.connect().expect("connect starts");
+        // Racing the failure on purpose: on some runs this aborts a live connect,
+        // on others it arrives after the handshake already failed.
+        let _ = client.cancel();
+
+        let events = pump(&client, PATIENCE, |event| {
+            matches!(
+                event,
+                Event::State {
+                    state: State::Failed(_) | State::Closed,
+                    ..
+                }
+            )
+        });
+        never_connected(&events);
+        let last = states(&events).last().copied();
+        assert!(
+            matches!(last, Some(State::Failed(_) | State::Closed)),
+            "attempt {attempt}: a cancelled or failed handshake ends in Failed or Closed: {events:?}"
+        );
+        client.wait_for_worker(PATIENCE).expect("the worker stops");
+        drop(client);
+        assert_eq!(leaked_handles(), 0, "attempt {attempt}: the handle was released");
+    }
+}
+
+/// A peer that closes right after its banner ends the session as a failure, and the
+/// test reports SKIP like every other one when the backends are not built.
 #[test]
 fn a_peer_that_hangs_up_after_its_banner_ends_the_session() {
     if !backends_built() {

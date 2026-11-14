@@ -10,7 +10,9 @@
 //! 1. A panic never crosses the C ABI. The callback trampoline catches it, counts
 //!    it and drops the event; the protocol worker keeps running.
 //! 2. Callbacks are unregistered before anything they captured is released.
-//!    `Drop` cancels, waits for the worker to exit, detaches, then frees.
+//!    `Drop` cancels, detaches, waits for the worker to exit, then frees: the
+//!    callback is gone before the protocol context is torn down, so a late state
+//!    event during shutdown is dropped instead of racing the release.
 //! 3. A frame is copied out of the library's buffer during the callback. The buffer
 //!    belongs to the protocol library and is never retained.
 //!
@@ -460,6 +462,11 @@ impl DesktopClient {
         status(unsafe { ffi::sd_client_set_vnc_security(self.handle, security.0) })
     }
 
+    /// Selects the pixel depth VNC frames are delivered in. Only four bytes per
+    /// pixel is accepted: the shim pins the RFB pixel format to 32bpp, so it can
+    /// never emit a three-byte frame. Any other value returns
+    /// [`Error::Argument`] instead of configuring a depth whose frames would all be
+    /// dropped.
     pub fn set_vnc_colour_depth(&mut self, bytes_per_pixel: u32) -> Result<(), Error> {
         status(unsafe { ffi::sd_client_set_vnc_colour_depth(self.handle, bytes_per_pixel) })
     }
@@ -518,9 +525,20 @@ impl DesktopClient {
         status(unsafe { ffi::sd_client_pointer(self.handle, x, y, buttons.0) })
     }
 
+    /// Submits clipboard text for the remote side.
+    ///
+    /// Only VNC forwards it: the RDP integration loads no clipboard channel, so an
+    /// RDP session reports [`Error::Unavailable`] here rather than accepting text
+    /// the shim would drop.
     pub fn clipboard(&self, text: &str) -> Result<(), Error> {
         let text = CString::new(text).map_err(|_| Error::Argument)?;
-        status(unsafe { ffi::sd_client_clipboard(self.handle, text.as_ptr()) })
+        match unsafe { ffi::sd_client_clipboard(self.handle, text.as_ptr()) } {
+            ffi::SD_OK => Ok(()),
+            ffi::SD_ERR_UNAVAILABLE => Err(Error::Unavailable(
+                "this backend does not forward clipboard text".to_string(),
+            )),
+            other => status(other),
+        }
     }
 
     /// Blocks until an event arrives or `timeout` passes. Only a session created
@@ -558,13 +576,17 @@ impl DesktopClient {
 
 impl Drop for DesktopClient {
     fn drop(&mut self) {
-        // 1. stop new protocol work, 2. wait for the worker and its context to go,
-        // 3. unregister the callback, 4. release the handle, 5. release the inbox.
+        // 1. stop new protocol work, 2. unregister the callback, 3. wait for the
+        // worker and its context to go, 4. release the handle, 5. release the inbox.
+        //
+        // The detach comes before the wait on purpose: the callback must not be
+        // reachable while the worker tears its context down (see the crate docs).
+        // It is idempotent, so the shim's own detach during free changes nothing.
         let _ = unsafe { ffi::sd_client_cancel(self.handle) };
+        unsafe { ffi::sd_client_detach(self.handle) };
         let stopped =
             unsafe { ffi::sd_client_wait(self.handle, SHUTDOWN_TIMEOUT.as_millis() as u32) }
                 == ffi::SD_OK;
-        unsafe { ffi::sd_client_detach(self.handle) };
 
         if !stopped {
             LEAKED_HANDLES.fetch_add(1, Ordering::Relaxed);
@@ -655,6 +677,11 @@ unsafe fn translate(event: &ffi::sd_event) -> Option<Event> {
 
 /// Copies one dirty region. The bounds are checked here as well as in C because a
 /// wrong stride would otherwise become an out-of-bounds read in this process.
+///
+/// The row width is four bytes per pixel and that is not an assumption: the shim
+/// pins its pixel format to 32bpp (sd_client_set_vnc_colour_depth refuses anything
+/// else), so a frame with another depth cannot be produced. A stride shorter than
+/// the row is still rejected rather than read.
 fn frame(event: &ffi::sd_event) -> Option<Event> {
     let width = event.w;
     let height = event.h;

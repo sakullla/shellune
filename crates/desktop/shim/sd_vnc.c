@@ -24,6 +24,19 @@
 
 #define SD_CONNECT_TIMEOUT_MS 10000u
 #define SD_POLL_SLICE_MS 20u
+/* Bounds a single blocking recv during a handshake or the security probe.
+ *
+ * Abort normally ends such a read by shutting the socket down, which makes recv
+ * return 0 at once. This timeout is the backstop for the case where it does not
+ * reach that socket, so a cancel can never leave the worker parked in recv: the
+ * read fails within this bound, the handshake reports failure, and the failure
+ * path reads the cancel flag. It is cleared again once the peer has answered, so
+ * a healthy session keeps its unlimited reads.
+ *
+ * Sized for the slowest legitimate handshake read (a TLS handshake step on a slow
+ * link), not for promptness: promptness comes from the shutdown, which is what
+ * makes a cancel land in milliseconds. */
+#define SD_HANDSHAKE_RECV_TIMEOUT_MS 2000u
 
 typedef struct sd_vnc_session {
   sd_client *client;
@@ -234,7 +247,11 @@ static uint32_t sd_vnc_security_bit(uint8_t type) {
 /* Asks a peer that just refused our handshake which security types it offers, on its
  * own short lived connection. This runs only after a failure, and answers exactly one
  * question: is every type it offers one this build refuses? Guessing from the
- * library's log text is not an interface; this is the protocol itself. */
+ * library's log text is not an interface; this is the protocol itself.
+ *
+ * The reads are bounded and the cancel flag is checked between them, because this
+ * runs on the worker thread: a peer that accepts and then says nothing must not be
+ * able to keep the worker alive past a cancel. */
 static int32_t sd_vnc_probe_rejects_our_security(sd_client *client, const char *host,
                                                  uint16_t port, uint32_t mask, char *offered,
                                                  size_t cap) {
@@ -246,9 +263,14 @@ static int32_t sd_vnc_probe_rejects_our_security(sd_client *client, const char *
   SOCKET sock = sd_vnc_connect(client, host, port, &scratch);
   if (sock == INVALID_SOCKET) return 0;
 
+  DWORD recv_timeout = SD_HANDSHAKE_RECV_TIMEOUT_MS;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout,
+             (int)sizeof(recv_timeout));
+
   int32_t rejected = 0;
   char version[12];
-  if (recv(sock, version, sizeof(version), MSG_WAITALL) == (int)sizeof(version)) {
+  if (!sd_is_cancelled(client) &&
+      recv(sock, version, sizeof(version), MSG_WAITALL) == (int)sizeof(version)) {
     static const char ours[] = "RFB 003.008\n";
     if (send(sock, ours, (int)sizeof(ours) - 1, 0) == (int)sizeof(ours) - 1) {
       uint8_t count = 0;
@@ -329,6 +351,22 @@ void sd_vnc_run(sd_client *client) {
   }
   session->sock = sock;
 
+  /* Published as soon as the socket exists, before rfbGetClient and before the
+   * blocking handshake. This is what removes the window the old code had: there is
+   * no moment after the connection is up where client->backend is still NULL, so
+   * abort always finds a session whose socket it can shut down.
+   *
+   * A cancel that arrived before this point set the flag before it called abort
+   * (sd_client_cancel writes the flag first), so the check below sees it; a cancel
+   * that arrives after it finds the published session. Neither ordering leaves the
+   * worker parked in a read. */
+  sd_backend_publish(client, session);
+  if (sd_is_cancelled(client)) {
+    failure = SD_FAILURE_CANCELLED;
+    snprintf(session->reason, sizeof(session->reason), "connect cancelled");
+    goto finish;
+  }
+
   rfbClient *rfb = rfbGetClient(8, 3, bytes_per_pixel);
   if (rfb == NULL) {
     failure = SD_FAILURE_INTERNAL;
@@ -376,9 +414,14 @@ void sd_vnc_run(sd_client *client) {
     SetClientAuthSchemes(rfb, schemes, count);
   }
 
-  EnterCriticalSection(&client->lock);
-  client->backend = session;
-  LeaveCriticalSection(&client->lock);
+  /* One bounded recv per handshake step, so the read above cannot park the worker
+   * forever if the abort's shutdown never reaches this socket. Cleared after the
+   * peer has answered, below, because a live session reads whole messages. */
+  {
+    DWORD recv_timeout = SD_HANDSHAKE_RECV_TIMEOUT_MS;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout,
+               (int)sizeof(recv_timeout));
+  }
 
   rfbBool initialised = rfbInitClient(rfb, NULL, NULL);
 
@@ -386,6 +429,11 @@ void sd_vnc_run(sd_client *client) {
     /* LibVNCClient frees the client and closes its socket itself when the handshake
      * fails, so the handle must not be touched or cleaned up again. */
     session->rfb = NULL;
+    /* Retire before the socket value is discarded and before the probe below opens
+     * a socket of its own: once this returns no thread is inside sd_vnc_abort with
+     * this session, so a stale SOCKET value cannot be handed to shutdown() after
+     * Windows has recycled the number for the probe. */
+    sd_backend_retire(client);
     session->sock = INVALID_SOCKET;
     if (sd_is_cancelled(client)) {
       failure = SD_FAILURE_CANCELLED;
@@ -407,6 +455,12 @@ void sd_vnc_run(sd_client *client) {
       }
     }
     goto finish;
+  }
+
+  {
+    DWORD recv_timeout = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout,
+               (int)sizeof(recv_timeout));
   }
 
   /* Ask once for the whole framebuffer at the requested size. */
@@ -444,9 +498,9 @@ void sd_vnc_run(sd_client *client) {
     snprintf(session->reason, sizeof(session->reason), "cancelled");
   }
 
-  EnterCriticalSection(&client->lock);
-  client->backend = NULL;
-  LeaveCriticalSection(&client->lock);
+  /* Retire first: after it returns no abort can be inside shutdown() on this
+   * socket, so the cleanup below is free to close it. */
+  sd_backend_retire(client);
   session->connected = 0;
   /* rfbClientCleanup closes rfb->sock, which is the socket created above. */
   session->sock = INVALID_SOCKET;
@@ -454,6 +508,10 @@ void sd_vnc_run(sd_client *client) {
   session->rfb = NULL;
 
 finish:
+  /* Also reached by the failure paths, which may not have retired yet. Idempotent:
+   * it clears the pointer (there is none by now in the normal case) and waits out
+   * any reader, so client->backend never outlives the session it points at. */
+  sd_backend_retire(client);
   if (session->sock != INVALID_SOCKET) {
     closesocket(session->sock);
     session->sock = INVALID_SOCKET;
@@ -473,19 +531,24 @@ finish:
 }
 
 void sd_vnc_abort(sd_client *client) {
-  EnterCriticalSection(&client->lock);
-  sd_vnc_session *session = (sd_vnc_session *)client->backend;
-  SOCKET sock = session != NULL ? session->sock : INVALID_SOCKET;
-  LeaveCriticalSection(&client->lock);
+  /* The reference is held across shutdown(), so the worker cannot free the session
+   * (and close its socket) in the middle of this call. */
+  sd_vnc_session *session = (sd_vnc_session *)sd_backend_acquire(client);
+  if (session == NULL) return;
   /* shutdown, not closesocket: the worker still owns the handle and will close it
    * after its blocking read returns. */
-  if (sock != INVALID_SOCKET) shutdown(sock, SD_BOTH);
+  if (session->sock != INVALID_SOCKET) shutdown(session->sock, SD_BOTH);
+  sd_backend_release(client);
 }
 
 static rfbClient *sd_vnc_live(sd_client *client, sd_vnc_session **out_session) {
-  EnterCriticalSection(&client->lock);
+  /* Reached from sd_flush_input only, which runs on the worker thread - the same
+   * thread that retires the session - so the returned pointer cannot be freed
+   * underneath the caller. It is read under backend_lock so it is never a value
+   * published by another thread without that lock. */
+  EnterCriticalSection(&client->backend_lock);
   sd_vnc_session *session = (sd_vnc_session *)client->backend;
-  LeaveCriticalSection(&client->lock);
+  LeaveCriticalSection(&client->backend_lock);
   if (out_session != NULL) *out_session = session;
   if (session == NULL || session->rfb == NULL) return NULL;
   return session->rfb;
@@ -534,10 +597,20 @@ sd_status sd_vnc_available(char *out, size_t cap) {
 #else
       "none";
 #endif
+  /* Built from the same compile-time conditions sd_vnc_security_bit() switches on,
+   * so the string cannot advertise a type the handshake would refuse. "vencrypt" is
+   * the RFB security type name; the old "vencrypt-auth" name does not exist. */
+  char security[48];
+  int used = snprintf(security, sizeof(security), "none,vncauth");
+#if defined(LIBVNCSERVER_HAVE_LIBSSL) || defined(LIBVNCSERVER_HAVE_GNUTLS)
+  if (used > 0 && (size_t)used < sizeof(security)) {
+    used += snprintf(security + used, sizeof(security) - (size_t)used, ",tls,vencrypt");
+  }
+#endif
   int written = snprintf(out, cap,
-                         "libvncclient=%s tls=%s security=none,vencrypt-auth "
+                         "libvncclient=%s tls=%s security=%s "
                          "encodings=raw,copyrect,rre,hextile,zrle",
-                         LIBVNCSERVER_VERSION, tls);
+                         LIBVNCSERVER_VERSION, tls, security);
   if (written < 0) return SD_ERR_INTERNAL;
   if ((size_t)written >= cap) return SD_ERR_ARGUMENT;
   return SD_OK;

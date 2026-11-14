@@ -47,8 +47,13 @@ struct sd_client {
   int32_t proto;
   int32_t reserved;
 
-  /* One recursive lock serialises event dispatch with detach and with state
-   * changes, so "no event after detach returned" holds without a second flag. */
+  /* One lock serialises event dispatch with detach and with state changes, so
+   * "no event after detach returned" holds without a second flag.
+   *
+   * It is a plain CRITICAL_SECTION, not a recursive one: the thread already
+   * holding it must not enter it again. Event dispatch calls the consumer's
+   * callback while holding it, so a callback must not call back into the same
+   * client (sd_client_cancel, sd_client_key, ... would deadlock). */
   CRITICAL_SECTION lock;
   sd_event_fn fn;
   void *user;
@@ -69,6 +74,17 @@ struct sd_client {
   HANDLE thread;
   volatile LONG cancel;
   volatile LONG running;
+
+  /* The backend session pointer, guarded separately from `lock`.
+   *
+   * Readers (abort, from any thread) take a reference under `backend_lock` and
+   * release it after their last use; the worker clears the pointer and waits for
+   * the reference count to reach zero before it frees the session. A separate
+   * lock is needed because releasing a session calls back into event dispatch,
+   * which takes `lock`, and `lock` is not recursive. */
+  CRITICAL_SECTION backend_lock;
+  HANDLE backend_idle;
+  volatile LONG backend_refs;
   void *backend;
 
   /* Certificate question: the worker waits here, another thread answers. */
@@ -106,6 +122,23 @@ int32_t sd_ask_certificate(sd_client *client, const char *host, const char *subj
                            const char *issuer, const char *fingerprint,
                            uint32_t flags);
 void sd_emit_clipboard(sd_client *client, const char *text, uint32_t len);
+
+/* --- backend pointer lifetime ---
+ *
+ * The worker publishes its session once the object exists and retires it before
+ * freeing. Anything that may run on another thread while the worker is alive
+ * (abort) reads the pointer through sd_backend_acquire and must call
+ * sd_backend_release after its last use of the session. */
+
+/* Publishes `backend` so other threads can reach it. */
+void sd_backend_publish(sd_client *client, void *backend);
+/* Returns the current backend with one reference held, or NULL. */
+void *sd_backend_acquire(sd_client *client);
+/* Drops one reference taken by sd_backend_acquire. */
+void sd_backend_release(sd_client *client);
+/* Clears the published pointer and waits until no reader holds a reference, so the
+ * caller may free the session. Called by the worker only, before the free. */
+void sd_backend_retire(sd_client *client);
 
 int32_t sd_is_cancelled(sd_client *client);
 /* Pops one queued input event. Returns 0 when the queue is empty. */

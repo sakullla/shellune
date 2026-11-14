@@ -246,6 +246,39 @@ int32_t sd_is_cancelled(sd_client *client) {
   return InterlockedCompareExchange(&client->cancel, 0, 0) != 0 ? 1 : 0;
 }
 
+/* ----------------------------------------------------------------- backend refs */
+
+void sd_backend_publish(sd_client *client, void *backend) {
+  EnterCriticalSection(&client->backend_lock);
+  client->backend = backend;
+  LeaveCriticalSection(&client->backend_lock);
+}
+
+void *sd_backend_acquire(sd_client *client) {
+  void *backend = NULL;
+  EnterCriticalSection(&client->backend_lock);
+  backend = client->backend;
+  if (backend != NULL) InterlockedIncrement(&client->backend_refs);
+  LeaveCriticalSection(&client->backend_lock);
+  return backend;
+}
+
+void sd_backend_release(sd_client *client) {
+  if (InterlockedDecrement(&client->backend_refs) == 0) SetEvent(client->backend_idle);
+}
+
+void sd_backend_retire(sd_client *client) {
+  EnterCriticalSection(&client->backend_lock);
+  client->backend = NULL;
+  LeaveCriticalSection(&client->backend_lock);
+  /* A reader holds the pointer only for the length of one library call, so this
+   * loop is bounded in practice; it exists because "abort ran once, concurrently"
+   * must not become a use-after-free. */
+  while (InterlockedCompareExchange(&client->backend_refs, 0, 0) != 0) {
+    WaitForSingleObject(client->backend_idle, 50);
+  }
+}
+
 int32_t sd_ask_certificate(sd_client *client, const char *host, const char *subject,
                            const char *issuer, const char *fingerprint,
                            uint32_t flags) {
@@ -381,8 +414,19 @@ sd_status sd_client_new(int32_t proto, sd_event_fn fn, void *user, sd_client **o
   client->height = 768;
   InitializeCriticalSection(&client->lock);
   InitializeCriticalSection(&client->input_lock);
+  InitializeCriticalSection(&client->backend_lock);
   client->cert_signal = CreateEventW(NULL, FALSE, FALSE, NULL);
   if (client->cert_signal == NULL) {
+    DeleteCriticalSection(&client->backend_lock);
+    DeleteCriticalSection(&client->input_lock);
+    DeleteCriticalSection(&client->lock);
+    free(client);
+    return SD_ERR_INTERNAL;
+  }
+  client->backend_idle = CreateEventW(NULL, FALSE, FALSE, NULL);
+  if (client->backend_idle == NULL) {
+    CloseHandle(client->cert_signal);
+    DeleteCriticalSection(&client->backend_lock);
     DeleteCriticalSection(&client->input_lock);
     DeleteCriticalSection(&client->lock);
     free(client);
@@ -483,7 +527,13 @@ sd_status sd_client_set_vnc_security(sd_client *client, uint32_t allowed_mask) {
 
 sd_status sd_client_set_vnc_colour_depth(sd_client *client, uint32_t bytes_per_pixel) {
   if (client == NULL) return SD_ERR_ARGUMENT;
-  if (bytes_per_pixel != 3 && bytes_per_pixel != 4) return SD_ERR_ARGUMENT;
+  /* Four bytes per pixel is the only depth this backend can deliver: sd_vnc_run
+   * pins the RFB pixel format to 32bpp and every frame is handed out from a
+   * four-byte-per-pixel framebuffer. Accepting 3 here would let a caller configure
+   * a depth the shim never produces, and the row width of a 3-byte frame would not
+   * match the stride the frame event promises. Refused at the ABI, not silently
+   * ignored. */
+  if (bytes_per_pixel != 4) return SD_ERR_ARGUMENT;
   EnterCriticalSection(&client->lock);
   if (client->proto != SD_PROTOCOL_VNC) {
     LeaveCriticalSection(&client->lock);
@@ -522,16 +572,24 @@ sd_status sd_client_connect(sd_client *client) {
   }
   InterlockedExchange(&client->cancel, 0);
   InterlockedExchange(&client->cert_answer, 0);
+  /* `running` is raised before the CONNECTING event so a consumer that reacts to
+   * that event by cancelling finds the session already marked live. The thread
+   * handle is published under the same lock further down; between the two,
+   * sd_client_wait and sd_client_free report SD_ERR_STATE rather than "stopped". */
   InterlockedExchange(&client->running, 1);
   client->state = SD_STATE_CONNECTING;
   LeaveCriticalSection(&client->lock);
 
   sd_emit_state(client, SD_STATE_CONNECTING, SD_FAILURE_NONE, 0, NULL);
 
-  client->thread = CreateThread(NULL, 0, sd_worker, client, 0, NULL);
-  if (client->thread == NULL) {
-    InterlockedExchange(&client->running, 0);
-    sd_emit_state(client, SD_STATE_FAILED, SD_FAILURE_INTERNAL, (int32_t)GetLastError(),
+  HANDLE thread = CreateThread(NULL, 0, sd_worker, client, 0, NULL);
+  DWORD thread_error = thread == NULL ? GetLastError() : 0;
+  EnterCriticalSection(&client->lock);
+  client->thread = thread;
+  if (thread == NULL) InterlockedExchange(&client->running, 0);
+  LeaveCriticalSection(&client->lock);
+  if (thread == NULL) {
+    sd_emit_state(client, SD_STATE_FAILED, SD_FAILURE_INTERNAL, (int32_t)thread_error,
                   "could not start the connection worker");
     return SD_ERR_INTERNAL;
   }
@@ -558,11 +616,15 @@ sd_status sd_client_cancel(sd_client *client) {
 
 sd_status sd_client_wait(sd_client *client, uint32_t timeout_ms) {
   if (client == NULL) return SD_ERR_ARGUMENT;
-  if (InterlockedCompareExchange(&client->running, 0, 0) == 0) return SD_OK;
   EnterCriticalSection(&client->lock);
+  int32_t running = InterlockedCompareExchange(&client->running, 0, 0) != 0 ? 1 : 0;
   HANDLE thread = client->thread;
   LeaveCriticalSection(&client->lock);
-  if (thread == NULL) return SD_OK;
+  if (!running) return SD_OK;
+  /* A live session with no published thread handle is not "already stopped": the
+   * worker was started but its handle has not been stored yet. Saying SD_OK here
+   * would let a caller free a handle a worker is about to use. */
+  if (thread == NULL) return SD_ERR_STATE;
   DWORD waited = WaitForSingleObject(thread, timeout_ms);
   if (waited == WAIT_OBJECT_0) return SD_OK;
   return SD_ERR_STATE;
@@ -636,6 +698,12 @@ sd_status sd_client_pointer(sd_client *client, uint16_t x, uint16_t y,
 
 sd_status sd_client_clipboard(sd_client *client, const char *utf8) {
   if (client == NULL || utf8 == NULL) return SD_ERR_ARGUMENT;
+  /* The RDP backend does not forward client clipboard text: FreeRDP's clipboard
+   * channel is not loaded, so sd_rdp_clipboard is a no-op. Saying so here is the
+   * only way a caller can tell "queued" from "dropped"; a silent SD_OK followed by
+   * a discarded event is not a reportable outcome. The check comes before the
+   * state check so an idle RDP handle answers the same way. */
+  if (client->proto == SD_PROTOCOL_RDP) return SD_ERR_UNAVAILABLE;
   size_t len = strlen(utf8);
   if (len > SD_MAX_CLIPBOARD_BYTES) return SD_ERR_ARGUMENT;
   char *copy = (char *)malloc(len + 1);
@@ -670,8 +738,15 @@ sd_status sd_client_free(sd_client *client) {
   if (InterlockedCompareExchange(&client->running, 0, 0) != 0) {
     sd_client_cancel(client);
     EnterCriticalSection(&client->lock);
+    int32_t running = InterlockedCompareExchange(&client->running, 0, 0) != 0 ? 1 : 0;
     HANDLE thread = client->thread;
     LeaveCriticalSection(&client->lock);
+    if (running && thread == NULL) {
+      /* The worker was started but its handle is not published yet, so there is
+       * nothing to wait on and no proof it has stopped. Refuse, as above. */
+      sd_client_detach(client);
+      return SD_ERR_STATE;
+    }
     if (thread != NULL && WaitForSingleObject(thread, SD_FREE_WAIT_MS) != WAIT_OBJECT_0) {
       /* The library still owns the handle. Give up the Rust callback and leave the
        * allocation alive rather than freeing memory a worker is writing. */
@@ -693,7 +768,9 @@ sd_status sd_client_free(sd_client *client) {
   free(client->cert_fingerprint);
   free(client->clipboard_text);
   if (client->cert_signal != NULL) CloseHandle(client->cert_signal);
+  if (client->backend_idle != NULL) CloseHandle(client->backend_idle);
   DeleteCriticalSection(&client->input_lock);
+  DeleteCriticalSection(&client->backend_lock);
   DeleteCriticalSection(&client->lock);
   free(client);
   return SD_OK;

@@ -26,6 +26,14 @@ Fetching needs network access the first time. After a successful build the
 verified tarball and the unpacked tree are reused, and an offline re-run works as
 long as <work>/src still holds the trees the manifest points at.
 
+Re-running skips a step only when its archives are installed *and* carry a pin
+stamp naming the version, commit, tarball hash and options they were built from
+(<dist>/.shellune-step-<name>). A missing or different stamp rebuilds, so a
+changed pin cannot leave the prefix on the old version while the manifest claims
+the new one. `--self-test` checks that comparison without a toolchain or network;
+the first run against a prefix built by an older version of this script rebuilds
+once, because those archives have no stamp yet.
+
 Nothing is downloaded at run time and no installed DLL is used: the shim links
 the static archives built here. Build prerequisites live in vendor/README.md -
 Visual Studio Build Tools (MSVC, CMake, Ninja) and, for OpenSSL, a Perl with its
@@ -47,6 +55,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -93,6 +102,11 @@ LIBVNC = {
 # Written into an unpacked tree so a later run can tell a verified checkout from a
 # half-finished download without hashing the whole tree again.
 SOURCE_STAMP = ".shellune-source-commit"
+# Written into the prefix next to the archives, so a later run can tell which pin
+# those archives were compiled from. Without it a changed pin plus an existing
+# archive would write a manifest that claims the new version while the prefix still
+# holds the old one.
+STEP_STAMP = ".shellune-step-"
 
 # Fetched by tag. The commit is verified after checkout.
 EXTERNALS = {
@@ -230,15 +244,50 @@ def log(message: str) -> None:
     print("[native] " + message, flush=True)
 
 
-def already_built(dist: pathlib.Path, names: list[str], force: bool) -> bool:
-    """Skips a step whose archives are already in the prefix.
+def step_pin(name: str, spec: dict, options: list[str] | tuple[str, ...] = ()) -> str:
+    """The identity of one build step: what it compiles and how."""
+    parts = [name, str(spec.get("version", spec.get("tag", ""))), str(spec.get("commit", "")),
+             str(spec.get("sha256", ""))]
+    parts.extend(options)
+    return "|".join(parts)
+
+
+def step_stamp_path(dist: pathlib.Path, name: str) -> pathlib.Path:
+    return dist / (STEP_STAMP + name)
+
+
+def already_built(dist: pathlib.Path, names: list[str], force: bool,
+                  step: str | None = None, pin: str | None = None) -> bool:
+    """Skips a step whose archives are already in the prefix, built from this pin.
 
     The script is meant to be re-runnable: after a failure in a later step, or after
     adding an option, nobody should have to rebuild OpenSSL again from scratch.
+
+    An archive on disk is not enough. The step stamp records the version, commit,
+    tarball hash and options the archives were produced from, and a run with a
+    different pin (or with no stamp at all) rebuilds. Otherwise a changed pin would
+    leave the old archives in place while write_manifest() declared the new ones.
     """
     if force:
         return False
-    return all((dist / "lib" / (name + ".lib")).is_file() for name in names)
+    if not all((dist / "lib" / (name + ".lib")).is_file() for name in names):
+        return False
+    if step is None or pin is None:
+        return True
+    stamp = step_stamp_path(dist, step)
+    if not stamp.is_file():
+        log(step + ": installed archives carry no pin stamp; rebuilding them")
+        return False
+    recorded = stamp.read_text(encoding="utf-8").strip()
+    if recorded != pin:
+        log(step + ": installed archives were built from another pin; rebuilding them")
+        return False
+    return True
+
+
+def record_built(dist: pathlib.Path, step: str, pin: str) -> None:
+    """Records the pin the archives in `dist` were built from."""
+    step_stamp_path(dist, step).write_text(pin + "\n", encoding="utf-8")
 
 
 def run(command: list[str], cwd: pathlib.Path | None = None) -> None:
@@ -399,9 +448,16 @@ def ensure_source(work: pathlib.Path, spec: dict) -> pathlib.Path:
     return unpack(archive, spec, work)
 
 
+ZLIB_OPTIONS = ("-DCMAKE_BUILD_TYPE=Release", "-DZLIB_BUILD_EXAMPLES=OFF",
+                "-DBUILD_SHARED_LIBS=OFF")
+OPENSSL_OPTIONS = ("Configure VC-WIN64A no-asm no-shared no-tests no-docs no-apps",
+                   'CFLAGS="/MD -O2"')
+
+
 def build_zlib(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
                force: bool) -> None:
-    if already_built(dist, ["zlibstatic"], force):
+    pin = step_pin("zlib", EXTERNALS["zlib"], ZLIB_OPTIONS)
+    if already_built(dist, ["zlibstatic"], force, "zlib", pin):
         log("zlib already installed")
         return
     source = fetch_external(work, "zlib", EXTERNALS["zlib"])
@@ -416,11 +472,13 @@ def build_zlib(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path
         ]),
         "cmake --build " + quoted(build) + " --target install",
     ])
+    record_built(dist, "zlib", pin)
 
 
 def build_openssl(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
                   perl: str, force: bool) -> None:
-    if already_built(dist, ["libcrypto", "libssl"], force):
+    pin = step_pin("openssl", EXTERNALS["openssl"], OPENSSL_OPTIONS)
+    if already_built(dist, ["libcrypto", "libssl"], force, "openssl", pin):
         log("openssl already installed")
         return
     source = fetch_external(work, "openssl", EXTERNALS["openssl"])
@@ -439,12 +497,14 @@ def build_openssl(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
         "nmake /nologo build_libs >> " + quoted(log_path),
         "nmake /nologo install_dev >> " + quoted(log_path),
     ])
+    record_built(dist, "openssl", pin)
 
 
 def build_freerdp(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
                   source: pathlib.Path, force: bool) -> pathlib.Path | None:
     build = work / "build" / "freerdp"
-    if already_built(dist, FREERDP_LIBRARIES, force):
+    pin = step_pin("freerdp", FREERDP, FREERDP_OPTIONS)
+    if already_built(dist, FREERDP_LIBRARIES, force, "freerdp", pin):
         log("freerdp already installed")
         return build
     options = [
@@ -457,13 +517,15 @@ def build_freerdp(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
         " ".join(["cmake -S", quoted(source), "-B", quoted(build), "-G Ninja", *options]),
         "cmake --build " + quoted(build),
     ])
+    record_built(dist, "freerdp", pin)
     return build
 
 
 def build_libvnc(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
                  source: pathlib.Path, force: bool) -> pathlib.Path | None:
     build = work / "build" / "libvncserver"
-    if already_built(dist, LIBVNC_LIBRARIES, force):
+    pin = step_pin("libvncserver", LIBVNC, LIBVNC_OPTIONS)
+    if already_built(dist, LIBVNC_LIBRARIES, force, "libvncserver", pin):
         log("libvncserver already installed")
         return build
     options = [
@@ -476,6 +538,7 @@ def build_libvnc(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Pa
         " ".join(["cmake -S", quoted(source), "-B", quoted(build), "-G Ninja", *options]),
         "cmake --build " + quoted(build),
     ])
+    record_built(dist, "libvncserver", pin)
     return build
 
 
@@ -520,6 +583,40 @@ def write_manifest(dist: pathlib.Path, include_dirs: list[pathlib.Path],
     log("wrote " + str(target))
 
 
+def self_test() -> int:
+    """Checks the pin comparison without a toolchain, network or prefix.
+
+    Run it with `python packaging/native/build_native.py --self-test`. It builds a
+    throwaway prefix and asserts the three cases that matter: no stamp means
+    rebuild, a matching stamp skips, a changed pin rebuilds even though the archive
+    is still on disk.
+    """
+    work = pathlib.Path(tempfile.mkdtemp(prefix="shellune-native-selftest-"))
+    try:
+        dist = work / "dist"
+        (dist / "lib").mkdir(parents=True)
+        (dist / "lib" / "zlibstatic.lib").write_bytes(b"archive")
+        pin = step_pin("zlib", EXTERNALS["zlib"], ZLIB_OPTIONS)
+        if already_built(dist, ["zlibstatic"], False, "zlib", pin):
+            raise SystemExit("self-test: an archive without a stamp must not count as built")
+        record_built(dist, "zlib", pin)
+        if not already_built(dist, ["zlibstatic"], False, "zlib", pin):
+            raise SystemExit("self-test: a matching stamp must be reused")
+        if already_built(dist, ["zlibstatic"], True, "zlib", pin):
+            raise SystemExit("self-test: --force must rebuild")
+        moved = step_pin("zlib", {
+            **EXTERNALS["zlib"], "commit": "0" * 40
+        }, ZLIB_OPTIONS)
+        if already_built(dist, ["zlibstatic"], False, "zlib", moved):
+            raise SystemExit(
+                "self-test: a changed pin must rebuild even though the archive exists"
+            )
+        log("self-test passed: pin stamping decides skip versus rebuild as documented")
+        return 0
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build the pinned native desktop backends.")
     parser.add_argument("--work", default=str(REPO_ROOT / "target/native"),
@@ -531,7 +628,12 @@ def main() -> int:
                         help="Perl with its standard modules, needed by OpenSSL")
     parser.add_argument("--force", action="store_true",
                         help="rebuild steps whose archives are already installed")
+    parser.add_argument("--self-test", action="store_true",
+                        help="check the pin comparison logic and exit, no build")
     arguments = parser.parse_args()
+
+    if arguments.self_test:
+        return self_test()
 
     if sys.platform != "win32":
         raise SystemExit(
