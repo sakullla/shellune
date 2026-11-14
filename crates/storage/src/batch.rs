@@ -351,6 +351,93 @@ impl BatchStore {
         Ok(RunLog {
             events,
             tail_ignored,
+            head_skipped: false,
+        })
+    }
+
+    /// The end of a run's log, as the events that fit in `max_bytes`.
+    ///
+    /// This is the bounded read the task centre uses when it rebuilds one host's
+    /// output on demand: a run with thousands of hosts must not be loaded whole to
+    /// show the last screenful of one of them. The file is read from its end, so a
+    /// log of any length costs one seek and one read.
+    ///
+    /// The first line of such a read can begin in the middle of a line, and is
+    /// dropped as the fragment it is; `head_skipped` says whether that happened. The
+    /// last line is tolerated the same way [Self::read_events] tolerates a torn tail,
+    /// and a complete line that is not an event is still corruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read failure, or corruption for a complete line that is not an
+    /// event.
+    pub fn read_events_tail(
+        &self,
+        run: BatchRunId,
+        max_bytes: usize,
+    ) -> Result<RunLog, PersistError> {
+        let path = self.log_path(run);
+        let read = |reason: String| PersistError::Read {
+            label: LOG_LABEL,
+            path: path.clone(),
+            reason,
+        };
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(RunLog::default()),
+            Err(error) => return Err(read(error.to_string())),
+        };
+        let length = file
+            .metadata()
+            .map_err(|error| read(error.to_string()))?
+            .len();
+        let window = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let start = length.saturating_sub(window);
+        // A read that starts past the beginning starts somewhere in the middle of the
+        // file. One byte before the window says whether that is a line boundary.
+        let starts_on_a_line = if start == 0 {
+            true
+        } else {
+            file.seek(SeekFrom::Start(start - 1))
+                .map_err(|error| read(error.to_string()))?;
+            let mut previous = [0u8; 1];
+            file.read_exact(&mut previous)
+                .map_err(|error| read(error.to_string()))?;
+            previous[0] == b'\n'
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| read(error.to_string()))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut parts: Vec<&str> = text.split('\n').collect();
+        if !starts_on_a_line && !parts.is_empty() {
+            parts.remove(0);
+        }
+        let lines: Vec<&str> = parts
+            .into_iter()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let last = lines.len().saturating_sub(1);
+        let mut events = Vec::with_capacity(lines.len());
+        let mut tail_ignored = false;
+        for (index, line) in lines.into_iter().enumerate() {
+            match serde_json::from_str::<BatchEvent>(line) {
+                Ok(event) => events.push(event),
+                Err(_) if index == last => tail_ignored = true,
+                Err(error) => {
+                    return Err(PersistError::Corrupt {
+                        label: LOG_LABEL,
+                        path,
+                        reason: format!("a complete line is not an event: {error}"),
+                    });
+                }
+            }
+        }
+        Ok(RunLog {
+            events,
+            tail_ignored,
+            head_skipped: start > 0,
         })
     }
 
@@ -511,6 +598,7 @@ struct RunDocument {
 pub struct RunLog {
     events: Vec<BatchEvent>,
     tail_ignored: bool,
+    head_skipped: bool,
 }
 
 impl RunLog {
@@ -524,6 +612,15 @@ impl RunLog {
     #[must_use]
     pub fn tail_ignored(&self) -> bool {
         self.tail_ignored
+    }
+
+    /// Whether the read started past the beginning of the log.
+    ///
+    /// A bounded read that began at the end of the file says so, so a caller can show
+    /// "the log continues above" instead of presenting a tail as the whole run.
+    #[must_use]
+    pub fn head_skipped(&self) -> bool {
+        self.head_skipped
     }
 
     /// Rebuilds a run by folding this log over its summary.
@@ -1065,5 +1162,93 @@ mod tests {
                 },
             ))
             .expect("the summary folds too");
+    }
+
+    #[test]
+    fn the_tail_of_a_long_log_reads_back_bounded_and_says_what_it_skipped() {
+        let store = BatchStore::at(scratch("tail"));
+        let run = planned(&task(&["alpha"]));
+        let host = run.hosts()[0].target().host_id();
+        let mut written = Vec::new();
+        for index in 0..200u32 {
+            written.push(
+                store
+                    .append(
+                        run.id(),
+                        BatchEventKind::Output {
+                            host,
+                            step: 0,
+                            stream: OutputStream::Stdout,
+                            chunk: format!("line {index}\n"),
+                        },
+                        u64::from(index),
+                    )
+                    .expect("the line is written"),
+            );
+        }
+        let whole = store.read_events(run.id()).expect("the log reads back");
+        assert_eq!(whole.events().len(), written.len());
+        assert!(
+            !whole.head_skipped(),
+            "a whole read starts at the beginning"
+        );
+
+        // A window smaller than the log reads its end only, and does not pretend
+        // that the events it did not read never happened.
+        let tail = store
+            .read_events_tail(run.id(), 512)
+            .expect("the tail reads back");
+        assert!(tail.head_skipped(), "the tail says the log continues above");
+        assert!(!tail.events().is_empty());
+        assert!(tail.events().len() < whole.events().len());
+        assert!(!tail.tail_ignored());
+        let last = tail.events().last().expect("at least one event");
+        assert_eq!(last.seq(), 199, "the newest line is what a tail must keep");
+        assert!(
+            tail.events()
+                .windows(2)
+                .all(|pair| pair[1].seq() == pair[0].seq() + 1),
+            "the events a tail keeps are contiguous"
+        );
+
+        // A window larger than the log is the whole log.
+        let all = store
+            .read_events_tail(run.id(), 1 << 20)
+            .expect("the whole log reads back");
+        assert!(!all.head_skipped());
+        assert_eq!(all.events().len(), whole.events().len());
+    }
+
+    #[test]
+    fn a_tail_that_begins_inside_a_line_drops_the_fragment_and_keeps_the_rest() {
+        let store = BatchStore::at(scratch("tail-fragment"));
+        let run = planned(&task(&["alpha"]));
+        let host = run.hosts()[0].target().host_id();
+        for index in 0..40u32 {
+            store
+                .append(
+                    run.id(),
+                    BatchEventKind::Output {
+                        host,
+                        step: 0,
+                        stream: OutputStream::Stdout,
+                        chunk: format!("a long line number {index}\n"),
+                    },
+                    u64::from(index),
+                )
+                .expect("the line is written");
+        }
+        // A window of a few lines starts inside a JSON object, which is exactly the
+        // fragment a bounded read has to drop instead of reporting it as corruption.
+        let tail = store
+            .read_events_tail(run.id(), 500)
+            .expect("the tail reads back");
+        assert!(tail.head_skipped());
+        assert!(
+            tail.events().len() >= 2,
+            "a window of a few lines keeps the complete ones"
+        );
+        let last = tail.events().last().expect("at least one event");
+        assert_eq!(last.seq(), 39);
     }
 }

@@ -1318,3 +1318,120 @@ fn a_batch_runs_two_steps_over_a_real_server_when_one_can_be_started() {
         "the second command's output was recorded: {output}"
     );
 }
+
+#[test]
+fn a_saved_definition_keeps_its_identity_and_each_run_of_it_gets_a_new_one() {
+    let one = host("alpha");
+    let store = BatchStore::at(scratch("identities"));
+    let definition = task(&["uptime"], &[&one], 1);
+    let task_id = definition.id();
+
+    // Saving a definition writes it down and runs nothing.
+    let mut book = shellune_core::BatchBook::new();
+    book.insert(definition.clone());
+    store.save_tasks(&book).expect("the definition saves");
+    let reloaded = store.load_tasks().expect("the definition reads back");
+    assert_eq!(reloaded.tasks().len(), 1);
+    assert_eq!(reloaded.task(task_id), Some(&definition));
+
+    // Editing it again keeps the identifier, so saving replaces that one record.
+    let mut edited = definition.clone().with_id(task_id);
+    edited.set_name(Some("nightly"));
+    let mut book = reloaded;
+    book.insert(edited.clone());
+    store.save_tasks(&book).expect("the edit saves");
+    let reloaded = store.load_tasks().expect("the edit reads back");
+    assert_eq!(reloaded.tasks().len(), 1, "an edit is not a second copy");
+    assert_eq!(
+        reloaded.task(task_id).and_then(BatchTask::name),
+        Some("nightly")
+    );
+
+    // Two runs of the same definition are two runs: their own identity, their own
+    // record, so a history can tell them apart.
+    let confirmed = edited.confirm(1_700_000_020).expect("a confirmable task");
+    let first = BatchRun::planned(&confirmed, BatchRunId::new(), 1_700_000_021);
+    let second = BatchRun::planned(&confirmed, BatchRunId::new(), 1_700_000_022);
+    assert_ne!(first.id(), second.id());
+    assert_eq!(
+        first.task().id(),
+        task_id,
+        "both runs come from the same definition"
+    );
+    assert_eq!(second.task().id(), task_id);
+    store.save_run(&first).expect("the first run saves");
+    store.save_run(&second).expect("the second run saves");
+    assert_eq!(
+        store.list_runs().expect("the runs list").len(),
+        2,
+        "each run has its own record"
+    );
+}
+
+#[test]
+fn the_end_of_a_finished_runs_log_reads_back_bounded() {
+    let one = host("alpha");
+    let two = host("beta");
+    let hosts = Arc::new(FakeHosts::default());
+    let store = BatchStore::at(scratch("tail"));
+    let confirmed = task(&["uptime", "df -h"], &[&one, &two], 2)
+        .confirm(1_700_000_030)
+        .expect("a confirmable task");
+    let mut run = BatchRun::planned(&confirmed, BatchRunId::new(), 1_700_000_031);
+    store.save_run(&run).expect("the planned run saves");
+    let mut runner =
+        BatchRunner::start(confirmed, factory(&hosts), RunnerOptions { concurrency: 2 });
+    let mut written = 0;
+    while !runner.is_finished() {
+        for event in runner.drain() {
+            store
+                .append(run.id(), event.kind().clone(), event.at_unix())
+                .expect("the line is appended");
+            run.apply(&event).expect("the event folds");
+            written += 1;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for event in runner.join() {
+        store
+            .append(run.id(), event.kind().clone(), event.at_unix())
+            .expect("the line is appended");
+        run.apply(&event).expect("the event folds");
+        written += 1;
+    }
+    store.save_run(&run).expect("the summary saves");
+    assert_eq!(run.state(), RunState::Completed);
+
+    let whole = store.read_events(run.id()).expect("the log reads back");
+    assert_eq!(whole.events().len(), written);
+    assert!(
+        !whole.head_skipped(),
+        "a whole read starts at the beginning"
+    );
+
+    // A window that holds only the end of the log keeps the newest lines, and says that
+    // the rest continues above instead of presenting a tail as the run's whole story.
+    let tail = store
+        .read_events_tail(run.id(), 400)
+        .expect("the tail reads back");
+    assert!(tail.head_skipped(), "the tail says the log continues above");
+    assert!(tail.events().len() < whole.events().len());
+    assert!(!tail.tail_ignored());
+    assert!(
+        tail.events()
+            .windows(2)
+            .all(|pair| pair[1].seq() == pair[0].seq() + 1),
+        "the events a tail keeps are contiguous"
+    );
+    let last = tail.events().last().expect("the tail has events");
+    assert!(
+        matches!(
+            last.kind(),
+            BatchEventKind::RunState {
+                state: RunState::Completed
+            }
+        ),
+        "the end of the run is what a tail must keep, found {:?}",
+        last.kind()
+    );
+}

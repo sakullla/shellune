@@ -839,6 +839,18 @@ impl BatchTask {
         self.id
     }
 
+    /// The same definition under an identity it already has.
+    ///
+    /// A saved task that is edited again keeps its identifier: the library lists
+    /// tasks by id, and a run's history names the id it came from. A copy or a retry
+    /// is a different task and gets a fresh one, which is what [Self::new] and
+    /// [Self::retry_after] do.
+    #[must_use]
+    pub fn with_id(mut self, id: BatchTaskId) -> Self {
+        self.id = id;
+        self
+    }
+
     /// The name a list shows, when the user gave one.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
@@ -2113,6 +2125,20 @@ mod tests {
         assert!(!encoded.contains("passphrase"));
         let decoded: BatchTask = serde_json::from_str(&encoded).expect("it reads back");
         assert_eq!(decoded, task);
+    }
+
+    #[test]
+    fn a_task_edited_again_keeps_the_identity_it_was_saved_under() {
+        let one = host("alpha");
+        let task = task(&["uptime"], &[&one]);
+        let saved = task.id();
+        // A copy of a saved task is a different record...
+        let copy = task.clone().with_id(BatchTaskId::new());
+        assert_ne!(copy.id(), saved, "a copy is a different task");
+        // ...and editing the saved one again puts its identity back.
+        let edited = copy.with_id(saved);
+        assert_eq!(edited.id(), saved, "an edit keeps the saved task's id");
+        assert_eq!(edited, task, "and nothing else about the definition");
     }
 
     #[test]
