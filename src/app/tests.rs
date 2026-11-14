@@ -4249,6 +4249,66 @@ async fn the_wheel_scrolls_back_through_the_history(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn tab_padded_columns_stay_on_their_column(cx: &mut TestAppContext) {
+    // macOS "ls -C" pads its columns with tabs, and each row writes a different
+    // number of them: the widest name needs fewer, the rest pad to the next stop.
+    // The grid keeps a tab as the marker of the stop it covers, so a row that drew
+    // it as a character put its next column somewhere else than the row above.
+    let (pane, cx) = pane_with("ab\t\t--\t::\r\nabcdef\t\t--\t::", cx);
+    let rows = cx.update(|_window, app| pane.read(app).visible_text());
+    let column = rows[0].find("--").expect("the first row holds the column");
+    assert!(
+        !rows[0].contains('\t'),
+        "a tab cell is drawn as a blank: {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[1].find("--"),
+        Some(column),
+        "the second row's column starts where the first one does: {:?} / {:?}",
+        rows[0],
+        rows[1]
+    );
+}
+
+#[gpui::test]
+async fn a_scroll_smaller_than_a_line_waits_until_it_adds_up(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with(&needle_lines(400), cx);
+    let center = bounds_of(cx, "terminal.viewport").center();
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    let offset = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| pane.read(app).display_offset())
+    };
+    let scroll = |cx: &mut VisualTestContext, pixels: f32| {
+        cx.simulate_event(ScrollWheelEvent {
+            position: center,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(pixels))),
+            modifiers: Modifiers::default(),
+            touch_phase: Default::default(),
+        });
+        cx.run_until_parked();
+    };
+
+    // A pixel is a fraction of a line, not a line: the view stays on the live
+    // bottom and the fraction is kept instead of being rounded up.
+    scroll(cx, 1.0);
+    assert_eq!(offset(cx), 0, "a sub-line scroll must not jump a whole line");
+
+    // The same downward, at the bottom the history cannot take: nothing is left
+    // over, so a gesture that ran past the end cannot pull the view back up.
+    scroll(cx, -2.0);
+    assert_eq!(offset(cx), 0, "a scroll past the end leaves nothing behind");
+
+    // Enough pixels of the same gesture add up to the line they make.
+    let per_line = cell.height.max(1.0);
+    let steps = (per_line / 2.0).ceil() as usize + 1;
+    for _ in 0..steps {
+        scroll(cx, 2.0);
+    }
+    assert_eq!(offset(cx), 1, "the fractions add up to exactly one line");
+}
+
+#[gpui::test]
 async fn the_font_size_controls_change_the_grid(cx: &mut TestAppContext) {
     let (pane, cx) = pane_with("abc", cx);
     let before = cx.update(|_window, app| {

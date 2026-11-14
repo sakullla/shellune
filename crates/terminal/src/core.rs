@@ -586,7 +586,12 @@ impl TerminalCore {
                 String::new()
             };
             if !hidden {
-                text.push(cell.c);
+                // A tab is the marker the grid keeps for the stop it covers: the
+                // cells after it are already blank, so it is drawn as the blank it
+                // stands for. Drawn as a tab, its width is not a cell's — a tab
+                // inside a run of text is not one advance wide — and every column
+                // after it in the line drifts. "ls" pads its columns with tabs.
+                text.push(if cell.c == '\t' { ' ' } else { cell.c });
                 if let Some(zerowidth) = cell.zerowidth() {
                     for character in zerowidth {
                         text.push(*character);
@@ -1235,6 +1240,36 @@ mod tests {
         assert_eq!(snapshot.rows.len(), 10);
         assert_eq!(snapshot.row_text(0).as_deref(), Some("hello"));
         assert_eq!(snapshot.cursor.expect("cursor is visible").column, 5);
+    }
+
+    #[test]
+    fn a_tab_is_drawn_as_the_blanks_it_stands_for() {
+        // "ls -C" pads its columns with tabs, so each row writes a different number
+        // of them; the grid keeps the tab as a marker on the first cell of the stop
+        // and leaves the rest blank. Drawn as a character, every column after it in
+        // that row would drift by its own width, and the columns would not line up.
+        let mut terminal = core();
+        terminal.feed(b"ab\t--\t\t::\r\nabcde\t--\t\t::");
+        let snapshot = terminal.snapshot();
+        let short = snapshot.row_text(0).expect("row 0");
+        let long = snapshot.row_text(1).expect("row 1");
+
+        assert!(!short.contains('\t'), "a tab is drawn as a blank: {short:?}");
+        assert_eq!(
+            short.find("--"),
+            long.find("--"),
+            "the column after the tabs lines up: {short:?} / {long:?}"
+        );
+        assert_eq!(
+            short.find("::"),
+            long.find("::"),
+            "the second column lines up too: {short:?} / {long:?}"
+        );
+        assert_eq!(
+            long.find("--"),
+            Some(8),
+            "a tab stops at the next multiple of 8"
+        );
     }
 
     #[test]

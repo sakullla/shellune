@@ -440,6 +440,14 @@ pub struct TerminalPane {
     /// that offset so the same rows stay on screen, and the old number would
     /// close onto a lower row.
     search_scroll: Option<LineAnchor>,
+    /// Lines a trackpad has scrolled that did not add up to a whole line yet.
+    ///
+    /// A trackpad reports most of a gesture in deltas smaller than one line.
+    /// Moving a line for each of them turns a gentle flick into a jump, and makes
+    /// a stray sub-pixel event — the ones a gesture ends with as the fingers
+    /// settle — a whole line of its own, which reads as the view scrolling by
+    /// itself. The fraction waits until it adds up.
+    scroll_fraction: f32,
     block_filter: BlockFilter,
     /// The shortcuts the pane's own controls answer, as the bindings in force show
     /// them (R5). The view keeps this in step with the settings page.
@@ -614,6 +622,7 @@ impl TerminalPane {
             search_mark: None,
             search_options: SearchOptions::literal(),
             search_scroll: None,
+            scroll_fraction: 0.0,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
@@ -676,6 +685,7 @@ impl TerminalPane {
             search_mark: None,
             search_options: SearchOptions::literal(),
             search_scroll: None,
+            scroll_fraction: 0.0,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
@@ -737,6 +747,7 @@ impl TerminalPane {
             search_mark: None,
             search_options: SearchOptions::literal(),
             search_scroll: None,
+            scroll_fraction: 0.0,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
@@ -815,6 +826,7 @@ impl TerminalPane {
             search_mark: None,
             search_options: SearchOptions::literal(),
             search_scroll: None,
+            scroll_fraction: 0.0,
             block_filter: BlockFilter::All,
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
@@ -2033,15 +2045,19 @@ impl TerminalPane {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        let lines = match event.delta {
+        let scrolled = match event.delta {
             ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => f32::from(delta.y) / self.cell.sanitized().height,
         };
-        let lines = if lines.abs() < 1.0 {
-            lines.signum() * 1.0
-        } else {
-            lines.trunc()
-        } as i32;
+        // The fraction is kept rather than rounded up: a trackpad sends a gesture as
+        // many deltas smaller than a line, and moving a line for each of them would
+        // both make the scroll jump and turn the last, near-zero events of a gesture
+        // into lines of their own — the view would go on scrolling after the fingers
+        // stopped, and climb back out of the bottom it had just reached.
+        self.scroll_fraction += scrolled;
+        let whole = self.scroll_fraction.trunc();
+        self.scroll_fraction -= whole;
+        let lines = whole as i32;
         if lines == 0 {
             return;
         }
@@ -2072,7 +2088,14 @@ impl TerminalPane {
             self.write(&bytes, cx);
             return;
         }
+        let before = self.core.display_offset();
         self.core.scroll(lines);
+        // A scroll the history could not take leaves nothing behind: the next event
+        // starts from where the view really is instead of from where a gesture that
+        // ran past an end wanted it to be.
+        if self.core.display_offset() == before {
+            self.scroll_fraction = 0.0;
+        }
         cx.notify();
     }
 
