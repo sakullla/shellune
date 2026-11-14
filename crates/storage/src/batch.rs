@@ -129,6 +129,68 @@ impl BatchStore {
         )
     }
 
+    /// Reads the saved tasks, upgrading a document the previous build wrote.
+    ///
+    /// Version 0.4.4 saved a task by loading a default `BatchBook` first, and a default
+    /// book declares format version 0 - a document this build refuses to read. A machine
+    /// that saved one task with that build therefore holds
+    /// `{"version": 0, "tasks": [...]}`, and would never be able to save again unless
+    /// the user deleted the file by hand.
+    ///
+    /// Such a document is migrated in place: it is read as a book, checked by the same
+    /// shape and definition rules the current format uses, and rewritten at the current
+    /// version through the atomic writer. Anything doubtful - damaged JSON, a newer
+    /// version, a secret field, a task this build would not have written - is refused
+    /// and the file is left exactly as it was, so the evidence of what went wrong is
+    /// never deleted by a migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read failure, a damaged or newer document, or a stored task this
+    /// build would not have written.
+    pub fn load_tasks_upgrading(&self) -> Result<BatchBook, PersistError> {
+        let path = self.tasks_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // A first save starts an empty book at the current format instead of the
+            // version a default book declares.
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BatchBook::new()),
+            Err(error) => {
+                return Err(PersistError::Read {
+                    label: TASKS_LABEL,
+                    path,
+                    reason: error.to_string(),
+                });
+            }
+        };
+        let corrupt = |path: PathBuf, reason: String| PersistError::Corrupt {
+            label: TASKS_LABEL,
+            path,
+            reason,
+        };
+        // Only a document that says version 0 is migrated. Everything else is read by
+        // the strict reader, which already reports a newer version, a missing version
+        // and damage without touching the file.
+        let version = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.get("version").and_then(|number| number.as_u64()));
+        if version != Some(0) {
+            return self.load_tasks();
+        }
+        let legacy: BatchBook = serde_json::from_str(&text)
+            .map_err(|error| corrupt(path.clone(), error.to_string()))?;
+        legacy
+            .validate()
+            .map_err(|reason| corrupt(path.clone(), reason))?;
+        let mut upgraded = BatchBook::new();
+        for task in legacy.tasks() {
+            upgraded.insert(task.clone());
+        }
+        // The write is atomic: a failure leaves the version 0 file in place.
+        self.save_tasks(&upgraded)?;
+        Ok(upgraded)
+    }
+
     /// Writes the saved tasks atomically.
     ///
     /// # Errors
@@ -1162,6 +1224,112 @@ mod tests {
                 },
             ))
             .expect("the summary folds too");
+    }
+
+    /// Writes a tasks document with the given version, the way a test needs it.
+    fn write_tasks_document(store: &BatchStore, version: u32, tasks: serde_json::Value) {
+        std::fs::create_dir_all(store.directory()).expect("the directory is made");
+        let document = serde_json::json!({"version": version, "tasks": tasks});
+        std::fs::write(
+            store.tasks_path(),
+            serde_json::to_vec_pretty(&document).expect("the document encodes"),
+        )
+        .expect("the document is written");
+    }
+
+    #[test]
+    fn a_tasks_file_the_previous_build_wrote_is_migrated_in_place() {
+        let store = BatchStore::at(scratch("upgrade"));
+        let saved = task(&["alpha"]);
+        write_tasks_document(
+            &store,
+            0,
+            serde_json::json!([serde_json::to_value(&saved).expect("the task encodes")]),
+        );
+
+        // Version 0 is what made a machine unable to save again: the strict reader calls
+        // it corruption, so every write went through a load that failed.
+        assert!(
+            store.load_tasks().is_err(),
+            "the strict reader refuses version 0"
+        );
+
+        let upgraded = store
+            .load_tasks_upgrading()
+            .expect("the version 0 file is migrated");
+        assert_eq!(upgraded.tasks(), [saved.clone()]);
+
+        // Afterwards it is a document this build writes, so nothing reports version 0.
+        let strict = store
+            .load_tasks()
+            .expect("the migrated file is readable by the strict reader");
+        assert_eq!(strict.tasks(), upgraded.tasks());
+        assert_eq!(
+            store
+                .load_tasks_upgrading()
+                .expect("a second read stays readable")
+                .tasks(),
+            [saved]
+        );
+        let text = std::fs::read_to_string(store.tasks_path()).expect("the file is readable");
+        assert!(text.contains(&format!("\"version\": {BATCH_FORMAT_VERSION}")));
+    }
+
+    #[test]
+    fn a_damaged_or_newer_tasks_file_is_refused_and_left_exactly_as_it_was() {
+        // Damaged JSON is not a version 0 document this build can read.
+        let store = BatchStore::at(scratch("upgrade-damaged"));
+        std::fs::create_dir_all(store.directory()).expect("the directory is made");
+        let damaged = br#"{"version": 0, "tasks": [{"id": "not-a-task"}]}"#;
+        std::fs::write(store.tasks_path(), damaged).expect("the damage is written");
+        assert!(
+            store.load_tasks_upgrading().is_err(),
+            "a task this build would not have written is refused"
+        );
+        assert_eq!(
+            std::fs::read(store.tasks_path()).expect("the file is readable"),
+            damaged,
+            "a refused migration keeps the evidence"
+        );
+
+        // A newer format is not this build's to rewrite.
+        let newer = br#"{"version": 99, "tasks": []}"#;
+        std::fs::write(store.tasks_path(), newer).expect("the newer document is written");
+        let error = store
+            .load_tasks_upgrading()
+            .expect_err("a newer document is refused");
+        assert!(matches!(error, PersistError::UnsupportedVersion { .. }));
+        assert_eq!(
+            std::fs::read(store.tasks_path()).expect("the file is readable"),
+            newer,
+            "the newer document is left as it was"
+        );
+
+        // A document whose version is not a number is damage, not a version 0 file.
+        let unreadable = br#"{"version": "zero", "tasks": []}"#;
+        std::fs::write(store.tasks_path(), unreadable).expect("the document is written");
+        assert!(store.load_tasks_upgrading().is_err());
+        assert_eq!(
+            std::fs::read(store.tasks_path()).expect("the file is readable"),
+            unreadable
+        );
+    }
+
+    #[test]
+    fn a_first_save_starts_a_book_at_the_current_format() {
+        let store = BatchStore::at(scratch("first-save"));
+        let book = store
+            .load_tasks_upgrading()
+            .expect("a missing file is empty");
+        assert!(book.tasks().is_empty());
+
+        let mut book = book;
+        book.insert(task(&["alpha"]));
+        store.save_tasks(&book).expect("the first save writes");
+        let reloaded = store
+            .load_tasks()
+            .expect("the first save writes a readable document");
+        assert_eq!(reloaded.tasks(), book.tasks());
     }
 
     #[test]

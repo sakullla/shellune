@@ -42,6 +42,7 @@
 //! on screen.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 use gpui::{App, AppContext as _, Context, Entity};
@@ -291,6 +292,37 @@ impl BatchQuestion {
                 copy::fill(ux.batch_proxy_question, &[("command", command)])
             }
         }
+    }
+}
+
+/// Why a confirmation was refused.
+///
+/// The two cases are separate because they call for different things: a definition
+/// problem is fixed in the editor, while a run already in progress is a matter of
+/// waiting for it or going back to it. Neither one starts anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmRefusal {
+    /// The definition itself is not runnable.
+    Definition(BatchProblem),
+    /// This window is still driving a run, and one window drives one run.
+    RunInProgress,
+}
+
+impl fmt::Display for ConfirmRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Definition(problem) => write!(formatter, "{problem}"),
+            Self::RunInProgress => write!(
+                formatter,
+                "a batch run is still going in this window; wait for it to end, or hide it and go back to it"
+            ),
+        }
+    }
+}
+
+impl From<BatchProblem> for ConfirmRefusal {
+    fn from(problem: BatchProblem) -> Self {
+        Self::Definition(problem)
     }
 }
 
@@ -939,9 +971,13 @@ impl BatchCenter {
 
     /// Puts the task centre away, without touching what it does not own.
     ///
-    /// A run that is still going cannot be put away: the page is the only place its
-    /// state is visible, so the centre refuses until the run has ended. A finished run
-    /// is kept in the history by the store, which is why the page can be dropped.
+    /// This is the dismissal of the surface - the dialog's close button and escape - so a
+    /// run that is still going is refused: the page is the only place its state is
+    /// visible, and dismissal is not a reason to end a run. A finished run is kept in
+    /// the history by the store, which is why the page can then be dropped.
+    ///
+    /// Leaving for another part of the application is [Self::hide], not this: it keeps
+    /// the run and its page, which is what R13 asks for.
     pub fn close(&mut self) -> bool {
         if self.is_watching() {
             return false;
@@ -1079,33 +1115,52 @@ impl BatchCenter {
         }
     }
 
+    /// The refusal a second confirmation gets because this window is still driving a run.
+    ///
+    /// One window drives one run: starting another would replace the page and stop
+    /// polling the run already under way. The view asks this before it offers the button,
+    /// and a test asks it without a window.
+    fn second_run_refusal(&self) -> Option<ConfirmRefusal> {
+        self.is_watching().then_some(ConfirmRefusal::RunInProgress)
+    }
+
     /// Confirms the task and starts the run.
     ///
-    /// This is the only place in the panel that can create a session, and it can only do
-    /// so through a [ConfirmedBatch]: the definition is validated, frozen and then handed
-    /// to a real [BatchRunner] with the caller's factory.
+    /// This is the only place in the task centre that can create a session, and it can
+    /// only do so through a [ConfirmedBatch]: the definition is validated, frozen and
+    /// then handed to a real [BatchRunner] with the caller's factory.
+    ///
+    /// One window drives one run. A second confirmation while a run is still going is
+    /// refused rather than accepted by silently replacing the page, because replacing it
+    /// would stop polling the run that is already under way. The run that is going can be
+    /// hidden with [Self::hide] and returned to through [Self::show_active_run].
     ///
     /// # Errors
     ///
-    /// Returns the problem the definition has; the preview stays open and nothing is
-    /// started.
+    /// Returns [ConfirmRefusal::RunInProgress] when this window is still driving a run,
+    /// and [ConfirmRefusal::Definition] for the problem the definition has. Either way the
+    /// preview stays open and nothing is started.
     pub fn confirm(
         &mut self,
         cx: &mut Context<ShelluneView>,
         factory: Arc<dyn TransportFactory>,
-    ) -> Result<(), BatchProblem> {
+    ) -> Result<(), ConfirmRefusal> {
+        if let Some(refusal) = self.second_run_refusal() {
+            self.problem = Some(refusal.to_string());
+            return Err(refusal);
+        }
         let task = match self.candidate(cx) {
             Ok(task) => task,
             Err(problem) => {
                 self.problem = Some(problem.to_string());
-                return Err(problem);
+                return Err(ConfirmRefusal::Definition(problem));
             }
         };
         let confirmed = match task.confirm(remote::now_unix()) {
             Ok(confirmed) => confirmed,
             Err(problem) => {
                 self.problem = Some(problem.to_string());
-                return Err(problem);
+                return Err(ConfirmRefusal::Definition(problem));
             }
         };
         self.save_task(&confirmed);
@@ -1163,11 +1218,16 @@ impl BatchCenter {
         page.apply(&events, self.store.as_ref());
         if finished && !page.finished {
             page.finished = true;
-            if let Some(store) = self.store.as_ref() {
-                let _ = store.save_run(&page.run);
+            // The run is over, so its summary is what the history will read. A summary
+            // that cannot be written is said on the page the same way a log line that
+            // cannot be appended is: the run's own result is not bent to hide the
+            // storage failure, and a run that will be missing from the history says so
+            // instead of disappearing from it silently.
+            if let Some(store) = self.store.as_ref()
+                && let Err(error) = store.save_run(&page.run)
+            {
+                page.problem = Some(format!("{}: {error}", copy::ux().batch_save_failed));
             }
-            // The run is over, so the record of it is what the history reads. It is
-            // read again on demand rather than kept in memory here.
         }
         self.is_watching()
     }
@@ -1304,6 +1364,23 @@ impl BatchCenter {
         self.refresh_history();
     }
 
+    /// Puts every surface away but keeps the run going.
+    ///
+    /// This is what leaving for another part of the application does (R13): the runner
+    /// keeps its slot in the centre and keeps polling, and the page it writes to - the
+    /// selected host, the output kept, the step times - is still there when
+    /// [Self::show_active_run] brings it back. [Self::close] is the dismissal of the
+    /// surface instead, which is why it can refuse while a run is going.
+    ///
+    /// Returns whether anything was on screen to put away.
+    pub fn hide(&mut self) -> bool {
+        if !self.view.is_open() {
+            return false;
+        }
+        self.view = BatchCenterView::Closed;
+        true
+    }
+
     /// Goes back to the run this window is driving.
     ///
     /// Returns whether there is such a run. The runner was never paused by leaving, so
@@ -1333,7 +1410,7 @@ impl BatchCenter {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        match store.load_tasks() {
+        match store.load_tasks_upgrading() {
             Ok(book) => self.library.adopt(book),
             // A damaged file is reported and the previous list is kept: a corrupt
             // document must not read as "no saved tasks".
@@ -1464,7 +1541,9 @@ impl BatchCenter {
             }
             return Err(self.library_missing_reason(id));
         };
-        let mut book = store.load_tasks().map_err(|error| error.to_string())?;
+        let mut book = store
+            .load_tasks_upgrading()
+            .map_err(|error| error.to_string())?;
         if !book.remove(id) {
             return Err(self.library_missing_reason(id));
         }
@@ -1610,15 +1689,13 @@ impl BatchCenter {
             self.library.keep(task);
             return Ok(());
         };
-        // A first save starts a book at the current format; a file that exists but
-        // cannot be read is not replaced, because overwriting it would bury the record
-        // of what went wrong. (A missing file reads back as a default book, whose
-        // version is the empty one, so the two cases are told apart by the file.)
-        let mut book = if store.tasks_path().is_file() {
-            store.load_tasks().map_err(|error| error.to_string())?
-        } else {
-            BatchBook::new()
-        };
+        // A first save starts a book at the current format, and a file the previous
+        // build wrote is migrated in place first. A file that is damaged, newer, or
+        // holds a task this build would not have written is not replaced, because
+        // overwriting it would bury the record of what went wrong.
+        let mut book = store
+            .load_tasks_upgrading()
+            .map_err(|error| error.to_string())?;
         book.insert(task.clone());
         store.save_tasks(&book).map_err(|error| error.to_string())?;
         self.library.keep(task);
@@ -1789,14 +1866,60 @@ mod tests {
         .expect("a valid task")
     }
 
+    /// A latch a test can hold a command on, so a run can be observed while it is going.
+    #[derive(Clone)]
+    struct Gate {
+        state: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Default for Gate {
+        fn default() -> Self {
+            Self::open()
+        }
+    }
+
+    impl Gate {
+        fn open() -> Self {
+            Self::closed_then(true)
+        }
+
+        fn closed() -> Self {
+            Self::closed_then(false)
+        }
+
+        fn closed_then(open: bool) -> Self {
+            Self {
+                state: std::sync::Arc::new((
+                    std::sync::Mutex::new(open),
+                    std::sync::Condvar::new(),
+                )),
+            }
+        }
+
+        fn wait(&self) {
+            let (lock, changed) = &*self.state;
+            let mut open = lock.lock().expect("a free lock");
+            while !*open {
+                open = changed.wait(open).expect("a free lock");
+            }
+        }
+
+        fn release(&self) {
+            let (lock, changed) = &*self.state;
+            *lock.lock().expect("a free lock") = true;
+            changed.notify_all();
+        }
+    }
+
     /// A transport that counts its opens and succeeds at every command.
     ///
-    /// The count is the whole point: a path that is not a confirmation must leave it at
-    /// zero, which is how "saving a draft opens nothing" is observed rather than read
-    /// off a signature.
+    /// The count is what makes "this path opens no connection" an observation instead of
+    /// a reading of a signature, and the gate is what keeps a run observable while it is
+    /// still going.
     #[derive(Clone, Default)]
     struct CountingHosts {
         opens: std::sync::Arc<AtomicUsize>,
+        gate: Gate,
     }
 
     impl CountingHosts {
@@ -1805,12 +1928,16 @@ mod tests {
         }
     }
 
-    struct SilentHost;
+    struct SilentHost {
+        gate: Gate,
+    }
 
     impl TransportFactory for CountingHosts {
         fn open(&self, _target: &BatchTarget) -> Result<Box<dyn HostTransport>, String> {
             self.opens.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(SilentHost))
+            Ok(Box::new(SilentHost {
+                gate: self.gate.clone(),
+            }))
         }
     }
 
@@ -1825,11 +1952,32 @@ mod tests {
             _control: &HostControl,
             output: &mut dyn FnMut(OutputStream, &[u8]),
         ) -> Result<Option<u32>, StepFailure> {
+            self.gate.wait();
             output(OutputStream::Stdout, format!("{command}\n").as_bytes());
             Ok(Some(0))
         }
 
         fn disconnect(&mut self) {}
+    }
+
+    /// Starts the run a task centre would drive, without an editor.
+    fn start_run(centre: &mut BatchCenter, task: &BatchTask, factory: &CountingHosts) {
+        let confirmed = task.clone().confirm(10).expect("a confirmable task");
+        let run = BatchRun::planned(&confirmed, BatchRunId::new(), 11);
+        let options = RunnerOptions::from_task(&confirmed);
+        let factory: Arc<dyn TransportFactory> = Arc::new(factory.clone());
+        let runner = BatchRunner::start(confirmed.clone(), factory, options);
+        centre.active = Some(BatchRunPage::new(confirmed, run, runner));
+    }
+
+    /// Polls until the run has ended, so a test never waits on a timer of its own.
+    fn settle(centre: &mut BatchCenter) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while centre.is_watching() && Instant::now() < deadline {
+            centre.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!centre.is_watching(), "the run ended before the deadline");
     }
 
     /// A task centre with a store, and no editor fields.
@@ -1841,19 +1989,23 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_draft_is_written_to_the_file_and_starts_nothing() {
+    fn a_saved_draft_writes_the_definition_and_leaves_no_run_behind() {
         let (mut centre, store) = centre(&scratch("draft"));
-        let factory = CountingHosts::default();
         let task = fixture_task(&["uptime"], &["alpha", "beta"]);
         let id = task.id();
 
-        // Saving is the whole action: it takes no transport factory, so there is no
-        // path from it to a connection.
+        // Saving is the whole action, and the draft path takes no transport factory at
+        // all: `confirm` is the only entry that receives one, which is why no
+        // connection can be made here. What is observable is that nothing of a run
+        // exists afterwards - no runner, and no summary for the history to list.
         centre
             .store_draft(task.clone())
             .expect("the draft is saved");
-        assert_eq!(factory.opens(), 0, "saving a draft opens nothing");
-        assert!(!centre.has_active_run(), "and starts no run");
+        assert!(!centre.has_active_run(), "saving a draft starts no runner");
+        assert!(
+            store.list_runs().expect("the runs list").is_empty(),
+            "saving a draft writes no run summary"
+        );
 
         let written = store.load_tasks().expect("the file reads back");
         assert_eq!(written.tasks().len(), 1);
@@ -1863,6 +2015,53 @@ mod tests {
         assert_eq!(centre.library().tasks().len(), 1);
         assert!(centre.library().task(id).is_some());
         assert!(centre.library().problem().is_none());
+
+        // The counter is a real measure, so the emptiness above is not an artefact of a
+        // double that never counts: the same factory, driving a confirmed run, does
+        // record opens.
+        let factory = CountingHosts::default();
+        start_run(&mut centre, &task, &factory);
+        settle(&mut centre);
+        assert!(
+            factory.opens() > 0,
+            "a confirmed run does open its transports"
+        );
+    }
+
+    #[test]
+    fn a_tasks_file_the_previous_build_wrote_can_be_saved_to_again() {
+        let (mut centre, store) = centre(&scratch("legacy-version-zero"));
+        let legacy = fixture_task(&["uptime"], &["alpha"]);
+        std::fs::create_dir_all(store.directory()).expect("the directory is made");
+        let document = serde_json::json!({
+            "version": 0,
+            "tasks": [serde_json::to_value(&legacy).expect("the task encodes")],
+        });
+        let bytes = serde_json::to_vec_pretty(&document).expect("the document encodes");
+        std::fs::write(store.tasks_path(), &bytes).expect("the legacy file is written");
+        // This is the state that made a machine unable to save at all: version 0 is not
+        // a document this build reads, so every load refused and every save failed.
+        assert!(store.load_tasks().is_err());
+
+        let added = fixture_task(&["df -h"], &["beta"]);
+        centre
+            .store_draft(added.clone())
+            .expect("a draft saves over a legacy file");
+
+        let written = store
+            .load_tasks()
+            .expect("the file is a document this build writes now");
+        assert_eq!(written.tasks().len(), 2, "the legacy task is kept");
+        assert_eq!(
+            written.task(legacy.id()),
+            Some(&legacy),
+            "the migration is lossless"
+        );
+        assert_eq!(written.task(added.id()), Some(&added));
+
+        centre.refresh_library();
+        assert!(centre.library().problem().is_none());
+        assert_eq!(centre.library().tasks().len(), 2);
     }
 
     #[test]
@@ -2075,28 +2274,14 @@ mod tests {
     #[test]
     fn a_run_keeps_polling_while_another_surface_is_on_screen() {
         let (mut centre, _store) = centre(&scratch("pump"));
-        let confirmed = fixture_task(&["uptime"], &["alpha", "beta"])
-            .confirm(10)
-            .expect("a confirmable task");
-        let run = BatchRun::planned(&confirmed, BatchRunId::new(), 11);
-        let factory: Arc<dyn TransportFactory> = Arc::new(CountingHosts::default());
-        let runner = BatchRunner::start(
-            confirmed.clone(),
-            factory,
-            RunnerOptions::from_task(&confirmed),
-        );
-        centre.active = Some(BatchRunPage::new(confirmed, run, runner));
-        centre.view = BatchCenterView::Library;
+        let task = fixture_task(&["uptime"], &["alpha", "beta"]);
+        let factory = CountingHosts::default();
+        start_run(&mut centre, &task, &factory);
+        // The library is what is on screen while the run goes on.
+        centre.show_library();
+        assert_eq!(centre.view(), BatchCenterView::Library);
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while centre.is_watching() && Instant::now() < deadline {
-            centre.pump();
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            !centre.is_watching(),
-            "the run ended while the library was shown"
-        );
+        settle(&mut centre);
         let page = centre.run().expect("the run page is still there");
         assert!(page.is_finished());
         assert_eq!(page.state(), RunState::Completed);
@@ -2104,6 +2289,84 @@ mod tests {
             centre.view(),
             BatchCenterView::Library,
             "polling the run does not change the surface the user chose"
+        );
+    }
+
+    #[test]
+    fn a_hidden_run_keeps_going_and_a_second_confirmation_is_refused() {
+        let (mut centre, _store) = centre(&scratch("second-run"));
+        let task = fixture_task(&["uptime"], &["alpha"]);
+        let factory = CountingHosts {
+            gate: Gate::closed(),
+            ..CountingHosts::default()
+        };
+        start_run(&mut centre, &task, &factory);
+
+        // The run is held on its one command, so it is going while these checks run.
+        assert!(centre.is_watching());
+        assert_eq!(
+            centre.second_run_refusal(),
+            Some(ConfirmRefusal::RunInProgress),
+            "one window drives one run"
+        );
+
+        // Leaving the surface keeps the run: hiding is not stopping.
+        centre.show_library();
+        assert!(centre.hide(), "the library was on screen");
+        assert_eq!(centre.view(), BatchCenterView::Closed);
+        assert!(centre.is_watching(), "hiding a run does not stop it");
+        assert!(
+            centre.show_active_run(),
+            "the run is still there to return to"
+        );
+        assert_eq!(centre.view(), BatchCenterView::ActiveRun);
+
+        factory.gate.release();
+        settle(&mut centre);
+        assert_eq!(
+            centre.second_run_refusal(),
+            None,
+            "a finished run no longer stands in the way"
+        );
+        assert_eq!(
+            centre.run().map(BatchRunPage::state),
+            Some(RunState::Completed)
+        );
+    }
+
+    #[test]
+    fn a_summary_that_cannot_be_written_is_said_on_the_page() {
+        // A full disk or a removed folder looks like this to the store: the runs
+        // directory is not a directory any more, so neither the summary nor the log can
+        // be written.
+        let (mut centre, store) = centre(&scratch("summary-failure"));
+        let task = fixture_task(&["uptime"], &["alpha"]);
+        let factory = CountingHosts {
+            gate: Gate::closed(),
+            ..CountingHosts::default()
+        };
+        start_run(&mut centre, &task, &factory);
+        assert!(centre.is_watching());
+        std::fs::create_dir_all(store.directory()).expect("the batch directory is made");
+        std::fs::write(store.runs_dir(), b"not a directory").expect("the obstacle is written");
+
+        factory.gate.release();
+        settle(&mut centre);
+
+        let page = centre.run().expect("the run page is still there");
+        assert_eq!(
+            page.state(),
+            RunState::Completed,
+            "the run's own result is not bent by a storage failure"
+        );
+        // The log append fails for the same reason and says so first, so the message has
+        // to be the summary one: that is the write the history depends on.
+        let problem = page
+            .problem()
+            .expect("a summary that was not written is said on the page");
+        assert!(
+            problem.contains(copy::ux().batch_save_failed),
+            "the summary write failure is the one reported: {problem}"
         );
     }
 
