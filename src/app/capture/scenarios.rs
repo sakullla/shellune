@@ -1547,7 +1547,10 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the failure, its reason and the way back; no transport, DNS lookup or \
                    authentication is part of it",
         quick: false,
-        variants: &[Variant::dark().comfortable(), Variant::light().comfortable()],
+        variants: &[
+            Variant::dark().comfortable(),
+            Variant::light().comfortable(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_connection_failed,

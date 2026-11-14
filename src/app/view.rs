@@ -1204,12 +1204,7 @@ impl ShelluneView {
 
     /// Opens the find bar with a query, for a capture (R2).
     #[cfg(feature = "ui-capture")]
-    pub fn capture_open_search(
-        &mut self,
-        text: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn capture_open_search(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pane) = self.active_pane() {
             pane.update(cx, |pane, cx| pane.capture_search(text, window, cx));
         }
