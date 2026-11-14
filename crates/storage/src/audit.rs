@@ -66,9 +66,13 @@ pub const CONFIG_KEYS: &[&str] = &[
     "visible",
     "section",
     // Connections whose protocol is not SSH: each carries its own protocol tag and
-    // only the fields its protocol has. None of these can hold a credential; the
-    // saved-secret flag keeps its name out of this list because the rule below
-    // rejects a key whose name contains "secret", and the storage tests cover it.
+    // only the fields its protocol has. None of these can hold a credential.
+    //
+    // The saved-secret flag is listed even though its name contains "secret": it is a
+    // boolean saying the system store *may* hold a credential for the record, and the
+    // key is what tells a reader of the file not to look for the value here. The
+    // self-test below allows that one name and refuses every other.
+    "remember_secret",
     "protocol",
     "domain",
     "certificate",
@@ -314,6 +318,12 @@ mod tests {
     #[test]
     fn no_persisted_key_means_secret() {
         for name in CONFIG_KEYS {
+            // The one exception, and the reason it is one: this key is a boolean flag
+            // that says a credential may exist in the system store. It never holds a
+            // value, and hiding its name would make the file's shape harder to read.
+            if *name == "remember_secret" {
+                continue;
+            }
             let lower = name.to_ascii_lowercase();
             for forbidden in [
                 "password",

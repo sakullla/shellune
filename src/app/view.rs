@@ -4973,8 +4973,11 @@ impl ShelluneView {
         let draft = self.hosts.protocol_draft().cloned()?;
         let edit = match draft.build() {
             Ok(edit) => edit,
-            Err(reason) => {
-                self.hosts.set_message(reason, true);
+            Err(problem) => {
+                // The reason names the field it came from, so the form can show it there
+                // and the banner says which field to change.
+                let label = problem.field().label(self.strings());
+                self.hosts.set_message(format!("{label}: {problem}"), true);
                 cx.notify();
                 return None;
             }

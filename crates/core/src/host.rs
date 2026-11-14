@@ -1710,9 +1710,12 @@ impl SerialConfig {
     }
 
     /// What the connection would open, as one line for the list.
+    ///
+    /// The device and its line speed are what a person recognises a port by; the frame
+    /// follows it so the row still says how the bytes are shaped.
     #[must_use]
     pub fn target(&self) -> String {
-        format!("{} {} {}", self.device, self.baud, self.frame())
+        format!("{}@{} {}", self.device, self.baud, self.frame())
     }
 
     /// The frame parameters as the short form a serial tool prints.
@@ -3080,7 +3083,7 @@ mod connection_tests {
         assert_eq!(config.baud(), DEFAULT_SERIAL_BAUD);
         assert_eq!(config.data_bits(), MAX_SERIAL_DATA_BITS);
         assert_eq!(config.frame(), "8N1");
-        assert_eq!(config.target(), "COM3 115200 8N1");
+        assert_eq!(config.target(), "COM3@115200 8N1");
         assert_eq!(config.flow(), SerialFlow::None);
 
         config.set_baud(9_600).expect("a common speed");

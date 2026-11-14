@@ -3110,19 +3110,20 @@ impl ProtocolDraft {
     ///
     /// Returns the sentence of the domain that refused a field, so the dialog keeps what
     /// was typed and names the field to change.
-    pub fn build(&self) -> Result<ConnectionEdit, String> {
-        let group = group_path_from_text(&self.group)?;
+    pub fn build(&self) -> Result<ConnectionEdit, ConnectionProblem> {
+        let group = group_path_from_text(&self.group)
+            .map_err(|reason| ConnectionProblem::new(ConnectionFormField::Group, reason))?;
         let protocol = self.protocol;
         let name = self.name.trim();
         let record = match protocol {
             ProtocolKind::Rdp => {
                 let address = self.address.trim();
                 let name = default_name(name, address);
-                let mut config = RdpConfig::new(name, address, Some(self.user.trim()))
-                    .map_err(|error| error.to_string())?;
+                let mut config =
+                    RdpConfig::new(name, address, Some(self.user.trim())).map_err(problem_of)?;
                 config
-                    .set_port(parse_port(&self.port)?.get().into())
-                    .map_err(|error| error.to_string())?;
+                    .set_port(connection_port(&self.port)?.get().into())
+                    .map_err(problem_of)?;
                 let domain = self.domain.trim();
                 config.set_domain((!domain.is_empty()).then_some(domain.to_owned()));
                 config.set_certificate(self.certificate);
@@ -3132,11 +3133,10 @@ impl ProtocolDraft {
             ProtocolKind::Vnc => {
                 let address = self.address.trim();
                 let name = default_name(name, address);
-                let mut config =
-                    VncConfig::new(name, address).map_err(|error| error.to_string())?;
+                let mut config = VncConfig::new(name, address).map_err(problem_of)?;
                 config
-                    .set_port(parse_port(&self.port)?.get().into())
-                    .map_err(|error| error.to_string())?;
+                    .set_port(connection_port(&self.port)?.get().into())
+                    .map_err(problem_of)?;
                 config.set_security(self.security);
                 config.set_remember_secret(self.remember);
                 ConnectionRecord::Vnc(config)
@@ -3144,14 +3144,13 @@ impl ProtocolDraft {
             ProtocolKind::Serial => {
                 let device = self.device.trim();
                 let name = default_name(name, device);
-                let mut config =
-                    SerialConfig::new(name, device).map_err(|error| error.to_string())?;
+                let mut config = SerialConfig::new(name, device).map_err(problem_of)?;
                 config
                     .set_baud(parse_baud(&self.baud)?)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(problem_of)?;
                 config
                     .set_data_bits(parse_data_bits(&self.data_bits)?)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(problem_of)?;
                 config.set_parity(self.parity);
                 config.set_stop_bits(self.stop_bits);
                 config.set_flow(self.flow);
@@ -3159,7 +3158,10 @@ impl ProtocolDraft {
                 ConnectionRecord::Serial(config)
             }
             ProtocolKind::Ssh => {
-                return Err("an SSH connection is edited as a host".to_owned());
+                return Err(ConnectionProblem::new(
+                    ConnectionFormField::Name,
+                    "an SSH connection is edited as a host",
+                ));
             }
         };
         let record = match group {
@@ -3202,30 +3204,114 @@ fn default_name(name: &str, target: &str) -> String {
     }
 }
 
-/// Reads a line speed, refusing anything the platform could not be asked for.
-fn parse_baud(text: &str) -> Result<u32, String> {
+/// Why a connection form could not be saved, and which field to change.
+///
+/// The sentence is the domain's own, so the dialog can show it under the field that
+/// produced it instead of one generic failure over the whole form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionProblem {
+    field: ConnectionFormField,
+    reason: String,
+}
+
+impl ConnectionProblem {
+    fn new(field: ConnectionFormField, reason: impl Into<String>) -> Self {
+        Self {
+            field,
+            reason: reason.into(),
+        }
+    }
+
+    /// The field the domain refused.
+    #[must_use]
+    pub fn field(&self) -> ConnectionFormField {
+        self.field
+    }
+
+    /// What the domain said about it.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for ConnectionProblem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Formatter::write_str(formatter, &self.reason)
+    }
+}
+
+/// Names the field a domain refusal belongs to.
+fn problem_of(error: shellune_core::ConnectionValidationError) -> ConnectionProblem {
+    use shellune_core::ConnectionValidationError as Refusal;
+    let field = match error {
+        Refusal::EmptyAddress | Refusal::AddressContainsWhitespace => ConnectionFormField::Address,
+        Refusal::EmptyName => ConnectionFormField::Name,
+        Refusal::PortOutOfRange { .. } => ConnectionFormField::Port,
+        Refusal::UserContainsWhitespace => ConnectionFormField::User,
+        Refusal::EmptyDevice | Refusal::DeviceContainsControlCharacter => {
+            ConnectionFormField::Device
+        }
+        Refusal::BaudOutOfRange { .. } => ConnectionFormField::Baud,
+        Refusal::DataBitsOutOfRange { .. } => ConnectionFormField::DataBits,
+    };
+    ConnectionProblem::new(field, error.to_string())
+}
+
+/// Reads the port of a connection, falling back to the protocol's own default.
+fn connection_port(text: &str) -> Result<Port, ConnectionProblem> {
     let text = text.trim();
-    let value: u32 = text
-        .parse()
-        .map_err(|_| format!("{text} is not a baud rate; use 50-4000000"))?;
+    if text.is_empty() {
+        // A blank field means "the port this protocol uses", which the form already
+        // filled in; reaching here is the same answer rather than a refusal.
+        return Ok(Port::DEFAULT);
+    }
+    let raw: u32 = text.parse().map_err(|_| {
+        ConnectionProblem::new(
+            ConnectionFormField::Port,
+            format!("{text} is not a port number; use 1-65535"),
+        )
+    })?;
+    Port::new(raw).map_err(|_| {
+        ConnectionProblem::new(
+            ConnectionFormField::Port,
+            format!("{raw} is outside the valid range 1-65535"),
+        )
+    })
+}
+
+/// Reads a line speed, refusing anything the platform could not be asked for.
+fn parse_baud(text: &str) -> Result<u32, ConnectionProblem> {
+    let text = text.trim();
+    let value: u32 = text.parse().map_err(|_| {
+        ConnectionProblem::new(
+            ConnectionFormField::Baud,
+            format!("{text} is not a baud rate; use 50-4000000"),
+        )
+    })?;
     if !(shellune_core::MIN_SERIAL_BAUD..=shellune_core::MAX_SERIAL_BAUD).contains(&value) {
-        return Err(format!(
-            "{value} is outside the range 50-4000000 this build accepts"
+        return Err(ConnectionProblem::new(
+            ConnectionFormField::Baud,
+            format!("{value} is outside the range 50-4000000 this build accepts"),
         ));
     }
     Ok(value)
 }
 
 /// Reads how many data bits one frame carries.
-fn parse_data_bits(text: &str) -> Result<u8, String> {
+fn parse_data_bits(text: &str) -> Result<u8, ConnectionProblem> {
     let text = text.trim();
-    let value: u8 = text
-        .parse()
-        .map_err(|_| format!("{text} is not a number of data bits; use 5-8"))?;
+    let value: u8 = text.parse().map_err(|_| {
+        ConnectionProblem::new(
+            ConnectionFormField::DataBits,
+            format!("{text} is not a number of data bits; use 5-8"),
+        )
+    })?;
     if !(shellune_core::MIN_SERIAL_DATA_BITS..=shellune_core::MAX_SERIAL_DATA_BITS).contains(&value)
     {
-        return Err(format!(
-            "{value} is outside the range 5-8 this build accepts"
+        return Err(ConnectionProblem::new(
+            ConnectionFormField::DataBits,
+            format!("{value} is outside the range 5-8 this build accepts"),
         ));
     }
     Ok(value)
@@ -3376,7 +3462,8 @@ mod tests {
         draft.set_text(ConnectionFormField::Device, "COM3");
         draft.set_text(ConnectionFormField::Baud, "10");
         let reason = draft.build().expect_err("ten baud is not a line speed");
-        assert!(reason.contains("10"), "{reason}");
+        assert_eq!(reason.field(), ConnectionFormField::Baud);
+        assert!(reason.reason().contains("10"), "{reason}");
 
         draft.set_text(ConnectionFormField::Baud, "9600");
         draft.set_text(ConnectionFormField::DataBits, "9");
@@ -3420,6 +3507,51 @@ mod tests {
         assert_eq!(copy.name(), "Office (copy)");
     }
 
+    #[test]
+    fn a_refused_value_names_the_field_it_came_from() {
+        let mut desktop = ProtocolDraft::create(ProtocolKind::Rdp);
+        desktop.set_text(ConnectionFormField::Address, "10.0.0.9");
+        desktop.set_text(ConnectionFormField::Port, "0");
+        let problem = desktop.build().expect_err("zero is not a port");
+        assert_eq!(problem.field(), ConnectionFormField::Port);
+        assert!(problem.reason().contains('0'), "{}", problem.reason());
+        assert_eq!(problem.to_string(), problem.reason());
+
+        desktop.set_text(ConnectionFormField::Port, "3389");
+        desktop.set_text(ConnectionFormField::User, "ali ce");
+        let problem = desktop.build().expect_err("a user has no space in it");
+        assert_eq!(problem.field(), ConnectionFormField::User);
+
+        let mut console = ProtocolDraft::create(ProtocolKind::Serial);
+        console.set_text(ConnectionFormField::Device, "COM3");
+        console.set_text(ConnectionFormField::DataBits, "9");
+        let problem = console.build().expect_err("nine data bits do not exist");
+        assert_eq!(problem.field(), ConnectionFormField::DataBits);
+        assert_eq!(
+            problem.field().debug_selector(),
+            "connection.field.data_bits"
+        );
+
+        console.set_text(ConnectionFormField::DataBits, "8");
+        console.set_text(ConnectionFormField::Group, "   ");
+        assert!(
+            console.build().is_ok(),
+            "a blank group is no group, not a refusal"
+        );
+    }
+
+    #[test]
+    fn a_serial_row_names_the_device_and_its_line_speed() {
+        let mut config = SerialConfig::new("Console", "COM3").expect("a valid record");
+        config.set_baud(9_600).expect("a common speed");
+        let record = ConnectionRecord::Serial(config);
+        assert_eq!(record.target(), "COM3@9600 8N1");
+        assert!(
+            record.target().contains('@'),
+            "the device and its speed are what the row shows: {}",
+            record.target()
+        );
+    }
     #[test]
     fn a_copied_connection_comes_back_as_a_form_for_a_new_record() {
         let mut book = HostBook::new();

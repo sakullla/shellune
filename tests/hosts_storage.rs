@@ -1592,6 +1592,9 @@ fn a_document_with_desktop_and_serial_connections_passes_the_persisted_key_audit
     let mut office = RdpConfig::new("Office", "10.0.0.9", Some("alice")).expect("valid");
     office.set_domain(Some("CORP"));
     office.set_certificate(RdpCertificatePolicy::Reject);
+    // The one key whose name says "secret": it is a flag, and the audit has to accept it
+    // without accepting any value beside it.
+    office.set_remember_secret(true);
     book.insert_connection(ConnectionRecord::Rdp(office))
         .expect("inserted");
     let mut wall = VncConfig::new("Wall", "10.0.0.7").expect("valid");
@@ -1616,6 +1619,11 @@ fn a_document_with_desktop_and_serial_connections_passes_the_persisted_key_audit
             "the saved document uses the key {key:?}, which is not on the allowlist"
         );
         let lower = key.to_lowercase();
+        if key == "remember_secret" {
+            // A boolean flag: it says a credential may be in the system store, and no
+            // value of any credential is written beside the record.
+            continue;
+        }
         for forbidden in [
             "password",
             "passphrase",
@@ -1630,6 +1638,11 @@ fn a_document_with_desktop_and_serial_connections_passes_the_persisted_key_audit
             );
         }
     }
+    assert_eq!(
+        document["connections"][0]["remember_secret"],
+        serde_json::Value::Bool(true),
+        "the flag says a credential may be in the system store, and holds no value"
+    );
     // The audit really covered the new records rather than only an SSH one.
     for expected in [
         "protocol",

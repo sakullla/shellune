@@ -1145,6 +1145,27 @@ impl ShelluneView {
                     .child(entity),
             );
         }
+        // A refusal is shown under the field that produced it, and only once the form
+        // has really been asked to save: a form still being filled is not an error.
+        let problem = self
+            .hosts
+            .message()
+            .filter(|message| message.failed())
+            .and_then(|_| {
+                self.hosts
+                    .protocol_draft()
+                    .and_then(|draft| draft.build().err())
+            })
+            .filter(|problem| problem.field() == field);
+        if let Some(problem) = problem {
+            cell = cell.child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::DANGER))
+                    .debug_selector(move || format!("{}.problem", field.debug_selector()))
+                    .child(SharedString::from(problem.reason().to_owned())),
+            );
+        }
         cell
     }
 
