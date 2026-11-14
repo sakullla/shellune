@@ -1477,8 +1477,10 @@ impl ShelluneView {
             .text_size(metrics.heading_size())
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
-            .when(wrapping, |title| title.w_full().whitespace_normal())
-            .when(!wrapping, |title| title.w_full().truncate())
+            // Whole words, wrapped: a one-line truncate inside the flexible column
+            // could collapse a short title to a bare ellipsis.
+            .w_full()
+            .whitespace_normal()
             .child(SharedString::from(title));
         let column = div()
             .flex()
@@ -1526,6 +1528,158 @@ impl ShelluneView {
                 .child(SharedString::from(subtitle))
         });
         (bar, subtitle)
+    }
+
+    /// Where a running attempt is: four steps, the one in flight marked, and the way
+    /// it signs in written once underneath (R17).
+    ///
+    /// It replaces a stage line, a target line, a status chip and a form that all said
+    /// "connecting" at once. Nothing here is editable: an attempt in flight cannot change
+    /// how it signs in, and fields that looked editable only invited a change that would
+    /// not take effect. When the server or the shell asks something, the step that
+    /// asks is marked as waiting for the user and the question follows below.
+    fn connection_progress(&self) -> Div {
+        use crate::app::remote::RemoteStatus;
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let Some(panel) = self.remote.as_ref() else {
+            return div();
+        };
+        let host = panel.host();
+        let status = panel.status();
+        let session_state = self
+            .form_session
+            .and_then(|id| self.workspace.session(id))
+            .map(|session| session.state().clone());
+        let (current, waiting) = match status {
+            RemoteStatus::VerifyingHost(_) => (1, Some(strings.remote_wait_identity)),
+            RemoteStatus::ConfirmingProxy { .. } => (0, Some(strings.remote_proxy_title)),
+            RemoteStatus::ConfirmingX11 { .. } => (0, Some(strings.x11_trusted_title)),
+            _ => match session_state {
+                Some(SessionState::VerifyingHost) => (1, None),
+                Some(SessionState::Authenticating) => (2, None),
+                _ => (0, None),
+            },
+        };
+        let steps = [
+            ux.connect_step_dial,
+            ux.connect_step_identity,
+            ux.connect_step_login,
+            ux.connect_step_terminal,
+        ];
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT + 2.0))
+            .py(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::BASE))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "remote.stage".to_owned());
+        for (index, label) in steps.iter().enumerate() {
+            let done = index < current;
+            let now = index == current;
+            let mark = if done {
+                icons::icon(
+                    Icon::Check,
+                    metrics.small_icon_size(),
+                    theme::swatch(palette::POSITIVE),
+                )
+                .into_any_element()
+            } else if now && waiting.is_some() {
+                components::status_mark(Tone::Warning, metrics.scale(10.0)).into_any_element()
+            } else if now {
+                progress_pulse(metrics)
+            } else {
+                div()
+                    .size(metrics.scale(6.0))
+                    .rounded_full()
+                    .bg(theme::swatch(palette::BORDER_STRONG))
+                    .into_any_element()
+            };
+            let mut line = div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap(metrics.scale(spacing::TIGHT))
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size(metrics.scale(16.0))
+                        .child(mark),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.label_size())
+                        .when(now, |text| text.font_weight(FontWeight::MEDIUM))
+                        .text_color(theme::swatch(if now {
+                            palette::TEXT_PRIMARY
+                        } else if done {
+                            palette::TEXT_SECONDARY
+                        } else {
+                            palette::TEXT_MUTED
+                        }))
+                        .when(now, |text| {
+                            text.debug_selector(|| "remote.stage.value".to_owned())
+                        })
+                        .child(*label),
+                );
+            // The first step says where it is going, the third with what it signs in:
+            // the two facts a person checks when a connection takes long.
+            if index == 0 {
+                line = line.child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .font_family(crate::app::terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "remote.target".to_owned())
+                        .child(SharedString::from(host.target())),
+                );
+            }
+            if index == 2 {
+                let method = panel.method();
+                let detail = if method.needs_key_path() && !panel.key_path().is_empty() {
+                    format!("{} · {}", method.label(strings), panel.key_path())
+                } else {
+                    method.label(strings).to_owned()
+                };
+                line = line.child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "remote.method.summary".to_owned())
+                        .child(SharedString::from(detail)),
+                );
+            }
+            if now && let Some(detail) = waiting {
+                line = line
+                    .child(
+                        components::chip(strings.remote_waiting, Tone::Warning, metrics)
+                            .debug_selector(|| "remote.waiting".to_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "remote.waiting.detail".to_owned())
+                            .child(SharedString::from(detail)),
+                    );
+            }
+            list = list.child(line);
+        }
+        list
     }
 
     /// The connection being set up, or the quick-connect form, as a dialog.
@@ -1579,36 +1733,25 @@ impl ShelluneView {
         // on top of it pushed that next line past the window (R4).
         let choosing = matches!(panel.status(), crate::app::remote::RemoteStatus::Idle);
         let failed = matches!(panel.status(), crate::app::remote::RemoteStatus::Failed(_));
+        // The head names the host and the address once. The state is the body's job:
+        // a chip here said "connecting" a second time beside the progress that says it.
+        let in_flight = panel.status().is_busy() || panel.status().is_asking();
         let (header, subtitle) = self.modal_header_lead(
             Some(host_avatar(host.name(), false, metrics)),
             format!("{} {}", ux.connect_title, host.name()),
-            Some(host.target()),
-            Some(components::chip(status_label, tone, metrics)),
+            // While an attempt runs, its first step names the address; saying it under
+            // the title too was the same line twice.
+            (!in_flight).then(|| host.target()),
+            None,
             "remote.close",
             cx,
             |this, cx| this.close_remote(cx),
         );
-        // What the attempt is really doing, and whether it is waiting for the user:
-        // the stage is the transport's own state, not a progress animation that would
-        // keep claiming to connect while a fingerprint or a ProxyCommand waits (R17).
         let asking = panel.status().is_asking();
-        // The strip is about an attempt that is in flight or waiting for the user. A
-        // finished attempt already says what happened in the failure banner, and an
-        // idle form has not started anything, so neither gets a line claiming a stage
-        // it does not have (R17).
-        let show_stage = panel.status().is_busy() || asking;
-        let waiting_on = match panel.status() {
-            crate::app::remote::RemoteStatus::VerifyingHost(_) => {
-                Some(strings.remote_wait_identity)
-            }
-            crate::app::remote::RemoteStatus::ConfirmingProxy { .. } => {
-                Some(strings.remote_proxy_title)
-            }
-            crate::app::remote::RemoteStatus::ConfirmingX11 { .. } => {
-                Some(strings.x11_trusted_title)
-            }
-            _ => None,
-        };
+        // The progress belongs to an attempt in flight or waiting for an answer. A form
+        // that has not started and a finished failure say what they are on their own.
+        let show_progress = panel.status().is_busy() || asking;
+        let _ = (status_label, tone);
         let body = div()
             .flex()
             .flex_col()
@@ -1617,73 +1760,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::LOOSE))
-            .when(show_stage, |body| {
-                body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_wrap()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .debug_selector(|| "remote.stage".to_owned())
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(strings.remote_stage_title),
-                        )
-                        .child(components::status_dot(tone, metrics))
-                        .child(
-                            div()
-                                .text_size(metrics.label_size())
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(tone.text())
-                                .debug_selector(|| "remote.stage.value".to_owned())
-                                .child(status_label),
-                        )
-                        .when(asking, |row| {
-                            row.child(
-                                components::chip(strings.remote_waiting, Tone::Warning, metrics)
-                                    .debug_selector(|| "remote.waiting".to_owned()),
-                            )
-                        }),
-                )
-            })
-            .children(waiting_on.map(|detail| {
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .debug_selector(|| "remote.waiting.detail".to_owned())
-                    .child(SharedString::from(detail))
-            }))
-            // The address the attempt dials, spelled out beside the host's name so the
-            // dialog never says "connecting" without saying to what (R17).
-            .when(show_stage, |body| {
-                body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .min_w(px(0.0))
-                        .debug_selector(|| "remote.target".to_owned())
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(strings.remote_target_label),
-                        )
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .font_family(crate::app::terminal::monospace_family())
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .child(SharedString::from(host.target())),
-                        ),
-                )
-            })
+            .when(show_progress, |body| body.child(self.connection_progress()))
             .when(choosing, |body| {
                 body.child(
                     div()
@@ -2813,5 +2890,27 @@ impl ShelluneView {
                         )),
                 ),
         )
+    }
+}
+
+/// A soft pulse for the step that is running: it says "working" without a bar that
+/// claims a percentage nobody measured. Still when motion is reduced.
+fn progress_pulse(metrics: theme::Metrics) -> AnyElement {
+    let dot = div()
+        .size(metrics.scale(8.0))
+        .rounded_full()
+        .bg(theme::swatch(palette::ACCENT));
+    if theme::motion_allowed() {
+        gpui::AnimationExt::with_animation(
+            dot,
+            "remote.progress.pulse",
+            gpui::Animation::new(std::time::Duration::from_millis(900))
+                .repeat()
+                .with_easing(gpui::pulsating_between(0.35, 1.0)),
+            |dot, delta| dot.opacity(delta),
+        )
+        .into_any_element()
+    } else {
+        dot.into_any_element()
     }
 }

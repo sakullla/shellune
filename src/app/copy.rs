@@ -310,10 +310,6 @@ pub struct Strings {
     pub remote_live: &'static str,
     /// Status of a failed attempt.
     pub remote_failed: &'static str,
-    /// Title of the stage row in the connection dialog.
-    pub remote_stage_title: &'static str,
-    /// Label of the address a connection targets.
-    pub remote_target_label: &'static str,
     /// Said while the attempt is waiting for the user.
     pub remote_waiting: &'static str,
     /// What that wait is about when the server identity is unknown.
@@ -652,8 +648,6 @@ pub struct Strings {
     pub host_startup_placeholder: &'static str,
     /// Host dialog: what the startup command does.
     pub host_startup_note: &'static str,
-    /// Host dialog: what the agent method needs.
-    pub host_agent_note: &'static str,
     /// Label of the X11 forwarding choice (R11).
     pub x11_label: &'static str,
     /// The three X11 modes, as a chooser shows them.
@@ -1116,8 +1110,6 @@ pub static ENGLISH: Strings = Strings {
     remote_verifying: "Waiting for your decision",
     remote_live: "SSH session live",
     remote_failed: "Could not connect",
-    remote_stage_title: "Stage",
-    remote_target_label: "Target",
     remote_waiting: "Waiting for you",
     remote_wait_identity: "the server's identity",
     remote_cancel_attempt: "Cancel connection",
@@ -1300,7 +1292,6 @@ pub static ENGLISH: Strings = Strings {
     x11_bar_enabling: "X11 starting",
     x11_bar_ready: "X11",
     x11_bar_failed: "X11 failed",
-    host_agent_note: "Uses a key already loaded into the system SSH agent; nothing to fill in here.",
     host_save_connect: "Save and connect",
     host_dialog_close: "Close",
     remote_saved_secret_failed: "The saved password could not be read",
@@ -1575,8 +1566,6 @@ pub static CHINESE: Strings = Strings {
     remote_verifying: "等待你确认服务器身份",
     remote_live: "SSH 会话已连接",
     remote_failed: "连接未建立",
-    remote_stage_title: "阶段",
-    remote_target_label: "目标",
     remote_waiting: "等待你操作",
     remote_wait_identity: "服务器身份",
     remote_cancel_attempt: "取消连接",
@@ -1759,7 +1748,6 @@ pub static CHINESE: Strings = Strings {
     x11_bar_enabling: "X11 启用中",
     x11_bar_ready: "X11",
     x11_bar_failed: "X11 失败",
-    host_agent_note: "使用系统 SSH Agent 中已加载的密钥，这里无需填写。",
     host_save_connect: "保存并连接",
     host_dialog_close: "关闭",
     remote_saved_secret_failed: "无法读取已保存的密码",
@@ -2421,6 +2409,36 @@ pub struct UxStrings {
     pub hosts_connect_hint: &'static str,
     /// Example a host form's empty group field shows
     pub host_example_group: &'static str,
+    /// Connection progress: reaching the server
+    pub connect_step_dial: &'static str,
+    /// Connection progress: checking the server's identity
+    pub connect_step_identity: &'static str,
+    /// Connection progress: signing in
+    pub connect_step_login: &'static str,
+    /// Connection progress: opening the terminal
+    pub connect_step_terminal: &'static str,
+    /// Connection form: reveals the less common options
+    pub connect_more_options: &'static str,
+    /// Sign-in method: try what the computer has
+    pub auth_auto: &'static str,
+    /// What the automatic sign-in tries
+    pub auth_auto_hint: &'static str,
+    /// Host dialog: under its title
+    pub host_dialog_intro: &'static str,
+    /// Host dialog: name field, which may stay empty
+    pub host_name_optional: &'static str,
+    /// Host dialog: group field, which may stay empty
+    pub host_group_optional: &'static str,
+    /// Host dialog: the password of the automatic method
+    pub host_password_optional: &'static str,
+    /// Host dialog: the key file is protected by a passphrase
+    pub host_key_has_passphrase: &'static str,
+    /// Host dialog: the folded section
+    pub host_advanced_title: &'static str,
+    /// Host dialog: what the folded section holds
+    pub host_advanced_hint: &'static str,
+    /// Host dialog: something in the folded section is set
+    pub host_advanced_in_use: &'static str,
     /// Group action: create a group
     pub hosts_group_new: &'static str,
     /// Group action: rename a group
@@ -2839,6 +2857,21 @@ impl UxStrings {
             self.hosts_groups_all,
             self.hosts_connect_hint,
             self.host_example_group,
+            self.connect_step_dial,
+            self.connect_step_identity,
+            self.connect_step_login,
+            self.connect_step_terminal,
+            self.connect_more_options,
+            self.auth_auto,
+            self.auth_auto_hint,
+            self.host_dialog_intro,
+            self.host_name_optional,
+            self.host_group_optional,
+            self.host_password_optional,
+            self.host_key_has_passphrase,
+            self.host_advanced_title,
+            self.host_advanced_hint,
+            self.host_advanced_in_use,
             self.hosts_group_new,
             self.hosts_group_rename,
             self.hosts_group_move,
@@ -3165,6 +3198,21 @@ included",
     hosts_groups_all: "All hosts",
     hosts_connect_hint: "Connect (or double-click the row)",
     host_example_group: "Production/Web",
+    connect_step_dial: "Reach the server",
+    connect_step_identity: "Verify the server",
+    connect_step_login: "Sign in",
+    connect_step_terminal: "Open the terminal",
+    connect_more_options: "More options…",
+    auth_auto: "Automatic",
+    host_dialog_intro: "An address and a user are enough; everything else can wait.",
+    host_name_optional: "Name (optional)",
+    host_group_optional: "Group (optional)",
+    host_password_optional: "Password (optional)",
+    host_key_has_passphrase: "This key has a passphrase",
+    host_advanced_title: "Advanced",
+    host_advanced_hint: "Jump hosts, ProxyCommand, startup command, file transfer, X11, keepalive",
+    host_advanced_in_use: "In use",
+    auth_auto_hint: "Tries the system SSH agent, then your keys in ~/.ssh (id_ed25519, id_ecdsa, id_rsa), then the password below if you give one.",
     hosts_group_new: "New group",
     hosts_group_rename: "Rename group",
     hosts_group_move: "Move selection here",
@@ -3486,6 +3534,21 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     hosts_groups_all: "全部主机",
     hosts_connect_hint: "连接（也可以双击这一行）",
     host_example_group: "生产/Web",
+    connect_step_dial: "连接服务器",
+    connect_step_identity: "验证服务器身份",
+    connect_step_login: "登录",
+    connect_step_terminal: "打开终端",
+    connect_more_options: "更多选项…",
+    auth_auto: "自动",
+    host_dialog_intro: "填好地址和用户名就能连接，其余都可以以后再说。",
+    host_name_optional: "名称（可选）",
+    host_group_optional: "分组（可选）",
+    host_password_optional: "密码（可选）",
+    host_key_has_passphrase: "这个私钥设置了口令",
+    host_advanced_title: "高级设置",
+    host_advanced_hint: "跳板机、代理命令、启动命令、文件传输、X11、保活",
+    host_advanced_in_use: "已设置",
+    auth_auto_hint: "依次尝试系统 SSH Agent、~/.ssh 里的私钥（id_ed25519、id_ecdsa、id_rsa），最后用下面的密码（可不填）。",
     hosts_group_new: "新建分组",
     hosts_group_rename: "重命名分组",
     hosts_group_move: "把所选主机移到这里",

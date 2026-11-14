@@ -15,6 +15,9 @@ use crate::error::{AgentKind, SecretString};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethodKind {
+    /// Try what this computer already has - the system agent, then the usual key
+    /// files - and a password when one was given, in that order.
+    Auto,
     /// A password typed for this attempt.
     Password,
     /// A private key file that needs no passphrase.
@@ -27,7 +30,8 @@ pub enum AuthMethodKind {
 
 impl AuthMethodKind {
     /// Every kind, in the order a chooser shows them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
         Self::Password,
         Self::KeyFile,
         Self::EncryptedKeyFile,
@@ -38,6 +42,7 @@ impl AuthMethodKind {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
+            Self::Auto => "Automatic",
             Self::Password => "Password",
             Self::KeyFile => "Key file",
             Self::EncryptedKeyFile => "Key file with passphrase",
@@ -87,6 +92,18 @@ pub enum AuthMethod {
         /// Which agent is used, so an unavailable one can be named.
         kind: AgentKind,
     },
+    /// Everything this computer can offer, tried in order until one is accepted: the
+    /// agent's keys, then each key file that opens without a passphrase, then the
+    /// password when one was given. Nothing missing is an error by itself; only a
+    /// server that refuses all of it is.
+    Auto {
+        /// The agent to ask, when there is one.
+        agent: Option<AgentKind>,
+        /// Key file paths to try, in order. Only paths are kept.
+        keys: Vec<String>,
+        /// A password to fall back on.
+        password: Option<SecretString>,
+    },
 }
 
 impl AuthMethod {
@@ -123,6 +140,7 @@ impl AuthMethod {
                 None => AuthMethodKind::KeyFile,
             },
             Self::Agent { .. } => AuthMethodKind::Agent,
+            Self::Auto { .. } => AuthMethodKind::Auto,
         }
     }
 
@@ -131,7 +149,7 @@ impl AuthMethod {
     pub fn key_path(&self) -> Option<&str> {
         match self {
             Self::KeyFile { path, .. } => Some(path),
-            Self::Password { .. } | Self::Agent { .. } => None,
+            Self::Password { .. } | Self::Agent { .. } | Self::Auto { .. } => None,
         }
     }
 
@@ -140,6 +158,7 @@ impl AuthMethod {
     pub fn agent_kind(&self) -> Option<AgentKind> {
         match self {
             Self::Agent { kind } => Some(*kind),
+            Self::Auto { agent, .. } => *agent,
             Self::Password { .. } | Self::KeyFile { .. } => None,
         }
     }
@@ -187,7 +206,7 @@ mod tests {
             .iter()
             .map(|kind| kind.label())
             .collect();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 5);
         let mut sorted = labels.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -196,5 +215,9 @@ mod tests {
         assert!(AuthMethodKind::KeyFile.needs_key_path());
         assert!(AuthMethodKind::EncryptedKeyFile.needs_key_path());
         assert!(!AuthMethodKind::Agent.needs_key_path());
+        assert!(
+            !AuthMethodKind::Auto.needs_password() && !AuthMethodKind::Auto.needs_key_path(),
+            "automatic sign-in asks for nothing up front"
+        );
     }
 }

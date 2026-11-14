@@ -30,6 +30,8 @@ use crate::app::copy::Strings;
 /// Which authentication method the form is set to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodChoice {
+    /// Whatever this computer has - agent, usual key files - and an optional password.
+    Auto,
     /// A password typed for this attempt.
     Password,
     /// A private key file that needs no passphrase.
@@ -42,7 +44,8 @@ pub enum MethodChoice {
 
 impl MethodChoice {
     /// Every method, in the order the chooser shows them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
         Self::Password,
         Self::KeyFile,
         Self::EncryptedKeyFile,
@@ -53,6 +56,7 @@ impl MethodChoice {
     #[must_use]
     pub fn label(self, strings: &Strings) -> &'static str {
         match self {
+            Self::Auto => crate::app::copy::ux().auth_auto,
             Self::Password => strings.auth_password,
             Self::KeyFile => strings.auth_key,
             Self::EncryptedKeyFile => strings.auth_key_passphrase,
@@ -64,6 +68,7 @@ impl MethodChoice {
     #[must_use]
     pub fn hint(self, strings: &Strings) -> &'static str {
         match self {
+            Self::Auto => crate::app::copy::ux().auth_auto_hint,
             Self::Password => strings.auth_password_hint,
             Self::KeyFile => strings.auth_key_hint,
             Self::EncryptedKeyFile => strings.auth_key_passphrase_hint,
@@ -75,6 +80,7 @@ impl MethodChoice {
     #[must_use]
     pub fn debug_selector(self) -> &'static str {
         match self {
+            Self::Auto => "remote.method.auto",
             Self::Password => "remote.method.password",
             Self::KeyFile => "remote.method.key",
             Self::EncryptedKeyFile => "remote.method.key-passphrase",
@@ -96,14 +102,23 @@ impl MethodChoice {
 
     /// Whether the method reads a password.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn needs_password(self) -> bool {
         matches!(self, Self::Password)
+    }
+
+    /// Whether the form shows a password field: required for a password, optional
+    /// as the last resort of the automatic method.
+    #[must_use]
+    pub fn takes_password(self) -> bool {
+        matches!(self, Self::Password | Self::Auto)
     }
 
     /// The choice that stands for a domain method kind.
     #[must_use]
     pub fn from_kind(kind: shellune_core::AuthMethodKind) -> Self {
         match kind {
+            shellune_core::AuthMethodKind::Auto => Self::Auto,
             shellune_core::AuthMethodKind::Password => Self::Password,
             shellune_core::AuthMethodKind::KeyFile => Self::KeyFile,
             shellune_core::AuthMethodKind::EncryptedKeyFile => Self::EncryptedKeyFile,
@@ -115,6 +130,7 @@ impl MethodChoice {
     #[must_use]
     pub fn kind(self) -> shellune_core::AuthMethodKind {
         match self {
+            Self::Auto => shellune_core::AuthMethodKind::Auto,
             Self::Password => shellune_core::AuthMethodKind::Password,
             Self::KeyFile => shellune_core::AuthMethodKind::KeyFile,
             Self::EncryptedKeyFile => shellune_core::AuthMethodKind::EncryptedKeyFile,
@@ -522,6 +538,12 @@ impl RemotePanel {
     /// Returns the reason a field is missing, naming the field rather than the value.
     pub fn take_auth(&mut self, strings: &Strings) -> Result<AuthMethod, String> {
         let auth = match self.method {
+            // The password is optional here: it is the last thing tried, after what the
+            // computer already has.
+            MethodChoice::Auto => automatic_auth(
+                (!self.password.is_empty())
+                    .then(|| SecretString::new(std::mem::take(&mut self.password))),
+            ),
             MethodChoice::Password => {
                 if self.password.is_empty() {
                     return Err(strings.auth_missing_password.to_owned());
@@ -546,6 +568,32 @@ impl RemotePanel {
         };
         self.form_error = None;
         Ok(auth)
+    }
+}
+
+/// The key files the automatic method tries, in the order OpenSSH tries them.
+#[must_use]
+pub fn default_key_files() -> Vec<String> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let directory = std::path::PathBuf::from(home).join(".ssh");
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .iter()
+        .map(|name| directory.join(name))
+        .filter(|path| path.is_file())
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+/// The automatic method: this platform's agent, the usual key files, then `password`.
+#[must_use]
+pub fn automatic_auth(password: Option<SecretString>) -> AuthMethod {
+    AuthMethod::Auto {
+        agent: Some(default_agent()),
+        keys: default_key_files(),
+        password,
     }
 }
 
@@ -613,6 +661,13 @@ pub fn now_unix() -> u64 {
 #[must_use]
 pub fn stored_auth(host: &HostConfig, secret: Option<&SecretString>) -> Option<AuthMethod> {
     match host.auth()? {
+        // Nothing is ever missing: the automatic method asks the computer, and a
+        // remembered password is only the last thing it tries.
+        AuthMethodKind::Auto => Some(automatic_auth(
+            secret
+                .filter(|secret| !secret.expose().is_empty())
+                .map(|secret| SecretString::new(secret.expose().to_owned())),
+        )),
         AuthMethodKind::Agent => Some(AuthMethod::agent(default_agent())),
         AuthMethodKind::KeyFile => {
             let path = host.identity_file()?.trim();
@@ -1040,13 +1095,17 @@ mod tests {
             .iter()
             .map(|method| method.label(&ENGLISH))
             .collect();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 5);
         let mut sorted = labels.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), labels.len(), "each method has its own label");
 
         assert!(MethodChoice::Password.needs_password());
+        assert!(
+            !MethodChoice::Auto.needs_password() && MethodChoice::Auto.takes_password(),
+            "the automatic method offers a password field but does not require it"
+        );
         assert!(MethodChoice::KeyFile.needs_key_path());
         assert!(MethodChoice::EncryptedKeyFile.needs_passphrase());
         assert!(!MethodChoice::Agent.needs_key_path());

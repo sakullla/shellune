@@ -293,6 +293,10 @@ impl ShelluneView {
     }
 
     /// The fields the chosen sign-in method asks for.
+    ///
+    /// Four choices, not five: a key with a passphrase is a key file whose box says it
+    /// has one, which is how people think of it. "Automatic" is first and the default;
+    /// its password is optional, the last thing tried after what the computer has.
     fn sign_in_fields(
         &self,
         fields: &HostFields,
@@ -301,18 +305,31 @@ impl ShelluneView {
     ) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
         let auth = draft.auth();
         let mut column = div().flex().flex_col().gap(metrics.scale(spacing::SNUG));
 
         let mut methods = components::segmented(metrics).debug_selector(|| "hosts.auth".to_owned());
-        for choice in MethodChoice::ALL {
+        for choice in MethodChoice::ALL
+            .into_iter()
+            .filter(|choice| *choice != MethodChoice::EncryptedKeyFile)
+        {
             let kind = choice.kind();
+            let chosen = kind == auth
+                || (choice == MethodChoice::KeyFile && auth == AuthMethodKind::EncryptedKeyFile);
             methods = methods.child(
-                components::segment(choice.label(strings), kind == auth, metrics)
+                components::segment(choice.label(strings), chosen, metrics)
                     .id(choice.debug_selector())
                     .debug_selector(move || format!("hosts.auth.{}", choice.debug_selector()))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.set_host_auth(kind, cx);
+                        // Choosing "key file" again keeps a passphrase that was ticked.
+                        let already_key = this
+                            .hosts
+                            .draft()
+                            .is_some_and(|draft| draft.auth().needs_key_path());
+                        if !(kind == AuthMethodKind::KeyFile && already_key) {
+                            this.set_host_auth(kind, cx);
+                        }
                     })),
             );
         }
@@ -321,17 +338,18 @@ impl ShelluneView {
                 .flex()
                 .flex_col()
                 .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                .child(div().flex().child(methods))
                 .child(
                     div()
                         .text_size(metrics.caption_size())
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .child(strings.host_auth_title),
-                )
-                .child(div().flex().child(methods)),
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "hosts.auth.hint".to_owned())
+                        .child(MethodChoice::from_kind(auth).hint(strings)),
+                ),
         );
 
         if auth.needs_key_path() {
+            let has_passphrase = auth.needs_passphrase();
             column = column
                 .child(self.dialog_field(fields, HostField::IdentityFile, None, 1.0))
                 .child(
@@ -340,6 +358,24 @@ impl ShelluneView {
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_MUTED))
                         .child(strings.host_identity_note),
+                )
+                .child(
+                    checkbox(
+                        "hosts.key.passphrase",
+                        ux.host_key_has_passphrase,
+                        has_passphrase,
+                        metrics,
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.set_host_auth(
+                            if has_passphrase {
+                                AuthMethodKind::KeyFile
+                            } else {
+                                AuthMethodKind::EncryptedKeyFile
+                            },
+                            cx,
+                        );
+                    })),
                 );
         }
         if draft.needs_secret() {
@@ -348,40 +384,82 @@ impl ShelluneView {
                     strings.host_secret_passphrase,
                     strings.host_remember_passphrase,
                 )
+            } else if auth == AuthMethodKind::Auto {
+                (ux.host_password_optional, strings.host_remember_password)
             } else {
                 (strings.auth_password, strings.host_remember_password)
             };
             column = column
                 .child(self.dialog_field(fields, HostField::Secret, Some(label), 1.0))
                 .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(metrics.scale(spacing::HAIRLINE))
-                        .child(
-                            checkbox("hosts.remember", remember_label, draft.remember(), metrics)
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.toggle_remember(cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .pl(metrics.scale(24.0))
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(strings.host_remember_note),
-                        ),
+                    checkbox("hosts.remember", remember_label, draft.remember(), metrics)
+                        .tooltip(components::tooltip(strings.host_remember_note))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.toggle_remember(cx);
+                        })),
                 );
         }
-        if auth == AuthMethodKind::Agent {
-            column = column.child(
+        column
+    }
+
+    /// The folded section's head: what is inside it, and whether anything there is in use.
+    fn advanced_toggle(&self, draft: &HostDraft, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let open = self.host_advanced;
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        div()
+            .id("hosts.advanced")
+            .debug_selector(|| "hosts.advanced".to_owned())
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .w_full()
+            .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(spacing::TIGHT + 2.0))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .child(icons::icon(
+                if open {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                metrics.small_icon_size(),
+                theme::swatch(palette::TEXT_SECONDARY),
+            ))
+            .child(
                 div()
+                    .flex_none()
+                    .text_size(metrics.label_size())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(ux.host_advanced_title),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.host_agent_note),
-            );
-        }
-        column
+                    .child(ux.host_advanced_hint),
+            )
+            .when(draft.has_advanced(), |row| {
+                row.child(components::chip(
+                    ux.host_advanced_in_use,
+                    Tone::Accent,
+                    metrics,
+                ))
+            })
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.host_advanced = !this.host_advanced;
+                cx.notify();
+            }))
     }
 
     /// The choice of the protocol this host's transfers start with (R10).
@@ -732,16 +810,20 @@ impl ShelluneView {
                 .child(left)
                 .child(right)
         };
+        let ux = copy::ux();
         let section = |title: &'static str| {
             div()
-                .pt(metrics.scale(spacing::HAIRLINE))
-                .text_size(metrics.caption_size())
+                .text_size(metrics.label_size())
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .child(title)
         };
+        let rule = || div().h(px(1.0)).bg(theme::swatch(palette::BORDER));
 
-        let body = div()
+        // What a person needs to reach a server comes first - where, who, how - and
+        // only that is required. Naming and grouping follow; everything a first host
+        // never needs folds away under one line that says what is inside.
+        let mut body = div()
             .id("hosts.editor.body")
             .flex()
             .flex_col()
@@ -751,47 +833,64 @@ impl ShelluneView {
             .overflow_y_scroll()
             .track_scroll(&self.host_body_scroll)
             .child(line(
-                self.dialog_field(fields, HostField::Name, None, 0.5),
-                self.dialog_field(fields, HostField::Group, None, 0.5),
-            ))
-            .child(line(
                 self.dialog_field(fields, HostField::Address, None, 0.75),
                 self.dialog_field(fields, HostField::Port, None, 0.25),
             ))
             .child(self.dialog_field(fields, HostField::User, None, 1.0))
-            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
+            .child(rule())
+            .child(section(strings.host_auth_title))
             .child(self.sign_in_fields(fields, &draft, cx))
-            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
-            .child(self.jump_section(fields, &draft, cx))
-            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
-            .child(self.copy_protocol_section(&draft, metrics, strings, cx))
-            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
-            .child(self.x11_section(&draft, metrics, strings, cx))
-            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
-            .child(self.connection_section(&draft, metrics, cx))
-            .child(div().h(px(1.0)).bg(theme::swatch(palette::BORDER)))
-            .child(section(strings.host_startup_label))
-            .child(
+            .child(rule())
+            .child(line(
+                self.dialog_field(fields, HostField::Name, Some(ux.host_name_optional), 0.5),
+                self.dialog_field(fields, HostField::Group, Some(ux.host_group_optional), 0.5),
+            ))
+            .child(self.advanced_toggle(&draft, cx));
+
+        if self.host_advanced {
+            body = body.child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                    .gap(metrics.scale(spacing::SNUG + 2.0))
+                    .pl(metrics.scale(spacing::SNUG))
+                    .border_l_2()
+                    .border_color(theme::swatch(palette::BORDER))
+                    .debug_selector(|| "hosts.advanced.body".to_owned())
+                    .child(self.jump_section(fields, &draft, cx))
                     .child(
                         div()
                             .flex()
-                            .w_full()
-                            .debug_selector(|| {
-                                HostField::StartupCommand.debug_selector().to_owned()
-                            })
-                            .child(fields.startup.clone()),
+                            .flex_col()
+                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(strings.host_startup_label),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .w_full()
+                                    .debug_selector(|| {
+                                        HostField::StartupCommand.debug_selector().to_owned()
+                                    })
+                                    .child(fields.startup.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(strings.host_startup_note),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(strings.host_startup_note),
-                    ),
+                    .child(self.copy_protocol_section(&draft, metrics, strings, cx))
+                    .child(self.x11_section(&draft, metrics, strings, cx))
+                    .child(self.connection_section(&draft, metrics, cx)),
             );
+        }
 
         let refusal = self
             .hosts
@@ -811,16 +910,51 @@ impl ShelluneView {
             .justify_between()
             .px(metrics.scale(spacing::LOOSE))
             .pt(metrics.scale(spacing::BASE + 2.0))
+            .pb(metrics.scale(spacing::TIGHT))
             .child(
                 div()
-                    .text_size(metrics.heading_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(if editing {
-                        strings.host_editor_edit
-                    } else {
-                        strings.host_editor_new
-                    }),
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(metrics.scale(36.0))
+                            .rounded(px(radius::MEDIUM))
+                            .bg(theme::swatch(palette::ACCENT_TINT))
+                            .child(icons::icon(
+                                Icon::Server,
+                                metrics.icon_size(),
+                                theme::swatch(palette::ACCENT_ON_TINT),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(metrics.heading_size())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .child(if editing {
+                                        strings.host_editor_edit
+                                    } else {
+                                        strings.host_editor_new
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(ux.host_dialog_intro),
+                            ),
+                    ),
             )
             .child(
                 components::icon_only_button(Icon::Close, metrics)

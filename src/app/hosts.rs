@@ -737,7 +737,9 @@ impl HostDraft {
             user: String::new(),
             group: String::new(),
             identity: String::new(),
-            auth: AuthMethodKind::Password,
+            // A new host signs in the way most servers expect without being told: the
+            // agent, the usual keys, then a password if one is typed.
+            auth: AuthMethodKind::Auto,
             remember: true,
             has_saved_secret: false,
             secret: String::new(),
@@ -867,7 +869,76 @@ impl HostDraft {
     /// Whether the chosen method reads a password or a passphrase.
     #[must_use]
     pub fn needs_secret(&self) -> bool {
-        self.auth.needs_password() || self.auth.needs_passphrase()
+        self.auth.needs_password()
+            || self.auth.needs_passphrase()
+            || self.auth == AuthMethodKind::Auto
+    }
+
+    /// Whether any of the settings the dialog folds away differs from its default.
+    ///
+    /// A host that uses one of them opens with the section unfolded, so nothing it
+    /// relies on is hidden from the person editing it.
+    #[must_use]
+    pub fn has_advanced(&self) -> bool {
+        !self.jumps.is_empty()
+            || !self.proxy.trim().is_empty()
+            || !self.startup.trim().is_empty()
+            || self.protocol != TransferProtocol::Sftp
+            || self.x11 != X11Forwarding::Off
+            || self.connection.choice() != ConnectionChoice::Inherit
+    }
+
+    /// Splits an address typed the way `ssh` takes it - `user@host:port` - into its
+    /// fields, returning whether it did.
+    ///
+    /// The user and the port are only taken when their own fields are still at their
+    /// starting values, so a paste never overwrites something typed on purpose. An
+    /// IPv6 literal (more than one colon, or brackets) is left as it is.
+    pub fn split_address(&mut self) -> bool {
+        let text = self.address.trim().to_owned();
+        let (user, rest) = match text.split_once('@') {
+            Some((user, rest)) if !user.is_empty() && !rest.is_empty() => {
+                (Some(user.to_owned()), rest.to_owned())
+            }
+            _ => (None, text.clone()),
+        };
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((host, port))
+                if !host.contains(':')
+                    && !host.starts_with('[')
+                    && !host.is_empty()
+                    && !port.is_empty()
+                    && port.chars().all(|ch| ch.is_ascii_digit()) =>
+            {
+                (host.to_owned(), Some(port.to_owned()))
+            }
+            _ => (rest, None),
+        };
+        if user.is_none() && port.is_none() {
+            return false;
+        }
+        self.address = host;
+        if let Some(user) = user
+            && self.user.trim().is_empty()
+        {
+            self.user = user;
+        }
+        if let Some(port) = port
+            && self.port == Port::DEFAULT.to_string()
+        {
+            self.port = port;
+        }
+        true
+    }
+
+    /// The name the host is saved under: the typed one, or its address when the name
+    /// was left empty - a host is usually called what it is reached by.
+    fn effective_name(&self) -> String {
+        if self.name.trim().is_empty() {
+            self.address.trim().to_owned()
+        } else {
+            self.name.clone()
+        }
     }
 
     /// Whether the form will keep a secret in the system store when saved.
@@ -946,7 +1017,7 @@ impl HostDraft {
         match existing {
             Some(saved) => {
                 let mut host = saved.clone();
-                host.set_name(self.name.clone())
+                host.set_name(self.effective_name())
                     .map_err(|error| error.to_string())?;
                 host.set_address(self.address.clone())
                     .map_err(|error| error.to_string())?;
@@ -965,7 +1036,7 @@ impl HostDraft {
             }
             None => {
                 let mut host = HostConfig::new(
-                    self.name.clone(),
+                    self.effective_name(),
                     self.address.clone(),
                     port.get(),
                     self.user.clone(),
@@ -2389,6 +2460,47 @@ fn hosts_under(book: &HostBook, kept: &BTreeSet<HostId>, path: &GroupPath) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_typed_like_ssh_fills_the_user_and_the_port() {
+        let mut draft = HostDraft::create();
+        draft.set_text(HostField::Address, "deploy@10.0.0.12:2222");
+        assert!(draft.split_address());
+        assert_eq!(draft.text(HostField::Address), "10.0.0.12");
+        assert_eq!(draft.text(HostField::User), "deploy");
+        assert_eq!(draft.text(HostField::Port), "2222");
+
+        // A user typed on purpose is not overwritten by a paste.
+        let mut typed = HostDraft::create();
+        typed.set_text(HostField::User, "ada");
+        typed.set_text(HostField::Address, "root@example.com");
+        assert!(typed.split_address());
+        assert_eq!(typed.text(HostField::User), "ada");
+        assert_eq!(typed.text(HostField::Address), "example.com");
+
+        // A plain host and an IPv6 literal are left alone.
+        let mut plain = HostDraft::create();
+        plain.set_text(HostField::Address, "example.com");
+        assert!(!plain.split_address());
+        let mut six = HostDraft::create();
+        six.set_text(HostField::Address, "fe80::1");
+        assert!(!six.split_address());
+        assert_eq!(six.text(HostField::Address), "fe80::1");
+    }
+
+    #[test]
+    fn a_new_host_signs_in_automatically_and_is_named_after_its_address() {
+        let mut draft = HostDraft::create();
+        assert_eq!(draft.auth(), AuthMethodKind::Auto);
+        assert!(!draft.has_advanced(), "a new host folds nothing it uses");
+        draft.set_text(HostField::Address, "10.0.0.12");
+        draft.set_text(HostField::User, "root");
+        let edit = draft.build(None).expect("a valid host");
+        let host = edit.host();
+        assert!(edit.replaces().is_none(), "a new host is created");
+        assert_eq!(host.name(), "10.0.0.12");
+        assert_eq!(host.auth(), Some(AuthMethodKind::Auto));
+    }
     use crate::app::copy::{CHINESE, ENGLISH};
     use shellune_storage::HostBook;
 

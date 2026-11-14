@@ -273,10 +273,45 @@ impl ShelluneView {
     pub(super) fn settings_page(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let folded = self.settings_folded();
-        let shown = self.settings_nav.current();
-        // Once folded, the navigation comes first: the two pickers are the only way to reach
-        // another category, so they stay at the top of the page and the item's heading and its
-        // card follow them (R8).
+
+        // Every category on one page that scrolls: settings are read the way a person
+        // reads a document, top to bottom, and the navigation is a table of contents -
+        // a press scrolls to a category, and scrolling moves the mark in the
+        // navigation. Only the sections scroll; the navigation stays where it is.
+        let mut sections = div()
+            .id("settings.scroll")
+            .debug_selector(|| "settings.scroll".to_owned())
+            .track_scroll(&self.settings_scroll)
+            .on_scroll_wheel(cx.listener(|this, _event, _window, cx| {
+                // The reader is scrolling now: the mark follows the page again, and the
+                // page redraws as it moves.
+                this.settings_pending_reveal.set(false);
+                cx.notify();
+            }))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .w_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .max_w(metrics.scale(680.0))
+            .overflow_y_scroll()
+            .overflow_x_hidden()
+            .gap(metrics.scale(spacing::LOOSE + spacing::BASE))
+            .pt(metrics.scale(spacing::LOOSE))
+            .pr(metrics.scale(spacing::HAIRLINE));
+        for category in Category::ALL {
+            sections = sections.child(self.settings_section(category, cx));
+        }
+        // Room after the last section, so a press on any category - the last ones too -
+        // can bring its heading to the top instead of stopping at the end of the page.
+        sections = sections.child(
+            div()
+                .flex_none()
+                .h(self.viewport_height * 0.6)
+                .debug_selector(|| "settings.tail".to_owned()),
+        );
+
         let body = if folded {
             div()
                 .flex()
@@ -284,40 +319,40 @@ impl ShelluneView {
                 .flex_1()
                 .w_full()
                 .min_w(px(0.0))
-                .gap(metrics.scale(spacing::LOOSE))
-                .child(self.settings_pickers(cx))
-                .child(self.settings_item_heading(shown))
-                .child(self.settings_item_body(shown, cx))
+                .min_h(px(0.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .pt(metrics.scale(spacing::LOOSE))
+                        .child(self.settings_pickers(cx)),
+                )
+                .child(sections)
         } else {
             div()
                 .flex()
-                .items_start()
+                .flex_1()
                 .w_full()
                 .min_w(px(0.0))
+                .min_h(px(0.0))
                 .gap(metrics.scale(spacing::LOOSE))
-                .child(self.settings_navigation(cx))
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .max_w(metrics.scale(640.0))
-                        .gap(metrics.scale(spacing::LOOSE))
-                        .child(self.settings_item_heading(shown))
-                        .child(self.settings_item_body(shown, cx)),
+                        .flex_none()
+                        .pt(metrics.scale(spacing::LOOSE))
+                        .child(self.settings_navigation(cx)),
                 )
+                .child(sections)
         };
         let page = div()
             .flex()
             .flex_col()
+            .flex_1()
             .w_full()
             .min_w(px(0.0))
+            .min_h(px(0.0))
             .max_w(metrics.scale(980.0))
             .mx_auto()
             .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::LOOSE))
-            .gap(metrics.scale(spacing::LOOSE))
             .debug_selector(|| "settings".to_owned())
             .child(body);
 
@@ -334,10 +369,151 @@ impl ShelluneView {
             .w_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
-            .overflow_y_scroll()
-            .overflow_x_hidden()
+            .overflow_hidden()
             .bg(theme::swatch(palette::CANVAS))
             .child(page)
+    }
+
+    /// The category the reader is in: the last section whose heading has passed the top
+    /// of the scrolled area, or the last one once the page is scrolled to its end.
+    ///
+    /// Before the first layout there are no bounds, and the category chosen in the
+    /// navigation is the answer.
+    pub(super) fn settings_category_in_view(&self) -> Category {
+        let handle = &self.settings_scroll;
+        let area = handle.bounds();
+        // A press in the navigation scrolls on the next layout; until the reader scrolls
+        // the page themselves, the category they chose is the one they are in.
+        if self.settings_pending_reveal.get() || area.size.height <= px(0.0) {
+            return self.settings_nav.category;
+        }
+        // The section at the top of the scrolled area is the one being read: the first
+        // whose end is still below the top edge. The handle keeps where each section was
+        // laid out before scrolling; the offset (negative as the page moves up) says
+        // where it is now.
+        let top = area.origin.y + self.metrics().scale(spacing::LOOSE);
+        let offset = handle.offset().y;
+        for (index, category) in Category::ALL.iter().enumerate() {
+            match handle.bounds_for_item(index) {
+                Some(bounds) if bounds.origin.y + bounds.size.height + offset > top => {
+                    return *category;
+                }
+                Some(_) => {}
+                None => return self.settings_nav.category,
+            }
+        }
+        Category::ALL[Category::ALL.len() - 1]
+    }
+
+    /// The id of the category the page is scrolled to, for the tests.
+    #[cfg(test)]
+    pub fn settings_category_in_view_id(&self) -> &'static str {
+        self.settings_category_in_view().id()
+    }
+
+    /// Scrolls the page so a category's heading is at the top.
+    pub(super) fn settings_reveal(&self, category: Category) {
+        self.settings_pending_reveal.set(true);
+        self.settings_scroll.scroll_to_top_of_item(category.index());
+    }
+
+    /// One category of the page: its title, then each of its settings under its own
+    /// small heading and card.
+    fn settings_section(&self, category: Category, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let locale = self.workspace.locale();
+        let in_view = self.settings_category_in_view() == category;
+        let shown = self.settings_nav.current();
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .min_w(px(0.0))
+            .gap(metrics.scale(spacing::BASE))
+            .debug_selector({
+                let selector = format!("settings.section.{}", category.id());
+                move || selector.clone()
+            })
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .text_size(metrics.title_size() + metrics.scale(3.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .when(category == shown.category(), |title| {
+                        title.debug_selector(|| "header.title".to_owned())
+                    })
+                    .when(in_view, |title| {
+                        title.debug_selector(|| "settings.crumb".to_owned())
+                    })
+                    .child(category.label(locale)),
+            );
+        for item in category.items() {
+            let item = *item;
+            let chosen = item == shown;
+            let selector = format!("settings.page.{}", item.id());
+            // A category of one page named like the category needs no second heading.
+            let named = !Self::single_named_item(category, locale);
+            let hint = match item {
+                Item::Shortcuts | Item::Policy => item.hint(locale),
+                _ => "",
+            };
+            section = section.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .debug_selector(move || selector.clone())
+                    .when(named, |block| {
+                        block.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(metrics.scale(spacing::TIGHT))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(2.0))
+                                        .h(metrics.scale(14.0))
+                                        .rounded(px(1.0))
+                                        .bg(if chosen {
+                                            theme::swatch(palette::ACCENT)
+                                        } else {
+                                            theme::clear()
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(metrics.body_size())
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::swatch(if chosen {
+                                            palette::TEXT_PRIMARY
+                                        } else {
+                                            palette::TEXT_SECONDARY
+                                        }))
+                                        .child(item.label(locale)),
+                                ),
+                        )
+                    })
+                    .when(!hint.is_empty(), |block| {
+                        block.child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .text_size(metrics.label_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .debug_selector(|| "settings.intro".to_owned())
+                                .child(hint),
+                        )
+                    })
+                    .child(self.settings_item_body(item, cx)),
+            );
+        }
+        section
     }
 
     /// The navigation column: every category, with the items of the chosen one under it.
@@ -353,8 +529,10 @@ impl ShelluneView {
             .min_w(px(0.0))
             .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "settings.nav".to_owned());
+        // The mark follows what is on screen, so scrolling the page moves it.
+        let in_view = self.settings_category_in_view();
         for category in Category::ALL {
-            let chosen = category == self.settings_nav.category;
+            let chosen = category == in_view;
             let selector = format!("settings.category.{}", category.id());
             // A category is a line of the column, not a card: the column is navigation,
             // and seven bordered boxes made it heavier than the page it navigates. The
@@ -595,56 +773,6 @@ impl ShelluneView {
             })
             .when(self.settings_nav.nav_focus, |column| {
                 column.child(self.settings_nav_hint())
-            })
-    }
-
-    /// The page of one item: where it sits, its name and its sentence, then its own
-    /// controls - and nothing else (R16).
-    fn settings_item_heading(&self, item: Item) -> Div {
-        let metrics = self.metrics();
-        let locale = self.workspace.locale();
-        let selector = format!("settings.page.{}", item.id());
-        // A page whose card is one setting already says the name in its row; repeating the
-        // sentence here would print the same words twice (R16). Pages that are a list of
-        // rows keep it, because nothing below repeats it.
-        let hint = match item {
-            Item::Shortcuts | Item::Policy => item.hint(locale),
-            _ => "",
-        };
-        div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .min_w(px(0.0))
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(move || selector.clone())
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .debug_selector(|| "settings.crumb".to_owned())
-                    .child(item.category().label(locale)),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .min_w(px(0.0))
-                    .text_size(metrics.hero_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .debug_selector(|| "header.title".to_owned())
-                    .child(item.label(locale)),
-            )
-            .when(!hint.is_empty(), |column| {
-                column.child(
-                    div()
-                        .w_full()
-                        .min_w(px(0.0))
-                        .text_size(metrics.body_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .debug_selector(|| "settings.intro".to_owned())
-                        .child(hint),
-                )
             })
     }
 }
@@ -1587,10 +1715,10 @@ impl ShelluneView {
     /// Opens one category, keeping the item it was last on (R16).
     fn settings_select_category(&mut self, category: Category, cx: &mut Context<Self>) {
         self.settings_nav.nav_focus = false;
-        if self.settings_nav.category != category {
-            self.settings_nav.category = category;
-            cx.notify();
-        }
+        self.settings_nav.category = category;
+        // Pressed again after scrolling away, the same category still scrolls back to it.
+        self.settings_reveal(category);
+        cx.notify();
     }
 
     /// Opens one item of one category.
@@ -1598,6 +1726,7 @@ impl ShelluneView {
         self.settings_nav.category = category;
         self.settings_nav.set_item(category, index);
         self.settings_nav.nav_focus = false;
+        self.settings_reveal(category);
         self.keys_selected = 0;
         self.keys_control = 0;
         cx.notify();
@@ -1621,6 +1750,7 @@ impl ShelluneView {
             .position(|candidate| *candidate == self.settings_nav.category)
             .unwrap_or_default();
         self.settings_nav.category = all[crate::app::palette::step(at, delta, all.len())];
+        self.settings_reveal(self.settings_nav.category);
         cx.notify();
     }
 

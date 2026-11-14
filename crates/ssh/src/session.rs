@@ -1052,6 +1052,12 @@ pub(crate) enum Material {
         kind: AgentKind,
         client: agent::DynamicAgent,
     },
+    /// What the automatic method found on this computer, in the order it is tried.
+    Auto {
+        agent: Option<agent::DynamicAgent>,
+        keys: Vec<Arc<russh::keys::PrivateKey>>,
+        password: Option<shellune_core::SecretString>,
+    },
 }
 
 impl Material {
@@ -1065,6 +1071,29 @@ impl Material {
             AuthMethod::Agent { kind } => {
                 let client = agent::connect(kind).await?;
                 Ok(Self::Agent { kind, client })
+            }
+            AuthMethod::Auto {
+                agent: kind,
+                keys,
+                password,
+            } => {
+                // Whatever is not there is skipped, not reported: an agent that is not
+                // running or a key that needs a passphrase is simply not one of the
+                // things this attempt can offer.
+                let agent = match kind {
+                    Some(kind) => agent::connect(kind).await.ok(),
+                    None => None,
+                };
+                let keys = keys
+                    .iter()
+                    .filter_map(|path| load_private_key(path, None).ok())
+                    .map(Arc::new)
+                    .collect();
+                Ok(Self::Auto {
+                    agent,
+                    keys,
+                    password,
+                })
             }
         }
     }
@@ -1127,6 +1156,46 @@ pub(crate) async fn authenticate<H: client::Handler>(
                 }
             }
             Err(ConnectError::AgentIdentityRejected { agent: kind })
+        }
+        Material::Auto {
+            agent,
+            keys,
+            password,
+        } => {
+            if let Some(mut client) = agent
+                && let Ok(identities) = client.request_identities().await
+            {
+                for identity in identities {
+                    let public = identity.public_key().into_owned();
+                    if let Ok(result) = handle
+                        .authenticate_publickey_with(user, public, None, &mut client)
+                        .await
+                        && result.success()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            for key in keys {
+                let hash_alg = rsa_hash_alg(handle, &key).await;
+                let accepted = handle
+                    .authenticate_publickey(user, PrivateKeyWithHashAlg::new(key, hash_alg))
+                    .await
+                    .map_err(ConnectError::from)?;
+                if accepted.success() {
+                    return Ok(());
+                }
+            }
+            if let Some(password) = password {
+                let accepted = handle
+                    .authenticate_password(user, password.expose())
+                    .await
+                    .map_err(ConnectError::from)?;
+                if accepted.success() {
+                    return Ok(());
+                }
+            }
+            Err(ConnectError::AuthRejected)
         }
     }
 }

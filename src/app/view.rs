@@ -522,6 +522,10 @@ pub struct ShelluneView {
     forwards_polling: bool,
     /// The next dial is a pure forward and must not open a shell.
     forward_only_dial: bool,
+    /// Whether the host dialog shows its advanced settings.
+    host_advanced: bool,
+    /// Whether the connection form shows its less common options (X11 forwarding).
+    remote_more: bool,
     /// Rules waiting for that dial to authenticate.
     pending_forward_rules: Vec<ForwardId>,
     /// A non-loopback listen waiting for confirmation. Nothing is bound.
@@ -662,6 +666,10 @@ pub struct ShelluneView {
     palette_selected: usize,
     /// Keeps the highlighted palette entry in view.
     palette_scroll: gpui::ScrollHandle,
+    /// The settings page, which scrolls through every category.
+    settings_scroll: gpui::ScrollHandle,
+    /// A category the navigation scrolled to and the page has not drawn there yet.
+    settings_pending_reveal: std::cell::Cell<bool>,
     /// The tab whose menu is open, and where the pointer opened it.
     tab_menu: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
     /// The tab whose name is being edited, while that dialog is open.
@@ -1882,6 +1890,8 @@ impl ShelluneView {
             forward_target_port,
             forwards_polling: false,
             forward_only_dial: false,
+            host_advanced: false,
+            remote_more: false,
             pending_forward_rules: Vec::new(),
             pending_exposure: None,
             forward_confirm: None,
@@ -1932,6 +1942,8 @@ impl ShelluneView {
             focus_lost_watch: None,
             palette_selected: 0,
             palette_scroll: gpui::ScrollHandle::new(),
+            settings_scroll: gpui::ScrollHandle::new(),
+            settings_pending_reveal: std::cell::Cell::new(false),
             tab_menu: None,
             tab_rename: None,
             accent_hover: None,
@@ -3875,7 +3887,9 @@ impl ShelluneView {
     /// a test observes the state below rather than the screen.
     fn hide_for_reopen(&mut self, cx: &mut Context<Self>) {
         self.hidden_for_reopen = true;
-        #[cfg(target_os = "macos")]
+        // The test platform implements no application hide and panics if asked; the
+        // tests read `hidden_for_reopen`, which is the same decision.
+        #[cfg(all(target_os = "macos", not(test)))]
         cx.hide();
         cx.notify();
     }
@@ -4430,12 +4444,40 @@ impl ShelluneView {
 
         cx.observe(&entity, move |view, text_field, cx| {
             let text = text_field.read(cx).text().to_owned();
+            let mut split = false;
             if let Some(draft) = view.hosts.draft_mut() {
                 draft.set_text(field, text);
+                // `root@10.0.0.12:2222` pasted into the address is three fields at once.
+                split = field == HostField::Address && draft.split_address();
+            }
+            if split {
+                view.refill_host_fields(
+                    &[HostField::Address, HostField::User, HostField::Port],
+                    cx,
+                );
             }
             cx.notify();
         })
         .detach();
+    }
+
+    /// Writes the draft's text back into some of the dialog's fields, after the draft
+    /// changed them itself.
+    fn refill_host_fields(&mut self, which: &[HostField], cx: &mut Context<Self>) {
+        let (Some(fields), Some(draft)) = (self.host_fields.as_ref(), self.hosts.draft()) else {
+            return;
+        };
+        let updates: Vec<(Entity<TextField>, String)> = which
+            .iter()
+            .map(|field| (fields.get(*field).clone(), draft.text(*field).to_owned()))
+            .collect();
+        for (entity, text) in updates {
+            entity.update(cx, |field, cx| {
+                if field.text() != text {
+                    field.set_text(text, cx);
+                }
+            });
+        }
     }
 
     /// The global keepalive and timeout numbers in force (R20).
@@ -4587,6 +4629,10 @@ impl ShelluneView {
     }
 
     fn open_host_fields(&mut self, cx: &mut Context<Self>) {
+        self.host_advanced = self
+            .hosts
+            .draft()
+            .is_some_and(crate::app::hosts::HostDraft::has_advanced);
         // The form is built before anything is typed, so this is where the numbers an
         // override starts from are read from the defaults in force (R20).
         self.hosts
@@ -5370,7 +5416,7 @@ impl ShelluneView {
         self.form_session = None;
         let mut panel = RemotePanel::new(&host);
         match method {
-            MethodChoice::Password => panel.set_password(password),
+            MethodChoice::Password | MethodChoice::Auto => panel.set_password(password),
             MethodChoice::KeyFile => panel.set_key_path(key_path),
             MethodChoice::EncryptedKeyFile => {
                 panel.set_key_path(key_path);
@@ -5467,6 +5513,7 @@ impl ShelluneView {
         self.pending_ephemeral = None;
         self.chain = Some(ChainDraft::prepare(self.book.hosts(), host));
         self.remote = Some(RemotePanel::new(host));
+        self.remote_more = false;
         self.showing_connection_form = true;
         self.sync_remote_fields(cx);
         self.connect_when_ready(host, cx);
@@ -7253,7 +7300,7 @@ impl ShelluneView {
         card = card
             .child(div().flex().child(methods))
             .child(caption_line(method.hint(strings).to_owned(), metrics));
-        if method.needs_password() {
+        if method.takes_password() {
             card = card.child(self.remote_field(
                 SharedString::from("quick.password"),
                 strings.auth_password,
@@ -7565,11 +7612,14 @@ impl ShelluneView {
             let reason = failure.reason().to_owned();
             let next_step =
                 copy::next_step_text(failure.next_step(), self.workspace.locale()).to_owned();
-            let retryable = failure.retryable();
+            // What to do comes first and in the reader's language; the transport's own
+            // words follow as the detail they are, small and in the monospace face a
+            // person copies into a search or a ticket. The retry is the form's button
+            // below, so the card carries no second primary action.
             column = column.child(
                 components::banner(Tone::Danger, metrics)
                     .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                    .py(metrics.scale(spacing::HAIRLINE))
+                    .py(metrics.scale(spacing::TIGHT))
                     .debug_selector(|| "remote.failure".to_owned())
                     .child(
                         div()
@@ -7583,35 +7633,22 @@ impl ShelluneView {
                             .w_full()
                             .min_w(px(0.0))
                             .whitespace_normal()
-                            .text_size(metrics.caption_size())
+                            .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .debug_selector(|| "remote.failure.reason".to_owned())
-                            .child(SharedString::from(reason)),
+                            .debug_selector(|| "remote.failure.next".to_owned())
+                            .child(SharedString::from(next_step)),
                     )
                     .child(
                         div()
                             .w_full()
                             .min_w(px(0.0))
                             .whitespace_normal()
+                            .font_family(crate::app::terminal::monospace_family())
                             .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .debug_selector(|| "remote.failure.next".to_owned())
-                            .child(SharedString::from(format!(
-                                "{}: {next_step}",
-                                strings.next_step
-                            ))),
-                    )
-                    .when(retryable, |card| {
-                        card.child(div().flex().pt(metrics.scale(spacing::HAIRLINE)).child(
-                            self.text_button(
-                                SharedString::from("remote.retry"),
-                                strings.recovery_retry,
-                                Variant::Primary,
-                                cx,
-                                |view, cx| view.retry_remote(cx),
-                            ),
-                        ))
-                    }),
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "remote.failure.reason".to_owned())
+                            .child(SharedString::from(reason)),
+                    ),
             );
         }
 
@@ -7636,7 +7673,17 @@ impl ShelluneView {
             );
         }
 
-        if !matches!(status, RemoteStatus::Live) && !status.is_asking() {
+        // The form is for choosing how to sign in, before an attempt or after one
+        // failed. While an attempt runs or waits for an answer, the progress above says
+        // what it uses; fields shown then could not change it.
+        // A failure that pressing again cannot fix - a changed server identity - offers
+        // no form: its card says what to check instead.
+        let retry_blocked = status.failure().is_some_and(|failure| !failure.retryable());
+        if !matches!(status, RemoteStatus::Live)
+            && !status.is_asking()
+            && !status.is_busy()
+            && !retry_blocked
+        {
             column = column.child(self.remote_form(cx));
         }
 
@@ -7715,10 +7762,14 @@ impl ShelluneView {
         form = form.child(div().flex().child(methods));
         form = form.child(caption_line(method.hint(strings).to_owned(), metrics));
 
-        if method.needs_password() {
+        if method.takes_password() {
             form = form.child(self.remote_field(
                 SharedString::from("remote.password"),
-                strings.auth_password,
+                if method == MethodChoice::Auto {
+                    copy::ux().host_password_optional
+                } else {
+                    strings.auth_password
+                },
                 self.remote_fields.password.clone(),
             ));
         }
@@ -7736,7 +7787,7 @@ impl ShelluneView {
                 self.remote_fields.passphrase.clone(),
             ));
         }
-        if !method.needs_key_path() && !method.needs_password() {
+        if !method.needs_key_path() && !method.takes_password() {
             form = form.child(caption_line(
                 format!(
                     "{}: {}",
@@ -7760,7 +7811,25 @@ impl ShelluneView {
         // The X11 mode is part of this attempt, so it is chosen here as well as in the
         // host dialog: a saved default decides what the form starts with, not what this
         // connection has to use (R11).
-        if !busy {
+        let show_more = self.remote_more || panel.x11() != X11Forwarding::Off;
+        if !busy && !show_more {
+            form = form.child(
+                div().flex().child(
+                    components::compact_button(
+                        copy::ux().connect_more_options,
+                        Variant::Ghost,
+                        metrics,
+                    )
+                    .id("remote.more")
+                    .debug_selector(|| "remote.more".to_owned())
+                    .on_click(cx.listener(|view, _event, _window, cx| {
+                        view.remote_more = true;
+                        cx.notify();
+                    })),
+                ),
+            );
+        }
+        if !busy && show_more {
             let chosen = panel.x11();
             let mut modes =
                 components::segmented(metrics).debug_selector(|| "remote.x11.mode".to_owned());
@@ -7830,15 +7899,29 @@ impl ShelluneView {
                     .child(strings.remote_connecting),
             );
         } else {
+            // After a failure the same button tries again with whatever the form now
+            // says - one primary action, not a retry in the card and a connect here.
+            let failed = panel.status().failure().is_some();
+            let (selector, label) = if failed {
+                ("remote.retry", strings.recovery_retry)
+            } else {
+                ("remote.connect", strings.remote_connect)
+            };
             form = form.child(
                 div().flex().justify_end().child(
                     self.icon_text_button(
-                        SharedString::from("remote.connect"),
-                        Icon::Plug,
-                        strings.remote_connect,
+                        SharedString::from(selector),
+                        if failed { Icon::Refresh } else { Icon::Plug },
+                        label,
                         Variant::Primary,
                         cx,
-                        |view, cx| view.connect_remote(cx),
+                        move |view, cx| {
+                            if failed {
+                                view.retry_remote(cx);
+                            } else {
+                                view.connect_remote(cx);
+                            }
+                        },
                     )
                     .h(metrics.control_height())
                     .px(metrics.scale(spacing::BASE)),
@@ -13682,7 +13765,8 @@ impl Render for ShelluneView {
             let handle = self
                 .host_fields
                 .as_ref()
-                .map(|fields| fields.name.read(cx).focus_handle().clone());
+                // The address is the first thing the dialog asks for.
+                .map(|fields| fields.address.read(cx).focus_handle().clone());
             if let Some(handle) = handle {
                 self.remember_focus(window, cx);
                 window.focus(&handle);
@@ -14184,6 +14268,7 @@ fn quick_storage_failure(error: &StorageError, strings: &Strings) -> (String, St
 /// Debug selector of one quick-connection method, distinct from the remote form.
 fn quick_method_selector(choice: MethodChoice) -> &'static str {
     match choice {
+        MethodChoice::Auto => "quick.method.auto",
         MethodChoice::Password => "quick.method.password",
         MethodChoice::KeyFile => "quick.method.key",
         MethodChoice::EncryptedKeyFile => "quick.method.key-passphrase",
@@ -14231,7 +14316,7 @@ fn clock_text(left: std::time::Duration) -> String {
 /// Example values the host form shows in its empty fields. They are values, not
 /// wording, so they read the same in both languages.
 const HOST_EXAMPLE_NAME: &str = "prod-web";
-const HOST_EXAMPLE_ADDRESS: &str = "10.0.0.12 / example.com";
+const HOST_EXAMPLE_ADDRESS: &str = "10.0.0.12 · root@example.com:22";
 const HOST_EXAMPLE_USER: &str = "root";
 
 fn home_relative(path: &str) -> String {

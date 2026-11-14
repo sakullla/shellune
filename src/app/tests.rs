@@ -368,7 +368,6 @@ async fn two_hundred_percent_chinese_keeps_every_page_inside_the_minimum_window(
             // The page is one item at a time and scrolls at this size, so the settings are
             // reached through the navigation above them: what has to be inside the window is
             // that navigation, and nothing may be wider than the window (R8).
-            assert_within_width(bounds_of(cx, "settings.crumb"), viewport, name);
             assert_fits_inside(bounds_of(cx, "settings.picker.category"), viewport, name);
             assert_within_width(bounds_of(cx, "settings.picker.item"), viewport, name);
         } else {
@@ -1720,7 +1719,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             host_startup_label,
             host_startup_placeholder,
             host_startup_note,
-            host_agent_note,
             host_save_connect,
             host_dialog_close,
             remote_saved_secret_failed,
@@ -1734,8 +1732,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             host_proxy_placeholder,
             host_proxy_note,
             host_proxy_conflict,
-            remote_stage_title,
-            remote_target_label,
             remote_waiting,
             remote_wait_identity,
             remote_cancel_attempt,
@@ -5365,6 +5361,8 @@ async fn a_host_inherits_switches_off_or_overrides_the_keepalive(cx: &mut TestAp
     cx.run_until_parked();
 
     click(cx, "hosts.edit.0");
+    // These settings live under the folded "advanced" section.
+    click(cx, "hosts.advanced");
     assert!(
         cx.debug_bounds("hosts.editor.connection").is_some(),
         "the host form offers the keepalive choice"
@@ -13929,7 +13927,9 @@ fn fill_new_host(cx: &mut VisualTestContext) {
 async fn a_remembered_password_goes_to_the_credential_store_not_the_file(cx: &mut TestAppContext) {
     let (view, cx, dir) = dialog_view(cx, Vec::new());
     fill_new_host(cx);
-    // Password is the default sign-in for a new host, and remembering is ticked.
+    // These are about the password method, which is no longer the default.
+    click(cx, "hosts.auth.remote.method.password");
+    // Remembering is ticked by default.
     type_into(cx, "hosts.field.secret", "s3cret-pass");
     click(cx, "hosts.save");
 
@@ -13958,6 +13958,8 @@ async fn a_remembered_password_goes_to_the_credential_store_not_the_file(cx: &mu
 async fn a_host_that_remembers_its_password_connects_in_one_click(cx: &mut TestAppContext) {
     let (view, cx, _dir) = dialog_view(cx, Vec::new());
     fill_new_host(cx);
+    // These are about the password method, which is no longer the default.
+    click(cx, "hosts.auth.remote.method.password");
     type_into(cx, "hosts.field.secret", "s3cret-pass");
     click(cx, "hosts.save");
 
@@ -13983,6 +13985,8 @@ async fn a_host_that_remembers_its_password_connects_in_one_click(cx: &mut TestA
 async fn saving_without_a_password_asks_for_it_when_connecting(cx: &mut TestAppContext) {
     let (view, cx, _dir) = dialog_view(cx, Vec::new());
     fill_new_host(cx);
+    // These are about the password method, which is no longer the default.
+    click(cx, "hosts.auth.remote.method.password");
     click(cx, "hosts.save");
     let host = cx
         .update(|_window, app| view.read(app).book().hosts().first().cloned())
@@ -14005,6 +14009,8 @@ async fn saving_without_a_password_asks_for_it_when_connecting(cx: &mut TestAppC
 async fn unticking_remember_or_deleting_the_host_forgets_the_secret(cx: &mut TestAppContext) {
     let (view, cx, _dir) = dialog_view(cx, Vec::new());
     fill_new_host(cx);
+    // These are about the password method, which is no longer the default.
+    click(cx, "hosts.auth.remote.method.password");
     type_into(cx, "hosts.field.secret", "first");
     click(cx, "hosts.save");
     let id = cx
@@ -14632,7 +14638,12 @@ async fn the_host_dialog_keeps_a_jump_and_a_proxy_command_on_the_form(cx: &mut T
             stored_host("web", "10.0.0.2", 22, "deploy", None),
         ],
     );
+    // The advanced section sits below the fold of the design window.
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
     click(cx, "hosts.edit.1");
+    // These settings live under the folded "advanced" section.
+    click(cx, "hosts.advanced");
     assert!(cx.debug_bounds("hosts.field.proxy").is_some());
     assert!(cx.debug_bounds("hosts.jump").is_some());
     click(cx, "hosts.jump.add.0");
@@ -19209,6 +19220,8 @@ async fn the_host_dialog_saves_the_chosen_x11_mode(cx: &mut TestAppContext) {
     cx.simulate_resize(tall_window());
     cx.run_until_parked();
     click(cx, "hosts.edit.0");
+    // These settings live under the folded "advanced" section.
+    click(cx, "hosts.advanced");
     assert!(
         cx.debug_bounds("hosts.editor.x11").is_some(),
         "the X11 mode is part of the host form"
@@ -19290,6 +19303,7 @@ async fn a_trusted_x11_connection_asks_before_it_dials(cx: &mut TestAppContext) 
     );
 
     // Changing the mode here is for this connection only.
+    click(cx, "remote.more");
     click(cx, "remote.x11.trusted");
     assert!(
         cx.debug_bounds("remote.x11.warning").is_some(),
@@ -21527,5 +21541,53 @@ async fn a_double_click_on_a_host_row_connects_and_a_single_click_does_not(
     assert!(
         cx.debug_bounds("remote.panel").is_some(),
         "a double click opens the host the row is"
+    );
+}
+
+#[gpui::test]
+async fn the_settings_page_scrolls_through_every_category_and_the_navigation_follows(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    cx.dispatch_action(crate::app::actions::GoToSettings);
+    cx.run_until_parked();
+
+    // One page: every category's section is drawn, not only the chosen one.
+    for section in [
+        "settings.section.appearance",
+        "settings.section.terminal",
+        "settings.section.connection",
+        "settings.section.about",
+    ] {
+        assert!(
+            cx.debug_bounds(section).is_some(),
+            "{section} is on the page"
+        );
+    }
+    let first = cx.update(|_window, app| view.read(app).settings_category_in_view_id());
+
+    // Scrolling the page moves the mark in the navigation with it.
+    let center = bounds_of(cx, "settings.scroll").center();
+    for _ in 0..12 {
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(center.x, center.y),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    }
+    let after = cx.update(|_window, app| view.read(app).settings_category_in_view_id());
+    assert_ne!(first, after, "the navigation followed the page down");
+
+    // A press in the navigation scrolls the page to that category.
+    click(cx, "settings.category.about");
+    cx.run_until_parked();
+    let about = bounds_of(cx, "settings.section.about");
+    let area = bounds_of(cx, "settings.scroll");
+    assert!(
+        about.origin.y < area.origin.y + area.size.height,
+        "the chosen category is scrolled into view: {about:?} in {area:?}"
     );
 }
