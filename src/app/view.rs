@@ -4348,6 +4348,21 @@ impl ShelluneView {
     /// Mirrors the search field into the panel, so the list filters as the user types.
     fn bind_host_search(&mut self, cx: &mut Context<Self>) {
         let search = self.hosts_search.clone();
+        // Typing a few letters and pressing Enter is the fastest way to a server: the
+        // first host the filters keep is the one the list shows on top. An empty phrase
+        // never connects, so Enter in an untouched field cannot dial anything.
+        let view = cx.entity().downgrade();
+        search.update(cx, |field, _cx| {
+            field.on_submit(move |_text, _window, app| {
+                view.update(app, |view, cx| {
+                    if let Some(id) = view.first_searched_host() {
+                        view.connect_saved_host(id, cx);
+                    }
+                    false
+                })
+                .unwrap_or(false)
+            });
+        });
         cx.observe(&search, |view, field, cx| {
             let phrase = field.read(cx).text().to_owned();
             if view.hosts.search() != phrase {
@@ -4356,6 +4371,21 @@ impl ShelluneView {
             }
         })
         .detach();
+    }
+
+    /// The host a search would open: the first one of the list as it is drawn, while a
+    /// phrase is typed.
+    pub(super) fn first_searched_host(&self) -> Option<HostId> {
+        if self.hosts.search().trim().is_empty() {
+            return None;
+        }
+        let list = self
+            .hosts
+            .list(&self.book, &self.groups, &|id| self.host_is_open(id));
+        list.rows().iter().find_map(|row| match row {
+            crate::app::hosts::HostListRow::Host(host) => Some(host.id),
+            crate::app::hosts::HostListRow::Group(_) => None,
+        })
     }
 
     /// Redraws the settings page as the shortcut search is typed into.
@@ -4562,24 +4592,24 @@ impl ShelluneView {
             .cloned()
             .unwrap_or_else(HostDraft::create);
         let strings = self.strings();
-        let name = cx.new(|cx| {
-            TextField::with_text(strings.host_field_name, draft.text(HostField::Name), cx)
-        });
+        // The label above a field already names it; the empty field shows what a value
+        // looks like instead, which is the question a first host actually raises.
+        let name =
+            cx.new(|cx| TextField::with_text(HOST_EXAMPLE_NAME, draft.text(HostField::Name), cx));
         let address = cx.new(|cx| {
-            TextField::with_text(
-                strings.host_field_address,
-                draft.text(HostField::Address),
-                cx,
-            )
+            TextField::with_text(HOST_EXAMPLE_ADDRESS, draft.text(HostField::Address), cx)
         });
         let port = cx.new(|cx| {
             TextField::with_text(strings.host_field_port, draft.text(HostField::Port), cx)
         });
-        let user = cx.new(|cx| {
-            TextField::with_text(strings.host_field_user, draft.text(HostField::User), cx)
-        });
+        let user =
+            cx.new(|cx| TextField::with_text(HOST_EXAMPLE_USER, draft.text(HostField::User), cx));
         let group = cx.new(|cx| {
-            TextField::with_text(strings.host_field_group, draft.text(HostField::Group), cx)
+            TextField::with_text(
+                copy::ux().host_example_group,
+                draft.text(HostField::Group),
+                cx,
+            )
         });
         let identity = cx.new(|cx| {
             let mut field = TextField::with_text(
@@ -7916,54 +7946,18 @@ impl ShelluneView {
             && !self.hosts.is_editing()
             && !self.import.is_open()
         {
-            return column
-                .child(
-                    self.section_card(Destination::Hosts, state)
-                        .child(self.hosts_import_entry(cx)),
-                )
-                .child(self.hosts_storage_line());
+            return column.child(
+                self.section_card(Destination::Hosts, state)
+                    .child(self.hosts_import_entry(cx)),
+            );
         }
 
         if let Some(id) = self.hosts.pending_delete() {
             column = column.child(self.host_delete_bar(id, cx));
         }
-        column
-            .child(self.hosts_management(cx))
-            .child(self.hosts_storage_line())
-    }
-
-    /// Where the records are stored, said plainly.
-    fn hosts_storage_line(&self) -> Stateful<Div> {
-        let metrics = self.metrics();
-        let strings = self.strings();
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .min_w(px(0.0))
-            .pt(metrics.scale(spacing::TIGHT))
-            .id("hosts.storage")
-            .debug_selector(|| "hosts.storage".to_owned())
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(strings.hosts_storage_label),
-            )
-            .child(
-                div()
-                    .truncate()
-                    .font_family(terminal::monospace_family())
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(SharedString::from(home_relative(
-                        &self.store.path().display().to_string(),
-                    ))),
-            )
-            .tooltip(components::tooltip(SharedString::from(
-                self.store.path().display().to_string(),
-            )))
+        // Where the records live is a fact for the data settings, not a line that costs
+        // the list a row on every visit.
+        column.child(self.hosts_management(cx))
     }
 
     /// The button that opens the import panel.
@@ -14228,6 +14222,12 @@ fn clock_text(left: std::time::Duration) -> String {
         format!("{minutes}:{seconds:02}")
     }
 }
+
+/// Example values the host form shows in its empty fields. They are values, not
+/// wording, so they read the same in both languages.
+const HOST_EXAMPLE_NAME: &str = "prod-web";
+const HOST_EXAMPLE_ADDRESS: &str = "10.0.0.12 / example.com";
+const HOST_EXAMPLE_USER: &str = "root";
 
 fn home_relative(path: &str) -> String {
     let home = std::env::var("HOME")

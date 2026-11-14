@@ -21,8 +21,9 @@ use shellune_core::{SessionFailure, SessionKind, SessionState, TabAccent, Transf
 
 /// Raw colour tokens as 24-bit sRGB values.
 ///
-/// The palette is neutral graphite in the dark and soft paper white in the light,
-/// with exactly one chromatic identity colour: a cyan-blue accent for the current
+/// The palette takes its colours from the logo: a blue-black graphite in the dark and
+/// a cool paper grey in the light, with exactly one chromatic identity colour - the
+/// logo's periwinkle - as the accent for the current
 /// object and the one primary action. Nothing else in the regular interface is
 /// allowed to be saturated, so a busy session list stays quiet and the only colours
 /// that shout are the four status tones.
@@ -30,46 +31,46 @@ pub mod palette {
     /// Application background: the content area and the terminal itself.
     pub const CANVAS: u32 = 0x0b0c10;
     /// Chrome surface: the navigation rail, the tab strip and the status bar.
-    pub const SURFACE: u32 = 0x121317;
+    pub const SURFACE: u32 = 0x111218;
     /// Raised surface for cards, rows and inputs.
-    pub const SURFACE_RAISED: u32 = 0x17181d;
+    pub const SURFACE_RAISED: u32 = 0x16171e;
     /// Surface under the pointer, one step above [`SURFACE_RAISED`].
-    pub const SURFACE_HOVER: u32 = 0x1e2026;
+    pub const SURFACE_HOVER: u32 = 0x1d1e27;
     /// Surface used for the selected navigation entry, tab or choice.
-    pub const SURFACE_SELECTED: u32 = 0x26282f;
+    pub const SURFACE_SELECTED: u32 = 0x24252f;
     /// Surface of a control under the pressed pointer: a step below
     /// [`SURFACE_SELECTED`], so a press is felt and not only tinted.
-    pub const SURFACE_PRESSED: u32 = 0x2e3038;
+    pub const SURFACE_PRESSED: u32 = 0x2c2d38;
     /// Hairline border between regions.
-    pub const BORDER: u32 = 0x24262d;
+    pub const BORDER: u32 = 0x21222b;
     /// Border of controls and of an element under the pointer.
-    pub const BORDER_STRONG: u32 = 0x383b44;
+    pub const BORDER_STRONG: u32 = 0x33343f;
     /// The sunken track a segmented control's options sit in.
-    pub const SEGMENT_TRACK: u32 = 0x0e0f13;
+    pub const SEGMENT_TRACK: u32 = 0x0d0e13;
     /// The raised thumb under the chosen option of a segmented control.
-    pub const SEGMENT_THUMB: u32 = 0x282a32;
+    pub const SEGMENT_THUMB: u32 = 0x282a35;
     /// Primary text: titles and the current object.
-    pub const TEXT_PRIMARY: u32 = 0xecedf1;
+    pub const TEXT_PRIMARY: u32 = 0xedeef3;
     /// Secondary text: body copy and list metadata.
-    pub const TEXT_SECONDARY: u32 = 0xaeb2bb;
+    pub const TEXT_SECONDARY: u32 = 0xb1b3be;
     /// Muted text: hints, counts and the status bar.
     ///
     /// Light enough to keep the body floor on [`SURFACE_PRESSED`], the darkest
     /// surface a muted label is drawn on, not just on the raised surfaces.
-    pub const TEXT_MUTED: u32 = 0x9498a2;
+    pub const TEXT_MUTED: u32 = 0x9699a4;
     /// Accent used for the selected destination and primary actions.
-    pub const ACCENT: u32 = 0x4cc2dd;
+    pub const ACCENT: u32 = 0x8b9ffd;
     /// Accent under the pointer, for a solid primary button.
-    pub const ACCENT_HOVER: u32 = 0x6bd4ec;
+    pub const ACCENT_HOVER: u32 = 0xa3b3fe;
     /// The accent under a pressed primary button: one step down from [`ACCENT`], so a
     /// press sinks instead of brightening.
-    pub const ACCENT_PRESSED: u32 = 0x37a9c4;
+    pub const ACCENT_PRESSED: u32 = 0x7489f2;
     /// Text drawn on a solid [`ACCENT`] fill.
-    pub const ON_ACCENT: u32 = 0x04161c;
+    pub const ON_ACCENT: u32 = 0x0b0f2e;
     /// Accent tint for filled accent surfaces.
-    pub const ACCENT_TINT: u32 = 0x0f2b33;
+    pub const ACCENT_TINT: u32 = 0x1a1d3a;
     /// Text and icons drawn on [`ACCENT_TINT`].
-    pub const ACCENT_ON_TINT: u32 = 0x9fe3f2;
+    pub const ACCENT_ON_TINT: u32 = 0xbcc7ff;
     /// Dark tint behind a positive chip or banner.
     pub const POSITIVE_TINT: u32 = 0x11241d;
     /// Dark tint behind a warning chip or banner.
@@ -90,7 +91,7 @@ pub mod palette {
     /// It is the accent's own family but its own token: a focus ring may be tuned
     /// for visibility without moving the colour of the primary action. The ring is
     /// always drawn in addition to a thickness or edge change, never instead of one.
-    pub const FOCUS_RING: u32 = 0x7fdcf1;
+    pub const FOCUS_RING: u32 = 0xa9b7ff;
     /// Fill of a control that cannot be used right now.
     pub const DISABLED_SURFACE: u32 = 0x141519;
     /// Text and icons on [`DISABLED_SURFACE`].
@@ -102,7 +103,7 @@ pub mod palette {
     pub const LOADING_TRACK: u32 = 0x22242b;
     /// The in-flight indicator itself; it never carries meaning on its own, the
     /// state's word does.
-    pub const LOADING_FILL: u32 = 0x59c9e3;
+    pub const LOADING_FILL: u32 = 0x95a8fd;
     /// What a dialog lays over the page beneath it, at [`scrim`]'s alpha.
     pub const SCRIM: u32 = 0x05060a;
     /// Host avatar pairs (tint, initials): slate, steel, sand, sage, clay.
@@ -120,10 +121,9 @@ pub mod palette {
     ];
     /// The deeper stop of the one remaining accent gradient.
     ///
-    /// It stays in the accent's own family: a violet second stop is gone, and no
-    /// regular control may be filled with a gradient - only the welcome emblem still
-    /// uses two stops of the same cyan.
-    pub const BRAND_END: u32 = 0x1f7f96;
+    /// It is the lavender the logo's crescent fades into, so the one gradient left - the
+    /// welcome emblem - is the logo's own. No regular control is filled with it.
+    pub const BRAND_END: u32 = 0xb29bfc;
     /// Tab identity colours, in [`TabAccent::ALL`] order.
     ///
     /// They are deliberately not the status hues: green, amber and red keep meaning
@@ -447,25 +447,25 @@ pub mod light {
 
     /// Every token of [`super::palette`] and its light value.
     pub const TABLE: &[(u32, u32)] = &[
-        (dark::CANVAS, 0xfcfcfd),
-        (dark::SURFACE, 0xf4f5f7),
+        (dark::CANVAS, 0xf6f7fb),
+        (dark::SURFACE, 0xeff0f6),
         (dark::SURFACE_RAISED, 0xffffff),
-        (dark::SURFACE_HOVER, 0xeeeff2),
-        (dark::SURFACE_SELECTED, 0xe4e7ea),
-        (dark::SURFACE_PRESSED, 0xdcdfe4),
-        (dark::BORDER, 0xe3e5e9),
-        (dark::BORDER_STRONG, 0xc9cdd4),
-        (dark::SEGMENT_TRACK, 0xeef0f2),
+        (dark::SURFACE_HOVER, 0xe9eaf2),
+        (dark::SURFACE_SELECTED, 0xe0e2ec),
+        (dark::SURFACE_PRESSED, 0xd7d9e5),
+        (dark::BORDER, 0xdfe1ea),
+        (dark::BORDER_STRONG, 0xc5c7d2),
+        (dark::SEGMENT_TRACK, 0xebedf3),
         (dark::SEGMENT_THUMB, 0xffffff),
-        (dark::TEXT_PRIMARY, 0x14161a),
-        (dark::TEXT_SECONDARY, 0x454a53),
-        (dark::TEXT_MUTED, 0x5c616a),
-        (dark::ACCENT, 0x0d6b82),
-        (dark::ACCENT_HOVER, 0x0a5a6e),
-        (dark::ACCENT_PRESSED, 0x084f60),
+        (dark::TEXT_PRIMARY, 0x15161c),
+        (dark::TEXT_SECONDARY, 0x444652),
+        (dark::TEXT_MUTED, 0x595b67),
+        (dark::ACCENT, 0x3f52c8),
+        (dark::ACCENT_HOVER, 0x3646b0),
+        (dark::ACCENT_PRESSED, 0x2e3c98),
         (dark::ON_ACCENT, 0xffffff),
-        (dark::ACCENT_TINT, 0xe2f1f6),
-        (dark::ACCENT_ON_TINT, 0x0a5568),
+        (dark::ACCENT_TINT, 0xeceffe),
+        (dark::ACCENT_ON_TINT, 0x3442a6),
         (dark::POSITIVE_TINT, 0xdff2e8),
         (dark::WARNING_TINT, 0xfaf0d8),
         (dark::DANGER_TINT, 0xfce7e9),
@@ -473,13 +473,13 @@ pub mod light {
         (dark::WARNING, 0x7a5300),
         (dark::DANGER, 0xb32b3c),
         (dark::PLANNED, 0x5b606a),
-        (dark::FOCUS_RING, 0x0a5a6e),
+        (dark::FOCUS_RING, 0x3646b0),
         (dark::DISABLED_SURFACE, 0xf1f2f4),
         (dark::DISABLED_TEXT, 0x777c85),
         (dark::LOADING_TRACK, 0xe2e4e8),
-        (dark::LOADING_FILL, 0x0d6b82),
+        (dark::LOADING_FILL, 0x3f52c8),
         (dark::SCRIM, 0x1a1c20),
-        (dark::BRAND_END, 0x0a5a6e),
+        (dark::BRAND_END, 0x7c5cd6),
         // Host avatars after the accent pair they share their first entry with.
         (dark::AVATARS[1].0, 0xe4eef7),
         (dark::AVATARS[1].1, 0x1c4a6b),
@@ -507,7 +507,7 @@ pub mod light {
     pub const TERMINAL: &[(u32, u32)] = &[
         (0xe6e9f0, 0x1f2329), // foreground
         (0x0b0c10, 0xfcfcfd), // background
-        (0x8fa0ff, 0x0d6b82), // cursor
+        (0x8b9ffd, 0x3f52c8), // cursor
         (0x2b313d, 0x3a3e48), // black
         (0xff8d99, 0xc8334a), // red
         (0x64d8a8, 0x2a7a3f), // green
@@ -1186,24 +1186,37 @@ mod tests {
             }
         }
 
-        // The one identity colour is cyan-blue: no violet or magenta stops are left in
-        // the regular interface (R3).
+        // The one identity colour is the logo's periwinkle: blue is its strongest channel
+        // and green never drops below red, so the accent cannot turn violet or magenta
+        // in a regular control (R3).
         for (name, token) in [
             ("accent", palette::ACCENT),
             ("accent hover", palette::ACCENT_HOVER),
-            ("brand end", palette::BRAND_END),
+            ("accent pressed", palette::ACCENT_PRESSED),
         ] {
             for (palette_name, value) in [("dark", token), ("light", light(token))] {
                 let [_, r, g, b] = value.to_be_bytes();
                 assert!(
-                    g > r && b > r,
-                    "{palette_name} {name} is {value:06x}, which is not a cyan-blue"
+                    b > g && g >= r,
+                    "{palette_name} {name} is {value:06x}, which is not the logo's periwinkle"
                 );
                 assert!(
-                    b.abs_diff(g) < 0x50,
-                    "{palette_name} {name} is {value:06x}, which leans purple"
+                    b - g >= 0x40,
+                    "{palette_name} {name} is {value:06x}, which drifts towards cyan"
                 );
             }
+        }
+        // The emblem's second stop is the logo's own lavender tail: still blue-led, and
+        // never a red-led magenta.
+        for (palette_name, value) in [
+            ("dark", palette::BRAND_END),
+            ("light", light(palette::BRAND_END)),
+        ] {
+            let [_, r, g, b] = value.to_be_bytes();
+            assert!(
+                b > r && b > g,
+                "{palette_name} brand end is {value:06x}, which is not blue-led"
+            );
         }
     }
 
@@ -1225,10 +1238,10 @@ mod tests {
     }
 
     #[test]
-    fn the_light_terminal_keeps_a_cyan_cursor() {
+    fn the_light_terminal_keeps_the_accent_cursor() {
         let cursor = TERMINAL
             .iter()
-            .find(|(from, _)| *from == 0x8fa0ff)
+            .find(|(from, _)| *from == 0x8b9ffd)
             .map(|(_, to)| *to)
             .expect("the cursor has a light value");
         let [_, r, g, b] = cursor.to_be_bytes();

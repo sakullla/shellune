@@ -31,7 +31,7 @@ use crate::app::copy::{self, Strings, UxStrings};
 use crate::app::hosts::{
     GroupAction, HostGroupRow, HostList, HostListRow, HostStatusFilter, SelectionScope, format_unix,
 };
-use crate::app::icons::Icon;
+use crate::app::icons::{self, Icon};
 use crate::app::theme::{self, Metrics, Tone, palette, spacing};
 use crate::app::view::ShelluneView;
 use crate::app::{components, theme::radius};
@@ -77,8 +77,11 @@ struct HostRowView {
     group: Option<SharedString>,
     /// Whether this window already has a session to it.
     open: bool,
-    /// When the book last recorded a connection to it, when it ever did.
+    /// When the book last recorded a connection to it, said relatively ("3 hours
+    /// ago · 12 connections"), when it ever did.
     last: Option<SharedString>,
+    /// The exact stamp of that connection, for the hover.
+    last_exact: Option<SharedString>,
     /// Whether the user picked it.
     selected: bool,
 }
@@ -432,6 +435,9 @@ impl ShelluneView {
     }
 
     /// The group column: the tree the list's headers come from (R4, R18).
+    ///
+    /// It opens with "all hosts", the row that clears the narrowing, and the creation of
+    /// a group sits on the column's own heading, where a new group will appear.
     fn hosts_group_column(&self, tree: &[HostGroupRow], cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
@@ -445,9 +451,20 @@ impl ShelluneView {
             .debug_selector(|| "hosts.groups".to_owned())
             .child(
                 div()
-                    .px(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(spacing::HAIRLINE))
-                    .child(components::section_label(ux.hosts_groups_title, metrics)),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pl(metrics.scale(spacing::TIGHT))
+                    .child(components::section_label(ux.hosts_groups_title, metrics))
+                    .child(
+                        components::icon_only_button(Icon::Plus, metrics)
+                            .id("hosts.group.new")
+                            .debug_selector(|| "hosts.group.new".to_owned())
+                            .tooltip(components::tooltip(ux.hosts_group_new))
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.open_group_dialog(GroupAction::Create, window, cx);
+                            })),
+                    ),
             );
 
         let mut rows = div()
@@ -456,13 +473,24 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .overflow_y_scroll();
+            .gap(metrics.scale(1.0))
+            .overflow_y_scroll()
+            .child(self.group_tree_all_row(cx));
 
-        let any = !tree.is_empty();
-        for (number, group) in tree.iter().enumerate() {
-            rows = rows.child(self.group_tree_row(group, number, cx));
+        // A row of the tree is a group to narrow to. The hosts in no group are not one:
+        // they have their own header in the list, and "all hosts" above reaches them.
+        let groups: Vec<(usize, &HostGroupRow)> = tree
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.path.is_some())
+            .collect();
+        for (position, (number, group)) in groups.iter().enumerate() {
+            let branch = groups
+                .get(position + 1)
+                .is_some_and(|(_, next)| next.depth > group.depth);
+            rows = rows.child(self.group_tree_row(group, *number, branch, cx));
         }
-        if !any {
+        if groups.is_empty() {
             rows = rows.child(
                 div()
                     .px(metrics.scale(spacing::TIGHT))
@@ -476,25 +504,59 @@ impl ShelluneView {
         column.child(rows)
     }
 
+    /// The first row of the group column: every saved host, which is no narrowing.
+    fn group_tree_all_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let chosen = self.hosts.filter().group().is_none();
+        tree_row_frame(chosen, metrics)
+            .id("hosts.tree.all")
+            .debug_selector(|| "hosts.tree.all".to_owned())
+            .pl(metrics.scale(spacing::TIGHT))
+            .child(icons::icon(
+                Icon::Server,
+                metrics.small_icon_size(),
+                theme::swatch(if chosen {
+                    palette::ACCENT
+                } else {
+                    palette::TEXT_MUTED
+                }),
+            ))
+            .child(tree_row_label(
+                ux.hosts_groups_all.to_owned(),
+                chosen,
+                metrics,
+            ))
+            .child(components::badge(
+                self.book.hosts().len(),
+                if chosen { Tone::Accent } else { Tone::Neutral },
+                metrics,
+            ))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.pick_group_row(None, cx);
+            }))
+    }
+
     /// One group of the column: its chevron, its name and how many hosts it holds.
+    ///
+    /// Only a branch has a chevron; a leaf keeps the chevron's room so names still line
+    /// up, but offers nothing to open.
     fn group_tree_row(
         &self,
         group: &HostGroupRow,
         number: usize,
+        branch: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let metrics = self.metrics();
-        let strings = self.strings();
-        let ux = copy::ux();
         let path = group.path.clone();
         let narrowed = match (&path, self.hosts.filter().group()) {
             (Some(path), Some(filter)) => path == filter,
             _ => false,
         };
-        let label = group
-            .path
-            .as_ref()
-            .map_or_else(|| ux.hosts_groups_all.to_owned(), GroupPath::to_canonical);
+        let label = group.path.as_ref().map_or_else(String::new, |path| {
+            path.segments().last().cloned().unwrap_or_default()
+        });
         let chevron = if group.expanded {
             Icon::ChevronDown
         } else {
@@ -502,48 +564,49 @@ impl ShelluneView {
         };
         let toggle_path = path.clone();
         let pick_path = path.clone();
-        div()
+        let toggle = if branch {
+            components::icon_only_button(chevron, metrics)
+                .size(metrics.scale(18.0))
+                .id(SharedString::from(format!("hosts.tree.{number}.toggle")))
+                .debug_selector(move || format!("hosts.tree.{number}.toggle"))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_group_row(toggle_path.clone(), cx);
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .flex_none()
+                .size(metrics.scale(18.0))
+                .into_any_element()
+        };
+        tree_row_frame(narrowed, metrics)
             .id(SharedString::from(format!("hosts.tree.{number}")))
             .debug_selector(move || format!("hosts.tree.{number}"))
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .pl(metrics.scale(spacing::TIGHT + group.depth as f32 * 12.0))
-            .pr(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(2.0))
-            .rounded(px(radius::SMALL))
-            .cursor_pointer()
-            .when(narrowed, |row| {
-                row.bg(theme::swatch(palette::SURFACE_SELECTED))
-            })
-            .hover(|row| row.bg(theme::swatch(palette::SURFACE_RAISED)))
-            .child(
-                components::icon_only_button(chevron, metrics)
-                    .size(metrics.scale(18.0))
-                    .id(SharedString::from(format!("hosts.tree.{number}.toggle")))
-                    .debug_selector(move || format!("hosts.tree.{number}.toggle"))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.toggle_group_row(toggle_path.clone(), cx);
-                    })),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(if narrowed {
-                        palette::TEXT_PRIMARY
-                    } else {
-                        palette::TEXT_SECONDARY
-                    }))
-                    .child(SharedString::from(label)),
-            )
-            .child(components::badge(group.hosts, Tone::Neutral, metrics))
+            .pl(metrics.scale(spacing::HAIRLINE + group.depth as f32 * 14.0))
+            .child(toggle)
+            .child(icons::icon(
+                Icon::Folder,
+                metrics.small_icon_size(),
+                theme::swatch(if narrowed {
+                    palette::ACCENT
+                } else {
+                    palette::TEXT_MUTED
+                }),
+            ))
+            .child(tree_row_label(label, narrowed, metrics))
+            .child(components::badge(
+                group.hosts,
+                if narrowed {
+                    Tone::Accent
+                } else {
+                    Tone::Neutral
+                },
+                metrics,
+            ))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.pick_group_row(pick_path.clone(), cx);
             }))
-            .tooltip(components::tooltip(strings.hosts_search_placeholder))
     }
 
     /// The group filter, folded into one control on a narrow window (R8).
@@ -607,15 +670,7 @@ impl ShelluneView {
             .items_center()
             .flex_wrap()
             .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "hosts.group.actions".to_owned())
-            .child(
-                components::compact_button(ux.hosts_group_new, Variant::Ghost, metrics)
-                    .id("hosts.group.new")
-                    .debug_selector(|| "hosts.group.new".to_owned())
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.open_group_dialog(GroupAction::Create, window, cx);
-                    })),
-            );
+            .debug_selector(|| "hosts.group.actions".to_owned());
         if let Some(path) = self.hosts.filter().group().cloned() {
             let rename = path.clone();
             let delete = path;
@@ -726,8 +781,9 @@ impl ShelluneView {
 
     /// Reads every row of the list once, for the frame about to be drawn.
     fn host_rows_snapshot(&self, list: &HostList) -> Rc<Vec<SnapshotRow>> {
-        let ux = copy::ux();
-        let _ = ux;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
         let mut rows = Vec::with_capacity(list.len());
         let mut hosts = 0usize;
         let mut groups = 0usize;
@@ -755,9 +811,20 @@ impl ShelluneView {
                             SharedString::from(format!(
                                 "{} {} · {} {}",
                                 self.strings().host_last_connected,
-                                format_unix(recent.last_connected_unix()),
+                                copy::relative_time(
+                                    recent.last_connected_unix(),
+                                    now,
+                                    copy::Locale::current()
+                                ),
                                 recent.connections(),
                                 self.strings().host_connection_count
+                            ))
+                        }),
+                        last_exact: self.book.recent_of(host.id).map(|recent| {
+                            SharedString::from(format!(
+                                "{} {}",
+                                self.strings().host_last_connected,
+                                format_unix(recent.last_connected_unix())
                             ))
                         }),
                         selected: self.hosts.selected().contains(host.id),
@@ -980,43 +1047,50 @@ fn host_row_element(
     let number = host.number;
     let id = host.id;
     let selected = host.selected;
-    let hover = theme::swatch(palette::SURFACE_RAISED);
+    let hover = theme::swatch(palette::SURFACE_HOVER);
     let pick = weak.clone();
     let connect = weak.clone();
     let forwards = weak.clone();
     let edit = weak.clone();
     let delete = weak.clone();
-    let tick = if selected {
-        Icon::Check
-    } else {
-        Icon::ChevronRight
-    };
+    let open_row = weak.clone();
+    // A row is a line on the page, not a card: the list reads as one surface and the
+    // pointer, the selection and the keyboard are what lift a row out of it.
     let mut row = div()
         .id(SharedString::from(format!("hosts.row.id.{number}")))
         .debug_selector(move || format!("{prefix}.{number}"))
+        .group("host-row")
         .h(row_height)
         .flex()
         .items_center()
         .gap(metrics.scale(spacing::SNUG))
         .w_full()
         .min_w(px(0.0))
-        .px(metrics.scale(spacing::SNUG))
+        .px(metrics.scale(spacing::TIGHT + 2.0))
         .rounded(px(radius::MEDIUM))
-        .bg(theme::swatch(if selected {
-            palette::SURFACE_SELECTED
-        } else {
-            palette::SURFACE_RAISED
-        }))
         .border_1()
-        .border_color(theme::swatch(palette::BORDER))
-        .hover(move |style| style.bg(hover))
+        .when(selected, |row| {
+            row.bg(theme::swatch(palette::ACCENT_TINT))
+                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.35))
+        })
+        .when(!selected, |row| {
+            row.border_color(theme::clear())
+                .hover(move |style| style.bg(hover))
+        })
+        // A double click is the fastest way in: the row is the host, so opening it is
+        // what the row does, and the plug stays for a single, deliberate press.
+        .on_click(move |event, _window, cx| {
+            if event.click_count() >= 2 {
+                let _ = open_row.update(cx, |view, cx| view.connect_saved_host(id, cx));
+            }
+        })
         .child(
-            components::icon_only_button(tick, metrics)
-                .size(metrics.scale(18.0))
+            checkbox(selected, metrics)
                 .id(SharedString::from(format!("hosts.select.{number}")))
                 .debug_selector(move || format!("hosts.select.{number}"))
                 .tooltip(components::tooltip(ux.hosts_select_start))
                 .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
                     let _ = pick.update(cx, |view, cx| view.toggle_host_selection(id, cx));
                 }),
         )
@@ -1065,12 +1139,15 @@ fn host_row_element(
                                 .child(host.target.clone()),
                         )
                         .children(host.last.clone().map(|last| {
+                            let exact = host.last_exact.clone().unwrap_or_default();
                             div()
+                                .id(SharedString::from(format!("hosts.last.{number}")))
                                 .truncate()
                                 .min_w(px(0.0))
                                 .text_size(metrics.caption_size())
                                 .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(last)
+                                .tooltip(components::tooltip(exact))
+                                .child(SharedString::from(format!("· {last}")))
                         })),
                 ),
         )
@@ -1086,44 +1163,131 @@ fn host_row_element(
                 })),
         );
 
-    row = row.child(
-        components::icon_only_button(Icon::Plug, metrics)
-            .size(metrics.scale(24.0))
+    // The tools of a host are quiet icons; the one thing a row is for - connecting - is
+    // the labelled button at its end. Every press stops at its button, so a quick
+    // double press on an icon never also opens the host underneath it.
+    let tools = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(2.0))
+        .child(
+            components::icon_only_button(Icon::Forward, metrics)
+                .size(metrics.scale(26.0))
+                .id(SharedString::from(format!("hosts.forwards.{number}")))
+                .debug_selector(move || format!("hosts.forwards.{number}"))
+                .tooltip(components::tooltip(strings.forward_open))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = forwards.update(cx, |view, cx| view.open_saved_forwards(id, cx));
+                }),
+        )
+        .child(
+            components::icon_only_button(Icon::Pencil, metrics)
+                .size(metrics.scale(26.0))
+                .id(SharedString::from(format!("hosts.edit.{number}")))
+                .debug_selector(move || format!("hosts.edit.{number}"))
+                .tooltip(components::tooltip(strings.host_edit))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = edit.update(cx, |view, cx| view.edit_saved_host(id, cx));
+                }),
+        )
+        .child(
+            components::danger_icon_button(Icon::Trash, metrics)
+                .size(metrics.scale(26.0))
+                .id(SharedString::from(format!("hosts.delete.{number}")))
+                .debug_selector(move || format!("hosts.delete.{number}"))
+                .tooltip(components::tooltip(strings.host_delete))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
+                }),
+        );
+    row = row.child(tools);
+    row.child(
+        components::icon_label_button(Icon::Plug, strings.remote_connect, Variant::Soft, metrics)
+            .h(metrics.compact_control_height())
+            .text_size(metrics.caption_size())
             .id(SharedString::from(format!("hosts.connect.{number}")))
             .debug_selector(move || format!("hosts.connect.{number}"))
-            .tooltip(components::tooltip(strings.remote_connect))
+            .tooltip(components::tooltip(ux.hosts_connect_hint))
             .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
                 let _ = connect.update(cx, |view, cx| view.connect_saved_host(id, cx));
             }),
-    );
-    row = row.child(
-        components::icon_only_button(Icon::Forward, metrics)
-            .size(metrics.scale(24.0))
-            .id(SharedString::from(format!("hosts.forwards.{number}")))
-            .debug_selector(move || format!("hosts.forwards.{number}"))
-            .tooltip(components::tooltip(strings.forward_open))
-            .on_click(move |_event, _window, cx| {
-                let _ = forwards.update(cx, |view, cx| view.open_saved_forwards(id, cx));
-            }),
-    );
-    row = row.child(
-        components::icon_only_button(Icon::Pencil, metrics)
-            .size(metrics.scale(24.0))
-            .id(SharedString::from(format!("hosts.edit.{number}")))
-            .debug_selector(move || format!("hosts.edit.{number}"))
-            .tooltip(components::tooltip(strings.host_edit))
-            .on_click(move |_event, _window, cx| {
-                let _ = edit.update(cx, |view, cx| view.edit_saved_host(id, cx));
-            }),
-    );
-    row.child(
-        components::danger_icon_button(Icon::Trash, metrics)
-            .size(metrics.scale(24.0))
-            .id(SharedString::from(format!("hosts.delete.{number}")))
-            .debug_selector(move || format!("hosts.delete.{number}"))
-            .tooltip(components::tooltip(strings.host_delete))
-            .on_click(move |_event, _window, cx| {
-                let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
-            }),
     )
+}
+
+/// The frame of one row of the group column, chosen or not.
+fn tree_row_frame(chosen: bool, metrics: Metrics) -> Div {
+    let hover = theme::swatch(palette::SURFACE_HOVER);
+    div()
+        .flex()
+        .items_center()
+        .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+        .min_h(metrics.scale(28.0))
+        .pr(metrics.scale(spacing::TIGHT))
+        .rounded(px(radius::SMALL))
+        .cursor_pointer()
+        .when(chosen, |row| {
+            row.bg(theme::swatch(palette::SURFACE_SELECTED))
+        })
+        .when(!chosen, |row| row.hover(move |style| style.bg(hover)))
+}
+
+/// The name in a row of the group column.
+fn tree_row_label(label: String, chosen: bool, metrics: Metrics) -> Div {
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .truncate()
+        .text_size(metrics.label_size())
+        .when(chosen, |label| label.font_weight(FontWeight::MEDIUM))
+        .text_color(theme::swatch(if chosen {
+            palette::TEXT_PRIMARY
+        } else {
+            palette::TEXT_SECONDARY
+        }))
+        .child(SharedString::from(label))
+}
+
+/// A selection box: a hollow square that fills with the accent and a tick when chosen.
+///
+/// It is drawn as what it is - a checkbox - rather than borrowing a chevron, which reads
+/// as "open this" and hid the fact that rows can be picked for a batch at all.
+fn checkbox(checked: bool, metrics: Metrics) -> Div {
+    let size = metrics.scale(16.0);
+    let hit = metrics.hit_target();
+    let border = theme::swatch(palette::ACCENT);
+    let mut boxed = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(size)
+        .rounded(px(4.0))
+        .border_1();
+    boxed = if checked {
+        boxed
+            .bg(theme::swatch(palette::ACCENT))
+            .border_color(theme::swatch(palette::ACCENT))
+            .child(crate::app::icons::icon(
+                Icon::Check,
+                metrics.scale(12.0),
+                theme::swatch(palette::ON_ACCENT),
+            ))
+    } else {
+        boxed
+            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .group_hover("host-checkbox", move |style| style.border_color(border))
+    };
+    div()
+        .group("host-checkbox")
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(hit)
+        .cursor_pointer()
+        .child(boxed)
 }

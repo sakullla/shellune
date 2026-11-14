@@ -220,8 +220,6 @@ pub struct Strings {
     pub hosts_saved: &'static str,
     /// Feedback after a host was removed.
     pub hosts_deleted: &'static str,
-    /// Label introducing where the hosts are stored.
-    pub hosts_storage_label: &'static str,
     /// Button that reads the host file again after a failure.
     pub hosts_retry: &'static str,
     /// Label introducing when a host was last reached.
@@ -1047,7 +1045,7 @@ pub static ENGLISH: Strings = Strings {
     terminal_larger: "Larger text",
     shell_default: "Default",
     shell_custom_hint: "Any program, by path",
-    hosts_search_placeholder: "Search name, address, user or group",
+    hosts_search_placeholder: "Search hosts · Enter connects",
     keys_search_placeholder: "Search actions or shortcuts",
     hosts_view_all: "All hosts",
     hosts_view_groups: "Groups",
@@ -1073,7 +1071,6 @@ pub static ENGLISH: Strings = Strings {
     host_delete_note: "Only the saved record is removed; nothing on the server changes.",
     hosts_saved: "Host saved. No connection was opened.",
     hosts_deleted: "Host deleted.",
-    hosts_storage_label: "Saved in",
     hosts_retry: "Read the file again",
     host_last_connected: "Last connected",
     host_connection_count: "connections",
@@ -1507,7 +1504,7 @@ pub static CHINESE: Strings = Strings {
     terminal_larger: "放大字号",
     shell_default: "默认",
     shell_custom_hint: "本机上的任意程序",
-    hosts_search_placeholder: "搜索名称、地址、用户名或分组",
+    hosts_search_placeholder: "搜索主机，回车直接连接",
     keys_search_placeholder: "搜索动作或快捷键",
     hosts_view_all: "全部主机",
     hosts_view_groups: "按分组",
@@ -1533,7 +1530,6 @@ pub static CHINESE: Strings = Strings {
     host_delete_note: "只删除本地保存的记录，服务器上的内容不会改变。",
     hosts_saved: "主机已保存，没有打开任何连接。",
     hosts_deleted: "主机已删除。",
-    hosts_storage_label: "保存位置",
     hosts_retry: "重新读取文件",
     host_last_connected: "最近连接",
     host_connection_count: "次连接",
@@ -2421,6 +2417,10 @@ pub struct UxStrings {
     pub hosts_groups_title: &'static str,
     /// Filter entry that clears the group narrowing
     pub hosts_groups_all: &'static str,
+    /// Hover on a host row's connect button: the faster way in
+    pub hosts_connect_hint: &'static str,
+    /// Example a host form's empty group field shows
+    pub host_example_group: &'static str,
     /// Group action: create a group
     pub hosts_group_new: &'static str,
     /// Group action: rename a group
@@ -2837,6 +2837,8 @@ impl UxStrings {
             self.snippet_problem_unknown,
             self.hosts_groups_title,
             self.hosts_groups_all,
+            self.hosts_connect_hint,
+            self.host_example_group,
             self.hosts_group_new,
             self.hosts_group_rename,
             self.hosts_group_move,
@@ -3160,7 +3162,9 @@ included",
     snippet_problem_body_long: "The command body is limited to {max} characters.",
     snippet_problem_unknown: "That command is no longer in the library; reopen the list.",
     hosts_groups_title: "Groups",
-    hosts_groups_all: "All groups",
+    hosts_groups_all: "All hosts",
+    hosts_connect_hint: "Connect (or double-click the row)",
+    host_example_group: "Production/Web",
     hosts_group_new: "New group",
     hosts_group_rename: "Rename group",
     hosts_group_move: "Move selection here",
@@ -3479,7 +3483,9 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     snippet_problem_body_long: "命令正文最多 {max} 个字符。",
     snippet_problem_unknown: "这条命令已不在库中，请重新打开列表。",
     hosts_groups_title: "分组",
-    hosts_groups_all: "全部分组",
+    hosts_groups_all: "全部主机",
+    hosts_connect_hint: "连接（也可以双击这一行）",
+    host_example_group: "生产/Web",
     hosts_group_new: "新建分组",
     hosts_group_rename: "重命名分组",
     hosts_group_move: "把所选主机移到这里",
@@ -3642,6 +3648,40 @@ pub fn tab_accent_label(accent: TabAccent, locale: Locale) -> &'static str {
     }
 }
 
+/// How long ago something happened, said the way a list row says it.
+///
+/// A list of servers is scanned for "which one did I use last", which an absolute UTC
+/// stamp answers only after arithmetic. The exact stamp stays one hover away; this is
+/// the glanceable part. A moment in the future (a clock that moved back) reads as
+/// "just now" instead of a negative age.
+#[must_use]
+pub fn relative_time(then_unix: u64, now_unix: u64, locale: Locale) -> String {
+    let seconds = now_unix.saturating_sub(then_unix);
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    match locale {
+        Locale::English => match () {
+            () if minutes < 1 => "just now".to_owned(),
+            () if hours < 1 => format!("{minutes} min ago"),
+            () if days < 1 => format!("{hours} h ago"),
+            () if days == 1 => "yesterday".to_owned(),
+            () if days < 30 => format!("{days} days ago"),
+            () if days < 365 => format!("{} mo ago", days / 30),
+            () => format!("{} y ago", days / 365),
+        },
+        Locale::Chinese => match () {
+            () if minutes < 1 => "刚刚".to_owned(),
+            () if hours < 1 => format!("{minutes} 分钟前"),
+            () if days < 1 => format!("{hours} 小时前"),
+            () if days == 1 => "昨天".to_owned(),
+            () if days < 30 => format!("{days} 天前"),
+            () if days < 365 => format!("{} 个月前", days / 30),
+            () => format!("{} 年前", days / 365),
+        },
+    }
+}
+
 /// Fills `{name}` placeholders.
 #[must_use]
 pub fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
@@ -3665,6 +3705,34 @@ mod ux_tests {
             assert!(!en.trim().is_empty() && !zh.trim().is_empty());
             assert_ne!(en, zh, "{en} is not translated");
         }
+    }
+
+    #[test]
+    fn relative_time_reads_at_a_glance_in_both_languages() {
+        let now = 1_700_000_000;
+        assert_eq!(relative_time(now, now, Locale::English), "just now");
+        assert_eq!(relative_time(now + 50, now, Locale::Chinese), "刚刚");
+        assert_eq!(
+            relative_time(now - 5 * 60, now, Locale::English),
+            "5 min ago"
+        );
+        assert_eq!(
+            relative_time(now - 3 * 3600, now, Locale::Chinese),
+            "3 小时前"
+        );
+        assert_eq!(relative_time(now - 30 * 3600, now, Locale::Chinese), "昨天");
+        assert_eq!(
+            relative_time(now - 9 * 86_400, now, Locale::English),
+            "9 days ago"
+        );
+        assert_eq!(
+            relative_time(now - 70 * 86_400, now, Locale::Chinese),
+            "2 个月前"
+        );
+        assert_eq!(
+            relative_time(now - 800 * 86_400, now, Locale::English),
+            "2 y ago"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Div, FontWeight, SharedString, Stateful, Window, div, px};
 
 use super::ShelluneView;
-use crate::app::components::{self, ControlState};
+use crate::app::components;
 use crate::app::copy::{self, Locale};
 use crate::app::hosts::{ConnectionField, connection_problem_text};
 use crate::app::keymap;
@@ -356,42 +356,58 @@ impl ShelluneView {
         for category in Category::ALL {
             let chosen = category == self.settings_nav.category;
             let selector = format!("settings.category.{}", category.id());
+            // A category is a line of the column, not a card: the column is navigation,
+            // and seven bordered boxes made it heavier than the page it navigates. The
+            // chosen category is told by weight and fill; with its pages listed under it,
+            // the page carries the bar instead, so one mark says where the page is.
+            let expanded = chosen && !Self::single_named_item(category, locale);
+            let hover = theme::swatch(palette::SURFACE_HOVER);
             column = column.child(
-                components::row_with_state(
-                    if chosen {
-                        ControlState::Selected
-                    } else {
-                        ControlState::Resting
-                    },
-                    metrics,
-                )
-                .id(SharedString::from(selector.clone()))
-                .debug_selector({
-                    let selector = selector.clone();
-                    move || selector.clone()
-                })
-                .when(chosen && ringed, |row| {
-                    row.border_color(theme::swatch(palette::FOCUS_RING))
-                })
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .text_size(metrics.body_size())
-                        .font_weight(if chosen {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::MEDIUM
-                        })
-                        .text_color(theme::swatch(if chosen {
-                            palette::TEXT_PRIMARY
-                        } else {
-                            palette::TEXT_SECONDARY
-                        }))
-                        .child(category.label(locale)),
-                )
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.settings_select_category(category, cx);
-                })),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .w_full()
+                    .min_w(px(0.0))
+                    .min_h(metrics.scale(32.0))
+                    .px(metrics.scale(spacing::SNUG))
+                    .rounded(px(radius::SMALL))
+                    .border_1()
+                    .border_color(theme::clear())
+                    .cursor_pointer()
+                    .when(chosen && !expanded, |row| {
+                        row.bg(theme::swatch(palette::SURFACE_SELECTED))
+                    })
+                    .when(!chosen, |row| row.hover(move |style| style.bg(hover)))
+                    .when(expanded, |row| row.mt(metrics.scale(spacing::HAIRLINE)))
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector({
+                        let selector = selector.clone();
+                        move || selector.clone()
+                    })
+                    .when(chosen && ringed, |row| {
+                        row.border_color(theme::swatch(palette::FOCUS_RING))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(metrics.body_size())
+                            .font_weight(if chosen {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(theme::swatch(if chosen {
+                                palette::TEXT_PRIMARY
+                            } else {
+                                palette::TEXT_SECONDARY
+                            }))
+                            .child(category.label(locale)),
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.settings_select_category(category, cx);
+                    })),
             );
             // A category whose only page carries its own name would put the same label
             // twice in a row; the chosen category already says where the page is (R16).
@@ -444,10 +460,15 @@ impl ShelluneView {
             .min_w(px(0.0))
             .pl(metrics.scale(spacing::SNUG))
             .pr(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::HAIRLINE + 2.0))
             .rounded(px(radius::SMALL))
+            .cursor_pointer()
             .when(picked, |row| {
                 row.bg(theme::swatch(palette::SURFACE_SELECTED))
+            })
+            .when(!picked, |row| {
+                let hover = theme::swatch(palette::SURFACE_HOVER);
+                row.hover(move |style| style.bg(hover))
             })
             .when(picked && ringed, |row| {
                 row.border_1()
@@ -609,7 +630,7 @@ impl ShelluneView {
                     .w_full()
                     .min_w(px(0.0))
                     .text_size(metrics.hero_size())
-                    .font_weight(FontWeight::BOLD)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .debug_selector(|| "header.title".to_owned())
                     .child(item.label(locale)),
@@ -1138,15 +1159,19 @@ impl ShelluneView {
                     .min_w(metrics.scale(200.0))
                     .max_w_full()
                     .gap(metrics.scale(2.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .text_size(metrics.body_size())
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(label),
-                    )
+                    // A row whose page heading already names it has no label of its own;
+                    // an empty line here pushed the hint below the control's centre.
+                    .when(!label.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .text_size(metrics.body_size())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(label),
+                        )
+                    })
                     .when(!hint.is_empty(), |column| {
                         column.child(
                             div()

@@ -28,9 +28,9 @@ pub const BACKGROUND: Rgb = Rgb {
 
 /// Default cursor colour, matching the accent token.
 pub const CURSOR: Rgb = Rgb {
-    r: 0x8f,
-    g: 0xa0,
-    b: 0xff,
+    r: 0x8b,
+    g: 0x9f,
+    b: 0xfd,
 };
 
 /// The sixteen ANSI colours.

@@ -1584,7 +1584,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             host_delete_note,
             hosts_saved,
             hosts_deleted,
-            hosts_storage_label,
             hosts_retry,
             host_last_connected,
             host_connection_count,
@@ -21441,4 +21440,82 @@ fn a_route_names_why_a_host_cannot_be_reached() {
         .err()
         .expect("a missing host is a refusal");
     assert!(!error.is_empty());
+}
+
+#[gpui::test]
+async fn enter_in_the_host_search_connects_the_first_match_and_only_while_searching(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("search-enter");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", None),
+            stored_host("db", "10.0.0.9", 22, "postgres", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    // An untouched search field dials nothing: Enter there is not a request.
+    click(cx, "hosts.search");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote.panel").is_none(),
+        "Enter in an empty search must not connect anywhere"
+    );
+
+    type_into(cx, "hosts.search", "db");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        let state = view
+            .read(app)
+            .remote_state()
+            .expect("Enter opened the connection to the match");
+        assert_eq!(
+            state.host().name(),
+            "db",
+            "the first match is the one opened"
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_double_click_on_a_host_row_connects_and_a_single_click_does_not(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("row-double-click");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let (_view, cx) = hosts_view_with_trust(cx, &dir);
+
+    click(cx, "hosts.row.0");
+    assert!(
+        cx.debug_bounds("remote.panel").is_none(),
+        "a single click only points at the row"
+    );
+
+    let center = bounds_of(cx, "hosts.row.0").center();
+    let position = point(center.x, center.y);
+    cx.simulate_event(gpui::MouseDownEvent {
+        position,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        position,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote.panel").is_some(),
+        "a double click opens the host the row is"
+    );
 }

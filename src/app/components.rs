@@ -470,12 +470,11 @@ pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .h(metrics.scale(20.0))
-        .px(metrics.scale(8.0))
+        .px(metrics.scale(7.0))
         .rounded(px(radius::SMALL))
-        .border_1()
-        .border_color(theme::swatch(palette::BORDER_STRONG))
+        .bg(theme::swatch(palette::SURFACE_SELECTED))
         .text_size(metrics.caption_size())
-        .text_color(theme::swatch(palette::TEXT_MUTED))
+        .text_color(theme::swatch(palette::TEXT_SECONDARY))
         .child(label.into())
 }
 
@@ -747,6 +746,7 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
             .font_weight(gpui::FontWeight::MEDIUM)
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
+            .shadow_xs()
     } else {
         let hover = theme::swatch(palette::TEXT_PRIMARY);
         base.text_color(theme::swatch(palette::TEXT_MUTED))

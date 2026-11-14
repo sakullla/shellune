@@ -712,7 +712,9 @@ impl ShelluneView {
         // A tab with one pane needs no pane chrome: the session bar already names
         // it and carries the split buttons, and a focus frame around the only pane
         // marks nothing.
-        let solo = self.active_tab_is_solo() && !leaf.is_pending();
+        // A waiting pane is no exception: its card names the wait and carries its own
+        // remove, so a lone one is not framed as "Pane 1 · Active" over nothing.
+        let solo = self.active_tab_is_solo();
         let mut frame = div()
             .id(SharedString::from(format!("pane.leaf.{pane}")))
             .flex()
@@ -980,22 +982,41 @@ impl ShelluneView {
             .debug_selector(|| "pane.pending".to_owned())
             .child(
                 div()
-                    .text_size(metrics.body_size())
-                    .child(strings.pane_pending),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(metrics.scale(40.0))
+                    .mb(metrics.scale(spacing::HAIRLINE))
+                    .rounded(px(radius::MEDIUM))
+                    .bg(theme::swatch(palette::ACCENT_TINT))
+                    .child(crate::app::icons::icon(
+                        Icon::Terminal,
+                        metrics.icon_size(),
+                        theme::swatch(palette::ACCENT_ON_TINT),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .text_size(metrics.title_size())
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(strings.pane_pending),
+                    )
+                    .child(crate::app::components::tag(mode, metrics)),
             )
             .child(
                 div()
                     .max_w(metrics.scale(420.0))
-                    .text_size(metrics.caption_size())
+                    .mb(metrics.scale(spacing::HAIRLINE))
+                    .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .text_center()
                     .child(strings.pane_pending_body),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(mode),
             );
         if missing {
             card = card
@@ -1052,7 +1073,7 @@ impl ShelluneView {
                 .child(self.text_button(
                     SharedString::from(format!("pane.remove.{pane}")),
                     strings.pane_remove,
-                    Variant::Danger,
+                    Variant::Ghost,
                     cx,
                     move |this, cx| this.close_one_pane(pane, cx),
                 )),

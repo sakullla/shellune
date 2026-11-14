@@ -232,10 +232,10 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let live = matches!(session.state(), SessionState::Connected);
-        let target = match session.kind() {
-            SessionKind::Local { .. } => program_label(&self.target_of(session)),
-            SessionKind::Remote { .. } => self.target_of(session),
-        };
+        // A local shell is described by the program it runs - the whole path, since the
+        // tab already carries the short name - and a remote one by what it dialled.
+        let remote = matches!(session.kind(), SessionKind::Remote { .. });
+        let target = self.target_of(session);
         // A local shell's program is often its own title: the tab already says it, so
         // the row keeps only what the tab does not say.
         let label = self.tab_title(id);
@@ -421,6 +421,17 @@ impl ShelluneView {
                     .flex_wrap()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
+                    // What kind of session this is opens the row, so the line is never
+                    // empty and a local shell is not mistaken for a server.
+                    .child(components::kind_badge(
+                        if remote {
+                            strings.session_kind_remote
+                        } else {
+                            strings.session_kind_local
+                        },
+                        remote,
+                        metrics,
+                    ))
                     .when_some(target, |row, target| {
                         row.child(
                             div()
@@ -630,18 +641,22 @@ impl ShelluneView {
                     .min_w(px(0.0))
                     .child(
                         div()
-                            .text_size(metrics.hero_size() + metrics.scale(2.0))
-                            .font_weight(FontWeight::BOLD)
+                            .text_size(metrics.hero_size())
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector(|| "header.title".to_owned())
                             .child(ux.home_title),
                     )
-                    .child(
-                        div()
-                            .text_size(metrics.body_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .child(ux.home_subtitle),
-                    ),
+                    // On a short window the sentence under the title costs the list a row
+                    // and says nothing the page does not show; it goes first.
+                    .when(self.viewport_height >= metrics.scale(600.0), |column| {
+                        column.child(
+                            div()
+                                .text_size(metrics.body_size())
+                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                .child(ux.home_subtitle),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -782,7 +797,7 @@ impl ShelluneView {
             .flex_wrap()
             .items_center()
             .w_full()
-            .gap(metrics.scale(spacing::SNUG))
+            .gap(metrics.scale(spacing::TIGHT + 2.0))
             .debug_selector(|| "shell.picker".to_owned());
         for (index, shell) in self.workspace.shells().iter().enumerate() {
             let selected = index == self.workspace.shell_choice();
@@ -854,7 +869,7 @@ impl ShelluneView {
         let mut section = div()
             .flex()
             .flex_col()
-            .gap(metrics.scale(spacing::SNUG))
+            .gap(metrics.scale(spacing::TIGHT))
             .when(!compact, |section| {
                 section.child(components::section_label(ux.home_local_section, metrics))
             });
@@ -878,36 +893,38 @@ impl ShelluneView {
         badge: Option<&'static str>,
     ) -> Div {
         let metrics = self.metrics();
-        let hover_border = theme::faded(theme::swatch(palette::ACCENT), 0.55);
-        let hover_bg = theme::swatch(palette::SURFACE_RAISED);
+        let hover_border = theme::swatch(palette::BORDER_STRONG);
+        let hover_bg = theme::swatch(palette::SURFACE_HOVER);
+        // A launcher, not a feature card: one line tall, so the servers below keep the
+        // window. The icon sits on the accent's quiet tint instead of a gradient tile -
+        // the accent is for the current object and the primary action, and a row of
+        // saturated tiles shouted louder than the button that adds a host.
         div()
-            .group("home-card")
             .flex()
             .items_center()
-            .gap(metrics.scale(spacing::SNUG))
-            .w(metrics.scale(228.0))
-            .p(metrics.scale(spacing::SNUG + 2.0))
-            .rounded(px(radius::LARGE))
+            .gap(metrics.scale(spacing::TIGHT + 2.0))
+            .w(metrics.scale(212.0))
+            .px(metrics.scale(spacing::SNUG - 2.0))
+            .py(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::MEDIUM))
             .bg(theme::swatch(palette::SURFACE_RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
-            .shadow_xs()
             .cursor_pointer()
-            .hover(move |style| style.border_color(hover_border).bg(hover_bg).shadow_md())
+            .hover(move |style| style.border_color(hover_border).bg(hover_bg))
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .size(metrics.scale(38.0))
-                    .rounded(px(radius::MEDIUM))
-                    .bg(super::brand_gradient())
-                    .shadow_sm()
+                    .size(metrics.scale(30.0))
+                    .rounded(px(radius::SMALL + 1.0))
+                    .bg(theme::swatch(palette::ACCENT_TINT))
                     .child(icons::icon(
                         icon,
-                        metrics.icon_size(),
-                        theme::swatch(palette::ON_ACCENT),
+                        metrics.small_icon_size(),
+                        theme::swatch(palette::ACCENT_ON_TINT),
                     )),
             )
             .child(
@@ -916,7 +933,6 @@ impl ShelluneView {
                     .flex_col()
                     .flex_1()
                     .min_w(px(0.0))
-                    .gap(metrics.scale(2.0))
                     .child(
                         div()
                             .flex()
@@ -930,9 +946,7 @@ impl ShelluneView {
                                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                                     .child(SharedString::from(name)),
                             )
-                            .children(
-                                badge.map(|badge| components::chip(badge, Tone::Accent, metrics)),
-                            ),
+                            .children(badge.map(|badge| components::tag(badge, metrics))),
                     )
                     .child(
                         div()

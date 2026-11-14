@@ -311,7 +311,7 @@ impl BatchRunPage {
     /// The timeline is drawn from the runner's real clock, which makes the last digit of
     /// an offset differ between two runs of the same revision. A shot has to be
     /// comparable with the next one, so the fixture states the offsets instead (R2).
-    #[cfg(feature = "ui-capture")]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn normalize_times_for_capture(&mut self) {
         let start = self.run.started_at_unix();
         for ((_, step), time) in self.times.iter_mut() {
@@ -489,16 +489,16 @@ impl BatchPanel {
         }
     }
 
-    /// Which surface is on screen.
-    #[must_use]
     /// Rewrites the run's step times to fixed offsets, for a capture (R2).
-    #[cfg(feature = "ui-capture")]
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn normalize_times_for_capture(&mut self) {
         if let Some(run) = self.run.as_mut() {
             run.normalize_times_for_capture();
         }
     }
 
+    /// Which surface is on screen.
+    #[must_use]
     pub fn page(&self) -> BatchPage {
         self.page
     }
