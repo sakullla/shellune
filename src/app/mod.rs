@@ -111,7 +111,8 @@ pub mod actions {
             FilesDownload,
             TerminalSearch,
             TerminalCopy,
-            TerminalPaste
+            TerminalPaste,
+            ShowCopied
         ]
     );
 }

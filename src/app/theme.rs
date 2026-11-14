@@ -805,11 +805,6 @@ impl Metrics {
         self.scale(52.0)
     }
 
-    /// Height of the session bar above a terminal.
-    pub fn session_bar_height(self) -> Pixels {
-        self.scale(36.0)
-    }
-
     /// Edge length of a navigation or inline icon.
     pub fn icon_size(self) -> Pixels {
         self.scale(16.0)

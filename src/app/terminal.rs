@@ -368,6 +368,9 @@ pub struct TerminalPane {
     /// belongs to a process this pane does not show is dropped instead of being drawn
     /// into the wrong terminal.
     tag: EventTag,
+    /// The session's own half of the bar under the grid, handed in by the window for
+    /// the frame being drawn: where the session is and what can be done to it.
+    session_slot: std::cell::RefCell<Option<(gpui::AnyElement, gpui::AnyElement)>>,
     core: TerminalCore,
     source: Option<PaneSource>,
     /// What the pane is running: a program here, or a host over SSH.
@@ -602,6 +605,7 @@ impl TerminalPane {
             polling: false,
             pending_paste: None,
             search_open: false,
+            session_slot: std::cell::RefCell::new(None),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -663,6 +667,7 @@ impl TerminalPane {
             polling: false,
             pending_paste: None,
             search_open: false,
+            session_slot: std::cell::RefCell::new(None),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -723,6 +728,7 @@ impl TerminalPane {
             polling: false,
             pending_paste: None,
             search_open: false,
+            session_slot: std::cell::RefCell::new(None),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -800,6 +806,7 @@ impl TerminalPane {
             polling: false,
             pending_paste: None,
             search_open: false,
+            session_slot: std::cell::RefCell::new(None),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -2211,7 +2218,18 @@ impl TerminalPane {
     /// A live process needs no badge to say so - the session bar above already
     /// states the connection - so the state is only spelled out once the program
     /// stopped, in the tone of how it stopped.
+    /// Hands the pane the session's half of its bar for the next draw.
+    pub fn set_session_slot(&self, left: gpui::AnyElement, right: gpui::AnyElement) {
+        *self.session_slot.borrow_mut() = Some((left, right));
+    }
+
     fn bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let slot = self.session_slot.borrow_mut().take();
+        let (slot_left, slot_right) = match slot {
+            Some((left, right)) => (Some(left), Some(right)),
+            None => (None, None),
+        };
+        let has_slot = slot_left.is_some();
         let strings = self.locale.strings();
         let live = self.state.accepts_input();
         let tone = if live {
@@ -2230,7 +2248,9 @@ impl TerminalPane {
             .items_center()
             .justify_between()
             .gap(metrics.scale(spacing::TIGHT))
-            .h(px(SHELL_BAR_HEIGHT))
+            // At least the bar's height; taller when the window's text is larger, so
+            // the session's half it carries is never cut off at its bottom.
+            .min_h(px(SHELL_BAR_HEIGHT))
             .flex_none()
             .pl(metrics.scale(spacing::BASE - 2.0))
             .pr(metrics.scale(spacing::HAIRLINE))
@@ -2245,16 +2265,23 @@ impl TerminalPane {
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
                     .min_w(px(0.0))
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_family(monospace_family())
-                            .debug_selector(|| "terminal.grid.size".to_owned())
-                            .child(SharedString::from(format!(
-                                "{}\u{00D7}{}",
-                                self.grid.cols, self.grid.rows
-                            ))),
-                    )
+                    .flex_1()
+                    .overflow_hidden()
+                    // The session's half leads the bar; the grid size steps aside to the
+                    // tools, where it is a detail rather than the first thing read.
+                    .children(slot_left)
+                    .when(!has_slot, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .font_family(monospace_family())
+                                .debug_selector(|| "terminal.grid.size".to_owned())
+                                .child(SharedString::from(format!(
+                                    "{}\u{00D7}{}",
+                                    self.grid.cols, self.grid.rows
+                                ))),
+                        )
+                    })
                     // The program is named on the session bar and the tab; down here it
                     // is only repeated once it stopped, beside how it stopped.
                     .when(!live, |row| {
@@ -2301,6 +2328,20 @@ impl TerminalPane {
                     .flex_none()
                     .items_center()
                     .gap(metrics.scale(1.0))
+                    .children(slot_right)
+                    .when(has_slot, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .px(metrics.scale(spacing::HAIRLINE))
+                                .font_family(monospace_family())
+                                .debug_selector(|| "terminal.grid.size".to_owned())
+                                .child(SharedString::from(format!(
+                                    "{}\u{00D7}{}",
+                                    self.grid.cols, self.grid.rows
+                                ))),
+                        )
+                    })
                     .child(self.mode_button(metrics, strings, cx))
                     .child(self.search_button(metrics, strings, cx))
                     .child(

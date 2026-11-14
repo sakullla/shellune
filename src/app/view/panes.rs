@@ -377,6 +377,13 @@ impl ShelluneView {
                     .child(self.notice_line(reason.clone(), Tone::Danger)),
             );
         }
+        // A connection being set up in its tab is the whole page: its card states the
+        // progress, the question or the failure once, so no banner repeats it above.
+        if self.connection_inline()
+            && let Some(page) = self.connection_page(cx)
+        {
+            return column.child(page).children(self.standalone_session_bar(cx));
+        }
         column = column.children(self.layout_status_banners());
         let session_id = if self.workspace.layout().active_tab().is_some() {
             self.workspace.layout().active_session()
@@ -403,7 +410,9 @@ impl ShelluneView {
         }
         let files = session_id.filter(|id| self.files.is_open(*id));
         if let Some(id) = files {
-            column = column.child(self.files_view(id, window, cx));
+            column = column
+                .child(self.files_view(id, window, cx))
+                .children(self.standalone_session_bar(cx));
         } else if let Some(tab) = self.workspace.layout().active_tab() {
             let zoomed = tab.zoomed();
             let tree = if let Some(zoomed) = zoomed {
@@ -412,6 +421,15 @@ impl ShelluneView {
                 self.layout_node(tab.root(), true, cx)
             };
             column = column.child(tree);
+        }
+        // A session with no terminal on screen - still connecting, or ended without one
+        // - keeps its bar at the bottom all the same.
+        if files.is_none()
+            && let Some(id) = session_id
+            && self.pane_for(id).is_none()
+            && self.workspace.session(id).is_some()
+        {
+            column = column.children(self.standalone_session_bar(cx));
         }
         if self.split_drag.is_some() {
             column = column.child(self.split_drag_canvas(cx));
@@ -752,6 +770,13 @@ impl ShelluneView {
         } else if let Some(id) = session
             && let Some(terminal) = self.pane_for(id)
         {
+            // The pane the keys are in carries the session's half of the bar under its
+            // grid; the others keep their own bar alone.
+            if active && let Some((left, right)) = self.session_bar_parts(cx) {
+                terminal
+                    .read(cx)
+                    .set_session_slot(left.into_any_element(), right.into_any_element());
+            }
             frame = frame.child(terminal.clone());
         } else if let Some(id) = session {
             let text = self

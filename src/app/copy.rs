@@ -2409,6 +2409,10 @@ pub struct UxStrings {
     pub hosts_connect_hint: &'static str,
     /// Example a host form's empty group field shows
     pub host_example_group: &'static str,
+    /// Hover on a value that one click copies
+    pub copy_click_hint: &'static str,
+    /// Toast after a value was copied
+    pub toast_copied: &'static str,
     /// Connection progress: reaching the server
     pub connect_step_dial: &'static str,
     /// Connection progress: checking the server's identity
@@ -2419,6 +2423,8 @@ pub struct UxStrings {
     pub connect_step_terminal: &'static str,
     /// Connection form: reveals the less common options
     pub connect_more_options: &'static str,
+    /// Connection failure that was not about signing in: open the sign-in form anyway
+    pub connect_change_sign_in: &'static str,
     /// Sign-in method: try what the computer has
     pub auth_auto: &'static str,
     /// What the automatic sign-in tries
@@ -2857,11 +2863,14 @@ impl UxStrings {
             self.hosts_groups_all,
             self.hosts_connect_hint,
             self.host_example_group,
+            self.copy_click_hint,
+            self.toast_copied,
             self.connect_step_dial,
             self.connect_step_identity,
             self.connect_step_login,
             self.connect_step_terminal,
             self.connect_more_options,
+            self.connect_change_sign_in,
             self.auth_auto,
             self.auth_auto_hint,
             self.host_dialog_intro,
@@ -3198,11 +3207,14 @@ included",
     hosts_groups_all: "All hosts",
     hosts_connect_hint: "Connect (or double-click the row)",
     host_example_group: "Production/Web",
+    copy_click_hint: "Click to copy",
+    toast_copied: "Copied",
     connect_step_dial: "Reach the server",
     connect_step_identity: "Verify the server",
     connect_step_login: "Sign in",
     connect_step_terminal: "Open the terminal",
     connect_more_options: "More options…",
+    connect_change_sign_in: "Change how to sign in…",
     auth_auto: "Automatic",
     host_dialog_intro: "An address and a user are enough; everything else can wait.",
     host_name_optional: "Name (optional)",
@@ -3534,11 +3546,14 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     hosts_groups_all: "全部主机",
     hosts_connect_hint: "连接（也可以双击这一行）",
     host_example_group: "生产/Web",
+    copy_click_hint: "点击复制",
+    toast_copied: "已复制",
     connect_step_dial: "连接服务器",
     connect_step_identity: "验证服务器身份",
     connect_step_login: "登录",
     connect_step_terminal: "打开终端",
     connect_more_options: "更多选项…",
+    connect_change_sign_in: "修改登录方式…",
     auth_auto: "自动",
     host_dialog_intro: "填好地址和用户名就能连接，其余都可以以后再说。",
     host_name_optional: "名称（可选）",

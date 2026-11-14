@@ -47,6 +47,47 @@ pub(super) fn tone_icon(tone: Tone) -> Icon {
 }
 
 impl ShelluneView {
+    /// A value a person may want to paste elsewhere - an address, a path, a reason,
+    /// a fingerprint - drawn in `base` and copied with one click.
+    ///
+    /// Text drawn by the shell cannot be dragged over and selected, so the values
+    /// worth copying say so under the pointer and go to the clipboard whole, with a
+    /// toast that shows what was copied.
+    pub(super) fn copyable_text(
+        &self,
+        selector: &'static str,
+        text: impl Into<String>,
+        base: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let text: String = text.into();
+        let copied = text.clone();
+        let hover = theme::swatch(palette::TEXT_PRIMARY);
+        base.id(selector)
+            .debug_selector(move || selector.to_owned())
+            .cursor_pointer()
+            .hover(move |style| style.text_color(hover).underline())
+            .tooltip(crate::app::components::tooltip(
+                crate::app::copy::ux().copy_click_hint,
+            ))
+            .on_click(cx.listener(move |view, _event, _window, cx| {
+                cx.stop_propagation();
+                view.copy_text(copied.clone(), cx);
+            }))
+            .child(gpui::SharedString::from(text))
+    }
+
+    /// Puts text on the clipboard and says so.
+    pub(super) fn copy_text(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        self.toast(
+            Tone::Positive,
+            crate::app::copy::ux().toast_copied,
+            Some(text),
+            cx,
+        );
+    }
+
     /// Shows a message in the corner for a while, and says which one it was.
     ///
     /// The id lets a caller take the message away when what it describes stops being

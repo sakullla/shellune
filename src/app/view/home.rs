@@ -1131,12 +1131,15 @@ fn host_row_element(
                         .gap(metrics.scale(spacing::HAIRLINE + 2.0))
                         .min_w(px(0.0))
                         .child(
-                            div()
-                                .flex_none()
-                                .font_family(crate::app::terminal::monospace_family())
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(host.target.clone()),
+                            components::copy_on_click(
+                                div()
+                                    .flex_none()
+                                    .font_family(crate::app::terminal::monospace_family())
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED)),
+                                host.target.to_string(),
+                            )
+                            .child(host.target.clone()),
                         )
                         .children(host.last.clone().map(|last| {
                             let exact = host.last_exact.clone().unwrap_or_default();

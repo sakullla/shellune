@@ -245,6 +245,25 @@ impl ConnectError {
         }
     }
 
+    /// Whether the failure is about signing in - the credentials, the key or the agent -
+    /// as opposed to reaching the server or trusting it. Only these are fixed by
+    /// choosing another way to sign in.
+    #[must_use]
+    pub fn is_sign_in(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthRejected
+                | Self::KeyUnreadable { .. }
+                | Self::KeyEncrypted { .. }
+                | Self::KeyDecryptFailed { .. }
+                | Self::KeyInvalid { .. }
+                | Self::AgentUnavailable { .. }
+                | Self::AgentHasNoIdentity { .. }
+                | Self::AgentSignFailed { .. }
+                | Self::AgentIdentityRejected { .. }
+        )
+    }
+
     /// The security view of this failure, when it is one the user must decide about.
     #[must_use]
     pub fn security_error(&self) -> Option<SecurityError> {

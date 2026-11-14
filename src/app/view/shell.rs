@@ -14,7 +14,8 @@ use gpui::{
     Window, div, px,
 };
 
-use shellune_core::{SessionKind, SessionState, SnippetId};
+use shellune_core::{SessionState, SnippetId};
+use shellune_ssh::X11Status;
 
 use super::{
     ELLIPSIS, ShelluneView, SnippetNote, brand_mark, files_focus_ring, host_avatar, may_reconnect,
@@ -31,13 +32,6 @@ use crate::app::terminal::SnippetOffer;
 use crate::app::text_field::TextField;
 use crate::app::theme::{self, ThemeChoice, Tone, palette, radius, spacing};
 use crate::app::workspace::{AttentionKind, SectionState};
-
-/// Width at which the head's second row still holds its target and its actions on
-/// one line.
-///
-/// Below it the actions take a line of their own inside the same band, which is the
-/// shortest that row can be there and leaves the terminal its room (R4).
-const CONTEXT_ONE_LINE_WIDTH: f32 = 860.0;
 
 /// A tool of a host or session that opens over the page instead of being a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,40 +90,6 @@ impl ShelluneView {
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "session.header".to_owned())
             .child(self.top_bar(window, cx))
-            .when(!self.session_fused(), |head| {
-                head.children(self.session_context(false, cx))
-            })
-    }
-
-    /// Whether the current session's row folds into the tab row (R12).
-    ///
-    /// A session that is simply running has nothing to report: its name, colour and
-    /// state are on the tab, and the row under it held only a target and a handful of
-    /// icons - a whole band of chrome above the terminal for no news. Such a session
-    /// gives the band back and its target and actions move to the right of the tabs.
-    /// The row returns as soon as it has something to say - connecting, ended, a
-    /// reconnect, an unsaved quick connection, an X11 bridge - or when the window is
-    /// too narrow to hold both on one line.
-    pub(super) fn session_fused(&self) -> bool {
-        if self.workspace.destination() != Destination::LocalShells
-            || !self.shows_terminal(Destination::LocalShells)
-            || self.viewport_width < self.metrics().scale(CONTEXT_ONE_LINE_WIDTH)
-        {
-            return false;
-        }
-        let id = if self.workspace.layout().active_tab().is_some() {
-            self.workspace.layout().active_session()
-        } else {
-            self.active
-        };
-        let Some(session) = id.and_then(|id| self.workspace.session(id)) else {
-            return false;
-        };
-        let id = session.id();
-        matches!(session.state(), SessionState::Connected)
-            && !may_reconnect(session)
-            && !self.unsaved.iter().any(|(unsaved, _)| *unsaved == id)
-            && !self.x11.contains_key(&id)
     }
 
     /// The top row: brand, the hosts tab, the terminal tabs, a new-tab control, the
@@ -238,33 +198,20 @@ impl ShelluneView {
                     .h_full()
                     .min_w(metrics.scale(24.0)),
             )
-            .when(self.session_fused(), |bar| {
-                bar.children(self.session_context(true, cx)).child(
-                    components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)),
-                )
-            })
             .child(trailing)
             .children(controls)
     }
 
-    /// The second row of the head: where the current session stands, and what can be
-    /// done to it (R12).
+    /// What the session in front says about itself and what can be done to it, as the
+    /// two halves of the bar under the terminal (R12).
     ///
-    /// Nothing here repeats the tab. The name, its colour and its state dot belong to
-    /// the tab; this row carries the target that is not the name, the states that are
-    /// news (connecting, disconnected, ended), the bridge or the save that needs an
-    /// answer, and the actions. The name was drawn here as well, which is exactly the
-    /// duplication this row removes.
-    ///
-    /// `inline` draws the same target and actions as one quiet cluster for the tab row,
-    /// without the kind mark, the state chip or a second Close: a running session needs
-    /// none of them there, and the tab already closes it.
-    fn session_context(&self, inline: bool, cx: &mut Context<Self>) -> Option<Div> {
-        if self.workspace.destination() != Destination::LocalShells
-            || !self.shows_terminal(Destination::LocalShells)
-        {
-            return None;
-        }
+    /// The head above is the tabs and the application's own buttons, the same for a
+    /// local shell and a server; the session lives at the bottom, beside the terminal
+    /// tools, as in an editor's status line. The left half is where it is - the
+    /// target, and the state when it is news; the right half is what it does - files,
+    /// splitting, the reconnect or the save that is waiting, and the menu. The tab
+    /// closes the session, so there is no second Close here.
+    pub(super) fn session_bar_parts(&self, cx: &mut Context<Self>) -> Option<(Div, Div)> {
         let id = if self.workspace.layout().active_tab().is_some() {
             self.workspace.layout().active_session()
         } else {
@@ -273,50 +220,93 @@ impl ShelluneView {
         let session = self.workspace.session(id)?;
         let metrics = self.metrics();
         let strings = self.strings();
+        let ux = copy::ux();
         let live = matches!(session.state(), SessionState::Connected);
-        // A local shell is described by the program it runs - the whole path, since the
-        // tab already carries the short name - and a remote one by what it dialled.
-        let remote = matches!(session.kind(), SessionKind::Remote { .. });
         let target = self.target_of(session);
-        // A local shell's program is often its own title: the tab already says it, so
-        // the row keeps only what the tab does not say.
-        let label = self.tab_title(id);
-        let target = (target.to_lowercase() != label.to_lowercase()).then_some(target);
         let state_label = copy::session_state_label(session.state(), self.workspace.locale());
         let tone = session_tone(session.state());
         let can_reconnect = may_reconnect(session);
-        // Only a connection that can really browse offers the file view: a local
-        // session has no server to ask, and a session whose connection ended has no
-        // directory left to show.
         let browsable = self.files.can_browse(id);
         let files_open = self.files.is_open(id);
         let unsaved = self.unsaved.iter().any(|(session, _)| *session == id);
-        // Terminal and files are two views of the same connection: a switch, not a
-        // pair of open and close buttons.
+        let has_terminal = self.pane_for(id).is_some();
+        // While the connection card is on screen it is the one place to act on the
+        // attempt; the bar only says where it stands.
+        let card = self.connection_inline();
+        let ended = matches!(
+            session.state(),
+            SessionState::Disconnected(_) | SessionState::Failed(_) | SessionState::Closed
+        );
+        let can_reconnect = can_reconnect && !card;
+
+        let left = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .debug_selector(|| "session.context".to_owned())
+            .child(components::status_dot(tone, metrics))
+            .child(
+                self.copyable_text(
+                    "session.target",
+                    target,
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .font_family(terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY)),
+                    cx,
+                ),
+            )
+            .when(!live, |row| {
+                row.child(components::chip(state_label, tone, metrics))
+            })
+            // "X11 off" is the default and says nothing; only a bridge that is up,
+            // coming up or failed is worth a chip.
+            .when_some(
+                self.x11
+                    .get(&id)
+                    .filter(|status| !matches!(status, X11Status::Off))
+                    .cloned(),
+                |row, status| row.child(self.x11_chip(&status, metrics)),
+            )
+            .when(unsaved, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(strings.quick_unsaved_note),
+                )
+            });
+
+        // Terminal and files are two views of one connection: a small switch, icons
+        // named by their tooltips.
         let files_button = browsable.then(|| {
-            let ux = copy::ux();
             let view_segment =
-                |selector: &'static str, icon: Icon, label: &'static str, selected: bool| {
+                move |selector: &'static str, icon: Icon, label: &'static str, selected: bool| {
                     let color = theme::swatch(if selected {
                         palette::TEXT_PRIMARY
                     } else {
                         palette::TEXT_SECONDARY
                     });
                     components::segment("", selected, metrics)
+                        .h(metrics.scale(20.0))
+                        .px(metrics.scale(spacing::HAIRLINE + 2.0))
                         .flex()
                         .items_center()
-                        .gap(metrics.scale(spacing::HAIRLINE + 1.0))
+                        .gap(metrics.scale(spacing::HAIRLINE))
                         .child(icons::icon(icon, metrics.small_icon_size(), color))
                         .child(label)
                         .id(selector)
                         .debug_selector(move || selector.to_owned())
                 };
-            // One line. The shared track wraps so a settings row can shrink, and that
-            // same wrap stacked these two segments until the head was tall enough to
-            // leave the file pane shorter than the failure it has to show.
             components::segmented(metrics)
                 .flex_none()
                 .flex_nowrap()
+                .p(metrics.scale(1.0))
                 .child(
                     view_segment(
                         "files.close",
@@ -325,9 +315,7 @@ impl ShelluneView {
                         !files_open,
                     )
                     // The way back to the terminal is a stop of the file view's keyboard
-                    // walk, so it can be reached with Tab and pressed with Enter (R4). It
-                    // answers the ring through the same handler the columns use, because
-                    // the walk is one list whichever of its controls holds the keys.
+                    // walk, so it can be reached with Tab and pressed with Enter (R4).
                     .track_focus(&self.files_close_focus)
                     .focus(files_focus_ring)
                     .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
@@ -335,10 +323,10 @@ impl ShelluneView {
                             cx.stop_propagation();
                         }
                     }))
-                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                    .on_click(cx.listener(move |view, _event, window, cx| {
                         if view.files.is_open(id) {
                             view.toggle_files(id, cx);
-                            view.reclaim_focus(_window, cx);
+                            view.reclaim_focus(window, cx);
                         }
                     })),
                 )
@@ -357,43 +345,56 @@ impl ShelluneView {
                 )
         });
 
-        // One line: what this session is on the left, its actions on the right. The
-        // line wraps as a whole, so a narrow window or large text moves the actions
-        // under the target instead of squeezing either into a chip (R4).
-        let actions_row = div()
+        let right = div()
             .flex()
-            .flex_shrink()
-            .min_w(px(0.0))
-            .max_w_full()
-            .flex_wrap()
+            .flex_none()
             .items_center()
-            .justify_end()
-            .ml_auto()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .children(self.split_buttons(cx))
-            .when_some(files_button, |row, button| row.child(button))
-            // The two actions that are the reason the user is looking at this row stay
-            // on it; everything else is one menu away (R5).
+            .gap(metrics.scale(2.0))
             .when(can_reconnect, |row| {
-                row.child(self.icon_text_button(
-                    SharedString::from("session.reconnect"),
-                    Icon::Refresh,
-                    strings.session_reconnect,
-                    Variant::Primary,
-                    cx,
-                    move |view, cx| view.reconnect_session(id, cx),
-                ))
+                row.child(
+                    self.icon_text_button(
+                        SharedString::from("session.reconnect"),
+                        Icon::Refresh,
+                        strings.session_reconnect,
+                        Variant::Primary,
+                        cx,
+                        move |view, cx| view.reconnect_session(id, cx),
+                    )
+                    .h(metrics.scale(22.0))
+                    .text_size(metrics.caption_size()),
+                )
             })
             .when(unsaved, |row| {
-                row.child(self.icon_text_button(
-                    SharedString::from("session.save_host"),
-                    Icon::Server,
-                    strings.quick_save_host,
-                    Variant::Primary,
-                    cx,
-                    move |view, cx| view.save_quick_host(id, cx),
-                ))
+                row.child(
+                    self.icon_text_button(
+                        SharedString::from("session.save_host"),
+                        Icon::Server,
+                        strings.quick_save_host,
+                        Variant::Primary,
+                        cx,
+                        move |view, cx| view.save_quick_host(id, cx),
+                    )
+                    .h(metrics.scale(22.0))
+                    .text_size(metrics.caption_size()),
+                )
             })
+            // A session that ended for good has one thing left to do.
+            .when(ended && !can_reconnect && !unsaved && !card, |row| {
+                row.child(
+                    self.icon_text_button(
+                        SharedString::from("session.close"),
+                        Icon::Close,
+                        strings.session_close,
+                        Variant::Secondary,
+                        cx,
+                        move |view, cx| view.request_close_session(id, cx),
+                    )
+                    .h(metrics.scale(22.0))
+                    .text_size(metrics.caption_size()),
+                )
+            })
+            .when_some(files_button, |row, button| row.child(button))
+            .when(has_terminal, |row| row.children(self.split_buttons(cx)))
             .child(
                 self.bar_icon(
                     "session.more",
@@ -401,9 +402,9 @@ impl ShelluneView {
                     strings.session_more.to_owned(),
                     self.session_more.is_some(),
                 )
-                // Opened on the press, like the tab menu: the head's button is a
-                // control of the shell, and a menu that took the keyboard from the
-                // terminal would leave Escape unanswered (R5).
+                .size(metrics.hit_target())
+                // Opened on the press, like the tab menu, so the terminal keeps the
+                // keyboard and Escape is still answered (R5).
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
@@ -411,128 +412,42 @@ impl ShelluneView {
                         view.open_session_more(id, event.position, window, cx);
                     }),
                 ),
-            );
-        if inline {
-            return Some(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .debug_selector(|| "session.context".to_owned())
-                    .when_some(target, |row, target| {
-                        row.child(
-                            div()
-                                .max_w(metrics.scale(260.0))
-                                .truncate()
-                                .font_family(terminal::monospace_family())
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .debug_selector(|| "session.target".to_owned())
-                                .child(SharedString::from(target)),
-                        )
-                    })
-                    .child(actions_row.flex_nowrap().ml_0()),
-            );
-        }
-        let close = components::icon_only_button(Icon::Close, metrics)
-            .id("session.close")
-            .debug_selector(|| "session.close".to_owned())
-            .tooltip(components::tooltip(strings.session_close))
-            .on_click(cx.listener(move |view, _event, _window, cx| {
-                view.request_close_session(id, cx);
-            }));
-        // A wide window has room for one line: the target on the left, every action and
-        // Close on the right. A narrow one (or large text) keeps Close beside the target
-        // and gives the actions a line of their own, which is the shortest this row can
-        // be, so the terminal keeps its room (R4).
-        let compact = self.viewport_width < metrics.scale(CONTEXT_ONE_LINE_WIDTH);
-        let (actions_row, close) = if compact {
-            (
-                actions_row.w_full(),
-                Some(div().flex_none().ml_auto().child(close)),
             )
-        } else {
-            (
-                actions_row
-                    .child(
-                        components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)),
-                    )
-                    .child(close),
-                None,
-            )
-        };
-
-        let row = div()
-            .flex()
-            .flex_none()
-            .flex_wrap()
-            .items_center()
-            .w_full()
-            .gap_x(metrics.scale(spacing::TIGHT))
-            .gap_y(metrics.scale(spacing::HAIRLINE))
-            .min_h(metrics.session_bar_height())
-            .py(px(1.0))
-            .pl(metrics.scale(spacing::SNUG))
-            .pr(metrics.scale(spacing::HAIRLINE + 2.0))
-            .debug_selector(|| "session.context".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .flex_grow()
-                    .flex_shrink()
-                    .flex_basis(gpui::auto())
-                    .min_w(px(0.0))
-                    .flex_wrap()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    // What kind of session this is opens the row, so the line is never
-                    // empty and a local shell is not mistaken for a server.
-                    .child(components::kind_badge(
-                        if remote {
-                            strings.session_kind_remote
-                        } else {
-                            strings.session_kind_local
-                        },
-                        remote,
-                        metrics,
-                    ))
-                    .when_some(target, |row, target| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .max_w_full()
-                                .whitespace_normal()
-                                .font_family(terminal::monospace_family())
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                .debug_selector(|| "session.target".to_owned())
-                                .child(SharedString::from(target)),
-                        )
-                    })
-                    .when(!live, |row| {
-                        row.child(components::chip(state_label, tone, metrics))
-                    })
-                    .when_some(self.x11.get(&id).cloned(), |row, status| {
-                        row.child(self.x11_chip(&status, metrics))
-                    })
-                    .when(unsaved, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .max_w_full()
-                                .min_w(px(0.0))
-                                .whitespace_normal()
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .child(strings.quick_unsaved_note),
-                        )
-                    }),
-            )
-            .children(close)
-            .child(actions_row);
-        Some(row)
+            // The terminal's own tools follow in the same bar when there is a terminal.
+            .when(has_terminal, |row| {
+                row.child(
+                    components::divider_vertical(metrics)
+                        .h(metrics.scale(12.0))
+                        .mx(metrics.scale(spacing::HAIRLINE)),
+                )
+            });
+        Some((left, right))
     }
+
+    /// The session bar on its own, for when no terminal is on screen to carry it: the
+    /// file view, or a session that has no terminal (yet).
+    pub(super) fn standalone_session_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (left, right) = self.session_bar_parts(cx)?;
+        let metrics = self.metrics();
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap(metrics.scale(spacing::TIGHT))
+                .min_h(px(terminal::SHELL_BAR_HEIGHT))
+                .pl(metrics.scale(spacing::BASE - 2.0))
+                .pr(metrics.scale(spacing::HAIRLINE))
+                .bg(theme::swatch(palette::CANVAS))
+                .border_t_1()
+                .border_color(theme::faded(theme::swatch(palette::BORDER), 0.8))
+                .debug_selector(|| "session.bar".to_owned())
+                .child(left.flex_1())
+                .child(right),
+        )
+    }
+
     /// A square icon button of the top bar.
     fn bar_icon(
         &self,
@@ -1636,14 +1551,17 @@ impl ShelluneView {
             // the two facts a person checks when a connection takes long.
             if index == 0 {
                 line = line.child(
-                    div()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .font_family(crate::app::terminal::monospace_family())
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .debug_selector(|| "remote.target".to_owned())
-                        .child(SharedString::from(host.target())),
+                    components::copy_on_click(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(crate::app::terminal::monospace_family())
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "remote.target".to_owned()),
+                        host.target(),
+                    )
+                    .child(SharedString::from(host.target())),
                 );
             }
             if index == 2 {
@@ -1724,6 +1642,77 @@ impl ShelluneView {
         if !(self.showing_connection_form && self.remote.is_some()) {
             return None;
         }
+        // An attempt that has its own tab is shown in that tab, not over the page.
+        if self.connection_inline() {
+            return None;
+        }
+        let content = self.connection_content(cx)?;
+        Some(self.modal(window, "remote.dialog", 600.0, content))
+    }
+
+    /// Whether the connection being set up is drawn in its own tab rather than as a
+    /// dialog: it has a session, and that session's tab is the one on screen.
+    ///
+    /// Pressing Connect is going to that server, so the window goes there: the tab
+    /// opens at once and the steps, a question or a failure are where the terminal is
+    /// about to be, instead of a dialog over the list that was just left.
+    pub(super) fn connection_inline(&self) -> bool {
+        self.showing_connection_form
+            && !self.quick_open
+            && self.remote.is_some()
+            && self.workspace.destination() == Destination::LocalShells
+            && self
+                .form_session
+                .is_some_and(|id| self.active == Some(id) && self.workspace.session(id).is_some())
+    }
+
+    /// The connection being set up, drawn in the terminal area of its tab.
+    pub(super) fn connection_page(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let metrics = self.metrics();
+        let ModalContent {
+            header,
+            subtitle,
+            body,
+            footer,
+        } = self.connection_content(cx)?;
+        Some(
+            div()
+                .id("remote.page")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .items_center()
+                .overflow_y_scroll()
+                .bg(theme::swatch(palette::CANVAS))
+                .px(metrics.scale(spacing::LOOSE))
+                .py(metrics.scale(spacing::LOOSE * 2.0))
+                .debug_selector(|| "remote.dialog".to_owned())
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .w_full()
+                        .max_w(metrics.scale(600.0))
+                        .rounded(px(radius::XLARGE))
+                        .bg(theme::swatch(palette::SURFACE_RAISED))
+                        .border_1()
+                        .border_color(theme::swatch(palette::BORDER))
+                        .shadow_sm()
+                        .child(header)
+                        .children(subtitle)
+                        .child(body)
+                        .children(footer),
+                ),
+        )
+    }
+
+    /// What the connection dialog holds - head, body and buttons - wherever it is drawn.
+    fn connection_content(&self, cx: &mut Context<Self>) -> Option<ModalContent> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
         let panel = self.remote.as_ref()?;
         let host = panel.host();
         let (status_label, tone) = super::remote_status_label(panel.status(), strings);
@@ -1808,17 +1797,12 @@ impl ShelluneView {
                     ))
                 })
         });
-        Some(self.modal(
-            window,
-            "remote.dialog",
-            600.0,
-            ModalContent {
-                header,
-                subtitle,
-                body,
-                footer,
-            },
-        ))
+        Some(ModalContent {
+            header,
+            subtitle,
+            body,
+            footer,
+        })
     }
 
     /// Importing hosts from an SSH configuration, as a dialog: read, preview, then
@@ -2060,6 +2044,14 @@ impl ShelluneView {
         // for it again.
         self.form_session = None;
         self.showing_connection_form = false;
+        // Put away from its own tab, an attempt that has no terminal yet leaves nothing
+        // to look at there: the window goes back to the hosts while it keeps running.
+        if self
+            .active
+            .is_some_and(|id| self.pane_for(id).is_none() && self.attempt_index(id).is_some())
+        {
+            self.workspace.select(Destination::Hosts);
+        }
         cx.notify();
     }
 

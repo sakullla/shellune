@@ -21,7 +21,7 @@ use shellune_core::{BatchTarget, FailurePolicy, HostId, HostState, RunState, Ste
 use super::ShelluneView;
 use super::shell::ModalContent;
 use crate::app::batch::{BatchPage, BatchRunPage, MAX_PREVIEW_ROWS};
-use crate::app::components::{self, ControlState, Variant};
+use crate::app::components::{self, Variant};
 use crate::app::copy::{self, UxStrings};
 use crate::app::hosts::SelectionScope;
 use crate::app::icons::Icon;
@@ -456,11 +456,12 @@ impl ShelluneView {
                             .child(SharedString::from(number)),
                     )
                     .child(
-                        components::field_frame(ControlState::Resting, metrics)
+                        // The text field draws its own border; a frame around it drew a
+                        // second one.
+                        div()
+                            .flex()
                             .flex_1()
                             .min_w(px(0.0))
-                            .px(metrics.scale(spacing::TIGHT))
-                            .py(metrics.scale(spacing::HAIRLINE))
                             .debug_selector(move || format!("batch.step.field.{index}"))
                             .child(field.clone()),
                     )
@@ -558,10 +559,9 @@ impl ShelluneView {
                             .child(ux.batch_concurrency),
                     )
                     .children(concurrency.map(|field| {
-                        components::field_frame(ControlState::Resting, metrics)
+                        div()
+                            .flex()
                             .w(metrics.scale(72.0))
-                            .px(metrics.scale(spacing::TIGHT))
-                            .py(metrics.scale(spacing::HAIRLINE))
                             .debug_selector(|| "batch.concurrency".to_owned())
                             .child(field)
                     }))
@@ -590,11 +590,10 @@ impl ShelluneView {
                             .child(ux.batch_name),
                     )
                     .children(name.map(|field| {
-                        components::field_frame(ControlState::Resting, metrics)
+                        div()
+                            .flex()
                             .flex_1()
                             .min_w(metrics.scale(160.0))
-                            .px(metrics.scale(spacing::TIGHT))
-                            .py(metrics.scale(spacing::HAIRLINE))
                             .debug_selector(|| "batch.name".to_owned())
                             .child(field)
                     })),

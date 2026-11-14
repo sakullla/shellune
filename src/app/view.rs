@@ -526,6 +526,8 @@ pub struct ShelluneView {
     host_advanced: bool,
     /// Whether the connection form shows its less common options (X11 forwarding).
     remote_more: bool,
+    /// Whether a failure that was not about signing in still shows the sign-in form.
+    remote_edit_auth: bool,
     /// Rules waiting for that dial to authenticate.
     pending_forward_rules: Vec<ForwardId>,
     /// A non-loopback listen waiting for confirmation. Nothing is bound.
@@ -1892,6 +1894,7 @@ impl ShelluneView {
             forward_only_dial: false,
             host_advanced: false,
             remote_more: false,
+            remote_edit_auth: false,
             pending_forward_rules: Vec::new(),
             pending_exposure: None,
             forward_confirm: None,
@@ -5514,6 +5517,7 @@ impl ShelluneView {
         self.chain = Some(ChainDraft::prepare(self.book.hosts(), host));
         self.remote = Some(RemotePanel::new(host));
         self.remote_more = false;
+        self.remote_edit_auth = false;
         self.showing_connection_form = true;
         self.sync_remote_fields(cx);
         self.connect_when_ready(host, cx);
@@ -5923,6 +5927,15 @@ impl ShelluneView {
             pending_rules,
         });
         self.watch_attempt(id, cx);
+        // Connecting is going to that server: its tab comes to the front at once and
+        // shows the attempt, instead of a dialog over the page that was left. A
+        // forward-only dial has no terminal to go to and stays where it was.
+        if !forward_only {
+            self.workspace.layout_mut().focus_session(id);
+            if self.workspace.destination() != Destination::LocalShells {
+                self.workspace.select(Destination::LocalShells);
+            }
+        }
         cx.notify();
     }
 
@@ -7639,15 +7652,18 @@ impl ShelluneView {
                             .child(SharedString::from(next_step)),
                     )
                     .child(
-                        div()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .whitespace_normal()
-                            .font_family(crate::app::terminal::monospace_family())
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .debug_selector(|| "remote.failure.reason".to_owned())
-                            .child(SharedString::from(reason)),
+                        components::copy_on_click(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .whitespace_normal()
+                                .font_family(crate::app::terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .debug_selector(|| "remote.failure.reason".to_owned()),
+                            reason.clone(),
+                        )
+                        .child(SharedString::from(reason)),
                     ),
             );
         }
@@ -7679,7 +7695,47 @@ impl ShelluneView {
         // A failure that pressing again cannot fix - a changed server identity - offers
         // no form: its card says what to check instead.
         let retry_blocked = status.failure().is_some_and(|failure| !failure.retryable());
-        if !matches!(status, RemoteStatus::Live)
+        // A server that did not answer is not fixed by another way to sign in: such a
+        // failure offers the retry alone, and the form one press away.
+        let reach_failure = status
+            .failure()
+            .is_some_and(|failure| failure.retryable() && !failure.sign_in());
+        if reach_failure && !self.remote_edit_auth {
+            column = column.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::compact_button(
+                            copy::ux().connect_change_sign_in,
+                            Variant::Ghost,
+                            metrics,
+                        )
+                        .id("remote.edit_auth")
+                        .debug_selector(|| "remote.edit_auth".to_owned())
+                        .on_click(cx.listener(
+                            |view, _event, _window, cx| {
+                                view.remote_edit_auth = true;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        self.icon_text_button(
+                            SharedString::from("remote.retry"),
+                            Icon::Refresh,
+                            strings.recovery_retry,
+                            Variant::Primary,
+                            cx,
+                            |view, cx| view.retry_remote(cx),
+                        )
+                        .h(metrics.control_height())
+                        .px(metrics.scale(spacing::BASE)),
+                    ),
+            );
+        } else if !matches!(status, RemoteStatus::Live)
             && !status.is_asking()
             && !status.is_busy()
             && !retry_blocked
@@ -7706,13 +7762,17 @@ impl ShelluneView {
                     .child(label),
             )
             .child(
-                div()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .debug_selector(move || selector.to_owned())
-                    .child(SharedString::from(value)),
+                components::copy_on_click(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .font_family(terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .debug_selector(move || selector.to_owned()),
+                    value.clone(),
+                )
+                .child(SharedString::from(value)),
             )
     }
 
@@ -9236,9 +9296,9 @@ impl ShelluneView {
             return false;
         }
         let live = self.active.is_some_and(|id| self.pane_for(id).is_some());
-        // A waiting pane is drawn in the workspace. A session that is only
-        // connecting still has no terminal, so it does not take the page over.
-        live || self.workspace.layout().has_pending()
+        // A waiting pane is drawn in the workspace, and so is a connection being set up
+        // in its own tab.
+        live || self.workspace.layout().has_pending() || self.connection_inline()
     }
 
     /// The content under the top bar: the settings, a terminal, or the hosts home.
@@ -13181,14 +13241,25 @@ impl ShelluneView {
                     palette::TEXT_MUTED
                 }),
             ))
-            .child(
+            .child({
+                // The title asks for the room its words need (up to a cap) instead of
+                // relying on the platform's measure of a truncated line, which could
+                // leave a tab with a bare ellipsis where its name belongs.
+                let title = self.tab_title(id);
+                // Marks the tab carries take the room first; the name then truncates.
+                let floor = if mark_room > px(0.0) {
+                    px(0.0)
+                } else {
+                    (components::reserved_text_width(&title, metrics.label_size()) * 1.3)
+                        .min(metrics.scale(110.0))
+                };
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
+                    .flex_shrink()
+                    .min_w(floor)
                     .truncate()
                     .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
-                    .child(SharedString::from(self.tab_title(id))),
-            )
+                    .child(SharedString::from(title))
+            })
             .when(!live, |body| {
                 body.child(
                     div()
@@ -13886,6 +13957,20 @@ impl Render for ShelluneView {
                     cx.stop_propagation();
                 }
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::app::actions::ShowCopied, _window, cx| {
+                    let copied = cx
+                        .read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .unwrap_or_default();
+                    this.toast(
+                        Tone::Positive,
+                        copy::ux().toast_copied,
+                        (!copied.is_empty()).then_some(copied),
+                        cx,
+                    );
+                }),
+            )
             .on_action(cx.listener(|this, _: &GoToLocalShells, window, cx| {
                 this.select(Destination::LocalShells, window, cx);
             }))

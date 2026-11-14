@@ -151,6 +151,8 @@ pub struct RemoteFailure {
     reason: String,
     next_step: String,
     retryable: bool,
+    /// Whether choosing another way to sign in can fix it.
+    sign_in: bool,
 }
 
 impl RemoteFailure {
@@ -161,6 +163,7 @@ impl RemoteFailure {
             reason: error.to_string(),
             next_step: error.next_step().to_owned(),
             retryable: error.is_retryable(),
+            sign_in: error.is_sign_in(),
         }
     }
 
@@ -172,6 +175,7 @@ impl RemoteFailure {
     /// chain text instead.
     #[must_use]
     pub fn from_chain(failure: &ChainFailure) -> Self {
+        let sign_in = matches!(failure, ChainFailure::Hop { error, .. } if error.is_sign_in());
         let (next_step, retryable) = match failure {
             ChainFailure::Hop { error, .. } => (error.next_step().to_owned(), error.is_retryable()),
             ChainFailure::NotDialed { .. } => (
@@ -191,6 +195,7 @@ impl RemoteFailure {
             reason: failure.to_string(),
             next_step,
             retryable,
+            sign_in,
         }
     }
 
@@ -202,6 +207,8 @@ impl RemoteFailure {
             reason: reason.into(),
             next_step: next_step.into(),
             retryable,
+            // The shell's own failures name no layer; the form stays, as it always did.
+            sign_in: true,
         }
     }
 
@@ -215,6 +222,12 @@ impl RemoteFailure {
     #[must_use]
     pub fn next_step(&self) -> &str {
         &self.next_step
+    }
+
+    /// Whether another way to sign in could fix it.
+    #[must_use]
+    pub fn sign_in(&self) -> bool {
+        self.sign_in
     }
 
     /// Whether offering the form again is honest.

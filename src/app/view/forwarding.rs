@@ -561,12 +561,15 @@ impl ShelluneView {
                                     )),
                             )
                             .child(
-                                div()
-                                    .truncate()
-                                    .font_family(crate::app::terminal::monospace_family())
-                                    .text_size(metrics.label_size())
-                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                    .child(SharedString::from(mapping)),
+                                components::copy_on_click(
+                                    div()
+                                        .truncate()
+                                        .font_family(crate::app::terminal::monospace_family())
+                                        .text_size(metrics.label_size())
+                                        .text_color(theme::swatch(palette::TEXT_SECONDARY)),
+                                    mapping.clone(),
+                                )
+                                .child(SharedString::from(mapping)),
                             )
                             .children(detail.map(|detail| {
                                 div()

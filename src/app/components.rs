@@ -1359,14 +1359,36 @@ pub fn dialog_header(
 /// the two places the shell uses two families; the other is the terminal grid.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn endpoint(value: impl Into<SharedString>, metrics: Metrics) -> Div {
-    div()
-        .flex_none()
-        .min_w(px(0.0))
-        .truncate()
-        .font_family(crate::app::terminal::monospace_family())
-        .text_size(metrics.label_size())
-        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-        .child(value.into())
+    let value: SharedString = value.into();
+    copy_on_click(
+        div()
+            .flex_none()
+            .min_w(px(0.0))
+            .truncate()
+            .font_family(crate::app::terminal::monospace_family())
+            .text_size(metrics.label_size())
+            .text_color(theme::swatch(palette::TEXT_SECONDARY)),
+        value.to_string(),
+    )
+    .child(value)
+}
+
+/// Makes a value one click away from the clipboard.
+///
+/// The shell draws its text itself, and a drawn line cannot be dragged over and
+/// selected the way a document's can; the values a person copies elsewhere -
+/// addresses, paths, fingerprints, the reason a connection failed - therefore copy
+/// whole on a click, and the window says so with a toast ([`crate::app::actions::ShowCopied`]).
+pub fn copy_on_click(base: Div, text: impl Into<String>) -> Div {
+    let text: String = text.into();
+    let hover = theme::swatch(palette::TEXT_PRIMARY);
+    base.cursor_pointer()
+        .hover(move |style| style.text_color(hover))
+        .on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
+            cx.stop_propagation();
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+            window.dispatch_action(Box::new(crate::app::actions::ShowCopied), cx);
+        })
 }
 
 /// A short in-flight bar: the work is running, and the word beside it says what.

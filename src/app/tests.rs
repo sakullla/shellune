@@ -12027,7 +12027,7 @@ async fn closing_the_application_lists_the_transfers_and_stopping_is_confirmed(
     let second_task = second_transfers.starts()[0].transfer;
 
     assert!(
-        !cx.simulate_close(),
+        !request_real_close(cx, &view),
         "a window with running transfers does not close on the first request"
     );
     cx.run_until_parked();
@@ -12059,7 +12059,7 @@ async fn closing_the_application_lists_the_transfers_and_stopping_is_confirmed(
         1
     );
 
-    assert!(!cx.simulate_close());
+    assert!(!request_real_close(cx, &view));
     cx.run_until_parked();
     assert!(
         cx.debug_bounds("app.close.confirm").is_some(),
@@ -16055,22 +16055,19 @@ async fn the_head_is_one_band_that_names_the_session_once(cx: &mut TestAppContex
     let tabs = bounds_of(cx, "session.tabs");
     let context = bounds_of(cx, "session.context");
     let topbar = bounds_of(cx, "topbar");
+    let viewport = cx.update(|window, _app| window.viewport_size());
     assert_fits_inside(tabs, header.size, "the tab strip in the head");
-    assert_fits_inside(
-        context,
-        header.size,
-        "the session's target and actions in the head",
-    );
-    // A running session has no news, so its target and actions sit on the tab row and
-    // the head is that one row: no second band above the terminal.
-    assert!(
-        context.origin.y >= topbar.origin.y
-            && context.origin.y + context.size.height <= topbar.origin.y + topbar.size.height,
-        "a running session's actions share the tab row: {context:?} vs {topbar:?}"
-    );
+    // The head is the tabs and nothing else, for a local shell as for a server; the
+    // session's target and tools are in the bar under the terminal.
     assert!(
         header.size.height <= topbar.size.height + px(1.0),
-        "the head of a running session is one row: {header:?} vs {topbar:?}"
+        "the head is one row: {header:?} vs {topbar:?}"
+    );
+    assert_fits_inside(context, viewport, "the session's half of the bar");
+    let grid = bounds_of(cx, "terminal.viewport");
+    assert!(
+        context.origin.y >= grid.origin.y + grid.size.height - px(1.0),
+        "the session's half of the bar is under the terminal: {context:?} vs {grid:?}"
     );
     assert!(
         cx.debug_bounds("session.close").is_none(),
@@ -19470,8 +19467,8 @@ async fn the_session_bar_says_what_x11_forwarding_is_doing(cx: &mut TestAppConte
     cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("session.x11.off").is_some(),
-        "the bar says that this session forwards nothing"
+        cx.debug_bounds("session.x11.off").is_none(),
+        "forwarding nothing is the default and is not called out in the head"
     );
 }
 
@@ -19635,7 +19632,7 @@ async fn the_x11_state_and_its_reason_stay_inside_the_minimum_window_at_two_hund
         "the terminal has no room left under the notice: {terminal:?}"
     );
     assert_fits_inside(terminal, viewport, "the terminal");
-    assert_fits_inside(bounds_of(cx, "session.close"), viewport, "session.close");
+    assert_fits_inside(bounds_of(cx, "session.more"), viewport, "session.more");
 }
 
 /// The failure a real window shows when DISPLAY is unset: the reason line is whole
@@ -19858,7 +19855,7 @@ async fn a_transfer_failure_stays_whole_while_x11_failed_at_two_hundred_percent(
         );
         assert_fits_inside(bounds, viewport, selector);
     }
-    assert_fits_inside(bounds_of(cx, "session.close"), viewport, "session.close");
+    assert_fits_inside(bounds_of(cx, "session.more"), viewport, "session.more");
 }
 
 // ---------------------------------------------------------------------------
@@ -21590,4 +21587,17 @@ async fn the_settings_page_scrolls_through_every_category_and_the_navigation_fol
         about.origin.y < area.origin.y + area.size.height,
         "the chosen category is scrolled into view: {about:?} in {area:?}"
     );
+}
+
+/// Asks the window to close the way Windows and Linux do - for real.
+///
+/// On macOS the window's own close button only hides it (R13), so a test about the
+/// question a real close asks drives that path directly instead of through the
+/// platform's close, which would hide the window on a Mac runner.
+fn request_real_close(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -> bool {
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.on_window_should_close(Platform::Windows, cx)
+        })
+    })
 }

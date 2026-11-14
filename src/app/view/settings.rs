@@ -791,16 +791,19 @@ impl ShelluneView {
                         "hosts-file",
                         copy::ux().settings_hosts_file,
                         "",
-                        div()
-                            .max_w(metrics.scale(360.0))
-                            .truncate()
-                            .font_family(terminal::monospace_family())
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .debug_selector(|| "settings.paths".to_owned())
-                            .child(SharedString::from(super::home_relative(
-                                &self.store.path().display().to_string(),
-                            ))),
+                        components::copy_on_click(
+                            div()
+                                .max_w(metrics.scale(360.0))
+                                .truncate()
+                                .font_family(terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                .debug_selector(|| "settings.paths".to_owned()),
+                            self.store.path().display().to_string(),
+                        )
+                        .child(SharedString::from(super::home_relative(
+                            &self.store.path().display().to_string(),
+                        ))),
                     ),
                 ],
             ),
