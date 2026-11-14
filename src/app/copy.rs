@@ -340,6 +340,50 @@ pub struct Strings {
     pub session_kind_local: &'static str,
     /// Kind label of an SSH session, on the session tab and bar.
     pub session_kind_remote: &'static str,
+    /// Kind label of an RDP or VNC session, on the session tab and bar.
+    pub session_kind_desktop: &'static str,
+    /// Kind label of a serial session, on the session tab and bar.
+    pub session_kind_serial: &'static str,
+    /// New or edit title of a connection that is not an SSH host.
+    pub connection_editor_new: &'static str,
+    /// Title of the form for a saved desktop or serial connection.
+    pub connection_editor_edit: &'static str,
+    /// Field label: the protocol a new connection speaks.
+    pub connection_field_protocol: &'static str,
+    /// Field label: the Windows domain a RDP user belongs to.
+    pub connection_field_domain: &'static str,
+    /// Field label: what a RDP connection does with an untrusted certificate.
+    pub connection_field_certificate: &'static str,
+    /// Field label: how much a VNC connection insists on encryption.
+    pub connection_field_security: &'static str,
+    /// Field label: the device a serial connection opens.
+    pub connection_field_device: &'static str,
+    /// Field label: the line speed of a serial connection.
+    pub connection_field_baud: &'static str,
+    /// Field label: how many data bits one serial frame carries.
+    pub connection_field_data_bits: &'static str,
+    /// Field label: how a serial frame carries parity.
+    pub connection_field_parity: &'static str,
+    /// Field label: how many stop bits end a serial frame.
+    pub connection_field_stop_bits: &'static str,
+    /// Field label: how a serial port paces its bytes.
+    pub connection_field_flow: &'static str,
+    /// Field label: whether typed characters are echoed locally.
+    pub connection_field_local_echo: &'static str,
+    /// Note under the serial fields: nothing opens until the user starts a session.
+    pub connection_not_started_note: &'static str,
+    /// Suffix given to a copied connection's name.
+    pub connection_copy_suffix: &'static str,
+    /// Button that deletes one saved connection.
+    pub connection_delete: &'static str,
+    /// Question asked before a connection is deleted.
+    pub connection_delete_question: &'static str,
+    /// Entry that copies a saved connection into a new one.
+    pub connection_duplicate: &'static str,
+    /// Message after a desktop or serial connection was written.
+    pub connection_saved: &'static str,
+    /// Message after a desktop or serial connection was removed.
+    pub connection_deleted: &'static str,
     /// Button that closes one session.
     pub session_close: &'static str,
     /// Button that starts another process for a session that ended.
@@ -348,6 +392,8 @@ pub struct Strings {
     pub session_reconnect_no_shell: &'static str,
     /// Why a remote session's host cannot be connected to again.
     pub session_reconnect_missing_host: &'static str,
+    /// Why a desktop or serial session cannot be started again in this build.
+    pub session_reconnect_not_wired: &'static str,
     /// Said where a selected session has no terminal to draw.
     pub session_no_terminal: &'static str,
 
@@ -1125,10 +1171,33 @@ pub static ENGLISH: Strings = Strings {
     remote_close: "Close the connection panel",
     session_kind_local: "Local",
     session_kind_remote: "SSH",
+    session_kind_desktop: "Desktop",
+    session_kind_serial: "Serial",
+    connection_editor_new: "New connection",
+    connection_editor_edit: "Edit connection",
+    connection_field_protocol: "Protocol",
+    connection_field_domain: "Domain",
+    connection_field_certificate: "Certificate",
+    connection_field_security: "Security",
+    connection_field_device: "Device",
+    connection_field_baud: "Baud rate",
+    connection_field_data_bits: "Data bits",
+    connection_field_parity: "Parity",
+    connection_field_stop_bits: "Stop bits",
+    connection_field_flow: "Flow control",
+    connection_field_local_echo: "Local echo",
+    connection_not_started_note: "Saving a connection opens nothing: it dials, or opens the device, only when you start a session.",
+    connection_copy_suffix: " (copy)",
+    connection_delete: "Delete connection",
+    connection_delete_question: "Delete this saved connection? Nothing that is running is affected.",
+    connection_duplicate: "Duplicate",
+    connection_saved: "Connection saved",
+    connection_deleted: "Connection deleted",
     session_close: "Close session",
     session_reconnect: "Reconnect",
     session_reconnect_no_shell: "This session has no program recorded, so it cannot be started again.",
     session_reconnect_missing_host: "The saved host this session used is no longer there, so it cannot be connected to again.",
+    session_reconnect_not_wired: "Starting this kind of session is not available yet, so nothing was started.",
     session_no_terminal: "This session has no terminal open",
     files_open: "Files",
     files_up: "Up",
@@ -1581,10 +1650,33 @@ pub static CHINESE: Strings = Strings {
     remote_close: "关闭连接面板",
     session_kind_local: "本地",
     session_kind_remote: "SSH 远程",
+    session_kind_desktop: "远程桌面",
+    session_kind_serial: "串口",
+    connection_editor_new: "新建连接",
+    connection_editor_edit: "编辑连接",
+    connection_field_protocol: "协议",
+    connection_field_domain: "域",
+    connection_field_certificate: "证书",
+    connection_field_security: "安全",
+    connection_field_device: "设备",
+    connection_field_baud: "波特率",
+    connection_field_data_bits: "数据位",
+    connection_field_parity: "校验",
+    connection_field_stop_bits: "停止位",
+    connection_field_flow: "流控",
+    connection_field_local_echo: "本地回显",
+    connection_not_started_note: "保存连接不会打开任何东西：只有你启动会话时才会拨号或打开设备。",
+    connection_copy_suffix: "（副本）",
+    connection_delete: "删除连接",
+    connection_delete_question: "删除这条已保存的连接？正在运行的内容不受影响。",
+    connection_duplicate: "复制一份",
+    connection_saved: "连接已保存",
+    connection_deleted: "连接已删除",
     session_close: "关闭会话",
     session_reconnect: "重新连接",
     session_reconnect_no_shell: "该会话没有记录可启动的程序，无法重新启动。",
     session_reconnect_missing_host: "该会话使用的主机记录已被删除，无法再次连接。",
+    session_reconnect_not_wired: "这类会话暂时还不能启动，所以没有启动任何东西。",
     session_no_terminal: "该会话当前没有终端",
     files_open: "文件",
     files_up: "上级",

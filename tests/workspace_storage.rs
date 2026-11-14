@@ -134,6 +134,84 @@ fn assert_allowlisted(bytes: &str) {
 }
 
 #[test]
+fn a_desktop_and_a_serial_tab_survive_a_restart_and_wait_for_the_user() {
+    let dir = TempDir::new("desktop-tabs");
+    let rdp = HostId::new();
+    let vnc = HostId::new();
+    let serial = HostId::new();
+    let gone = HostId::new();
+    let desktop = WorkspaceTab::new(
+        "Desktops",
+        PaneNode::split(
+            SplitAxis::LeftRight,
+            5000,
+            PaneNode::leaf(PaneTarget::rdp(rdp), TerminalMode::Integrated),
+            PaneNode::leaf(PaneTarget::vnc(vnc), TerminalMode::Integrated),
+        )
+        .expect("ratio"),
+    )
+    .expect("title");
+    let device = WorkspaceTab::new(
+        "Console",
+        PaneNode::leaf(PaneTarget::serial(serial), TerminalMode::Classic),
+    )
+    .expect("title");
+    let stale = WorkspaceTab::new(
+        "Old rack",
+        PaneNode::leaf(PaneTarget::rdp(gone), TerminalMode::Classic),
+    )
+    .expect("title");
+    let snapshot = WorkspaceSnapshot::new(
+        vec![desktop, device, stale],
+        PanelConfig::new(true, PanelSection::Files),
+    )
+    .expect("snapshot");
+
+    let store = WorkspaceStore::at(dir.path());
+    store.save(&snapshot).expect("the snapshot saves");
+    let loaded = WorkspaceStore::at(dir.path())
+        .load()
+        .expect("the snapshot loads after a restart");
+    assert_eq!(loaded, snapshot, "every protocol keeps its place");
+
+    let text = std::fs::read_to_string(dir.path().join(WORKSPACE_FILE_NAME))
+        .expect("the snapshot file exists");
+    assert!(text.contains("\"kind\": \"rdp\""), "{text}");
+    assert!(text.contains("\"kind\": \"vnc\""), "{text}");
+    assert!(text.contains("\"kind\": \"serial\""), "{text}");
+
+    let restored = loaded.restore(|id| id != gone);
+    assert_eq!(restored.tabs().len(), 3);
+    let panes = restored.panes();
+    assert_eq!(panes.len(), 4);
+    assert!(
+        panes.iter().all(|pane| !pane.connection().is_started()),
+        "restoring a desktop or a serial pane opens nothing"
+    );
+    let connections: Vec<PendingConnection> =
+        panes.iter().map(|pane| pane.connection().clone()).collect();
+    assert!(
+        connections.contains(&PendingConnection::Rdp { host: rdp }),
+        "the RDP pane is waiting for its saved connection: {connections:?}"
+    );
+    assert!(connections.contains(&PendingConnection::Vnc { host: vnc }));
+    assert!(connections.contains(&PendingConnection::Serial { host: serial }));
+    assert!(
+        restored
+            .issues()
+            .iter()
+            .any(|issue| issue.message().contains(&gone.to_string())
+                && issue.message().contains("Nothing was connected")),
+        "the deleted connection is reported and its pane is kept: {:?}",
+        restored.issues()
+    );
+    assert_eq!(
+        restored.panel().section(),
+        PanelSection::Files,
+        "the rest of the shell is restored as it was"
+    );
+}
+#[test]
 fn a_snapshot_round_trips_tabs_splits_and_the_panel() {
     let dir = TempDir::new("round-trip");
     let empty = WorkspaceStore::at(dir.path())

@@ -6,7 +6,11 @@
 //! * `HostBook` / `HostStore` — hosts, their group labels and the recent-connection
 //!   log. One book, so search, grouping and the recent view can never disagree
 //!   about what a host is called or which address it uses. A host may also name a
-//!   jump chain and a ProxyCommand; those are references and command text.
+//!   jump chain and a ProxyCommand; those are references and command text. The
+//!   same book holds the connections whose protocol is not SSH, each carrying its
+//!   protocol explicitly: a record of a protocol this build does not know is
+//!   reported instead of loaded, and a book without such records is written exactly
+//!   as an older build wrote it.
 //! * `GroupStore` / `GroupService` — the group tree: which paths exist, empty ones
 //!   included, and the changes that keep it and the hosts agreeing when a group is
 //!   moved, renamed or deleted.

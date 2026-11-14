@@ -1,5 +1,9 @@
 //! The saved records: hosts, their group labels and the recent-connection log.
 //!
+//! The SSH hosts are the host list this build has always written, and the
+//! connections of the other protocols are kept beside it with an explicit protocol
+//! tag, so an older file still reads and an SSH record keeps its exact shape.
+//!
 //! One book serves every view. Search returns references into the same host list
 //! the group view and the recent view use, so an edited address is what every view
 //! shows; there is no second copy that a view could keep stale.
@@ -7,7 +11,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use shellune_core::{GroupPath, HostConfig, HostId, JumpFault, jump_faults};
+use shellune_core::{ConnectionRecord, GroupPath, HostConfig, HostId, JumpFault, jump_faults};
 
 use crate::error::BookError;
 
@@ -144,6 +148,18 @@ impl HostEdit {
 pub struct HostBook {
     version: u32,
     hosts: Vec<HostConfig>,
+    /// The saved connections whose protocol is not SSH (R2, R18).
+    ///
+    /// Kept beside the host list rather than replacing it: the SSH record is the one
+    /// older builds wrote and the one every existing consumer takes, so a file from
+    /// an older build stays readable and an SSH connection keeps its exact fields.
+    /// Each record here carries its protocol explicitly, which is what lets one
+    /// record of an unknown protocol be reported instead of loaded.
+    ///
+    /// Absent from a file that has no such connection, so a book of SSH hosts is
+    /// written byte for byte as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    connections: Vec<ConnectionRecord>,
     recents: Vec<RecentConnection>,
 }
 
@@ -152,6 +168,7 @@ impl Default for HostBook {
         Self {
             version: FORMAT_VERSION,
             hosts: Vec::new(),
+            connections: Vec::new(),
             recents: Vec::new(),
         }
     }
@@ -289,6 +306,179 @@ impl HostBook {
         };
         self.recents.retain(|recent| recent.host() != id);
         Ok(self.hosts.remove(index))
+    }
+    /// Every saved connection whose protocol is not SSH, in saved order.
+    #[must_use]
+    pub fn connections(&self) -> &[ConnectionRecord] {
+        &self.connections
+    }
+
+    /// One saved connection of any protocol.
+    ///
+    /// An SSH host answers as [`ConnectionRecord::Ssh`], so a caller that lists
+    /// connections does not need a second lookup for the common case.
+    #[must_use]
+    pub fn connection(&self, id: HostId) -> Option<ConnectionRecord> {
+        if let Some(host) = self.host(id) {
+            return Some(ConnectionRecord::Ssh(host.clone()));
+        }
+        self.connections
+            .iter()
+            .find(|connection| connection.id() == id)
+            .cloned()
+    }
+
+    /// How many connections are saved, whatever their protocol.
+    #[must_use]
+    pub fn connection_count(&self) -> usize {
+        self.hosts.len() + self.connections.len()
+    }
+
+    /// Every saved connection: the SSH hosts first, then the other protocols.
+    ///
+    /// The two lists are kept apart because the SSH record is the shape older builds
+    /// wrote; this is the one place that presents them as what the user sees.
+    #[must_use]
+    pub fn records(&self) -> Vec<ConnectionRecord> {
+        let mut records: Vec<ConnectionRecord> = self
+            .hosts
+            .iter()
+            .cloned()
+            .map(ConnectionRecord::Ssh)
+            .collect();
+        records.extend(self.connections.iter().cloned());
+        records
+    }
+
+    /// Whether either list already holds this identifier.
+    #[must_use]
+    pub fn contains_connection(&self, id: HostId) -> bool {
+        self.host(id).is_some()
+            || self
+                .connections
+                .iter()
+                .any(|connection| connection.id() == id)
+    }
+
+    /// Adds a connection of any protocol.
+    ///
+    /// An SSH connection is stored as a host record, so neither list can hold the
+    /// same connection twice and every existing consumer of `hosts` keeps working.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BookError::DuplicateHost`] when the identifier is already saved.
+    pub fn insert_connection(&mut self, connection: ConnectionRecord) -> Result<(), BookError> {
+        if self.contains_connection(connection.id()) {
+            return Err(BookError::DuplicateHost {
+                id: connection.id(),
+            });
+        }
+        match connection {
+            ConnectionRecord::Ssh(host) => self.hosts.push(host),
+            other => self.connections.push(other),
+        }
+        Ok(())
+    }
+
+    /// Replaces a saved connection, keeping its position when its protocol stays.
+    ///
+    /// A change from SSH to another protocol (or back) moves the record to the other
+    /// list, which is a different place in the document; the connection keeps its
+    /// identifier either way. Leaving SSH also drops the recency record, because a
+    /// history of SSH sign-ins is not a history of desktop sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BookError::UnknownHost`] when no connection with that identifier is
+    /// saved.
+    pub fn update_connection(
+        &mut self,
+        connection: ConnectionRecord,
+        id: HostId,
+    ) -> Result<(), BookError> {
+        let host_slot = self.hosts.iter().position(|host| host.id() == id);
+        let connection_slot = self.connections.iter().position(|saved| saved.id() == id);
+        if host_slot.is_none() && connection_slot.is_none() {
+            return Err(BookError::UnknownHost { id });
+        }
+        // The identifier is the connection's identity in the credential store and in
+        // the workspace, so a record that arrives under a different one would silently
+        // become a second connection. Refusing says which edit was wrong.
+        if connection.id() != id {
+            return Err(BookError::Inconsistent {
+                reason: format!(
+                    "the connection {} cannot replace {}, because they are different connections",
+                    connection.id(),
+                    id
+                ),
+            });
+        }
+        match connection {
+            ConnectionRecord::Ssh(host) => {
+                if let Some(slot) = host_slot {
+                    self.hosts[slot] = host;
+                } else {
+                    self.hosts.push(host);
+                }
+                if let Some(slot) = connection_slot {
+                    self.connections.remove(slot);
+                }
+            }
+            other => {
+                if let Some(slot) = connection_slot {
+                    self.connections[slot] = other;
+                } else {
+                    self.connections.push(other);
+                }
+                if let Some(slot) = host_slot {
+                    self.hosts.remove(slot);
+                    self.recents.retain(|recent| recent.host() != id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a saved connection of any protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BookError::UnknownHost`] when no connection with that identifier is
+    /// saved.
+    pub fn remove_connection(&mut self, id: HostId) -> Result<ConnectionRecord, BookError> {
+        if let Some(slot) = self.hosts.iter().position(|host| host.id() == id) {
+            self.recents.retain(|recent| recent.host() != id);
+            return Ok(ConnectionRecord::Ssh(self.hosts.remove(slot)));
+        }
+        if let Some(slot) = self
+            .connections
+            .iter()
+            .position(|connection| connection.id() == id)
+        {
+            return Ok(self.connections.remove(slot));
+        }
+        Err(BookError::UnknownHost { id })
+    }
+
+    /// Connections of any protocol matching a search phrase (R2).
+    ///
+    /// The phrase is matched the way the host list already matches it, and an SSH
+    /// connection is also found by the word "ssh"; a desktop or serial connection is
+    /// found by its protocol name and by what it would reach. An empty phrase keeps
+    /// every connection, so clearing the field restores the list.
+    #[must_use]
+    pub fn search_connections(&self, phrase: &str) -> Vec<ConnectionRecord> {
+        let phrase = phrase.trim().to_lowercase();
+        self.records()
+            .into_iter()
+            .filter(|connection| match connection {
+                ConnectionRecord::Ssh(host) => {
+                    host_matches(host, &phrase) || connection.matches(&phrase)
+                }
+                other => other.matches(&phrase),
+            })
+            .collect()
     }
 
     /// Records that a host was really reached.
@@ -521,6 +711,23 @@ impl HostBook {
                 return Err(format!(
                     "two hosts share the id {}, so the file is not a valid host book",
                     host.id()
+                ));
+            }
+        }
+        for connection in &self.connections {
+            // An SSH connection is a host: a file that lists one here asks this build
+            // to read the same record two ways, which it does not write and will not
+            // guess at.
+            if connection.protocol().is_ssh() {
+                return Err(format!(
+                    "the connection {} is stored as a non-SSH record, so the file is not one this build wrote",
+                    connection.id()
+                ));
+            }
+            if !ids.insert(connection.id()) {
+                return Err(format!(
+                    "two records share the id {}, so the file is not a valid host book",
+                    connection.id()
                 ));
             }
         }

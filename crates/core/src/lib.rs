@@ -57,12 +57,16 @@ pub use group::{
     MAX_GROUP_DEPTH, MAX_GROUP_SEGMENT_CHARS,
 };
 pub use host::{
-    DEFAULT_SSH_PORT, HostConfig, HostValidationError, JumpFault, Port, X11Forwarding,
-    connection_jump_fault, jump_faults,
+    ConnectionRecord, ConnectionValidationError, DEFAULT_RDP_PORT, DEFAULT_SERIAL_BAUD,
+    DEFAULT_SSH_PORT, DEFAULT_VNC_PORT, HostConfig, HostValidationError, JumpFault,
+    MAX_SERIAL_BAUD, MAX_SERIAL_DATA_BITS, MIN_SERIAL_BAUD, MIN_SERIAL_DATA_BITS, Port,
+    ProtocolKind, RdpCertificatePolicy, RdpConfig, SerialConfig, SerialFlow, SerialParity,
+    SerialStopBits, VncConfig, VncSecurity, X11Forwarding, connection_jump_fault, jump_faults,
 };
 pub use ids::{ForwardId, HostId, PaneId, SessionId, TabId, TransferId};
 pub use session::{
-    EventTag, Session, SessionFailure, SessionKind, SessionState, SessionTransitionError,
+    Capability, EventTag, Session, SessionCapabilities, SessionFailure, SessionKind, SessionState,
+    SessionTransitionError,
 };
 pub use shell::LocalShell;
 pub use snippet::{

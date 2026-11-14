@@ -22,9 +22,11 @@
 use std::collections::BTreeSet;
 
 use shellune_core::{
-    AuthMethodKind, ConnectionDefaults, ConnectionValueError, DEFAULT_KEEPALIVE_INTERVAL_SECS,
-    GroupBook, GroupPath, HostConfig, HostConnection, HostId, MAX_CONNECT_TIMEOUT_SECS,
-    MAX_KEEPALIVE_INTERVAL_SECS, MAX_KEEPALIVE_MAX_MISSES, Port, TransferProtocol, X11Forwarding,
+    AuthMethodKind, ConnectionDefaults, ConnectionRecord, ConnectionValueError,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, GroupBook, GroupPath, HostConfig, HostConnection, HostId,
+    MAX_CONNECT_TIMEOUT_SECS, MAX_KEEPALIVE_INTERVAL_SECS, MAX_KEEPALIVE_MAX_MISSES, Port,
+    ProtocolKind, RdpCertificatePolicy, RdpConfig, SerialConfig, SerialFlow, SerialParity,
+    SerialStopBits, TransferProtocol, VncConfig, VncSecurity, X11Forwarding,
 };
 use shellune_storage::{
     DEFAULT_CONFIG_TEXT, HostBook, HostEdit, ImportOutcome, ImportPlan, ImportPreview,
@@ -1012,6 +1014,19 @@ impl HostDraft {
     /// Returns the reason the domain rejected the values: an empty name, address or
     /// user, an address with whitespace, or a port outside `1..=65535`. The text is
     /// not changed, so the user can correct the field that was refused.
+    /// Turns this form into a copy of a saved host (R9).
+    ///
+    /// The copy keeps every editable field, gets the name the caller chose, and holds
+    /// no identifier, so saving it creates a new record. Nothing here carries a
+    /// credential: the copy's identifier is one the credential store has never seen,
+    /// and the field a secret would be typed into starts empty.
+    pub fn rename_for_copy(&mut self, name: &str) {
+        self.editing = None;
+        self.name = name.to_owned();
+        self.has_saved_secret = false;
+        self.secret.clear();
+    }
+
     pub fn build(&self, existing: Option<&HostConfig>) -> Result<HostEdit, String> {
         let port = parse_port(&self.port)?;
         match existing {
@@ -1208,6 +1223,11 @@ pub struct HostsPanel {
     view: HostView,
     search: String,
     draft: Option<HostDraft>,
+    /// The form of a connection whose protocol is not SSH (R2, R18).
+    ///
+    /// One of the two drafts is open at a time: the SSH form is the one this build
+    /// already had, and the other protocols have their own fields.
+    protocol_draft: Option<ProtocolDraft>,
     pending_delete: Option<HostId>,
     message: Option<HostsMessage>,
     /// The group and status the list is narrowed to, beside the search phrase.
@@ -1286,6 +1306,7 @@ impl HostsPanel {
 
     pub fn open_create(&mut self) {
         self.draft = Some(HostDraft::create());
+        self.protocol_draft = None;
         self.pending_delete = None;
         self.clear_message();
     }
@@ -1293,13 +1314,104 @@ impl HostsPanel {
     /// Opens the form filled with a saved host.
     pub fn open_edit(&mut self, host: &HostConfig) {
         self.draft = Some(HostDraft::edit(host));
+        self.protocol_draft = None;
         self.pending_delete = None;
         self.clear_message();
+    }
+
+    /// The open connection form, if any.
+    #[must_use]
+    pub fn protocol_draft(&self) -> Option<&ProtocolDraft> {
+        self.protocol_draft.as_ref()
+    }
+
+    /// The open connection form, for the fields to write into.
+    pub fn protocol_draft_mut(&mut self) -> Option<&mut ProtocolDraft> {
+        self.protocol_draft.as_mut()
+    }
+
+    /// Whether a form for a connection of another protocol is open.
+    #[must_use]
+    pub fn is_editing_connection(&self) -> bool {
+        self.protocol_draft.is_some()
+    }
+
+    /// Opens the form filled with a saved connection.
+    pub fn open_connection_edit(&mut self, record: &ConnectionRecord) {
+        self.protocol_draft = Some(ProtocolDraft::edit(record));
+        self.draft = None;
+        self.pending_delete = None;
+        self.clear_message();
+    }
+
+    /// Opens a copy of a saved connection as a new one (R9).
+    ///
+    /// The copy has a fresh identifier, no saved credential and no sign-in history; an
+    /// SSH copy also drops any jump that named the copy itself.
+    pub fn open_connection_copy(&mut self, record: &ConnectionRecord, suffix: &str) {
+        let copy = record.duplicated();
+        let name = format!("{}{suffix}", copy.name());
+        match &copy {
+            ConnectionRecord::Ssh(host) => {
+                let mut draft = HostDraft::edit(host);
+                draft.rename_for_copy(&name);
+                self.draft = Some(draft);
+                self.protocol_draft = None;
+            }
+            other => {
+                let mut draft = ProtocolDraft::edit(other);
+                draft.rename_for_copy(&name);
+                self.protocol_draft = Some(draft);
+                self.draft = None;
+            }
+        }
+        self.pending_delete = None;
+        self.clear_message();
+    }
+
+    /// Switches the open form to another protocol, keeping the name and group typed.
+    ///
+    /// A protocol decides which fields exist, so changing it builds the form for the
+    /// new one instead of hiding fields the old one had.
+    pub fn switch_protocol(&mut self, protocol: ProtocolKind) {
+        let name = match (&self.draft, &self.protocol_draft) {
+            (Some(draft), _) => draft.text(HostField::Name).to_owned(),
+            (None, Some(draft)) => draft.text(ConnectionFormField::Name).to_owned(),
+            (None, None) => String::new(),
+        };
+        let group = match (&self.draft, &self.protocol_draft) {
+            (Some(draft), _) => draft.text(HostField::Group).to_owned(),
+            (None, Some(draft)) => draft.text(ConnectionFormField::Group).to_owned(),
+            (None, None) => String::new(),
+        };
+        match protocol {
+            ProtocolKind::Ssh => {
+                let mut draft = HostDraft::create();
+                draft.set_text(HostField::Name, name);
+                draft.set_text(HostField::Group, group);
+                self.draft = Some(draft);
+                self.protocol_draft = None;
+            }
+            other => {
+                let mut draft = ProtocolDraft::create(other);
+                draft.set_text(ConnectionFormField::Name, name);
+                draft.set_text(ConnectionFormField::Group, group);
+                self.protocol_draft = Some(draft);
+                self.draft = None;
+            }
+        }
+        self.clear_message();
+    }
+
+    /// Closes a connection form, keeping what was typed out of the records.
+    pub fn close_connection_editor(&mut self) {
+        self.protocol_draft = None;
     }
 
     /// Closes the form, keeping what was typed out of the records.
     pub fn close_editor(&mut self) {
         self.draft = None;
+        self.protocol_draft = None;
     }
 
     /// The host the user is about to delete.
@@ -1524,7 +1636,34 @@ impl HostsPanel {
                 self.push_tree(&mut rows, book, groups, &kept, narrow_search);
             }
         }
-        HostList { rows, matched, all }
+        // The connections of another protocol are listed after the hosts. The recent
+        // view is a sign-in history, and one of them has no history to be found in.
+        let connections: Vec<HostId> = match self.view {
+            HostView::Recent => Vec::new(),
+            HostView::All | HostView::Groups => {
+                let searched: BTreeSet<HostId> = book
+                    .search_connections(&self.search)
+                    .iter()
+                    .map(ConnectionRecord::id)
+                    .collect();
+                book.connections()
+                    .iter()
+                    .filter(|record| self.matches_connection(record, &searched, open))
+                    .map(ConnectionRecord::id)
+                    .collect()
+            }
+        };
+        for id in &connections {
+            rows.push(HostListRow::Connection(ConnectionRow { id: *id }));
+        }
+        let saved_connections = book.connections().len();
+        HostList {
+            rows,
+            matched,
+            all,
+            connections,
+            saved_connections,
+        }
     }
 
     /// The group tree on its own, whatever view the list is in (R4, R18).
@@ -1555,7 +1694,7 @@ impl HostsPanel {
         rows.into_iter()
             .filter_map(|row| match row {
                 HostListRow::Group(group) => Some(group),
-                HostListRow::Host(_) => None,
+                HostListRow::Host(_) | HostListRow::Connection(_) => None,
             })
             .collect()
     }
@@ -1694,6 +1833,36 @@ impl HostsPanel {
         open: &dyn Fn(HostId) -> bool,
     ) -> bool {
         host_matches(host, &self.search) && self.matches_status(book, host, open)
+    }
+
+    /// Whether one connection of another protocol survives the search and the filters.
+    ///
+    /// The phrase is matched against the name, the protocol and what the connection
+    /// would reach, which is what makes "rdp" or "10.0.0.9:3389" find the same row. The
+    /// status filter keeps its SSH meaning: a connection of another protocol has no
+    /// sign-in history yet, so it is only ever "never connected".
+    fn matches_connection(
+        &self,
+        record: &ConnectionRecord,
+        searched: &BTreeSet<HostId>,
+        open: &dyn Fn(HostId) -> bool,
+    ) -> bool {
+        // The phrase is matched by the book, which is the one matcher over names,
+        // protocols and targets; this list only applies it to the records it draws.
+        if !searched.contains(&record.id()) {
+            return false;
+        }
+        if let Some(wanted) = &self.filter.group {
+            match record.group_path() {
+                Some(path) if path.starts_with(wanted) => {}
+                _ => return false,
+            }
+        }
+        match self.filter.status {
+            HostStatusFilter::Any | HostStatusFilter::NeverConnected => true,
+            HostStatusFilter::Connected => open(record.id()),
+            HostStatusFilter::Recent => false,
+        }
     }
 
     /// Whether one host survives the status filter.
@@ -2123,13 +2292,25 @@ pub struct HostRow {
     pub id: HostId,
 }
 
+/// One saved connection whose protocol is not SSH, in the flattened list (R2, R18).
+///
+/// The row carries the identifier only: name, protocol and what the connection would
+/// reach are read from the book, so a row can never show a stale copy of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionRow {
+    /// The saved connection, by identifier.
+    pub id: HostId,
+}
+
 /// One row of the list the window draws.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostListRow {
     /// A group header, which opens and closes its branch.
     Group(HostGroupRow),
-    /// A saved host.
+    /// A saved SSH host.
     Host(HostRow),
+    /// A saved connection of another protocol.
+    Connection(ConnectionRow),
 }
 
 /// The flattened list: the rows to draw and the hosts the filters keep.
@@ -2138,6 +2319,14 @@ pub struct HostList {
     rows: Vec<HostListRow>,
     matched: Vec<HostId>,
     all: Vec<HostId>,
+    /// The connections of another protocol the filters keep, in saved order.
+    ///
+    /// Kept apart from «matched» because a selection, a group move and a batch target
+    /// are SSH operations: only a host may be one of those, and a desktop connection
+    /// is only listed and edited.
+    connections: Vec<HostId>,
+    /// How many connections of another protocol are saved at all.
+    saved_connections: usize,
 }
 
 impl HostList {
@@ -2162,16 +2351,16 @@ impl HostList {
         self.rows.is_empty()
     }
 
-    /// How many hosts survive the current search and filters.
+    /// How many rows the current search and filters keep: hosts and connections.
     #[must_use]
     pub fn matched_len(&self) -> usize {
-        self.matched.len()
+        self.matched.len() + self.connections.len()
     }
 
-    /// How many hosts are saved.
+    /// How many saved records the list is drawn from: hosts and connections.
     #[must_use]
     pub fn total(&self) -> usize {
-        self.all.len()
+        self.all.len() + self.saved_connections
     }
 
     /// The hosts one scope covers.
@@ -2457,10 +2646,942 @@ fn hosts_under(book: &HostBook, kept: &BTreeSet<HostId>, path: &GroupPath) -> Ve
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// The form of a connection that is not an SSH host (R2, R18)
+// ---------------------------------------------------------------------------
+//
+// A protocol decides which fields exist. The SSH form keeps the fields it already had,
+// jumps and forwarding included; a desktop or serial connection has its own, and none
+// of the SSH-only ones appear for it.
+
+/// One field of a connection form whose protocol is not SSH.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionFormField {
+    /// The display name.
+    Name,
+    /// The optional group path.
+    Group,
+    /// The address a desktop connection dials.
+    Address,
+    /// The TCP port of a desktop connection.
+    Port,
+    /// The user a RDP connection signs in as.
+    User,
+    /// The Windows domain that user belongs to.
+    Domain,
+    /// What a RDP connection does with an untrusted certificate.
+    Certificate,
+    /// How much a VNC connection insists on encryption.
+    Security,
+    /// The device a serial connection opens.
+    Device,
+    /// The line speed.
+    Baud,
+    /// How many data bits one frame carries.
+    DataBits,
+    /// How a frame carries parity.
+    Parity,
+    /// How many stop bits end a frame.
+    StopBits,
+    /// How the port paces its bytes.
+    Flow,
+    /// Whether typed characters are echoed locally.
+    LocalEcho,
+}
+
+impl ConnectionFormField {
+    /// Every field, once.
+    ///
+    /// Used by the tests that check each field has its own selector and that a protocol
+    /// shows only the fields it has; the forms are built from
+    /// [`Self::of_protocol`], which is why nothing outside a test asks for this list.
+    #[cfg(test)]
+    pub const ALL: [Self; 15] = [
+        Self::Name,
+        Self::Group,
+        Self::Address,
+        Self::Port,
+        Self::User,
+        Self::Domain,
+        Self::Certificate,
+        Self::Security,
+        Self::Device,
+        Self::Baud,
+        Self::DataBits,
+        Self::Parity,
+        Self::StopBits,
+        Self::Flow,
+        Self::LocalEcho,
+    ];
+
+    /// Every field of one protocol, in form order.
+    #[must_use]
+    pub fn of_protocol(protocol: ProtocolKind) -> &'static [Self] {
+        match protocol {
+            // SSH has the form this build already had, so it is not described here.
+            ProtocolKind::Ssh => &[],
+            ProtocolKind::Rdp => &[
+                Self::Address,
+                Self::Port,
+                Self::User,
+                Self::Domain,
+                Self::Certificate,
+                Self::Name,
+                Self::Group,
+            ],
+            ProtocolKind::Vnc => &[
+                Self::Address,
+                Self::Port,
+                Self::Security,
+                Self::Name,
+                Self::Group,
+            ],
+            ProtocolKind::Serial => &[
+                Self::Device,
+                Self::Baud,
+                Self::DataBits,
+                Self::Parity,
+                Self::StopBits,
+                Self::Flow,
+                Self::LocalEcho,
+                Self::Name,
+                Self::Group,
+            ],
+        }
+    }
+
+    /// Label shown in front of the field.
+    #[must_use]
+    pub fn label(self, strings: &Strings) -> &'static str {
+        match self {
+            Self::Name => strings.host_field_name,
+            Self::Group => strings.host_field_group,
+            Self::Address => strings.host_field_address,
+            Self::Port => strings.host_field_port,
+            Self::User => strings.host_field_user,
+            Self::Domain => strings.connection_field_domain,
+            Self::Certificate => strings.connection_field_certificate,
+            Self::Security => strings.connection_field_security,
+            Self::Device => strings.connection_field_device,
+            Self::Baud => strings.connection_field_baud,
+            Self::DataBits => strings.connection_field_data_bits,
+            Self::Parity => strings.connection_field_parity,
+            Self::StopBits => strings.connection_field_stop_bits,
+            Self::Flow => strings.connection_field_flow,
+            Self::LocalEcho => strings.connection_field_local_echo,
+        }
+    }
+
+    /// Debug selector of the field, used by the tests.
+    #[must_use]
+    pub fn debug_selector(self) -> &'static str {
+        match self {
+            Self::Name => "connection.field.name",
+            Self::Group => "connection.field.group",
+            Self::Address => "connection.field.address",
+            Self::Port => "connection.field.port",
+            Self::User => "connection.field.user",
+            Self::Domain => "connection.field.domain",
+            Self::Certificate => "connection.field.certificate",
+            Self::Security => "connection.field.security",
+            Self::Device => "connection.field.device",
+            Self::Baud => "connection.field.baud",
+            Self::DataBits => "connection.field.data_bits",
+            Self::Parity => "connection.field.parity",
+            Self::StopBits => "connection.field.stop_bits",
+            Self::Flow => "connection.field.flow",
+            Self::LocalEcho => "connection.field.local_echo",
+        }
+    }
+
+    /// Whether the field is typed into, as opposed to chosen from a fixed set.
+    #[must_use]
+    pub fn is_text(self) -> bool {
+        matches!(
+            self,
+            Self::Name
+                | Self::Group
+                | Self::Address
+                | Self::Port
+                | Self::User
+                | Self::Domain
+                | Self::Device
+                | Self::Baud
+                | Self::DataBits
+        )
+    }
+}
+
+/// A connection form built for the protocol it names.
+///
+/// Values stay text until the form is saved, so a port or a baud rate the domain
+/// refuses is still visible in the field that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtocolDraft {
+    protocol: ProtocolKind,
+    editing: Option<HostId>,
+    name: String,
+    group: String,
+    address: String,
+    port: String,
+    user: String,
+    domain: String,
+    certificate: RdpCertificatePolicy,
+    security: VncSecurity,
+    device: String,
+    baud: String,
+    data_bits: String,
+    parity: SerialParity,
+    stop_bits: SerialStopBits,
+    flow: SerialFlow,
+    local_echo: bool,
+    remember: bool,
+}
+
+impl ProtocolDraft {
+    /// An empty form for a new connection of one protocol.
+    #[must_use]
+    pub fn create(protocol: ProtocolKind) -> Self {
+        let port = protocol
+            .default_port()
+            .map(|port| port.to_string())
+            .unwrap_or_default();
+        Self {
+            protocol,
+            editing: None,
+            name: String::new(),
+            group: String::new(),
+            address: String::new(),
+            port,
+            user: String::new(),
+            domain: String::new(),
+            certificate: RdpCertificatePolicy::default(),
+            security: VncSecurity::default(),
+            device: String::new(),
+            baud: shellune_core::DEFAULT_SERIAL_BAUD.to_string(),
+            data_bits: shellune_core::MAX_SERIAL_DATA_BITS.to_string(),
+            parity: SerialParity::default(),
+            stop_bits: SerialStopBits::default(),
+            flow: SerialFlow::default(),
+            local_echo: false,
+            // The form has no credential field: a password is asked for when the
+            // session is started, so nothing here claims the store already holds one.
+            remember: false,
+        }
+    }
+
+    /// A form filled with a saved connection.
+    ///
+    /// # Panics
+    ///
+    /// Never: an SSH record has the host form, so it is not passed here. The fallback
+    /// keeps that rule from becoming a panic in the window.
+    #[must_use]
+    pub fn edit(record: &ConnectionRecord) -> Self {
+        match record {
+            ConnectionRecord::Rdp(config) => {
+                let mut draft = Self::create(ProtocolKind::Rdp);
+                draft.editing = Some(config.id());
+                draft.name = config.name().to_owned();
+                draft.group = config
+                    .group_path()
+                    .map(|path| path.to_string())
+                    .or_else(|| config.group().map(str::to_owned))
+                    .unwrap_or_default();
+                draft.address = config.address().to_owned();
+                draft.port = config.port().to_string();
+                draft.user = config.user().unwrap_or_default().to_owned();
+                draft.domain = config.domain().unwrap_or_default().to_owned();
+                draft.certificate = config.certificate();
+                draft.remember = config.remembers_secret();
+                draft
+            }
+            ConnectionRecord::Vnc(config) => {
+                let mut draft = Self::create(ProtocolKind::Vnc);
+                draft.editing = Some(config.id());
+                draft.name = config.name().to_owned();
+                draft.group = config
+                    .group_path()
+                    .map(|path| path.to_string())
+                    .or_else(|| config.group().map(str::to_owned))
+                    .unwrap_or_default();
+                draft.address = config.address().to_owned();
+                draft.port = config.port().to_string();
+                draft.security = config.security();
+                draft.remember = config.remembers_secret();
+                draft
+            }
+            ConnectionRecord::Serial(config) => {
+                let mut draft = Self::create(ProtocolKind::Serial);
+                draft.editing = Some(config.id());
+                draft.name = config.name().to_owned();
+                draft.group = config
+                    .group_path()
+                    .map(|path| path.to_string())
+                    .or_else(|| config.group().map(str::to_owned))
+                    .unwrap_or_default();
+                draft.device = config.device().to_owned();
+                draft.baud = config.baud().to_string();
+                draft.data_bits = config.data_bits().to_string();
+                draft.parity = config.parity();
+                draft.stop_bits = config.stop_bits();
+                draft.flow = config.flow();
+                draft.local_echo = config.local_echo();
+                draft
+            }
+            ConnectionRecord::Ssh(host) => {
+                let mut draft = Self::create(ProtocolKind::Serial);
+                draft.editing = Some(host.id());
+                draft.name = host.name().to_owned();
+                draft
+            }
+        }
+    }
+
+    /// Which protocol this form is for.
+    #[must_use]
+    pub fn protocol(&self) -> ProtocolKind {
+        self.protocol
+    }
+
+    /// The record being edited, when the form was opened on one.
+    #[must_use]
+    pub fn editing(&self) -> Option<HostId> {
+        self.editing
+    }
+
+    /// The fields this protocol has, in form order.
+    #[must_use]
+    pub fn fields(&self) -> &'static [ConnectionFormField] {
+        ConnectionFormField::of_protocol(self.protocol)
+    }
+
+    /// The text of one typed field.
+    #[must_use]
+    pub fn text(&self, field: ConnectionFormField) -> &str {
+        match field {
+            ConnectionFormField::Name => &self.name,
+            ConnectionFormField::Group => &self.group,
+            ConnectionFormField::Address => &self.address,
+            ConnectionFormField::Port => &self.port,
+            ConnectionFormField::User => &self.user,
+            ConnectionFormField::Domain => &self.domain,
+            ConnectionFormField::Device => &self.device,
+            ConnectionFormField::Baud => &self.baud,
+            ConnectionFormField::DataBits => &self.data_bits,
+            ConnectionFormField::Certificate
+            | ConnectionFormField::Security
+            | ConnectionFormField::Parity
+            | ConnectionFormField::StopBits
+            | ConnectionFormField::Flow
+            | ConnectionFormField::LocalEcho => "",
+        }
+    }
+
+    /// Writes the text of one typed field, returning whether it changed.
+    pub fn set_text(&mut self, field: ConnectionFormField, text: impl Into<String>) -> bool {
+        let text = text.into();
+        let slot = match field {
+            ConnectionFormField::Name => &mut self.name,
+            ConnectionFormField::Group => &mut self.group,
+            ConnectionFormField::Address => &mut self.address,
+            ConnectionFormField::Port => &mut self.port,
+            ConnectionFormField::User => &mut self.user,
+            ConnectionFormField::Domain => &mut self.domain,
+            ConnectionFormField::Device => &mut self.device,
+            ConnectionFormField::Baud => &mut self.baud,
+            ConnectionFormField::DataBits => &mut self.data_bits,
+            ConnectionFormField::Certificate
+            | ConnectionFormField::Security
+            | ConnectionFormField::Parity
+            | ConnectionFormField::StopBits
+            | ConnectionFormField::Flow
+            | ConnectionFormField::LocalEcho => return false,
+        };
+        if *slot == text {
+            return false;
+        }
+        *slot = text;
+        true
+    }
+
+    /// The certificate policy the form holds.
+    #[must_use]
+    pub fn certificate(&self) -> RdpCertificatePolicy {
+        self.certificate
+    }
+
+    /// Chooses the certificate policy.
+    pub fn set_certificate(&mut self, policy: RdpCertificatePolicy) -> bool {
+        if self.certificate == policy {
+            return false;
+        }
+        self.certificate = policy;
+        true
+    }
+
+    /// The security policy the form holds.
+    #[must_use]
+    pub fn security(&self) -> VncSecurity {
+        self.security
+    }
+
+    /// Chooses the security policy.
+    pub fn set_security(&mut self, security: VncSecurity) -> bool {
+        if self.security == security {
+            return false;
+        }
+        self.security = security;
+        true
+    }
+
+    /// The parity the form holds.
+    #[must_use]
+    pub fn parity(&self) -> SerialParity {
+        self.parity
+    }
+
+    /// Chooses the parity.
+    pub fn set_parity(&mut self, parity: SerialParity) -> bool {
+        if self.parity == parity {
+            return false;
+        }
+        self.parity = parity;
+        true
+    }
+
+    /// The number of stop bits the form holds.
+    #[must_use]
+    pub fn stop_bits(&self) -> SerialStopBits {
+        self.stop_bits
+    }
+
+    /// Chooses the number of stop bits.
+    pub fn set_stop_bits(&mut self, stop_bits: SerialStopBits) -> bool {
+        if self.stop_bits == stop_bits {
+            return false;
+        }
+        self.stop_bits = stop_bits;
+        true
+    }
+
+    /// The flow control the form holds.
+    #[must_use]
+    pub fn flow(&self) -> SerialFlow {
+        self.flow
+    }
+
+    /// Chooses the flow control.
+    pub fn set_flow(&mut self, flow: SerialFlow) -> bool {
+        if self.flow == flow {
+            return false;
+        }
+        self.flow = flow;
+        true
+    }
+
+    /// Whether typed characters would be echoed locally.
+    #[must_use]
+    pub fn local_echo(&self) -> bool {
+        self.local_echo
+    }
+
+    /// Chooses whether typed characters are echoed locally.
+    pub fn set_local_echo(&mut self, echo: bool) -> bool {
+        if self.local_echo == echo {
+            return false;
+        }
+        self.local_echo = echo;
+        true
+    }
+
+    /// Turns this form into a copy of a saved connection (R9).
+    pub fn rename_for_copy(&mut self, name: &str) {
+        self.editing = None;
+        self.name = name.to_owned();
+    }
+
+    /// The record this form would save, or the reason it cannot be saved.
+    ///
+    /// Nothing is dialled, opened or written here: this builds the record the caller
+    /// stores, and the connection it describes is still something the user has to start.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sentence of the domain that refused a field, so the dialog keeps what
+    /// was typed and names the field to change.
+    pub fn build(&self) -> Result<ConnectionEdit, String> {
+        let group = group_path_from_text(&self.group)?;
+        let protocol = self.protocol;
+        let name = self.name.trim();
+        let record = match protocol {
+            ProtocolKind::Rdp => {
+                let address = self.address.trim();
+                let name = default_name(name, address);
+                let mut config = RdpConfig::new(name, address, Some(self.user.trim()))
+                    .map_err(|error| error.to_string())?;
+                config
+                    .set_port(parse_port(&self.port)?.get().into())
+                    .map_err(|error| error.to_string())?;
+                let domain = self.domain.trim();
+                config.set_domain((!domain.is_empty()).then_some(domain.to_owned()));
+                config.set_certificate(self.certificate);
+                config.set_remember_secret(self.remember);
+                ConnectionRecord::Rdp(config)
+            }
+            ProtocolKind::Vnc => {
+                let address = self.address.trim();
+                let name = default_name(name, address);
+                let mut config =
+                    VncConfig::new(name, address).map_err(|error| error.to_string())?;
+                config
+                    .set_port(parse_port(&self.port)?.get().into())
+                    .map_err(|error| error.to_string())?;
+                config.set_security(self.security);
+                config.set_remember_secret(self.remember);
+                ConnectionRecord::Vnc(config)
+            }
+            ProtocolKind::Serial => {
+                let device = self.device.trim();
+                let name = default_name(name, device);
+                let mut config =
+                    SerialConfig::new(name, device).map_err(|error| error.to_string())?;
+                config
+                    .set_baud(parse_baud(&self.baud)?)
+                    .map_err(|error| error.to_string())?;
+                config
+                    .set_data_bits(parse_data_bits(&self.data_bits)?)
+                    .map_err(|error| error.to_string())?;
+                config.set_parity(self.parity);
+                config.set_stop_bits(self.stop_bits);
+                config.set_flow(self.flow);
+                config.set_local_echo(self.local_echo);
+                ConnectionRecord::Serial(config)
+            }
+            ProtocolKind::Ssh => {
+                return Err("an SSH connection is edited as a host".to_owned());
+            }
+        };
+        let record = match group {
+            Some(path) => match record {
+                ConnectionRecord::Rdp(mut config) => {
+                    config.set_group_path(Some(path));
+                    ConnectionRecord::Rdp(config)
+                }
+                ConnectionRecord::Vnc(mut config) => {
+                    config.set_group_path(Some(path));
+                    ConnectionRecord::Vnc(config)
+                }
+                ConnectionRecord::Serial(mut config) => {
+                    config.set_group_path(Some(path));
+                    ConnectionRecord::Serial(config)
+                }
+                ssh => ssh,
+            },
+            None => record,
+        };
+        // The identifier belongs to the record it was opened on, so an edit keeps the
+        // identity the credential store and the workspace already know.
+        let record = match self.editing {
+            Some(id) => record.reidentified(id),
+            None => record,
+        };
+        Ok(ConnectionEdit {
+            record,
+            replaces: self.editing,
+        })
+    }
+}
+
+/// The name a blank field falls back to, which is what the connection reaches.
+fn default_name(name: &str, target: &str) -> String {
+    if name.is_empty() {
+        target.to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Reads a line speed, refusing anything the platform could not be asked for.
+fn parse_baud(text: &str) -> Result<u32, String> {
+    let text = text.trim();
+    let value: u32 = text
+        .parse()
+        .map_err(|_| format!("{text} is not a baud rate; use 50-4000000"))?;
+    if !(shellune_core::MIN_SERIAL_BAUD..=shellune_core::MAX_SERIAL_BAUD).contains(&value) {
+        return Err(format!(
+            "{value} is outside the range 50-4000000 this build accepts"
+        ));
+    }
+    Ok(value)
+}
+
+/// Reads how many data bits one frame carries.
+fn parse_data_bits(text: &str) -> Result<u8, String> {
+    let text = text.trim();
+    let value: u8 = text
+        .parse()
+        .map_err(|_| format!("{text} is not a number of data bits; use 5-8"))?;
+    if !(shellune_core::MIN_SERIAL_DATA_BITS..=shellune_core::MAX_SERIAL_DATA_BITS).contains(&value)
+    {
+        return Err(format!(
+            "{value} is outside the range 5-8 this build accepts"
+        ));
+    }
+    Ok(value)
+}
+
+/// One change to the saved connections, before it is stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionEdit {
+    record: ConnectionRecord,
+    replaces: Option<HostId>,
+}
+
+impl ConnectionEdit {
+    /// The record to store.
+    #[must_use]
+    pub fn record(&self) -> &ConnectionRecord {
+        &self.record
+    }
+
+    /// The connection this one replaces, when the form was opened on a saved one.
+    #[must_use]
+    pub fn replaces(&self) -> Option<HostId> {
+        self.replaces
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Connections of another protocol (R2, R9, R18)
+    // -----------------------------------------------------------------------
+
+    fn rdp_record(name: &str, address: &str, user: &str) -> ConnectionRecord {
+        let mut config = RdpConfig::new(name, address, Some(user)).expect("a valid RDP record");
+        config.set_domain(Some("CORP"));
+        ConnectionRecord::Rdp(config)
+    }
+
+    fn serial_record(name: &str, device: &str) -> ConnectionRecord {
+        ConnectionRecord::Serial(SerialConfig::new(name, device).expect("a valid serial record"))
+    }
+
+    #[test]
+    fn a_protocol_form_shows_only_the_fields_its_protocol_has() {
+        let ssh = ConnectionFormField::of_protocol(ProtocolKind::Ssh);
+        assert!(
+            ssh.is_empty(),
+            "an SSH connection keeps the host form this build already had"
+        );
+
+        let rdp = ConnectionFormField::of_protocol(ProtocolKind::Rdp);
+        assert!(rdp.contains(&ConnectionFormField::Domain));
+        assert!(rdp.contains(&ConnectionFormField::Certificate));
+        for withheld in [
+            ConnectionFormField::Device,
+            ConnectionFormField::Baud,
+            ConnectionFormField::Parity,
+            ConnectionFormField::Security,
+        ] {
+            assert!(!rdp.contains(&withheld), "RDP has no {withheld:?}");
+        }
+
+        let vnc = ConnectionFormField::of_protocol(ProtocolKind::Vnc);
+        assert!(vnc.contains(&ConnectionFormField::Security));
+        for withheld in [
+            ConnectionFormField::User,
+            ConnectionFormField::Domain,
+            ConnectionFormField::Certificate,
+            ConnectionFormField::Device,
+        ] {
+            assert!(!vnc.contains(&withheld), "VNC has no {withheld:?}");
+        }
+
+        let serial = ConnectionFormField::of_protocol(ProtocolKind::Serial);
+        for field in [
+            ConnectionFormField::Device,
+            ConnectionFormField::Baud,
+            ConnectionFormField::DataBits,
+            ConnectionFormField::Parity,
+            ConnectionFormField::StopBits,
+            ConnectionFormField::Flow,
+            ConnectionFormField::LocalEcho,
+        ] {
+            assert!(serial.contains(&field), "serial offers {field:?}");
+        }
+        for withheld in [
+            ConnectionFormField::Address,
+            ConnectionFormField::Port,
+            ConnectionFormField::Certificate,
+            ConnectionFormField::Security,
+        ] {
+            assert!(
+                !serial.contains(&withheld),
+                "a serial port has no {withheld:?}"
+            );
+        }
+
+        // A selector is what the tests and the manifest point at, so two fields cannot
+        // share one.
+        let mut selectors: Vec<&str> = ConnectionFormField::ALL
+            .iter()
+            .map(|field| field.debug_selector())
+            .collect();
+        selectors.sort_unstable();
+        let count = selectors.len();
+        selectors.dedup();
+        assert_eq!(selectors.len(), count, "every field has its own selector");
+    }
+
+    #[test]
+    fn a_desktop_form_builds_a_record_with_its_own_fields() {
+        let mut draft = ProtocolDraft::create(ProtocolKind::Rdp);
+        assert_eq!(
+            draft.text(ConnectionFormField::Port),
+            "3389",
+            "a new RDP connection starts on the port the protocol uses"
+        );
+        draft.set_text(ConnectionFormField::Address, "10.0.0.9");
+        draft.set_text(ConnectionFormField::User, "alice");
+        draft.set_text(ConnectionFormField::Domain, "CORP");
+        draft.set_text(ConnectionFormField::Group, "Prod/East");
+        assert!(draft.set_certificate(RdpCertificatePolicy::Reject));
+
+        let edit = draft.build().expect("a valid RDP connection");
+        assert_eq!(edit.replaces(), None, "a new connection replaces nothing");
+        let ConnectionRecord::Rdp(config) = edit.record() else {
+            panic!("the form built the protocol it was opened for");
+        };
+        assert_eq!(config.name(), "10.0.0.9", "a blank name is what it reaches");
+        assert_eq!(config.address(), "10.0.0.9");
+        assert_eq!(config.user(), Some("alice"));
+        assert_eq!(config.domain(), Some("CORP"));
+        assert_eq!(config.certificate(), RdpCertificatePolicy::Reject);
+        assert_eq!(config.port().get(), 3389);
+        assert_eq!(
+            config.group_path().map(|path| path.to_string()),
+            Some("Prod/East".to_owned())
+        );
+        assert!(edit.record().as_ssh().is_none(), "it is not an SSH host");
+    }
+
+    #[test]
+    fn a_serial_form_refuses_a_value_the_device_cannot_use() {
+        let mut draft = ProtocolDraft::create(ProtocolKind::Serial);
+        assert_eq!(draft.text(ConnectionFormField::Baud), "115200");
+        draft.set_text(ConnectionFormField::Device, "COM3");
+        draft.set_text(ConnectionFormField::Baud, "10");
+        let reason = draft.build().expect_err("ten baud is not a line speed");
+        assert!(reason.contains("10"), "{reason}");
+
+        draft.set_text(ConnectionFormField::Baud, "9600");
+        draft.set_text(ConnectionFormField::DataBits, "9");
+        assert!(draft.build().is_err(), "nine data bits do not exist");
+
+        draft.set_text(ConnectionFormField::DataBits, "7");
+        assert!(draft.set_parity(SerialParity::Even));
+        assert!(draft.set_stop_bits(SerialStopBits::Two));
+        assert!(draft.set_flow(SerialFlow::Hardware));
+        assert!(draft.set_local_echo(true));
+        let edit = draft.build().expect("a usable frame");
+        let ConnectionRecord::Serial(config) = edit.record() else {
+            panic!("the form built the protocol it was opened for");
+        };
+        assert_eq!(config.device(), "COM3");
+        assert_eq!(config.baud(), 9_600);
+        assert_eq!(config.data_bits(), 7);
+        assert_eq!(config.frame(), "7E2");
+        assert_eq!(config.flow(), SerialFlow::Hardware);
+        assert!(config.local_echo());
+        assert_eq!(config.name(), "COM3");
+    }
+
+    #[test]
+    fn editing_a_connection_keeps_its_identifier_and_a_copy_does_not() {
+        let saved = rdp_record("Office", "10.0.0.9", "alice");
+        let id = saved.id();
+        let mut draft = ProtocolDraft::edit(&saved);
+        assert_eq!(draft.editing(), Some(id));
+        assert_eq!(draft.text(ConnectionFormField::Domain), "CORP");
+        draft.set_text(ConnectionFormField::Address, "10.0.0.10");
+        let edit = draft.build().expect("a valid edit");
+        assert_eq!(edit.replaces(), Some(id));
+        assert_eq!(edit.record().id(), id, "the identity survives an edit");
+
+        draft.rename_for_copy("Office (copy)");
+        assert_eq!(draft.editing(), None, "a copy is a new record");
+        assert_eq!(draft.text(ConnectionFormField::Name), "Office (copy)");
+        let copy = draft.build().expect("a valid copy").record().clone();
+        assert_ne!(copy.id(), id);
+        assert_eq!(copy.name(), "Office (copy)");
+    }
+
+    #[test]
+    fn a_copied_connection_comes_back_as_a_form_for_a_new_record() {
+        let mut book = HostBook::new();
+        let saved = serial_record("Console", "COM3");
+        book.insert_connection(saved.clone()).expect("inserted");
+        let mut panel = HostsPanel::new();
+
+        panel.open_connection_copy(&saved, " (copy)");
+        let draft = panel
+            .protocol_draft()
+            .expect("the copy opens the protocol form");
+        assert_eq!(draft.protocol(), ProtocolKind::Serial);
+        assert_eq!(draft.editing(), None, "saving writes a new connection");
+        assert_eq!(draft.text(ConnectionFormField::Name), "Console (copy)");
+        assert_eq!(draft.text(ConnectionFormField::Device), "COM3");
+        assert_eq!(
+            book.connections().len(),
+            1,
+            "opening a copy saves nothing by itself"
+        );
+    }
+
+    #[test]
+    fn an_ssh_copy_never_names_itself_in_its_own_jump_chain() {
+        let gateway = host("gateway", "10.0.0.1", 22, "deploy", None);
+        let mut web = host("web", "10.0.0.5", 22, "deploy", None);
+        web.set_jumps([gateway.id()]);
+        let record = ConnectionRecord::Ssh(web.clone());
+        let copy = record.duplicated();
+        let copied = copy.as_ssh().expect("still an SSH record");
+        assert_ne!(copied.id(), web.id());
+        assert_eq!(
+            copied.jumps(),
+            [gateway.id()],
+            "the reference to another host is kept"
+        );
+        assert!(
+            !copied.jumps().contains(&copied.id()),
+            "a copy never names itself"
+        );
+
+        let mut panel = HostsPanel::new();
+        panel.open_connection_copy(&record, " (copy)");
+        let draft = panel.draft().expect("an SSH copy keeps the host form");
+        assert!(draft.editing().is_none(), "saving writes a new host");
+        assert_eq!(draft.text(HostField::Name), "web (copy)");
+    }
+
+    #[test]
+    fn switching_the_form_to_another_protocol_keeps_what_was_typed() {
+        let mut panel = HostsPanel::new();
+        panel.open_create();
+        panel
+            .draft_mut()
+            .expect("the SSH form is open")
+            .set_text(HostField::Name, "rack 4");
+        panel.switch_protocol(ProtocolKind::Serial);
+        let draft = panel.protocol_draft().expect("the serial form is open");
+        assert!(panel.draft().is_none(), "one form is open at a time");
+        assert_eq!(draft.text(ConnectionFormField::Name), "rack 4");
+        assert_eq!(draft.protocol(), ProtocolKind::Serial);
+
+        panel.switch_protocol(ProtocolKind::Ssh);
+        assert!(panel.protocol_draft().is_none());
+        assert_eq!(
+            panel
+                .draft()
+                .expect("the SSH form is back")
+                .text(HostField::Name),
+            "rack 4"
+        );
+    }
+
+    #[test]
+    fn the_list_carries_desktop_and_serial_connections_beside_the_hosts() {
+        let server = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
+        let mut book = HostBook::from_hosts(vec![server.clone()]).expect("one host");
+        let office = rdp_record("Office", "10.0.0.9", "alice");
+        let console = serial_record("Console", "COM3");
+        book.insert_connection(office.clone()).expect("inserted");
+        book.insert_connection(console.clone()).expect("inserted");
+        let groups = GroupBook::new();
+        let no_sessions = |_: HostId| false;
+
+        let mut panel = HostsPanel::new();
+        let list = panel.list(&book, &groups, &no_sessions);
+        assert_eq!(list.matched_len(), 3, "one host and two connections");
+        assert_eq!(list.total(), 3);
+        let listed: Vec<HostId> = list
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                HostListRow::Connection(row) => Some(row.id),
+                HostListRow::Host(host) => Some(host.id),
+                HostListRow::Group(_) => None,
+            })
+            .collect();
+        assert!(listed.contains(&server.id()));
+        assert!(listed.contains(&office.id()));
+        assert!(listed.contains(&console.id()));
+
+        // The selection is an SSH operation, so it never picks up a connection.
+        assert_eq!(list.ids_in_scope(SelectionScope::AllHosts), [server.id()]);
+
+        // The recent view is a sign-in history, which a connection has none of yet.
+        panel.select_view(HostView::Recent);
+        let recent = panel.list(&book, &groups, &no_sessions);
+        assert!(
+            !recent
+                .rows()
+                .iter()
+                .any(|row| matches!(row, HostListRow::Connection(_))),
+            "a connection is not in the recent view"
+        );
+    }
+
+    #[test]
+    fn a_search_finds_a_connection_by_its_protocol_or_its_target() {
+        let mut book = HostBook::from_hosts(vec![host("web", "10.0.0.5", 22, "deploy", None)])
+            .expect("one host");
+        let office = rdp_record("Office", "10.0.0.9", "alice");
+        let console = serial_record("Console", "COM3");
+        book.insert_connection(office.clone()).expect("inserted");
+        book.insert_connection(console.clone()).expect("inserted");
+        let groups = GroupBook::new();
+        let no_sessions = |_: HostId| false;
+        let mut panel = HostsPanel::new();
+
+        let names = |panel: &HostsPanel| -> Vec<HostId> {
+            panel
+                .list(&book, &groups, &no_sessions)
+                .rows()
+                .iter()
+                .filter_map(|row| match row {
+                    HostListRow::Connection(row) => Some(row.id),
+                    HostListRow::Host(host) => Some(host.id),
+                    HostListRow::Group(_) => None,
+                })
+                .collect()
+        };
+
+        panel.set_search("rdp");
+        assert_eq!(names(&panel), [office.id()]);
+        panel.set_search("COM3");
+        assert_eq!(names(&panel), [console.id()]);
+        panel.set_search("alice@10.0.0.9");
+        assert_eq!(names(&panel), [office.id()]);
+        panel.set_search("web");
+        assert_eq!(names(&panel), [book.hosts()[0].id()]);
+        panel.set_search("warehouse");
+        assert!(names(&panel).is_empty());
+        panel.set_search("");
+
+        // The status filter keeps its SSH meaning: a connection has no sign-in yet.
+        panel.set_status_filter(HostStatusFilter::NeverConnected);
+        assert_eq!(names(&panel).len(), 3);
+        panel.set_status_filter(HostStatusFilter::Recent);
+        assert!(
+            !names(&panel).contains(&office.id()),
+            "a connection is not a recent sign-in"
+        );
+    }
     #[test]
     fn an_address_typed_like_ssh_fills_the_user_and_the_port() {
         let mut draft = HostDraft::create();
@@ -3085,7 +4206,7 @@ mod tests {
             .iter()
             .filter_map(|row| match row {
                 HostListRow::Host(host) => Some(host.id),
-                HostListRow::Group(_) => None,
+                HostListRow::Group(_) | HostListRow::Connection(_) => None,
             })
             .collect();
         assert_eq!(
@@ -3098,7 +4219,7 @@ mod tests {
             .iter()
             .filter_map(|row| match row {
                 HostListRow::Group(group) => Some(group.path.clone()),
-                HostListRow::Host(_) => None,
+                HostListRow::Host(_) | HostListRow::Connection(_) => None,
             })
             .collect();
         assert_eq!(

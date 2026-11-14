@@ -234,10 +234,15 @@ impl ShelluneView {
             let kind_label = match kind {
                 PaneKind::Local => strings.session_kind_local,
                 PaneKind::Remote => strings.session_kind_remote,
+                PaneKind::Desktop => strings.session_kind_desktop,
+                PaneKind::Serial => strings.session_kind_serial,
             };
             let target = match session.kind() {
                 SessionKind::Local { .. } => program_label(&session_target(&self.book, session)),
-                SessionKind::Remote { .. } => session_target(&self.book, session),
+                SessionKind::Remote { .. }
+                | SessionKind::Rdp { .. }
+                | SessionKind::Vnc { .. }
+                | SessionKind::Serial { .. } => session_target(&self.book, session),
             };
             entries.push(Entry {
                 command: Command::Switch(id),
@@ -253,7 +258,11 @@ impl ShelluneView {
                     .and_then(|spec| self.keymap.label(spec.id)),
                 icon: match kind {
                     PaneKind::Local => Icon::Terminal,
+                    // A desktop is a remote machine; a serial session is a character
+                    // device, so it keeps the prompt icon.
                     PaneKind::Remote => Icon::Server,
+                    PaneKind::Desktop => Icon::Server,
+                    PaneKind::Serial => Icon::Terminal,
                 },
                 current: self.active == Some(id),
             });
@@ -992,6 +1001,10 @@ impl ShelluneView {
                     self.open_remote(&host, cx);
                 }
             }
+            // Duplicating a tab copies what it is about to start. This build cannot
+            // start a desktop or serial session yet, so it copies nothing rather than
+            // opening a tab that could never connect.
+            SessionKind::Rdp { .. } | SessionKind::Vnc { .. } | SessionKind::Serial { .. } => {}
         }
     }
 
@@ -1718,7 +1731,10 @@ impl ShelluneView {
                             SessionKind::Local { .. } => {
                                 program_label(&session_target(&self.book, session))
                             }
-                            SessionKind::Remote { .. } => session_target(&self.book, session),
+                            SessionKind::Remote { .. }
+                            | SessionKind::Rdp { .. }
+                            | SessionKind::Vnc { .. }
+                            | SessionKind::Serial { .. } => session_target(&self.book, session),
                         };
                         (
                             if remote {
@@ -1743,6 +1759,15 @@ impl ShelluneView {
                                     .book
                                     .host(*host)
                                     .map(|host| host.target())
+                                    .unwrap_or_else(|| host.to_string()),
+                                // A waiting desktop or serial pane names the connection it
+                                // would start, or the id when that record is gone.
+                                PaneTarget::Rdp { host }
+                                | PaneTarget::Vnc { host }
+                                | PaneTarget::Serial { host } => self
+                                    .book
+                                    .connection(*host)
+                                    .map(|record| record.target())
                                     .unwrap_or_else(|| host.to_string()),
                             })
                             .unwrap_or_default();
@@ -1952,7 +1977,10 @@ impl ShelluneView {
             .and_then(|id| self.workspace.session(id))
             .map(|session| match session.kind() {
                 SessionKind::Local { .. } => program_label(&session_target(&self.book, session)),
-                SessionKind::Remote { .. } => session_target(&self.book, session),
+                SessionKind::Remote { .. }
+                | SessionKind::Rdp { .. }
+                | SessionKind::Vnc { .. }
+                | SessionKind::Serial { .. } => session_target(&self.book, session),
             });
         let subtitle = shown.map(|shown| match target {
             Some(target) => format!("{shown} · {target}"),

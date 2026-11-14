@@ -891,6 +891,11 @@ pub fn session_kind_label(kind: &SessionKind, shell_fallback: &str) -> String {
     match kind {
         SessionKind::Local { shell } => shell.clone().unwrap_or_else(|| shell_fallback.to_owned()),
         SessionKind::Remote { .. } => "SSH".to_owned(),
+        // A desktop or serial tab says its protocol here. None of them can be started
+        // by this build yet, so the label never claims a live connection.
+        SessionKind::Rdp { .. } => "RDP".to_owned(),
+        SessionKind::Vnc { .. } => "VNC".to_owned(),
+        SessionKind::Serial { .. } => "Serial".to_owned(),
     }
 }
 

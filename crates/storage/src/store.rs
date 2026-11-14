@@ -142,6 +142,7 @@ impl HostStore {
                 self.emit(&StoreEvent::Saved {
                     path,
                     hosts: book.hosts().len(),
+                    connections: book.connections().len(),
                     groups: HostBook::group(book.hosts()).len(),
                     recents: book.recents().len(),
                 });

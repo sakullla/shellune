@@ -22,10 +22,10 @@ use std::rc::Rc;
 
 use shellune_core::X11Forwarding;
 use shellune_core::{
-    BrowseFailure, BrowseState, EventTag, FileKind, ForwardId, ForwardRule, GroupBook, GroupPath,
-    HostConfig, HostId, HostValidationError, LocalShell, Session, SessionFailure, SessionId,
-    SessionKind, SessionState, SplitAxis, TabAccent, TabId, Transfer, TransferDirection,
-    TransferProtocol, join_path,
+    BrowseFailure, BrowseState, ConnectionRecord, EventTag, FileKind, ForwardId, ForwardRule,
+    GroupBook, GroupPath, HostConfig, HostId, HostValidationError, LocalShell, ProtocolKind,
+    Session, SessionFailure, SessionId, SessionKind, SessionState, SplitAxis, TabAccent, TabId,
+    Transfer, TransferDirection, TransferProtocol, join_path,
 };
 #[cfg(test)]
 use shellune_ssh::RemoteEvent;
@@ -57,8 +57,9 @@ use crate::app::files::{
 };
 use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
-    ConnectionChoice, ConnectionDraft, ConnectionField, GroupAction, HostDraft, HostField,
-    HostView, HostsPanel, ImportPanel, group_path_from_text, import_message, unimported_hosts,
+    ConnectionChoice, ConnectionDraft, ConnectionField, ConnectionFormField, GroupAction,
+    HostDraft, HostField, HostView, HostsPanel, ImportPanel, group_path_from_text, import_message,
+    unimported_hosts,
 };
 use crate::app::icons::{self, Icon};
 use crate::app::keymap::{self, Keymap, Problem};
@@ -115,15 +116,20 @@ type FilesRow = (FileSource, FilesStop, gpui::Bounds<gpui::Pixels>);
 enum PaneKind {
     Local,
     Remote,
+    /// A remote desktop: RDP or VNC. It has no terminal, no files and no forwarding.
+    Desktop,
+    /// A serial device: a character session that is not a network one.
+    Serial,
 }
 
 impl PaneKind {
     /// The kind of terminal a session runs.
     fn of(kind: &SessionKind) -> Self {
-        if kind.is_remote() {
-            Self::Remote
-        } else {
-            Self::Local
+        match kind {
+            SessionKind::Local { .. } => Self::Local,
+            SessionKind::Remote { .. } => Self::Remote,
+            SessionKind::Rdp { .. } | SessionKind::Vnc { .. } => Self::Desktop,
+            SessionKind::Serial { .. } => Self::Serial,
         }
     }
 }
@@ -429,6 +435,9 @@ pub struct ShelluneView {
     /// The host form's three override numbers, present only while the editor is open
     /// (R20).
     host_connection_fields: Option<HostConnectionFields>,
+    /// The typed fields of the form for a connection whose protocol is not SSH,
+    /// present only while that form is open (R2, R18).
+    protocol_fields: Option<ProtocolFields>,
     /// The SSH configuration import panel and what the last read of a file showed.
     import: ImportPanel,
     /// The configuration path field, present only while that panel is open.
@@ -908,6 +917,46 @@ struct HostFields {
     secret: Entity<TextField>,
     startup: Entity<TextField>,
     proxy: Entity<TextField>,
+}
+
+/// The typed fields of the form for a connection whose protocol is not SSH.
+///
+/// One entity per typed field of the protocol the form was opened for; the choice
+/// fields (certificate policy, security, parity, stop bits, flow, local echo) are drawn
+/// from the draft itself because they have a fixed set of answers.
+struct ProtocolFields {
+    name: Entity<TextField>,
+    group: Entity<TextField>,
+    address: Entity<TextField>,
+    port: Entity<TextField>,
+    user: Entity<TextField>,
+    domain: Entity<TextField>,
+    device: Entity<TextField>,
+    baud: Entity<TextField>,
+    data_bits: Entity<TextField>,
+}
+
+impl ProtocolFields {
+    /// The entity of one typed field, or \`None\` for a field that is chosen.
+    fn get(&self, field: ConnectionFormField) -> Option<&Entity<TextField>> {
+        match field {
+            ConnectionFormField::Name => Some(&self.name),
+            ConnectionFormField::Group => Some(&self.group),
+            ConnectionFormField::Address => Some(&self.address),
+            ConnectionFormField::Port => Some(&self.port),
+            ConnectionFormField::User => Some(&self.user),
+            ConnectionFormField::Domain => Some(&self.domain),
+            ConnectionFormField::Device => Some(&self.device),
+            ConnectionFormField::Baud => Some(&self.baud),
+            ConnectionFormField::DataBits => Some(&self.data_bits),
+            ConnectionFormField::Certificate
+            | ConnectionFormField::Security
+            | ConnectionFormField::Parity
+            | ConnectionFormField::StopBits
+            | ConnectionFormField::Flow
+            | ConnectionFormField::LocalEcho => None,
+        }
+    }
 }
 
 impl HostFields {
@@ -1963,6 +2012,7 @@ impl ShelluneView {
             restore_focus_pending: false,
             rail_collapsed: false,
             host_connection_fields: None,
+            protocol_fields: None,
             theme_choice: theme::ThemeChoice::default(),
             terminal_scheme: theme::TerminalScheme::default(),
             connection_choice: None,
@@ -3637,7 +3687,12 @@ impl ShelluneView {
                 SessionKind::Remote { host } => {
                     self.book.host(*host).map(HostConfig::transfer_protocol)
                 }
-                SessionKind::Local { .. } => None,
+                // Files are an SSH capability: a local, desktop or serial session has
+                // no transfer protocol to start with.
+                SessionKind::Local { .. }
+                | SessionKind::Rdp { .. }
+                | SessionKind::Vnc { .. }
+                | SessionKind::Serial { .. } => None,
             })
             .unwrap_or_default()
     }
@@ -4213,6 +4268,14 @@ impl ShelluneView {
                 self.connect_when_ready(&host, cx);
                 cx.notify();
             }
+            // Starting a desktop or serial attempt is not part of this build: the
+            // session layer that would own it is not wired yet. The session keeps the
+            // reason it ended and says so, instead of opening a form that could not
+            // connect anything.
+            SessionKind::Rdp { .. } | SessionKind::Vnc { .. } | SessionKind::Serial { .. } => {
+                let reason = self.strings().session_reconnect_not_wired.to_owned();
+                self.refuse_reconnect(id, reason, cx);
+            }
         }
     }
 
@@ -4406,7 +4469,10 @@ impl ShelluneView {
             .list(&self.book, &self.groups, &|id| self.host_is_open(id));
         list.rows().iter().find_map(|row| match row {
             crate::app::hosts::HostListRow::Host(host) => Some(host.id),
-            crate::app::hosts::HostListRow::Group(_) => None,
+            // Only a host can be opened by pressing Enter; a desktop or serial row is
+            // edited, not started.
+            crate::app::hosts::HostListRow::Group(_)
+            | crate::app::hosts::HostListRow::Connection(_) => None,
         })
     }
 
@@ -4742,6 +4808,193 @@ impl ShelluneView {
         cx.notify();
     }
 
+    // -----------------------------------------------------------------------
+    // The form of a connection that is not an SSH host (R2, R18)
+    // -----------------------------------------------------------------------
+
+    /// Opens the form of a saved connection, whichever protocol it is.
+    fn edit_saved_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        let Some(record) = self.book.connection(id) else {
+            return;
+        };
+        match record {
+            // An SSH connection keeps the host form it already had.
+            ConnectionRecord::Ssh(host) => self.open_edit_host(&host, cx),
+            other => {
+                self.hosts.open_connection_edit(&other);
+                self.open_protocol_fields(cx);
+            }
+        }
+    }
+
+    /// Opens a copy of a saved connection as a new record (R9).
+    ///
+    /// The copy has a fresh identifier, no saved credential and no sign-in history, and
+    /// saving it writes a new record rather than replacing the one it came from.
+    fn duplicate_saved_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        let Some(record) = self.book.connection(id) else {
+            return;
+        };
+        let suffix = self.strings().connection_copy_suffix;
+        self.hosts.open_connection_copy(&record, suffix);
+        if self.hosts.is_editing_connection() {
+            self.open_protocol_fields(cx);
+        } else {
+            self.open_host_fields(cx);
+        }
+    }
+
+    /// Switches the open form to another protocol, keeping the name and group typed.
+    fn switch_form_protocol(&mut self, protocol: ProtocolKind, cx: &mut Context<Self>) {
+        self.hosts.switch_protocol(protocol);
+        if self.hosts.is_editing_connection() {
+            self.open_protocol_fields(cx);
+        } else {
+            self.open_host_fields(cx);
+        }
+    }
+
+    /// Builds the fields of the open protocol form and keeps the draft in step.
+    fn open_protocol_fields(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.hosts.protocol_draft().cloned() else {
+            self.protocol_fields = None;
+            return;
+        };
+        let strings = self.strings();
+        let text = |field: ConnectionFormField| draft.text(field).to_owned();
+        let name = cx.new(|cx| {
+            TextField::with_text(strings.host_field_name, text(ConnectionFormField::Name), cx)
+        });
+        let group = cx.new(|cx| {
+            TextField::with_text(
+                copy::ux().host_example_group,
+                text(ConnectionFormField::Group),
+                cx,
+            )
+        });
+        let address = cx.new(|cx| {
+            TextField::with_text(
+                strings.host_field_address,
+                text(ConnectionFormField::Address),
+                cx,
+            )
+        });
+        let port = cx.new(|cx| {
+            TextField::with_text(strings.host_field_port, text(ConnectionFormField::Port), cx)
+        });
+        let user = cx.new(|cx| {
+            TextField::with_text(strings.host_field_user, text(ConnectionFormField::User), cx)
+        });
+        let domain = cx.new(|cx| {
+            TextField::with_text(
+                strings.connection_field_domain,
+                text(ConnectionFormField::Domain),
+                cx,
+            )
+        });
+        let device = cx.new(|cx| {
+            TextField::with_text(
+                strings.connection_field_device,
+                text(ConnectionFormField::Device),
+                cx,
+            )
+        });
+        let baud = cx.new(|cx| {
+            TextField::with_text(
+                strings.connection_field_baud,
+                text(ConnectionFormField::Baud),
+                cx,
+            )
+        });
+        let data_bits = cx.new(|cx| {
+            TextField::with_text(
+                strings.connection_field_data_bits,
+                text(ConnectionFormField::DataBits),
+                cx,
+            )
+        });
+        self.protocol_fields = Some(ProtocolFields {
+            name,
+            group,
+            address,
+            port,
+            user,
+            domain,
+            device,
+            baud,
+            data_bits,
+        });
+        let typed: Vec<ConnectionFormField> = draft
+            .fields()
+            .iter()
+            .copied()
+            .filter(|field| field.is_text())
+            .collect();
+        for field in typed {
+            self.bind_protocol_field(field, cx);
+        }
+        self.focus_host_dialog = true;
+        cx.notify();
+    }
+
+    /// Mirrors one typed field of the protocol form into its draft.
+    fn bind_protocol_field(&mut self, field: ConnectionFormField, cx: &mut Context<Self>) {
+        let Some(entity) = self
+            .protocol_fields
+            .as_ref()
+            .and_then(|fields| fields.get(field))
+            .cloned()
+        else {
+            return;
+        };
+        cx.observe(&entity, move |view, text_field, cx| {
+            let text = text_field.read(cx).text().to_owned();
+            if let Some(draft) = view.hosts.protocol_draft_mut() {
+                draft.set_text(field, text);
+            }
+            cx.notify();
+        })
+        .detach();
+    }
+
+    /// Closes the protocol form without touching the saved records.
+    fn close_connection_editor(&mut self, cx: &mut Context<Self>) {
+        self.hosts.close_connection_editor();
+        self.protocol_fields = None;
+        self.restore_focus_pending = true;
+        cx.notify();
+    }
+
+    /// Validates the protocol form and stores it when the domain accepts it.
+    ///
+    /// The record is written before the list adopts it: a failed write leaves the saved
+    /// connections exactly as they were and keeps the form open with the reason.
+    fn save_connection(&mut self, cx: &mut Context<Self>) -> Option<HostId> {
+        let draft = self.hosts.protocol_draft().cloned()?;
+        let edit = match draft.build() {
+            Ok(edit) => edit,
+            Err(reason) => {
+                self.hosts.set_message(reason, true);
+                cx.notify();
+                return None;
+            }
+        };
+        let mut next = self.book.clone();
+        let outcome = match edit.replaces() {
+            Some(id) => next.update_connection(edit.record().clone(), id),
+            None => next.insert_connection(edit.record().clone()),
+        };
+        if let Err(error) = outcome {
+            self.hosts.set_message(error.to_string(), true);
+            cx.notify();
+            return None;
+        }
+        let id = edit.record().id();
+        let message = self.strings().connection_saved;
+        self.commit_hosts(next, message, cx);
+        self.protocol_fields.is_none().then_some(id)
+    }
+
     /// Validates the form and stores it when the domain accepts it.
     ///
     /// Returns the id of the host that was saved, or `None` when the dialog stays open
@@ -4817,6 +5070,7 @@ impl ShelluneView {
                 self.book = next;
                 self.hosts.close_editor();
                 self.host_fields = None;
+                self.protocol_fields = None;
                 self.restore_focus_pending = true;
                 self.hosts.set_message(message.to_owned(), false);
                 let items = self.book.hosts().to_vec();
@@ -4849,19 +5103,35 @@ impl ShelluneView {
             return;
         };
         let mut next = self.book.clone();
-        let removed = match next.remove(id) {
-            Ok(removed) => removed,
-            Err(error) => {
-                self.hosts.set_message(error.to_string(), true);
-                cx.notify();
-                return;
+        // The question is asked for a host or for a connection of another protocol; the
+        // book knows which list the record is in, and the message says which was removed.
+        let (remembers_secret, message) = if next.host(id).is_some() {
+            match next.remove(id) {
+                Ok(removed) => (removed.remembers_secret(), self.strings().hosts_deleted),
+                Err(error) => {
+                    self.hosts.set_message(error.to_string(), true);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            match next.remove_connection(id) {
+                Ok(removed) => (
+                    removed.remembers_secret(),
+                    self.strings().connection_deleted,
+                ),
+                Err(error) => {
+                    self.hosts.set_message(error.to_string(), true);
+                    cx.notify();
+                    return;
+                }
             }
         };
-        // A deleted host's secret has nobody left to use it.
-        if removed.remembers_secret() {
+        // A deleted connection's secret has nobody left to use it.
+        if remembers_secret {
             let _ = self.secrets.forget(id);
         }
-        self.commit_hosts(next, self.strings().hosts_deleted, cx);
+        self.commit_hosts(next, message, cx);
     }
 
     // -----------------------------------------------------------------------
@@ -8514,9 +8784,16 @@ impl ShelluneView {
     fn host_delete_bar(&self, id: HostId, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let target = self.book.host(id).map_or_else(String::new, |host| {
-            format!("{} ({})", host.name(), host.target())
+        // The question is asked for a host or for a connection of another protocol, so it
+        // names whichever record is really there.
+        let target = self.book.connection(id).map_or_else(String::new, |record| {
+            format!("{} ({})", record.name(), record.target())
         });
+        let question = if self.book.host(id).is_some() {
+            strings.host_delete_question
+        } else {
+            strings.connection_delete_question
+        };
 
         components::banner(Tone::Danger, metrics)
             .flex_row()
@@ -8535,10 +8812,7 @@ impl ShelluneView {
                             .truncate()
                             .text_size(metrics.label_size())
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(format!(
-                                "{} {target}",
-                                strings.host_delete_question
-                            ))),
+                            .child(SharedString::from(format!("{question} {target}"))),
                     )
                     .child(
                         div()
@@ -13130,6 +13404,8 @@ impl ShelluneView {
         let kind_label = match kind {
             PaneKind::Local => strings.session_kind_local,
             PaneKind::Remote => strings.session_kind_remote,
+            PaneKind::Desktop => strings.session_kind_desktop,
+            PaneKind::Serial => strings.session_kind_serial,
         };
         let jump = if index < crate::app::TAB_JUMP_COUNT {
             keymap::tab_jump_action(index + 1)
@@ -14149,6 +14425,7 @@ impl Render for ShelluneView {
             .children(self.tool_overlay(window, cx))
             .children(self.batch_overlay(window, cx))
             .children(self.host_dialog_overlay(window, cx))
+            .children(self.connection_dialog_overlay(window, cx))
             .children(self.group_dialog_overlay(window, cx))
             .children(self.custom_shell_overlay(window, cx))
             .children(self.shell_menu_overlay(window, cx))
@@ -14468,6 +14745,12 @@ fn session_target(book: &HostBook, session: &Session) -> String {
         SessionKind::Remote { host } => book
             .host(*host)
             .map_or_else(|| format!("host {host}"), HostConfig::target),
+        // A desktop or serial session names what its saved connection would reach. The
+        // id is shown when that connection is gone, exactly as for a host.
+        SessionKind::Rdp { host } | SessionKind::Vnc { host } | SessionKind::Serial { host } => {
+            book.connection(*host)
+                .map_or_else(|| format!("connection {host}"), |record| record.target())
+        }
     }
 }
 

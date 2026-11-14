@@ -8,13 +8,17 @@
 
 use gpui::prelude::*;
 use gpui::{Context, Div, FontWeight, MouseButton, SharedString, Stateful, Window, div, px};
-use shellune_core::{AuthMethodKind, HostId, TransferProtocol, X11Forwarding};
+use shellune_core::{
+    AuthMethodKind, HostId, ProtocolKind, RdpCertificatePolicy, SerialFlow, SerialParity,
+    SerialStopBits, TransferProtocol, VncSecurity, X11Forwarding,
+};
 
 use super::{HostFields, ShelluneView};
 use crate::app::components::{self, Variant};
 use crate::app::copy;
 use crate::app::hosts::{
-    ConnectionChoice, ConnectionField, HostDraft, HostField, connection_problem_text,
+    ConnectionChoice, ConnectionField, ConnectionFormField, HostDraft, HostField,
+    connection_problem_text,
 };
 use crate::app::icons::{self, Icon};
 use crate::app::remote::MethodChoice;
@@ -831,7 +835,14 @@ impl ShelluneView {
             .px(metrics.scale(spacing::LOOSE))
             .py(metrics.scale(spacing::BASE))
             .overflow_y_scroll()
-            .track_scroll(&self.host_body_scroll)
+            .track_scroll(&self.host_body_scroll);
+        // A new record may be of another protocol. The chooser is here so the form the
+        // user sees is always the one the chosen protocol really has (R2, R18); a saved
+        // host keeps the protocol it was saved with, so editing never shows it.
+        if !editing {
+            body = body.child(self.protocol_chooser(ProtocolKind::Ssh, cx));
+        }
+        body = body
             .child(line(
                 self.dialog_field(fields, HostField::Address, None, 0.75),
                 self.dialog_field(fields, HostField::Port, None, 0.25),
@@ -1060,5 +1071,556 @@ impl ShelluneView {
                     .child(dialog),
             ),
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // The form of a connection that is not an SSH host (R2, R18)
+    // -----------------------------------------------------------------------
+
+    /// The protocol of a new connection.
+    ///
+    /// Shown only while creating: a saved connection keeps the protocol it was saved
+    /// with, because changing it would be a different record rather than an edit.
+    fn protocol_chooser(&self, current: ProtocolKind, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let mut choices = components::segmented(metrics);
+        for protocol in ProtocolKind::ALL {
+            choices = choices.child(
+                components::segment(protocol.label(), protocol == current, metrics)
+                    .id(SharedString::from(format!(
+                        "connection.protocol.{}",
+                        protocol.wire_name()
+                    )))
+                    .debug_selector(move || format!("connection.protocol.{}", protocol.wire_name()))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.switch_form_protocol(protocol, cx);
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(strings.connection_field_protocol),
+            )
+            .child(choices)
+    }
+
+    /// One typed field of the protocol form.
+    fn protocol_field(&self, field: ConnectionFormField) -> Div {
+        let metrics = self.metrics();
+        let label = field.label(self.strings());
+        let entity = self
+            .protocol_fields
+            .as_ref()
+            .and_then(|fields| fields.get(field))
+            .cloned();
+        let mut cell = div()
+            .flex()
+            .flex_col()
+            .flex_grow()
+            .flex_basis(gpui::relative(1.0))
+            .min_w(px(0.0))
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(label),
+            );
+        if let Some(entity) = entity {
+            cell = cell.child(
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .debug_selector(move || field.debug_selector().to_owned())
+                    .child(entity),
+            );
+        }
+        cell
+    }
+
+    /// The form of a saved desktop or serial connection.
+    pub(super) fn connection_dialog_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let draft = self.hosts.protocol_draft()?.clone();
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let viewport = window.viewport_size();
+        let editing = draft.editing().is_some();
+        let width = px(600.0).min(viewport.width - metrics.scale(spacing::LOOSE) * 2.0);
+        let max_height = viewport.height - metrics.scale(spacing::LOOSE) * 2.0;
+
+        let line = |left: Div, right: Div| {
+            div()
+                .flex()
+                .w_full()
+                .gap(metrics.scale(spacing::SNUG))
+                .child(left)
+                .child(right)
+        };
+        let rule = || div().h(px(1.0)).bg(theme::swatch(palette::BORDER));
+
+        let mut body = div()
+            .id("connection.editor.body")
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG + 2.0))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::BASE))
+            .overflow_y_scroll()
+            .track_scroll(&self.host_body_scroll);
+
+        if !editing {
+            body = body.child(self.protocol_chooser(draft.protocol(), cx));
+        }
+
+        // Only the fields this protocol has: no identity file, no secret, no jump chain
+        // and no forwarding appears for a connection that cannot use them.
+        for field in draft.fields() {
+            let field = *field;
+            match field {
+                ConnectionFormField::Address => {
+                    body = body.child(line(
+                        self.protocol_field(ConnectionFormField::Address),
+                        self.protocol_field(ConnectionFormField::Port),
+                    ));
+                }
+                ConnectionFormField::Port => {}
+                ConnectionFormField::User => {
+                    body = body.child(line(
+                        self.protocol_field(ConnectionFormField::User),
+                        self.protocol_field(ConnectionFormField::Domain),
+                    ));
+                }
+                ConnectionFormField::Domain => {}
+                ConnectionFormField::Certificate => {
+                    let mut choices = components::segmented(metrics);
+                    for policy in RdpCertificatePolicy::ALL {
+                        choices = choices.child(
+                            components::segment(
+                                policy.label(),
+                                draft.certificate() == policy,
+                                metrics,
+                            )
+                            .id(SharedString::from(format!(
+                                "connection.certificate.{}",
+                                certificate_id(policy)
+                            )))
+                            .debug_selector(move || {
+                                format!("connection.certificate.{}", certificate_id(policy))
+                            })
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                        draft.set_certificate(policy);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        );
+                    }
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .debug_selector(|| "connection.field.certificate".to_owned())
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(strings.connection_field_certificate),
+                            )
+                            .child(choices),
+                    );
+                }
+                ConnectionFormField::Security => {
+                    let mut choices = components::segmented(metrics);
+                    for security in VncSecurity::ALL {
+                        choices = choices.child(
+                            components::segment(
+                                security.label(),
+                                draft.security() == security,
+                                metrics,
+                            )
+                            .id(SharedString::from(format!(
+                                "connection.security.{}",
+                                security_id(security)
+                            )))
+                            .debug_selector(move || {
+                                format!("connection.security.{}", security_id(security))
+                            })
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                        draft.set_security(security);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        );
+                    }
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .debug_selector(|| "connection.field.security".to_owned())
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(strings.connection_field_security),
+                            )
+                            .child(choices),
+                    );
+                }
+                ConnectionFormField::Parity => {
+                    let mut choices = components::segmented(metrics);
+                    for parity in SerialParity::ALL {
+                        choices = choices.child(
+                            components::segment(parity.label(), draft.parity() == parity, metrics)
+                                .id(SharedString::from(format!(
+                                    "connection.parity.{}",
+                                    parity_id(parity)
+                                )))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                        draft.set_parity(parity);
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .debug_selector(|| "connection.field.parity".to_owned())
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(strings.connection_field_parity),
+                            )
+                            .child(choices),
+                    );
+                }
+                ConnectionFormField::StopBits => {
+                    let mut choices = components::segmented(metrics);
+                    for stop_bits in SerialStopBits::ALL {
+                        choices = choices.child(
+                            components::segment(
+                                stop_bits.label(),
+                                draft.stop_bits() == stop_bits,
+                                metrics,
+                            )
+                            .id(SharedString::from(format!(
+                                "connection.stop_bits.{}",
+                                stop_bits.label()
+                            )))
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                        draft.set_stop_bits(stop_bits);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        );
+                    }
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .debug_selector(|| "connection.field.stop_bits".to_owned())
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(strings.connection_field_stop_bits),
+                            )
+                            .child(choices),
+                    );
+                }
+                ConnectionFormField::Flow => {
+                    let mut choices = components::segmented(metrics);
+                    for flow in SerialFlow::ALL {
+                        choices = choices.child(
+                            components::segment(flow.label(), draft.flow() == flow, metrics)
+                                .id(SharedString::from(format!(
+                                    "connection.flow.{}",
+                                    flow_id(flow)
+                                )))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                        draft.set_flow(flow);
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .debug_selector(|| "connection.field.flow".to_owned())
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(strings.connection_field_flow),
+                            )
+                            .child(choices),
+                    );
+                }
+                ConnectionFormField::LocalEcho => {
+                    let echo = draft.local_echo();
+                    body = body.child(
+                        checkbox(
+                            "connection.local_echo",
+                            strings.connection_field_local_echo,
+                            echo,
+                            metrics,
+                        )
+                        .debug_selector(|| "connection.field.local_echo".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                let next = this
+                                    .hosts
+                                    .protocol_draft()
+                                    .is_some_and(|draft| !draft.local_echo());
+                                if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                    draft.set_local_echo(next);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    );
+                }
+                ConnectionFormField::Device => {
+                    body = body.child(line(
+                        self.protocol_field(ConnectionFormField::Device),
+                        self.protocol_field(ConnectionFormField::Baud),
+                    ));
+                }
+                ConnectionFormField::Baud => {}
+                ConnectionFormField::DataBits => {
+                    body = body.child(self.protocol_field(ConnectionFormField::DataBits));
+                }
+                ConnectionFormField::Name => {
+                    body = body.child(rule()).child(line(
+                        self.protocol_field(ConnectionFormField::Name),
+                        self.protocol_field(ConnectionFormField::Group),
+                    ));
+                }
+                ConnectionFormField::Group => {}
+            }
+        }
+
+        body = body.child(
+            div()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .debug_selector(|| "connection.not_started".to_owned())
+                .child(strings.connection_not_started_note),
+        );
+
+        let refusal = self
+            .hosts
+            .message()
+            .filter(|message| message.failed())
+            .map(|message| {
+                components::banner(Tone::Danger, metrics)
+                    .debug_selector(|| "connection.message".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(message.text().to_owned()))
+            });
+
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .px(metrics.scale(spacing::LOOSE))
+            .pt(metrics.scale(spacing::BASE + 2.0))
+            .pb(metrics.scale(spacing::TIGHT))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(metrics.heading_size())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .child(if editing {
+                                        strings.connection_editor_edit
+                                    } else {
+                                        strings.connection_editor_new
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(draft.protocol().label()),
+                            ),
+                    ),
+            )
+            .child(
+                components::icon_only_button(Icon::Close, metrics)
+                    .id("connection.editor.close")
+                    .debug_selector(|| "connection.editor.close".to_owned())
+                    .tooltip(components::tooltip(strings.host_dialog_close))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.close_connection_editor(cx);
+                    })),
+            );
+
+        let footer = div()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::BASE))
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .children(refusal)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        self.text_button(
+                            SharedString::from("connection.cancel"),
+                            strings.host_cancel,
+                            Variant::Ghost,
+                            cx,
+                            |view, cx| view.close_connection_editor(cx),
+                        )
+                        .h(metrics.control_height()),
+                    )
+                    .child(
+                        self.text_button(
+                            SharedString::from("connection.save"),
+                            strings.host_save,
+                            Variant::Primary,
+                            cx,
+                            |view, cx| {
+                                let _ = view.save_connection(cx);
+                            },
+                        )
+                        .h(metrics.control_height()),
+                    ),
+            );
+
+        let dialog = div()
+            .id("connection.editor")
+            .debug_selector(|| "connection.editor".to_owned())
+            .w(width)
+            .max_h(max_height)
+            .flex()
+            .flex_col()
+            .rounded(px(radius::XLARGE))
+            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .shadow_2xl()
+            .overflow_hidden()
+            .occlude()
+            .child(header)
+            .child(body)
+            .child(footer);
+
+        Some(
+            super::overlay_layer().child(
+                div()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .child(
+                        div()
+                            .id("connection.editor.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .bg(gpui::rgba(0x0000_0080))
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                    )
+                    .child(dialog),
+            ),
+        )
+    }
+}
+
+/// Stable identifier of a certificate policy, for a debug selector.
+fn certificate_id(policy: RdpCertificatePolicy) -> &'static str {
+    match policy {
+        RdpCertificatePolicy::Ask => "ask",
+        RdpCertificatePolicy::Reject => "reject",
+    }
+}
+
+/// Stable identifier of a VNC security choice, for a debug selector.
+fn security_id(security: VncSecurity) -> &'static str {
+    match security {
+        VncSecurity::Automatic => "automatic",
+        VncSecurity::EncryptedOnly => "encrypted",
+    }
+}
+
+/// Stable identifier of a parity choice, for a debug selector.
+fn parity_id(parity: SerialParity) -> &'static str {
+    match parity {
+        SerialParity::None => "none",
+        SerialParity::Even => "even",
+        SerialParity::Odd => "odd",
+        SerialParity::Mark => "mark",
+        SerialParity::Space => "space",
+    }
+}
+
+/// Stable identifier of a flow-control choice, for a debug selector.
+fn flow_id(flow: SerialFlow) -> &'static str {
+    match flow {
+        SerialFlow::None => "none",
+        SerialFlow::Software => "software",
+        SerialFlow::Hardware => "hardware",
     }
 }

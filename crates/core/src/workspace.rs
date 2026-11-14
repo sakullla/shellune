@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::host::ProtocolKind;
 use crate::ids::{HostId, PaneId, TabId};
 
 /// The format this build writes for a workspace snapshot.
@@ -171,6 +172,27 @@ pub enum PaneTarget {
         /// The host the pane belongs to.
         host: HostId,
     },
+    /// A saved RDP connection that has not been dialed (R18).
+    ///
+    /// Restoring a snapshot builds this value and stops there: no library context, no
+    /// certificate question and no socket exists until the user starts the pane.
+    Rdp {
+        /// The saved connection the pane belongs to.
+        host: HostId,
+    },
+    /// A saved VNC connection that has not been dialed (R18).
+    Vnc {
+        /// The saved connection the pane belongs to.
+        host: HostId,
+    },
+    /// A saved serial connection whose device has not been opened (R21).
+    ///
+    /// Opening a device can take an exclusive lock on a real port, so restore never
+    /// does it: the pane waits for the user exactly like a desktop one.
+    Serial {
+        /// The saved connection whose device the pane would open.
+        host: HostId,
+    },
 }
 
 impl PaneTarget {
@@ -194,16 +216,52 @@ impl PaneTarget {
     pub fn shell(&self) -> Option<&str> {
         match self {
             Self::Local { shell } => shell.as_deref(),
-            Self::Remote { .. } => None,
+            Self::Remote { .. } | Self::Rdp { .. } | Self::Vnc { .. } | Self::Serial { .. } => None,
         }
     }
 
-    /// The host id when this pane is remote.
+    /// A saved RDP connection. The id is stored; no connection is opened.
+    #[must_use]
+    pub fn rdp(host: HostId) -> Self {
+        Self::Rdp { host }
+    }
+
+    /// A saved VNC connection. The id is stored; no connection is opened.
+    #[must_use]
+    pub fn vnc(host: HostId) -> Self {
+        Self::Vnc { host }
+    }
+
+    /// A saved serial connection. The id is stored; no device is opened.
+    #[must_use]
+    pub fn serial(host: HostId) -> Self {
+        Self::Serial { host }
+    }
+
+    /// The saved connection id when this pane is not a local shell.
+    ///
+    /// Every protocol keeps the same identity it has in the host book, which is what
+    /// lets one restored pane be matched to one saved connection.
     #[must_use]
     pub fn host(&self) -> Option<HostId> {
         match self {
-            Self::Remote { host } => Some(*host),
+            Self::Remote { host }
+            | Self::Rdp { host }
+            | Self::Vnc { host }
+            | Self::Serial { host } => Some(*host),
             Self::Local { .. } => None,
+        }
+    }
+
+    /// The protocol this pane would speak, or `None` for a local shell.
+    #[must_use]
+    pub fn protocol(&self) -> Option<ProtocolKind> {
+        match self {
+            Self::Local { .. } => None,
+            Self::Remote { .. } => Some(ProtocolKind::Ssh),
+            Self::Rdp { .. } => Some(ProtocolKind::Rdp),
+            Self::Vnc { .. } => Some(ProtocolKind::Vnc),
+            Self::Serial { .. } => Some(ProtocolKind::Serial),
         }
     }
 }
@@ -728,18 +786,20 @@ fn restore_node(
                         .filter(|shell| !shell.is_empty()),
                 },
                 PaneTarget::Remote { host } => {
-                    if !host_exists(*host) {
-                        issues.push(WorkspaceIssue::MissingHost {
-                            tab: tab.id,
-                            pane: pane.id,
-                            host: *host,
-                            message: format!(
-                                "Pane {} on tab \"{}\" references host {host}, which is not saved. Fix the host or remove the pane. Nothing was connected.",
-                                pane.id, tab.title
-                            ),
-                        });
-                    }
+                    note_missing_connection(pane.id, *host, tab, host_exists, issues);
                     PendingConnection::Remote { host: *host }
+                }
+                PaneTarget::Rdp { host } => {
+                    note_missing_connection(pane.id, *host, tab, host_exists, issues);
+                    PendingConnection::Rdp { host: *host }
+                }
+                PaneTarget::Vnc { host } => {
+                    note_missing_connection(pane.id, *host, tab, host_exists, issues);
+                    PendingConnection::Vnc { host: *host }
+                }
+                PaneTarget::Serial { host } => {
+                    note_missing_connection(pane.id, *host, tab, host_exists, issues);
+                    PendingConnection::Serial { host: *host }
                 }
             };
             RestoredNode::Leaf(PendingPane {
@@ -760,6 +820,31 @@ fn restore_node(
             second: Box::new(restore_node(second, tab, host_exists, issues)),
         },
     }
+}
+
+/// Notes one restored pane whose saved connection is gone.
+///
+/// The pane stays in the tree: a missing record is a problem the user can fix, not a
+/// reason to drop half of a workspace. Nothing is connected either way.
+fn note_missing_connection(
+    pane: PaneId,
+    host: HostId,
+    tab: &WorkspaceTab,
+    host_exists: &mut impl FnMut(HostId) -> bool,
+    issues: &mut Vec<WorkspaceIssue>,
+) {
+    if host_exists(host) {
+        return;
+    }
+    issues.push(WorkspaceIssue::MissingHost {
+        tab: tab.id,
+        pane,
+        host,
+        message: format!(
+            "Pane {pane} on tab \"{}\" references host {host}, which is not saved. Fix the host or remove the pane. Nothing was connected.",
+            tab.title
+        ),
+    });
 }
 
 /// A problem that belongs to one tab or pane. The snapshot is otherwise intact.
@@ -978,6 +1063,21 @@ pub enum PendingConnection {
         /// The host the pane belongs to, even when that host is no longer saved.
         host: HostId,
     },
+    /// A saved RDP connection that has not been dialed (R18).
+    Rdp {
+        /// The saved connection the pane belongs to, even when it is no longer saved.
+        host: HostId,
+    },
+    /// A saved VNC connection that has not been dialed (R18).
+    Vnc {
+        /// The saved connection the pane belongs to, even when it is no longer saved.
+        host: HostId,
+    },
+    /// A saved serial connection whose device has not been opened (R21).
+    Serial {
+        /// The saved connection the pane belongs to, even when it is no longer saved.
+        host: HostId,
+    },
 }
 
 impl PendingConnection {
@@ -993,6 +1093,102 @@ impl PendingConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_desktop_and_a_serial_pane_restore_as_pending_and_start_nothing() {
+        let rdp = HostId::new();
+        let vnc = HostId::new();
+        let serial = HostId::new();
+        let left = PaneNode::leaf(PaneTarget::rdp(rdp), TerminalMode::Integrated);
+        let middle = PaneNode::split(
+            SplitAxis::LeftRight,
+            5000,
+            PaneNode::leaf(PaneTarget::vnc(vnc), TerminalMode::Integrated),
+            PaneNode::leaf(PaneTarget::serial(serial), TerminalMode::Classic),
+        )
+        .expect("ratio");
+        let root = PaneNode::split(SplitAxis::TopBottom, 5000, left, middle).expect("ratio");
+        let tab = WorkspaceTab::new("Desktops", root).expect("title");
+        let snapshot =
+            WorkspaceSnapshot::new(vec![tab], PanelConfig::new(true, PanelSection::Forwards))
+                .expect("snapshot");
+
+        let restored = snapshot.restore(|_| true);
+        let panes = restored.panes();
+        assert_eq!(panes.len(), 3);
+        assert!(
+            panes.iter().all(|pane| !pane.connection().is_started()),
+            "restoring a snapshot never dials a desktop or opens a device"
+        );
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| pane.connection().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PendingConnection::Rdp { host: rdp },
+                PendingConnection::Vnc { host: vnc },
+                PendingConnection::Serial { host: serial },
+            ],
+            "each pane keeps its protocol and its saved connection"
+        );
+        assert!(
+            restored.issues().is_empty(),
+            "a saved connection is not a missing one: {:?}",
+            restored.issues()
+        );
+        assert_eq!(
+            restored.panel().section(),
+            PanelSection::Forwards,
+            "the rest of the shell is restored as it was"
+        );
+    }
+
+    #[test]
+    fn a_desktop_pane_whose_connection_is_gone_stays_and_is_reported() {
+        let saved = HostId::new();
+        let gone = HostId::new();
+        let root = PaneNode::split(
+            SplitAxis::LeftRight,
+            5000,
+            PaneNode::leaf(PaneTarget::rdp(saved), TerminalMode::Integrated),
+            PaneNode::leaf(PaneTarget::serial(gone), TerminalMode::Classic),
+        )
+        .expect("ratio");
+        let tab = WorkspaceTab::new("Desktops", root).expect("title");
+        let snapshot = WorkspaceSnapshot::new(vec![tab], PanelConfig::default()).expect("snapshot");
+
+        let restored = snapshot.restore(|id| id == saved);
+        assert_eq!(restored.panes().len(), 2, "the pane is kept, not dropped");
+        assert_eq!(
+            restored.issues().len(),
+            1,
+            "only the connection that is gone is reported"
+        );
+        assert!(restored.issues().iter().any(|issue| matches!(
+            issue,
+            WorkspaceIssue::MissingHost { host, .. } if *host == gone
+        )));
+    }
+
+    #[test]
+    fn the_new_panes_are_tagged_in_the_snapshot_by_their_protocol() {
+        let root = PaneNode::split(
+            SplitAxis::LeftRight,
+            5000,
+            PaneNode::leaf(PaneTarget::rdp(HostId::new()), TerminalMode::Integrated),
+            PaneNode::leaf(PaneTarget::serial(HostId::new()), TerminalMode::Classic),
+        )
+        .expect("ratio");
+        let tab = WorkspaceTab::new("Desktops", root).expect("title");
+        let snapshot = WorkspaceSnapshot::new(vec![tab], PanelConfig::default()).expect("snapshot");
+        let text = serde_json::to_string(&snapshot).expect("the snapshot encodes");
+        assert!(text.contains("\"kind\":\"rdp\""), "{text}");
+        assert!(text.contains("\"kind\":\"serial\""), "{text}");
+
+        let decoded: WorkspaceSnapshot = serde_json::from_str(&text).expect("the snapshot decodes");
+        assert_eq!(decoded, snapshot);
+    }
 
     #[test]
     fn restore_keeps_a_missing_host_local_and_starts_nothing() {

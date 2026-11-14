@@ -181,6 +181,29 @@ impl ShelluneView {
                     self.present_active_pane(window, cx);
                     self.checkpoint_layout();
                 }
+                // A desktop or serial tab splits into a waiting pane of its own
+                // protocol: a split records a target, it does not connect or open one.
+                SessionKind::Rdp { host } => {
+                    self.workspace
+                        .layout_mut()
+                        .split_pending(axis, PaneTarget::rdp(host));
+                    self.present_active_pane(window, cx);
+                    self.checkpoint_layout();
+                }
+                SessionKind::Vnc { host } => {
+                    self.workspace
+                        .layout_mut()
+                        .split_pending(axis, PaneTarget::vnc(host));
+                    self.present_active_pane(window, cx);
+                    self.checkpoint_layout();
+                }
+                SessionKind::Serial { host } => {
+                    self.workspace
+                        .layout_mut()
+                        .split_pending(axis, PaneTarget::serial(host));
+                    self.present_active_pane(window, cx);
+                    self.checkpoint_layout();
+                }
             }
             return;
         }
@@ -1237,6 +1260,12 @@ impl ShelluneView {
                 self.park_focused_form();
                 self.workspace.arm_adopt(pane);
                 self.open_remote_after_park(&host, cx);
+            }
+            // Starting a desktop or serial pane belongs to the session layer that owns
+            // those workers, which is not wired in this build. The pane stays waiting,
+            // and no library context or device handle is created on a click.
+            PaneTarget::Rdp { .. } | PaneTarget::Vnc { .. } | PaneTarget::Serial { .. } => {
+                cx.notify();
             }
         }
     }

@@ -1414,20 +1414,23 @@ fn node_from_restored(
 ) -> Node {
     match node {
         RestoredNode::Leaf(pane) => {
+            // The issue list already says whether this pane's saved connection is
+            // gone; every protocol is reported the same way, so it is asked once.
+            let missing = issues.iter().any(|issue| {
+                matches!(
+                    issue,
+                    WorkspaceIssue::MissingHost { pane: id, .. } if *id == pane.id()
+                )
+            });
+            let mark = |host: HostId| missing.then_some(LeafMark::MissingHost { host });
             let (target, mark) = match pane.connection() {
                 PendingConnection::Local { shell } => (PaneTarget::local(shell.clone()), None),
-                PendingConnection::Remote { host } => {
-                    let missing = issues.iter().any(|issue| {
-                        matches!(
-                            issue,
-                            WorkspaceIssue::MissingHost { pane: id, .. } if *id == pane.id()
-                        )
-                    });
-                    (
-                        PaneTarget::remote(*host),
-                        missing.then_some(LeafMark::MissingHost { host: *host }),
-                    )
-                }
+                PendingConnection::Remote { host } => (PaneTarget::remote(*host), mark(*host)),
+                // A desktop or serial pane is restored the same way an SSH one is: as
+                // a waiting target. Starting any of them belongs to the session layer.
+                PendingConnection::Rdp { host } => (PaneTarget::rdp(*host), mark(*host)),
+                PendingConnection::Vnc { host } => (PaneTarget::vnc(*host), mark(*host)),
+                PendingConnection::Serial { host } => (PaneTarget::serial(*host), mark(*host)),
             };
             // A restored leaf has no session. `is_started` on the connection is
             // always false; this tree does not grow a process to disagree with it.

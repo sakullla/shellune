@@ -11,7 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use shellune_core::{HostConfig, HostId, HostValidationError, JumpFault, Port};
+use shellune_core::{
+    ConnectionRecord, HostConfig, HostId, HostValidationError, JumpFault, Port, ProtocolKind,
+    RdpCertificatePolicy, RdpConfig, SerialConfig, SerialFlow, SerialParity, VncConfig,
+    VncSecurity,
+};
 use shellune_storage::{
     BookError, CONFIG_KEYS, FORMAT_VERSION, HostBook, HostEdit, HostStore, LOG_FIELDS, StorageError,
 };
@@ -1553,5 +1557,481 @@ fn a_label_that_cannot_be_a_group_path_is_reported_and_kept_visible() {
             .group(),
         Some(long.as_str()),
         "the label was not silently dropped"
+    );
+}
+// ---------------------------------------------------------------------------
+// Connections of the other protocols (R2, R9, R18)
+// ---------------------------------------------------------------------------
+
+/// An RDP connection a test can save.
+fn rdp(name: &str, address: &str, user: &str) -> ConnectionRecord {
+    let mut config = RdpConfig::new(name, address, Some(user)).expect("a valid RDP connection");
+    config.set_port(3_389).expect("the default port");
+    ConnectionRecord::Rdp(config)
+}
+
+/// A VNC connection a test can save.
+fn vnc(name: &str, address: &str) -> ConnectionRecord {
+    ConnectionRecord::Vnc(VncConfig::new(name, address).expect("a valid VNC connection"))
+}
+
+/// A serial connection a test can save, on a frame that is not the default.
+fn serial(name: &str, device: &str) -> ConnectionRecord {
+    let mut config = SerialConfig::new(name, device).expect("a valid serial connection");
+    config.set_baud(9_600).expect("a common speed");
+    config.set_parity(SerialParity::Even);
+    config.set_flow(SerialFlow::Hardware);
+    ConnectionRecord::Serial(config)
+}
+
+#[test]
+fn a_document_with_desktop_and_serial_connections_passes_the_persisted_key_audit() {
+    let dir = TempDir::new("connection-audit");
+    let store = dir.store();
+    let mut book = store.load().expect("the book loads");
+    let mut office = RdpConfig::new("Office", "10.0.0.9", Some("alice")).expect("valid");
+    office.set_domain(Some("CORP"));
+    office.set_certificate(RdpCertificatePolicy::Reject);
+    book.insert_connection(ConnectionRecord::Rdp(office))
+        .expect("inserted");
+    let mut wall = VncConfig::new("Wall", "10.0.0.7").expect("valid");
+    wall.set_security(VncSecurity::EncryptedOnly);
+    book.insert_connection(ConnectionRecord::Vnc(wall))
+        .expect("inserted");
+    let mut console = SerialConfig::new("Console", "COM3").expect("valid");
+    console.set_parity(SerialParity::Even);
+    console.set_flow(SerialFlow::Hardware);
+    console.set_local_echo(true);
+    book.insert_connection(ConnectionRecord::Serial(console))
+        .expect("inserted");
+    store.save(&book).expect("the book saves");
+
+    let document: serde_json::Value =
+        serde_json::from_str(&dir.read_file()).expect("the file is JSON");
+    let mut keys = Vec::new();
+    collect_keys(&document, &mut keys);
+    for key in &keys {
+        assert!(
+            CONFIG_KEYS.contains(&key.as_str()),
+            "the saved document uses the key {key:?}, which is not on the allowlist"
+        );
+        let lower = key.to_lowercase();
+        for forbidden in [
+            "password",
+            "passphrase",
+            "secret",
+            "token",
+            "credential",
+            "private",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "the saved document has a key that names a secret: {key:?}"
+            );
+        }
+    }
+    // The audit really covered the new records rather than only an SSH one.
+    for expected in [
+        "protocol",
+        "domain",
+        "certificate",
+        "security",
+        "device",
+        "baud",
+        "data_bits",
+        "parity",
+        "stop_bits",
+        "flow",
+        "local_echo",
+    ] {
+        assert!(
+            keys.iter().any(|key| key == expected),
+            "the audit did not see the {expected} key: {keys:?}"
+        );
+    }
+}
+
+#[test]
+fn the_save_log_counts_connections_apart_from_hosts() {
+    let dir = TempDir::new("connection-log");
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    let store = dir.store().logging_to(move |line| {
+        sink.lock()
+            .expect("the log is reachable")
+            .push(line.to_owned());
+    });
+    let mut book = store.load().expect("the book loads");
+    book.insert(host("web", "10.0.0.5", 22, "deploy", None))
+        .expect("the host is inserted");
+    book.insert_connection(serial("Console", "COM3"))
+        .expect("the connection is inserted");
+    store.save(&book).expect("the book saves");
+
+    let saved = lines
+        .lock()
+        .expect("the log is reachable")
+        .iter()
+        .find(|line| line.starts_with("storage.saved"))
+        .cloned()
+        .expect("the save was logged");
+    assert!(
+        saved.contains("hosts=1"),
+        "one SSH host was written: {saved}"
+    );
+    assert!(
+        saved.contains("connections=1"),
+        "one connection of another protocol was written: {saved}"
+    );
+}
+#[test]
+fn a_book_of_ssh_hosts_is_written_without_the_new_fields() {
+    let dir = TempDir::new("legacy-shape");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", Some("Prod")));
+
+    let book = store.load().expect("the book loads");
+    assert_eq!(book.connections().len(), 0);
+    assert_eq!(book.connection_count(), 1);
+    let record = book.connection(web.id()).expect("the host is a connection");
+    assert_eq!(record.protocol(), ProtocolKind::Ssh);
+    assert_eq!(
+        book.records().len(),
+        1,
+        "a reader sees the host list and the connection list as one list"
+    );
+
+    let document: serde_json::Value =
+        serde_json::from_str(&dir.read_file()).expect("the file is JSON");
+    assert!(
+        document.get("connections").is_none(),
+        "a book without other protocols writes no connections key: {document}"
+    );
+    let stored_host = &document["hosts"][0];
+    assert!(
+        stored_host.get("protocol").is_none(),
+        "an SSH host keeps the exact shape older builds wrote: {stored_host}"
+    );
+}
+
+#[test]
+fn a_desktop_and_a_serial_connection_survive_a_restart_with_their_protocol() {
+    let dir = TempDir::new("protocols");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", None));
+
+    let mut book = store.load().expect("the book loads");
+    let office = rdp("Office desktop", "10.0.0.9", "alice");
+    let wall = vnc("Wall", "10.0.0.7");
+    let console = serial("Console", "COM3");
+    for record in [&office, &wall, &console] {
+        book.insert_connection(record.clone())
+            .expect("a fresh connection is inserted");
+    }
+    store.save(&book).expect("the book saves");
+
+    let document: serde_json::Value =
+        serde_json::from_str(&dir.read_file()).expect("the file is JSON");
+    let stored = document["connections"]
+        .as_array()
+        .expect("the other protocols are stored as a list");
+    assert_eq!(stored.len(), 3);
+    assert_eq!(stored[0]["protocol"], "rdp");
+    assert_eq!(stored[1]["protocol"], "vnc");
+    assert_eq!(stored[2]["protocol"], "serial");
+    assert_eq!(
+        document["hosts"].as_array().map(Vec::len),
+        Some(1),
+        "the SSH host stays in the host list it was written to"
+    );
+
+    let book = dir.store().load().expect("the restarted store reads it");
+    assert_eq!(book.hosts().len(), 1);
+    assert_eq!(book.connections().len(), 3);
+    assert_eq!(book.connection_count(), 4);
+    assert_eq!(book.connection(office.id()), Some(office.clone()));
+    assert_eq!(book.connection(wall.id()), Some(wall.clone()));
+    let reread = book
+        .connection(console.id())
+        .expect("the serial record is there");
+    assert_eq!(reread, console.clone());
+    let ConnectionRecord::Serial(config) = reread else {
+        panic!("the serial record keeps its protocol");
+    };
+    assert_eq!(config.baud(), 9_600);
+    assert_eq!(config.parity(), SerialParity::Even);
+    assert_eq!(config.flow(), SerialFlow::Hardware);
+    assert_eq!(config.frame(), "8E1");
+    assert_eq!(book.host(web.id()).map(HostConfig::name), Some("web"));
+}
+
+#[test]
+fn an_unknown_protocol_is_reported_instead_of_becoming_an_empty_book() {
+    let dir = TempDir::new("unknown-protocol");
+    let store = dir.store();
+    let id = HostId::new();
+    let text = format!(
+        r#"{{"version":{FORMAT_VERSION},"hosts":[],"connections":[{{"protocol":"telnet","id":"{id}","name":"old switch","address":"10.0.0.2","port":23}}],"recents":[]}}"#
+    );
+    dir.write_file(&text);
+
+    let error = store
+        .load()
+        .expect_err("a protocol this build cannot run is a failure");
+    let reason = match &error {
+        StorageError::Corrupt { reason, .. } => reason.clone(),
+        other => panic!("the file is reported as damaged, not as {other:?}"),
+    };
+    assert!(
+        reason.contains("telnet"),
+        "the refusal names the protocol it found: {reason}"
+    );
+    assert_eq!(
+        dir.read_file(),
+        text,
+        "the file that could not be understood is left exactly as it was"
+    );
+}
+
+#[test]
+fn a_desktop_record_inside_the_host_list_is_refused_instead_of_becoming_a_host() {
+    let dir = TempDir::new("rdp-in-hosts");
+    let store = dir.store();
+    let id = HostId::new();
+    dir.write_file(&format!(
+        r#"{{"version":{FORMAT_VERSION},"hosts":[{{"protocol":"rdp","id":"{id}","name":"office","address":"10.0.0.9","port":3389}}],"recents":[]}}"#
+    ));
+    let error = store
+        .load()
+        .expect_err("a desktop record is not an SSH host record");
+    assert!(
+        matches!(error, StorageError::Corrupt { .. }),
+        "the file is damaged as far as this build is concerned: {error:?}"
+    );
+}
+
+#[test]
+fn a_record_with_a_field_its_protocol_does_not_have_is_refused() {
+    let dir = TempDir::new("foreign-field");
+    let store = dir.store();
+    let id = HostId::new();
+    dir.write_file(&format!(
+        r#"{{"version":{FORMAT_VERSION},"hosts":[],"connections":[{{"protocol":"vnc","id":"{id}","name":"wall","address":"10.0.0.7","port":5900,"user":"alice"}}],"recents":[]}}"#
+    ));
+    assert!(
+        store.load().is_err(),
+        "a VNC record with an SSH-only field is not a file this build wrote"
+    );
+}
+
+#[test]
+fn an_ssh_record_in_the_connection_list_is_refused_rather_than_read_twice() {
+    let dir = TempDir::new("ssh-in-connections");
+    let store = dir.store();
+    let host = host("web", "10.0.0.5", 22, "deploy", None);
+    let id = host.id();
+    dir.write_file(&format!(
+        r#"{{"version":{FORMAT_VERSION},"hosts":[],"connections":[{{"protocol":"ssh","id":"{id}","name":"web","address":"10.0.0.5","port":22,"user":"deploy","group":null}}],"recents":[]}}"#
+    ));
+    let error = store.load().expect_err("one record cannot be two things");
+    assert!(
+        error.to_string().contains(&id.to_string()),
+        "the refusal names the record: {error}"
+    );
+}
+
+#[test]
+fn two_records_with_one_identifier_are_refused_across_the_lists() {
+    let dir = TempDir::new("shared-id");
+    let store = dir.store();
+    let id = HostId::new();
+    dir.write_file(&format!(
+        r#"{{"version":{FORMAT_VERSION},"hosts":[{{"id":"{id}","name":"web","address":"10.0.0.5","port":22,"user":"deploy","group":null}}],"connections":[{{"protocol":"vnc","id":"{id}","name":"wall","address":"10.0.0.7","port":5900}}],"recents":[]}}"#
+    ));
+    let error = store
+        .load()
+        .expect_err("one identifier cannot name two records");
+    assert!(
+        error.to_string().contains(&id.to_string()),
+        "the refusal names the identifier: {error}"
+    );
+}
+
+#[test]
+fn a_connection_identifier_is_unique_across_every_protocol() {
+    let dir = TempDir::new("unique-id");
+    let store = dir.store();
+    let mut book = store.load().expect("the book loads");
+    let office = rdp("Office", "10.0.0.9", "alice");
+    book.insert_connection(office.clone()).expect("inserted");
+    assert_eq!(
+        book.insert_connection(office.clone()),
+        Err(BookError::DuplicateHost { id: office.id() })
+    );
+    let web = host("web", "10.0.0.5", 22, "deploy", None);
+    book.insert(web.clone()).expect("the SSH host is inserted");
+    assert_eq!(
+        book.insert_connection(ConnectionRecord::Ssh(web.clone())),
+        Err(BookError::DuplicateHost { id: web.id() }),
+        "the host list and the connection list share one namespace"
+    );
+    assert_eq!(
+        book.record_connection(office.id(), 1_700_000_000),
+        Err(BookError::UnknownHost { id: office.id() }),
+        "a sign-in history is an SSH history, not a desktop one"
+    );
+}
+
+#[test]
+fn changing_a_connection_to_another_protocol_moves_it_and_drops_the_sign_in_history() {
+    let dir = TempDir::new("protocol-change");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", None));
+    let mut book = store.load().expect("the book loads");
+    book.record_connection(web.id(), 1_700_000_000)
+        .expect("the sign-in is recorded");
+
+    let mut office = RdpConfig::new("web", "10.0.0.5", Some("deploy")).expect("valid");
+    office.set_port(3_389).expect("a port");
+    book.update_connection(
+        ConnectionRecord::Rdp(office).reidentified(web.id()),
+        web.id(),
+    )
+    .expect("the connection changes protocol");
+    assert!(
+        book.update_connection(vnc("wall", "10.0.0.7"), web.id())
+            .is_err(),
+        "a record under another identifier cannot replace this one"
+    );
+    assert_eq!(book.hosts().len(), 0, "the host record is gone");
+    assert_eq!(book.connections().len(), 1);
+    assert_eq!(
+        book.recents().len(),
+        0,
+        "a desktop session does not inherit the SSH sign-in history"
+    );
+    store.save(&book).expect("the book saves");
+
+    let mut book = dir.store().load().expect("the restarted store reads it");
+    assert_eq!(
+        book.connection(web.id()).map(|record| record.protocol()),
+        Some(ProtocolKind::Rdp)
+    );
+
+    let unknown = HostId::new();
+    assert_eq!(
+        book.update_connection(vnc("wall", "10.0.0.7"), unknown),
+        Err(BookError::UnknownHost { id: unknown })
+    );
+    assert_eq!(
+        book.remove_connection(unknown),
+        Err(BookError::UnknownHost { id: unknown })
+    );
+}
+
+#[test]
+fn removing_a_connection_takes_it_out_of_the_list_it_lives_in() {
+    let dir = TempDir::new("remove-connection");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", None));
+    let mut book = store.load().expect("the book loads");
+    book.record_connection(web.id(), 1_700_000_000)
+        .expect("the sign-in is recorded");
+    let wall = vnc("Wall", "10.0.0.7");
+    book.insert_connection(wall.clone()).expect("inserted");
+
+    assert_eq!(
+        book.remove_connection(wall.id()),
+        Ok(wall.clone()),
+        "a desktop connection is removed from its own list"
+    );
+    assert_eq!(book.connections().len(), 0);
+    let saved_web = book.host(web.id()).expect("the host is there").clone();
+    assert_eq!(
+        book.remove_connection(web.id()),
+        Ok(ConnectionRecord::Ssh(saved_web)),
+        "the SSH host is still removable the way it always was"
+    );
+    assert_eq!(book.hosts().len(), 0);
+    assert_eq!(
+        book.recents().len(),
+        0,
+        "removing a host also removes its sign-in record"
+    );
+}
+
+#[test]
+fn a_search_finds_a_connection_by_its_name_its_protocol_or_its_target() {
+    let dir = TempDir::new("search-connections");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", Some("Prod")));
+    let mut book = store.load().expect("the book loads");
+    let office = rdp("Office desktop", "10.0.0.9", "alice");
+    let console = serial("Console", "COM3");
+    book.insert_connection(office.clone()).expect("inserted");
+    book.insert_connection(console.clone()).expect("inserted");
+
+    let ids = |phrase: &str| -> Vec<HostId> {
+        book.search_connections(phrase)
+            .iter()
+            .map(ConnectionRecord::id)
+            .collect()
+    };
+    assert_eq!(ids(""), vec![web.id(), office.id(), console.id()]);
+    assert_eq!(ids("office"), vec![office.id()]);
+    assert_eq!(ids("rdp"), vec![office.id()]);
+    assert_eq!(ids("serial"), vec![console.id()]);
+    assert_eq!(ids("COM3"), vec![console.id()]);
+    assert_eq!(ids("alice@10.0.0.9"), vec![office.id()]);
+    assert_eq!(
+        ids("prod"),
+        vec![web.id()],
+        "an SSH connection is still found by its group label"
+    );
+    assert_eq!(ids("ssh"), vec![web.id()]);
+    assert!(ids("warehouse").is_empty());
+}
+
+#[test]
+fn a_document_with_desktop_connections_still_has_no_place_for_a_secret() {
+    let dir = TempDir::new("connection-keys");
+    let store = dir.store();
+    let mut book = store.load().expect("the book loads");
+    let mut office = RdpConfig::new("Office", "10.0.0.9", Some("alice")).expect("valid");
+    office.set_remember_secret(true);
+    book.insert_connection(ConnectionRecord::Rdp(office))
+        .expect("inserted");
+    book.insert_connection(serial("Console", "COM3"))
+        .expect("inserted");
+    store.save(&book).expect("the book saves");
+
+    let document: serde_json::Value =
+        serde_json::from_str(&dir.read_file()).expect("the file is JSON");
+    let mut keys = Vec::new();
+    collect_keys(&document, &mut keys);
+    assert!(
+        keys.iter().any(|key| key == "remember_secret"),
+        "the document really was the one under test: {keys:?}"
+    );
+    for key in &keys {
+        let lower = key.to_lowercase();
+        for forbidden in [
+            "password",
+            "passphrase",
+            "secret_value",
+            "token",
+            "credential",
+            "private",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "the saved document has a key that names a secret: {key:?}"
+            );
+        }
+    }
+    let stored = document["connections"][0].to_string();
+    assert!(
+        !stored.contains("alice-password"),
+        "no value of a credential is written beside the record"
     );
 }

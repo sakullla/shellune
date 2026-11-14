@@ -65,6 +65,21 @@ pub const CONFIG_KEYS: &[&str] = &[
     "shell",
     "visible",
     "section",
+    // Connections whose protocol is not SSH: each carries its own protocol tag and
+    // only the fields its protocol has. None of these can hold a credential; the
+    // saved-secret flag keeps its name out of this list because the rule below
+    // rejects a key whose name contains "secret", and the storage tests cover it.
+    "protocol",
+    "domain",
+    "certificate",
+    "security",
+    "device",
+    "baud",
+    "data_bits",
+    "parity",
+    "stop_bits",
+    "flow",
+    "local_echo",
 ];
 
 /// Every field a log line may contain.
@@ -75,6 +90,7 @@ pub const LOG_FIELDS: &[&str] = &[
     "storage.save_failed",
     "path",
     "hosts",
+    "connections",
     "groups",
     "recents",
     "reason",
@@ -97,8 +113,14 @@ pub enum StoreEvent {
     Saved {
         /// The file that was written.
         path: PathBuf,
-        /// How many hosts were written.
+        /// How many SSH hosts were written.
         hosts: usize,
+        /// How many saved connections of another protocol were written.
+        ///
+        /// Counted apart from the hosts because the two live in different lists in the
+        /// document, and a support log that said "5 hosts" for three desktop
+        /// connections and two servers would be untrue.
+        connections: usize,
         /// How many distinct groups they use.
         groups: usize,
         /// How many recent connections were written.
@@ -126,7 +148,14 @@ impl StoreEvent {
     pub fn field_names(&self) -> &'static [&'static str] {
         match self {
             Self::Loaded { .. } => &["storage.loaded", "path", "hosts"],
-            Self::Saved { .. } => &["storage.saved", "path", "hosts", "groups", "recents"],
+            Self::Saved { .. } => &[
+                "storage.saved",
+                "path",
+                "hosts",
+                "connections",
+                "groups",
+                "recents",
+            ],
             Self::LoadFailed { .. } => &["storage.load_failed", "path", "reason"],
             Self::SaveFailed { .. } => &["storage.save_failed", "path", "reason"],
         }
@@ -157,11 +186,12 @@ impl StoreEvent {
             Self::Saved {
                 path,
                 hosts,
+                connections,
                 groups,
                 recents,
             } => {
                 line.push_str(&format!(
-                    " path=\"{}\" hosts={hosts} groups={groups} recents={recents}",
+                    " path=\"{}\" hosts={hosts} connections={connections} groups={groups} recents={recents}",
                     path.display()
                 ));
             }
@@ -219,6 +249,7 @@ mod tests {
             StoreEvent::Saved {
                 path: path(),
                 hosts: 2,
+                connections: 1,
                 groups: 1,
                 recents: 0,
             },

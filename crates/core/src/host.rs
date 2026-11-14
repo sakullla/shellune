@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::connection::{ConnectionDefaults, ConnectionPolicy, HostConnection};
 use crate::group::GroupPath;
 use crate::ids::HostId;
+use crate::session::SessionCapabilities;
 use crate::task::TransferProtocol;
 
 /// Port used when the user does not specify one.
@@ -733,6 +734,1423 @@ fn normalize_proxy_command(command: Option<String>) -> Option<String> {
 fn normalize_identity_file(path: Option<String>) -> Option<String> {
     path.map(|path| path.trim().to_owned())
         .filter(|path| !path.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Protocol identity and the configuration each protocol keeps (R2, R9, R18)
+// ---------------------------------------------------------------------------
+//
+// A saved connection is one of four kinds, and every kind keeps its own
+// configuration instead of sharing one record full of optional SSH fields. A record
+// written before this choice existed carries no protocol tag at all, and that is
+// exactly what an SSH connection means, so an older file keeps its meaning.
+
+/// What a saved connection speaks.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolKind {
+    /// Secure Shell: a character session with files, batch, forwarding and X11.
+    #[default]
+    Ssh,
+    /// Remote Desktop Protocol: a desktop session.
+    Rdp,
+    /// RFB/VNC: a desktop session.
+    Vnc,
+    /// A serial device: a character session over a local port (R21).
+    Serial,
+}
+
+impl ProtocolKind {
+    /// Every protocol, in the order a chooser shows them.
+    pub const ALL: [Self; 4] = [Self::Ssh, Self::Rdp, Self::Vnc, Self::Serial];
+
+    /// What the tag says in a stored record.
+    ///
+    /// The same string the serde representation uses, so a file, a log line and a
+    /// test all name the protocol identically.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Ssh => "ssh",
+            Self::Rdp => "rdp",
+            Self::Vnc => "vnc",
+            Self::Serial => "serial",
+        }
+    }
+
+    /// Short label used beside a connection name.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ssh => "SSH",
+            Self::Rdp => "RDP",
+            Self::Vnc => "VNC",
+            Self::Serial => "Serial",
+        }
+    }
+
+    /// The port this protocol uses when the user does not choose one.
+    ///
+    /// A serial port has no network port, which is why the answer is optional
+    /// rather than a number every protocol has to invent.
+    #[must_use]
+    pub fn default_port(self) -> Option<Port> {
+        match self {
+            Self::Ssh => Some(Port(DEFAULT_SSH_PORT)),
+            Self::Rdp => Some(Port(DEFAULT_RDP_PORT)),
+            Self::Vnc => Some(Port(DEFAULT_VNC_PORT)),
+            Self::Serial => None,
+        }
+    }
+
+    /// Whether this protocol is the one that carries files, batch, forwarding and X11.
+    ///
+    /// Named for what the code decides with it: only an SSH connection may be a
+    /// batch target, a forwarding host or an X11 client.
+    #[must_use]
+    pub fn is_ssh(self) -> bool {
+        matches!(self, Self::Ssh)
+    }
+
+    /// Whether the connection is reached over the network.
+    #[must_use]
+    pub fn is_network(self) -> bool {
+        matches!(self, Self::Ssh | Self::Rdp | Self::Vnc)
+    }
+
+    /// Whether the session is drawn as a character grid.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Ssh | Self::Serial)
+    }
+
+    /// Whether the session is drawn as a framebuffer.
+    #[must_use]
+    pub fn is_desktop(self) -> bool {
+        matches!(self, Self::Rdp | Self::Vnc)
+    }
+
+    /// The protocol a stored tag names, or `None` for a word this build does not know.
+    ///
+    /// A caller that meets an unknown word keeps it as an unknown protocol rather
+    /// than turning it into a connection it could dial.
+    #[must_use]
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "ssh" => Some(Self::Ssh),
+            "rdp" => Some(Self::Rdp),
+            "vnc" => Some(Self::Vnc),
+            "serial" => Some(Self::Serial),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ProtocolKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.label(), formatter)
+    }
+}
+
+/// Port an RDP connection uses when the user does not choose one.
+pub const DEFAULT_RDP_PORT: u16 = 3389;
+
+/// Port a VNC connection uses when the user does not choose one.
+pub const DEFAULT_VNC_PORT: u16 = 5900;
+
+/// Line speed a serial connection starts with when the user does not choose one.
+pub const DEFAULT_SERIAL_BAUD: u32 = 115_200;
+
+/// Slowest line speed this build accepts.
+pub const MIN_SERIAL_BAUD: u32 = 50;
+
+/// Fastest line speed this build accepts.
+pub const MAX_SERIAL_BAUD: u32 = 4_000_000;
+
+/// Data bits a serial frame can carry.
+pub const MIN_SERIAL_DATA_BITS: u8 = 5;
+
+/// Widest serial frame this build accepts.
+pub const MAX_SERIAL_DATA_BITS: u8 = 8;
+
+/// How a serial frame carries parity.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialParity {
+    /// No parity bit.
+    #[default]
+    None,
+    /// Even parity.
+    Even,
+    /// Odd parity.
+    Odd,
+    /// Mark (always one) parity.
+    Mark,
+    /// Space (always zero) parity.
+    Space,
+}
+
+impl SerialParity {
+    /// Every parity, in the order a chooser shows them.
+    pub const ALL: [Self; 5] = [Self::None, Self::Even, Self::Odd, Self::Mark, Self::Space];
+
+    /// Short label used in the form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Even => "Even",
+            Self::Odd => "Odd",
+            Self::Mark => "Mark",
+            Self::Space => "Space",
+        }
+    }
+}
+
+/// How many stop bits a serial frame ends with.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialStopBits {
+    /// One stop bit.
+    #[default]
+    One,
+    /// Two stop bits.
+    Two,
+}
+
+impl SerialStopBits {
+    /// Every choice, in the order a chooser shows them.
+    pub const ALL: [Self; 2] = [Self::One, Self::Two];
+
+    /// Short label used in the form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::One => "1",
+            Self::Two => "2",
+        }
+    }
+}
+
+/// How the serial port paces the bytes it carries.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialFlow {
+    /// No pacing.
+    #[default]
+    None,
+    /// XON/XOFF characters.
+    Software,
+    /// RTS/CTS lines.
+    Hardware,
+}
+
+impl SerialFlow {
+    /// Every choice, in the order a chooser shows them.
+    pub const ALL: [Self; 3] = [Self::None, Self::Software, Self::Hardware];
+
+    /// Short label used in the form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Software => "XON/XOFF",
+            Self::Hardware => "RTS/CTS",
+        }
+    }
+}
+
+/// Why a non-SSH connection configuration was rejected.
+///
+/// Kept apart from `HostValidationError` so that the SSH rules a caller already
+/// matches on do not grow variants that mean something else.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectionValidationError {
+    /// The display name is empty or only whitespace.
+    #[error("connection name cannot be empty")]
+    EmptyName,
+    /// The address is empty or only whitespace.
+    #[error("host address cannot be empty")]
+    EmptyAddress,
+    /// The address contains whitespace and cannot be resolved.
+    #[error("host address cannot contain whitespace")]
+    AddressContainsWhitespace,
+    /// The port falls outside `1..=65535`.
+    #[error("port {value} is outside the valid range 1-65535")]
+    PortOutOfRange {
+        /// The rejected value, kept as an integer so the message is exact.
+        value: u32,
+    },
+    /// The user name is present but contains whitespace.
+    #[error("user name cannot contain whitespace")]
+    UserContainsWhitespace,
+    /// The device name is empty or only whitespace.
+    #[error("device name cannot be empty")]
+    EmptyDevice,
+    /// The device name contains a control character.
+    #[error("device name cannot contain control characters")]
+    DeviceContainsControlCharacter,
+    /// The line speed is outside the range this build accepts.
+    #[error("baud rate {value} is outside the range {MIN_SERIAL_BAUD}-{MAX_SERIAL_BAUD}")]
+    BaudOutOfRange {
+        /// The rejected value, kept as an integer so the message is exact.
+        value: u32,
+    },
+    /// The frame width is not one a serial port can use.
+    #[error("data bits {value} is outside the range {MIN_SERIAL_DATA_BITS}-{MAX_SERIAL_DATA_BITS}")]
+    DataBitsOutOfRange {
+        /// The rejected value, kept as a number so the message is exact.
+        value: u8,
+    },
+}
+
+/// How much a VNC connection insists on encryption (R18, R20 in the wider sense).
+///
+/// This is a policy the connection will follow, not a claim about the server: the
+/// session reports the security type it actually negotiated, and an
+/// `EncryptedOnly` connection that cannot reach an encrypted type fails instead of
+/// silently using a weaker one.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VncSecurity {
+    /// Accept whatever security type the server offers and report what it was.
+    #[default]
+    Automatic,
+    /// Refuse a connection whose negotiated security type is not encrypted.
+    EncryptedOnly,
+}
+
+impl VncSecurity {
+    /// Every choice, in the order a chooser shows them.
+    pub const ALL: [Self; 2] = [Self::Automatic, Self::EncryptedOnly];
+
+    /// Short label used in the form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Server default",
+            Self::EncryptedOnly => "Encrypted only",
+        }
+    }
+}
+
+/// What a RDP connection does with a server certificate it has not been told to trust.
+///
+/// The fingerprint is still shown before a decision is taken; this policy decides
+/// whether the user is asked at all or the attempt ends. It never means "accept
+/// anything silently".
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RdpCertificatePolicy {
+    /// Show the certificate and let the user decide, every time.
+    #[default]
+    Ask,
+    /// End the attempt when the certificate is not trusted, without asking.
+    Reject,
+}
+
+impl RdpCertificatePolicy {
+    /// Every choice, in the order a chooser shows them.
+    pub const ALL: [Self; 2] = [Self::Ask, Self::Reject];
+
+    /// Short label used in the form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask every time",
+            Self::Reject => "Reject untrusted",
+        }
+    }
+}
+
+/// Whether a policy is the default one, so a file can leave it out.
+fn certificate_is_default(policy: &RdpCertificatePolicy) -> bool {
+    *policy == RdpCertificatePolicy::Ask
+}
+
+/// Whether a security choice is the default one, so a file can leave it out.
+fn security_is_default(security: &VncSecurity) -> bool {
+    *security == VncSecurity::Automatic
+}
+
+/// A saved RDP connection (R18).
+///
+/// The record holds what the next connection needs to find and sign in to a
+/// desktop: address, port, an optional user and an optional domain. A password has
+/// nowhere to live here; `remember_secret` only records that the system credential
+/// store may hold one for this identifier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RdpConfigWire")]
+pub struct RdpConfig {
+    id: HostId,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_path: Option<GroupPath>,
+    address: String,
+    port: Port,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    /// The Windows domain or realm the user belongs to, when the server needs it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    /// What the connection does with a certificate it has not been told to trust.
+    #[serde(default, skip_serializing_if = "certificate_is_default")]
+    certificate: RdpCertificatePolicy,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    remember_secret: bool,
+}
+
+/// The stored shape of an RDP connection.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RdpConfigWire {
+    id: HostId,
+    name: String,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    group_path: Option<GroupPath>,
+    address: String,
+    port: Port,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    certificate: RdpCertificatePolicy,
+    #[serde(default)]
+    remember_secret: bool,
+}
+
+impl TryFrom<RdpConfigWire> for RdpConfig {
+    type Error = ConnectionValidationError;
+
+    fn try_from(wire: RdpConfigWire) -> Result<Self, Self::Error> {
+        let (group, group_path) = split_group(wire.group, wire.group_path);
+        Ok(Self {
+            id: wire.id,
+            name: connection_name(wire.name)?,
+            group,
+            group_path,
+            address: connection_address(wire.address)?,
+            // The range check is repeated here: a stored `port: 0` would otherwise
+            // become a connection that dials nothing.
+            port: connection_port(u32::from(wire.port.get()))?,
+            user: connection_user(wire.user)?,
+            domain: normalize_optional_text(wire.domain),
+            certificate: wire.certificate,
+            remember_secret: wire.remember_secret,
+        })
+    }
+}
+
+impl RdpConfig {
+    /// A new RDP connection on the protocol's default port.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError` when the name or address is empty, the
+    /// address contains whitespace or the optional user is unusable.
+    pub fn new(
+        name: impl Into<String>,
+        address: impl Into<String>,
+        user: Option<impl Into<String>>,
+    ) -> Result<Self, ConnectionValidationError> {
+        Ok(Self {
+            id: HostId::new(),
+            name: connection_name(name.into())?,
+            group: None,
+            group_path: None,
+            address: connection_address(address.into())?,
+            port: Port(DEFAULT_RDP_PORT),
+            user: connection_user(user.map(Into::into))?,
+            domain: None,
+            certificate: RdpCertificatePolicy::default(),
+            remember_secret: false,
+        })
+    }
+
+    /// Stable identifier, shared with the secret store key and the workspace.
+    #[must_use]
+    pub fn id(&self) -> HostId {
+        self.id
+    }
+
+    /// User-visible name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Host name or address.
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// TCP port.
+    #[must_use]
+    pub fn port(&self) -> Port {
+        self.port
+    }
+
+    /// The user the next connection signs in as, when one was chosen.
+    #[must_use]
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
+    /// The domain the user belongs to, when one was chosen.
+    #[must_use]
+    pub fn domain(&self) -> Option<&str> {
+        self.domain.as_deref()
+    }
+
+    /// The single grouping label an earlier build would have written.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    /// The hierarchy path of the group this connection is in.
+    #[must_use]
+    pub fn group_path(&self) -> Option<&GroupPath> {
+        self.group_path.as_ref()
+    }
+
+    /// What the connection does with a certificate it does not already trust.
+    #[must_use]
+    pub fn certificate(&self) -> RdpCertificatePolicy {
+        self.certificate
+    }
+
+    /// Whether a credential for this identifier may be in the system store.
+    #[must_use]
+    pub fn remembers_secret(&self) -> bool {
+        self.remember_secret
+    }
+
+    /// What the connection would dial, as one line for the list.
+    #[must_use]
+    pub fn target(&self) -> String {
+        match self.user() {
+            Some(user) => format!("{user}@{}:{}", self.address, self.port),
+            None => format!("{}:{}", self.address, self.port),
+        }
+    }
+
+    /// Renames the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::EmptyName` for a blank name.
+    pub fn set_name(&mut self, name: impl Into<String>) -> Result<(), ConnectionValidationError> {
+        self.name = connection_name(name.into())?;
+        Ok(())
+    }
+
+    /// Changes the address.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::EmptyAddress` or
+    /// `ConnectionValidationError::AddressContainsWhitespace`.
+    pub fn set_address(
+        &mut self,
+        address: impl Into<String>,
+    ) -> Result<(), ConnectionValidationError> {
+        self.address = connection_address(address.into())?;
+        Ok(())
+    }
+
+    /// Changes the port.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::PortOutOfRange` outside `1..=65535`.
+    pub fn set_port(&mut self, port: u32) -> Result<(), ConnectionValidationError> {
+        self.port = connection_port(port)?;
+        Ok(())
+    }
+
+    /// Sets or clears the user.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::UserContainsWhitespace` for a user with
+    /// whitespace in it.
+    pub fn set_user(
+        &mut self,
+        user: Option<impl Into<String>>,
+    ) -> Result<(), ConnectionValidationError> {
+        self.user = connection_user(user.map(Into::into))?;
+        Ok(())
+    }
+
+    /// Sets or clears the domain.
+    pub fn set_domain(&mut self, domain: Option<impl Into<String>>) {
+        self.domain = normalize_optional_text(domain.map(Into::into));
+    }
+
+    /// Chooses what an untrusted certificate means for this connection.
+    pub fn set_certificate(&mut self, policy: RdpCertificatePolicy) {
+        self.certificate = policy;
+    }
+
+    /// Sets or clears the grouping label.
+    pub fn set_group(&mut self, group: Option<impl Into<String>>) {
+        self.group = normalize_optional_text(group.map(Into::into));
+        if self.group.is_some() {
+            self.group_path = None;
+        }
+    }
+
+    /// Places the connection in a group hierarchy.
+    pub fn set_group_path(&mut self, path: Option<GroupPath>) {
+        if path.is_some() {
+            self.group = None;
+        }
+        self.group_path = path;
+    }
+
+    /// Records or clears whether the system store may hold a credential for this id.
+    pub fn set_remember_secret(&mut self, remember: bool) {
+        self.remember_secret = remember;
+    }
+}
+
+/// A saved VNC connection (R18).
+///
+/// VNC authentication is a password and nothing else, so this record has no user
+/// and no domain field rather than two fields that would always be empty.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "VncConfigWire")]
+pub struct VncConfig {
+    id: HostId,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_path: Option<GroupPath>,
+    address: String,
+    port: Port,
+    /// How much this connection insists on encryption.
+    #[serde(default, skip_serializing_if = "security_is_default")]
+    security: VncSecurity,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    remember_secret: bool,
+}
+
+/// The stored shape of a VNC connection.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VncConfigWire {
+    id: HostId,
+    name: String,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    group_path: Option<GroupPath>,
+    address: String,
+    port: Port,
+    #[serde(default)]
+    security: VncSecurity,
+    #[serde(default)]
+    remember_secret: bool,
+}
+
+impl TryFrom<VncConfigWire> for VncConfig {
+    type Error = ConnectionValidationError;
+
+    fn try_from(wire: VncConfigWire) -> Result<Self, Self::Error> {
+        let (group, group_path) = split_group(wire.group, wire.group_path);
+        Ok(Self {
+            id: wire.id,
+            name: connection_name(wire.name)?,
+            group,
+            group_path,
+            address: connection_address(wire.address)?,
+            port: connection_port(u32::from(wire.port.get()))?,
+            security: wire.security,
+            remember_secret: wire.remember_secret,
+        })
+    }
+}
+
+impl VncConfig {
+    /// A new VNC connection on the protocol's default port.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError` when the name or address is empty or the
+    /// address contains whitespace.
+    pub fn new(
+        name: impl Into<String>,
+        address: impl Into<String>,
+    ) -> Result<Self, ConnectionValidationError> {
+        Ok(Self {
+            id: HostId::new(),
+            name: connection_name(name.into())?,
+            group: None,
+            group_path: None,
+            address: connection_address(address.into())?,
+            port: Port(DEFAULT_VNC_PORT),
+            security: VncSecurity::default(),
+            remember_secret: false,
+        })
+    }
+
+    /// Stable identifier, shared with the secret store key and the workspace.
+    #[must_use]
+    pub fn id(&self) -> HostId {
+        self.id
+    }
+
+    /// User-visible name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Host name or address.
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// TCP port.
+    #[must_use]
+    pub fn port(&self) -> Port {
+        self.port
+    }
+
+    /// The single grouping label an earlier build would have written.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    /// The hierarchy path of the group this connection is in.
+    #[must_use]
+    pub fn group_path(&self) -> Option<&GroupPath> {
+        self.group_path.as_ref()
+    }
+
+    /// How much this connection insists on encryption.
+    #[must_use]
+    pub fn security(&self) -> VncSecurity {
+        self.security
+    }
+
+    /// Whether a credential for this identifier may be in the system store.
+    #[must_use]
+    pub fn remembers_secret(&self) -> bool {
+        self.remember_secret
+    }
+
+    /// What the connection would dial, as one line for the list.
+    #[must_use]
+    pub fn target(&self) -> String {
+        format!("{}:{}", self.address, self.port)
+    }
+
+    /// Renames the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::EmptyName` for a blank name.
+    pub fn set_name(&mut self, name: impl Into<String>) -> Result<(), ConnectionValidationError> {
+        self.name = connection_name(name.into())?;
+        Ok(())
+    }
+
+    /// Changes the address.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::EmptyAddress` or
+    /// `ConnectionValidationError::AddressContainsWhitespace`.
+    pub fn set_address(
+        &mut self,
+        address: impl Into<String>,
+    ) -> Result<(), ConnectionValidationError> {
+        self.address = connection_address(address.into())?;
+        Ok(())
+    }
+
+    /// Changes the port.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::PortOutOfRange` outside `1..=65535`.
+    pub fn set_port(&mut self, port: u32) -> Result<(), ConnectionValidationError> {
+        self.port = connection_port(port)?;
+        Ok(())
+    }
+
+    /// Sets or clears the grouping label.
+    pub fn set_group(&mut self, group: Option<impl Into<String>>) {
+        self.group = normalize_optional_text(group.map(Into::into));
+        if self.group.is_some() {
+            self.group_path = None;
+        }
+    }
+
+    /// Places the connection in a group hierarchy.
+    pub fn set_group_path(&mut self, path: Option<GroupPath>) {
+        if path.is_some() {
+            self.group = None;
+        }
+        self.group_path = path;
+    }
+
+    /// Chooses how much this connection insists on encryption.
+    pub fn set_security(&mut self, security: VncSecurity) {
+        self.security = security;
+    }
+
+    /// Records or clears whether the system store may hold a credential for this id.
+    pub fn set_remember_secret(&mut self, remember: bool) {
+        self.remember_secret = remember;
+    }
+}
+
+/// A saved serial connection (R18, R21).
+///
+/// The record names the device and the frame it speaks. It holds no credential:
+/// a serial port authenticates nothing, so there is no field here that could carry
+/// a secret and no `remember_secret` flag to mislead a reader.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SerialConfigWire")]
+pub struct SerialConfig {
+    id: HostId,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_path: Option<GroupPath>,
+    /// The device path or port name, exactly as the platform spells it.
+    device: String,
+    baud: u32,
+    data_bits: u8,
+    parity: SerialParity,
+    stop_bits: SerialStopBits,
+    flow: SerialFlow,
+    /// Whether what the user types is echoed locally instead of by the device.
+    ///
+    /// A terminal device that does not echo would otherwise show nothing as it is
+    /// typed; a device that does would show every character twice, so this is a
+    /// per-connection decision and not a global one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    local_echo: bool,
+}
+
+/// The stored shape of a serial connection.
+///
+/// The frame parameters default to the values a new form starts with, so a record
+/// that names only a device still means something specific instead of failing to
+/// load.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerialConfigWire {
+    id: HostId,
+    name: String,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    group_path: Option<GroupPath>,
+    device: String,
+    #[serde(default = "default_baud")]
+    baud: u32,
+    #[serde(default = "default_data_bits")]
+    data_bits: u8,
+    #[serde(default)]
+    parity: SerialParity,
+    #[serde(default)]
+    stop_bits: SerialStopBits,
+    #[serde(default)]
+    flow: SerialFlow,
+    #[serde(default)]
+    local_echo: bool,
+}
+
+fn default_baud() -> u32 {
+    DEFAULT_SERIAL_BAUD
+}
+
+fn default_data_bits() -> u8 {
+    MAX_SERIAL_DATA_BITS
+}
+
+impl TryFrom<SerialConfigWire> for SerialConfig {
+    type Error = ConnectionValidationError;
+
+    fn try_from(wire: SerialConfigWire) -> Result<Self, Self::Error> {
+        let (group, group_path) = split_group(wire.group, wire.group_path);
+        Ok(Self {
+            id: wire.id,
+            name: connection_name(wire.name)?,
+            group,
+            group_path,
+            device: connection_device(wire.device)?,
+            baud: connection_baud(wire.baud)?,
+            data_bits: connection_data_bits(wire.data_bits)?,
+            parity: wire.parity,
+            stop_bits: wire.stop_bits,
+            flow: wire.flow,
+            local_echo: wire.local_echo,
+        })
+    }
+}
+
+impl SerialConfig {
+    /// A new serial connection on the default line speed and frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError` when the name is empty or the device is
+    /// empty or carries control characters.
+    pub fn new(
+        name: impl Into<String>,
+        device: impl Into<String>,
+    ) -> Result<Self, ConnectionValidationError> {
+        Ok(Self {
+            id: HostId::new(),
+            name: connection_name(name.into())?,
+            group: None,
+            group_path: None,
+            device: connection_device(device.into())?,
+            baud: DEFAULT_SERIAL_BAUD,
+            data_bits: MAX_SERIAL_DATA_BITS,
+            parity: SerialParity::None,
+            stop_bits: SerialStopBits::One,
+            flow: SerialFlow::None,
+            local_echo: false,
+        })
+    }
+
+    /// Stable identifier, shared with the workspace.
+    #[must_use]
+    pub fn id(&self) -> HostId {
+        self.id
+    }
+
+    /// User-visible name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The device this connection opens, exactly as the platform spells it.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// Line speed.
+    #[must_use]
+    pub fn baud(&self) -> u32 {
+        self.baud
+    }
+
+    /// Bits per frame.
+    #[must_use]
+    pub fn data_bits(&self) -> u8 {
+        self.data_bits
+    }
+
+    /// Parity.
+    #[must_use]
+    pub fn parity(&self) -> SerialParity {
+        self.parity
+    }
+
+    /// Stop bits.
+    #[must_use]
+    pub fn stop_bits(&self) -> SerialStopBits {
+        self.stop_bits
+    }
+
+    /// Flow control.
+    #[must_use]
+    pub fn flow(&self) -> SerialFlow {
+        self.flow
+    }
+
+    /// Whether typed characters are echoed locally rather than by the device.
+    #[must_use]
+    pub fn local_echo(&self) -> bool {
+        self.local_echo
+    }
+
+    /// The single grouping label an earlier build would have written.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    /// The hierarchy path of the group this connection is in.
+    #[must_use]
+    pub fn group_path(&self) -> Option<&GroupPath> {
+        self.group_path.as_ref()
+    }
+
+    /// What the connection would open, as one line for the list.
+    #[must_use]
+    pub fn target(&self) -> String {
+        format!("{} {} {}", self.device, self.baud, self.frame())
+    }
+
+    /// The frame parameters as the short form a serial tool prints.
+    #[must_use]
+    pub fn frame(&self) -> String {
+        format!(
+            "{}{}{}",
+            self.data_bits,
+            match self.parity {
+                SerialParity::None => "N",
+                SerialParity::Even => "E",
+                SerialParity::Odd => "O",
+                SerialParity::Mark => "M",
+                SerialParity::Space => "S",
+            },
+            self.stop_bits.label()
+        )
+    }
+
+    /// Renames the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::EmptyName` for a blank name.
+    pub fn set_name(&mut self, name: impl Into<String>) -> Result<(), ConnectionValidationError> {
+        self.name = connection_name(name.into())?;
+        Ok(())
+    }
+
+    /// Changes the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::EmptyDevice` or
+    /// `ConnectionValidationError::DeviceContainsControlCharacter`.
+    pub fn set_device(
+        &mut self,
+        device: impl Into<String>,
+    ) -> Result<(), ConnectionValidationError> {
+        self.device = connection_device(device.into())?;
+        Ok(())
+    }
+
+    /// Changes the line speed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::BaudOutOfRange` outside the supported range.
+    pub fn set_baud(&mut self, baud: u32) -> Result<(), ConnectionValidationError> {
+        self.baud = connection_baud(baud)?;
+        Ok(())
+    }
+
+    /// Changes the frame width.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::DataBitsOutOfRange` outside `5..=8`.
+    pub fn set_data_bits(&mut self, data_bits: u8) -> Result<(), ConnectionValidationError> {
+        self.data_bits = connection_data_bits(data_bits)?;
+        Ok(())
+    }
+
+    /// Sets the parity.
+    pub fn set_parity(&mut self, parity: SerialParity) {
+        self.parity = parity;
+    }
+
+    /// Sets the number of stop bits.
+    pub fn set_stop_bits(&mut self, stop_bits: SerialStopBits) {
+        self.stop_bits = stop_bits;
+    }
+
+    /// Sets the flow control.
+    pub fn set_flow(&mut self, flow: SerialFlow) {
+        self.flow = flow;
+    }
+
+    /// Chooses whether typed characters are echoed locally.
+    pub fn set_local_echo(&mut self, echo: bool) {
+        self.local_echo = echo;
+    }
+
+    /// Sets or clears the grouping label.
+    pub fn set_group(&mut self, group: Option<impl Into<String>>) {
+        self.group = normalize_optional_text(group.map(Into::into));
+        if self.group.is_some() {
+            self.group_path = None;
+        }
+    }
+
+    /// Places the connection in a group hierarchy.
+    pub fn set_group_path(&mut self, path: Option<GroupPath>) {
+        if path.is_some() {
+            self.group = None;
+        }
+        self.group_path = path;
+    }
+}
+
+/// One saved connection of any protocol (R2, R18).
+///
+/// The SSH variant holds the record this build already wrote, so an SSH connection
+/// keeps every field it had; the other variants hold only their own protocol's
+/// configuration. Nothing here is a live session, and nothing here dials, opens a
+/// device or runs a command.
+///
+/// The stored form carries the protocol as a tag, except for SSH, which is written
+/// exactly as before so an older file stays byte-identical.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum ConnectionRecord {
+    /// A saved SSH host, with the fields this build already had.
+    Ssh(HostConfig),
+    /// A saved RDP endpoint.
+    Rdp(RdpConfig),
+    /// A saved VNC endpoint.
+    Vnc(VncConfig),
+    /// A saved serial device.
+    Serial(SerialConfig),
+}
+
+impl ConnectionRecord {
+    /// Stable identifier, shared by the list, the secret store and the workspace.
+    #[must_use]
+    pub fn id(&self) -> HostId {
+        match self {
+            Self::Ssh(host) => host.id(),
+            Self::Rdp(config) => config.id(),
+            Self::Vnc(config) => config.id(),
+            Self::Serial(config) => config.id(),
+        }
+    }
+
+    /// User-visible name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Ssh(host) => host.name(),
+            Self::Rdp(config) => config.name(),
+            Self::Vnc(config) => config.name(),
+            Self::Serial(config) => config.name(),
+        }
+    }
+
+    /// Which protocol this connection speaks.
+    #[must_use]
+    pub fn protocol(&self) -> ProtocolKind {
+        match self {
+            Self::Ssh(_) => ProtocolKind::Ssh,
+            Self::Rdp(_) => ProtocolKind::Rdp,
+            Self::Vnc(_) => ProtocolKind::Vnc,
+            Self::Serial(_) => ProtocolKind::Serial,
+        }
+    }
+
+    /// The single grouping label an earlier build would have written.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        match self {
+            Self::Ssh(host) => host.group(),
+            Self::Rdp(config) => config.group(),
+            Self::Vnc(config) => config.group(),
+            Self::Serial(config) => config.group(),
+        }
+    }
+
+    /// The hierarchy path of the group this connection is in.
+    ///
+    /// Returned by value because the SSH record already answers with its own copy;
+    /// a caller that needs one string should ask [`Self::group_text`].
+    #[must_use]
+    pub fn group_path(&self) -> Option<GroupPath> {
+        match self {
+            Self::Ssh(host) => host.group_path(),
+            Self::Rdp(config) => config.group_path().cloned(),
+            Self::Vnc(config) => config.group_path().cloned(),
+            Self::Serial(config) => config.group_path().cloned(),
+        }
+    }
+
+    /// The grouping as one string, whichever of the two spellings the record has.
+    #[must_use]
+    pub fn group_text(&self) -> Option<String> {
+        self.group_path()
+            .map(|path| path.to_string())
+            .or_else(|| self.group().map(str::to_owned))
+    }
+
+    /// What the connection would reach, as one line for the list.
+    #[must_use]
+    pub fn target(&self) -> String {
+        match self {
+            Self::Ssh(host) => host.target(),
+            Self::Rdp(config) => config.target(),
+            Self::Vnc(config) => config.target(),
+            Self::Serial(config) => config.target(),
+        }
+    }
+
+    /// Whether a credential for this identifier may be in the system store.
+    ///
+    /// A serial port never has one. Desktop and SSH connections record only the
+    /// fact that the store may hold a secret; the secret itself stays there.
+    #[must_use]
+    pub fn remembers_secret(&self) -> bool {
+        match self {
+            Self::Ssh(host) => host.remembers_secret(),
+            Self::Rdp(config) => config.remembers_secret(),
+            Self::Vnc(config) => config.remembers_secret(),
+            Self::Serial(_) => false,
+        }
+    }
+
+    /// The SSH record, when this connection is one.
+    ///
+    /// Batch targets, SSH imports, forwarding rules and X11 sessions ask for this
+    /// and get `None` for every other protocol, which is what keeps those features
+    /// off a connection they cannot use.
+    #[must_use]
+    pub fn as_ssh(&self) -> Option<&HostConfig> {
+        match self {
+            Self::Ssh(host) => Some(host),
+            Self::Rdp(_) | Self::Vnc(_) | Self::Serial(_) => None,
+        }
+    }
+
+    /// Whether this connection is an SSH one.
+    #[must_use]
+    pub fn is_ssh(&self) -> bool {
+        self.protocol().is_ssh()
+    }
+
+    /// What a session of this protocol can do (R2, R18, R23).
+    #[must_use]
+    pub fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities::of_protocol(self.protocol())
+    }
+
+    /// A copy with a fresh identifier, no saved credential and no history (R9).
+    ///
+    /// The copy is a new record: the recency log is keyed by identifier, so the
+    /// original's history does not follow it, and no credential reference is
+    /// carried because the copy has an identifier the store has never seen.
+    /// An SSH copy also drops any jump that named the copy itself, so a duplicate
+    /// can never be built as a cycle.
+    #[must_use]
+    pub fn duplicated(&self) -> Self {
+        match self {
+            Self::Ssh(host) => {
+                let mut copy = host.clone();
+                copy.id = HostId::new();
+                copy.remember_secret = false;
+                let id = copy.id;
+                copy.jumps.retain(|jump| *jump != id);
+                Self::Ssh(copy)
+            }
+            Self::Rdp(config) => {
+                let mut copy = config.clone();
+                copy.id = HostId::new();
+                copy.remember_secret = false;
+                Self::Rdp(copy)
+            }
+            Self::Vnc(config) => {
+                let mut copy = config.clone();
+                copy.id = HostId::new();
+                copy.remember_secret = false;
+                Self::Vnc(copy)
+            }
+            Self::Serial(config) => {
+                let mut copy = config.clone();
+                copy.id = HostId::new();
+                Self::Serial(copy)
+            }
+        }
+    }
+
+    /// The same connection under another identifier.
+    ///
+    /// A record keeps the identifier the credential store and the workspace know.
+    /// Changing protocol therefore means building the new record and giving it the
+    /// identifier the old one had, which is what this does; a fresh identifier would
+    /// look like a different connection to both.
+    #[must_use]
+    pub fn reidentified(self, id: HostId) -> Self {
+        match self {
+            Self::Ssh(mut host) => {
+                host.id = id;
+                Self::Ssh(host)
+            }
+            Self::Rdp(mut config) => {
+                config.id = id;
+                Self::Rdp(config)
+            }
+            Self::Vnc(mut config) => {
+                config.id = id;
+                Self::Vnc(config)
+            }
+            Self::Serial(mut config) => {
+                config.id = id;
+                Self::Serial(config)
+            }
+        }
+    }
+
+    /// Renames the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the protocol's own refusal for a blank name or an unusable field.
+    pub fn set_name(&mut self, name: impl Into<String>) -> Result<(), ConnectionValidationError> {
+        let name = name.into();
+        match self {
+            Self::Ssh(host) => host.set_name(name).map_err(host_error),
+            Self::Rdp(config) => config.set_name(name),
+            Self::Vnc(config) => config.set_name(name),
+            Self::Serial(config) => config.set_name(name),
+        }
+    }
+
+    /// Whether this connection answers a search phrase (R2).
+    ///
+    /// The phrase is matched case-insensitively against the name, the protocol name
+    /// and what the connection would reach, so "rdp", "office" and "10.0.0.5:3389"
+    /// all find the same record.
+    #[must_use]
+    pub fn matches(&self, phrase: &str) -> bool {
+        let phrase = phrase.trim().to_lowercase();
+        if phrase.is_empty() {
+            return true;
+        }
+        let protocol = self.protocol();
+        self.name().to_lowercase().contains(&phrase)
+            || protocol.label().to_lowercase().contains(&phrase)
+            || protocol.wire_name().contains(&phrase)
+            || self.target().to_lowercase().contains(&phrase)
+    }
+}
+
+impl From<HostConfig> for ConnectionRecord {
+    fn from(host: HostConfig) -> Self {
+        Self::Ssh(host)
+    }
+}
+
+/// Names the shared refusal for a name the SSH record rejected.
+///
+/// The SSH record has its own error type because it has more required fields; a
+/// caller that switches on protocol should still see one error shape.
+fn host_error(error: HostValidationError) -> ConnectionValidationError {
+    match error {
+        HostValidationError::EmptyName => ConnectionValidationError::EmptyName,
+        HostValidationError::EmptyAddress => ConnectionValidationError::EmptyAddress,
+        HostValidationError::AddressContainsWhitespace => {
+            ConnectionValidationError::AddressContainsWhitespace
+        }
+        HostValidationError::EmptyUser => ConnectionValidationError::EmptyName,
+        HostValidationError::PortOutOfRange { value } => {
+            ConnectionValidationError::PortOutOfRange { value }
+        }
+    }
+}
+
+/// Splits the two group spellings the way the SSH record does: a stored path wins.
+fn split_group(
+    group: Option<String>,
+    group_path: Option<GroupPath>,
+) -> (Option<String>, Option<GroupPath>) {
+    match group_path {
+        Some(path) => (None, Some(path)),
+        None => (normalize_optional_text(group), None),
+    }
+}
+
+/// Trims an optional piece of text and turns a blank one into `None`.
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn connection_name(name: String) -> Result<String, ConnectionValidationError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ConnectionValidationError::EmptyName);
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn connection_address(address: String) -> Result<String, ConnectionValidationError> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err(ConnectionValidationError::EmptyAddress);
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(ConnectionValidationError::AddressContainsWhitespace);
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn connection_port(port: u32) -> Result<Port, ConnectionValidationError> {
+    Port::new(port).map_err(|_| ConnectionValidationError::PortOutOfRange { value: port })
+}
+
+fn connection_user(user: Option<String>) -> Result<Option<String>, ConnectionValidationError> {
+    let user = normalize_optional_text(user);
+    let unusable = user
+        .as_deref()
+        .is_some_and(|user| user.chars().any(char::is_whitespace));
+    if unusable {
+        return Err(ConnectionValidationError::UserContainsWhitespace);
+    }
+    Ok(user)
+}
+
+fn connection_device(device: String) -> Result<String, ConnectionValidationError> {
+    let trimmed = device.trim();
+    if trimmed.is_empty() {
+        return Err(ConnectionValidationError::EmptyDevice);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(ConnectionValidationError::DeviceContainsControlCharacter);
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn connection_baud(baud: u32) -> Result<u32, ConnectionValidationError> {
+    if !(MIN_SERIAL_BAUD..=MAX_SERIAL_BAUD).contains(&baud) {
+        return Err(ConnectionValidationError::BaudOutOfRange { value: baud });
+    }
+    Ok(baud)
+}
+
+fn connection_data_bits(data_bits: u8) -> Result<u8, ConnectionValidationError> {
+    if !(MIN_SERIAL_DATA_BITS..=MAX_SERIAL_DATA_BITS).contains(&data_bits) {
+        return Err(ConnectionValidationError::DataBitsOutOfRange { value: data_bits });
+    }
+    Ok(data_bits)
 }
 
 /// Why a jump chain cannot be used, limited to the hop that is wrong.
@@ -1476,5 +2894,349 @@ mod jump_tests {
                 .message()
                 .contains("Choose a saved host")
         );
+    }
+}
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::session::Capability;
+    use serde_json::{Value, json};
+
+    fn ssh(name: &str, address: &str) -> HostConfig {
+        HostConfig::new(name, address, 22, "deploy").expect("a valid SSH host")
+    }
+
+    #[test]
+    fn every_protocol_names_itself_the_same_way_in_a_file_and_in_the_list() {
+        assert_eq!(ProtocolKind::ALL.len(), 4);
+        for protocol in ProtocolKind::ALL {
+            let value = serde_json::to_value(protocol).expect("a protocol serializes");
+            assert_eq!(
+                value,
+                Value::String(protocol.wire_name().to_owned()),
+                "the stored tag and the reported name have to agree"
+            );
+            assert_eq!(
+                ProtocolKind::from_wire_name(protocol.wire_name()),
+                Some(protocol)
+            );
+        }
+        assert_eq!(ProtocolKind::from_wire_name("telnet"), None);
+        assert_eq!(
+            ProtocolKind::from_wire_name("  RDP "),
+            Some(ProtocolKind::Rdp)
+        );
+        assert_eq!(ProtocolKind::default(), ProtocolKind::Ssh);
+    }
+
+    #[test]
+    fn a_new_connection_starts_on_the_port_its_protocol_uses() {
+        assert_eq!(ProtocolKind::Ssh.default_port().map(Port::get), Some(22));
+        assert_eq!(ProtocolKind::Rdp.default_port().map(Port::get), Some(3389));
+        assert_eq!(ProtocolKind::Vnc.default_port().map(Port::get), Some(5900));
+        assert_eq!(
+            ProtocolKind::Serial.default_port(),
+            None,
+            "a serial device has no TCP port to offer"
+        );
+    }
+
+    #[test]
+    fn an_old_ssh_record_keeps_its_old_shape_and_the_tagged_form_means_the_same() {
+        let host = ssh("prod web", "10.0.0.5");
+        let stored = serde_json::to_value(&host).expect("the host serializes");
+        assert!(
+            stored.get("protocol").is_none(),
+            "the host shape older builds wrote has no tag: {stored}"
+        );
+        let legacy: HostConfig =
+            serde_json::from_value(stored).expect("the old shape is still a host record");
+        let record = ConnectionRecord::from(legacy);
+        assert!(record.is_ssh());
+        assert_eq!(record.id(), host.id());
+        assert_eq!(record.name(), "prod web");
+        assert_eq!(record.as_ssh().map(HostConfig::address), Some("10.0.0.5"));
+
+        let tagged = serde_json::to_value(&record).expect("the record serializes");
+        assert_eq!(
+            tagged["protocol"],
+            Value::String("ssh".to_owned()),
+            "a connection record always names its protocol"
+        );
+        let read: ConnectionRecord = serde_json::from_value(tagged).expect("it reads back");
+        assert_eq!(read, record);
+    }
+
+    #[test]
+    fn a_tagged_ssh_record_is_the_same_connection_as_the_untagged_one() {
+        let host = ssh("prod web", "10.0.0.5");
+        let mut tagged = serde_json::to_value(&host).expect("the host serializes");
+        tagged["protocol"] = Value::String("ssh".to_owned());
+        let record: ConnectionRecord =
+            serde_json::from_value(tagged).expect("an explicit ssh tag names the same protocol");
+        assert_eq!(record, ConnectionRecord::Ssh(host));
+    }
+
+    #[test]
+    fn a_desktop_record_carries_an_explicit_protocol_tag() {
+        let mut config = RdpConfig::new("office", "10.0.0.9", Some("alice")).expect("valid");
+        config.set_domain(Some("CORP"));
+        let record = ConnectionRecord::Rdp(config);
+        let written = serde_json::to_value(&record).expect("the record serializes");
+        assert_eq!(written["protocol"], json!("rdp"));
+        assert_eq!(written["port"], Value::from(3389));
+        assert_eq!(written["user"], json!("alice"));
+        assert_eq!(written["domain"], json!("CORP"));
+
+        let read: ConnectionRecord = serde_json::from_value(written).expect("it reads back");
+        assert_eq!(read, record);
+        assert_eq!(read.protocol(), ProtocolKind::Rdp);
+        assert!(read.as_ssh().is_none());
+    }
+
+    #[test]
+    fn an_unknown_protocol_is_refused_instead_of_becoming_a_connection() {
+        let text = json!({
+            "protocol": "telnet",
+            "id": HostId::new(),
+            "name": "old switch",
+            "address": "10.0.0.2",
+            "port": 23
+        });
+        let error = serde_json::from_value::<ConnectionRecord>(text)
+            .expect_err("a protocol this build does not know cannot become a connection");
+        assert!(
+            error.to_string().contains("telnet"),
+            "the refusal names the protocol it found: {error}"
+        );
+    }
+
+    #[test]
+    fn a_field_the_chosen_protocol_does_not_have_is_refused() {
+        let text = json!({
+            "protocol": "vnc",
+            "id": HostId::new(),
+            "name": "wall",
+            "address": "10.0.0.7",
+            "port": 5900,
+            "user": "alice"
+        });
+        let error = serde_json::from_value::<ConnectionRecord>(text)
+            .expect_err("VNC has no user, so a record that carries one is not this build's");
+        assert!(error.to_string().contains("user"), "{error}");
+    }
+
+    #[test]
+    fn a_stored_port_outside_the_range_is_refused_rather_than_becoming_dialable() {
+        let text = json!({
+            "protocol": "rdp",
+            "id": HostId::new(),
+            "name": "office",
+            "address": "10.0.0.9",
+            "port": 0
+        });
+        assert!(serde_json::from_value::<ConnectionRecord>(text).is_err());
+    }
+
+    #[test]
+    fn the_policies_and_the_echo_flag_survive_a_round_trip() {
+        let mut rdp = RdpConfig::new("office", "10.0.0.9", Some("alice")).expect("valid");
+        assert_eq!(rdp.certificate(), RdpCertificatePolicy::Ask);
+        rdp.set_certificate(RdpCertificatePolicy::Reject);
+        let written = serde_json::to_value(ConnectionRecord::Rdp(rdp.clone())).expect("serializes");
+        assert_eq!(written["certificate"], Value::String("reject".to_owned()));
+        let read: ConnectionRecord = serde_json::from_value(written).expect("reads back");
+        assert_eq!(read, ConnectionRecord::Rdp(rdp));
+
+        // The default policy is left out, so a record that never chose one keeps the
+        // shape an older build wrote.
+        let plain = RdpConfig::new("office", "10.0.0.9", None::<String>).expect("valid");
+        let written = serde_json::to_value(ConnectionRecord::Rdp(plain)).expect("serializes");
+        assert!(written.get("certificate").is_none(), "{written}");
+
+        let mut vnc = VncConfig::new("wall", "10.0.0.7").expect("valid");
+        assert_eq!(vnc.security(), VncSecurity::Automatic);
+        vnc.set_security(VncSecurity::EncryptedOnly);
+        let written = serde_json::to_value(ConnectionRecord::Vnc(vnc.clone())).expect("serializes");
+        assert_eq!(
+            written["security"],
+            Value::String("encrypted_only".to_owned())
+        );
+        let read: ConnectionRecord = serde_json::from_value(written).expect("reads back");
+        assert_eq!(read, ConnectionRecord::Vnc(vnc));
+
+        let mut console = SerialConfig::new("console", "COM3").expect("valid");
+        assert!(!console.local_echo());
+        console.set_local_echo(true);
+        let written =
+            serde_json::to_value(ConnectionRecord::Serial(console.clone())).expect("serializes");
+        assert_eq!(written["local_echo"], Value::Bool(true));
+        let read: ConnectionRecord = serde_json::from_value(written).expect("reads back");
+        assert_eq!(read, ConnectionRecord::Serial(console));
+    }
+    #[test]
+    fn a_serial_record_checks_the_device_and_the_frame() {
+        let mut config = SerialConfig::new("console", "COM3").expect("a valid device");
+        assert_eq!(config.baud(), DEFAULT_SERIAL_BAUD);
+        assert_eq!(config.data_bits(), MAX_SERIAL_DATA_BITS);
+        assert_eq!(config.frame(), "8N1");
+        assert_eq!(config.target(), "COM3 115200 8N1");
+        assert_eq!(config.flow(), SerialFlow::None);
+
+        config.set_baud(9_600).expect("a common speed");
+        config.set_data_bits(7).expect("a usable width");
+        config.set_parity(SerialParity::Even);
+        config.set_stop_bits(SerialStopBits::Two);
+        config.set_flow(SerialFlow::Hardware);
+        assert_eq!(config.frame(), "7E2");
+
+        assert_eq!(
+            SerialConfig::new("  ", "COM3"),
+            Err(ConnectionValidationError::EmptyName)
+        );
+        assert_eq!(
+            SerialConfig::new("console", "   "),
+            Err(ConnectionValidationError::EmptyDevice)
+        );
+        assert_eq!(
+            SerialConfig::new("console", "COM\u{7}3"),
+            Err(ConnectionValidationError::DeviceContainsControlCharacter)
+        );
+        assert_eq!(
+            config.set_baud(10),
+            Err(ConnectionValidationError::BaudOutOfRange { value: 10 })
+        );
+        assert_eq!(
+            config.set_data_bits(9),
+            Err(ConnectionValidationError::DataBitsOutOfRange { value: 9 })
+        );
+        assert!(!ConnectionRecord::Serial(config).remembers_secret());
+    }
+
+    #[test]
+    fn the_capability_set_is_what_each_protocol_can_really_do() {
+        let ssh = ConnectionRecord::Ssh(ssh("web", "10.0.0.5")).capabilities();
+        for capability in [
+            Capability::Terminal,
+            Capability::Files,
+            Capability::Batch,
+            Capability::Forwarding,
+            Capability::X11,
+            Capability::Clipboard,
+        ] {
+            assert!(ssh.allows(capability), "SSH offers {capability:?}");
+        }
+        assert!(
+            !ssh.allows(Capability::Desktop),
+            "an SSH session is a character grid, not a framebuffer"
+        );
+
+        let rdp = ConnectionRecord::Rdp(
+            RdpConfig::new("office", "10.0.0.9", None::<String>).expect("valid"),
+        )
+        .capabilities();
+        assert!(rdp.allows(Capability::Desktop));
+        assert!(rdp.allows(Capability::Clipboard));
+        for withheld in [
+            Capability::Terminal,
+            Capability::Files,
+            Capability::Batch,
+            Capability::Forwarding,
+            Capability::X11,
+        ] {
+            assert!(
+                !rdp.allows(withheld),
+                "a desktop does not offer {withheld:?}"
+            );
+        }
+
+        let vnc = ConnectionRecord::Vnc(VncConfig::new("wall", "10.0.0.7").expect("valid"))
+            .capabilities();
+        assert_eq!(
+            vnc.iter().collect::<Vec<_>>(),
+            vec![Capability::Desktop, Capability::Clipboard]
+        );
+
+        let serial = ConnectionRecord::Serial(SerialConfig::new("console", "COM3").expect("valid"))
+            .capabilities();
+        assert_eq!(
+            serial.iter().collect::<Vec<_>>(),
+            vec![Capability::Terminal, Capability::Clipboard]
+        );
+        assert!(!serial.is_empty());
+    }
+
+    #[test]
+    fn only_ssh_carries_the_batch_forwarding_and_file_entry_points() {
+        for protocol in [ProtocolKind::Rdp, ProtocolKind::Vnc, ProtocolKind::Serial] {
+            let capabilities = SessionCapabilities::of_protocol(protocol);
+            assert!(!capabilities.allows(Capability::Batch));
+            assert!(!capabilities.allows(Capability::Forwarding));
+            assert!(!capabilities.allows(Capability::X11));
+            assert!(!capabilities.allows(Capability::Files));
+        }
+        assert!(SessionCapabilities::of_protocol(ProtocolKind::Ssh).allows(Capability::Files));
+    }
+
+    #[test]
+    fn a_copy_gets_a_new_identity_and_inherits_no_credential_or_history() {
+        let mut original = ssh("prod web", "10.0.0.5");
+        original.set_remember_secret(true);
+        let original = ConnectionRecord::Ssh(original);
+        let copy = original.duplicated();
+        assert_ne!(copy.id(), original.id(), "a copy is a new connection");
+        assert_eq!(copy.name(), original.name());
+        assert!(
+            !copy.remembers_secret(),
+            "the copy has an identifier the credential store has never seen"
+        );
+        assert_eq!(copy.target(), original.target());
+
+        let mut jumper = ssh("gateway", "10.0.0.1");
+        jumper.set_jumps([HostId::new()]);
+        let copy = ConnectionRecord::Ssh(jumper).duplicated();
+        let host = copy.as_ssh().expect("still SSH");
+        assert_eq!(host.jumps().len(), 1);
+        assert!(
+            !host.jumps().contains(&host.id()),
+            "a duplicate never names itself in its own jump chain"
+        );
+    }
+
+    #[test]
+    fn a_connection_is_found_by_its_name_its_protocol_or_its_target() {
+        let record = ConnectionRecord::Rdp(
+            RdpConfig::new("Office desktop", "10.0.0.9", Some("alice")).expect("valid"),
+        );
+        assert!(record.matches("office"));
+        assert!(record.matches("rdp"));
+        assert!(record.matches("RDP"));
+        assert!(record.matches("10.0.0.9:3389"));
+        assert!(record.matches("alice@10.0.0.9"));
+        assert!(
+            record.matches("   "),
+            "an empty phrase keeps every connection"
+        );
+        assert!(!record.matches("vnc"));
+        assert!(!record.matches("warehouse"));
+    }
+
+    #[test]
+    fn both_group_spellings_are_read_the_way_the_ssh_record_reads_them() {
+        let mut config = VncConfig::new("wall", "10.0.0.7").expect("valid");
+        config.set_group(Some("Prod"));
+        assert_eq!(config.group(), Some("Prod"));
+        let path = GroupPath::parse("Prod/East").expect("a usable path");
+        config.set_group_path(Some(path.clone()));
+        assert_eq!(config.group(), None, "one record carries one spelling");
+        assert_eq!(config.group_path(), Some(&path));
+        let record = ConnectionRecord::Vnc(config);
+        assert_eq!(record.group_text(), Some("Prod/East".to_owned()));
+
+        let written = serde_json::to_value(&record).expect("serializes");
+        assert_eq!(written["group_path"], Value::String("Prod/East".to_owned()));
+        assert!(written.get("group").is_none());
+        let read: ConnectionRecord = serde_json::from_value(written).expect("reads back");
+        assert_eq!(read.group_path(), Some(path));
     }
 }

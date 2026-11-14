@@ -57,6 +57,24 @@ enum SnapshotRow {
     },
     /// A saved host.
     Host(HostRowView),
+    /// A saved connection of another protocol.
+    Connection(ConnectionRowView),
+}
+
+/// One connection of another protocol, with what its row shows (R2, R18).
+///
+/// It has no checkbox: a selection is a batch or group-move target, and both are SSH
+/// operations. It has no connect button either: starting a desktop or serial session is
+/// not part of this build, so the row only edits, copies and deletes the record.
+struct ConnectionRowView {
+    id: HostId,
+    /// The row's number among the connection rows, for its selector.
+    number: usize,
+    name: SharedString,
+    /// The protocol, as the chip in front of the target says it.
+    protocol: SharedString,
+    target: SharedString,
+    group: Option<SharedString>,
 }
 
 /// One host of the list, with what its row shows.
@@ -766,6 +784,9 @@ impl ShelluneView {
                     SnapshotRow::Host(host) => {
                         host_row_element(host, &weak, row_height, prefix, metrics, strings, ux)
                     }
+                    SnapshotRow::Connection(connection) => {
+                        connection_row_element(connection, &weak, row_height, metrics, strings)
+                    }
                 };
                 items.push(element.into_any_element());
             }
@@ -787,6 +808,7 @@ impl ShelluneView {
         let mut rows = Vec::with_capacity(list.len());
         let mut hosts = 0usize;
         let mut groups = 0usize;
+        let mut connections = 0usize;
         for row in list.rows() {
             match row {
                 HostListRow::Group(group) => {
@@ -830,6 +852,20 @@ impl ShelluneView {
                         selected: self.hosts.selected().contains(host.id),
                     }));
                     hosts += 1;
+                }
+                HostListRow::Connection(row) => {
+                    let Some(saved) = self.book.connection(row.id) else {
+                        continue;
+                    };
+                    rows.push(SnapshotRow::Connection(ConnectionRowView {
+                        id: row.id,
+                        number: connections,
+                        name: SharedString::from(saved.name().to_owned()),
+                        protocol: SharedString::from(saved.protocol().label()),
+                        target: SharedString::from(saved.target()),
+                        group: saved.group_text().map(SharedString::from),
+                    }));
+                    connections += 1;
                 }
             }
         }
@@ -1220,6 +1256,142 @@ fn host_row_element(
                 let _ = connect.update(cx, |view, cx| view.connect_saved_host(id, cx));
             }),
     )
+}
+
+/// One saved connection of another protocol inside the list.
+///
+/// The row says what the connection is and what it would reach, and offers the three
+/// things that belong to a record: edit it, copy it, delete it. It has no connect
+/// button and no checkbox, because starting a desktop or serial session is not part of
+/// this build and a batch or group move only takes SSH hosts.
+fn connection_row_element(
+    connection: &ConnectionRowView,
+    weak: &WeakEntity<ShelluneView>,
+    row_height: gpui::Pixels,
+    metrics: Metrics,
+    strings: &'static Strings,
+) -> Stateful<Div> {
+    let number = connection.number;
+    let id = connection.id;
+    let hover = theme::swatch(palette::SURFACE_HOVER);
+    let edit = weak.clone();
+    let open_row = weak.clone();
+    let copy = weak.clone();
+    let delete = weak.clone();
+    div()
+        .id(SharedString::from(format!("hosts.connection.id.{number}")))
+        .debug_selector(move || format!("hosts.connection.{number}"))
+        .group("host-row")
+        .h(row_height)
+        .flex()
+        .items_center()
+        .gap(metrics.scale(spacing::SNUG))
+        .w_full()
+        .min_w(px(0.0))
+        .px(metrics.scale(spacing::TIGHT + 2.0))
+        .rounded(px(radius::MEDIUM))
+        .border_1()
+        .border_color(theme::clear())
+        .hover(move |style| style.bg(hover))
+        // A row is the record: double pressing it opens the form that edits it. It
+        // never starts anything.
+        .on_click(move |event, _window, cx| {
+            if event.click_count() >= 2 {
+                let _ = open_row.update(cx, |view, cx| view.edit_saved_connection(id, cx));
+            }
+        })
+        .child(super::host_avatar(connection.name.as_ref(), false, metrics))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap(metrics.scale(1.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(metrics.body_size())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(connection.name.clone()),
+                        )
+                        .child(components::tag(connection.protocol.clone(), metrics)),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(connection.target.clone()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .children(
+                    connection
+                        .group
+                        .clone()
+                        .map(|group| components::tag(group, metrics)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(2.0))
+                .child(
+                    components::icon_only_button(Icon::Pencil, metrics)
+                        .size(metrics.scale(26.0))
+                        .id(SharedString::from(format!(
+                            "hosts.connection.edit.{number}"
+                        )))
+                        .debug_selector(move || format!("hosts.connection.edit.{number}"))
+                        .tooltip(components::tooltip(strings.host_edit))
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            let _ = edit.update(cx, |view, cx| view.edit_saved_connection(id, cx));
+                        }),
+                )
+                .child(
+                    components::icon_only_button(Icon::Copy, metrics)
+                        .size(metrics.scale(26.0))
+                        .id(SharedString::from(format!(
+                            "hosts.connection.copy.{number}"
+                        )))
+                        .debug_selector(move || format!("hosts.connection.copy.{number}"))
+                        .tooltip(components::tooltip(strings.connection_duplicate))
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            let _ =
+                                copy.update(cx, |view, cx| view.duplicate_saved_connection(id, cx));
+                        }),
+                )
+                .child(
+                    components::danger_icon_button(Icon::Trash, metrics)
+                        .size(metrics.scale(26.0))
+                        .id(SharedString::from(format!(
+                            "hosts.connection.delete.{number}"
+                        )))
+                        .debug_selector(move || format!("hosts.connection.delete.{number}"))
+                        .tooltip(components::tooltip(strings.connection_delete))
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
+                        }),
+                ),
+        )
 }
 
 /// The frame of one row of the group column, chosen or not.

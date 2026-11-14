@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::host::ProtocolKind;
 use crate::ids::{HostId, SessionId};
 
 /// What a session runs against.
@@ -21,6 +22,25 @@ pub enum SessionKind {
         /// The host the session was started from.
         host: HostId,
     },
+    /// A remote desktop session over RDP (R18).
+    ///
+    /// Carries the saved connection's identifier, never a frame, a credential or a
+    /// live library handle: a session record says what would be shown, while the
+    /// protocol worker owns everything else.
+    Rdp {
+        /// The saved connection the session was started from.
+        host: HostId,
+    },
+    /// A remote desktop session over VNC (R18).
+    Vnc {
+        /// The saved connection the session was started from.
+        host: HostId,
+    },
+    /// A character session over a serial device (R21).
+    Serial {
+        /// The saved connection whose device the session opened.
+        host: HostId,
+    },
 }
 
 impl SessionKind {
@@ -30,13 +50,36 @@ impl SessionKind {
         match self {
             Self::Local { .. } => "Local",
             Self::Remote { .. } => "SSH",
+            Self::Rdp { .. } => "RDP",
+            Self::Vnc { .. } => "VNC",
+            Self::Serial { .. } => "Serial",
         }
     }
 
     /// Whether the session needs host identity verification and authentication.
+    ///
+    /// True for the protocols that reach a server over the network, including the two
+    /// desktop ones, whose certificate and credential decisions happen before a
+    /// session can be reported as live. A serial device authenticates nothing, so it
+    /// is not a remote session even though it is not local either.
     #[must_use]
     pub fn is_remote(&self) -> bool {
-        matches!(self, Self::Remote { .. })
+        matches!(
+            self,
+            Self::Remote { .. } | Self::Rdp { .. } | Self::Vnc { .. }
+        )
+    }
+
+    /// The protocol this session speaks, or `None` for a local shell.
+    #[must_use]
+    pub fn protocol(&self) -> Option<ProtocolKind> {
+        match self {
+            Self::Local { .. } => None,
+            Self::Remote { .. } => Some(ProtocolKind::Ssh),
+            Self::Rdp { .. } => Some(ProtocolKind::Rdp),
+            Self::Vnc { .. } => Some(ProtocolKind::Vnc),
+            Self::Serial { .. } => Some(ProtocolKind::Serial),
+        }
     }
 }
 
@@ -376,6 +419,9 @@ impl Session {
                 shell.clone().unwrap_or_else(|| "Local shell".to_owned())
             }
             SessionKind::Remote { .. } => "SSH session".to_owned(),
+            SessionKind::Rdp { .. } => "RDP desktop".to_owned(),
+            SessionKind::Vnc { .. } => "VNC desktop".to_owned(),
+            SessionKind::Serial { .. } => "Serial session".to_owned(),
         };
         let title = if title.trim().is_empty() {
             fallback
@@ -497,9 +543,14 @@ impl Session {
     /// Returns [`SessionTransitionError`] unless the session finished connecting, or
     /// for a remote session unless the host was verified and the user authenticated.
     pub fn connected(&mut self) -> Result<(), SessionTransitionError> {
+        // A desktop session answers a certificate and a credential question before it
+        // is live, so it becomes connected the same way an SSH one does. A serial
+        // device authenticates nothing: opening it is the whole of connecting.
         let allowed_from: &[SessionState] = match self.kind {
-            SessionKind::Local { .. } => &[SessionState::Connecting],
-            SessionKind::Remote { .. } => &[SessionState::Authenticating],
+            SessionKind::Local { .. } | SessionKind::Serial { .. } => &[SessionState::Connecting],
+            SessionKind::Remote { .. } | SessionKind::Rdp { .. } | SessionKind::Vnc { .. } => {
+                &[SessionState::Authenticating]
+            }
         };
         self.advance(SessionState::Connected, allowed_from)
     }
@@ -608,9 +659,176 @@ impl Session {
     }
 }
 
+/// One thing a session can do (R2, R18, R23).
+///
+/// A capability belongs to the protocol, not to a view: a desktop session has no
+/// file entry to hide because it has no file capability to offer in the first
+/// place. Views ask this set instead of deciding for themselves what a connection
+/// "probably" supports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Capability {
+    /// A character grid the user can type into.
+    Terminal,
+    /// A remote desktop framebuffer.
+    Desktop,
+    /// A file browser over this very session.
+    Files,
+    /// Running a saved batch task against this connection.
+    Batch,
+    /// Local, remote or dynamic port forwarding.
+    Forwarding,
+    /// X11 forwarding.
+    X11,
+    /// Sharing the system clipboard.
+    Clipboard,
+}
+
+impl Capability {
+    /// Every capability, in the order a page would list them.
+    pub const ALL: [Self; 7] = [
+        Self::Terminal,
+        Self::Desktop,
+        Self::Files,
+        Self::Batch,
+        Self::Forwarding,
+        Self::X11,
+        Self::Clipboard,
+    ];
+
+    /// Name shown in the interface and in diagnostics.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::Desktop => "Desktop",
+            Self::Files => "Files",
+            Self::Batch => "Batch",
+            Self::Forwarding => "Forwarding",
+            Self::X11 => "X11",
+            Self::Clipboard => "Clipboard",
+        }
+    }
+
+    /// Stable identifier used by debug selectors and tests.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Desktop => "desktop",
+            Self::Files => "files",
+            Self::Batch => "batch",
+            Self::Forwarding => "forwarding",
+            Self::X11 => "x11",
+            Self::Clipboard => "clipboard",
+        }
+    }
+
+    /// This capability as one bit of a set.
+    fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+}
+
+/// What one protocol can do, as a small set.
+///
+/// Derived from the protocol so that adding a protocol is one decision in one
+/// place, instead of every page growing its own guess. The set is deliberately
+/// narrow: SSH is the only protocol with files, batch, forwarding and X11, and a
+/// desktop protocol has no character terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionCapabilities {
+    mask: u8,
+}
+
+impl SessionCapabilities {
+    /// The capabilities a protocol offers.
+    #[must_use]
+    pub fn of_protocol(protocol: ProtocolKind) -> Self {
+        let mask = match protocol {
+            ProtocolKind::Ssh => {
+                Capability::Terminal.bit()
+                    | Capability::Files.bit()
+                    | Capability::Batch.bit()
+                    | Capability::Forwarding.bit()
+                    | Capability::X11.bit()
+                    | Capability::Clipboard.bit()
+            }
+            ProtocolKind::Rdp | ProtocolKind::Vnc => {
+                Capability::Desktop.bit() | Capability::Clipboard.bit()
+            }
+            ProtocolKind::Serial => Capability::Terminal.bit() | Capability::Clipboard.bit(),
+        };
+        Self { mask }
+    }
+
+    /// The capabilities a live session offers, from the kind it was started with.
+    #[must_use]
+    pub fn of_kind(kind: &SessionKind) -> Self {
+        match kind.protocol() {
+            None => Self {
+                mask: Capability::Terminal.bit() | Capability::Clipboard.bit(),
+            },
+            Some(protocol) => Self::of_protocol(protocol),
+        }
+    }
+
+    /// Whether this set contains one capability.
+    #[must_use]
+    pub fn allows(self, capability: Capability) -> bool {
+        self.mask & capability.bit() != 0
+    }
+
+    /// The capabilities in this set, in the order of `Capability::ALL`.
+    pub fn iter(self) -> impl Iterator<Item = Capability> {
+        Capability::ALL
+            .into_iter()
+            .filter(move |capability| self.allows(*capability))
+    }
+
+    /// Whether the set is empty, which no protocol currently is.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.mask == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_session_offers_a_terminal_and_the_clipboard_and_nothing_else() {
+        let capabilities = SessionCapabilities::of_kind(&SessionKind::Local { shell: None });
+        assert_eq!(
+            capabilities.iter().collect::<Vec<_>>(),
+            vec![Capability::Terminal, Capability::Clipboard],
+            "a local shell has no files, batch, forwarding, X11 or desktop to offer"
+        );
+        assert!(capabilities.allows(Capability::Terminal));
+        assert!(!capabilities.allows(Capability::Desktop));
+    }
+
+    #[test]
+    fn a_remote_session_offers_what_the_ssh_protocol_offers() {
+        let capabilities = SessionCapabilities::of_kind(&SessionKind::Remote {
+            host: HostId::new(),
+        });
+        assert_eq!(
+            capabilities,
+            SessionCapabilities::of_protocol(ProtocolKind::Ssh)
+        );
+        for capability in [
+            Capability::Terminal,
+            Capability::Files,
+            Capability::Batch,
+            Capability::Forwarding,
+            Capability::X11,
+            Capability::Clipboard,
+        ] {
+            assert!(capabilities.allows(capability), "SSH offers {capability:?}");
+        }
+        assert!(!capabilities.allows(Capability::Desktop));
+    }
 
     fn remote_session() -> Session {
         Session::new(
