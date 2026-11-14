@@ -1,0 +1,17 @@
+[package]
+name = "shellune-desktop"
+description = "Native RDP and VNC sessions behind a thin C shim."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+# The C shim is compiled and linked by build.rs; the native protocol libraries it
+# calls are built from the pinned sources in vendor/ by
+# packaging/native/build_native.py. Without them build.rs compiles the stub and
+# every call reports "unavailable" instead of pretending to connect.
+links = "shellune_desktop_shim"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1.2.25"

@@ -6056,6 +6056,7 @@ dependencies = [
  "raw-window-handle",
  "serde_json",
  "shellune-core",
+ "shellune-desktop",
  "shellune-ssh",
  "shellune-storage",
  "shellune-terminal",
@@ -6071,6 +6072,13 @@ dependencies = [
  "thiserror 2.0.21",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "shellune-desktop"
+version = "0.4.4"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

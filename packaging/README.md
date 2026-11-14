@@ -59,3 +59,24 @@ Generate with Python 3.11+ and Pillow, or rebuild offline from the saved source:
 python tool/generate_app_icons.py --force
 python tool/generate_app_icons.py --reuse-source --force
 ```
+
+## Native desktop backends (RDP, VNC)
+
+The Windows binary links the RDP and VNC protocol libraries statically, so the
+portable zip and the installer ship `shellune.exe` alone: there is no
+`freerdp.dll` or `vncclient.dll` to place next to it, and a library installed
+on the user's machine is never used. Build them before the release binary:
+
+    python packaging/native/build_native.py --perl <perl with standard modules>
+    cargo build --workspace --release
+
+`target/native/dist/shellune-native.txt` records the pinned versions and the options
+that were used. A build without it still compiles and starts, but
+`crates/desktop` reports both protocols as unavailable - the packaging step must
+not describe RDP or VNC support for a binary built that way.
+
+The vendored sources and their licenses are described in `vendor/README.md`; a
+distributable that includes the binary carries the same obligations as before
+(GPL-3.0-only for Shellune, Apache-2.0 for FreeRDP and OpenSSL, GPL-2.0-or-later
+for LibVNCServer). macOS and Linux builds of the protocol libraries are not wired
+up yet, so those platforms must not claim desktop protocol support.
