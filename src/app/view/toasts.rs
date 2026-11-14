@@ -190,35 +190,6 @@ impl ShelluneView {
         Some(stack)
     }
 
-    /// Puts a notification on screen for a capture, without its timer (R2).
-    ///
-    /// A capture takes a second; a toast that expired while the frame settled would be
-    /// a shot of nothing. Nothing else about the toast differs from one an action makes.
-    #[cfg(feature = "ui-capture")]
-    pub fn capture_toast(
-        &mut self,
-        tone: Tone,
-        title: &str,
-        detail: Option<&str>,
-        cx: &mut Context<Self>,
-    ) {
-        self.next_toast += 1;
-        self.toasts.push(Toast {
-            id: self.next_toast,
-            tone,
-            title: title.to_owned(),
-            detail: detail.map(str::to_owned),
-        });
-        cx.notify();
-    }
-
-    /// How many notifications are on screen, for a capture (R2).
-    #[cfg(feature = "ui-capture")]
-    #[must_use]
-    pub fn capture_toast_count(&self) -> usize {
-        self.toasts.len()
-    }
-
     /// The toasts on screen, oldest first, for a test.
     #[cfg(test)]
     pub fn toast_titles(&self) -> Vec<String> {

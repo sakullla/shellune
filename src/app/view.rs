@@ -1249,6 +1249,28 @@ impl ShelluneView {
             .is_some_and(|panel| panel.status().failure().is_some())
     }
 
+    /// Raises the notification an action would raise, for a capture (R2).
+    ///
+    /// It is the same toast, with the same timer; the shot is taken while it is still
+    /// up, so nothing about it differs from one a real save would show.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_toast(
+        &mut self,
+        tone: crate::app::theme::Tone,
+        title: &str,
+        detail: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.toast(tone, title, detail.map(str::to_owned), cx);
+    }
+
+    /// How many notifications are on screen, for a capture (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_toast_count(&self) -> usize {
+        self.toasts.len()
+    }
+
     /// Asks the deletion question for the first saved host, for a capture (R2).
     #[cfg(feature = "ui-capture")]
     pub fn capture_ask_delete_first(&mut self, cx: &mut Context<Self>) {
