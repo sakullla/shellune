@@ -9,13 +9,22 @@ crates/desktop/build.rs reads:
 
 What is pinned, and why:
 
-* vendor/freerdp      - FreeRDP, checked into this repository; the C shim is
-                        written against its 3.x public API.
-* vendor/libvncserver - LibVNCClient, checked into this repository.
-* zlib, OpenSSL      - build dependencies of those two. They are fetched by tag
-                        and the checked-out commit is verified before anything is
-                        built, so a moved tag fails the build instead of quietly
-                        changing what ships.
+* freerdp      - FreeRDP; the C shim in crates/desktop is written against its 3.x
+                 public API.
+* libvncserver - LibVNCClient.
+* zlib, OpenSSL - build dependencies of those two.
+
+None of the four is stored in this repository. FreeRDP and LibVNCServer are
+downloaded as a source tarball pinned by commit and verified by sha256; zlib and
+OpenSSL are cloned by tag and the checked-out commit is verified. Every check runs
+before anything is compiled, so a moved tag or a re-cut archive fails the build
+instead of quietly changing what ships. The sources land in
+<work>/src/<name>, never in vendor/: 3.3k upstream files in the repository make
+routine git commands exceed the Windows command-line limit.
+
+Fetching needs network access the first time. After a successful build the
+verified tarball and the unpacked tree are reused, and an offline re-run works as
+long as <work>/src still holds the trees the manifest points at.
 
 Nothing is downloaded at run time and no installed DLL is used: the shim links
 the static archives built here. Build prerequisites live in vendor/README.md -
@@ -31,34 +40,61 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import http.client
 import pathlib
 import shutil
 import subprocess
 import sys
+import tarfile
+import urllib.error
+import urllib.request
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-VENDOR = REPO_ROOT / "vendor"
 
 DEFAULT_BUILD_TOOLS = pathlib.Path(
     "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools"
 )
 
+# Tarballs pinned by commit, not by tag: the URL names the commit directly, so a
+# re-pointed tag cannot change what is downloaded, and the sha256 catches a re-cut
+# archive. "required" is the few paths that must exist after unpacking; a tree that
+# unpacks but lacks them is not the release we pinned.
 FREERDP = {
     "name": "freerdp",
     "version": "3.33.1",
+    "tag": "3.33.1",
     "commit": "65bcca1913a28cbdd7eb913599f692bd2b707991",
     "license": "Apache-2.0",
-    "source": VENDOR / "freerdp",
+    "url": "https://codeload.github.com/FreeRDP/FreeRDP/tar.gz/"
+           "65bcca1913a28cbdd7eb913599f692bd2b707991",
+    "sha256": "97771fc4b967b4262bbe690f9b666402ad4c717717527c006b4acea8e21fffb8",
+    "required": [
+        "CMakeLists.txt",
+        "include/freerdp/freerdp.h",
+        "winpr/include/winpr/winpr.h",
+    ],
 }
 LIBVNC = {
     "name": "libvncserver",
     "version": "0.9.15",
+    "tag": "LibVNCServer-0.9.15",
     "commit": "9b54b1ec32731bd23158ca014dc18014db4194c3",
     "license": "GPL-2.0-or-later",
-    "source": VENDOR / "libvncserver",
+    "url": "https://codeload.github.com/LibVNC/libvncserver/tar.gz/"
+           "9b54b1ec32731bd23158ca014dc18014db4194c3",
+    "sha256": "662c311e0d4a8fc71bae6cf4759308948e4681c2e23987583ff2121cb1f1aedf",
+    "required": [
+        "CMakeLists.txt",
+        "include/rfb/rfbclient.h",
+        "src/libvncclient",
+    ],
 }
+# Written into an unpacked tree so a later run can tell a verified checkout from a
+# half-finished download without hashing the whole tree again.
+SOURCE_STAMP = ".shellune-source-commit"
 
-# Fetched, not vendored. The commit is verified after checkout.
+# Fetched by tag. The commit is verified after checkout.
 EXTERNALS = {
     "zlib": {
         "url": "https://github.com/madler/zlib.git",
@@ -140,7 +176,7 @@ LIBVNC_OPTIONS = [
     "-DWITH_EXAMPLES=OFF",
     "-DWITH_TESTS=OFF",
     # libvncserver copies compile_commands.json into the source tree otherwise, and
-    # the vendored tree must stay exactly what the tag contains.
+    # the fetched tree should stay exactly what the pinned archive contains.
     "-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF",
 ]
 
@@ -248,11 +284,119 @@ def fetch_external(work: pathlib.Path, name: str, spec: dict) -> pathlib.Path:
     return target
 
 
-def vendored(spec: dict) -> pathlib.Path:
-    source = spec["source"]
-    if not source.is_dir():
-        raise SystemExit("missing vendored source " + str(source))
-    return source
+def sha256_of(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download(url: str, destination: pathlib.Path, name: str) -> None:
+    """Fetches a source tarball; a network failure is reported, never skipped."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.name + ".part")
+    log("downloading " + name + " from " + url)
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response:
+            with partial.open("wb") as handle:
+                shutil.copyfileobj(response, handle, 1024 * 256)
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+        partial.unlink(missing_ok=True)
+        raise SystemExit(
+            name + ": network error while downloading " + url + ": " + str(error)
+            + ". Fetching this dependency needs network access; the source tree is "
+            "not stored in this repository."
+        ) from error
+    partial.replace(destination)
+
+
+def verify_sha256(archive: pathlib.Path, spec: dict) -> None:
+    actual = sha256_of(archive)
+    if actual != spec["sha256"]:
+        raise SystemExit(
+            spec["name"] + ": sha256 mismatch for " + archive.name + "\n"
+            + "  expected " + spec["sha256"] + "\n"
+            + "  actual   " + actual + "\n"
+            + "Upstream re-cut the archive or the download was corrupted. Nothing was "
+            "built. Delete the file to fetch it again, and change the pin in this "
+            "script only deliberately."
+        )
+
+
+def unpack(archive: pathlib.Path, spec: dict, work: pathlib.Path) -> pathlib.Path:
+    """Unpacks into <work>/src/<name> through a staging directory.
+
+    The commit is written into the tree as SOURCE_STAMP only after the archive and
+    the expected files check out, so an interrupted run cannot leave something that
+    a later run mistakes for a verified checkout.
+    """
+    target = work / "src" / spec["name"]
+    staging = work / "src" / (spec["name"] + ".unpacking")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    log("unpacking " + archive.name)
+    try:
+        with tarfile.open(archive, "r:gz") as bundle:
+            try:
+                bundle.extractall(staging, filter="data")
+            except TypeError:  # filter= arrived in Python 3.12.
+                bundle.extractall(staging)
+    except (tarfile.TarError, OSError) as error:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit(
+            spec["name"] + ": cannot unpack " + str(archive) + ": " + str(error)
+            + ". The downloaded archive is not usable; delete it and fetch it again."
+        ) from error
+    roots = [entry for entry in staging.iterdir() if entry.name != SOURCE_STAMP]
+    if len(roots) != 1 or not roots[0].is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit(
+            spec["name"] + ": unexpected layout in " + archive.name + ", expected one "
+            "top-level directory with the sources."
+        )
+    missing = [name for name in spec["required"] if not (roots[0] / name).exists()]
+    if missing:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit(
+            spec["name"] + ": " + archive.name + " unpacked but is missing "
+            + ", ".join(missing) + ", so it is not " + spec["version"] + "."
+        )
+    if target.exists():
+        shutil.rmtree(target)
+    roots[0].rename(target)
+    shutil.rmtree(staging, ignore_errors=True)
+    (target / SOURCE_STAMP).write_text(spec["commit"] + "\n", encoding="utf-8")
+    log(spec["name"] + " " + spec["version"] + " unpacked into " + str(target))
+    return target
+
+
+def ensure_source(work: pathlib.Path, spec: dict) -> pathlib.Path:
+    """Returns a verified source tree, fetching it once.
+
+    Reuses an unpacked tree only when its stamp names this commit; reuses a cached
+    tarball only when its sha256 still matches. Anything else is re-fetched, so a
+    stale or tampered tree cannot be compiled by accident.
+    """
+    target = work / "src" / spec["name"]
+    stamp = target / SOURCE_STAMP
+    if stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == spec["commit"]:
+        log(spec["name"] + " " + spec["version"] + " sources already unpacked")
+        return target
+    if target.exists():
+        log(spec["name"] + ": replacing the source tree, it is not " + spec["commit"])
+        shutil.rmtree(target)
+    archive = work / "downloads" / (spec["name"] + "-" + spec["version"] + ".tar.gz")
+    if archive.is_file() and sha256_of(archive) == spec["sha256"]:
+        log(spec["name"] + ": using cached " + archive.name)
+    else:
+        if archive.exists():
+            log(spec["name"] + ": cached tarball does not match the pinned sha256")
+            archive.unlink()
+        download(spec["url"], archive, spec["name"])
+        verify_sha256(archive, spec)
+    return unpack(archive, spec, work)
 
 
 def build_zlib(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
@@ -298,12 +442,11 @@ def build_openssl(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
 
 
 def build_freerdp(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
-                  force: bool) -> pathlib.Path | None:
+                  source: pathlib.Path, force: bool) -> pathlib.Path | None:
     build = work / "build" / "freerdp"
     if already_built(dist, FREERDP_LIBRARIES, force):
         log("freerdp already installed")
         return build
-    source = vendored(FREERDP)
     options = [
         "-DCMAKE_PREFIX_PATH=" + quoted(dist),
         "-DZLIB_LIBRARY=" + quoted(dist / "lib/zlibstatic.lib"),
@@ -318,12 +461,11 @@ def build_freerdp(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
 
 
 def build_libvnc(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
-                 force: bool) -> pathlib.Path | None:
+                 source: pathlib.Path, force: bool) -> pathlib.Path | None:
     build = work / "build" / "libvncserver"
     if already_built(dist, LIBVNC_LIBRARIES, force):
         log("libvncserver already installed")
         return build
-    source = vendored(LIBVNC)
     options = [
         "-DCMAKE_PREFIX_PATH=" + quoted(dist),
         "-DZLIB_LIBRARY=" + quoted(dist / "lib/zlibstatic.lib"),
@@ -356,8 +498,10 @@ def write_manifest(dist: pathlib.Path, include_dirs: list[pathlib.Path],
         "# Generated by packaging/native/build_native.py. Do not edit by hand.",
         "# freerdp=" + FREERDP["version"] + " " + FREERDP["commit"]
         + " (" + FREERDP["license"] + ")",
+        "# freerdp tarball sha256=" + FREERDP["sha256"],
         "# libvncserver=" + LIBVNC["version"] + " " + LIBVNC["commit"]
         + " (" + LIBVNC["license"] + ")",
+        "# libvncserver tarball sha256=" + LIBVNC["sha256"],
         "# zlib=" + EXTERNALS["zlib"]["tag"] + " " + EXTERNALS["zlib"]["commit"]
         + " (" + EXTERNALS["zlib"]["license"] + ")",
         "# openssl=" + EXTERNALS["openssl"]["tag"] + " " + EXTERNALS["openssl"]["commit"]
@@ -404,10 +548,15 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     dist.mkdir(parents=True, exist_ok=True)
 
+    # Sources first: every check runs before anything is compiled, so a missing
+    # network or a wrong archive is reported instead of a half-built prefix.
+    freerdp_source = ensure_source(work, FREERDP)
+    vnc_source = ensure_source(work, LIBVNC)
+
     build_zlib(work, dist, build_tools, arguments.force)
     build_openssl(work, dist, build_tools, arguments.perl, arguments.force)
-    freerdp_build = build_freerdp(work, dist, build_tools, arguments.force)
-    vnc_build = build_libvnc(work, dist, build_tools, arguments.force)
+    freerdp_build = build_freerdp(work, dist, build_tools, freerdp_source, arguments.force)
+    vnc_build = build_libvnc(work, dist, build_tools, vnc_source, arguments.force)
 
     libraries = collect_archives(freerdp_build, dist, FREERDP_LIBRARIES)
     libraries.extend(collect_archives(vnc_build, dist, LIBVNC_LIBRARIES))
@@ -422,11 +571,11 @@ def main() -> int:
     libraries.append(ZLIB_LIBRARY)
     include_dirs = [
         dist / "include",
-        FREERDP["source"] / "include",
-        FREERDP["source"] / "winpr/include",
+        freerdp_source / "include",
+        freerdp_source / "winpr/include",
         freerdp_build / "include",
         freerdp_build / "winpr/include",
-        LIBVNC["source"] / "include",
+        vnc_source / "include",
         vnc_build / "include",
     ]
     write_manifest(dist, [directory for directory in include_dirs if directory.is_dir()],
