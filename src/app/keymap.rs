@@ -517,14 +517,14 @@ pub const ACTIONS: &[ActionSpec] = &[
         context: Context::Terminal,
         name_en: "Copy the selection",
         name_zh: "复制选中内容",
-        defaults: &[DefaultKey::Modifier("shift-c")],
+        defaults: &[DefaultKey::Modifier("c")],
     },
     ActionSpec {
         id: "terminal.paste",
         context: Context::Terminal,
         name_en: "Paste into the terminal",
         name_zh: "粘贴到终端",
-        defaults: &[DefaultKey::Modifier("shift-v")],
+        defaults: &[DefaultKey::Modifier("v")],
     },
 ];
 
@@ -982,7 +982,7 @@ impl Keymap {
     /// The actions the settings page lists for `query`, in catalogue order.
     ///
     /// Every word of the query has to be found in the action's name, its identifier,
-    /// its context or one of its shortcuts, so "终端 复制" and "ctrl-shift-c" both
+    /// its context or one of its shortcuts, so "终端 复制" and "ctrl-c" both
     /// find the same row.
     #[must_use]
     pub fn matching(&self, query: &str, locale: Locale) -> Vec<&'static ActionSpec> {

@@ -2844,7 +2844,7 @@ pub struct UxStrings {
     pub hosts_filter_clear: &'static str,
     /// What a narrowing filter leaves behind when nothing matches
     pub hosts_no_match_hint: &'static str,
-    /// A group with nothing inside it
+    /// The group column when no group has been made yet
     pub hosts_group_empty: &'static str,
     /// Button: open the batch task preview for the selected hosts
     pub hosts_batch_open: &'static str,
@@ -3749,7 +3749,7 @@ included",
     hosts_result_count: "{shown} of {total} hosts",
     hosts_filter_clear: "Clear filters",
     hosts_no_match_hint: "Change the search or drop a filter to see more hosts.",
-    hosts_group_empty: "No host in this group",
+    hosts_group_empty: "No groups yet. Use + to make one.",
     hosts_batch_open: "Batch task",
     hosts_batch_open_hint: "Run ordered commands on the selected hosts, after you confirm the list",
     batch_title: "Batch task",
@@ -4142,7 +4142,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     hosts_result_count: "共 {total} 台，当前显示 {shown} 台",
     hosts_filter_clear: "清除筛选",
     hosts_no_match_hint: "改一下搜索词，或去掉一个筛选条件，就能看到更多主机。",
-    hosts_group_empty: "这个分组里没有主机",
+    hosts_group_empty: "还没有分组，点 + 新建",
     hosts_batch_open: "批量任务",
     hosts_batch_open_hint: "确认清单后，在选中的主机上按顺序执行命令",
     batch_title: "批量任务",

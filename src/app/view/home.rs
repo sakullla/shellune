@@ -537,7 +537,12 @@ impl ShelluneView {
                 .is_some_and(|(_, next)| next.depth > group.depth);
             rows = rows.child(self.group_tree_row(group, *number, branch, cx));
         }
-        if groups.is_empty() {
+        // The tree follows the search, so an empty tree under a search only means the
+        // search hid the groups; the list beside it already says so. The hint to make
+        // a group is for a book that really has none.
+        let searching =
+            !self.hosts.search().trim().is_empty() || self.hosts.filter().is_narrowing();
+        if groups.is_empty() && !searching {
             rows = rows.child(
                 div()
                     .px(metrics.scale(spacing::TIGHT))
@@ -574,8 +579,10 @@ impl ShelluneView {
                 chosen,
                 metrics,
             ))
+            // Every saved record the list can show, desktop and serial ones included,
+            // so the number matches the list's own "n of m" line.
             .child(components::badge(
-                self.book.hosts().len(),
+                self.book.hosts().len() + self.book.connections().len(),
                 if chosen { Tone::Accent } else { Tone::Neutral },
                 metrics,
             ))
@@ -752,10 +759,14 @@ impl ShelluneView {
         let strings = self.strings();
         let ux = copy::ux();
         if self.hosts.view() == crate::app::hosts::HostView::Recent {
+            // `items_start`: the button is as wide as its words, not a bar across
+            // the whole list.
             return div()
                 .flex()
                 .flex_col()
+                .items_start()
                 .gap(metrics.scale(spacing::HAIRLINE))
+                .pt(metrics.scale(spacing::TIGHT))
                 .debug_selector(|| "hosts.recent.empty".to_owned())
                 .child(
                     div()
@@ -780,7 +791,9 @@ impl ShelluneView {
         div()
             .flex()
             .flex_col()
+            .items_start()
             .gap(metrics.scale(spacing::HAIRLINE))
+            .pt(metrics.scale(spacing::TIGHT))
             .debug_selector(|| "hosts.nomatch".to_owned())
             .child(
                 div()
@@ -796,6 +809,7 @@ impl ShelluneView {
             )
             .child(
                 components::compact_button(ux.hosts_filter_clear, Variant::Secondary, metrics)
+                    .mt(metrics.scale(spacing::HAIRLINE))
                     .id("hosts.nomatch.clear")
                     .debug_selector(|| "hosts.nomatch.clear".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {
@@ -1111,25 +1125,68 @@ fn group_header_row(
     };
     let toggled = weak.clone();
     let path = group.path.clone();
+    let clicked = weak.clone();
+    let click_path = group.path.clone();
+    // A header is one row of the uniform list, so it keeps the row's height exactly
+    // and spans the list's width: a section divider the eye can follow, not a
+    // floating label. The bar sits at the bottom of its row, so the gap above it
+    // separates the group from the one before.
     div()
         .h(row_height)
+        .w_full()
         .id(SharedString::from(format!("hosts.group.row.{number}")))
         .debug_selector(move || format!("hosts.group.{number}"))
         .flex()
+        .items_end()
+        .pb(metrics.scale(spacing::HAIRLINE))
+        .child(
+            div()
+                .id(SharedString::from(format!("hosts.group.bar.{number}")))
+                .flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .h(metrics.scale(32.0))
+                .pl(metrics.scale(spacing::HAIRLINE + group.depth as f32 * 14.0))
+                .pr(metrics.scale(spacing::TIGHT))
+                .border_b_1()
+                .border_color(theme::swatch(palette::BORDER))
+                // The whole header folds its group, not only the chevron.
+                .cursor_pointer()
+                .on_click(move |_event, _window, cx| {
+                    let path = click_path.clone();
+                    let _ = clicked.update(cx, |view, cx| view.toggle_group_row(path, cx));
+                })
+                .child(group_header_body(
+                    group, number, label, chevron, path, toggled, metrics,
+                )),
+        )
+}
+
+/// The chevron, name and count of a group header.
+fn group_header_body(
+    group: &HostGroupRow,
+    number: usize,
+    label: String,
+    chevron: Icon,
+    path: Option<GroupPath>,
+    toggled: WeakEntity<ShelluneView>,
+    metrics: Metrics,
+) -> Div {
+    div()
+        .flex()
+        .flex_1()
+        .min_w(px(0.0))
         .items_center()
         .gap(metrics.scale(spacing::TIGHT))
-        .mt(metrics.scale(spacing::TIGHT))
-        .pl(metrics.scale(spacing::TIGHT + group.depth as f32 * 14.0))
-        .pr(metrics.scale(spacing::TIGHT))
-        .py(metrics.scale(spacing::HAIRLINE))
-        .rounded(px(radius::MEDIUM))
-        .bg(theme::swatch(palette::SURFACE))
         .child(
             components::icon_only_button(chevron, metrics)
                 .size(metrics.scale(18.0))
                 .id(SharedString::from(format!("hosts.group.{number}.toggle")))
                 .debug_selector(move || format!("hosts.group.{number}.toggle"))
                 .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
                     let path = path.clone();
                     let _ = toggled.update(cx, |view, cx| view.toggle_group_row(path, cx));
                 }),
@@ -1139,9 +1196,9 @@ fn group_header_row(
                 .flex_1()
                 .min_w(px(0.0))
                 .truncate()
-                .text_size(metrics.caption_size())
+                .text_size(metrics.label_size())
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .child(SharedString::from(label)),
         )
         .child(components::badge(group.hosts, Tone::Neutral, metrics))
@@ -1428,6 +1485,9 @@ fn connection_row_element(
                 let _ = menu_row.update(cx, |view, cx| view.open_host_menu(id, event, window, cx));
             },
         )
+        // No checkbox (a selection is an SSH target), but its room is kept: the
+        // avatars and names of every row stand in one column.
+        .child(div().flex_none().size(metrics.hit_target()))
         .child(super::host_avatar(connection.name.as_ref(), false, metrics))
         .child(
             div()

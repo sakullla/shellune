@@ -597,9 +597,10 @@ pub struct TerminalPane {
 pub struct TerminalShortcuts {
     /// The search action, `Ctrl+Shift+F` or `⌘F` by default.
     pub search: Option<String>,
-    /// The copy action, `Ctrl+Shift+C` or `⌘⇧C` by default.
+    /// The copy action, `Ctrl+C` or `⌘C` by default. With nothing selected the
+    /// combination stays the program's own key (an interrupt on Ctrl+C).
     pub copy: Option<String>,
-    /// The paste action, `Ctrl+Shift+V` or `⌘⇧V` by default.
+    /// The paste action, `Ctrl+V` or `⌘V` by default.
     pub paste: Option<String>,
 }
 
@@ -1783,8 +1784,9 @@ impl TerminalPane {
 
         // The terminal's own clipboard and search keys arrive as actions, so the
         // settings page can rebind or unbind them (R5). These confirm or cancel a
-        // paste and step through search hits; they are not Ctrl+L or Ctrl+C, which
-        // stay program input below.
+        // paste and step through search hits; they are not Ctrl+L, which stays
+        // program input below. Ctrl+C reaches here only when nothing is selected,
+        // and then it is the program's interrupt.
         if modifiers.control && modifiers.shift {
             match keystroke.key.as_str() {
                 "enter" if self.pending_paste.is_some() => {
@@ -1869,6 +1871,28 @@ impl TerminalPane {
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
         self.last_copy = Some(text);
         cx.notify();
+    }
+
+    /// The keyboard copy: copies a selection and clears it, so a second press is the
+    /// program's interrupt. Returns whether there was anything to copy.
+    fn copy_selection_from_key(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self
+            .core
+            .selection_text()
+            .is_some_and(|text| !text.is_empty())
+        {
+            // A highlight over blank cells holds nothing to copy; it goes, and the
+            // key is the program's.
+            if self.core.has_selection() {
+                self.core.clear_selection();
+                cx.notify();
+            }
+            return false;
+        }
+        self.copy_selection(cx);
+        self.core.clear_selection();
+        cx.notify();
+        true
     }
 
     /// Sends pasted text, or holds it when it is multi-line or high-risk.
@@ -4202,11 +4226,25 @@ impl TerminalPane {
                 this.toggle_search(window, cx);
                 cx.stop_propagation();
             }))
+            // Copy and paste use the everyday Ctrl+C / Ctrl+V (⌘C / ⌘V). Copy only
+            // takes the key while something is selected, and then drops the
+            // highlight, so the next Ctrl+C is the program's interrupt again, as in
+            // other terminals. With nothing to copy, the key falls through to the
+            // program untouched.
             .on_action(cx.listener(|this, _: &TerminalCopy, _window, cx| {
-                this.copy_selection(cx);
-                cx.stop_propagation();
+                if this.copy_selection_from_key(cx) {
+                    cx.stop_propagation();
+                } else {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|this, _: &TerminalPaste, window, cx| {
+                // An empty clipboard has nothing to paste: the key is the program's
+                // (Ctrl+V is "insert the next key literally" in a shell).
+                if cx.read_from_clipboard().is_none() {
+                    cx.propagate();
+                    return;
+                }
                 this.paste(window, cx);
                 cx.stop_propagation();
             }))

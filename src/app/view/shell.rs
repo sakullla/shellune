@@ -504,7 +504,8 @@ impl ShelluneView {
         let strings = self.strings();
         let selected = self.home_is_shown();
         let hover = theme::swatch(palette::SURFACE_HOVER);
-        let count = self.book.hosts().len();
+        // Every saved record the page lists, desktop and serial ones too.
+        let count = self.book.hosts().len() + self.book.connections().len();
         // The hint reads the binding in force, so a rebound or unbound shortcut is
         // described as it really is (R5).
         let shortcut = crate::app::keymap::page_action(Destination::Hosts)
@@ -955,27 +956,38 @@ impl ShelluneView {
                     .flex_col()
                     .flex_1()
                     .min_w(px(0.0))
+                    // The name has the whole line to itself, so a long one ("Windows
+                    // PowerShell") ends in an ellipsis instead of being cut under a
+                    // badge. The badge reads first on the detail line, in the accent,
+                    // at the same line height, so every card stays the same height.
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(metrics.body_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(name)),
+                    )
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                            .min_w(px(0.0))
+                            .gap(metrics.scale(spacing::HAIRLINE + 1.0))
+                            .text_size(metrics.caption_size())
+                            .children(badge.map(|badge| {
+                                div()
+                                    .flex_none()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::ACCENT_ON_TINT))
+                                    .child(format!("{badge} ·"))
+                            }))
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(metrics.body_size())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(name)),
-                            )
-                            .children(badge.map(|badge| components::tag(badge, metrics))),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(detail)),
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(SharedString::from(detail)),
+                            ),
                     ),
             )
     }

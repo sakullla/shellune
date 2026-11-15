@@ -566,7 +566,9 @@ impl ShelluneView {
                         let selector = selector.clone();
                         move || selector.clone()
                     })
-                    .when(chosen && ringed, |row| {
+                    // One ring, on the one row the keys move: an open category hands
+                    // it to its chosen page, so two outlined rows never compete.
+                    .when(chosen && ringed && !expanded, |row| {
                         row.border_color(theme::swatch(palette::FOCUS_RING))
                     })
                     .child(
@@ -631,7 +633,7 @@ impl ShelluneView {
         let metrics = self.metrics();
         let locale = self.workspace.locale();
         let picked = index == self.settings_nav.item_of(category);
-        let ringed = !self.pointer_input;
+        let ringed = !self.pointer_input || self.settings_nav.nav_focus;
         let selector = format!("settings.item.{}", item.id());
         div()
             .flex()
@@ -651,9 +653,12 @@ impl ShelluneView {
                 let hover = theme::swatch(palette::SURFACE_HOVER);
                 row.hover(move |style| style.bg(hover))
             })
+            // The border is always there, clear until it rings, so the ring never
+            // moves the label by a pixel.
+            .border_1()
+            .border_color(theme::clear())
             .when(picked && ringed, |row| {
-                row.border_1()
-                    .border_color(theme::swatch(palette::FOCUS_RING))
+                row.border_color(theme::swatch(palette::FOCUS_RING))
             })
             .id(SharedString::from(selector.clone()))
             .debug_selector({

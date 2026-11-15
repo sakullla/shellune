@@ -2061,6 +2061,20 @@ fn host_avatar_initials_are_readable_on_their_tint() {
 }
 
 #[test]
+fn host_initials_tell_numbered_hosts_apart() {
+    use crate::app::view::host_initials;
+    assert_eq!(host_initials("stage-01"), "S1");
+    assert_eq!(host_initials("stage-02"), "S2");
+    assert_eq!(host_initials("node-0017"), "N7");
+    assert_eq!(host_initials("web3"), "W3");
+    assert_eq!(host_initials("Design workstation"), "DW");
+    assert_eq!(host_initials("prod-web"), "PW");
+    assert_eq!(host_initials("gateway"), "G");
+    assert_eq!(host_initials("开发机"), "开");
+    assert_eq!(host_initials("--"), "#");
+}
+
+#[test]
 fn tab_identity_colours_are_readable_distinct_and_not_status_hues() {
     let surfaces = [
         palette::CANVAS,
@@ -12428,7 +12442,7 @@ async fn the_transfer_center_keeps_a_task_after_the_file_view_closes(cx: &mut Te
         "the target is named: {summary}"
     );
     assert!(
-        summary.contains("2048/8192"),
+        summary.contains("2.0 KB / 8.0 KB"),
         "the progress is the worker's number: {summary}"
     );
 
@@ -12443,7 +12457,7 @@ async fn the_transfer_center_keeps_a_task_after_the_file_view_closes(cx: &mut Te
         .update(|_window, app| view.read(app).transfer_center_text_for_test(task))
         .expect("the center still has the task");
     assert!(
-        later.contains("4096/8192"),
+        later.contains("4.0 KB / 8.0 KB"),
         "the center follows the worker, not the number it had when the files closed: {later}"
     );
     assert!(
@@ -12632,7 +12646,7 @@ async fn a_refused_resume_stays_failed_and_transfer_again_is_a_new_task(cx: &mut
         "the refusal says the source changed: {detail}"
     );
     assert!(
-        !detail.contains("100/400"),
+        !detail.contains("100 B / 400 B"),
         "a refused resume does not keep the old progress as if it still counted: {detail}"
     );
 
@@ -17208,10 +17222,59 @@ async fn an_image_pasted_into_a_local_terminal_is_left_to_the_program(cx: &mut T
         gpui::ImageFormat::Png,
         vec![0x89, b'P', b'N', b'G'],
     )));
-    cx.simulate_keystrokes("ctrl-shift-v");
+    let keymap = Keymap::defaults(Platform::current());
+    cx.update(|_window, app| crate::app::apply_keymap(app, &keymap));
+    cx.simulate_keystrokes("secondary-v");
     cx.run_until_parked();
     let sent = cx.update(|_window, app| pane.read(app).sent().to_vec());
     assert_eq!(sent, vec![0x16], "the program is sent Ctrl+V");
+}
+
+#[gpui::test]
+async fn the_everyday_copy_key_copies_a_selection_and_otherwise_interrupts(
+    cx: &mut TestAppContext,
+) {
+    // Copy and paste are the everyday Ctrl+C / Ctrl+V (⌘C / ⌘V), like every other
+    // application. With a selection, Ctrl+C copies it and drops the highlight; with
+    // none, it is the program's interrupt.
+    let (pane, cx) = pane_with("hello\r\n", cx);
+    let keymap = Keymap::defaults(Platform::current());
+    cx.update(|_window, app| crate::app::apply_keymap(app, &keymap));
+    right_click(cx, "terminal.row.0");
+    click(cx, "terminal.menu.select_all");
+    cx.write_to_clipboard(ClipboardItem::new_string("before".to_owned()));
+
+    cx.simulate_keystrokes("secondary-c");
+    cx.run_until_parked();
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    assert!(
+        copied.contains("hello"),
+        "the selection was copied: {copied:?}"
+    );
+    assert!(
+        cx.update(|_window, app| pane.read(app).sent().is_empty()),
+        "a copy sends nothing to the program"
+    );
+
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        vec![0x03],
+        "with the selection gone, Ctrl+C interrupts"
+    );
+
+    cx.write_to_clipboard(ClipboardItem::new_string("pasted".to_owned()));
+    cx.simulate_keystrokes("secondary-v");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().to_vec()),
+        b"\x03pasted".to_vec(),
+        "the everyday paste key pastes"
+    );
 }
 
 #[gpui::test]
@@ -20889,7 +20952,7 @@ async fn a_queued_transfer_says_it_is_queued_and_only_a_known_total_draws_a_bar(
         .update(|_window, app| view.read(app).transfer_detail_for_test(first))
         .expect("the task is listed");
     assert!(
-        detail.contains("25%") && detail.contains("1024/4096"),
+        detail.contains("25%") && detail.contains("1.0 KB / 4.0 KB"),
         "the row shows the worker's own fraction: {detail}"
     );
     assert!(

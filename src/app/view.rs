@@ -14259,7 +14259,13 @@ impl ShelluneView {
                 // The share is printed only when the whole is known: a percentage
                 // beside no total would be a guess about how much is left.
                 let percent = task.state().permille().map_or(0, |permille| permille / 10);
-                let mut line = format!("{state_label} · {percent}% · {transferred}/{total} B");
+                // Sizes are read, not counted: "7.8 MB / 18 MB" rather than eight
+                // digits over eight more.
+                let mut line = format!(
+                    "{state_label} · {percent}% · {} / {}",
+                    human_size(*transferred),
+                    human_size(*total)
+                );
                 // Speed and the time still needed are measurements, so they are printed
                 // only once the window has two real progress reports to divide: nothing
                 // is extrapolated from the size of a file or from a single sample.
@@ -14278,7 +14284,7 @@ impl ShelluneView {
                 // A tree whose size the worker cannot know has no percentage and no
                 // estimate - only the bytes it has really written, and the speed they
                 // were written at.
-                let mut line = format!("{state_label} · {transferred} B");
+                let mut line = format!("{state_label} · {}", human_size(*transferred));
                 if let Some(rate) = self.transfers.rate(task.id()) {
                     line.push_str(&format!(" · {}/s", bytes_text(rate.round() as u64)));
                 }
@@ -14439,6 +14445,7 @@ impl ShelluneView {
         let detail = self.transfer_detail(task);
         let mut actions = div()
             .flex()
+            .flex_none()
             .items_center()
             .flex_wrap()
             .gap(metrics.scale(spacing::HAIRLINE));
@@ -14458,17 +14465,26 @@ impl ShelluneView {
             .px(metrics.scale(spacing::TIGHT))
             .py(metrics.scale(spacing::HAIRLINE + 2.0))
             .text_size(metrics.caption_size())
+            // The state and the actions it allows share one line: the button sits
+            // beside what it acts on instead of on a line of its own under the bar.
             .child(
                 div()
-                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
                     .min_w(px(0.0))
-                    .whitespace_normal()
-                    .text_color(tone.text())
-                    .debug_selector(move || format!("transfers.state.{index}"))
-                    .child(SharedString::from(detail)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
+                            .text_color(tone.text())
+                            .debug_selector(move || format!("transfers.state.{index}"))
+                            .child(SharedString::from(detail)),
+                    )
+                    .child(actions),
             )
             .children(self.transfer_progress_bar(index, task))
-            .child(actions)
             .child(
                 div()
                     .flex()
@@ -16155,23 +16171,51 @@ impl ShelluneView {
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
             .min_w(px(0.0));
-        if let Some(step) = step {
-            actions = actions.child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .debug_selector(|| "terminal.failure.next".to_owned())
-                    .child(SharedString::from(format!(
-                        "{} · {step}",
-                        strings.next_step
-                    ))),
-            );
+        // The next step is the button itself, beside the reason it answers: a sentence
+        // naming "Reconnect" while the button sits in the bar at the other end of the
+        // window made the reader look for it.
+        let can_reconnect =
+            self.workspace.session(id).is_some_and(may_reconnect) && !self.connection_inline();
+        match status.step() {
+            Some(SessionStep::Reconnect) if can_reconnect => {
+                actions = actions.child(self.icon_text_button(
+                    SharedString::from("terminal.failure.next"),
+                    Icon::Refresh,
+                    strings.session_reconnect,
+                    Variant::Primary,
+                    cx,
+                    move |view, cx| view.reconnect_session(id, cx),
+                ));
+            }
+            Some(SessionStep::Close) => {
+                actions = actions.child(self.text_button(
+                    SharedString::from("terminal.failure.next"),
+                    strings.session_close,
+                    Variant::Secondary,
+                    cx,
+                    move |view, cx| view.request_close_session(id, cx),
+                ));
+            }
+            _ => {
+                if let Some(step) = step {
+                    actions = actions.child(
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "terminal.failure.next".to_owned())
+                            .child(SharedString::from(format!(
+                                "{} · {step}",
+                                strings.next_step
+                            ))),
+                    );
+                }
+            }
         }
         if status.diagnostic().is_some() {
             actions = actions.child(self.text_button(
                 SharedString::from("terminal.failure.details"),
                 toggle,
-                Variant::Secondary,
+                Variant::Ghost,
                 cx,
                 move |view, cx| {
                     view.toggle_diagnostic(id, cx);
@@ -16280,6 +16324,14 @@ impl ShelluneView {
         // their room: a narrow strip then clips a whole tab rather than letting one
         // tab's marks and close button slide over its neighbour (R4, R7).
         let marks = tab_attention_marks(unread, strings, metrics, index);
+        // A state word ("Disconnected", "连接中") cannot shrink either: the tab grows
+        // by its room, so it is read whole instead of being cut at the tab's edge.
+        let state_room = if live {
+            px(0.0)
+        } else {
+            components::reserved_text_width(&state_label, metrics.caption_size())
+                + metrics.scale(spacing::TIGHT)
+        };
         let mark_room = attention_mark_room(unread, metrics);
 
         let mut tab = div()
@@ -16289,8 +16341,8 @@ impl ShelluneView {
             .flex()
             .items_center()
             .flex_shrink()
-            .min_w(metrics.scale(84.0) + mark_room)
-            .max_w(metrics.scale(220.0))
+            .min_w(metrics.scale(84.0) + mark_room + state_room)
+            .max_w(metrics.scale(220.0) + state_room)
             .gap(metrics.scale(spacing::TIGHT - 1.0))
             .h(metrics.tab_height())
             .pl(metrics.scale(spacing::SNUG - 2.0))
@@ -17622,14 +17674,15 @@ fn may_reconnect(session: &Session) -> bool {
 fn session_target(book: &HostBook, session: &Session) -> String {
     match session.kind() {
         SessionKind::Local { shell } => shell.clone().unwrap_or_else(|| session.title().to_owned()),
+        // When the saved record is gone the session keeps the name it was opened
+        // under: an internal identifier means nothing to the person reading it.
         SessionKind::Remote { host } => book
             .host(*host)
-            .map_or_else(|| format!("host {host}"), HostConfig::target),
-        // A desktop or serial session names what its saved connection would reach. The
-        // id is shown when that connection is gone, exactly as for a host.
+            .map_or_else(|| session.title().to_owned(), HostConfig::target),
+        // A desktop or serial session names what its saved connection would reach.
         SessionKind::Rdp { host } | SessionKind::Vnc { host } | SessionKind::Serial { host } => {
             book.connection(*host)
-                .map_or_else(|| format!("connection {host}"), |record| record.target())
+                .map_or_else(|| session.title().to_owned(), |record| record.target())
         }
     }
 }
@@ -17823,23 +17876,45 @@ fn brand_mark(size: gpui::Pixels, _metrics: Metrics) -> Div {
         .child(gpui::img(icons::APP_ICON).size(size))
 }
 
+/// The two characters a host avatar shows.
+///
+/// Hosts are usually named as a role and a number (`build-01`, `node-0002`,
+/// `web3`), so the mark is the first letter and the last digit of the number:
+/// `stage-01` and `stage-02` read `S1` and `S2` instead of the same `S0`. Names of
+/// words read as their first two initials (`Design workstation` → `DW`), and a
+/// single word as its first letter.
+pub(crate) fn host_initials(name: &str) -> String {
+    let parts: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(first) = parts.first().and_then(|part| part.chars().next()) else {
+        return "#".to_owned();
+    };
+    let mut initials: String = first.to_uppercase().collect();
+    // The number a name ends in, read from its last part: a part of its own
+    // (`build-01`) or the tail of a word (`web3`).
+    let last = parts.last().copied().unwrap_or_default();
+    let trailing_digit = last
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .next()
+        .filter(|_| parts.len() > 1 || last.chars().count() > 1);
+    if let Some(digit) = trailing_digit {
+        initials.push(digit);
+    } else if let Some(second) = parts.get(1).and_then(|part| part.chars().next()) {
+        initials.extend(second.to_uppercase());
+    }
+    initials
+}
+
 /// A rounded square with the initials of a host, so a list is scanned by name shape.
 ///
 /// A host that was really reached before is tinted in the positive tone, the same
 /// rule the recent view uses for its dot; every other host is drawn in the accent.
 fn host_avatar(name: &str, reached: bool, metrics: Metrics) -> Div {
-    let initials: String = name
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .take(2)
-        .filter_map(|part| part.chars().next())
-        .flat_map(char::to_uppercase)
-        .collect();
-    let initials = if initials.is_empty() {
-        "#".to_owned()
-    } else {
-        initials
-    };
+    let initials = host_initials(name);
     let (background, text) = if reached {
         (palette::POSITIVE_TINT, palette::POSITIVE)
     } else {
