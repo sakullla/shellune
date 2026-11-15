@@ -164,7 +164,7 @@ gpui 0.2.2 的 Windows 后端在创建窗口时会把逻辑 bounds 换成设备�
   出厂默认 Shell、键入 `ping -n 60 127.0.0.1`，等屏幕上出现至少两个 `TTL=` 后按
   Ctrl+C，只断言 pane 恰好写出一个 `0x03` 且会话仍为 Live；控制台宿主是否把该字节变成
   中断事件不在它的断言里，端到端那一层由
-  `tests/local_shell.rs::interrupt::the_default_shell_forwards_the_interrupt_to_the_program_it_started`
+  `tests/local_interrupt.rs::interrupt::the_default_shell_forwards_the_interrupt_to_the_program_it_started`
   在 PTY 层测（本机全量跑时该用例回声跳过，跳过不等于通过）。
 - 复审用的 `portable-pty` 探针与应用的差别不在 ConPTY。Windows PowerShell 启动后
   会先发 `ESC[6n`（设备状态查询）并等回答，**不回答它就永远不打印提示符**
