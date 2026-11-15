@@ -656,12 +656,15 @@ fn a_real_shell_reports_command_blocks_without_using_its_process_exit() {
             osc("133;D")
         ),
     ));
-    session.poll_until("the unknown command block", |session, _, _| {
-        session
-            .core
-            .command_blocks()
-            .iter()
-            .any(|block| block.command.contains("false-cmd"))
+    // The wait is for the block to have *ended*, not for it to exist: the command line
+    // reaches the terminal before the marker that closes the block, so a wait that only
+    // looks for the name can be answered while the block is still Running - and then the
+    // status below is read before the marker that decides it ever arrived. Measured: one
+    // serial run in ten failed exactly there, on Running against the expected Unknown.
+    session.poll_until("the ended command block", |session, _, _| {
+        session.core.command_blocks().iter().any(|block| {
+            block.command.contains("false-cmd") && block.status != BlockStatus::Running
+        })
     });
     let unknown = session
         .core
@@ -943,6 +946,7 @@ mod interrupt {
     fn wait_until_it_takes_input(session: &mut Session) {
         let deadline = Instant::now() + support::FLOOD_BUDGET;
         let mut next_offer = Instant::now();
+        let mut offers = 0;
         loop {
             session.pump();
             let text = session.core.snapshot().text().join("\n");
@@ -951,11 +955,13 @@ mod interrupt {
             }
             if Instant::now() >= next_offer {
                 session.run(&format!("echo {INPUT_MARKER}"));
+                offers += 1;
                 next_offer = Instant::now() + Duration::from_millis(500);
             }
             assert!(
                 Instant::now() < deadline,
-                "the shell never answered a typed line in {:?}, so no command could reach it",
+                "the shell never answered a typed line in {:?} although it was offered \
+                 {offers} time(s); the screen held:\n{text}",
                 support::FLOOD_BUDGET
             );
             std::thread::sleep(support::READ_INTERVAL);
@@ -1129,6 +1135,11 @@ mod interrupt {
     /// sets `SHELLUNE_REQUIRE_INTERRUPT_DELIVERY=1` and then the same case fails instead.
     #[test]
     fn the_shell_forwards_the_interrupt_to_the_program_it_started() {
+        // The console host is taken before the shell is started, not after: a session
+        // created while another test is flooding the same host is a session whose first
+        // read is already queued behind that flood, and the wait below cannot tell that
+        // apart from a shell that is not reading its input at all.
+        let _alone = support::exclusive();
         let Some(session) = shell_for_the_flood() else {
             support::report(
                 "local_shell",
@@ -1149,6 +1160,7 @@ mod interrupt {
     /// factory path is exactly where the interrupt went unmeasured.
     #[test]
     fn the_default_shell_forwards_the_interrupt_to_the_program_it_started() {
+        let _alone = support::exclusive();
         let Some(session) = Session::start() else {
             support::report(
                 "local_shell",
@@ -1177,8 +1189,10 @@ mod interrupt {
     ///
     /// Shared so the factory shell is measured by exactly the same rules as `cmd.exe`;
     /// `label` is the test the failure or skip names, so either ending stays traceable.
+    /// The caller holds [support::exclusive]: this measures what it can see, and a
+    /// second flooding session on the same console host would make every reading here a
+    /// reading of the scheduler.
     fn forwards_the_interrupt(mut session: Session, label: &str) {
-        let _alone = support::exclusive();
         wait_until_it_takes_input(&mut session);
         let before_launch = session.bytes_read();
         let command = flood_command_for(&session.shell);

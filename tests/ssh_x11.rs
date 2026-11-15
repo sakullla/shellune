@@ -45,6 +45,11 @@ use shellune_ssh::{
     ChainEvent, ChainRequest, ChainSession, HopAuth, KnownHostKey, PtySize, X11Status,
 };
 
+/// Starting the disposable server: bounded retries, and every attempt's reason when none of
+/// them worked. One module, so every SSH file reads these starts the same way.
+#[path = "support/fixture.rs"]
+mod fixture;
+
 /// How long any single wait may take.
 const PATIENCE: Duration = Duration::from_secs(45);
 
@@ -311,8 +316,7 @@ fn remote_programs_reach_this_machines_display_over_one_authenticated_connection
     if skip("X11 forwarding to a local display", true) {
         return;
     }
-    let server = Harness::start_with_x11("x11-ready", Harness::free_port(), X11Server::Enabled)
-        .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-ready", X11Server::Enabled);
     let display = DisplayServer::start("x11-ready").expect("the display server starts");
     let xauth = display.xauth_path();
     let _env = DisplayEnv::set(
@@ -411,9 +415,7 @@ fn a_restricted_session_asks_the_display_for_an_untrusted_cookie_and_keeps_the_a
     if skip("restricted X11 forwarding to a local display", true) {
         return;
     }
-    let server =
-        Harness::start_with_x11("x11-restricted", Harness::free_port(), X11Server::Enabled)
-            .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-restricted", X11Server::Enabled);
     // `SHELLUNE_X11_DISPLAY` selects a server that already enforces SECURITY. The
     // harness's own Xvfb does not, and a pass on that server would be the refusal path.
     let display =
@@ -678,8 +680,7 @@ fn a_trusted_session_forwards_without_needing_a_restricted_cookie() {
     if skip("a trusted X11 session", true) {
         return;
     }
-    let server = Harness::start_with_x11("x11-trusted", Harness::free_port(), X11Server::Enabled)
-        .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-trusted", X11Server::Enabled);
     let display = DisplayServer::start("x11-trusted").expect("the display server starts");
     // No working xauth on this machine at all: the trusted mode forwards with the
     // display's own cookie and never asks for another one.
@@ -717,8 +718,7 @@ fn a_session_without_x11_never_asks_for_a_display() {
     if skip("a session without X11 forwarding", false) {
         return;
     }
-    let server = Harness::start_with_x11("x11-off", Harness::free_port(), X11Server::Enabled)
-        .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-off", X11Server::Enabled);
 
     let mut session = connect(&server, X11Forwarding::Off);
     let started = wait_connected(&mut session);
@@ -747,8 +747,7 @@ fn a_machine_without_a_display_says_so_and_keeps_the_shell() {
     if skip("X11 forwarding without a local display", false) {
         return;
     }
-    let server = Harness::start_with_x11("x11-nodisplay", Harness::free_port(), X11Server::Enabled)
-        .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-nodisplay", X11Server::Enabled);
     let _env = DisplayEnv::set(None, None, None);
 
     let mut session = connect(&server, X11Forwarding::Restricted);
@@ -780,9 +779,7 @@ fn a_display_without_the_security_extension_stops_the_restricted_mode() {
     if skip("restricted forwarding to a display without SECURITY", true) {
         return;
     }
-    let server =
-        Harness::start_with_x11("x11-nosecurity", Harness::free_port(), X11Server::Enabled)
-            .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-nosecurity", X11Server::Enabled);
     let display =
         DisplayServer::start_without_security("x11-nosecurity").expect("the display server starts");
     let xauth = display.xauth_path();
@@ -829,8 +826,7 @@ fn a_restricted_session_whose_xauth_fails_reports_it_instead_of_forwarding_trust
     if skip("restricted forwarding with a failing xauth", true) {
         return;
     }
-    let server = Harness::start_with_x11("x11-badxauth", Harness::free_port(), X11Server::Enabled)
-        .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-badxauth", X11Server::Enabled);
     let display = DisplayServer::start("x11-badxauth").expect("the display server starts");
     let broken = display.broken_xauth_path();
     let _env = DisplayEnv::set(
@@ -875,8 +871,7 @@ fn a_server_that_forbids_x11_is_reported_and_the_shell_still_works() {
     if skip("a server that forbids X11 forwarding", true) {
         return;
     }
-    let server = Harness::start_with_x11("x11-disabled", Harness::free_port(), X11Server::Disabled)
-        .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-disabled", X11Server::Disabled);
     let display = DisplayServer::start("x11-disabled").expect("the display server starts");
     // The trusted mode, because the server is what this test is about: the restricted
     // mode asks this machine's display for a restricted cookie first, and that check
@@ -931,9 +926,7 @@ fn a_server_without_xauth_reports_that_cause_and_the_shell_still_works() {
     if skip("a server without xauth", true) {
         return;
     }
-    let server =
-        Harness::start_with_x11("x11-noxauth", Harness::free_port(), X11Server::WithoutXauth)
-            .expect("the disposable server starts");
+    let server = fixture::server_with_x11_or_panic("x11-noxauth", X11Server::WithoutXauth);
 
     let display = DisplayServer::start("x11-noxauth").expect("the display server starts");
     // The trusted mode again: the server's own preparation is the subject, and this

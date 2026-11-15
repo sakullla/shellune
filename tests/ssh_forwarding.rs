@@ -18,6 +18,11 @@ use shellune_ssh::{
     RemoteSession,
 };
 
+/// Starting the disposable server: bounded retries, and every attempt's reason when none of
+/// them worked. One module, so every SSH file reads these starts the same way.
+#[path = "support/fixture.rs"]
+mod fixture;
+
 const PATIENCE: Duration = Duration::from_secs(45);
 
 fn ssh_gate() -> std::sync::MutexGuard<'static, ()> {
@@ -284,7 +289,7 @@ fn local_remote_and_dynamic_forward_real_traffic_until_stopped_or_disconnected()
         return;
     }
     let _gate = ssh_gate();
-    let server = Harness::start("fwd-kinds", Harness::free_port()).expect("server");
+    let server = fixture::server_or_panic("fwd-kinds");
     let echo = start_wsl_echo(&server);
     let (mut session, mut link) = dial(&server, false);
 
@@ -389,7 +394,7 @@ fn bind_refusal_and_a_dead_target_keep_the_reason_and_the_shell() {
         return;
     }
     let _gate = ssh_gate();
-    let server = Harness::start("fwd-fail", Harness::free_port()).expect("server");
+    let server = fixture::server_or_panic("fwd-fail");
     let (mut session, mut link) = dial(&server, true);
 
     let occupied = TcpListener::bind("127.0.0.1:0").expect("occupied");
@@ -435,7 +440,7 @@ fn a_server_that_disables_forwarding_is_named_and_the_shell_stays() {
     }
     let _gate = ssh_gate();
     let server =
-        Harness::start_without_forwarding("fwd-deny", Harness::free_port()).expect("server");
+        fixture::server_without_forwarding("fwd-deny").unwrap_or_else(|reason| panic!("{reason}"));
     let (mut session, mut link) = dial(&server, true);
     let rule = spec(
         ForwardKind::Local,
@@ -468,8 +473,8 @@ fn a_jump_carries_the_forward_to_the_target_and_dies_with_the_jump() {
         return;
     }
     let _gate = ssh_gate();
-    let mut jump = Harness::start("fwd-jump", Harness::free_port()).expect("jump");
-    let target = Harness::start("fwd-target", Harness::free_port()).expect("target");
+    let mut jump = fixture::server_or_panic("fwd-jump");
+    let target = fixture::server_or_panic("fwd-target");
     let echo = start_wsl_echo(&target);
     let jump_host = HostConfig::new("jump", "127.0.0.1", jump.port(), jump.user()).expect("host");
     let mut target_host =

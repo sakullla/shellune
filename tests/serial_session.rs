@@ -236,10 +236,19 @@ fn a_device_that_goes_away_ends_the_session_and_frees_the_port() {
         "the cause the platform allowed is kept: {error:?}"
     );
     // The port is released by the session itself: nothing is still held after a device
-    // that went away, so the same port can be opened again once it is back.
+    // that went away, so the same port can be opened again once it is back. The release
+    // is not done in the very step that hands the disconnect over - the session settles
+    // into its final state first and lets the port go there - so it is waited for, the
+    // same way every other state in this file is, instead of being read at one instant.
+    // Measured: one full-suite run in four failed here on that single reading.
+    let deadline = Instant::now() + PATIENCE;
+    while !port.is_released() && Instant::now() < deadline {
+        let _ = session.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert!(
         port.is_released(),
-        "the port was released when the device failed"
+        "the port was released within {PATIENCE:?} of the device failing"
     );
     let _ = session.close();
 }

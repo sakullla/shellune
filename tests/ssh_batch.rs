@@ -27,6 +27,11 @@ use shellune_ssh::hostkey::KnownHostKey;
 use shellune_ssh::testserver::Harness;
 use shellune_storage::BatchStore;
 
+/// Starting the disposable server: bounded retries, and every attempt's reason when none of
+/// them worked. One module, so every SSH file reads these starts the same way.
+#[path = "support/fixture.rs"]
+mod fixture;
+
 const PATIENCE: Duration = Duration::from_secs(30);
 
 fn host(name: &str) -> HostConfig {
@@ -1255,7 +1260,7 @@ fn a_batch_runs_two_steps_over_a_real_server_when_one_can_be_started() {
         );
         return;
     }
-    let server = Harness::start("batch", Harness::free_port()).expect("a server");
+    let server = fixture::server_or_panic("batch");
     let mut remote =
         HostConfig::new("batch-target", "127.0.0.1", server.port(), server.user()).expect("a host");
     let _ = &mut remote;

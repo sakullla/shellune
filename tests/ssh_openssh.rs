@@ -29,30 +29,27 @@ use shellune_storage::{HostKey, HostTrust, TrustStore, TrustVerdict};
 use shellune_terminal::core::SearchOptions;
 use shellune_terminal::{BlockStatus, TermMode, TerminalCore};
 
+/// Starting the disposable server: bounded retries, and every attempt's reason when none of
+/// them worked. One module, so every SSH file reads these starts the same way.
+#[path = "support/fixture.rs"]
+mod fixture;
+
 /// How long any single wait may take.
 const PATIENCE: Duration = Duration::from_secs(45);
 
 /// The server the whole file shares, started once.
-fn shared() -> &'static Option<Harness> {
-    static SERVER: OnceLock<Option<Harness>> = OnceLock::new();
-    SERVER.get_or_init(|| {
-        if !Harness::is_available() {
-            return None;
-        }
-        Harness::start("shared", Harness::free_port()).ok()
-    })
+fn shared() -> &'static Result<Harness, fixture::Unavailable> {
+    static SERVER: OnceLock<Result<Harness, fixture::Unavailable>> = OnceLock::new();
+    SERVER.get_or_init(|| fixture::server("shared"))
 }
 
 /// What to do when this host cannot run the server.
 fn skip(what: &str) -> bool {
-    if shared().is_some() {
+    let Err(reason) = shared() else {
         return false;
-    }
+    };
     eprintln!(
-        "SKIPPED {what}: this host cannot start a disposable OpenSSH server, so no SSH \
-         behaviour is verified here and none is claimed. On Windows the tests start one \
-         through WSL by themselves; elsewhere scripts/ssh-test-server.sh has to be run on \
-         a Linux host the tests can reach (scripts/ssh-integration.sh shows the sequence)."
+        "SKIPPED {what}: {reason}, so no SSH behaviour is verified here and none is claimed."
     );
     true
 }
@@ -136,6 +133,7 @@ fn wait_for_output(session: &mut RemoteSession, needle: &str) -> String {
 fn scratch_trust(name: &str) -> TrustStore {
     let root = shared()
         .as_ref()
+        .ok()
         .map(|server| server.dir().join("trust").join(name))
         .unwrap_or_else(|| std::env::temp_dir().join("shellune-ssh-trust").join(name));
     let _ = std::fs::remove_dir_all(&root);
@@ -387,14 +385,11 @@ fn a_changed_server_identity_is_blocked_and_the_recorded_one_is_kept() {
         return;
     }
     // A server of its own, because this test changes that server's identity.
-    static OWN: OnceLock<Option<Mutex<Harness>>> = OnceLock::new();
-    let server = OWN.get_or_init(|| {
-        Harness::start("changed", Harness::free_port())
-            .ok()
-            .map(Mutex::new)
-    });
-    let Some(server) = server.as_ref() else {
-        panic!("the second disposable server could not be started");
+    static OWN: OnceLock<Result<Mutex<Harness>, fixture::Unavailable>> = OnceLock::new();
+    let server = OWN.get_or_init(|| fixture::server("changed").map(Mutex::new));
+    let server = match server {
+        Ok(server) => server,
+        Err(reason) => panic!("the second disposable server could not be started: {reason}"),
     };
     let mut server = server.lock().unwrap_or_else(|error| error.into_inner());
 

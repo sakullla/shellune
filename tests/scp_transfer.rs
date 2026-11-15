@@ -35,6 +35,11 @@ use shellune_ssh::{
     TransferLink, TransferRequest,
 };
 
+/// Starting the disposable server: bounded retries, and every attempt's reason when none of
+/// them worked. One module, so every SSH file reads these starts the same way.
+#[path = "support/fixture.rs"]
+mod fixture;
+
 /// How long any single wait may take.
 const PATIENCE: Duration = Duration::from_secs(90);
 
@@ -42,38 +47,29 @@ const PATIENCE: Duration = Duration::from_secs(90);
 const AWKWARD: &str = "报告 '终稿' 与;空格.txt";
 
 /// The ordinary server, started once.
-fn shared() -> &'static Option<Harness> {
-    static SERVER: std::sync::OnceLock<Option<Harness>> = std::sync::OnceLock::new();
-    SERVER.get_or_init(|| {
-        if !Harness::is_available() {
-            return None;
-        }
-        Harness::start("scp", Harness::free_port()).ok()
-    })
+fn shared() -> &'static Result<Harness, fixture::Unavailable> {
+    static SERVER: std::sync::OnceLock<Result<Harness, fixture::Unavailable>> =
+        std::sync::OnceLock::new();
+    SERVER.get_or_init(|| fixture::server("scp"))
 }
 
 /// A server without an SFTP subsystem, started once.
 ///
 /// It is the case this whole module exists for: SCP has to work where the file browser
 /// cannot.
-fn without_sftp() -> &'static Option<Harness> {
-    static SERVER: std::sync::OnceLock<Option<Harness>> = std::sync::OnceLock::new();
-    SERVER.get_or_init(|| {
-        if !Harness::is_available() {
-            return None;
-        }
-        Harness::start_without_sftp("scp-no-sftp", Harness::free_port()).ok()
-    })
+fn without_sftp() -> &'static Result<Harness, fixture::Unavailable> {
+    static SERVER: std::sync::OnceLock<Result<Harness, fixture::Unavailable>> =
+        std::sync::OnceLock::new();
+    SERVER.get_or_init(|| fixture::server_without_sftp("scp-no-sftp"))
 }
 
 /// What to do when this host cannot run the server.
-fn skip(what: &str, server: &Option<Harness>) -> bool {
-    if server.is_some() {
+fn skip(what: &str, server: &Result<Harness, fixture::Unavailable>) -> bool {
+    let Err(reason) = server else {
         return false;
-    }
+    };
     eprintln!(
-        "SKIPPED {what}: this host cannot start a disposable OpenSSH server, so no SCP \
-         behaviour is verified here and none is claimed."
+        "SKIPPED {what}: {reason}, so no SCP behaviour is verified here and none is claimed."
     );
     true
 }
@@ -386,7 +382,7 @@ fn server_has(server: &Harness, path: &str) -> bool {
 
 #[test]
 fn a_file_goes_up_and_comes_down_over_a_server_without_sftp() {
-    let Some(server) = without_sftp().as_ref() else {
+    let Ok(server) = without_sftp() else {
         if skip("a file copy over SCP", without_sftp()) {
             return;
         }
@@ -488,7 +484,7 @@ fn a_path_that_says_home_really_copies_into_and_out_of_the_account_home() {
     // the remote shell expands, so the sink has to be started in the real home - not in
     // a directory literally called `~` at the root, which is what normalizing the path
     // first would have asked for.
-    let Some(server) = without_sftp().as_ref() else {
+    let Ok(server) = without_sftp() else {
         if skip("a copy into and out of the home directory", without_sftp()) {
             return;
         }
@@ -588,7 +584,7 @@ fn a_path_that_says_home_really_copies_into_and_out_of_the_account_home() {
 fn a_directory_is_copied_only_when_recursion_was_chosen() {
     // The same server the round trip uses: a real sshd that refuses the SFTP subsystem,
     // so a recursive copy that works here cannot be SFTP doing the work.
-    let Some(server) = without_sftp().as_ref() else {
+    let Ok(server) = without_sftp() else {
         if skip("a recursive directory copy", without_sftp()) {
             return;
         }
@@ -724,7 +720,7 @@ fn a_directory_is_copied_only_when_recursion_was_chosen() {
 
 #[test]
 fn an_existing_target_is_untouched_until_the_answer_replaces_it() {
-    let Some(server) = shared().as_ref() else {
+    let Ok(server) = shared() else {
         if skip("an existing target", shared()) {
             return;
         }
@@ -789,7 +785,7 @@ fn an_existing_target_is_untouched_until_the_answer_replaces_it() {
 
 #[test]
 fn a_write_the_server_refuses_is_reported_as_that_refusal() {
-    let Some(server) = shared().as_ref() else {
+    let Ok(server) = shared() else {
         if skip("a refused write", shared()) {
             return;
         }
@@ -829,7 +825,7 @@ fn a_write_the_server_refuses_is_reported_as_that_refusal() {
 
 #[test]
 fn a_missing_source_and_a_missing_target_directory_are_different_reasons() {
-    let Some(server) = shared().as_ref() else {
+    let Ok(server) = shared() else {
         if skip("a missing path", shared()) {
             return;
         }
@@ -883,7 +879,7 @@ fn a_missing_source_and_a_missing_target_directory_are_different_reasons() {
 
 #[test]
 fn a_cancelled_copy_is_never_a_completed_one() {
-    let Some(server) = shared().as_ref() else {
+    let Ok(server) = shared() else {
         if skip("a cancelled copy", shared()) {
             return;
         }
@@ -922,7 +918,7 @@ fn a_cancelled_copy_is_never_a_completed_one() {
 
 #[test]
 fn a_connection_that_ends_mid_copy_never_reports_completion() {
-    let Some(server) = shared().as_ref() else {
+    let Ok(server) = shared() else {
         if skip("a connection that ends", shared()) {
             return;
         }
@@ -997,7 +993,7 @@ fn cx_free_residue(recorder: &Recorder, id: TransferId) -> Option<String> {
 
 #[test]
 fn sftp_still_copies_on_the_ordinary_server_and_scp_does_not_replace_it() {
-    let Some(server) = shared().as_ref() else {
+    let Ok(server) = shared() else {
         if skip("both protocols", shared()) {
             return;
         }

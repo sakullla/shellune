@@ -29,6 +29,11 @@ use shellune_core::{
 use shellune_ssh::testserver::Harness;
 use shellune_ssh::{ConnectRequest, FileLink, KnownHostKey, PtySize, RemoteEvent, RemoteSession};
 
+/// Starting the disposable server: bounded retries, and every attempt's reason when none of
+/// them worked. One module, so every SSH file reads these starts the same way.
+#[path = "support/fixture.rs"]
+mod fixture;
+
 /// How long any single wait may take.
 const PATIENCE: Duration = Duration::from_secs(45);
 
@@ -36,28 +41,25 @@ const PATIENCE: Duration = Duration::from_secs(45);
 const CHINESE_DIR: &str = "文档 与 空格";
 
 /// The server the ordinary cases share, started once.
-fn shared() -> &'static Option<Harness> {
-    static SERVER: std::sync::OnceLock<Option<Harness>> = std::sync::OnceLock::new();
+fn shared() -> &'static Result<Harness, fixture::Unavailable> {
+    static SERVER: std::sync::OnceLock<Result<Harness, fixture::Unavailable>> =
+        std::sync::OnceLock::new();
     SERVER.get_or_init(|| {
-        if !Harness::is_available() {
-            return None;
-        }
-        let server = Harness::start("sftp", Harness::free_port()).ok()?;
-        prepare(&server).ok()?;
-        Some(server)
+        fixture::start("the disposable SFTP server", || {
+            let server = Harness::start("sftp", Harness::free_port())?;
+            prepare(&server)?;
+            Ok(server)
+        })
     })
 }
 
 /// What to do when this host cannot run the server.
 fn skip(what: &str) -> bool {
-    if shared().is_some() {
+    let Err(reason) = shared() else {
         return false;
-    }
+    };
     eprintln!(
-        "SKIPPED {what}: this host cannot start a disposable OpenSSH server, so no SFTP \
-         behaviour is verified here and none is claimed. On Windows the tests start one \
-         through WSL by themselves; elsewhere scripts/ssh-test-server.sh has to run on a \
-         Linux host the tests can reach."
+        "SKIPPED {what}: {reason}, so no SFTP behaviour is verified here and none is claimed."
     );
     true
 }

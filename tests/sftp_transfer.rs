@@ -35,6 +35,11 @@ use shellune_ssh::{
     TransferLink, TransferRequest,
 };
 
+/// Starting the disposable server: bounded retries, and every attempt's reason when none of
+/// them worked. One module, so every SSH file reads these starts the same way.
+#[path = "support/fixture.rs"]
+mod fixture;
+
 /// How long any single wait may take.
 const PATIENCE: Duration = Duration::from_secs(90);
 
@@ -42,24 +47,19 @@ const PATIENCE: Duration = Duration::from_secs(90);
 const CHINESE_FILE: &str = "报告 终稿.txt";
 
 /// The server the ordinary cases share, started once.
-fn shared() -> &'static Option<Harness> {
-    static SERVER: std::sync::OnceLock<Option<Harness>> = std::sync::OnceLock::new();
-    SERVER.get_or_init(|| {
-        if !Harness::is_available() {
-            return None;
-        }
-        Harness::start("transfer", Harness::free_port()).ok()
-    })
+fn shared() -> &'static Result<Harness, fixture::Unavailable> {
+    static SERVER: std::sync::OnceLock<Result<Harness, fixture::Unavailable>> =
+        std::sync::OnceLock::new();
+    SERVER.get_or_init(|| fixture::server("transfer"))
 }
 
 /// What to do when this host cannot run the server.
 fn skip(what: &str) -> bool {
-    if shared().is_some() {
+    let Err(reason) = shared() else {
         return false;
-    }
+    };
     eprintln!(
-        "SKIPPED {what}: this host cannot start a disposable OpenSSH server, so no \
-         transfer behaviour is verified here and none is claimed."
+        "SKIPPED {what}: {reason}, so no transfer behaviour is verified here and none is claimed."
     );
     true
 }
@@ -91,7 +91,7 @@ fn own_directory(server: &Harness, name: &str) -> String {
 
 /// A server of this test's own, so nothing else writes into its places.
 fn own_server(name: &str) -> Harness {
-    Harness::start(name, Harness::free_port())
+    fixture::server(name)
         .unwrap_or_else(|reason| panic!("the server {name} could not be started: {reason}"))
 }
 

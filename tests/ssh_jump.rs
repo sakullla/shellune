@@ -22,6 +22,11 @@ use shellune_ssh::{
 };
 use shellune_storage::{HostKey, HostTrust};
 
+/// Starting the disposable server: bounded retries, and every attempt's reason when
+/// none of them worked. Shared with the other SSH files instead of copied once per file.
+#[path = "support/fixture.rs"]
+mod fixture;
+
 const PATIENCE: Duration = Duration::from_secs(45);
 
 fn ssh_gate() -> std::sync::MutexGuard<'static, ()> {
@@ -186,19 +191,33 @@ fn chain_with_policy(
     )
 }
 
-fn wait_match(
+fn wait_match(session: &mut ChainSession, matches: impl FnMut(&ChainEvent) -> bool) -> ChainEvent {
+    try_wait_match(session, matches).unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+/// The same wait, reporting a chain that failed or stayed silent instead of panicking.
+///
+/// A hop that could not be dialled is a fact about the machine the test runs on, and a
+/// caller that may try once more needs it as a reason. A failure is reported as soon as
+/// the chain states it, so a retry costs seconds instead of the whole patience of the wait.
+fn try_wait_match(
     session: &mut ChainSession,
     mut matches: impl FnMut(&ChainEvent) -> bool,
-) -> ChainEvent {
+) -> Result<ChainEvent, String> {
     let deadline = Instant::now() + PATIENCE;
     let mut held = Vec::new();
     loop {
         match session.try_event() {
-            Some(event) if matches(&event) => return event,
+            Some(event) if matches(&event) => return Ok(event),
+            Some(ChainEvent::Failed(failure)) => {
+                return Err(format!("the chain failed while waiting: {failure}"));
+            }
             Some(event) => held.push(event),
             None => {
                 if Instant::now() > deadline {
-                    panic!("the chain did not report the expected event; held {held:?}");
+                    return Err(format!(
+                        "the chain did not report the expected event; held {held:?}"
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -214,29 +233,46 @@ fn wait_failed(session: &mut ChainSession) -> ChainFailure {
 }
 
 fn wait_proxy(session: &mut ChainSession) -> (HopLocation, String) {
-    match wait_match(session, |event| {
+    try_wait_proxy(session).unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+/// The same, as a reason, for a caller that may dial again.
+fn try_wait_proxy(session: &mut ChainSession) -> Result<(HopLocation, String), String> {
+    match try_wait_match(session, |event| {
         matches!(event, ChainEvent::ProxyConfirmation { .. })
-    }) {
-        ChainEvent::ProxyConfirmation { hop, command } => (hop, command),
-        other => panic!("expected a ProxyCommand confirmation, got {other:?}"),
+    })? {
+        ChainEvent::ProxyConfirmation { hop, command } => Ok((hop, command)),
+        other => Err(format!(
+            "expected a ProxyCommand confirmation, got {other:?}"
+        )),
     }
 }
 
 fn wait_prompt(session: &mut ChainSession) -> (HopLocation, HostKeyPrompt) {
-    match wait_match(session, |event| {
+    try_wait_prompt(session).unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+/// The same, as a reason, for a caller that may dial again.
+fn try_wait_prompt(session: &mut ChainSession) -> Result<(HopLocation, HostKeyPrompt), String> {
+    match try_wait_match(session, |event| {
         matches!(event, ChainEvent::HostKeyPrompt { .. })
-    }) {
-        ChainEvent::HostKeyPrompt { hop, prompt } => (hop, prompt),
-        other => panic!("expected a trust question, got {other:?}"),
+    })? {
+        ChainEvent::HostKeyPrompt { hop, prompt } => Ok((hop, prompt)),
+        other => Err(format!("expected a trust question, got {other:?}")),
     }
 }
 
 fn wait_connected(session: &mut ChainSession) -> HopLocation {
-    match wait_match(session, |event| {
+    try_wait_connected(session).unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+/// The same, as a reason, for a caller that may dial again.
+fn try_wait_connected(session: &mut ChainSession) -> Result<HopLocation, String> {
+    match try_wait_match(session, |event| {
         matches!(event, ChainEvent::Connected { .. })
-    }) {
-        ChainEvent::Connected { hop } => hop,
-        other => panic!("expected the target shell, got {other:?}"),
+    })? {
+        ChainEvent::Connected { hop } => Ok(hop),
+        other => Err(format!("expected the target shell, got {other:?}")),
     }
 }
 
@@ -315,15 +351,23 @@ fn wait_dead(pid: u32) {
 }
 
 fn wait_pid_file(path: &Path) -> u32 {
+    try_wait_pid_file(path).unwrap_or_else(|reason| panic!("{reason}"))
+}
+
+/// The same wait, reporting the unanswered file so a caller can try the dial again.
+fn try_wait_pid_file(path: &Path) -> Result<u32, String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(text) = std::fs::read_to_string(path)
             && let Ok(pid) = text.trim().parse::<u32>()
         {
-            return pid;
+            return Ok(pid);
         }
         if Instant::now() > deadline {
-            panic!("the ProxyCommand never wrote its pid to {}", path.display());
+            return Err(format!(
+                "the ProxyCommand never wrote its pid to {}",
+                path.display()
+            ));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -641,8 +685,8 @@ fn two_hops_reach_the_target_shell_and_trust_belongs_to_each_node() {
         return;
     }
     let _gate = ssh_gate();
-    let jump = Harness::start("jt-ok-j", Harness::free_port()).expect("jump server");
-    let target = Harness::start("jt-ok-t", Harness::free_port()).expect("target server");
+    let jump = fixture::server_or_panic("jt-ok-j");
+    let target = fixture::server_or_panic("jt-ok-t");
     jump.as_user(&format!(
         "printf '%s\\n' JUMP-MARKER > '{}/who.txt'",
         jump.home()
@@ -736,8 +780,8 @@ fn an_auth_failure_names_that_hop_and_leaves_another_session_working() {
         return;
     }
     let _gate = ssh_gate();
-    let jump = Harness::start("jt-auth-j", Harness::free_port()).expect("jump server");
-    let target = Harness::start("jt-auth-t", Harness::free_port()).expect("target server");
+    let jump = fixture::server_or_panic("jt-auth-j");
+    let target = fixture::server_or_panic("jt-auth-t");
     let mut other = direct_session(&target);
     wait_direct(&mut other);
     direct_echo(&mut other, "OTHER-JUMP-FAIL");
@@ -838,8 +882,8 @@ fn a_changed_identity_names_that_hop_and_does_not_replace_trust() {
         return;
     }
     let _gate = ssh_gate();
-    let jump = Harness::start("jt-id-j", Harness::free_port()).expect("jump server");
-    let mut target = Harness::start("jt-id-t", Harness::free_port()).expect("target server");
+    let jump = fixture::server_or_panic("jt-id-j");
+    let mut target = fixture::server_or_panic("jt-id-t");
     let old = target.host_key_fingerprint();
     let mut other = direct_session(&jump);
     wait_direct(&mut other);
@@ -902,8 +946,8 @@ fn a_dropped_jump_names_the_jump_and_the_target_session_keeps_working() {
         return;
     }
     let _gate = ssh_gate();
-    let mut jump = Harness::start("jt-drop-j", Harness::free_port()).expect("jump server");
-    let target = Harness::start("jt-drop-t", Harness::free_port()).expect("target server");
+    let mut jump = fixture::server_or_panic("jt-drop-j");
+    let target = fixture::server_or_panic("jt-drop-t");
     target
         .as_user(&format!(
             "printf '%s\\n' TARGET-MARKER > '{}/who.txt'",
@@ -1063,13 +1107,61 @@ fn a_confirmed_proxy_command_carries_a_real_shell_and_the_process_exits_afterwar
         return;
     }
     let _gate = ssh_gate();
-    let server = Harness::start("jt-proxy", Harness::free_port()).expect("server");
+    let server = fixture::server_or_panic("jt-proxy");
     server
         .as_user(&format!(
             "printf '%s\\n' PROXY-MARKER > '{}/who.txt'",
             server.home()
         ))
         .expect("marker");
+    let (mut session, pid) = dial_through_the_proxy(&server);
+    session.write(b"cat \"$HOME/who.txt\"\n").expect("write");
+    let output = wait_output(&mut session, "PROXY-MARKER");
+    assert!(!output.contains("hunter2"));
+    session.close();
+    wait_dead(pid);
+}
+
+/// Dialling the hop behind a proxy command until one attempt is connected.
+///
+/// The proxy command is a real ssh started inside this machine's Linux environment, and that
+/// environment is shared with every other test of this workspace: an instance that answers a
+/// start slowly enough is an instance whose hop does not connect, which is a fact about the
+/// machine rather than about the product. So the dialling is repeated up to
+/// [fixture::ATTEMPTS] times with the same growing pause a server start gets, and every
+/// failed attempt is kept with its reason.
+///
+/// Only the establishment is repeated, and each attempt runs the whole of it: the reason the
+/// command carries, the port it names, the pid file that must not exist before the user
+/// confirms, the trust order, the identity the hop presents. A product that got any of those
+/// wrong fails every attempt and still ends the test. What a retry cannot hide is the shell
+/// itself: the marker is read from the session this returns, once, with no retry around it.
+fn dial_through_the_proxy(server: &Harness) -> (ChainSession, u32) {
+    let mut reasons = Vec::new();
+    for attempt in 1..=fixture::ATTEMPTS {
+        match try_dialling(server) {
+            Ok(connected) => return connected,
+            Err(reason) => {
+                reasons.push(format!("attempt {attempt}: {reason}"));
+                if attempt < fixture::ATTEMPTS {
+                    std::thread::sleep(fixture::backoff(attempt));
+                }
+            }
+        }
+    }
+    panic!(
+        "the hop behind the proxy command never connected in {} attempts: {}",
+        reasons.len(),
+        reasons.join("; ")
+    );
+}
+
+/// One attempt at that dialling, reporting an unanswered chain instead of panicking.
+///
+/// Each attempt gets its own pid file, so "the command writes no pid before the user
+/// confirms" is a claim about the attempt that is being measured and not about a file a
+/// previous attempt left behind.
+fn try_dialling(server: &Harness) -> Result<(ChainSession, u32), String> {
     let pid_file = scratch("proxy-pid");
     let mut web = host("web", server.port(), server.user());
     web.set_proxy_command(Some(bridge_command(&pid_file)));
@@ -1083,7 +1175,7 @@ fn a_confirmed_proxy_command_carries_a_real_shell_and_the_process_exits_afterwar
         )],
         Duration::from_secs(20),
     );
-    let (hop, command) = wait_proxy(&mut session);
+    let (hop, command) = try_wait_proxy(&mut session)?;
     assert_eq!(hop.host_id, web.id());
     assert!(command.contains(&server.port().to_string()), "{command}");
     assert!(!command.contains("%p"), "{command}");
@@ -1093,21 +1185,17 @@ fn a_confirmed_proxy_command_carries_a_real_shell_and_the_process_exits_afterwar
         "a trust answer is not a confirmation"
     );
     assert!(session.confirm_proxy(web.id(), true));
-    let pid = wait_pid_file(&pid_file);
+    let pid = try_wait_pid_file(&pid_file)?;
     assert!(process_alive(pid));
 
-    let (hop, prompt) = wait_prompt(&mut session);
+    let (hop, prompt) = try_wait_prompt(&mut session)?;
     assert_eq!(hop.host_id, web.id());
     assert_eq!(prompt.port, server.port());
     assert_eq!(prompt.fingerprint(), server.host_key_fingerprint());
     assert!(session.answer_host_key(web.id(), true));
-    let connected = wait_connected(&mut session);
+    let connected = try_wait_connected(&mut session)?;
     assert_eq!(connected.host_id, web.id());
-    session.write(b"cat \"$HOME/who.txt\"\n").expect("write");
-    let output = wait_output(&mut session, "PROXY-MARKER");
-    assert!(!output.contains("hunter2"));
-    session.close();
-    wait_dead(pid);
+    Ok((session, pid))
 }
 
 #[test]
@@ -1116,7 +1204,7 @@ fn closing_during_a_trust_question_rejects_a_late_answer() {
         return;
     }
     let _gate = ssh_gate();
-    let server = Harness::start("jt-ask", Harness::free_port()).expect("server");
+    let server = fixture::server_or_panic("jt-ask");
     let web = host("web", server.port(), server.user());
     let mut session = chain(
         vec![web.clone()],
@@ -1198,7 +1286,7 @@ fn a_direct_session_is_dialled_with_the_policy_it_was_given() {
         return;
     }
     let _gate = ssh_gate();
-    let server = Harness::start("jt-policy", Harness::free_port()).expect("server");
+    let server = fixture::server_or_panic("jt-policy");
     server
         .as_user(&format!(
             "printf '%s\\n' POLICY-MARKER > '{}/who.txt'",
@@ -1254,8 +1342,8 @@ fn both_hops_of_a_chain_are_dialled_with_the_same_policy() {
         return;
     }
     let _gate = ssh_gate();
-    let jump = Harness::start("jt-policy-j", Harness::free_port()).expect("jump server");
-    let target = Harness::start("jt-policy-t", Harness::free_port()).expect("target server");
+    let jump = fixture::server_or_panic("jt-policy-j");
+    let target = fixture::server_or_panic("jt-policy-t");
     target
         .as_user(&format!(
             "printf '%s\\n' POLICY-TARGET > '{}/who.txt'",
@@ -1305,7 +1393,7 @@ fn a_policy_deadline_does_not_expire_while_the_user_compares_a_fingerprint() {
         return;
     }
     let _gate = ssh_gate();
-    let server = Harness::start("jt-wait", Harness::free_port()).expect("server");
+    let server = fixture::server_or_panic("jt-wait");
     let web = host("web", server.port(), server.user());
     // Deliberately shorter than the time this test takes to answer: once the identity
     // question is on screen the clock stops, so a slow comparison is never a timeout.
