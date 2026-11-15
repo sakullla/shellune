@@ -2887,6 +2887,92 @@ pub struct UxStrings {
     pub batch_host_skipped: &'static str,
     /// Host state: interrupted
     pub batch_host_interrupted: &'static str,
+    /// Segmented switch: the saved tasks
+    pub batch_switch_library: &'static str,
+    /// Segmented switch: the run this window is driving
+    pub batch_switch_run: &'static str,
+    /// Segmented switch: the stored runs
+    pub batch_switch_history: &'static str,
+    /// Segmented switch: the definition being edited
+    pub batch_switch_editor: &'static str,
+    /// The top bar control that opens the task centre
+    pub batch_center_open: &'static str,
+    /// Hint under the top bar control
+    pub batch_center_open_hint: &'static str,
+    /// Title of the saved tasks
+    pub batch_library_title: &'static str,
+    /// Subtitle of the saved tasks
+    pub batch_library_subtitle: &'static str,
+    /// Empty state of the saved tasks: title
+    pub batch_library_empty_title: &'static str,
+    /// Empty state of the saved tasks: body
+    pub batch_library_empty_body: &'static str,
+    /// Button: a new definition from the current selection
+    pub batch_library_new: &'static str,
+    /// Button: edit one saved definition
+    pub batch_library_edit: &'static str,
+    /// Button: delete one saved definition
+    pub batch_library_delete: &'static str,
+    /// Question: delete this saved task?
+    pub batch_library_delete_ask: &'static str,
+    /// Answer: delete it
+    pub batch_library_delete_yes: &'static str,
+    /// Answer: keep it
+    pub batch_library_delete_no: &'static str,
+    /// Toast: a saved task was deleted
+    pub batch_library_deleted: &'static str,
+    /// Row meta: the hosts, steps and concurrency of a saved task
+    pub batch_library_row_meta: &'static str,
+    /// A saved task that has no name
+    pub batch_untitled: &'static str,
+    /// Toast: the definition was saved and nothing ran
+    pub batch_saved: &'static str,
+    /// Button: save the definition without running it
+    pub batch_save_draft: &'static str,
+    /// Tooltip of the button that moves one step earlier
+    pub batch_step_up: &'static str,
+    /// Tooltip of the button that moves one step later
+    pub batch_step_down: &'static str,
+    /// Title of the stored runs
+    pub batch_history_title: &'static str,
+    /// Subtitle of the stored runs
+    pub batch_history_subtitle: &'static str,
+    /// Empty state of the stored runs
+    pub batch_history_empty: &'static str,
+    /// Label of the status filter
+    pub batch_history_filter: &'static str,
+    /// Filter value: every status
+    pub batch_history_filter_any: &'static str,
+    /// How many older runs are not listed
+    pub batch_history_omitted: &'static str,
+    /// A stored record that could not be read
+    pub batch_history_damaged: &'static str,
+    /// Button: open one stored run
+    pub batch_history_open: &'static str,
+    /// Button: back to the list of runs
+    pub batch_history_back: &'static str,
+    /// Hint: choose a host to read its output
+    pub batch_history_no_host: &'static str,
+    /// When one stored run started
+    pub batch_history_when: &'static str,
+    /// How many hosts of one stored run finished, out of how many
+    pub batch_history_hosts: &'static str,
+    /// Button: copy the diagnostics of one run
+    pub batch_diagnostics_copy: &'static str,
+    /// Toast: the diagnostics were copied
+    pub batch_diagnostics_copied: &'static str,
+    /// Button: leave the run page and keep the run going
+    pub batch_run_background: &'static str,
+    /// Hint: what the background indicator does
+    pub batch_run_background_hint: &'static str,
+    /// The top bar indicator of a run that is still going
+    pub batch_indicator_running: &'static str,
+    /// The top bar indicator of a run that ended with failures
+    pub batch_indicator_failed: &'static str,
+    /// The run record under runs/ could not be written
+    pub batch_run_save_failed: &'static str,
+    /// A retry confirmation: what it will and will not do
+    pub batch_retry_confirm: &'static str,
 }
 
 impl UxStrings {
@@ -3199,6 +3285,49 @@ impl UxStrings {
             self.batch_reason_missing_host,
             self.batch_save_failed,
             self.batch_log_failed,
+            self.batch_switch_library,
+            self.batch_switch_run,
+            self.batch_switch_history,
+            self.batch_switch_editor,
+            self.batch_center_open,
+            self.batch_center_open_hint,
+            self.batch_library_title,
+            self.batch_library_subtitle,
+            self.batch_library_empty_title,
+            self.batch_library_empty_body,
+            self.batch_library_new,
+            self.batch_library_edit,
+            self.batch_library_delete,
+            self.batch_library_delete_ask,
+            self.batch_library_delete_yes,
+            self.batch_library_delete_no,
+            self.batch_library_deleted,
+            self.batch_library_row_meta,
+            self.batch_untitled,
+            self.batch_saved,
+            self.batch_save_draft,
+            self.batch_step_up,
+            self.batch_step_down,
+            self.batch_history_title,
+            self.batch_history_subtitle,
+            self.batch_history_empty,
+            self.batch_history_filter,
+            self.batch_history_filter_any,
+            self.batch_history_omitted,
+            self.batch_history_damaged,
+            self.batch_history_open,
+            self.batch_history_back,
+            self.batch_history_no_host,
+            self.batch_history_when,
+            self.batch_history_hosts,
+            self.batch_diagnostics_copy,
+            self.batch_diagnostics_copied,
+            self.batch_run_background,
+            self.batch_run_background_hint,
+            self.batch_indicator_running,
+            self.batch_indicator_failed,
+            self.batch_run_save_failed,
+            self.batch_retry_confirm,
             self.batch_step_pending,
             self.batch_step_running,
             self.batch_step_succeeded,
@@ -3543,6 +3672,49 @@ included",
     batch_reason_missing_host: "the saved host is gone",
     batch_save_failed: "The task definition was not saved",
     batch_log_failed: "The run log could not be written",
+    batch_switch_library: "Saved tasks",
+    batch_switch_run: "This run",
+    batch_switch_history: "History",
+    batch_switch_editor: "Being edited",
+    batch_center_open: "Batch tasks",
+    batch_center_open_hint: "Edit a task, watch the run this window is driving, or read past runs",
+    batch_library_title: "Saved tasks",
+    batch_library_subtitle: "Opening or editing one starts nothing: only a confirmation starts a run.",
+    batch_library_empty_title: "No saved task yet",
+    batch_library_empty_body: "Select hosts on the host page and open the batch editor; Save keeps the definition, and a confirmation runs it.",
+    batch_library_new: "New task",
+    batch_library_edit: "Edit",
+    batch_library_delete: "Delete",
+    batch_library_delete_ask: "Delete this task? Its past runs stay in the history.",
+    batch_library_delete_yes: "Delete it",
+    batch_library_delete_no: "Keep it",
+    batch_library_deleted: "Task deleted",
+    batch_library_row_meta: "{hosts} hosts · {steps} steps · {concurrency} at once",
+    batch_untitled: "Untitled task",
+    batch_saved: "Saved; nothing was run",
+    batch_save_draft: "Save task",
+    batch_step_up: "Move this step earlier",
+    batch_step_down: "Move this step later",
+    batch_history_title: "Run history",
+    batch_history_subtitle: "Summaries kept on this computer. A run cut off by an exit is marked interrupted, never replayed.",
+    batch_history_empty: "No stored run yet",
+    batch_history_filter: "Status",
+    batch_history_filter_any: "Every status",
+    batch_history_omitted: "{count} older runs are not listed",
+    batch_history_damaged: "This record could not be read",
+    batch_history_open: "Details",
+    batch_history_back: "All runs",
+    batch_history_no_host: "Choose a host to read its output and timeline.",
+    batch_history_when: "Started {time}",
+    batch_history_hosts: "{done}/{total} hosts finished",
+    batch_diagnostics_copy: "Copy diagnostics",
+    batch_diagnostics_copied: "Diagnostics copied; no credential is in them",
+    batch_run_background: "Keep running in background",
+    batch_run_background_hint: "The run keeps going; the indicator in the top bar brings this page back.",
+    batch_indicator_running: "Batch {done}/{total}",
+    batch_indicator_failed: "Batch: {failed} failed",
+    batch_run_save_failed: "The run record was not written",
+    batch_retry_confirm: "A retry runs only the hosts and steps that did not succeed; nothing that already ran is undone.",
     batch_step_pending: "waiting",
     batch_step_running: "running",
     batch_step_succeeded: "succeeded",
@@ -3882,6 +4054,49 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     batch_reason_missing_host: "保存的主机已不存在",
     batch_save_failed: "任务定义未能保存",
     batch_log_failed: "运行日志未能写入",
+    batch_switch_library: "任务库",
+    batch_switch_run: "本次运行",
+    batch_switch_history: "历史",
+    batch_switch_editor: "编辑中",
+    batch_center_open: "批量任务",
+    batch_center_open_hint: "编辑任务、查看本窗口的运行，或翻阅历史运行",
+    batch_library_title: "已保存的任务",
+    batch_library_subtitle: "打开或编辑都不会启动任何任务：只有确认才会开始运行。",
+    batch_library_empty_title: "还没有保存的任务",
+    batch_library_empty_body: "在主机页选择主机并打开批量编辑器；保存会留下定义，确认后才会运行。",
+    batch_library_new: "新建任务",
+    batch_library_edit: "编辑",
+    batch_library_delete: "删除",
+    batch_library_delete_ask: "删除这个任务？它的历史运行仍会保留。",
+    batch_library_delete_yes: "删除",
+    batch_library_delete_no: "保留",
+    batch_library_deleted: "任务已删除",
+    batch_library_row_meta: "{hosts} 台主机 · {steps} 个步骤 · 并发 {concurrency}",
+    batch_untitled: "未命名任务",
+    batch_saved: "已保存，未运行任何命令",
+    batch_save_draft: "保存任务",
+    batch_step_up: "上移这一步",
+    batch_step_down: "下移这一步",
+    batch_history_title: "运行历史",
+    batch_history_subtitle: "保存在本机的运行摘要。上次退出时未结束的运行会标为中断，且不会重放。",
+    batch_history_empty: "还没有运行记录",
+    batch_history_filter: "状态",
+    batch_history_filter_any: "全部状态",
+    batch_history_omitted: "另有 {count} 条较早运行未列出",
+    batch_history_damaged: "这条记录无法读取",
+    batch_history_open: "详情",
+    batch_history_back: "全部运行",
+    batch_history_no_host: "选择一台主机查看它的输出与时间线。",
+    batch_history_when: "开始于 {time}",
+    batch_history_hosts: "{done}/{total} 台主机已结束",
+    batch_diagnostics_copy: "复制诊断",
+    batch_diagnostics_copied: "诊断已复制，其中不含凭据",
+    batch_run_background: "转入后台继续运行",
+    batch_run_background_hint: "运行会继续；点击顶栏的活动指示可回到本页。",
+    batch_indicator_running: "批量 {done}/{total}",
+    batch_indicator_failed: "批量：{failed} 台失败",
+    batch_run_save_failed: "运行记录未能写入",
+    batch_retry_confirm: "重试只执行未成功的主机与步骤，不撤销已执行的内容。",
     batch_step_pending: "等待",
     batch_step_running: "执行中",
     batch_step_succeeded: "成功",

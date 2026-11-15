@@ -1189,11 +1189,14 @@ impl ShelluneView {
         if self.showing_connection_form && self.remote.is_some() {
             return Some("connect");
         }
-        // The batch panel is a dialog of its own, drawn above the tools (R19).
-        match self.batch.page() {
-            crate::app::batch::BatchPage::Preview => return Some("batch-preview"),
-            crate::app::batch::BatchPage::Run => return Some("batch-run"),
-            crate::app::batch::BatchPage::Closed => {}
+        // The task centre is a dialog of its own, drawn above the tools, and each of
+        // its four surfaces has a name of its own (R11, R13).
+        match self.batch.view() {
+            crate::app::batch::BatchCenterView::Editor => return Some("batch-preview"),
+            crate::app::batch::BatchCenterView::ActiveRun => return Some("batch-run"),
+            crate::app::batch::BatchCenterView::Library => return Some("batch-library"),
+            crate::app::batch::BatchCenterView::History => return Some("batch-history"),
+            crate::app::batch::BatchCenterView::Closed => {}
         }
         match self.tool {
             Some(shell::Tool::Forwards) => Some("forwards"),
@@ -2204,6 +2207,11 @@ impl ShelluneView {
         view.restore_workspace_layout();
         view.restore_preferences(cx);
         view.relabel_fields(cx);
+        view.attach_batch_store();
+        // A run the last exit cut off is marked interrupted once, here, and nothing is
+        // replayed: the summary and the log say what it had finished, and a retry is
+        // the user's own decision from the history (R13).
+        view.batch.recover(crate::app::remote::now_unix());
         view
     }
 
@@ -9930,11 +9938,12 @@ impl ShelluneView {
             self.close_palette(window, cx);
             return true;
         }
-        // A batch preview is a question, so Escape is "not now". A run that has not
-        // ended keeps its page even so: closing it would leave a run nobody can see,
-        // while the commands it started go on (R19).
-        if self.batch.page().is_open() {
-            self.close_batch(cx);
+        // A batch preview or a list is a question, so Escape is "not now". A run that
+        // has not ended keeps its page even so: closing it would leave a run nobody can
+        // see, while the commands it started go on, and the page's own background
+        // action is what leaves it (R19, R13).
+        if self.batch.view().is_open() {
+            self.dismiss_batch(cx);
             return true;
         }
         if self.custom_shell_open {
@@ -15300,6 +15309,14 @@ impl Render for ShelluneView {
                         }
                         _ => {}
                     }
+                    cx.stop_propagation();
+                    return;
+                }
+                // The task centre's lists are a keyboard walk of their own: Up and Down
+                // move the mark and Enter opens the row, so a saved task or a stored run
+                // is reached without a mouse (R4). Every other key, and every key while
+                // the editor is open, keeps its way to the field or the program.
+                if this.batch_key(event, window, cx) {
                     cx.stop_propagation();
                     return;
                 }

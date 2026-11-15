@@ -198,6 +198,10 @@ impl ShelluneView {
                     .h_full()
                     .min_w(metrics.scale(24.0)),
             )
+            // The task centre sits beside the page tools: its entry is always there, and
+            // a run this window is driving says so in the same row, so leaving it for
+            // another page never loses it (R11, R13).
+            .children(self.batch_topbar_control(cx))
             .child(trailing)
             .children(controls)
     }

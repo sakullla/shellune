@@ -2064,6 +2064,68 @@ pub const SCENARIOS: &[Scenario] = &[
         ready: batch_paused_ready,
     },
     Scenario {
+        id: "batch-library",
+        title: "批量任务 · 任务库里的可复用定义",
+        category: Category::Overlay,
+        fixture: "three saved definitions on disk, one of them without a name and one with \
+                  three steps; nothing on screen was written by this shot",
+        evidence: "shows the library this build draws: the switch to the run and the history, the \
+                   targets and steps of each definition, and the edit and delete actions. Opening \
+                   the library reads the file and starts nothing",
+        quick: true,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::Hosts),
+        prepare: seed_batch_library,
+        install: show_batch_library,
+        ready: batch_library_ready,
+    },
+    Scenario {
+        id: "batch-history",
+        title: "批量任务 · 历史运行的逐机结果与时间线",
+        category: Category::Overlay,
+        fixture: "two stored runs written as the runner would have written them: one completed and \
+                  one finished with a failure, with its log lines",
+        evidence: "shows the detail of one stored run: the state of every host, the exit status of \
+                   every step, the output rebuilt from the log and the offsets taken from it. The \
+                   records are fixtures, so this is not evidence about any SSH server",
+        quick: true,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::Hosts),
+        prepare: seed_batch_history,
+        install: show_batch_history,
+        ready: batch_history_ready,
+    },
+    Scenario {
+        id: "batch-interrupted",
+        title: "批量任务 · 重启后中断的运行",
+        category: Category::Overlay,
+        fixture: "a run the last session left unfinished: started, one host done, the rest waiting",
+        evidence: "shows the history after a start: the run is marked interrupted, what it had \
+                   finished is still readable, and nothing was replayed to find that out",
+        quick: false,
+        variants: &[Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_batch_interrupted,
+        install: show_batch_history,
+        ready: batch_interrupted_ready,
+    },
+    Scenario {
+        id: "batch-background",
+        title: "批量任务 · 转入后台后的顶栏指示",
+        category: Category::Overlay,
+        fixture: "the real batch runner over four hosts, left in the background while the host \
+                  page is on screen",
+        evidence: "shows the run still going with the page it was left from: the top bar carries \
+                   the run and its progress, and choosing it returns to the same page. The \
+                   transport is a fixture, so this is not evidence about any SSH server",
+        quick: true,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_batch_background,
+        ready: batch_background_ready,
+    },
+    Scenario {
         id: "batch-cancelling",
         title: "批量任务 · 取消中等待远端退出",
         category: Category::Overlay,
@@ -2300,6 +2362,463 @@ fn batch_failed_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     }
     if !page.can_retry() {
         return Err("the page offers no retry for a run with a failure".to_owned());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The task centre (R11, R12, R13)
+// ---------------------------------------------------------------------------
+
+/// Builds one batch definition over the named saved hosts of the fixture.
+fn batch_task(
+    root: &Path,
+    commands: &[&str],
+    hosts: &[&str],
+    name: Option<&str>,
+) -> Result<shellune_core::BatchTask, String> {
+    let book = HostStore::at(root)
+        .load()
+        .map_err(|error| format!("the host fixture could not be read: {error}"))?;
+    let defaults = shellune_core::ConnectionDefaults::default();
+    let mut targets = Vec::new();
+    for wanted in hosts {
+        let host = book
+            .hosts()
+            .iter()
+            .find(|host| host.name() == *wanted)
+            .ok_or_else(|| format!("the host fixture has no host {wanted}"))?;
+        targets.push(
+            shellune_core::BatchTarget::snapshot(host, defaults)
+                .map_err(|error| format!("the target {wanted} is not valid: {error}"))?,
+        );
+    }
+    let steps = shellune_core::BatchTask::steps_from_commands(
+        commands.iter().map(|line| (*line).to_owned()),
+    )
+    .map_err(|error| format!("the commands are not valid steps: {error}"))?;
+    let mut task = shellune_core::BatchTask::new(steps, targets, 2)
+        .map_err(|error| format!("the task is not valid: {error}"))?;
+    if let Some(name) = name {
+        task.set_name(Some(name.to_owned()));
+    }
+    Ok(task)
+}
+
+/// Writes definitions as an earlier session would have left them.
+fn seed_batch_library(root: &Path) -> Result<(), String> {
+    seed_hosts(root)?;
+    let store = shellune_storage::BatchStore::at(root);
+    let mut book = store
+        .load_tasks_upgrading()
+        .map_err(|error| format!("the tasks file could not be read: {error}"))?;
+    for (commands, hosts, name) in [
+        (
+            &["uptime", "df -h /"][..],
+            &["build-01", "api-02", "edge-03", "stage-01"][..],
+            Some("Nightly check"),
+        ),
+        (
+            &["journalctl -u shellune -n 40 --no-pager"][..],
+            &["stage-02", "lab-07"][..],
+            Some("Tailing the journal"),
+        ),
+        (
+            &["git fetch --all", "git status --short", "make check"][..],
+            &["build-01"][..],
+            None,
+        ),
+    ] {
+        book.insert(batch_task(root, commands, hosts, name)?);
+    }
+    store
+        .save_tasks(&book)
+        .map_err(|error| format!("the tasks fixture could not be written: {error}"))
+}
+
+/// Appends one event to a run's log and folds it into the same run.
+fn append_run_event(
+    store: &shellune_storage::BatchStore,
+    run: &mut shellune_core::BatchRun,
+    seq: &mut u64,
+    kind: shellune_core::BatchEventKind,
+    at: u64,
+) -> Result<(), String> {
+    *seq += 1;
+    store
+        .append(run.id(), kind.clone(), at)
+        .map_err(|error| format!("the run log could not be written: {error}"))?;
+    run.apply(&shellune_core::BatchEvent::new(*seq, at, kind))
+        .map_err(|error| format!("the run refused its own history: {error}"))
+}
+
+/// Writes stored runs: one that completed, one that ended with a failure and its log.
+fn seed_batch_history(root: &Path) -> Result<(), String> {
+    seed_hosts(root)?;
+    let store = shellune_storage::BatchStore::at(root);
+    for (commands, hosts, failed) in [
+        (
+            &["uptime", "df -h /"][..],
+            &["build-01", "api-02"][..],
+            false,
+        ),
+        (
+            &["uptime", "deploy --check"][..],
+            &["stage-01", "stage-02", "lab-07"][..],
+            true,
+        ),
+    ] {
+        let task = batch_task(root, commands, hosts, Some("Nightly check"))?;
+        let confirmed = task
+            .confirm(1_700_000_000)
+            .map_err(|error| format!("the run fixture is not confirmable: {error}"))?;
+        let mut run = shellune_core::BatchRun::planned(
+            &confirmed,
+            shellune_core::BatchRunId::new(),
+            1_700_000_000,
+        );
+        let mut seq = 0u64;
+        let host_ids: Vec<shellune_core::HostId> = run
+            .hosts()
+            .iter()
+            .map(|host| host.target().host_id())
+            .collect();
+        append_run_event(
+            &store,
+            &mut run,
+            &mut seq,
+            shellune_core::BatchEventKind::RunStarted {
+                hosts: host_ids.len(),
+                steps: commands.len(),
+                concurrency: 2,
+            },
+            1_700_000_000,
+        )?;
+        for (index, id) in host_ids.iter().copied().enumerate() {
+            let at = 1_700_000_010 + index as u64 * 4;
+            append_run_event(
+                &store,
+                &mut run,
+                &mut seq,
+                shellune_core::BatchEventKind::HostState {
+                    host: id,
+                    state: shellune_core::HostState::Running,
+                },
+                at,
+            )?;
+            for (step, command) in commands.iter().enumerate() {
+                let step_at = at + step as u64;
+                append_run_event(
+                    &store,
+                    &mut run,
+                    &mut seq,
+                    shellune_core::BatchEventKind::StepStarted {
+                        host: id,
+                        step: step as u32,
+                    },
+                    step_at,
+                )?;
+                append_run_event(
+                    &store,
+                    &mut run,
+                    &mut seq,
+                    shellune_core::BatchEventKind::Output {
+                        host: id,
+                        step: step as u32,
+                        stream: shellune_core::OutputStream::Stdout,
+                        chunk: match (*command, failed && index == 1 && step == 1) {
+                            ("uptime", _) => {
+                                " 09:20:11 up 12 days,  load average: 0.08\n".to_owned()
+                            }
+                            ("df -h /", _) => {
+                                "/dev/nvme0n1p2  476G   98G  354G  22% /\n".to_owned()
+                            }
+                            (_, true) => "deploy: no such release: 0.4.1\n".to_owned(),
+                            _ => "release 0.4.0 is deployed\n".to_owned(),
+                        },
+                    },
+                    step_at + 1,
+                )?;
+                let failure = failed && index == 1 && step == 1;
+                append_run_event(
+                    &store,
+                    &mut run,
+                    &mut seq,
+                    shellune_core::BatchEventKind::StepFinished {
+                        host: id,
+                        step: step as u32,
+                        state: if failure {
+                            shellune_core::StepState::Failed
+                        } else {
+                            shellune_core::StepState::Succeeded
+                        },
+                        exit: Some(if failure { 3 } else { 0 }),
+                        detail: failure.then(|| "deploy: no such release: 0.4.1".to_owned()),
+                    },
+                    step_at + 2,
+                )?;
+            }
+            let host_failed = failed && index == 1;
+            append_run_event(
+                &store,
+                &mut run,
+                &mut seq,
+                shellune_core::BatchEventKind::HostFinished {
+                    host: id,
+                    state: if host_failed {
+                        shellune_core::HostState::Failed
+                    } else {
+                        shellune_core::HostState::Succeeded
+                    },
+                    detail: host_failed.then(|| "step 2 exited 3".to_owned()),
+                },
+                at + 5,
+            )?;
+        }
+        append_run_event(
+            &store,
+            &mut run,
+            &mut seq,
+            shellune_core::BatchEventKind::RunState {
+                state: if failed {
+                    shellune_core::RunState::Failed
+                } else {
+                    shellune_core::RunState::Completed
+                },
+            },
+            1_700_000_100,
+        )?;
+        store
+            .save_run(&run)
+            .map_err(|error| format!("the run summary could not be written: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Writes one run the last session left unfinished.
+fn seed_batch_interrupted(root: &Path) -> Result<(), String> {
+    seed_hosts(root)?;
+    let store = shellune_storage::BatchStore::at(root);
+    let task = batch_task(
+        root,
+        &["uptime", "df -h /"],
+        &["build-01", "api-02", "edge-03"],
+        Some("Nightly check"),
+    )?;
+    let confirmed = task
+        .confirm(1_700_000_000)
+        .map_err(|error| format!("the run fixture is not confirmable: {error}"))?;
+    let mut run = shellune_core::BatchRun::planned(
+        &confirmed,
+        shellune_core::BatchRunId::new(),
+        1_700_000_000,
+    );
+    let first = run.hosts()[0].target().host_id();
+    let mut seq = 0u64;
+    for (kind, at) in [
+        (
+            shellune_core::BatchEventKind::RunStarted {
+                hosts: 3,
+                steps: 2,
+                concurrency: 2,
+            },
+            1_700_000_000,
+        ),
+        (
+            shellune_core::BatchEventKind::HostState {
+                host: first,
+                state: shellune_core::HostState::Running,
+            },
+            1_700_000_004,
+        ),
+        (
+            shellune_core::BatchEventKind::StepStarted {
+                host: first,
+                step: 0,
+            },
+            1_700_000_005,
+        ),
+        (
+            shellune_core::BatchEventKind::Output {
+                host: first,
+                step: 0,
+                stream: shellune_core::OutputStream::Stdout,
+                chunk: " 09:20:11 up 12 days,  load average: 0.08\n".to_owned(),
+            },
+            1_700_000_006,
+        ),
+        (
+            shellune_core::BatchEventKind::StepFinished {
+                host: first,
+                step: 0,
+                state: shellune_core::StepState::Succeeded,
+                exit: Some(0),
+                detail: None,
+            },
+            1_700_000_007,
+        ),
+        (
+            shellune_core::BatchEventKind::HostFinished {
+                host: first,
+                state: shellune_core::HostState::Failed,
+                detail: Some("the connection was closed".to_owned()),
+            },
+            1_700_000_008,
+        ),
+    ] {
+        append_run_event(&store, &mut run, &mut seq, kind, at)?;
+    }
+    store
+        .save_run(&run)
+        .map_err(|error| format!("the run summary could not be written: {error}"))
+}
+
+fn show_batch_library(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_batch_library(cx);
+    Ok(())
+}
+
+fn batch_library_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    on_page(view, Destination::Hosts, SectionState::Populated)?;
+    if view.capture_overlay() != Some("batch-library") {
+        return Err(format!(
+            "the saved tasks are not the surface on screen: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let count = view.batch_panel().library().tasks().len();
+    if count != 3 {
+        return Err(format!(
+            "the library lists {count} task(s), not the three saved"
+        ));
+    }
+    Ok(())
+}
+
+fn show_batch_history(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_batch_history(cx);
+    // The shot is about the run that carries a failure, which is the one with the exit
+    // status, the reason and the output worth reading. The two fixtures are written in
+    // the same second, so the order they are listed in is the store's, not the shot's:
+    // every entry is tried and the first failed one is the one that is opened.
+    let mut opened = false;
+    for index in 0..8 {
+        if !view.capture_batch_stored(index, cx) {
+            break;
+        }
+        opened = true;
+        let failed = view
+            .batch_panel()
+            .stored_summary()
+            .is_some_and(|run| run.state() == shellune_core::RunState::Failed);
+        if failed {
+            break;
+        }
+    }
+    if !opened {
+        return Err("no stored run could be opened".to_owned());
+    }
+    Ok(())
+}
+
+fn batch_history_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    on_page(view, Destination::Hosts, SectionState::Populated)?;
+    if view.capture_overlay() != Some("batch-history") {
+        return Err(format!(
+            "the history is not the surface on screen: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let panel = view.batch_panel();
+    let run = panel
+        .stored_summary()
+        .ok_or_else(|| "no stored run is open".to_owned())?;
+    if run.state() != shellune_core::RunState::Failed {
+        return Err(format!("the open run ended {:?}, not failed", run.state()));
+    }
+    if run.hosts().len() != 3 {
+        return Err(format!(
+            "the open run has {} host(s), not the three the fixture wrote",
+            run.hosts().len()
+        ));
+    }
+    if panel.stored_detail_open().is_none() {
+        return Err("the output of the chosen host was not read from the log".to_owned());
+    }
+    Ok(())
+}
+
+fn batch_interrupted_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_overlay() != Some("batch-history") {
+        return Err(format!(
+            "the history is not the surface on screen: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let panel = view.batch_panel();
+    let state = panel
+        .stored_summary()
+        .map(shellune_core::BatchRun::state)
+        .ok_or_else(|| "no stored run is open".to_owned())?;
+    if state != shellune_core::RunState::Interrupted {
+        return Err(format!("the stored run is {state:?}, not interrupted"));
+    }
+    if panel.has_active_run() {
+        return Err("a restart must not start a runner".to_owned());
+    }
+    Ok(())
+}
+
+fn show_batch_background(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    use crate::app::view::batch::fixture::{HostScript, Plan, StepScript};
+    open_batch(view, &["journalctl -u shellune -f"], cx)?;
+    let held = HostScript::new(vec![StepScript::holding(
+        "Nov 12 09:15:41 shellune[421]: tailing the journal\n",
+    )]);
+    start_batch(view, Plan::new().every(&BATCH_TARGETS, held), cx);
+    let ready = view.capture_batch_wait(cx, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.running_hosts() == BATCH_TARGETS.len())
+    });
+    if !ready {
+        return Err("the run never had every host inside its command".to_owned());
+    }
+    view.capture_batch_background(cx);
+    Ok(())
+}
+
+fn batch_background_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_overlay().is_some() {
+        return Err(format!(
+            "a background run must leave the page free: {:?}",
+            view.capture_overlay()
+        ));
+    }
+    let panel = view.batch_panel();
+    if !panel.is_watching() {
+        return Err("the run stopped when the page was left".to_owned());
+    }
+    let page = panel
+        .run()
+        .ok_or_else(|| "the run page was dropped by leaving".to_owned())?;
+    if page.running_hosts() != BATCH_TARGETS.len() {
+        return Err(format!(
+            "{} host(s) are still running, not the four the shot names",
+            page.running_hosts()
+        ));
     }
     Ok(())
 }

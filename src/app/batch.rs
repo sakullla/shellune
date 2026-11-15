@@ -92,12 +92,13 @@ pub const MAX_HISTORY_LOG_BYTES: usize = 256 * 1024;
 /// five thousand hosts says so in one line rather than drawing five thousand rows.
 pub const MAX_PREVIEW_ROWS: usize = 120;
 
-/// Which surface of the panel is on screen.
+/// The two surfaces an earlier build drew as the whole panel.
 ///
-/// This is the two-surface projection the overlay draws today: a preview or a run. The
-/// task centre keeps four surfaces ([BatchCenterView]) and this type says which of them
-/// the overlay can show as a dialog, so the library and the history are reached through
-/// [BatchCenterView] instead of being forced into this shape.
+/// The task centre keeps four surfaces ([BatchCenterView]) and draws each of them now,
+/// so this projection is no longer how the overlay decides what to draw. It is kept for
+/// the tests that ask "is the preview or the run on screen", and it is built from
+/// [BatchCenterView] so the two shapes cannot disagree.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BatchPage {
     /// No batch surface: the page underneath is unobstructed.
@@ -108,14 +109,6 @@ pub enum BatchPage {
     Preview,
     /// The run: per-host state, output and the timeline.
     Run,
-}
-
-impl BatchPage {
-    /// Whether anything of the panel is drawn.
-    #[must_use]
-    pub fn is_open(self) -> bool {
-        self != Self::Closed
-    }
 }
 
 /// Which surface of the task centre is on screen.
@@ -157,7 +150,8 @@ impl BatchCenterView {
         self != Self::Closed
     }
 
-    /// The dialog surface this view is drawn as, when it is drawn as one.
+    /// The earlier two-surface projection of this view, for the tests that ask for it.
+    #[cfg(test)]
     #[must_use]
     pub fn page(self) -> BatchPage {
         match self {
@@ -253,6 +247,54 @@ pub struct StepTime {
     pub started: Option<u64>,
     /// When it ended, in Unix seconds.
     pub finished: Option<u64>,
+}
+
+/// When one step of one host ran, as the stored log recorded it.
+///
+/// The summary of a stored run keeps the state and the exit status of every step but
+/// not the times, because the times are what the log is for: the history reads them
+/// from the same bounded tail it reads the output from, so "which host was slow" is
+/// answered after a restart the same way it is answered while the run is going.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoredStepTime {
+    /// The zero-based step.
+    pub step: u32,
+    /// When it started, in Unix seconds, when the read part of the log holds it.
+    pub started: Option<u64>,
+    /// When it ended, in Unix seconds, when the read part of the log holds it.
+    pub finished: Option<u64>,
+}
+
+/// What one host of a stored run left behind: its output and its step times.
+#[derive(Clone, Debug, Default)]
+pub struct StoredDetail {
+    /// What the host printed, bounded the same way a live page bounds it.
+    pub output: HostOutput,
+    /// When each step it reached ran, oldest first.
+    pub steps: Vec<StoredStepTime>,
+}
+
+impl StoredDetail {
+    /// The row for one step, made when the log first mentions it.
+    fn time_mut(&mut self, step: u32) -> &mut StoredStepTime {
+        if let Some(at) = self.steps.iter().position(|time| time.step == step) {
+            return &mut self.steps[at];
+        }
+        self.steps.push(StoredStepTime {
+            step,
+            started: None,
+            finished: None,
+        });
+        self.steps
+            .last_mut()
+            .expect("a row that was just pushed is there")
+    }
+
+    /// The times of one step, when the log holds them.
+    #[must_use]
+    pub fn time_of(&self, step: u32) -> Option<StoredStepTime> {
+        self.steps.iter().copied().find(|time| time.step == step)
+    }
 }
 
 /// A question for the user about one host.
@@ -760,6 +802,21 @@ pub struct BatchCenter {
     history: BatchHistory,
     /// Where the definitions and the runs are kept.
     store: Option<BatchStore>,
+    // --- what the task centre shows of the two lists --------------------------
+    /// The state a stored run must have ended in to be listed, or every state.
+    history_filter: Option<RunState>,
+    /// The stored run whose detail is open, when one is.
+    history_open: Option<BatchRunId>,
+    /// The host of that run whose output is on screen.
+    history_host: Option<HostId>,
+    /// That host's output and step times, read once from the log.
+    history_detail: Option<StoredDetail>,
+    /// The saved task the user asked to delete, waiting for the answer.
+    library_confirm: Option<BatchTaskId>,
+    /// Which row of the saved tasks the keyboard is on.
+    library_selected: usize,
+    /// Which row of the run list the keyboard is on.
+    history_selected: usize,
 }
 
 /// The name this panel had when it was one page.
@@ -789,6 +846,13 @@ impl BatchCenter {
             library: BatchLibrary::default(),
             history: BatchHistory::default(),
             store: None,
+            history_filter: None,
+            history_open: None,
+            history_host: None,
+            history_detail: None,
+            library_confirm: None,
+            library_selected: 0,
+            history_selected: 0,
         }
     }
 
@@ -802,6 +866,7 @@ impl BatchCenter {
 
     /// Which dialog surface the overlay can draw, when it can draw one.
     #[must_use]
+    #[cfg(test)]
     pub fn page(&self) -> BatchPage {
         self.view.page()
     }
@@ -992,6 +1057,13 @@ impl BatchCenter {
         self.active = None;
         self.store = None;
         self.refused.clear();
+        // A question about deleting a saved task and the detail of a stored run belong
+        // to the surfaces that were on screen; dismissal takes them with it, so the next
+        // opening starts from the lists and not from a half-asked question.
+        self.library_confirm = None;
+        self.history_open = None;
+        self.history_host = None;
+        self.history_detail = None;
         true
     }
 
@@ -1120,7 +1192,7 @@ impl BatchCenter {
     /// One window drives one run: starting another would replace the page and stop
     /// polling the run already under way. The view asks this before it offers the button,
     /// and a test asks it without a window.
-    fn second_run_refusal(&self) -> Option<ConfirmRefusal> {
+    pub fn second_run_refusal(&self) -> Option<ConfirmRefusal> {
         self.is_watching().then_some(ConfirmRefusal::RunInProgress)
     }
 
@@ -1226,7 +1298,9 @@ impl BatchCenter {
             if let Some(store) = self.store.as_ref()
                 && let Err(error) = store.save_run(&page.run)
             {
-                page.problem = Some(format!("{}: {error}", copy::ux().batch_save_failed));
+                // What failed is the run record, not the task definition: the two writes
+                // go to different files and a reader has to know which one is missing.
+                page.problem = Some(format!("{}: {error}", copy::ux().batch_run_save_failed));
             }
         }
         self.is_watching()
@@ -1362,6 +1436,171 @@ impl BatchCenter {
     pub fn show_history(&mut self) {
         self.view = BatchCenterView::History;
         self.refresh_history();
+    }
+
+    /// Gives the centre the store the window uses, without opening any surface.
+    ///
+    /// The library and the history are read from this store, so the task centre can
+    /// list what is saved before a preview has ever been opened. Nothing is read here:
+    /// the two lists are read by [Self::refresh_library], [Self::refresh_history] and
+    /// [Self::recover].
+    pub fn attach_store(&mut self, store: BatchStore) {
+        self.store = Some(store);
+    }
+
+    /// Narrows the stored runs to those that ended in one state, or to every state.
+    pub fn set_history_filter(&mut self, filter: Option<RunState>) {
+        self.history_filter = filter;
+        self.history_open = None;
+    }
+
+    /// The state the stored runs are narrowed to, when one is chosen.
+    #[must_use]
+    pub fn history_filter(&self) -> Option<RunState> {
+        self.history_filter
+    }
+
+    /// The stored runs the filter keeps, newest first.
+    ///
+    /// A record that could not be read is kept whatever the filter is: its state is
+    /// unknown, and hiding it would turn a damaged file into a missing run.
+    #[must_use]
+    pub fn history_visible(&self) -> Vec<&HistoryEntry> {
+        self.history
+            .entries()
+            .iter()
+            .filter(|entry| match self.history_filter {
+                None => true,
+                Some(state) => match entry.summary() {
+                    Some(run) => run.state() == state,
+                    None => true,
+                },
+            })
+            .collect()
+    }
+
+    /// Puts the keyboard mark of the saved tasks on one row.
+    pub fn select_library_row(&mut self, index: usize) {
+        self.library_selected = index;
+    }
+
+    /// Which row of the saved tasks the keyboard is on.
+    #[must_use]
+    pub fn library_selected(&self) -> usize {
+        self.library_selected
+    }
+
+    /// Puts the keyboard mark of the run list on one row.
+    pub fn select_history_row(&mut self, index: usize) {
+        self.history_selected = index;
+    }
+
+    /// Which row of the run list the keyboard is on.
+    #[must_use]
+    pub fn history_selected(&self) -> usize {
+        self.history_selected
+    }
+
+    /// Opens one stored run's detail: its hosts, their steps and the exit statuses.
+    ///
+    /// Reading the summary starts nothing and replays nothing. The host output is read
+    /// only when a host is chosen, so opening a run with thousands of hosts does not
+    /// read thousands of logs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the run is not in the history, or the reason its summary
+    /// could not be read.
+    pub fn open_history_entry(&mut self, id: BatchRunId) -> Result<(), String> {
+        let Some(entry) = self.history.entry(id) else {
+            return Err(format!("the stored run {id} is not in the history"));
+        };
+        if let Some(problem) = entry.problem() {
+            return Err(problem.to_owned());
+        }
+        self.history_open = Some(id);
+        // The first host is chosen for the user, because the page has to show something
+        // in its output pane and an empty pane reads as "this host printed nothing".
+        self.history_host = entry
+            .summary()
+            .and_then(|run| run.hosts().first())
+            .map(|host| host.target().host_id());
+        self.history_detail = None;
+        if let Some(host) = self.history_host {
+            let _ = self.open_stored_host(host);
+        }
+        Ok(())
+    }
+
+    /// Closes the detail of a stored run and goes back to the list.
+    pub fn close_history_entry(&mut self) {
+        self.history_open = None;
+        self.history_host = None;
+        self.history_detail = None;
+    }
+
+    /// The stored run whose detail is open.
+    #[must_use]
+    pub fn stored_summary(&self) -> Option<&BatchRun> {
+        let id = self.history_open?;
+        self.history.entry(id)?.summary()
+    }
+
+    /// The stored run whose detail is open, by identity.
+    #[must_use]
+    pub fn stored_open(&self) -> Option<BatchRunId> {
+        self.history_open
+    }
+
+    /// Which host of that run has its output on screen.
+    #[must_use]
+    pub fn stored_host(&self) -> Option<HostId> {
+        self.history_host
+    }
+
+    /// Reads one host's output and step times from the run's log.
+    ///
+    /// The read is bounded by [MAX_HISTORY_LOG_BYTES]: the tail of a long log is what a
+    /// person asks for, and the page says how many lines it does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the log could not be read.
+    pub fn open_stored_host(&mut self, host: HostId) -> Result<(), String> {
+        let Some(run) = self.history_open else {
+            return Err("no stored run is open".to_owned());
+        };
+        let detail = self.stored_detail(run, host, MAX_HISTORY_LOG_BYTES)?;
+        self.history_host = Some(host);
+        self.history_detail = Some(detail);
+        Ok(())
+    }
+
+    /// The detail that was read for the host on screen.
+    #[must_use]
+    pub fn stored_detail_open(&self) -> Option<&StoredDetail> {
+        self.history_detail.as_ref()
+    }
+
+    /// Asks whether one saved task may be deleted.
+    pub fn ask_delete_saved(&mut self, id: BatchTaskId) {
+        self.library_confirm = Some(id);
+    }
+
+    /// Withdraws the question, so nothing is deleted.
+    pub fn cancel_delete_saved(&mut self) {
+        self.library_confirm = None;
+    }
+
+    /// The saved task waiting for the answer, when one is.
+    #[must_use]
+    pub fn delete_asked(&self) -> Option<BatchTaskId> {
+        self.library_confirm
+    }
+
+    /// Forgets the question, after the answer was acted on.
+    pub fn clear_delete_asked(&mut self) {
+        self.library_confirm = None;
     }
 
     /// Puts every surface away but keeps the run going.
@@ -1661,26 +1900,54 @@ impl BatchCenter {
         host: HostId,
         max_bytes: usize,
     ) -> Result<HostOutput, String> {
+        Ok(self.stored_detail(run, host, max_bytes)?.output)
+    }
+
+    /// One host's output and step times of a stored run, read from one bounded tail.
+    ///
+    /// Both come from the same read because they are in the same log: the output is the
+    /// chunks of that host, and the times are the `StepStarted` and `StepFinished`
+    /// events of it. A tail that starts after a step had already started leaves that
+    /// step's start unknown rather than guessing it, which is why the times are options.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the log could not be read, including a log that is damaged
+    /// before the part being read.
+    pub fn stored_detail(
+        &self,
+        run: BatchRunId,
+        host: HostId,
+        max_bytes: usize,
+    ) -> Result<StoredDetail, String> {
         let Some(store) = self.store.as_ref() else {
             return Err("no batch store is open".to_owned());
         };
         let log = store
             .read_events_tail(run, max_bytes)
             .map_err(|error| error.to_string())?;
-        let mut output = HostOutput::default();
+        let mut detail = StoredDetail::default();
         for event in log.events() {
-            if let BatchEventKind::Output {
-                host: at,
-                stream,
-                chunk,
-                ..
-            } = event.kind()
-                && *at == host
-            {
-                output.push(*stream, chunk.as_str());
+            match event.kind() {
+                BatchEventKind::Output {
+                    host: at,
+                    stream,
+                    chunk,
+                    ..
+                } if *at == host => detail.output.push(*stream, chunk.as_str()),
+                BatchEventKind::StepStarted { host: at, step } if *at == host => {
+                    let time = detail.time_mut(*step);
+                    time.started = Some(event.at_unix());
+                }
+                BatchEventKind::StepFinished { host: at, step, .. } if *at == host => {
+                    let time = detail.time_mut(*step);
+                    time.finished = Some(event.at_unix());
+                }
+                _ => {}
             }
         }
-        Ok(output)
+        detail.steps.sort_by_key(|time| time.step);
+        Ok(detail)
     }
 
     /// Writes one definition into the library and the file.
@@ -2360,13 +2627,18 @@ mod tests {
             "the run's own result is not bent by a storage failure"
         );
         // The log append fails for the same reason and says so first, so the message has
-        // to be the summary one: that is the write the history depends on.
+        // to be the run record one: that is the write the history depends on, and it is
+        // not the task definition, which was written before the run started.
         let problem = page
             .problem()
             .expect("a summary that was not written is said on the page");
         assert!(
-            problem.contains(copy::ux().batch_save_failed),
-            "the summary write failure is the one reported: {problem}"
+            problem.contains(copy::ux().batch_run_save_failed),
+            "the run record write failure is the one reported: {problem}"
+        );
+        assert!(
+            !problem.contains(copy::ux().batch_save_failed),
+            "a run record is not a task definition: {problem}"
         );
     }
 

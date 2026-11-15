@@ -20,7 +20,7 @@ use shellune_core::{BatchTarget, FailurePolicy, HostId, HostState, RunState, Ste
 
 use super::ShelluneView;
 use super::shell::ModalContent;
-use crate::app::batch::{BatchPage, BatchRunPage, MAX_PREVIEW_ROWS};
+use crate::app::batch::{BatchRunPage, MAX_PREVIEW_ROWS};
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, UxStrings};
 use crate::app::hosts::SelectionScope;
@@ -39,6 +39,127 @@ const BATCH_DIALOG_WIDTH: f32 = 880.0;
 /// is not drawn is still counted; drawing thousands of rows inside a dialog would make
 /// the page unusable instead.
 const MAX_RUN_ROWS: usize = 200;
+
+/// How many saved tasks a library lists before it counts the rest.
+///
+/// The library is a list of definitions a person picks from, not a table to scroll
+/// through: the count above it is exact, and a row that is not drawn is still counted,
+/// so thousands of saved tasks stay inside one dialog (R5).
+const MAX_LIBRARY_ROWS: usize = 60;
+
+/// How many stored runs a history lists before it counts the rest.
+const MAX_HISTORY_ROWS: usize = 60;
+
+/// How many hosts of one stored run its detail lists before it counts the rest.
+const MAX_HISTORY_HOSTS: usize = 120;
+
+/// The states the history can be narrowed to, in the order the filter lists them.
+///
+/// A run that is still going is not here: it is the run this window is driving, and it
+/// has a surface of its own.
+const HISTORY_FILTERS: [RunState; 4] = [
+    RunState::Completed,
+    RunState::Failed,
+    RunState::Cancelled,
+    RunState::Interrupted,
+];
+
+/// The debug selector of one filter value.
+fn history_filter_selector(state: RunState) -> &'static str {
+    match state {
+        RunState::Completed => "batch.history.filter.completed",
+        RunState::Failed => "batch.history.filter.failed",
+        RunState::Cancelled => "batch.history.filter.cancelled",
+        RunState::Interrupted => "batch.history.filter.interrupted",
+        _ => "batch.history.filter.other",
+    }
+}
+
+/// Removes every credential-shaped word from one sentence of a batch report.
+///
+/// The session sanitiser knows two shapes: the user information of a URL, and a
+/// password-style pair such as password=... A batch reason can also arrive as
+/// user:secret@host with no scheme in front of it, because that is how a sign-in failure
+/// is often worded. The word in front of the @ is dropped when it holds a colon and the
+/// host is kept, so a reader still sees what refused without seeing what was tried.
+pub(crate) fn redact_batch_text(text: &str) -> String {
+    let cleaned = crate::app::workspace::sanitize_diagnostic(text);
+    let mut out = String::with_capacity(cleaned.len());
+    let mut rest = cleaned.as_str();
+    while let Some(at) = rest.find('@') {
+        let (head, tail) = rest.split_at(at);
+        let start = head
+            .rfind([' ', '\t', '(', '"', '\'', ',', ';'])
+            .map_or(0, |index| index + 1);
+        let candidate = &head[start..];
+        if candidate.contains(':') {
+            out.push_str(&head[..start]);
+        } else {
+            out.push_str(head);
+            out.push('@');
+        }
+        rest = &tail[1..];
+    }
+    out.push_str(rest);
+    out
+}
+/// The diagnostics of one run as text, for a bug report.
+///
+/// It holds what a reader needs to see what the run did - the identity, the state, the
+/// hosts with their addresses, the state and exit status of every step and the reason a
+/// step gave - and nothing a person would not paste into a ticket: no password, no
+/// passphrase, no key, and no user name. The whole text still goes through
+/// [crate::app::workspace::sanitize_diagnostic] before it leaves, because a reason the
+/// server chose can be anything at all (R13, R22).
+pub(crate) fn batch_diagnostics(run: &shellune_core::BatchRun) -> String {
+    let ux = copy::ux();
+    let mut text = format!("shellune batch run {}\n", run.id());
+    text.push_str(&format!(
+        "state: {} · started: {} · hosts: {} · steps: {} · at once: {}\n",
+        run_state_text(run.state(), ux),
+        run.started_at_unix(),
+        run.hosts().len(),
+        run.task().steps().len(),
+        run.task().concurrency()
+    ));
+    text.push_str(&format!(
+        "task: {}\n",
+        run.task().name().unwrap_or("-").to_owned()
+    ));
+    for host in run.hosts() {
+        text.push_str(&format!(
+            "host {} {}:{} · {}\n",
+            host.target().label(),
+            host.target().address(),
+            host.target().port(),
+            host_state_text(host.state(), ux)
+        ));
+        for step in host.steps() {
+            let exit = step
+                .exit()
+                .map(|code| {
+                    format!(
+                        " {}",
+                        copy::fill(ux.batch_exit, &[("code", &code.to_string())])
+                    )
+                })
+                .unwrap_or_default();
+            let detail = step
+                .detail()
+                .map(|reason| format!(" · {reason}"))
+                .unwrap_or_default();
+            text.push_str(&format!(
+                "  step {} {}{exit}{detail}\n",
+                step.index() + 1,
+                step_state_text(step.state(), ux)
+            ));
+        }
+        if let Some(reason) = host.detail() {
+            text.push_str(&format!("  host detail: {reason}\n"));
+        }
+    }
+    redact_batch_text(&text)
+}
 
 impl ShelluneView {
     // -----------------------------------------------------------------------
@@ -217,16 +338,1357 @@ impl ShelluneView {
     }
 
     // -----------------------------------------------------------------------
+    // The task centre: saved tasks, this run, and the stored history
+    // (R11, R12, R13)
+    // -----------------------------------------------------------------------
+
+    /// Gives the task centre the store the rest of the window uses.
+    ///
+    /// The library and the history are read from it, so both can be listed before a
+    /// preview has ever been opened. Nothing is read here.
+    pub(super) fn attach_batch_store(&mut self) {
+        let store = shellune_storage::BatchStore::at(self.store.root());
+        self.batch.attach_store(store);
+    }
+
+    /// Opens the saved definitions.
+    pub(super) fn open_batch_library(&mut self, cx: &mut Context<Self>) {
+        self.attach_batch_store();
+        self.batch.show_library();
+        cx.notify();
+    }
+
+    /// Opens the stored runs of the past.
+    pub(super) fn open_batch_history(&mut self, cx: &mut Context<Self>) {
+        self.attach_batch_store();
+        self.batch.show_history();
+        cx.notify();
+    }
+
+    /// Switches the task centre to one of its four surfaces.
+    ///
+    /// Reading the library or the history starts nothing; going back to the run does not
+    /// restart it either, because the runner never stopped. A surface that has nothing
+    /// to show is refused by the model and the page stays where it is.
+    pub(super) fn show_batch_surface(
+        &mut self,
+        surface: crate::app::batch::BatchCenterView,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::app::batch::BatchCenterView;
+        match surface {
+            BatchCenterView::Library => {
+                self.open_batch_library(cx);
+                return;
+            }
+            BatchCenterView::History => {
+                self.open_batch_history(cx);
+                return;
+            }
+            BatchCenterView::ActiveRun => {
+                self.batch.show_active_run();
+            }
+            BatchCenterView::Editor => {
+                self.batch.show_editor();
+            }
+            BatchCenterView::Closed => {
+                self.batch.hide();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Puts the task centre away.
+    ///
+    /// The run page of a run that has not ended stays: it is the only place its state is
+    /// visible, and leaving it is the background action, which says what it does (R13).
+    /// Every other surface is a list or a question, so it goes.
+    pub(super) fn dismiss_batch(&mut self, cx: &mut Context<Self>) {
+        use crate::app::batch::BatchCenterView;
+        if self.batch.has_active_run() && self.batch.view() == BatchCenterView::ActiveRun {
+            return;
+        }
+        if self.batch.close() || self.batch.hide() {
+            self.restore_focus_pending = true;
+        }
+        cx.notify();
+    }
+
+    /// Leaves the run page with the run still going, and says where it came back from.
+    pub(super) fn background_batch(&mut self, cx: &mut Context<Self>) {
+        if self.batch.hide() {
+            self.restore_focus_pending = true;
+            let ux = copy::ux();
+            self.toast(
+                Tone::Accent,
+                ux.batch_run_background,
+                Some(ux.batch_run_background_hint.to_owned()),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Opens one saved definition in the editor under the identity it was saved with.
+    pub(super) fn edit_saved_batch(
+        &mut self,
+        id: shellune_core::BatchTaskId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(problem) = self.batch.edit_saved(cx, id) {
+            self.batch.set_problem(problem);
+        }
+        cx.notify();
+    }
+
+    /// Deletes one saved definition, after the question was answered.
+    pub(super) fn delete_saved_batch(
+        &mut self,
+        id: shellune_core::BatchTaskId,
+        cx: &mut Context<Self>,
+    ) {
+        let outcome = self.batch.delete_saved(id);
+        self.batch.clear_delete_asked();
+        match outcome {
+            Ok(()) => {
+                let title = copy::ux().batch_library_deleted.to_owned();
+                self.toast(Tone::Positive, title, None, cx);
+            }
+            Err(problem) => self.batch.set_problem(problem),
+        }
+        cx.notify();
+    }
+
+    /// Saves the definition being edited, without running it.
+    pub(super) fn save_batch_draft(&mut self, cx: &mut Context<Self>) {
+        let ux = copy::ux();
+        // A refusal is already on the page as its problem sentence, so only the success
+        // is announced here: what was saved, and that nothing ran.
+        if self.batch.save_draft(cx).is_ok() {
+            let title = ux.batch_saved.to_owned();
+            self.toast(Tone::Positive, title, None, cx);
+        }
+        cx.notify();
+    }
+
+    /// Opens one stored run's commands, exit statuses and timeline.
+    pub(super) fn open_stored_batch(
+        &mut self,
+        id: shellune_core::BatchRunId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(problem) = self.batch.open_history_entry(id) {
+            self.batch.set_problem(problem);
+        }
+        cx.notify();
+    }
+
+    /// Reads one host's output of the stored run that is open.
+    pub(super) fn select_stored_host(
+        &mut self,
+        host: shellune_core::HostId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(problem) = self.batch.open_stored_host(host) {
+            self.batch.set_problem(problem);
+        }
+        cx.notify();
+    }
+
+    /// Copies the diagnostics of one run, with the credentials taken out.
+    ///
+    /// The text is the run's own record - the hosts, the states, the exit statuses and
+    /// the reasons - passed through the same sanitiser a failed session uses, so a
+    /// password that a server echoed back cannot leave the application through it (R13).
+    pub(super) fn copy_batch_diagnostics(
+        &mut self,
+        run: &shellune_core::BatchRun,
+        cx: &mut Context<Self>,
+    ) {
+        let text = batch_diagnostics(run);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        let title = copy::ux().batch_diagnostics_copied.to_owned();
+        self.toast(Tone::Positive, title, None, cx);
+        cx.notify();
+    }
+
+    /// The keys the task centre's lists read while they are on screen.
+    ///
+    /// Up and Down move the mark, Enter opens the marked row: a saved task opens in the
+    /// editor, a stored run opens its detail. The editor is deliberately not here - a
+    /// key pressed there belongs to the text field the user is typing in - so this
+    /// answers false for it and the key goes on its way (R4).
+    ///
+    /// Returns whether the key was spent.
+    pub(super) fn batch_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::app::batch::BatchCenterView;
+        match self.batch.view() {
+            BatchCenterView::Library => {
+                let count = self.batch.library().tasks().len();
+                let current = self.batch.library_selected();
+                match event.keystroke.key.as_str() {
+                    "down" if count > 0 => {
+                        let next = crate::app::palette::step(current, 1, count);
+                        self.batch.select_library_row(next);
+                        cx.notify();
+                        true
+                    }
+                    "up" if count > 0 => {
+                        let next = crate::app::palette::step(current, -1, count);
+                        self.batch.select_library_row(next);
+                        cx.notify();
+                        true
+                    }
+                    "enter" if count > 0 => {
+                        let index = current.min(count - 1);
+                        if let Some(task) = self.batch.library().tasks().get(index) {
+                            let id = task.id();
+                            self.edit_saved_batch(id, cx);
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            BatchCenterView::History => {
+                // The detail of one run is read, not chosen from: its way back is the
+                // button and Escape.
+                if self.batch.stored_open().is_some() {
+                    return false;
+                }
+                let visible = self.batch.history_visible();
+                let count = visible.len();
+                let current = self.batch.history_selected();
+                match event.keystroke.key.as_str() {
+                    "down" if count > 0 => {
+                        let next = crate::app::palette::step(current, 1, count);
+                        self.batch.select_history_row(next);
+                        cx.notify();
+                        true
+                    }
+                    "up" if count > 0 => {
+                        let next = crate::app::palette::step(current, -1, count);
+                        self.batch.select_history_row(next);
+                        cx.notify();
+                        true
+                    }
+                    "enter" if count > 0 => {
+                        let index = current.min(count - 1);
+                        let id = visible.get(index).map(|entry| entry.id());
+                        if let Some(id) = id {
+                            self.open_stored_batch(id, cx);
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// The control the top bar draws for the task centre.
+    ///
+    /// Two things, and they say different things: an entry that opens the saved tasks,
+    /// and - only while this window is driving a run - the run's own state, which
+    /// returns to the same page with its selection and output still in place (R11,
+    /// R13). The state is the model's, so an indicator cannot show a run that ended.
+    pub(super) fn batch_topbar_control(&self, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let selected = self.batch.view().is_open();
+        let entry = components::icon_only_button(Icon::Layers, metrics)
+            .id("topbar.batch")
+            .debug_selector(|| "topbar.batch".to_owned())
+            .tooltip(components::tooltip(SharedString::from(format!(
+                "{} · {}",
+                ux.batch_center_open, ux.batch_center_open_hint
+            ))))
+            .when(selected, |button| {
+                button.bg(theme::swatch(palette::SURFACE_SELECTED))
+            })
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.open_batch_library(cx);
+            }));
+        let mut controls = vec![entry];
+        let Some(page) = self.batch.run() else {
+            return controls;
+        };
+        if page.is_finished() {
+            return controls;
+        }
+        let done = page.finished_hosts().to_string();
+        let total = page.total_hosts().to_string();
+        let label = if page.failed_hosts() > 0 {
+            copy::fill(
+                ux.batch_indicator_failed,
+                &[("failed", &page.failed_hosts().to_string())],
+            )
+        } else {
+            copy::fill(
+                ux.batch_indicator_running,
+                &[("done", &done), ("total", &total)],
+            )
+        };
+        let tone = run_state_tone(page.state());
+        controls.push(
+            div()
+                .id("topbar.batch.active")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .cursor_pointer()
+                .debug_selector(|| "topbar.batch.active".to_owned())
+                .tooltip(components::tooltip(SharedString::from(
+                    ux.batch_run_background_hint,
+                )))
+                .child(components::chip(label, tone, metrics))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    if this.batch.show_active_run() {
+                        cx.notify();
+                    }
+                })),
+        );
+        controls
+    }
+
+    // -----------------------------------------------------------------------
     // The dialog
     // -----------------------------------------------------------------------
 
     /// The batch dialog, when one is open.
     pub(super) fn batch_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
-        match self.batch.page() {
-            BatchPage::Closed => None,
-            BatchPage::Preview => Some(self.batch_preview_dialog(window, cx)),
-            BatchPage::Run => Some(self.batch_run_dialog(window, cx)),
+        use crate::app::batch::BatchCenterView;
+        match self.batch.view() {
+            BatchCenterView::Closed => None,
+            BatchCenterView::Editor => Some(self.batch_preview_dialog(window, cx)),
+            BatchCenterView::ActiveRun => Some(self.batch_run_dialog(window, cx)),
+            BatchCenterView::Library => Some(self.batch_library_dialog(window, cx)),
+            BatchCenterView::History => Some(self.batch_history_dialog(window, cx)),
         }
+    }
+
+    /// The switch between the four surfaces, drawn at the top of each of them.
+    ///
+    /// The run and the definition being edited are offered only when they exist: a
+    /// switch to a page that has nothing to show would be a dead end. Everything here is
+    /// a pointer target the size of a control and a keyboard stop in the lists, so the
+    /// centre is reachable without a mouse (R4).
+    fn batch_surface_switch(&self, cx: &mut Context<Self>) -> Div {
+        use crate::app::batch::BatchCenterView;
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let current = self.batch.view();
+        let mut segments = components::segmented(metrics);
+        let entries = [
+            (
+                BatchCenterView::Library,
+                ux.batch_switch_library,
+                "batch.switch.library",
+                true,
+            ),
+            (
+                BatchCenterView::Editor,
+                ux.batch_switch_editor,
+                "batch.switch.editor",
+                self.batch.concurrency().is_some(),
+            ),
+            (
+                BatchCenterView::ActiveRun,
+                ux.batch_switch_run,
+                "batch.switch.run",
+                self.batch.has_active_run(),
+            ),
+            (
+                BatchCenterView::History,
+                ux.batch_switch_history,
+                "batch.switch.history",
+                true,
+            ),
+        ];
+        for (surface, label, id, available) in entries {
+            if !available {
+                continue;
+            }
+            let selected = current == surface;
+            segments = segments.child(
+                components::segment(label, selected, metrics)
+                    .id(id)
+                    .debug_selector(move || id.to_owned())
+                    .when(!selected, |segment| {
+                        segment.cursor_pointer().on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.show_batch_surface(surface, cx);
+                            },
+                        ))
+                    }),
+            );
+        }
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "batch.switch".to_owned())
+            .child(segments)
+    }
+
+    /// The saved definitions: what is written down, what can be edited, and what goes.
+    fn batch_library_dialog(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let (header, subtitle) = self.modal_header(
+            Some(Icon::Layers),
+            ux.batch_library_title.to_owned(),
+            Some(ux.batch_library_subtitle.to_owned()),
+            "batch.library.close",
+            cx,
+            |this: &mut Self, cx: &mut Context<Self>| this.dismiss_batch(cx),
+        );
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .pb(metrics.scale(spacing::SNUG))
+            .child(self.batch_surface_switch(cx));
+        if let Some(problem) = self.batch.problem() {
+            body = body.child(
+                components::banner(Tone::Danger, metrics)
+                    .debug_selector(|| "batch.library.problem".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(problem.to_owned())),
+            );
+        }
+        if let Some(problem) = self.batch.library().problem() {
+            body = body.child(
+                components::banner(Tone::Danger, metrics)
+                    .debug_selector(|| "batch.library.file_problem".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(problem.to_owned())),
+            );
+        }
+        let tasks = self.batch.library().tasks();
+        if tasks.is_empty() {
+            body = body.child(
+                components::state_card(
+                    Tone::Accent,
+                    ux.batch_library_empty_title,
+                    ux.batch_library_empty_body,
+                    None,
+                    metrics,
+                )
+                .debug_selector(|| "batch.library.empty".to_owned()),
+            );
+        }
+        let mut rows = div()
+            .id("batch.library.rows")
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .max_h(metrics.scale(320.0))
+            .overflow_y_scroll()
+            .debug_selector(|| "batch.library.rows".to_owned());
+        for (index, task) in tasks.iter().take(MAX_LIBRARY_ROWS).enumerate() {
+            rows = rows.child(self.batch_library_row(index, task, cx));
+        }
+        body = body.child(rows);
+        let hidden = tasks.len().saturating_sub(MAX_LIBRARY_ROWS);
+        if hidden > 0 {
+            body = body.child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "batch.library.more".to_owned())
+                    .child(copy::fill(
+                        ux.batch_targets_more,
+                        &[("count", &hidden.to_string())],
+                    )),
+            );
+        }
+        let footer = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::SNUG))
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "batch.library.note".to_owned())
+                    .child(ux.batch_no_rollback),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .flex_none()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::compact_button(ux.batch_library_new, Variant::Primary, metrics)
+                            .id("batch.library.new")
+                            .debug_selector(|| "batch.library.new".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.open_batch_preview(cx);
+                            })),
+                    )
+                    .child(
+                        components::compact_button(ux.batch_close, Variant::Ghost, metrics)
+                            .id("batch.library.dismiss")
+                            .debug_selector(|| "batch.library.dismiss".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.dismiss_batch(cx);
+                            })),
+                    ),
+            );
+        self.modal(
+            window,
+            "batch.library",
+            BATCH_DIALOG_WIDTH,
+            ModalContent {
+                header,
+                subtitle,
+                body: body.into_any_element(),
+                footer: Some(footer),
+            },
+        )
+    }
+
+    /// One saved definition: what it would run on, and the three things to do with it.
+    fn batch_library_row(
+        &self,
+        index: usize,
+        task: &shellune_core::BatchTask,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let id = task.id();
+        let selected = self.batch.library_selected() == index;
+        let name = task.name().unwrap_or(ux.batch_untitled).to_owned();
+        let meta = copy::fill(
+            ux.batch_library_row_meta,
+            &[
+                ("hosts", &task.targets().len().to_string()),
+                ("steps", &task.steps().len().to_string()),
+                ("concurrency", &task.concurrency().to_string()),
+            ],
+        );
+        let asking = self.batch.delete_asked() == Some(id);
+        let mut row = components::row_with_state(
+            if selected {
+                components::ControlState::Selected
+            } else {
+                components::ControlState::Resting
+            },
+            metrics,
+        )
+        .id(SharedString::from(format!("batch.library.row.{index}")))
+        .debug_selector(move || format!("batch.library.row.{index}"))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.label_size())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(SharedString::from(name)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(SharedString::from(meta)),
+                ),
+        );
+        if asking {
+            row = row
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::DANGER))
+                        .debug_selector(move || format!("batch.library.delete_ask.{index}"))
+                        .child(ux.batch_library_delete_ask),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(
+                            components::compact_button(
+                                ux.batch_library_delete_no,
+                                Variant::Ghost,
+                                metrics,
+                            )
+                            .id(SharedString::from(format!(
+                                "batch.library.delete_no.{index}"
+                            )))
+                            .debug_selector(move || format!("batch.library.delete_no.{index}"))
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.batch.cancel_delete_saved();
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            components::compact_button(
+                                ux.batch_library_delete_yes,
+                                Variant::Danger,
+                                metrics,
+                            )
+                            .id(SharedString::from(format!(
+                                "batch.library.delete_yes.{index}"
+                            )))
+                            .debug_selector(move || format!("batch.library.delete_yes.{index}"))
+                            .on_click(cx.listener(
+                                move |this, _event, _window, cx| {
+                                    this.delete_saved_batch(id, cx);
+                                },
+                            )),
+                        ),
+                );
+        } else {
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::compact_button(
+                            ux.batch_library_edit,
+                            Variant::Secondary,
+                            metrics,
+                        )
+                        .id(SharedString::from(format!("batch.library.edit.{index}")))
+                        .debug_selector(move || format!("batch.library.edit.{index}"))
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.edit_saved_batch(id, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        components::compact_button(
+                            ux.batch_library_delete,
+                            Variant::Ghost,
+                            metrics,
+                        )
+                        .id(SharedString::from(format!("batch.library.delete.{index}")))
+                        .debug_selector(move || format!("batch.library.delete.{index}"))
+                        .on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.batch.ask_delete_saved(id);
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            );
+        }
+        row
+    }
+
+    /// The stored runs: a list to scan, and the detail of the one that was opened.
+    fn batch_history_dialog(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let open = self
+            .batch
+            .stored_open()
+            .and_then(|id| self.batch.history().entry(id));
+        let (title, subtitle) = match open {
+            Some(_) => (ux.batch_history_title.to_owned(), None),
+            None => (
+                ux.batch_history_title.to_owned(),
+                Some(ux.batch_history_subtitle.to_owned()),
+            ),
+        };
+        let (header, subtitle) = self.modal_header(
+            Some(Icon::Layers),
+            title,
+            subtitle,
+            "batch.history.close",
+            cx,
+            |this: &mut Self, cx: &mut Context<Self>| this.dismiss_batch(cx),
+        );
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .px(metrics.scale(spacing::LOOSE))
+            .pb(metrics.scale(spacing::SNUG))
+            .child(self.batch_surface_switch(cx));
+        if let Some(problem) = self.batch.problem() {
+            body = body.child(
+                components::banner(Tone::Danger, metrics)
+                    .debug_selector(|| "batch.history.problem".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(problem.to_owned())),
+            );
+        }
+        if let Some(problem) = self.batch.history().problem() {
+            body = body.child(
+                components::banner(Tone::Danger, metrics)
+                    .debug_selector(|| "batch.history.file_problem".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(problem.to_owned())),
+            );
+        }
+        body = body.child(match self.batch.stored_open() {
+            Some(id) if self.batch.history().entry(id).is_some() => {
+                self.batch_history_detail(id, cx)
+            }
+            _ => self.batch_history_list(cx),
+        });
+        let footer = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::LOOSE))
+            .py(metrics.scale(spacing::SNUG))
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "batch.history.note".to_owned())
+                    .child(ux.batch_no_rollback),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .flex_none()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .children(self.batch.stored_open().map(|_| {
+                        components::compact_button(
+                            ux.batch_diagnostics_copy,
+                            Variant::Secondary,
+                            metrics,
+                        )
+                        .id("batch.history.diagnostics")
+                        .debug_selector(|| "batch.history.diagnostics".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                let Some(run) = this.batch.stored_summary().cloned() else {
+                                    return;
+                                };
+                                this.copy_batch_diagnostics(&run, cx);
+                            },
+                        ))
+                    }))
+                    .child(
+                        components::compact_button(ux.batch_close, Variant::Ghost, metrics)
+                            .id("batch.history.dismiss")
+                            .debug_selector(|| "batch.history.dismiss".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.dismiss_batch(cx);
+                            })),
+                    ),
+            );
+        self.modal(
+            window,
+            "batch.history",
+            BATCH_DIALOG_WIDTH,
+            ModalContent {
+                header,
+                subtitle,
+                body: body.into_any_element(),
+                footer: Some(footer),
+            },
+        )
+    }
+
+    /// The stored runs the filter keeps, newest first.
+    fn batch_history_list(&self, cx: &mut Context<Self>) -> Div {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let mut filters = components::segmented(metrics);
+        let any_selected = self.batch.history_filter().is_none();
+        filters = filters.child(
+            components::segment(ux.batch_history_filter_any, any_selected, metrics)
+                .id("batch.history.filter.any")
+                .debug_selector(|| "batch.history.filter.any".to_owned())
+                .when(!any_selected, |segment| {
+                    segment
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.batch.set_history_filter(None);
+                            cx.notify();
+                        }))
+                }),
+        );
+        for state in HISTORY_FILTERS {
+            let selected = self.batch.history_filter() == Some(state);
+            let id = history_filter_selector(state);
+            filters = filters.child(
+                components::segment(run_state_text(state, ux), selected, metrics)
+                    .id(id)
+                    .debug_selector(move || id.to_owned())
+                    .when(!selected, |segment| {
+                        segment.cursor_pointer().on_click(cx.listener(
+                            move |this, _event, _window, cx| {
+                                this.batch.set_history_filter(Some(state));
+                                cx.notify();
+                            },
+                        ))
+                    }),
+            );
+        }
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(components::section_label(ux.batch_history_filter, metrics))
+                    .child(filters),
+            );
+        let entries = self.batch.history_visible();
+        if entries.is_empty() {
+            column = column.child(
+                components::state_card(
+                    Tone::Neutral,
+                    ux.batch_history_empty,
+                    ux.batch_history_subtitle,
+                    None,
+                    metrics,
+                )
+                .debug_selector(|| "batch.history.empty".to_owned()),
+            );
+        }
+        let mut rows = div()
+            .id("batch.history.rows")
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .max_h(metrics.scale(320.0))
+            .overflow_y_scroll()
+            .debug_selector(|| "batch.history.rows".to_owned());
+        for (index, entry) in entries.iter().take(MAX_HISTORY_ROWS).enumerate() {
+            rows = rows.child(self.batch_history_row(index, entry.id(), entry, cx));
+        }
+        column = column.child(rows);
+        let hidden =
+            entries.len().saturating_sub(MAX_HISTORY_ROWS) + self.batch.history().omitted();
+        if hidden > 0 {
+            column = column.child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "batch.history.more".to_owned())
+                    .child(copy::fill(
+                        ux.batch_history_omitted,
+                        &[("count", &hidden.to_string())],
+                    )),
+            );
+        }
+        column
+    }
+
+    /// One stored run: when it started, what it ended as, and how to read it.
+    fn batch_history_row(
+        &self,
+        index: usize,
+        id: shellune_core::BatchRunId,
+        entry: &crate::app::batch::HistoryEntry,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let selected = self.batch.history_selected() == index;
+        let mut row = components::row_with_state(
+            if selected {
+                components::ControlState::Selected
+            } else {
+                components::ControlState::Resting
+            },
+            metrics,
+        )
+        .id(SharedString::from(format!("batch.history.row.{index}")))
+        .debug_selector(move || format!("batch.history.row.{index}"));
+        let Some(run) = entry.summary() else {
+            return row.child(
+                div()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(id.to_string())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::DANGER))
+                            .debug_selector(move || format!("batch.history.damaged.{index}"))
+                            .child(entry.problem().map_or_else(
+                                || ux.batch_history_damaged.to_owned(),
+                                str::to_owned,
+                            )),
+                    ),
+            );
+        };
+        let name = run
+            .task()
+            .name()
+            .map_or_else(|| ux.batch_untitled.to_owned(), str::to_owned);
+        let when = copy::fill(
+            ux.batch_history_when,
+            &[(
+                "time",
+                &copy::relative_time(
+                    run.started_at_unix(),
+                    crate::app::remote::now_unix(),
+                    self.workspace.locale(),
+                ),
+            )],
+        );
+        row = row
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.label_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(name)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(format!(
+                                "{when} · {}",
+                                copy::fill(
+                                    ux.batch_history_hosts,
+                                    &[
+                                        ("done", &run.finished_hosts().to_string()),
+                                        ("total", &run.hosts().len().to_string()),
+                                    ],
+                                )
+                            ))),
+                    ),
+            )
+            .child(components::chip(
+                run_state_text(run.state(), ux),
+                run_state_tone(run.state()),
+                metrics,
+            ))
+            .child(
+                components::compact_button(ux.batch_history_open, Variant::Secondary, metrics)
+                    .id(SharedString::from(format!("batch.history.open.{index}")))
+                    .debug_selector(move || format!("batch.history.open.{index}"))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.open_stored_batch(id, cx);
+                    })),
+            );
+        row
+    }
+
+    /// One stored run in full: its hosts, their steps, the exit statuses, the timeline
+    /// and the output of the host that is chosen.
+    fn batch_history_detail(&self, id: shellune_core::BatchRunId, cx: &mut Context<Self>) -> Div {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let entry = self.batch.history().entry(id);
+        let Some(run) = entry.and_then(crate::app::batch::HistoryEntry::summary) else {
+            return self.batch_history_list(cx);
+        };
+        let name = run
+            .task()
+            .name()
+            .map_or_else(|| ux.batch_untitled.to_owned(), str::to_owned);
+        let when = copy::fill(
+            ux.batch_history_when,
+            &[(
+                "time",
+                &copy::relative_time(
+                    run.started_at_unix(),
+                    crate::app::remote::now_unix(),
+                    self.workspace.locale(),
+                ),
+            )],
+        );
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .debug_selector(|| "batch.history.detail".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.label_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(name)),
+                    )
+                    .child(components::chip(
+                        run_state_text(run.state(), ux),
+                        run_state_tone(run.state()),
+                        metrics,
+                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "batch.history.detail.when".to_owned())
+                            .child(SharedString::from(when)),
+                    )
+                    .child(components::chip(
+                        copy::fill(
+                            ux.batch_count_steps,
+                            &[("count", &run.task().steps().len().to_string())],
+                        ),
+                        Tone::Neutral,
+                        metrics,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        components::compact_button(ux.batch_history_back, Variant::Ghost, metrics)
+                            .id("batch.history.back")
+                            .debug_selector(|| "batch.history.back".to_owned())
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.batch.close_history_entry();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        components::compact_button(ux.batch_run_retry, Variant::Secondary, metrics)
+                            .id("batch.history.retry")
+                            .debug_selector(|| "batch.history.retry".to_owned())
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                // The retry is a new definition and goes through the
+                                // editor and its confirmation; nothing starts here (R22).
+                                match this.batch.retry_saved(cx, id) {
+                                    Ok(()) => {}
+                                    Err(problem) => this.batch.set_problem(problem),
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                components::banner(Tone::Neutral, metrics)
+                    .debug_selector(|| "batch.history.retry_note".to_owned())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(ux.batch_retry_confirm),
+            );
+        let selected = self.batch.stored_host();
+        let mut hosts = div()
+            .id("batch.history.hosts")
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .max_h(metrics.scale(160.0))
+            .overflow_y_scroll()
+            .debug_selector(|| "batch.history.hosts".to_owned());
+        for (index, host) in run.hosts().iter().take(MAX_HISTORY_HOSTS).enumerate() {
+            let host_id = host.target().host_id();
+            let mut steps = div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .debug_selector(move || format!("batch.history.steps.{index}"));
+            for step in host.steps() {
+                let exit = step
+                    .exit()
+                    .map(|code| copy::fill(ux.batch_exit, &[("code", &code.to_string())]))
+                    .unwrap_or_default();
+                let label = if exit.is_empty() {
+                    step_state_text(step.state(), ux).to_owned()
+                } else {
+                    format!("{} {exit}", step_state_text(step.state(), ux))
+                };
+                steps = steps.child(components::chip(
+                    label,
+                    step_state_tone(step.state()),
+                    metrics,
+                ));
+            }
+            let mut row = div()
+                .id(SharedString::from(format!("batch.history.host.{index}")))
+                .flex()
+                .flex_col()
+                .gap(metrics.scale(spacing::HAIRLINE))
+                .p(metrics.scale(spacing::TIGHT))
+                .rounded(px(radius::MEDIUM))
+                .cursor_pointer()
+                .bg(if selected == Some(host_id) {
+                    theme::swatch(palette::SURFACE_SELECTED)
+                } else {
+                    theme::swatch(palette::SURFACE_RAISED)
+                })
+                .debug_selector(move || format!("batch.history.host.{index}"))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.select_stored_host(host_id, cx);
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.label_size())
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                .child(SharedString::from(host.target().label().to_owned())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(SharedString::from(host.target().destination())),
+                        )
+                        .child(components::chip(
+                            host_state_text(host.state(), ux),
+                            host_state_tone(host.state()),
+                            metrics,
+                        )),
+                )
+                .child(steps);
+            if let Some(reason) = host.detail() {
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .child(SharedString::from(redact_batch_text(reason))),
+                );
+            }
+            hosts = hosts.child(row);
+        }
+        let hidden = run.hosts().len().saturating_sub(MAX_HISTORY_HOSTS);
+        if hidden > 0 {
+            hosts = hosts.child(
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(|| "batch.history.hosts.more".to_owned())
+                    .child(copy::fill(
+                        ux.batch_targets_more,
+                        &[("count", &hidden.to_string())],
+                    )),
+            );
+        }
+        column = column.child(hosts);
+        column = column.child(self.batch_history_output(run, cx));
+        column
+    }
+
+    /// The output and the step times of the chosen host of a stored run.
+    fn batch_history_output(&self, run: &shellune_core::BatchRun, _cx: &mut Context<Self>) -> Div {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let Some(host) = self.batch.stored_host() else {
+            return div()
+                .flex_none()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .debug_selector(|| "batch.history.output.no_host".to_owned())
+                .child(ux.batch_history_no_host);
+        };
+        let detail = self.batch.stored_detail_open();
+        let mut output = div()
+            .id("batch.history.output")
+            .flex()
+            .flex_col()
+            .h(metrics.scale(140.0))
+            .overflow_y_scroll()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .p(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::SEGMENT_TRACK))
+            .debug_selector(|| "batch.history.output".to_owned());
+        match detail.map(|detail| detail.output.lines()) {
+            Some(lines) if !lines.is_empty() => {
+                if let Some(dropped) = detail.map(|detail| detail.output.dropped())
+                    && dropped > 0
+                {
+                    output = output.child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "batch.history.output.dropped".to_owned())
+                            .child(copy::fill(
+                                ux.batch_run_output_dropped,
+                                &[("count", &dropped.to_string())],
+                            )),
+                    );
+                }
+                for line in lines {
+                    let text = if line.text.is_empty() {
+                        " ".to_owned()
+                    } else {
+                        line.text.clone()
+                    };
+                    output = output.child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(if line.is_error() {
+                                palette::DANGER
+                            } else {
+                                palette::TEXT_SECONDARY
+                            }))
+                            .child(SharedString::from(redact_batch_text(&text))),
+                    );
+                }
+            }
+            _ => {
+                output = output.child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "batch.history.output.empty".to_owned())
+                        .child(ux.batch_run_output_empty),
+                );
+            }
+        }
+        // The times come from the log, so the offsets are the run's own and not the
+        // wall clock the page was opened at.
+        let mut timeline = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "batch.history.timeline".to_owned())
+            .child(components::section_label(ux.batch_run_timeline, metrics));
+        let start = run.started_at_unix();
+        if let Some(record) = run.host(host) {
+            for (index, step) in record.steps().iter().enumerate() {
+                let command = run
+                    .task()
+                    .steps()
+                    .get(index)
+                    .map(|step| step.command().to_owned())
+                    .unwrap_or_default();
+                let offsets = detail
+                    .and_then(|detail| detail.time_of(step.index()))
+                    .map(|time| match (time.started, time.finished) {
+                        (Some(started), Some(finished)) => format!(
+                            "{} → {}",
+                            offset_text(start, started),
+                            offset_text(start, finished)
+                        ),
+                        (Some(started), None) => offset_text(start, started),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                timeline = timeline.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .debug_selector(move || format!("batch.history.timeline.{index}"))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(copy::fill(
+                                    ux.batch_run_step,
+                                    &[("index", &(index + 1).to_string())],
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                .child(SharedString::from(command)),
+                        )
+                        .child(components::chip(
+                            step_state_text(step.state(), ux),
+                            step_state_tone(step.state()),
+                            metrics,
+                        ))
+                        .when(!offsets.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(SharedString::from(offsets)),
+                            )
+                        }),
+                );
+            }
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .child(components::section_label(ux.batch_run_output, metrics))
+            .child(output)
+            .child(timeline)
     }
 
     fn batch_preview_dialog(&self, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -246,14 +1708,24 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::SNUG))
+            .child(self.batch_surface_switch(cx))
             .child(self.batch_targets_section(cx));
         if let Some(note) = self.batch.note() {
-            body = body.child(
-                components::banner(Tone::Accent, metrics)
-                    .debug_selector(|| "batch.note".to_owned())
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(SharedString::from(note.to_owned())),
-            );
+            body = body
+                .child(
+                    components::banner(Tone::Accent, metrics)
+                        .debug_selector(|| "batch.note".to_owned())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(SharedString::from(note.to_owned())),
+                )
+                // A retry says what it will and will not do before it is confirmed, in
+                // the same words the run page and the history use (R22).
+                .child(
+                    components::banner(Tone::Neutral, metrics)
+                        .debug_selector(|| "batch.retry.confirm_note".to_owned())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(ux.batch_retry_confirm),
+                );
         }
         body = body
             .child(self.batch_steps_section(cx))
@@ -290,6 +1762,23 @@ impl ShelluneView {
                     .flex_none()
                     .gap(metrics.scale(spacing::TIGHT))
                     .child(
+                        // Saving is the other half of the editor: it writes the
+                        // definition and starts nothing, which is what makes a task
+                        // reusable after a restart (R12).
+                        components::compact_button(
+                            ux.batch_save_draft,
+                            Variant::Secondary,
+                            metrics,
+                        )
+                        .id("batch.preview.save")
+                        .debug_selector(|| "batch.preview.save".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.save_batch_draft(cx);
+                            },
+                        )),
+                    )
+                    .child(
                         components::compact_button(ux.batch_cancel, Variant::Ghost, metrics)
                             .id("batch.preview.cancel")
                             .debug_selector(|| "batch.preview.cancel".to_owned())
@@ -297,14 +1786,27 @@ impl ShelluneView {
                                 this.close_batch(cx);
                             })),
                     )
-                    .child(
+                    .child(if let Some(refusal) = self.batch.second_run_refusal() {
+                        // A second run would replace the page of the one already going,
+                        // so the button is drawn unable to answer instead of answering
+                        // with a refusal after the click (R13).
+                        components::button_with_state(
+                            ux.batch_confirm,
+                            Variant::Primary,
+                            components::ControlState::Disabled,
+                            metrics,
+                        )
+                        .id("batch.preview.confirm")
+                        .debug_selector(|| "batch.preview.confirm".to_owned())
+                        .tooltip(components::tooltip(SharedString::from(refusal.to_string())))
+                    } else {
                         components::button(ux.batch_confirm, Variant::Primary, metrics)
                             .id("batch.preview.confirm")
                             .debug_selector(|| "batch.preview.confirm".to_owned())
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.confirm_batch(cx);
-                            })),
-                    ),
+                            }))
+                    }),
             );
         self.modal(
             window,
@@ -466,6 +1968,37 @@ impl ShelluneView {
                             .child(field.clone()),
                     )
                     .child(
+                        // The order is the order they run in, so it is moved here
+                        // rather than retyped: two steps swap, and the first and the
+                        // last say they have nowhere to go (R12).
+                        components::icon_button("↑", metrics)
+                            .id(SharedString::from(format!("batch.step.up.{index}")))
+                            .debug_selector(move || format!("batch.step.up.{index}"))
+                            .tooltip(components::tooltip(SharedString::from(ux.batch_step_up)))
+                            .when(index > 0, |button| {
+                                button.cursor_pointer().on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        let _ = this.batch.move_step_up(index);
+                                        cx.notify();
+                                    },
+                                ))
+                            }),
+                    )
+                    .child(
+                        components::icon_button("↓", metrics)
+                            .id(SharedString::from(format!("batch.step.down.{index}")))
+                            .debug_selector(move || format!("batch.step.down.{index}"))
+                            .tooltip(components::tooltip(SharedString::from(ux.batch_step_down)))
+                            .when(index + 1 < count, |button| {
+                                button.cursor_pointer().on_click(cx.listener(
+                                    move |this, _event, _window, cx| {
+                                        let _ = this.batch.move_step_down(index);
+                                        cx.notify();
+                                    },
+                                ))
+                            }),
+                    )
+                    .child(
                         components::compact_button(ux.batch_step_remove, Variant::Ghost, metrics)
                             .id(SharedString::from(format!("batch.step.remove.{index}")))
                             .debug_selector(move || format!("batch.step.remove.{index}"))
@@ -622,7 +2155,7 @@ impl ShelluneView {
             Some(state_text.to_owned()),
             "batch.run.close",
             cx,
-            |this: &mut Self, cx: &mut Context<Self>| this.close_batch(cx),
+            |this: &mut Self, cx: &mut Context<Self>| this.dismiss_batch(cx),
         );
         let mut body = div()
             .flex()
@@ -630,6 +2163,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::LOOSE))
             .pb(metrics.scale(spacing::SNUG))
+            .child(self.batch_surface_switch(cx))
             .child(self.batch_run_status(page));
         if let Some(problem) = page.problem() {
             body = body.child(
@@ -815,6 +2349,19 @@ impl ShelluneView {
                     })),
             );
         }
+        // The report of the run can leave the application as text, with the
+        // credentials taken out, whenever the run has said something (R13).
+        controls = controls.child(
+            components::compact_button(ux.batch_diagnostics_copy, Variant::Ghost, metrics)
+                .id("batch.run.diagnostics")
+                .debug_selector(|| "batch.run.diagnostics".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    let Some(run) = this.batch.run().map(|page| page.run().clone()) else {
+                        return;
+                    };
+                    this.copy_batch_diagnostics(&run, cx);
+                })),
+        );
         if finished {
             controls = controls.child(
                 components::compact_button(ux.batch_close, Variant::Primary, metrics)
@@ -822,6 +2369,21 @@ impl ShelluneView {
                     .debug_selector(|| "batch.run.close.action".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.close_batch(cx);
+                    })),
+            );
+        } else {
+            // Leaving is not stopping: the runner keeps its page and the top bar
+            // indicator brings this one back, with the chosen host and its output
+            // still in place (R11, R13).
+            controls = controls.child(
+                components::compact_button(ux.batch_run_background, Variant::Primary, metrics)
+                    .id("batch.run.background")
+                    .debug_selector(|| "batch.run.background".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(
+                        ux.batch_run_background_hint,
+                    )))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.background_batch(cx);
                     })),
             );
         }
@@ -1609,6 +3171,79 @@ impl ShelluneView {
     /// Asks the run on screen to stop.
     pub fn capture_batch_cancel(&mut self, cx: &mut Context<Self>) {
         self.cancel_batch(cx);
+    }
+
+    /// Opens the saved tasks, for a test or a shot.
+    pub fn capture_batch_library(&mut self, cx: &mut Context<Self>) {
+        self.open_batch_library(cx);
+    }
+
+    /// Opens the stored runs, for a test or a shot.
+    pub fn capture_batch_history(&mut self, cx: &mut Context<Self>) {
+        self.open_batch_history(cx);
+    }
+
+    /// Opens the detail of one stored run, by its place in the list the filter keeps.
+    pub fn capture_batch_stored(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let id = self
+            .batch
+            .history_visible()
+            .get(index)
+            .map(|entry| entry.id());
+        match id {
+            Some(id) => {
+                self.open_stored_batch(id, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Saves the definition in the editor without running it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the model's refusal or the reason the file could not be written.
+    #[cfg(test)]
+    pub fn capture_batch_save(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let outcome = self.batch.save_draft(cx);
+        cx.notify();
+        outcome.map(|_| ())
+    }
+
+    /// Chooses one host of the run page, as its list does.
+    #[cfg(test)]
+    pub fn capture_batch_select_host(
+        &mut self,
+        host: shellune_core::HostId,
+        cx: &mut Context<Self>,
+    ) {
+        self.batch.select_host(host);
+        cx.notify();
+    }
+
+    /// Leaves the run page with the run still going.
+    pub fn capture_batch_background(&mut self, cx: &mut Context<Self>) {
+        self.background_batch(cx);
+    }
+
+    /// Confirms the editor with a fixture, handing the answer back.
+    ///
+    /// The other helpers start a run and ignore the refusal; this one returns it, so a
+    /// test can drive the branch that answers a second confirmation (R13).
+    #[cfg(test)]
+    pub fn capture_batch_confirm(
+        &mut self,
+        plan: fixture::Plan,
+        cx: &mut Context<Self>,
+    ) -> (Result<(), crate::app::batch::ConfirmRefusal>, fixture::Gate) {
+        let gate = fixture::Gate::new();
+        let factory = std::sync::Arc::new(fixture::Factory::new(std::sync::Arc::new(plan), &gate));
+        let shared: std::sync::Arc<dyn shellune_ssh::batch::TransportFactory> = factory.clone();
+        let outcome = self.batch.confirm(cx, shared);
+        self.batch_polling = false;
+        cx.notify();
+        (outcome, gate)
     }
 
     /// Reads the runner until the page is in a state the caller names, or until the

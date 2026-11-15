@@ -21864,6 +21864,707 @@ async fn the_batch_dialog_fits_the_minimum_window(cx: &mut TestAppContext) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The batch task centre (R5, R11, R12, R13, R22)
+// ---------------------------------------------------------------------------
+
+/// A saved task the test wrote itself: the library reads it, nothing was run.
+fn saved_task(commands: &[&str], hosts: &[&str]) -> shellune_core::BatchTask {
+    let book = HostBook::from_hosts(batch_hosts()).expect("distinct hosts");
+    let defaults = shellune_core::ConnectionDefaults::default();
+    let mut targets = Vec::new();
+    for name in hosts {
+        let host = book
+            .hosts()
+            .iter()
+            .find(|host| host.name() == *name)
+            .expect("a host the fixture saved");
+        targets.push(
+            shellune_core::BatchTarget::snapshot(host, defaults).expect("a snapshot of the host"),
+        );
+    }
+    shellune_core::BatchTask::new(
+        shellune_core::BatchTask::steps_from_commands(
+            commands.iter().map(|line| (*line).to_owned()),
+        )
+        .expect("valid steps"),
+        targets,
+        2,
+    )
+    .expect("a valid task")
+}
+
+/// Writes one saved task into the store of a test, as an earlier session would have.
+fn seed_task(store: &HostStore, task: shellune_core::BatchTask) {
+    let batch = shellune_storage::BatchStore::at(store.root());
+    let mut book = batch.load_tasks_upgrading().expect("a readable book");
+    book.insert(task);
+    batch.save_tasks(&book).expect("the task is written");
+}
+
+#[gpui::test]
+async fn the_editor_saves_a_draft_and_the_library_offers_to_edit_or_delete_it(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("batch-library");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    // A definition saved from the editor: the run count stays at zero, because saving
+    // is not running.
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["uptime", "df -h /"]);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_save(cx).expect("the draft is written");
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.problem").is_none(),
+        "saving a valid definition is not a problem"
+    );
+    assert!(
+        cx.debug_bounds("batch.run").is_none(),
+        "saving a definition must not start a run"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_library(cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.library").is_some(),
+        "the saved tasks are on screen"
+    );
+    let (targets, steps) = cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        let task = panel
+            .library()
+            .tasks()
+            .first()
+            .expect("the draft is listed");
+        (task.targets().len(), task.steps().len())
+    });
+    assert_eq!((targets, steps), (2, 2));
+    assert!(
+        cx.debug_bounds("batch.library.row.0").is_some(),
+        "the saved task has a row"
+    );
+    assert!(
+        cx.debug_bounds("batch.library.row.1").is_none(),
+        "one saved task is one row"
+    );
+
+    // Edit opens the definition under the identity it was saved with, so saving it
+    // again replaces that record instead of adding a second one.
+    click(cx, "batch.library.edit.0");
+    cx.run_until_parked();
+    let (previewing, commands) = cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        (panel.is_previewing(), panel.commands(app))
+    });
+    assert!(previewing, "editing a saved task opens the editor");
+    assert_eq!(commands, vec!["uptime".to_owned(), "df -h /".to_owned()]);
+
+    // Deleting is a question, and the answer that is not "delete" keeps the task.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_library(cx));
+    });
+    cx.run_until_parked();
+    click(cx, "batch.library.delete.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.library.delete_ask.0").is_some(),
+        "a delete is asked before it happens"
+    );
+    click(cx, "batch.library.delete_no.0");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_panel().library().tasks().len()),
+        1,
+        "keeping the task keeps it"
+    );
+
+    click(cx, "batch.library.delete.0");
+    cx.run_until_parked();
+    click(cx, "batch.library.delete_yes.0");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_panel().library().tasks().len()),
+        0,
+        "the task is gone from the library"
+    );
+    let on_disk = shellune_storage::BatchStore::at(dir.store().root())
+        .load_tasks()
+        .expect("the tasks file still reads");
+    assert!(
+        on_disk.tasks().is_empty(),
+        "the record is removed from the file, not only from the list"
+    );
+}
+
+#[gpui::test]
+async fn a_finished_run_is_in_the_history_with_its_output_and_timeline(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-history");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["uptime", "deploy --check"]);
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let (outcome, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_confirm(
+                crate::app::view::batch::fixture::Plan::new()
+                    .host(
+                        "build-01",
+                        HostScript::new(vec![
+                            StepScript::ok(" 09:20:11 up 12 days\n"),
+                            // A reason a server chose, with a secret shape in it: the
+                            // history and the diagnostics must not carry it on.
+                            StepScript::failing(3, "deploy: password=hunter2 refused\n"),
+                        ]),
+                    )
+                    .host(
+                        "api-02",
+                        HostScript::new(vec![
+                            StepScript::ok(" 09:20:14 up 12 days\n"),
+                            StepScript::ok("release 0.4.1 is deployed\n"),
+                        ]),
+                    ),
+                cx,
+            )
+        })
+    });
+    assert!(outcome.is_ok(), "the first confirmation starts the run");
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_history(cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.history").is_some(),
+        "the stored runs are on screen"
+    );
+    let state = cx.update(|_window, app| {
+        view.read(app)
+            .batch_panel()
+            .history_visible()
+            .first()
+            .and_then(|entry| entry.summary().map(shellune_core::BatchRun::state))
+    });
+    assert_eq!(state, Some(shellune_core::RunState::Failed));
+
+    // The detail keeps what the run reported: the state of every host, the exit status
+    // of every step and the reason it failed.
+    click(cx, "batch.history.open.0");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.history.detail").is_some(),
+        "one stored run opens in full"
+    );
+    for selector in [
+        "batch.history.host.0",
+        "batch.history.steps.0",
+        "batch.history.timeline.0",
+        "batch.history.output",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is part of the detail"
+        );
+    }
+    let (output, diagnostics) = cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        let detail = panel.stored_detail_open().expect("the log was read");
+        let text = detail
+            .output
+            .lines()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let run = panel.stored_summary().expect("the summary is open").clone();
+        (text, crate::app::view::batch::batch_diagnostics(&run))
+    });
+    assert!(
+        output.contains("up 12 days"),
+        "the host's own output is read back from the log: {output}"
+    );
+    // The reason a server chose is written down as it came, and it is the diagnostic and
+    // the page that take the secret out: what is copied cannot carry it (R13).
+    assert!(
+        !diagnostics.contains("hunter2"),
+        "a secret-shaped reason does not leave in the diagnostics: {diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("build-01"),
+        "the diagnostics name the host that failed: {diagnostics}"
+    );
+    let times = cx.update(|_window, app| {
+        view.read(app)
+            .batch_panel()
+            .stored_detail_open()
+            .map(|detail| detail.steps.len())
+    });
+    assert!(
+        times.is_some_and(|steps| steps >= 2),
+        "the step times come from the log, not from memory"
+    );
+
+    // The filter narrows the list to the states it names, and the runs it keeps out are
+    // counted rather than silently dropped.
+    click(cx, "batch.history.back");
+    cx.run_until_parked();
+    click(cx, "batch.history.filter.completed");
+    cx.run_until_parked();
+    let visible = cx.update(|_window, app| view.read(app).batch_panel().history_visible().len());
+    assert_eq!(visible, 0, "a failed run is not a completed one");
+    click(cx, "batch.history.filter.failed");
+    cx.run_until_parked();
+    let visible = cx.update(|_window, app| view.read(app).batch_panel().history_visible().len());
+    assert_eq!(visible, 1, "the failed run is under its own state");
+}
+
+#[gpui::test]
+async fn a_restart_marks_the_run_interrupted_and_the_history_shows_what_it_finished(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("batch-interrupted");
+    seed(&dir.store(), batch_hosts());
+    // A run the last session left behind: started, one host done, nothing else.
+    let store = shellune_storage::BatchStore::at(dir.store().root());
+    let task = saved_task(&["uptime", "df -h /"], &["build-01", "api-02"]);
+    let confirmed = task
+        .clone()
+        .confirm(1_700_000_000)
+        .expect("a confirmable task");
+    let mut run = shellune_core::BatchRun::planned(
+        &confirmed,
+        shellune_core::BatchRunId::new(),
+        1_700_000_000,
+    );
+    let first = run.hosts()[0].target().host_id();
+    for kind in [
+        shellune_core::BatchEventKind::RunStarted {
+            hosts: 2,
+            steps: 2,
+            concurrency: 2,
+        },
+        shellune_core::BatchEventKind::HostState {
+            host: first,
+            state: shellune_core::HostState::Running,
+        },
+        shellune_core::BatchEventKind::StepStarted {
+            host: first,
+            step: 0,
+        },
+        shellune_core::BatchEventKind::StepFinished {
+            host: first,
+            step: 0,
+            state: shellune_core::StepState::Succeeded,
+            exit: Some(0),
+            detail: None,
+        },
+        shellune_core::BatchEventKind::HostFinished {
+            host: first,
+            state: shellune_core::HostState::Failed,
+            detail: Some("the connection was closed".to_owned()),
+        },
+    ] {
+        run.apply(&shellune_core::BatchEvent::new(0, 1_700_000_000, kind))
+            .expect("the run accepts its own history");
+    }
+    store.save_run(&run).expect("the summary is written");
+    let run_id = run.id();
+
+    // Starting the application is what marks it: the view reads the store once.
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_history(cx));
+    });
+    cx.run_until_parked();
+    let (state, _) = cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        let entry = panel
+            .history()
+            .entry(run_id)
+            .expect("the run is in the history");
+        (
+            entry.summary().map(shellune_core::BatchRun::state),
+            panel.has_active_run(),
+        )
+    });
+    assert_eq!(
+        state,
+        Some(shellune_core::RunState::Interrupted),
+        "a run cut off by a restart says so"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).batch_panel().has_active_run()),
+        "a restart replays nothing and drives nothing"
+    );
+    assert!(
+        cx.debug_bounds("batch.history.row.0").is_some(),
+        "the interrupted run is listed"
+    );
+
+    // Retrying it is a new definition that goes through the editor: the confirmation is
+    // where it can still be stopped, and no connection is made by the retry itself.
+    click(cx, "batch.history.open.0");
+    cx.run_until_parked();
+    click(cx, "batch.history.retry");
+    cx.run_until_parked();
+    let (previewing, note, driving) = cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        (
+            panel.is_previewing(),
+            panel.note().map(str::to_owned),
+            panel.has_active_run(),
+        )
+    });
+    assert!(previewing, "a retry is edited and confirmed like any task");
+    assert!(
+        note.is_some(),
+        "the editor says the definition is a retry of an earlier run"
+    );
+    assert!(
+        !driving,
+        "a retry after a restart starts no runner: only a confirmation does"
+    );
+    assert!(
+        cx.debug_bounds("batch.retry.confirm_note").is_some(),
+        "the confirmation says a retry runs only what is owed"
+    );
+}
+
+#[gpui::test]
+async fn a_second_confirmation_is_refused_while_a_run_is_going(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-second-confirm");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["journalctl -f"]);
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let held = HostScript::new(vec![StepScript::holding("tailing\n")]);
+    let (first, gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_confirm(fixture_plan(&["build-01", "api-02"], held), cx)
+        })
+    });
+    assert!(first.is_ok(), "the first confirmation starts the run");
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.running_hosts() > 0)
+    }));
+    let running = cx.update(|_window, app| {
+        view.read(app)
+            .batch_panel()
+            .run()
+            .map(|page| page.run().id())
+    });
+
+    // A second task would replace the page of the run that is going, so the answer is a
+    // refusal and the run on screen is not touched.
+    let second = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_confirm(fixture_plan(&["build-01"], HostScript::default()), cx)
+                .0
+        })
+    });
+    assert_eq!(
+        second,
+        Err(crate::app::batch::ConfirmRefusal::RunInProgress),
+        "one window drives one run"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .batch_panel()
+            .run()
+            .map(|page| page.run().id())),
+        running,
+        "the run that was going is still the one on the page"
+    );
+
+    // The editor draws its confirmation unable to answer while that run is going, so the
+    // refusal is visible before the click as well as after it.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_preview(cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.preview.confirm").is_some(),
+        "the confirmation is on screen, drawn as unavailable"
+    );
+    click(cx, "batch.preview.confirm");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .batch_panel()
+            .run()
+            .map(|page| page.run().id())),
+        running,
+        "a confirmation that cannot be answered starts nothing"
+    );
+    gate.release();
+    let _ = settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    });
+}
+
+#[gpui::test]
+async fn leaving_the_run_page_keeps_the_run_its_page_and_its_selection(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-background");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["journalctl -f"]);
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let held = HostScript::new(vec![StepScript::holding("tailing\n")]);
+    let (_outcome, gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_confirm(fixture_plan(&["build-01", "api-02"], held), cx)
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.running_hosts() > 0)
+    }));
+    let (run_id, host) = cx.update(|_window, app| {
+        let page = view.read(app).batch_panel().run().expect("a run page");
+        (page.run().id(), page.run().hosts()[1].target().host_id())
+    });
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_select_host(host, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Leaving is the background action, not a dismissal that stops anything.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_background(cx));
+    });
+    cx.run_until_parked();
+    // The surface the render reads is what says the page is out of the way: the test
+    // framework keeps every selector that was ever drawn in a frame, so "not drawn this
+    // frame" is asked of the same projection `batch_overlay` switches on.
+    let surface = cx.update(|_window, app| view.read(app).batch_panel().view());
+    assert_eq!(
+        surface,
+        crate::app::batch::BatchCenterView::Closed,
+        "leaving the run page puts the surface away"
+    );
+    assert!(
+        cx.debug_bounds("topbar.batch.active").is_some(),
+        "the top bar says a run is going"
+    );
+    // Another page is usable while the run goes on.
+    cx.dispatch_action(crate::app::actions::GoToLocalShells);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("topbar.batch.active").is_some(),
+        "the indicator stays on every page"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).batch_panel().is_watching()),
+        "the runner is still watched while another page is on screen"
+    );
+
+    // The indicator returns to the same run, with the host that was chosen still chosen.
+    click(cx, "topbar.batch.active");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.run").is_some(),
+        "the run page is back"
+    );
+    let (id, selected) = cx.update(|_window, app| {
+        let page = view.read(app).batch_panel().run().expect("a run page");
+        (page.run().id(), page.selected())
+    });
+    assert_eq!(id, run_id, "the same run, not a new one");
+    assert_eq!(selected, Some(host), "the chosen host is still chosen");
+    gate.release();
+    let _ = settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    });
+}
+
+#[gpui::test]
+async fn the_library_and_the_history_answer_the_keyboard(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-keyboard");
+    seed(&dir.store(), batch_hosts());
+    let mut first = saved_task(&["uptime"], &["build-01"]);
+    first.set_name(Some("nightly".to_owned()));
+    let mut second = saved_task(&["df -h /"], &["api-02"]);
+    second.set_name(Some("weekly".to_owned()));
+    seed_task(&dir.store(), first);
+    seed_task(&dir.store(), second);
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_library(cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.library.row.0").is_some(),
+        "two saved tasks are listed"
+    );
+    // Down moves the mark, Enter opens the marked definition.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_panel().library_selected()),
+        1
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let commands = cx.update(|_window, app| view.read(app).batch_panel().commands(app));
+    assert_eq!(
+        commands,
+        vec!["df -h /".to_owned()],
+        "the keyboard opened the second saved task"
+    );
+
+    // The same for a stored run: Escape puts the list away rather than hiding a run.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_history(cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.history").is_none(),
+        "escape puts the history away"
+    );
+}
+
+#[gpui::test]
+async fn the_task_centre_fits_the_minimum_window_and_speaks_both_languages(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("batch-centre-bounds");
+    seed(&dir.store(), batch_hosts());
+    let mut task = saved_task(
+        &["uptime", "df -h /", "journalctl -u shellune -n 40"],
+        &["build-01"],
+    );
+    task.set_name(Some(
+        "a name long enough to be cut off in a narrow dialog".to_owned(),
+    ));
+    seed_task(&dir.store(), task);
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+
+    focus_root(&view, cx);
+    for round in 0..2 {
+        if round == 1 {
+            // The second pass draws the same two surfaces in Chinese, so a label that
+            // only fits in one language is caught here (R5).
+            cx.dispatch_action(ToggleLanguage);
+            cx.run_until_parked();
+        }
+        let language = cx.update(|_window, app| view.read(app).workspace().locale());
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.capture_batch_library(cx);
+            });
+        });
+        cx.run_until_parked();
+        let dialog = bounds_of(cx, "batch.library");
+        assert_fits_inside(dialog, minimum_window(), "the library dialog");
+        for selector in ["batch.switch", "batch.library.row.0", "batch.library.new"] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} is drawn at the minimum window in {language:?}"
+            );
+        }
+
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| view.capture_batch_history(cx));
+        });
+        cx.run_until_parked();
+        let dialog = bounds_of(cx, "batch.history");
+        assert_fits_inside(dialog, minimum_window(), "the history dialog");
+        for selector in [
+            "batch.switch",
+            "batch.history.empty",
+            "batch.history.dismiss",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} is drawn at the minimum window in {language:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_diagnostics_name_the_hosts_and_carry_no_credential() {
+    let task = saved_task(&["uptime"], &["build-01"]);
+    let confirmed = task.confirm(1_700_000_000).expect("a confirmable task");
+    let mut run = shellune_core::BatchRun::planned(
+        &confirmed,
+        shellune_core::BatchRunId::new(),
+        1_700_000_000,
+    );
+    let host = run.hosts()[0].target().host_id();
+    for kind in [
+        shellune_core::BatchEventKind::RunStarted {
+            hosts: 1,
+            steps: 1,
+            concurrency: 1,
+        },
+        shellune_core::BatchEventKind::StepFinished {
+            host,
+            step: 0,
+            state: shellune_core::StepState::Failed,
+            exit: Some(255),
+            detail: Some("ssh://deploy:hunter2@192.0.2.11:22 said password=hunter2".to_owned()),
+        },
+        shellune_core::BatchEventKind::HostFinished {
+            host,
+            state: shellune_core::HostState::Failed,
+            detail: Some("permission denied for deploy:hunter2@192.0.2.11".to_owned()),
+        },
+    ] {
+        run.apply(&shellune_core::BatchEvent::new(0, 1_700_000_000, kind))
+            .expect("the run accepts its own history");
+    }
+    let text = crate::app::view::batch::batch_diagnostics(&run);
+    assert!(
+        text.contains("build-01"),
+        "the host is named so a reader knows where it was: {text}"
+    );
+    assert!(
+        text.contains("192.0.2.11:22"),
+        "the address is there, because what failed is the connection: {text}"
+    );
+    assert!(
+        text.contains(&copy::ux().batch_exit.replace("{code}", "255")),
+        "the exit status is part of the record: {text}"
+    );
+    assert!(!text.contains("hunter2"), "no secret leaves: {text}");
+    assert!(
+        text.contains("password=<hidden>"),
+        "the name of the pair stays so a reader knows what was wrong, and only its value goes: {text}"
+    );
+}
+
 #[test]
 fn a_route_names_why_a_host_cannot_be_reached() {
     use crate::app::batch::StoredRoutes;
