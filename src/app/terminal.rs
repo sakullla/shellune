@@ -46,6 +46,7 @@ use crate::app::components;
 use crate::app::copy::Locale;
 use crate::app::glyphs;
 use crate::app::icons::Icon;
+use crate::app::serial::{NewlineFormat, PortScan, SerialLink, SerialPane, SerialTarget, describe};
 use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, spacing};
 
 /// How often the pane looks for output from the shell.
@@ -155,6 +156,13 @@ pub enum PaneSource {
     Remote(RemoteSession),
     /// A shell on the target of a jump chain.
     Chain(ChainSession),
+    /// An open serial device (R21).
+    ///
+    /// A serial port is a byte stream in both directions and nothing more, so it is the
+    /// same grid, selection, scrollback and copy a local shell uses: only the byte
+    /// source differs. It is not a remote shell and it has no window size, which is why
+    /// a resize is not sent anywhere.
+    Serial(SerialLink),
 }
 
 /// Something a source produced, in the terms the pane thinks in.
@@ -203,6 +211,7 @@ impl PaneSource {
             Self::Local(session) => session.write(bytes).map_err(|error| error.to_string()),
             Self::Remote(session) => session.write(bytes),
             Self::Chain(session) => session.write(bytes),
+            Self::Serial(link) => link.write(bytes),
         }
     }
 
@@ -211,6 +220,10 @@ impl PaneSource {
             Self::Local(session) => session.resize(grid),
             Self::Remote(session) => session.resize(pty_size(grid)),
             Self::Chain(session) => session.resize(pty_size(grid)),
+            // A serial line has no window: the device sends and receives bytes and knows
+            // nothing about rows or columns. Saying "resized" would be a claim about a
+            // device that never heard of it, so nothing is sent and nothing is reported.
+            Self::Serial(_) => Ok(()),
         }
     }
 
@@ -229,6 +242,27 @@ impl PaneSource {
                 .drain()
                 .into_iter()
                 .filter_map(SourceEvent::from_remote)
+                .collect(),
+            Self::Serial(link) => link
+                .poll()
+                .into_iter()
+                .filter_map(|event| match event {
+                    shellune_serial::SerialEvent::Received(bytes) => Some(SourceEvent::Data(bytes)),
+                    // A device that went away is a session that was live and is not any
+                    // more; the sentence the platform gave is kept.
+                    shellune_serial::SerialEvent::Disconnected { error } => {
+                        Some(SourceEvent::Lost(describe(&error)))
+                    }
+                    // A release states no new state of the *terminal*: a close started
+                    // here has already moved the pane, and a device that failed reported
+                    // Disconnected first. The rest are facts about the line that
+                    // `SerialLink` keeps for the bar - a refused send, a frame the driver
+                    // cut short, bytes it dropped - and not changes of state.
+                    shellune_serial::SerialEvent::Closed
+                    | shellune_serial::SerialEvent::Sent { .. }
+                    | shellune_serial::SerialEvent::SendIncomplete { .. }
+                    | shellune_serial::SerialEvent::ReceiveOverflow { .. } => None,
+                })
                 .collect(),
             Self::Chain(session) => session
                 .drain()
@@ -260,6 +294,12 @@ impl PaneSource {
             Self::Local(session) => session.close(),
             Self::Remote(session) => session.close(),
             Self::Chain(session) => session.close(),
+            // A serial port is released through `SerialLink::close`, which reports what
+            // the close achieved: the pane states a port it could not release instead of
+            // pretending the device is free.
+            Self::Serial(link) => {
+                let _ = link.close();
+            }
         }
     }
 }
@@ -281,6 +321,11 @@ pub enum PaneOrigin {
         /// The address the session talks to, as the user sees it.
         target: String,
     },
+    /// A serial device (R21).
+    Serial {
+        /// The port the session holds, as the platform spells it.
+        device: String,
+    },
 }
 
 impl PaneOrigin {
@@ -290,6 +335,7 @@ impl PaneOrigin {
         match self {
             Self::Local(shell) => shell.name(),
             Self::Remote { target } => target,
+            Self::Serial { device } => device,
         }
     }
 
@@ -306,6 +352,13 @@ impl PaneOrigin {
             },
             Self::Remote { target } => SessionFailure::RemoteIoFailed {
                 host: target.clone(),
+                reason,
+            },
+            // The device is not a server and not a program: the sentence names the port
+            // and keeps the platform reason, so a disconnected session says which device
+            // went away and why instead of borrowing a network or a shell word (R21).
+            Self::Serial { device } => SessionFailure::SerialDeviceFailed {
+                port: device.clone(),
                 reason,
             },
         }
@@ -471,6 +524,12 @@ pub struct TerminalPane {
     /// change, and a note that disappeared would leave the user with an unexplained
     /// locale or an unexplained missing program.
     environment_notes: Vec<ShellEnvironmentNote>,
+    /// What a serial pane remembers beside its session (R21).
+    ///
+    /// Kept in the pane rather than in [`SerialLink`] because it outlives the port: the
+    /// device, its settings, the two send habits, the port list and the one line about
+    /// the line are what a pane whose device could not be opened still has to show.
+    serial: Option<SerialPane>,
 }
 
 /// What a terminal's copy, paste and search controls answer, written the way a
@@ -629,6 +688,7 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             x11: None,
             environment_notes,
+            serial: None,
         };
         pane.start_polling(cx);
         pane
@@ -691,6 +751,7 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             x11: None,
             environment_notes: Vec::new(),
+            serial: None,
         };
         pane.start_polling(cx);
         pane
@@ -752,18 +813,228 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             x11: None,
             environment_notes: Vec::new(),
+            serial: None,
         };
         pane.start_polling(cx);
         pane
     }
 
+    /// Opens the serial device a saved record names and wraps it in a pane (R21).
+    ///
+    /// A device that will not open is still a pane, and that is deliberate: the reason
+    /// the platform gave, the settings that were asked for and the port list are what
+    /// the user needs, and a tab that vanished would leave them with nothing to act on.
+    /// The state is [`PaneState::Failed`], never [`PaneState::Live`], so nothing here is
+    /// drawn as a connected terminal.
+    pub fn start_serial(
+        target: &SerialTarget,
+        tag: EventTag,
+        grid: GridSize,
+        font_size: f32,
+        locale: Locale,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut pane = Self::serial_skeleton(
+            target.device(),
+            target.config().summary(),
+            target.local_echo(),
+            tag,
+            grid,
+            font_size,
+            locale,
+            cx,
+        );
+        match SerialLink::open(target) {
+            Ok(link) => {
+                pane.source = Some(PaneSource::Serial(link));
+                pane.state = PaneState::Live;
+            }
+            Err(reason) => {
+                // The list is asked at the moment of failure, so the card can say what
+                // *is* attached while the record names what is not. It is asked once and
+                // kept until the refresh control is used.
+                if let Some(serial) = pane.serial.as_mut() {
+                    serial.refresh_ports();
+                    serial.set_note(Some(reason.clone()));
+                }
+                pane.state = PaneState::Failed(SessionFailure::ConnectionFailed { reason });
+            }
+        }
+        pane.start_polling(cx);
+        pane
+    }
+
+    /// A serial pane whose session is already open.
+    ///
+    /// The tests drive the real path with a real [`SerialLink`] - reader, writer,
+    /// bounded queue, close - over an in-memory port, because this machine has no
+    /// serial device and no virtual pair. Nothing in the application opens a port this
+    /// way: a saved record always goes through [`TerminalPane::start_serial`].
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_serial_with(
+        link: SerialLink,
+        device: &str,
+        settings: &str,
+        local_echo: bool,
+        tag: EventTag,
+        grid: GridSize,
+        font_size: f32,
+        locale: Locale,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut pane = Self::serial_skeleton(
+            device,
+            settings.to_owned(),
+            local_echo,
+            tag,
+            grid,
+            font_size,
+            locale,
+            cx,
+        );
+        pane.source = Some(PaneSource::Serial(link));
+        pane.state = PaneState::Live;
+        pane.start_polling(cx);
+        pane
+    }
+
+    /// The empty shell both serial constructors start from.
+    #[allow(clippy::too_many_arguments)]
+    fn serial_skeleton(
+        device: &str,
+        settings: String,
+        local_echo: bool,
+        tag: EventTag,
+        grid: GridSize,
+        font_size: f32,
+        locale: Locale,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let font_size = sanitize_font_size(font_size);
+        let grid = grid.clamped();
+        Self {
+            tag,
+            core: TerminalCore::new(grid.cols, grid.rows, shellune_terminal::DEFAULT_SCROLLBACK),
+            source: None,
+            origin: PaneOrigin::Serial {
+                device: device.to_owned(),
+            },
+            // Nothing is live until a link exists: the constructors above either set a
+            // source and this to Live, or leave both and report the reason.
+            state: PaneState::Failed(SessionFailure::ConnectionFailed {
+                reason: "the device has not been opened".to_owned(),
+            }),
+            #[cfg(test)]
+            sent: Vec::new(),
+            font_size,
+            cell: CellSize::for_font_size(font_size),
+            grid,
+            viewport: None,
+            focus: cx.focus_handle(),
+            dragging: false,
+            press: None,
+            press_selects: false,
+            mouse_held: None,
+            last_report_cell: None,
+            menu: None,
+            marked: None,
+            last_copy: None,
+            locale,
+            polling: false,
+            pending_paste: None,
+            search_open: false,
+            session_slot: std::cell::RefCell::new(None),
+            search_focused: false,
+            search_query: String::new(),
+            search_error: None,
+            search_hits: Vec::new(),
+            search_at: 0,
+            search_mark: None,
+            search_options: SearchOptions::literal(),
+            search_scroll: None,
+            block_filter: BlockFilter::All,
+            shortcuts: TerminalShortcuts::defaults(),
+            attention: TerminalAttention::default(),
+            x11: None,
+            environment_notes: Vec::new(),
+            serial: Some(SerialPane::new(device, settings, local_echo)),
+        }
+    }
+
+    /// A serial pane with no session behind it, for the capture probe (R21).
+    ///
+    /// The same pane the application draws for a live port - the same strip, the same
+    /// bar, the same grid - with no device: the bytes the caller supplies stand in for
+    /// what a device would have sent, and [`PaneState`] says which state is being
+    /// captured. Nothing here opens a port, so a shot taken with it proves what the
+    /// interface looks like and nothing about a device.
+    #[cfg(feature = "ui-capture")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn serial_without_device(
+        device: &str,
+        settings: &str,
+        local_echo: bool,
+        state: PaneState,
+        ports: PortScan,
+        note: Option<String>,
+        content: &[u8],
+        tag: EventTag,
+        grid: GridSize,
+        font_size: f32,
+        locale: Locale,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut pane = Self::serial_skeleton(
+            device,
+            settings.to_owned(),
+            local_echo,
+            tag,
+            grid,
+            font_size,
+            locale,
+            cx,
+        );
+        pane.state = state;
+        if let Some(serial) = pane.serial.as_mut() {
+            serial.show_ports(ports);
+            serial.set_note(note);
+        }
+        if !content.is_empty() {
+            let was_alternate = pane.alternate_screen();
+            let effects = pane.core.feed(content);
+            pane.apply_effects(effects, cx);
+            pane.recount_after_output(was_alternate);
+        }
+        pane
+    }
     /// Shuts the source down because the user closed it.
     ///
     /// The last screen stays on display: dropping the grid on close would hide what
     /// was on it, and the pane reports that it is no longer live either way.
     pub fn close(&mut self, cx: &mut Context<Self>) {
-        if let Some(source) = self.source.as_mut() {
-            source.close();
+        let released = match self.source.as_mut() {
+            Some(PaneSource::Serial(link)) => Some(link.close()),
+            Some(source) => {
+                source.close();
+                None
+            }
+            None => None,
+        };
+        // A port the driver did not release is stated as such: the device is still held,
+        // and a session that said nothing would let the next open of the same port fail
+        // for a reason no one can see (R17, R21).
+        if let (Some(report), Some(serial)) = (released, self.serial.as_mut())
+            && (!report.released || report.note.is_some())
+        {
+            let held = self.locale.strings().serial_still_held;
+            serial.set_note(report.note.map(|note| {
+                if report.released {
+                    note
+                } else {
+                    format!("{held}: {note}")
+                }
+            }));
         }
         self.source = None;
         self.polling = false;
@@ -830,6 +1101,7 @@ impl TerminalPane {
             attention: TerminalAttention::default(),
             x11: None,
             environment_notes: Vec::new(),
+            serial: None,
         }
     }
 
@@ -928,6 +1200,74 @@ impl TerminalPane {
         &self.focus
     }
 
+    /// What this pane remembers about its serial line, when it is one (R21).
+    ///
+    /// The window reads the state through the strip it draws itself; this is what a
+    /// test and the capture probe ask for the same facts.
+    #[cfg(test)]
+    #[must_use]
+    pub fn serial(&self) -> Option<&SerialPane> {
+        self.serial.as_ref()
+    }
+
+    /// Whether this pane is a serial session.
+    #[cfg(any(test, feature = "ui-capture"))]
+    #[must_use]
+    pub fn is_serial(&self) -> bool {
+        self.serial.is_some()
+    }
+
+    /// Chooses what the Return key sends, from the next send onwards.
+    pub fn set_serial_format(&mut self, format: NewlineFormat, cx: &mut Context<Self>) {
+        if let Some(serial) = self.serial.as_mut()
+            && serial.format() != format
+        {
+            serial.set_format(format);
+            cx.notify();
+        }
+    }
+
+    /// Turns the local echo on or off.
+    pub fn set_serial_echo(&mut self, echo: bool, cx: &mut Context<Self>) {
+        if let Some(serial) = self.serial.as_mut()
+            && serial.echo() != echo
+        {
+            serial.set_echo(echo);
+            cx.notify();
+        }
+    }
+
+    /// Asks the system for the serial port list again.
+    ///
+    /// It is the refresh control whole job: the answer replaces the one on screen
+    /// whether it was read or not, so a device that was just plugged in appears and a
+    /// device service that came back starts being readable again.
+    pub fn refresh_serial_ports(&mut self, cx: &mut Context<Self>) {
+        if let Some(serial) = self.serial.as_mut() {
+            serial.refresh_ports();
+            cx.notify();
+        }
+    }
+
+    /// Puts a port list in front of the pane without asking the system.
+    ///
+    /// The tests use it to drive the situations a machine cannot be made to produce on
+    /// demand - a list that could not be read, and an answer with nothing in it - while
+    /// the control above stays the only path the application uses.
+    #[cfg(test)]
+    pub fn show_serial_ports(&mut self, ports: PortScan, cx: &mut Context<Self>) {
+        if let Some(serial) = self.serial.as_mut() {
+            serial.show_ports(ports);
+            cx.notify();
+        }
+    }
+
+    /// The one line this pane says about its serial line, when it says one.
+    #[cfg(test)]
+    #[must_use]
+    pub fn serial_note(&self) -> Option<&str> {
+        self.serial.as_ref().and_then(SerialPane::note)
+    }
     /// Increases or decreases the font size by one step.
     pub fn step_font_size(&mut self, larger: bool, cx: &mut Context<Self>) {
         let size = step_font_size(self.font_size, larger);
@@ -990,6 +1330,30 @@ impl TerminalPane {
             return false;
         };
         let events = source.drain();
+        // What the line itself reported - a refused send, a frame the driver cut short,
+        // bytes it dropped - is taken even when no state event came with it: it is news
+        // about the device, and the pane is where a person reads it.
+        let line = match self.source.as_mut() {
+            Some(PaneSource::Serial(link)) => {
+                let mut said = None;
+                for note in [
+                    link.take_send_problem(),
+                    link.take_incomplete(),
+                    link.take_loss(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    said = Some(note);
+                }
+                said
+            }
+            _ => None,
+        };
+        if let (Some(note), Some(serial)) = (line, self.serial.as_mut()) {
+            serial.say(note);
+            cx.notify();
+        }
         if events.is_empty() {
             return self.state.accepts_input();
         }
@@ -1074,6 +1438,54 @@ impl TerminalPane {
     #[must_use]
     pub fn pending_attention_for_test(&self) -> TerminalAttention {
         self.attention
+    }
+
+    /// Sends bytes the user produced: typed text, a key, a paste, a saved command.
+    ///
+    /// Two rules of a serial session live here, and both are about the user half of the
+    /// line only (R21):
+    ///
+    /// * the chosen line ending is written for every break, so Return sends what the
+    ///   device expects;
+    /// * the local echo shows what was sent in this pane, because a device that does not
+    ///   echo would otherwise leave the user typing blind.
+    ///
+    /// What the device returns is never passed through either rule: it takes `write`
+    /// straight into the grid, so the transcript cannot gain a break the wire never
+    /// carried. The echo is drawn from this path alone, which is what keeps an echoed
+    /// byte from being read as a byte the device sent back - the pane only shows both
+    /// when both really happened, which is the case a device that also echoes produces.
+    fn write_user(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        let Some(serial) = self.serial.as_ref() else {
+            self.write(bytes, cx);
+            return;
+        };
+        let format = serial.format();
+        let echo = serial.echo();
+        let outgoing = format.apply(bytes);
+        if !self.state.accepts_input() || outgoing.is_empty() {
+            return;
+        }
+        if echo {
+            self.echo(&format.echo(&outgoing), cx);
+        }
+        self.write(&outgoing, cx);
+    }
+
+    /// Shows a copy of what was just sent, as the local echo.
+    ///
+    /// The bytes go into the same grid the device writes into, because that is what a
+    /// user reads; what keeps them from being mistaken for device output is that this is
+    /// the only path that draws them, and it is called from the send path alone.
+    fn echo(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let was_alternate = self.alternate_screen();
+        let effects = self.core.feed(bytes);
+        self.apply_effects(effects, cx);
+        self.recount_after_output(was_alternate);
+        cx.notify();
     }
 
     fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -1210,7 +1622,7 @@ impl TerminalPane {
         if let Some(key) = Key::from_name(&keystroke.key)
             && let Some(bytes) = encode_key(key, modifiers, self.core.mode())
         {
-            self.write(&bytes, cx);
+            self.write_user(&bytes, cx);
             // The key was consumed as a terminal key, so the text-input path must not
             // run for it as well: Return would otherwise be sent twice.
             cx.stop_propagation();
@@ -1220,7 +1632,7 @@ impl TerminalPane {
 
     /// Sends text to the program as if it had been typed.
     pub fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.write(text.as_bytes(), cx);
+        self.write_user(text.as_bytes(), cx);
     }
 
     /// Takes the shortcuts in force, so the toolbar describes the keys the window
@@ -1286,6 +1698,10 @@ impl TerminalPane {
         match self.origin {
             PaneOrigin::Local(_) => self.write(&[0x16], cx),
             PaneOrigin::Remote { .. } => cx.emit(PaneRequest::PasteImage(image)),
+            // A serial device has no clipboard to read and no channel to upload over, so
+            // an image pasted here goes nowhere and is not claimed to have gone
+            // anywhere (R21: no file capability for a serial session).
+            PaneOrigin::Serial { .. } => {}
         }
     }
 
@@ -1312,6 +1728,9 @@ impl TerminalPane {
                 self.type_text(&text, cx);
             }
             PaneOrigin::Remote { .. } => cx.emit(PaneRequest::UploadFiles(paths.to_vec())),
+            // A serial port transfers bytes, not files: a dropped file has nowhere to
+            // be uploaded to and no shell to receive its path, so nothing is written.
+            PaneOrigin::Serial { .. } => {}
         }
     }
 
@@ -1476,14 +1895,14 @@ impl TerminalPane {
         if !bytes.ends_with(b"\r") {
             bytes.push(b'\r');
         }
-        self.write(&bytes, cx);
+        self.write_user(&bytes, cx);
         debug_assert_eq!(self.core.command_blocks(), before);
         cx.notify();
     }
 
     fn write_paste(&mut self, text: &str, cx: &mut Context<Self>) {
         let bytes = encode_paste(text, self.core.mode());
-        self.write(&bytes, cx);
+        self.write_user(&bytes, cx);
     }
 
     /// Types a saved command, and submits it when `execute` says so.
@@ -1495,7 +1914,7 @@ impl TerminalPane {
         if execute {
             bytes.push(b'\r');
         }
-        self.write(&bytes, cx);
+        self.write_user(&bytes, cx);
     }
 
     fn alternate_screen(&self) -> bool {
@@ -2236,6 +2655,144 @@ impl TerminalPane {
         *self.session_slot.borrow_mut() = Some((left, right));
     }
 
+    /// The serial line own row above the bar (R21).
+    ///
+    /// It names the device and the settings it was opened with, carries the two send
+    /// habits, and - while the session is not live - says why, what the port list holds
+    /// and offers the refresh. Everything it states comes from what really happened: a
+    /// list that could not be read is never drawn as "no ports", and a saved device that
+    /// is absent is named as absent rather than quietly replaced by whatever else is
+    /// attached.
+    fn serial_strip(&self, metrics: Metrics, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let serial = self.serial.as_ref()?;
+        let strings = self.locale.strings();
+        let live = self.state.accepts_input();
+        let muted = theme::swatch(shell_palette::TEXT_MUTED);
+        let echo = if serial.echo() {
+            strings.serial_echo_on
+        } else {
+            strings.serial_echo_off
+        };
+        let row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .pl(metrics.scale(spacing::BASE - 2.0))
+            .pr(metrics.scale(spacing::HAIRLINE))
+            .text_size(metrics.caption_size())
+            .text_color(muted)
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(monospace_family())
+                    .debug_selector(|| "serial.device".to_owned())
+                    .child(SharedString::from(format!(
+                        "{} \u{00B7} {}",
+                        serial.device(),
+                        serial.settings()
+                    ))),
+            )
+            .child(div().flex_none().child(SharedString::from("|")))
+            .child(
+                div()
+                    .id("serial.echo")
+                    .flex_none()
+                    .px(metrics.scale(spacing::HAIRLINE))
+                    .rounded(px(radius::SMALL))
+                    .debug_selector(|| "serial.echo".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(format!(
+                        "{}: {echo}",
+                        strings.serial_echo
+                    ))))
+                    .child(SharedString::from(format!(
+                        "{} {echo}",
+                        strings.serial_echo
+                    )))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        let next = this.serial.as_ref().is_none_or(|serial| !serial.echo());
+                        this.set_serial_echo(next, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("serial.newline")
+                    .flex_none()
+                    .px(metrics.scale(spacing::HAIRLINE))
+                    .rounded(px(radius::SMALL))
+                    .debug_selector(|| "serial.newline".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(
+                        strings.serial_newline,
+                    )))
+                    .child(SharedString::from(format!(
+                        "{} {}",
+                        strings.serial_newline,
+                        serial.format().label()
+                    )))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        let Some(current) = this.serial.as_ref().map(SerialPane::format) else {
+                            return;
+                        };
+                        // The ladder is the whole catalogue in one order, so pressing the
+                        // control always reaches every choice and ends where it started.
+                        let all = NewlineFormat::ALL;
+                        let index = all
+                            .iter()
+                            .position(|format| *format == current)
+                            .unwrap_or(0);
+                        let next = all[(index + 1) % all.len()];
+                        this.set_serial_format(next, cx);
+                    })),
+            )
+            .when(!live, |row| {
+                row.child(
+                    div()
+                        .id("serial.ports.refresh")
+                        .flex_none()
+                        .px(metrics.scale(spacing::HAIRLINE))
+                        .rounded(px(radius::SMALL))
+                        .debug_selector(|| "serial.ports.refresh".to_owned())
+                        .tooltip(components::tooltip(SharedString::from(
+                            strings.serial_ports_refresh,
+                        )))
+                        .child(SharedString::from(strings.serial_ports_refresh))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.refresh_serial_ports(cx);
+                        })),
+                )
+            })
+            .when_some(serial.note().map(str::to_owned), |row, note| {
+                // The whole sentence is in the tooltip: this row is one line, and a
+                // reason the user cannot finish reading is not a reason.
+                row.child(
+                    div()
+                        .id("serial.note.text")
+                        .truncate()
+                        .debug_selector(|| "serial.note".to_owned())
+                        .tooltip(components::tooltip(SharedString::from(note.clone())))
+                        .child(SharedString::from(note)),
+                )
+            })
+            .when(!live, |row| {
+                row.child(
+                    div()
+                        .truncate()
+                        .debug_selector(|| "serial.ports".to_owned())
+                        .child(SharedString::from(ports_line(serial, self.locale))),
+                )
+            });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .debug_selector(|| "serial.strip".to_owned())
+                .bg(theme::swatch(shell_palette::CANVAS))
+                .border_t_1()
+                .border_color(theme::faded(theme::swatch(shell_palette::BORDER), 0.8))
+                .child(row),
+        )
+    }
     fn bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let slot = self.session_slot.borrow_mut().take();
         let (slot_left, slot_right) = match slot {
@@ -3737,6 +4294,13 @@ impl Render for TerminalPane {
                     .bg(color_of(palette::BACKGROUND))
                     .child(self.viewport(window, cx)),
             )
+            // A serial line states itself above the bar: its device, its settings and
+            // the two send habits are what a person changes while the session runs, and
+            // a port that would not open says why here instead of drawing a terminal
+            // that is not connected (R21).
+            .when_some(self.serial_strip(metrics, cx), |pane, strip| {
+                pane.child(strip)
+            })
             .child(self.bar(metrics, cx))
             .when(show_blocks, |column| {
                 column.child(self.block_overlay(metrics, cx))
@@ -3747,6 +4311,45 @@ impl Render for TerminalPane {
     }
 }
 
+/// One line about the serial port list, in the words the situation needs (R21).
+///
+/// Three situations are kept apart on purpose: a list that could not be read, an
+/// answer with no ports in it, and a list that simply does not hold the saved device.
+/// They have different next steps, and drawing them as one sentence would send a user
+/// to plug in a cable when the device service is what needs looking at - or would make
+/// a device the record names look attached because something else is.
+pub(crate) fn ports_line(serial: &SerialPane, locale: Locale) -> String {
+    let strings = locale.strings();
+    let ports = serial.ports();
+    match ports {
+        // Nothing is claimed before the system has been asked.
+        PortScan::NotAsked => String::new(),
+        PortScan::Failed(reason) => {
+            format!("{}: {reason}", strings.serial_ports_failed)
+        }
+        PortScan::Ready(_) if ports.is_empty_machine() => {
+            format!(
+                "{} - {}",
+                strings.serial_ports_empty, strings.serial_ports_hint
+            )
+        }
+        PortScan::Ready(_) => {
+            let shown = ports.labels().join(", ");
+            let mut line = format!("{}: {shown}", strings.serial_ports_attached);
+            // The saved device is matched by its exact name, never by resemblance: a
+            // COM3 that is gone is not satisfied by a COM30 that is present.
+            if crate::app::serial::DeviceChoice::of(ports, serial.device())
+                == crate::app::serial::DeviceChoice::Missing
+            {
+                line.push_str(" - ");
+                line.push_str(strings.serial_ports_missing);
+                line.push_str(", ");
+                line.push_str(strings.serial_ports_hint);
+            }
+            line
+        }
+    }
+}
 fn block_status_label(status: BlockStatus, strings: &crate::app::copy::Strings) -> String {
     match status {
         BlockStatus::Running => strings.terminal_block_running.to_owned(),

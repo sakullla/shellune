@@ -66,7 +66,7 @@ pub use config::{
     COMMON_BAUD_RATES, DataBits, FlowControl, MAX_BAUD_RATE, Parity, SerialConfig, StopBits,
 };
 pub use error::{RawCodeKind, RawError, SerialCause, SerialError};
-pub use io::{PortFault, PortIo};
+pub use io::{PortFault, PortIo, PortNotice};
 pub use port::{PortInfo, list_ports};
 pub use session::{
     CloseOutcome, DEFAULT_CLOSE_TIMEOUT, DEFAULT_PENDING_RX_BYTES, DEFAULT_QUEUED_BYTES,

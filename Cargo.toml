@@ -16,7 +16,9 @@ test-support = ["dep:libc"]
 # Builds the hidden-window capture probe in src/app/capture.rs (R1, R11). It is off
 # by default: a normal build, let alone a release artifact, contains no capture entry,
 # no scenario fixture and no PrintWindow call.
-ui-capture = ["dep:serde_json"]
+# The probe also builds the serial crate in-memory port double: a serial shot has no
+# device behind it, and a fixture port is the only way to show a port list without one.
+ui-capture = ["dep:serde_json", "shellune-serial/test-support"]
 
 [[bin]]
 name = "shellune-flood"
@@ -36,6 +38,10 @@ shellune-terminal = { path = "crates/terminal" }
 # one: a build without the native sources still compiles, and the pane reports the
 # reason instead of offering a connection that cannot open.
 shellune-desktop = { path = "crates/desktop" }
+# The serial ports a serial terminal holds open (R17, R21). The tests drive the same
+# session over an in-memory port; that half is behind the crate's test-support
+# feature and stays in the dev-dependencies below.
+shellune-serial = { path = "crates/serial" }
 # A rendered frame is handed to GPUI as an image, which is the only way a window
 # draws a framebuffer pixel by pixel. The version is the one GPUI itself uses, so
 # there is one image crate in the graph.

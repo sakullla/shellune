@@ -168,6 +168,17 @@ impl PortIo for UnixPort {
             libc::write(self.wake_write, byte.as_ptr().cast(), 1);
         }
     }
+
+    /// No notice: termios and `poll` keep no receive-overrun counter.
+    ///
+    /// A Unix serial device reports a framing or parity error as the byte that did
+    /// arrive, and a byte the driver dropped simply never appears; nothing in the
+    /// portable interface says how many were lost. This backend therefore takes the
+    /// trait's default and the session states no loss, rather than inventing one. The
+    /// Windows backend can ask `ClearCommError` and does.
+    fn take_notice(&self) -> Option<crate::io::PortNotice> {
+        None
+    }
 }
 
 impl Drop for UnixPort {

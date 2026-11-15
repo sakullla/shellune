@@ -37,6 +37,8 @@ pub struct FakeSpec {
     pub read_failure: Option<crate::SerialError>,
     /// Bytes the fake has already received, as if the device had sent them.
     pub scripted: Vec<Vec<u8>>,
+    /// A receive loss the fake reports once, as a driver that overran does.
+    pub notice: Option<crate::io::PortNotice>,
 }
 
 impl FakeSpec {
@@ -87,6 +89,13 @@ impl FakeSpec {
         self.scripted = chunks;
         self
     }
+
+    /// Reports a receive loss once, as a driver whose buffer overran does.
+    #[must_use]
+    pub fn with_notice(mut self, notice: crate::io::PortNotice) -> Self {
+        self.notice = Some(notice);
+        self
+    }
 }
 
 /// One end of an in-memory serial pair.
@@ -99,6 +108,7 @@ pub struct FakePort {
     written: Mutex<Vec<u8>>,
     interrupts: AtomicUsize,
     writes: AtomicUsize,
+    notice: Mutex<Option<crate::io::PortNotice>>,
     released: AtomicBool,
     forced: AtomicBool,
     hold: Mutex<()>,
@@ -116,6 +126,7 @@ impl FakePort {
             written: Mutex::new(Vec::new()),
             interrupts: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
+            notice: Mutex::new(spec.notice.clone()),
             released: AtomicBool::new(false),
             forced: AtomicBool::new(false),
             hold: Mutex::new(()),
@@ -246,6 +257,10 @@ impl PortIo for FakePort {
 
     fn release(&self) {
         self.released.store(true, Ordering::SeqCst);
+    }
+
+    fn take_notice(&self) -> Option<crate::io::PortNotice> {
+        lock(&self.notice).take()
     }
 }
 

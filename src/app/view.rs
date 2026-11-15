@@ -1231,6 +1231,72 @@ impl ShelluneView {
         id
     }
 
+    /// Puts a display-only serial session on screen (R21).
+    ///
+    /// The same pane the application draws for a real port, with nothing behind it: no
+    /// device is opened, and the state the caller names is the state the shot shows. What
+    /// it proves is what the interface looks like in that state; what it cannot prove is
+    /// that any device ever behaved that way, which the scenario says in its own words.
+    #[cfg(feature = "ui-capture")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_capture_serial_session(
+        &mut self,
+        name: &str,
+        device: &str,
+        settings: &str,
+        state: PaneState,
+        ports: crate::app::serial::PortScan,
+        note: Option<String>,
+        content: &[u8],
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> SessionId {
+        let host = HostId::new();
+        let session = self.workspace.register_session_not_started(
+            SessionKind::Serial { host },
+            name,
+            shellune_core::PaneTarget::serial(host),
+        );
+        let id = session.id();
+        let tag = session.tag();
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let local_echo = true;
+        let pane = cx.new(|pane_cx| {
+            TerminalPane::serial_without_device(
+                device,
+                settings,
+                local_echo,
+                state.clone(),
+                ports,
+                note,
+                content,
+                tag,
+                grid,
+                font_size,
+                locale,
+                pane_cx,
+            )
+        });
+        match state {
+            PaneState::Live => {
+                self.workspace.session_connected(id);
+                self.workspace.clear_session_failure();
+            }
+            other => {
+                if let Some(failure) = other.failure() {
+                    self.workspace.session_failed(id, failure);
+                }
+            }
+        }
+        if let Some(window) = window {
+            let handle = pane.read(cx).focus_handle().clone();
+            window.focus(&handle);
+        }
+        self.push_pane(tag, pane, cx);
+        id
+    }
     /// Puts a display-only session of a saved host on screen (R2).
     ///
     /// The same pane the application draws for a live connection, with nothing behind
@@ -3564,6 +3630,169 @@ impl ShelluneView {
         self.attach_desktop(tag, pane, cx);
     }
 
+    /// Starts a waiting serial pane: one session record, one device (R18, R21).
+    ///
+    /// Nothing is opened until this runs, which is what keeps a restored layout and a
+    /// placed pane from seizing a port on its own. The record is used exactly as it was
+    /// saved: the device it names is the device that is opened, and a port that is not
+    /// attached is reported as missing instead of being replaced by a similar one.
+    pub(super) fn open_serial_leaf(
+        &mut self,
+        pane: shellune_core::PaneId,
+        host: HostId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.book.connection(host) else {
+            cx.notify();
+            return;
+        };
+        self.workspace.arm_adopt(pane);
+        let session = self.workspace.register_session_not_started(
+            SessionKind::Serial { host },
+            record.name(),
+            shellune_core::PaneTarget::serial(host),
+        );
+        self.start_serial_session(session.id(), cx);
+    }
+
+    /// Opens the saved serial device of one session (R21).
+    ///
+    /// A device that will not open still gets a pane: it names the device, the reason
+    /// the platform gave, the settings that were asked for and what is really attached,
+    /// and its tab keeps the reconnect entry. What it never does is claim to be
+    /// connected - the session record states the failure, and the pane is built in the
+    /// failed state rather than looking live with nothing behind it.
+    pub(super) fn start_serial_session(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let record = self
+            .workspace
+            .session(session)
+            .and_then(|session| match session.kind() {
+                SessionKind::Serial { host } => self.book.connection(*host),
+                _ => None,
+            });
+        let Some(record) = record else {
+            let reason = self.strings().session_reconnect_missing_host.to_owned();
+            self.refuse_serial(session, reason, cx);
+            return;
+        };
+        let Some(target) = crate::app::serial::SerialTarget::of_record(&record) else {
+            let reason = self.strings().session_reconnect_missing_host.to_owned();
+            self.refuse_serial(session, reason, cx);
+            return;
+        };
+        // The record says the attempt is being made before the port is touched, so a
+        // tab never shows an idle session while a device is being opened.
+        self.workspace.session_starting(session);
+        let tag = self
+            .workspace
+            .session(session)
+            .map_or(EventTag::new(session, 0), shellune_core::Session::tag);
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let pane = cx.new(|pane_cx| {
+            TerminalPane::start_serial(&target, tag, grid, font_size, locale, pane_cx)
+        });
+        let state = pane.read(cx).state().clone();
+        match state.failure() {
+            Some(failure) => {
+                self.workspace.session_failed(session, failure);
+            }
+            None => {
+                self.workspace.session_connected(session);
+                self.workspace.clear_session_failure();
+            }
+        }
+        self.push_pane(tag, pane, cx);
+        self.checkpoint_layout();
+    }
+
+    /// Records that a serial session cannot be started at all, and why.
+    fn refuse_serial(&mut self, session: SessionId, reason: String, cx: &mut Context<Self>) {
+        // Another attempt cannot bring back a connection record that is gone, so the
+        // session stops offering one instead of looping (R12).
+        self.workspace
+            .session_failed(session, SessionFailure::ReconnectUnavailable { reason });
+        cx.notify();
+    }
+
+    /// Opens a saved serial record through the real start path, for the tests (R21).
+    ///
+    /// The record is used as it is instead of being looked up in the host book: the
+    /// point is the start path, and the store has its own tests.
+    #[cfg(test)]
+    pub fn start_serial_with_record_for_test(
+        &mut self,
+        record: &ConnectionRecord,
+        cx: &mut Context<Self>,
+    ) -> SessionId {
+        let target = crate::app::serial::SerialTarget::of_record(record)
+            .expect("the record is a serial connection");
+        let session = self.workspace.register_session_not_started(
+            SessionKind::Serial { host: record.id() },
+            record.name(),
+            shellune_core::PaneTarget::serial(record.id()),
+        );
+        self.workspace.session_starting(session.id());
+        let tag = session.tag();
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let pane = cx.new(|pane_cx| {
+            TerminalPane::start_serial(&target, tag, grid, font_size, locale, pane_cx)
+        });
+        let state = pane.read(cx).state().clone();
+        match state.failure() {
+            Some(failure) => {
+                self.workspace.session_failed(session.id(), failure);
+            }
+            None => {
+                self.workspace.session_connected(session.id());
+                self.workspace.clear_session_failure();
+            }
+        }
+        self.push_pane(tag, pane, cx);
+        session.id()
+    }
+
+    /// Mounts a serial session on an already open link, so the pane rules can be
+    /// driven on a machine with no serial device (R21).
+    ///
+    /// It goes through the same registration, record and placement the real start
+    /// uses; only the link is the in-memory one, which is what keeps the test from
+    /// proving a path the application does not take.
+    #[cfg(test)]
+    pub fn attach_scripted_serial_for_test(
+        &mut self,
+        record: &ConnectionRecord,
+        link: crate::app::serial::SerialLink,
+        device: &str,
+        settings: &str,
+        local_echo: bool,
+        cx: &mut Context<Self>,
+    ) -> SessionId {
+        let session = self.workspace.register_session_not_started(
+            SessionKind::Serial { host: record.id() },
+            record.name(),
+            shellune_core::PaneTarget::serial(record.id()),
+        );
+        self.workspace.session_starting(session.id());
+        let tag = session.tag();
+        let grid = GridSize::initial();
+        let font_size = self.workspace.local_font_size();
+        let locale = self.workspace.locale();
+        let device = device.to_owned();
+        let settings = settings.to_owned();
+        let pane = cx.new(|pane_cx| {
+            TerminalPane::start_serial_with(
+                link, &device, &settings, local_echo, tag, grid, font_size, locale, pane_cx,
+            )
+        });
+        self.workspace.session_connected(session.id());
+        self.workspace.clear_session_failure();
+        self.push_pane(tag, pane, cx);
+        session.id()
+    }
     /// Records that a desktop session cannot be started at all, and why.
     fn refuse_desktop(&mut self, session: SessionId, reason: String, cx: &mut Context<Self>) {
         // Another attempt cannot bring back a connection record that is gone, so the
@@ -4773,11 +5002,23 @@ impl ShelluneView {
                 }
                 self.start_desktop_session(id, cx);
             }
-            // A serial attempt still belongs to the session layer that opens its
-            // device; the session keeps the reason it ended until that arrives.
+            // A serial session reconnects in its own tab too (R17, R21): the record, the
+            // tab and its place stay, the port of the previous attempt is released first,
+            // and the new attempt is another generation of the same session. Two things
+            // are deliberately not carried over: the device is the one the *record* names
+            // (never a similar port that happens to be attached now), and the send queue
+            // of the old session is gone with it, so nothing typed into a port that is
+            // gone is written into the next one.
             SessionKind::Serial { .. } => {
-                let reason = self.strings().session_reconnect_not_wired.to_owned();
-                self.refuse_reconnect(id, reason, cx);
+                self.park_focused_form();
+                self.end_session_resources(id, ResourceEnd::Restarted, cx);
+                self.drop_pane(id, cx);
+                if !self.workspace.session_reconnecting(id) {
+                    let reason = self.strings().session_reconnect_missing_host.to_owned();
+                    self.refuse_reconnect(id, reason, cx);
+                    return;
+                }
+                self.start_serial_session(id, cx);
             }
         }
     }

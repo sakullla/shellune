@@ -432,6 +432,28 @@ pub struct Strings {
     pub desktop_zoom_in: &'static str,
     /// Zoom control: one step smaller.
     pub desktop_zoom_out: &'static str,
+    /// Label of the switch that echoes typed characters locally in a serial pane.
+    pub serial_echo: &'static str,
+    /// The local echo is on.
+    pub serial_echo_on: &'static str,
+    /// The local echo is off.
+    pub serial_echo_off: &'static str,
+    /// Label of the control that chooses what the Return key sends.
+    pub serial_newline: &'static str,
+    /// Control that asks the system for the serial ports again.
+    pub serial_ports_refresh: &'static str,
+    /// Headline of a serial port list that could not be read.
+    pub serial_ports_failed: &'static str,
+    /// Headline of an answer that listed no serial ports at all.
+    pub serial_ports_empty: &'static str,
+    /// Headline of a port list that does not hold the saved device.
+    pub serial_ports_missing: &'static str,
+    /// Lead-in of the ports the system did report.
+    pub serial_ports_attached: &'static str,
+    /// What to do about a device that is not attached, in the port list row.
+    pub serial_ports_hint: &'static str,
+    /// Note that a serial session closed while its port was still held.
+    pub serial_still_held: &'static str,
 
     /// Button that opens the file view of a remote session.
     pub files_open: &'static str,
@@ -1251,6 +1273,17 @@ pub static ENGLISH: Strings = Strings {
     desktop_zoom_fit: "Fit",
     desktop_zoom_in: "Larger",
     desktop_zoom_out: "Smaller",
+    serial_echo: "Echo",
+    serial_echo_on: "on",
+    serial_echo_off: "off",
+    serial_newline: "Newline",
+    serial_ports_refresh: "Refresh ports",
+    serial_ports_failed: "The port list could not be read",
+    serial_ports_empty: "This machine reports no serial ports",
+    serial_ports_missing: "The saved device is not attached",
+    serial_ports_attached: "Attached",
+    serial_ports_hint: "Plug the device in, then refresh the list",
+    serial_still_held: "The port is still held by the driver",
     files_open: "Files",
     files_up: "Up",
     files_refresh: "Refresh",
@@ -1746,6 +1779,17 @@ pub static CHINESE: Strings = Strings {
     desktop_zoom_fit: "适应窗口",
     desktop_zoom_in: "放大",
     desktop_zoom_out: "缩小",
+    serial_echo: "本地回显",
+    serial_echo_on: "开",
+    serial_echo_off: "关",
+    serial_newline: "换行",
+    serial_ports_refresh: "刷新串口",
+    serial_ports_failed: "无法读取串口列表",
+    serial_ports_empty: "本机没有可用的串口",
+    serial_ports_missing: "已保存的设备当前未接入",
+    serial_ports_attached: "已接入",
+    serial_ports_hint: "接入设备后刷新列表",
+    serial_still_held: "端口仍被驱动占用",
     files_open: "文件",
     files_up: "上级",
     files_refresh: "刷新",

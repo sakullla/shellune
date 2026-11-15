@@ -174,6 +174,18 @@ pub enum SessionFailure {
         /// What the transport reported.
         reason: String,
     },
+    /// A serial device stopped being usable while its session was open (R21).
+    ///
+    /// Kept apart from [Self::RemoteIoFailed] because there is no host and no SSH
+    /// channel: the port is a device on this machine, it went away or failed, and the
+    /// next step is to reconnect the device rather than to look at a network. The
+    /// reason the platform gave is kept beside it.
+    SerialDeviceFailed {
+        /// The port the session held, as the platform spells it.
+        port: String,
+        /// What the platform reported about the running device.
+        reason: String,
+    },
     /// The local shell process exited.
     ProcessExited {
         /// Exit code, when the platform reported one.
@@ -256,6 +268,9 @@ impl std::fmt::Display for SessionFailure {
                 formatter.write_str("the server rejected the credentials")
             }
             Self::ConnectionLost => formatter.write_str("the connection was lost"),
+            Self::SerialDeviceFailed { port, reason } => {
+                write!(formatter, "the serial device {port} stopped: {reason}")
+            }
             Self::ProcessExited { code } => match code {
                 Some(code) => write!(formatter, "the shell exited with code {code}"),
                 None => formatter.write_str("the shell exited"),

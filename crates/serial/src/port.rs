@@ -29,6 +29,23 @@ impl PortInfo {
         }
     }
 
+    /// A listed port built by hand, for a test or a capture fixture.
+    ///
+    /// Nothing in the application builds a port: the list comes from the system, and a
+    /// hand-made entry could claim a device that is not there. It exists behind
+    /// `test-support` so a test can drive what a list *containing* a port does on a
+    /// machine whose list is empty - which is the situation of this repository's
+    /// development machine.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn sample(name: &str, path: &str, description: Option<&str>) -> Self {
+        Self {
+            name: name.to_string(),
+            path: path.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
     /// The short name the user sees, such as `COM3` or `ttyUSB0`.
     #[must_use]
     pub fn name(&self) -> &str {

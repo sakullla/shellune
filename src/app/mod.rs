@@ -34,6 +34,8 @@ pub mod nav;
 pub mod palette;
 pub mod product;
 pub mod remote;
+/// The serial sessions a saved device opens, and the port list behind them (R17, R21).
+pub mod serial;
 pub mod snippets;
 pub mod terminal;
 pub mod text_field;

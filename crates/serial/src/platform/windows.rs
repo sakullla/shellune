@@ -25,9 +25,9 @@ use std::ptr;
 use std::sync::Arc;
 
 use windows_sys::Win32::Devices::Communication::{
-    COMMTIMEOUTS, DCB, EVENPARITY, GetCommState, MARKPARITY, NOPARITY, ODDPARITY, ONESTOPBIT,
-    PURGE_RXCLEAR, PURGE_TXCLEAR, PurgeComm, SPACEPARITY, SetCommState, SetCommTimeouts, SetupComm,
-    TWOSTOPBITS,
+    CE_OVERRUN, CE_RXOVER, COMMTIMEOUTS, COMSTAT, ClearCommError, DCB, EVENPARITY, GetCommState,
+    MARKPARITY, NOPARITY, ODDPARITY, ONESTOPBIT, PURGE_RXCLEAR, PURGE_TXCLEAR, PurgeComm,
+    SPACEPARITY, SetCommState, SetCommTimeouts, SetupComm, TWOSTOPBITS,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED,
@@ -104,6 +104,13 @@ pub(crate) struct WindowsPort {
     write_event: Handle,
     cancel_event: Handle,
     name: String,
+    /// The receive loss the driver reported and the session has not been told yet.
+    ///
+    /// A serial driver drops bytes silently when its buffer overruns; the only place
+    /// it says so is `ClearCommError`, whose error mask is cleared by the very call
+    /// that reads it. The mask is therefore taken right after every read and kept
+    /// until the session asks, so a loss is neither repeated nor lost.
+    overrun: std::sync::Mutex<Option<crate::io::PortNotice>>,
 }
 
 impl WindowsPort {
@@ -149,13 +156,19 @@ impl PortIo for WindowsPort {
             )
         };
         if started != 0 {
+            // A driver that completes an operation immediately can still have dropped
+            // bytes while the last read was being processed, so the error mask is
+            // asked for on every completed read - not only on the waiting path.
+            self.note_driver_errors();
             return Ok(transferred as usize);
         }
         let code = last_error();
         if code != ERROR_IO_PENDING {
             return Err(self.fault(code));
         }
-        self.wait(&overlapped, self.read_event.0, &mut transferred)
+        let read = self.wait(&overlapped, self.read_event.0, &mut transferred);
+        self.note_driver_errors();
+        read
     }
 
     fn write(&self, buf: &[u8]) -> Result<usize, PortFault> {
@@ -202,6 +215,14 @@ impl PortIo for WindowsPort {
             SetEvent(self.cancel_event.0);
         }
     }
+
+    /// The receive loss the driver reported, for the session to state.
+    fn take_notice(&self) -> Option<crate::io::PortNotice> {
+        self.overrun
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 impl WindowsPort {
@@ -225,22 +246,61 @@ impl WindowsPort {
             }
             return Err(self.fault(last_error()));
         }
+        // One branch for every outcome that is not "the operation completed": the
+        // cancel event, and a wait that failed outright. Both leave the operation in
+        // an unknown state, and in both the buffer the caller handed in is still the
+        // one the driver may write into. It is therefore cancelled and reaped before
+        // this function returns, so the caller's buffer cannot leave scope while the
+        // driver still owns the transfer - the same order the closing path uses.
+        let code = last_error();
+        // SAFETY: the overlapped structure belongs to this call and the handle is
+        // owned by this value.
+        unsafe {
+            CancelIoEx(self.handle.0, overlapped);
+            let mut reaped = 0u32;
+            GetOverlappedResult(self.handle.0, overlapped, &mut reaped, 1);
+        }
         if index == WAIT_OBJECT_0 + 1 {
-            // The session gave up. The operation is cancelled and then reaped, because a
-            // buffer must not leave scope while the driver may still write into it.
-            // SAFETY: the overlapped structure belongs to this call and the handle is
-            // owned by this value.
-            unsafe {
-                CancelIoEx(self.handle.0, overlapped);
-                let mut reaped = 0u32;
-                GetOverlappedResult(self.handle.0, overlapped, &mut reaped, 1);
-            }
             return Err(PortFault::Interrupted);
         }
         Err(PortFault::Failed(
-            self.failure(Stage::Io, last_error())
+            self.failure(Stage::Io, code)
                 .with_detail("waiting for the device did not succeed"),
         ))
+    }
+
+    /// Takes whatever `ClearCommError` says the driver dropped since the last read.
+    ///
+    /// The call is the only way to learn about a receive overrun, and it clears the
+    /// mask as it reports it, which is exactly the once-only delivery the session
+    /// wants. Its own failure is ignored: a port that cannot answer this question is
+    /// still a working port, and inventing a loss would be worse than not knowing.
+    fn note_driver_errors(&self) {
+        let mut errors = 0u32;
+        let mut status: COMSTAT = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is owned by this value, and both out-parameters are valid
+        // destinations of their own type for the duration of the call.
+        let asked = unsafe { ClearCommError(self.handle.0, &mut errors, &mut status) };
+        if asked == 0 {
+            return;
+        }
+        // Only the receive side is reported: a frame or parity error is the line
+        // condition of a byte that did arrive, which the bytes themselves already
+        // show, while these two mean bytes that arrived and were then dropped.
+        let overrun = errors & (CE_RXOVER | CE_OVERRUN);
+        if overrun == 0 {
+            return;
+        }
+        let notice = crate::io::PortNotice::overrun(
+            Some(overrun as i32),
+            None,
+            "the driver's receive buffer overran and dropped bytes",
+        );
+        let mut held = self
+            .overrun
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *held = Some(notice);
     }
 
     /// Turns a system code into the fault a session understands.
@@ -299,6 +359,7 @@ pub(crate) fn open(port: &str, config: &SerialConfig) -> Result<Arc<dyn PortIo>,
         write_event,
         cancel_event,
         name: port.to_string(),
+        overrun: std::sync::Mutex::new(None),
     }))
 }
 

@@ -10,6 +10,7 @@
 //!   against the numbers written down in `docs/design/02-shell-and-design-system.md`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui::prelude::*;
@@ -23,6 +24,7 @@ use shellune_core::{
     SessionId, SessionKind, SessionState, SplitAxis, TabAccent, TerminalMode, Transfer,
     TransferDirection, WorkspaceSnapshot, WorkspaceTab, X11Forwarding,
 };
+use shellune_serial::testing::FakePort;
 use shellune_ssh::X11Status;
 use shellune_storage::{
     ForwardStore, HostBook, HostEdit, HostKey, HostStore, KeymapPreferences, TrustStore,
@@ -43,6 +45,7 @@ use crate::app::layout::Direction;
 use crate::app::nav::{Destination, Platform};
 use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
+use crate::app::serial::{DeviceChoice, PortScan, SerialLink};
 use crate::app::terminal::{
     PaneState, SearchNote, SnippetOffer, SourceEvent, TerminalAttention, TerminalPane,
     TerminalShortcuts,
@@ -23050,5 +23053,443 @@ async fn a_desktop_that_failed_while_signing_in_says_which_step_it_stopped_on(
     assert!(
         cx.debug_bounds("desktop.status").is_some(),
         "the ended session keeps its card, and the card names the step"
+    );
+}
+
+// ---------------------------------------------------------------- serial (R17, R21)
+
+/// A saved serial connection for the tests.
+fn serial_record(name: &str, device: &str) -> shellune_core::ConnectionRecord {
+    shellune_core::ConnectionRecord::Serial(
+        shellune_core::SerialConfig::new(name, device).expect("a valid serial record"),
+    )
+}
+
+/// One end of an in-memory serial pair, and the session a pane drives over it.
+///
+/// The session is the real one - reader thread, writer thread, bounded queue, close -
+/// over the in-memory port this crate builds for tests. This machine has no serial
+/// device and no virtual pair, so a fake is the only way to move bytes; nothing here is
+/// evidence about a UART, a cable or a driver, and no assertion below is written as if
+/// it were.
+fn scripted_serial() -> (SerialLink, Arc<FakePort>, Arc<FakePort>) {
+    let (device, peer) = shellune_serial::testing::fake_pair();
+    let session = shellune_serial::testing::session_over(
+        Arc::clone(&device),
+        shellune_serial::SerialConfig::default(),
+    );
+    (SerialLink::holding(session), device, peer)
+}
+
+/// Mounts a serial session on a scripted link, through the path the application uses.
+fn mount_scripted_serial(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    name: &str,
+    device: &str,
+    local_echo: bool,
+    link: SerialLink,
+) -> SessionId {
+    let record = serial_record(name, device);
+    let id = cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            view.attach_scripted_serial_for_test(
+                &record,
+                link,
+                device,
+                "115200 8N1, none flow control",
+                local_echo,
+                cx,
+            )
+        })
+    });
+    pump_serial(view, cx, id);
+    id
+}
+
+/// Polls the pane until what was pushed has really arrived.
+///
+/// The session reads and writes on its own threads, so a byte handed to the device and
+/// a byte written to it are both asynchronous: a single poll would assert on the state
+/// of a race rather than on the rule.
+fn pump_serial_until(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    id: SessionId,
+    mut done: impl FnMut(&TerminalPane) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        pump_serial(view, cx, id);
+        let reached = cx.update(|_window, app| {
+            view.read(app)
+                .pane_of(id)
+                .is_some_and(|pane| done(pane.read(app)))
+        });
+        if reached || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Waits for something the session does on its writer thread.
+fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    done()
+}
+
+/// Applies whatever the device has sent since the last poll, the way the poll does.
+fn pump_serial(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: SessionId) {
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            if let Some(pane) = view.pane_of(id).cloned() {
+                pane.update(cx, |pane, cx| {
+                    pane.pump_once(cx);
+                });
+            }
+        });
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn serial_bytes_reach_the_terminal_grid_and_scroll_back(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, device, _peer) = scripted_serial();
+    let id = mount_scripted_serial(&view, cx, "console", "COM3", false, link);
+    // The device sends more than one screen, so scrollback exists at all: what is
+    // measured is the same grid, selection and history a local shell uses. The line
+    // count is well past any window size, so the oldest rows really did scroll off
+    // instead of fitting on the first screen.
+    let mut sent = Vec::new();
+    for line in 0..400 {
+        sent.extend_from_slice(format!("line {line}\r\n").as_bytes());
+    }
+    device.push_from_device(&sent);
+    pump_serial_until(&view, cx, id, |pane| {
+        pane.visible_text()
+            .iter()
+            .any(|row| row.contains("line 399"))
+    });
+    let (text, history, live) = cx.update(|_window, app| {
+        let pane = view.read(app).pane_of(id).expect("the pane is mounted");
+        let pane = pane.read(app);
+        (
+            pane.visible_text(),
+            pane.history_len(),
+            pane.state().accepts_input(),
+        )
+    });
+    assert!(live, "the session is live while the device is open");
+    assert!(
+        text.iter().any(|row| row.contains("line 399")),
+        "the last line the device sent is on the grid: {text:?}"
+    );
+    assert!(
+        history > 0,
+        "the lines that scrolled off are kept, so the view can scroll back"
+    );
+}
+
+#[gpui::test]
+async fn the_newline_choice_changes_what_is_sent_and_never_what_arrives(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, device, _peer) = scripted_serial();
+    let id = mount_scripted_serial(&view, cx, "console", "COM3", false, link);
+
+    // As typed: the bytes go out exactly as the terminal encoded them.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            let pane = view.pane_of(id).expect("the pane is mounted").clone();
+            pane.update(cx, |pane, cx| pane.type_text("at\n", cx));
+        });
+    });
+    assert!(
+        wait_for(|| device.written() == b"at\n"),
+        "nothing is rewritten by default: {:?}",
+        device.written()
+    );
+
+    // CRLF: every break the user sends becomes the pair the device expects.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            let pane = view.pane_of(id).expect("the pane is mounted").clone();
+            pane.update(cx, |pane, cx| {
+                pane.set_serial_format(
+                    crate::app::serial::NewlineFormat::CarriageReturnLineFeed,
+                    cx,
+                );
+                pane.type_text("crlf\r\n", cx);
+            });
+        });
+    });
+    assert!(
+        wait_for(|| device.written() == b"at\ncrlf\r\n"),
+        "a pair is one line break and is rewritten once: {:?}",
+        device.written()
+    );
+
+    // What the device returns is never rewritten, whichever ending is chosen.
+    device.push_from_device(b"device\nsaid\r\nso\r\n");
+    pump_serial_until(&view, cx, id, |pane| {
+        pane.visible_text().iter().any(|row| row.contains("device"))
+    });
+    let text = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .expect("the pane is mounted")
+            .read(app)
+            .visible_text()
+    });
+    assert!(
+        text.iter().any(|row| row.contains("device")),
+        "the bytes the device sent reach the grid: {text:?}"
+    );
+    assert_eq!(
+        device.written(),
+        b"at\ncrlf\r\n",
+        "nothing the device sent was echoed back out"
+    );
+}
+
+#[gpui::test]
+async fn the_local_echo_shows_what_was_typed_and_device_bytes_stay_single(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, device, _peer) = scripted_serial();
+    let id = mount_scripted_serial(&view, cx, "console", "COM3", true, link);
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            let pane = view.pane_of(id).expect("the pane is mounted").clone();
+            pane.update(cx, |pane, cx| pane.type_text("typed", cx));
+        });
+    });
+    cx.run_until_parked();
+    let text = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .expect("the pane is mounted")
+            .read(app)
+            .visible_text()
+    });
+    assert!(
+        text.iter().any(|row| row.contains("typed")),
+        "the echo shows what was typed while the device says nothing: {text:?}"
+    );
+    assert!(
+        wait_for(|| device.written() == b"typed"),
+        "and it was sent once: {:?}",
+        device.written()
+    );
+
+    // A device that answers is not echoed: only the send path draws the local echo, so
+    // a byte from the device appears once and never comes back out on the wire.
+    device.push_from_device(b"answer");
+    pump_serial_until(&view, cx, id, |pane| {
+        pane.visible_text().iter().any(|row| row.contains("answer"))
+    });
+    let text = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .expect("the pane is mounted")
+            .read(app)
+            .visible_text()
+    });
+    let line = text
+        .iter()
+        .find(|row| row.contains("answer"))
+        .expect("the answer is shown");
+    assert_eq!(
+        line.matches("answer").count(),
+        1,
+        "the device text is drawn once, not echoed a second time: {line:?}"
+    );
+    assert_eq!(
+        device.written(),
+        b"typed",
+        "what the device sent is never written back to it"
+    );
+}
+
+#[gpui::test]
+async fn a_device_that_will_not_open_keeps_its_tab_and_states_why(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    // A port name no machine has. Opening it really goes through the system API, so the
+    // reason is the one the system reports - not a sentence a test put there.
+    let record = serial_record("console", "COM999");
+    let id = cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            view.start_serial_with_record_for_test(&record, cx)
+        })
+    });
+    cx.run_until_parked();
+    let (state, note, pane_device) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view.pane_of(id).expect("the pane is kept");
+        let pane = pane.read(app);
+        (
+            view.workspace()
+                .session(id)
+                .map(|session| session.state().clone()),
+            pane.serial_note().map(str::to_owned),
+            pane.serial().map(|serial| serial.device().to_owned()),
+        )
+    });
+    assert!(
+        matches!(state, Some(SessionState::Failed(_))),
+        "a device that never opened is a failed session, never a live one: {state:?}"
+    );
+    let note = note.expect("the reason is stated on the pane");
+    assert!(
+        note.contains("COM999"),
+        "the sentence names the device it is about: {note}"
+    );
+    assert!(
+        note.contains("not found") || note.contains("not exist"),
+        "and it is the cause the system allowed: {note}"
+    );
+    assert!(
+        note.contains("Refresh the port list"),
+        "with the next step the cause points at: {note}"
+    );
+    assert_eq!(
+        pane_device.as_deref(),
+        Some("COM999"),
+        "the pane is about the device the record names, not a similar one"
+    );
+}
+
+#[gpui::test]
+async fn the_port_list_tells_a_failed_read_from_an_empty_machine_and_a_missing_device(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _device, _peer) = scripted_serial();
+    let id = mount_scripted_serial(&view, cx, "console", "COM3", false, link);
+    let wanted_missing = Locale::English.strings().serial_ports_missing;
+    let lines = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view.pane_of(id).expect("the pane is mounted").clone();
+        let mut lines = Vec::new();
+        for scan in [
+            PortScan::Failed("the list could not be read".to_owned()),
+            PortScan::Ready(Vec::new()),
+            PortScan::Ready(vec![shellune_serial::PortInfo::sample(
+                "COM30", "COM30", None,
+            )]),
+        ] {
+            pane.update(app, |pane, cx| pane.show_serial_ports(scan, cx));
+            let serial = pane.read(app).serial().expect("a serial pane");
+            lines.push(crate::app::terminal::ports_line(serial, Locale::English));
+        }
+        lines
+    });
+    let strings = Locale::English.strings();
+    assert!(
+        lines[0].contains(strings.serial_ports_failed),
+        "a list that could not be read says so: {lines:?}"
+    );
+    assert!(
+        lines[1].contains(strings.serial_ports_empty)
+            && lines[1].contains(strings.serial_ports_hint),
+        "an answer with no ports says that, and what to do: {lines:?}"
+    );
+    assert!(
+        lines[2].contains("COM30") && lines[2].contains(wanted_missing),
+        "a similar name is listed as present but not as the saved device: {lines:?}"
+    );
+    assert_ne!(
+        lines[0], lines[1],
+        "a failed read and an empty machine are two different sentences"
+    );
+}
+
+#[gpui::test]
+async fn a_similar_port_name_is_never_taken_for_the_saved_device(cx: &mut TestAppContext) {
+    let _ = cx;
+    let attached = PortScan::Ready(vec![shellune_serial::PortInfo::sample(
+        "COM30", "COM30", None,
+    )]);
+    assert_eq!(
+        DeviceChoice::of(&attached, "COM3"),
+        DeviceChoice::Missing,
+        "a COM30 that is plugged in does not stand in for a COM3 that is not"
+    );
+    assert_eq!(
+        DeviceChoice::of(&attached, "com30"),
+        DeviceChoice::Attached,
+        "the same port written in another case is still the same port"
+    );
+}
+
+#[gpui::test]
+async fn closing_a_serial_session_releases_the_port_and_leaves_the_other_one_alone(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (first, first_device, _first_peer) = scripted_serial();
+    let (second, second_device, _second_peer) = scripted_serial();
+    let first_id = mount_scripted_serial(&view, cx, "one", "COM1", false, first);
+    let second_id = mount_scripted_serial(&view, cx, "two", "COM2", false, second);
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.close_session(first_id, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        first_device.is_released(),
+        "the port of the closed session is released"
+    );
+    let (state, open) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (
+            view.workspace()
+                .session(first_id)
+                .map(|session| session.state().clone()),
+            view.open_sessions().contains(&second_id),
+        )
+    });
+    assert_eq!(
+        state,
+        Some(SessionState::Closed),
+        "the closed session says so"
+    );
+    assert!(open, "the other session is still open");
+
+    // The session that was left alone still sends: closing one port does not touch the
+    // worker of another.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            let pane = view
+                .pane_of(second_id)
+                .expect("the pane is mounted")
+                .clone();
+            pane.update(cx, |pane, cx| pane.type_text("still here", cx));
+        });
+    });
+    let typed = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view
+            .pane_of(second_id)
+            .map(|pane| pane.read(app).sent().to_vec());
+        let state = view
+            .workspace()
+            .session(second_id)
+            .map(|session| session.state().clone());
+        let note = view
+            .pane_of(second_id)
+            .and_then(|pane| pane.read(app).serial_note().map(str::to_owned));
+        (pane, state, note)
+    });
+    assert!(
+        wait_for(|| second_device.written() == b"still here"),
+        "the surviving session still sends: {:?} (typed {:?})",
+        second_device.written(),
+        typed
     );
 }

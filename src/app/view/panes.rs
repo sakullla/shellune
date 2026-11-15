@@ -1286,16 +1286,17 @@ impl ShelluneView {
                 self.open_remote_after_park(&host, cx);
             }
             // A desktop pane starts its own protocol worker, one session per pane
-            // (R18, R19). A serial pane still waits for the layer that opens a
-            // device: it stays waiting, and no device handle is opened on a click.
+            // (R18, R19), and a serial pane opens its own device (R21). Neither is
+            // dialled before the user points at it, which is why a restored layout
+            // places these panes as waiting ones.
             PaneTarget::Rdp { host } => {
                 self.open_desktop_leaf(pane, host, shellune_core::ProtocolKind::Rdp, cx);
             }
             PaneTarget::Vnc { host } => {
                 self.open_desktop_leaf(pane, host, shellune_core::ProtocolKind::Vnc, cx);
             }
-            PaneTarget::Serial { .. } => {
-                cx.notify();
+            PaneTarget::Serial { host } => {
+                self.open_serial_leaf(pane, host, cx);
             }
         }
     }

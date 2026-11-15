@@ -160,6 +160,17 @@ pub enum SerialEvent {
     },
     /// The port was released.
     Closed,
+    /// The driver dropped bytes it had already received (R21).
+    ///
+    /// This is the one loss a serial port suffers without any call failing: the
+    /// device kept sending while the driver's buffer was full. It is reported as its
+    /// own event so the session above this crate can say a gap is a gap instead of
+    /// presenting it as a quiet line. Windows reports it; a platform that cannot say
+    /// never produces this event, rather than producing a placeholder.
+    ReceiveOverflow {
+        /// What the driver said, with its own code.
+        notice: crate::io::PortNotice,
+    },
 }
 
 /// What a close achieved.
@@ -685,8 +696,14 @@ fn read_loop(port: &Arc<dyn PortIo>, shared: &Arc<Shared>) {
         if shared.closing.load(Ordering::SeqCst) {
             break;
         }
+        // Asked before the read, so a loss reported while the last read was in
+        // progress is stated with the bytes around it rather than a poll too late.
+        report_overrun(port, shared);
         match port.read(&mut buffer) {
-            Ok(read) if read > 0 => shared.deliver(&buffer[..read]),
+            Ok(read) if read > 0 => {
+                shared.deliver(&buffer[..read]);
+                report_overrun(port, shared);
+            }
             // A port that reports "nothing yet" without a fault is not spinning on a
             // device: yielding here keeps it from burning a core if a driver does that.
             Ok(_) => thread::sleep(Duration::from_millis(1)),
@@ -700,6 +717,17 @@ fn read_loop(port: &Arc<dyn PortIo>, shared: &Arc<Shared>) {
                 break;
             }
         }
+    }
+}
+
+/// States a receive loss the driver reported, if it reported one.
+///
+/// The notice is taken whether or not the session is closing: a loss that happened
+/// before a close is still part of what the session saw, and dropping it would make
+/// the transcript look complete when it is not.
+fn report_overrun(port: &Arc<dyn PortIo>, shared: &Arc<Shared>) {
+    if let Some(notice) = port.take_notice() {
+        shared.push_event(SerialEvent::ReceiveOverflow { notice });
     }
 }
 
@@ -762,4 +790,123 @@ fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> Result<JoinHandle<
 /// and it keeps a panic in one session from poisoning the next.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use crate::config::SerialConfig;
+    use crate::io::PortNotice;
+    use crate::session::{CloseOutcome, SerialEvent, SessionLimits};
+    use crate::testing::{FakeSpec, fake, session_over, session_over_with};
+
+    fn config() -> SerialConfig {
+        SerialConfig::default()
+    }
+
+    /// A close of a session whose queue really did hold frames says how many it
+    /// dropped, and the two numbers are the frames that were queued and their bytes.
+    ///
+    /// The bound this checks is the one R21 and T2 left unasserted: the counts in
+    /// [`CloseOutcome::Closed`] are not decoration, so a queue that is discarded on
+    /// close is a number the caller can show rather than a silence.
+    #[test]
+    fn a_close_discards_the_queued_frames_and_counts_them() {
+        let port = fake("COM7", FakeSpec::new().holding_writes());
+        let mut session = session_over(port.clone(), config());
+        let frame = b"abc";
+        // The first frame goes to the writer's in-flight slot and stalls inside the
+        // driver; the rest stay queued. Waiting for the queue to settle keeps the
+        // assertion on which frames were still waiting out of a race with the thread.
+        for _ in 0..3 {
+            session
+                .send(frame)
+                .expect("the queue takes three small frames");
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.pending_frames() > 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let queued_frames = session.pending_frames();
+        let queued_bytes = session.queued_bytes();
+        assert_eq!(
+            queued_frames, 2,
+            "one frame is in flight and two are still queued"
+        );
+        assert_eq!(
+            queued_bytes,
+            frame.len() * 3,
+            "the byte count covers the frame being written as well as the queue"
+        );
+
+        let outcome = session.close();
+        assert_eq!(
+            outcome,
+            CloseOutcome::Closed {
+                discarded_frames: 2,
+                discarded_bytes: frame.len() * 2,
+            },
+            "the counts are the frames and bytes that were never written"
+        );
+        assert!(port.is_released(), "the port is released after the close");
+
+        let events = session.poll();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SerialEvent::SendIncomplete { sent: 0, requested, .. } if *requested == frame.len()
+            )),
+            "the frame the driver would not take is reported part way, not replayed: {events:?}"
+        );
+        assert!(
+            events.contains(&SerialEvent::Closed),
+            "the release is stated: {events:?}"
+        );
+    }
+
+    /// A receive loss the driver reports becomes an event of its own.
+    ///
+    /// A platform that cannot report one never produces this event, which is the
+    /// difference between "nothing was lost" and "nobody said" - the second is what
+    /// the Unix backend can honestly answer, and it is not turned into the first.
+    #[test]
+    fn a_driver_overrun_is_reported_as_its_own_event() {
+        let notice = PortNotice::overrun(Some(0x0001), None, "the receive buffer overran");
+        let port = fake("COM8", FakeSpec::new().with_notice(notice.clone()));
+        let mut session = session_over_with(
+            port,
+            config(),
+            SessionLimits {
+                close_timeout: Duration::from_millis(200),
+                ..SessionLimits::default()
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen = None;
+        while Instant::now() < deadline {
+            let events = session.poll();
+            if let Some(found) = events
+                .into_iter()
+                .find(|event| matches!(event, SerialEvent::ReceiveOverflow { .. }))
+            {
+                seen = Some(found);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            seen,
+            Some(SerialEvent::ReceiveOverflow { notice }),
+            "the loss the driver reported reaches the session exactly once"
+        );
+        assert!(
+            !session
+                .poll()
+                .iter()
+                .any(|event| matches!(event, SerialEvent::ReceiveOverflow { .. })),
+            "a notice is reported once, not on every poll"
+        );
+        let _ = session.close();
+    }
 }

@@ -36,6 +36,8 @@ use crate::app::copy::Locale;
 use crate::app::hosts::ConnectionChoice;
 use crate::app::keymap::Problem;
 use crate::app::nav::{Destination, Platform};
+use crate::app::serial::PortScan;
+use crate::app::terminal::PaneState;
 use crate::app::theme::{self, Motion, Zoom};
 use crate::app::view::settings::Item;
 use crate::app::workspace::{AttentionKind, SectionState, Workspace};
@@ -225,6 +227,20 @@ fn page(destination: Destination) -> Workspace {
 /// The shell a terminal shot is titled after. Nothing is started from this name: the
 /// pane it appears on has no process.
 const SHOT_SHELL: &str = "pwsh";
+
+/// What a serial device would have sent, for the shot where the port is open.
+///
+/// The bytes are a boot banner of the kind a console cable shows. They were fed to a
+/// display-only pane: no device sent them, and the shot does not claim one did.
+const SERIAL_TRANSCRIPT: &str = "\x1b[1mU-Boot 2024.01 (Jan 12 2026 - 09:14:02)\x1b[0m\r\n\
+                                DRAM:  512 MiB\r\n\
+                                Loading environment from SPI Flash... OK\r\n\
+                                In:    serial\r\n\
+                                Out:   serial\r\n\
+                                Err:   serial\r\n\
+                                Net:   eth0: ethernet@1c30000\r\n\
+                                Hit any key to stop autoboot:  0\r\n\
+                                => ";
 
 /// The identifiers of the fixture hosts.
 ///
@@ -459,6 +475,70 @@ fn show_disconnected(
         .ok_or_else(|| "the host fixture is empty".to_owned())?;
     let id = view.attach_capture_remote_session(&host, TRANSCRIPT.as_bytes(), Some(window), cx);
     view.capture_end_session(id, SessionFailure::ConnectionLost);
+    Ok(())
+}
+
+/// The serial strip, in the two states a device produces: open, and not open (R21).
+///
+/// Two panes: one whose port is open and carries a transcript, and one whose port did not
+/// open, which names the device, the cause, the settings that were asked for and what the
+/// port list really holds. No device is opened for either of them, so the shot proves what
+/// the interface says in these states and nothing about a port.
+fn show_serial(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let live = view.attach_capture_serial_session(
+        "Console cable",
+        "COM3",
+        "115200 8N1, none flow control",
+        PaneState::Live,
+        PortScan::NotAsked,
+        None,
+        SERIAL_TRANSCRIPT.as_bytes(),
+        Some(window),
+        cx,
+    );
+    if view.pane_of(live).is_none() {
+        return Err("the serial session was recorded without a terminal".to_owned());
+    }
+    let busy = "COM7: port is in use. Close the other program that holds this port, then \
+                open it again.";
+    view.attach_capture_serial_session(
+        "Radio",
+        "COM7",
+        "9600 7E2, XON/XOFF flow control",
+        PaneState::Failed(shellune_core::SessionFailure::ConnectionFailed {
+            reason: busy.to_owned(),
+        }),
+        PortScan::Ready(vec![shellune_serial::PortInfo::sample(
+            "COM3",
+            "COM3",
+            Some("USB serial adapter"),
+        )]),
+        Some(busy.to_owned()),
+        b"",
+        Some(window),
+        cx,
+    );
+    view.activate(live, cx);
+    Ok(())
+}
+
+/// Where the serial shot has arrived: two serial panes are on screen with their strips.
+fn serial_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    let shown = view
+        .open_sessions()
+        .into_iter()
+        .filter(|id| {
+            view.pane_of(*id)
+                .is_some_and(|pane| pane.read(cx).is_serial())
+        })
+        .count();
+    if shown < 2 {
+        return Err(format!("only {shown} serial panes are on screen"));
+    }
     Ok(())
 }
 /// Puts one display-only session on screen, titled like a real one.
@@ -1502,6 +1582,23 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_hosts,
         install: show_host_connection_override,
         ready: host_connection_override_ready,
+    },
+    Scenario {
+        id: "serial-session",
+        title: "串口 · 会话与端口错误",
+        category: Category::Terminal,
+        fixture: "two display-only serial panes: one open on COM3 with a fixed transcript, one that could not open COM7 with a port list holding COM3; no port was opened",
+        evidence: "proves what the serial strip, the send habits and the failure card say in these states; proves nothing about a device, a driver, hardware flow control or an unplug, none of which this machine has",
+        quick: true,
+        variants: &[
+            Variant::dark().smallest(),
+            Variant::dark().comfortable(),
+            Variant::dark().chinese(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_serial,
+        ready: serial_ready,
     },
     Scenario {
         id: "terminal-local",
