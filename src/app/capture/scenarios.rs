@@ -576,7 +576,7 @@ const DESKTOP_SIZE: (u32, u32) = (1280, 720);
 /// A saved RDP connection for a shot. Nothing dials it.
 fn capture_rdp_record() -> shellune_core::ConnectionRecord {
     shellune_core::ConnectionRecord::Rdp(
-        shellune_core::RdpConfig::new("Design workstation", "10.0.0.40:3389", Some("alice"))
+        shellune_core::RdpConfig::new("Design workstation", "10.0.0.40", Some("alice"))
             .expect("a valid RDP record"),
     )
 }
@@ -584,8 +584,7 @@ fn capture_rdp_record() -> shellune_core::ConnectionRecord {
 /// A saved VNC connection for a shot. Nothing dials it.
 fn capture_vnc_record() -> shellune_core::ConnectionRecord {
     shellune_core::ConnectionRecord::Vnc(
-        shellune_core::VncConfig::new("Build monitor", "10.0.0.41:5900")
-            .expect("a valid VNC record"),
+        shellune_core::VncConfig::new("Build monitor", "10.0.0.41").expect("a valid VNC record"),
     )
 }
 
@@ -779,11 +778,11 @@ fn seed_connections(root: &Path) -> Result<(), String> {
     }
     for record in [
         shellune_core::ConnectionRecord::Rdp(
-            shellune_core::RdpConfig::new("Design workstation", "10.0.0.40:3389", Some("alice"))
+            shellune_core::RdpConfig::new("Design workstation", "10.0.0.40", Some("alice"))
                 .map_err(|error| format!("the RDP fixture is invalid: {error}"))?,
         ),
         shellune_core::ConnectionRecord::Vnc(
-            shellune_core::VncConfig::new("Build monitor", "10.0.0.41:5900")
+            shellune_core::VncConfig::new("Build monitor", "10.0.0.41")
                 .map_err(|error| format!("the VNC fixture is invalid: {error}"))?,
         ),
         shellune_core::ConnectionRecord::Serial(

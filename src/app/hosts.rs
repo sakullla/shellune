@@ -3117,13 +3117,12 @@ impl ProtocolDraft {
         let name = self.name.trim();
         let record = match protocol {
             ProtocolKind::Rdp => {
-                let address = self.address.trim();
-                let name = default_name(name, address);
+                let (address, port) =
+                    desktop_endpoint(&self.address, &self.port, shellune_core::DEFAULT_RDP_PORT)?;
+                let name = default_name(name, &address);
                 let mut config =
                     RdpConfig::new(name, address, Some(self.user.trim())).map_err(problem_of)?;
-                config
-                    .set_port(connection_port(&self.port)?.get().into())
-                    .map_err(problem_of)?;
+                config.set_port(port.get().into()).map_err(problem_of)?;
                 let domain = self.domain.trim();
                 config.set_domain((!domain.is_empty()).then_some(domain.to_owned()));
                 config.set_certificate(self.certificate);
@@ -3131,12 +3130,11 @@ impl ProtocolDraft {
                 ConnectionRecord::Rdp(config)
             }
             ProtocolKind::Vnc => {
-                let address = self.address.trim();
-                let name = default_name(name, address);
+                let (address, port) =
+                    desktop_endpoint(&self.address, &self.port, shellune_core::DEFAULT_VNC_PORT)?;
+                let name = default_name(name, &address);
                 let mut config = VncConfig::new(name, address).map_err(problem_of)?;
-                config
-                    .set_port(connection_port(&self.port)?.get().into())
-                    .map_err(problem_of)?;
+                config.set_port(port.get().into()).map_err(problem_of)?;
                 config.set_security(self.security);
                 config.set_remember_secret(self.remember);
                 ConnectionRecord::Vnc(config)
@@ -3278,6 +3276,59 @@ fn connection_port(text: &str) -> Result<Port, ConnectionProblem> {
             format!("{raw} is outside the valid range 1-65535"),
         )
     })
+}
+
+/// The address and port a desktop connection dials.
+///
+/// People paste `host:port` into the address field, as every other client takes it.
+/// That port is used when the port field still holds the protocol's default (or is
+/// blank, or says the same number), so the record never stores `host:3389` and then
+/// dials `host:3389:3389`. Two different ports are refused on the address field,
+/// rather than one of them being dropped silently. A blank port field is the
+/// protocol's own port. IPv6 literals (several colons, or brackets) are left alone.
+fn desktop_endpoint(
+    address: &str,
+    port_text: &str,
+    default_port: u16,
+) -> Result<(String, Port), ConnectionProblem> {
+    let address = address.trim();
+    let field_port = if port_text.trim().is_empty() {
+        Port::new(u32::from(default_port)).unwrap_or(Port::DEFAULT)
+    } else {
+        connection_port(port_text)?
+    };
+    let Some((host, typed)) = address.rsplit_once(':') else {
+        return Ok((address.to_owned(), field_port));
+    };
+    let plain = !host.is_empty()
+        && !host.contains(':')
+        && !host.starts_with('[')
+        && !typed.is_empty()
+        && typed.chars().all(|ch| ch.is_ascii_digit());
+    if !plain {
+        return Ok((address.to_owned(), field_port));
+    }
+    let typed_port = typed
+        .parse::<u32>()
+        .ok()
+        .and_then(|raw| Port::new(raw).ok())
+        .ok_or_else(|| {
+            ConnectionProblem::new(
+                ConnectionFormField::Address,
+                format!("{typed} is outside the valid range 1-65535"),
+            )
+        })?;
+    if field_port.get() == default_port || field_port == typed_port {
+        return Ok((host.to_owned(), typed_port));
+    }
+    Err(ConnectionProblem::new(
+        ConnectionFormField::Address,
+        format!(
+            "The address names port {} but the port field says {}; keep one of them",
+            typed_port.get(),
+            field_port.get()
+        ),
+    ))
 }
 
 /// Reads a line speed, refusing anything the platform could not be asked for.
@@ -3505,6 +3556,34 @@ mod tests {
         let copy = draft.build().expect("a valid copy").record().clone();
         assert_ne!(copy.id(), id);
         assert_eq!(copy.name(), "Office (copy)");
+    }
+
+    #[test]
+    fn a_desktop_address_with_a_port_is_split_instead_of_doubled() {
+        let target = |kind, address: &str, port: &str| {
+            let mut draft = ProtocolDraft::create(kind);
+            draft.set_text(ConnectionFormField::Address, address);
+            draft.set_text(ConnectionFormField::Port, port);
+            draft.build().map(|edit| edit.record().target())
+        };
+        let rdp = target(ProtocolKind::Rdp, "10.0.0.40:3390", "3389").expect("split");
+        assert!(rdp.ends_with("10.0.0.40:3390"), "{rdp}");
+        let same = target(ProtocolKind::Rdp, "10.0.0.40:3389", "3389").expect("split");
+        assert!(
+            same.ends_with("10.0.0.40:3389") && !same.contains("3389:3389"),
+            "{same}"
+        );
+        let blank = target(ProtocolKind::Vnc, "desk", "").expect("default port");
+        assert!(
+            blank.ends_with("desk:5900"),
+            "a blank port is the protocol's: {blank}"
+        );
+        let vnc = target(ProtocolKind::Vnc, "desk:5901", "5900").expect("split");
+        assert!(vnc.ends_with("desk:5901"), "{vnc}");
+        let clash = target(ProtocolKind::Rdp, "desk:3390", "4000").expect_err("two ports");
+        assert!(clash.to_string().contains("3390"));
+        let ipv6 = target(ProtocolKind::Rdp, "fe80::1", "3389").expect("ipv6 kept");
+        assert!(ipv6.contains("fe80::1"), "{ipv6}");
     }
 
     #[test]
