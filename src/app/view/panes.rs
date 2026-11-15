@@ -442,16 +442,21 @@ impl ShelluneView {
         }
         let files = session_id.filter(|id| self.files.is_open(*id));
         if let Some(id) = files {
-            column = column
-                .child(self.files_view(id, window, cx))
-                .children(self.standalone_session_bar(cx));
-        } else if let Some(tab) = self.workspace.layout().active_tab() {
-            let zoomed = tab.zoomed();
-            let tree = if let Some(zoomed) = zoomed {
-                self.zoomed_leaf(tab.root(), zoomed, cx)
-            } else {
-                self.layout_node(tab.root(), true, cx)
+            // A wide window keeps the terminal on screen beside the files, and a narrow
+            // one shows the files in its place: the session behind either arrangement is
+            // the same one, so switching cannot stop it (R14).
+            let docked = self
+                .files_docked()
+                .then(|| self.active_tab_tree(cx))
+                .flatten();
+            let area: gpui::AnyElement = match docked {
+                Some(tree) => self
+                    .files_with_terminal(id, tree, window, cx)
+                    .into_any_element(),
+                None => self.files_view(id, window, cx).into_any_element(),
             };
+            column = column.child(area).children(self.standalone_session_bar(cx));
+        } else if let Some(tree) = self.active_tab_tree(cx) {
             column = column.child(tree);
         }
         // A session with no terminal on screen - still connecting, or ended without one
@@ -519,6 +524,20 @@ impl ShelluneView {
             );
         }
         banners
+    }
+
+    /// The panes of the active tab, or nothing when the window has no tab (R14).
+    ///
+    /// The docked file view needs the same tree the tab would draw on its own, so it is
+    /// built here once instead of being copied into the branch that docks it.
+    fn active_tab_tree(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let tab = self.workspace.layout().active_tab()?;
+        let zoomed = tab.zoomed();
+        Some(if let Some(zoomed) = zoomed {
+            self.zoomed_leaf(tab.root(), zoomed, cx).into_any_element()
+        } else {
+            self.layout_node(tab.root(), true, cx).into_any_element()
+        })
     }
 
     fn zoomed_leaf(&self, root: &Node, pane: PaneId, cx: &mut Context<Self>) -> gpui::Div {

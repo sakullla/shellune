@@ -354,6 +354,21 @@ impl ShelluneView {
                         }
                     })),
                 )
+                // A wide window can share its width with the terminal or give it all to
+                // the files; the switch says what the next press gives, and it lives in
+                // this bar so that neither arrangement moves the listing (R14).
+                .children((files_open && self.files_side_by_side()).then(|| {
+                    let (selector, icon, label) = if self.files_focused() {
+                        ("files.mode.dock", Icon::Terminal, strings.files_mode_dock)
+                    } else {
+                        ("files.mode.focus", Icon::Maximize, strings.files_mode_focus)
+                    };
+                    view_segment(selector, icon, label, self.files_focused()).on_click(cx.listener(
+                        move |view, _event, _window, cx| {
+                            view.files_toggle_focus(cx);
+                        },
+                    ))
+                }))
         });
 
         let right = div()

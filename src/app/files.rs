@@ -17,11 +17,12 @@
 //! A change is answered by a report, then the same source is listed again. The report
 //! says what happened; only the next listing says what the directory holds now.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use shellune_core::{
-    BrowseFailure, BrowseRequest, BrowseResponse, BrowseState, FileBrowser, FileKind,
+    BrowseFailure, BrowseRequest, BrowseResponse, BrowseState, DirEntry, FileBrowser, FileKind,
     MutationAction, MutationOutcome, MutationStep, NameProblem, SessionId, TransferProtocol,
     join_path, normalize_path, parent_path,
 };
@@ -55,7 +56,7 @@ impl BrowseChannel for FileLink {
 ///
 /// Local and remote stay separate values: a narrow window may show only one of them,
 /// but it never folds the two into a single identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FileSource {
     /// A directory on this computer.
     Local,
@@ -97,6 +98,12 @@ pub enum FilesStop {
     QuestionConfirm,
     /// The question's cancelling button.
     QuestionCancel,
+    /// The field that filters one column's names (R14).
+    ///
+    /// It is a stop of its own so a column can be filtered with the keyboard alone:
+    /// Tab reaches the field, typing narrows the list, and the keys it does not use
+    /// step back out to the column.
+    Filter,
     /// The switch that makes the remote column follow the shell's directory (R15).
     ///
     /// It is a stop of its own so following can be turned off or taken back without a
@@ -132,6 +139,70 @@ pub enum FollowNote {
     Unreadable { path: String },
 }
 
+/// What one column orders its listing by (R14).
+///
+/// Ordering and filtering are the column's own: a name sorted on this computer says
+/// nothing about the server's column, and a filter typed into one of them must not
+/// hide rows of the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKey {
+    /// By name, ignoring case; the default.
+    Name,
+    /// By the size the server reported.
+    Size,
+}
+
+/// How one column orders its listing: a key and a direction.
+///
+/// Folders stay first whichever way the column is sorted, because a listing is a
+/// workspace first: the folder a reader is about to open is not ranked against the
+/// files beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileSort {
+    key: SortKey,
+    descending: bool,
+}
+
+impl FileSort {
+    /// The default of every column: names, A to Z.
+    #[must_use]
+    pub fn name() -> Self {
+        Self {
+            key: SortKey::Name,
+            descending: false,
+        }
+    }
+
+    /// What the column orders by.
+    #[must_use]
+    pub fn key(self) -> SortKey {
+        self.key
+    }
+
+    /// Whether the order runs backwards.
+    #[must_use]
+    pub fn descending(self) -> bool {
+        self.descending
+    }
+
+    /// The order a header press asks for: this key ascending, or the other way round
+    /// when the column is already sorted by it.
+    #[must_use]
+    pub fn pressed(self, key: SortKey) -> Self {
+        if self.key == key {
+            Self {
+                key,
+                descending: !self.descending,
+            }
+        } else {
+            Self {
+                key,
+                descending: false,
+            }
+        }
+    }
+}
+
 /// One browsable session: the remote connection, the local disk, and both views.
 struct SessionFiles {
     remote: Box<dyn BrowseChannel>,
@@ -161,6 +232,35 @@ struct SessionFiles {
     follow_target: Option<String>,
     /// What is said beside the follow switch.
     note: FollowNote,
+    /// Whether a directory report arrived while this session was not the active pane
+    /// and still has to be followed once it is (R15).
+    ///
+    /// The report is kept either way; this only records that the listing and the note
+    /// are behind it, so the column cannot claim to follow a directory it is not showing.
+    deferred_follow: bool,
+    /// How the local column orders its own listing (R14).
+    local_sort: FileSort,
+    /// How the remote column orders its own listing (R14).
+    remote_sort: FileSort,
+    /// The text the local column keeps only names containing (R14).
+    local_filter: String,
+    /// The text the remote column keeps only names containing (R14).
+    remote_filter: String,
+    /// The local entries the user marked, in the order they were marked (R14).
+    ///
+    /// The mark is separate from the row the keyboard is on: one row is where typing
+    /// and opening happen, and the marks are what a batch action acts on.
+    local_marked: Vec<String>,
+    /// The remote entries the user marked, in the order they were marked (R14).
+    remote_marked: Vec<String>,
+    /// Local deletions still to send, one at a time (R14).
+    ///
+    /// A browser answers one request at a time, so a batch is a queue rather than
+    /// several requests at once: each deletion is sent when the previous one and its
+    /// listing have been answered.
+    local_pending: VecDeque<String>,
+    /// Remote deletions still to send, one at a time (R14).
+    remote_pending: VecDeque<String>,
 }
 
 /// Every browsable session and which of them show a file view.
@@ -207,6 +307,15 @@ impl FileViews {
                 last_good: None,
                 follow_target: None,
                 note: FollowNote::NoReport,
+                deferred_follow: false,
+                local_sort: FileSort::name(),
+                remote_sort: FileSort::name(),
+                local_filter: String::new(),
+                remote_filter: String::new(),
+                local_marked: Vec::new(),
+                remote_marked: Vec::new(),
+                local_pending: VecDeque::new(),
+                remote_pending: VecDeque::new(),
             },
         );
     }
@@ -312,6 +421,285 @@ impl FileViews {
         }
     }
 
+    /// How one column orders its listing (R14).
+    ///
+    /// Each column keeps its own order, per session, so sorting the server's files
+    /// leaves this computer's column alone and a layout switch changes nothing.
+    #[must_use]
+    pub fn sort_of(&self, session: SessionId, source: FileSource) -> Option<FileSort> {
+        let files = self.sessions.get(&session)?;
+        files.remote_browser.as_ref()?;
+        Some(match source {
+            FileSource::Local => files.local_sort,
+            FileSource::Remote => files.remote_sort,
+        })
+    }
+
+    /// Orders one column by a key, the way a press on that column's header asks for.
+    ///
+    /// Returns whether the order changed, so the window redraws only when it did.
+    pub fn sort_by(&mut self, session: SessionId, source: FileSource, key: SortKey) -> bool {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        if files.remote_browser.is_none() {
+            return false;
+        }
+        let slot = match source {
+            FileSource::Local => &mut files.local_sort,
+            FileSource::Remote => &mut files.remote_sort,
+        };
+        let next = slot.pressed(key);
+        if *slot == next {
+            return false;
+        }
+        *slot = next;
+        true
+    }
+
+    /// The text one column keeps only matching names of (R14).
+    #[must_use]
+    pub fn filter_of(&self, session: SessionId, source: FileSource) -> Option<&str> {
+        let files = self.sessions.get(&session)?;
+        files.remote_browser.as_ref()?;
+        Some(match source {
+            FileSource::Local => &files.local_filter,
+            FileSource::Remote => &files.remote_filter,
+        })
+    }
+
+    /// Filters one column by a name fragment, ignoring case.
+    ///
+    /// Returns whether the text changed. The listing itself is not re-read: a filter is
+    /// a way of reading what the server already sent, so typing into it costs no round
+    /// trip.
+    pub fn set_filter(
+        &mut self,
+        session: SessionId,
+        source: FileSource,
+        text: impl Into<String>,
+    ) -> bool {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        if files.remote_browser.is_none() {
+            return false;
+        }
+        let text = text.into();
+        let slot = match source {
+            FileSource::Local => &mut files.local_filter,
+            FileSource::Remote => &mut files.remote_filter,
+        };
+        if *slot == text {
+            return false;
+        }
+        *slot = text;
+        true
+    }
+
+    /// The rows one column shows: its listing, filtered by the column's own text and
+    /// ordered by the column's own sort (R14).
+    ///
+    /// Nothing is invented here: every row is an entry the server or this computer
+    /// really returned, kept in the order the column asks for.
+    #[must_use]
+    pub fn rows(&self, session: SessionId, source: FileSource) -> Vec<DirEntry> {
+        let Some(browser) = self.browser_in(session, source) else {
+            return Vec::new();
+        };
+        let Some(listing) = browser.state().listing() else {
+            return Vec::new();
+        };
+        let needle = self
+            .filter_of(session, source)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let sort = self.sort_of(session, source).unwrap_or_else(FileSort::name);
+        let mut rows: Vec<DirEntry> = listing
+            .entries()
+            .iter()
+            .filter(|entry| needle.is_empty() || entry.name().to_lowercase().contains(&needle))
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| compare_entries(left, right, sort));
+        rows
+    }
+
+    /// How many names one column shows out of how many it holds (R14).
+    #[must_use]
+    pub fn counts(&self, session: SessionId, source: FileSource) -> Option<(usize, usize)> {
+        let total = self
+            .browser_in(session, source)?
+            .state()
+            .listing()?
+            .entries()
+            .len();
+        Some((self.rows(session, source).len(), total))
+    }
+
+    /// The entries one column has marked, in the order they were marked (R14).
+    #[must_use]
+    pub fn marked(&self, session: SessionId, source: FileSource) -> Vec<String> {
+        let Some(files) = self.sessions.get(&session) else {
+            return Vec::new();
+        };
+        match source {
+            FileSource::Local => files.local_marked.clone(),
+            FileSource::Remote => files.remote_marked.clone(),
+        }
+    }
+
+    /// Whether one entry of a column is marked.
+    #[must_use]
+    pub fn is_marked(&self, session: SessionId, source: FileSource, name: &str) -> bool {
+        let Some(files) = self.sessions.get(&session) else {
+            return false;
+        };
+        match source {
+            FileSource::Local => files.local_marked.iter().any(|marked| marked == name),
+            FileSource::Remote => files.remote_marked.iter().any(|marked| marked == name),
+        }
+    }
+
+    /// Adds one entry to a column's marks, or takes it out. Returns whether it is
+    /// marked now.
+    ///
+    /// Only an entry the listing really holds can be marked: a mark on a name that is
+    /// not there would be a batch action about a file nothing can reach.
+    pub fn toggle_mark(&mut self, session: SessionId, source: FileSource, name: &str) -> bool {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        let present = side_mut(files, source).is_some_and(|browser| browser.entry(name).is_some());
+        if !present {
+            return false;
+        }
+        let marks = match source {
+            FileSource::Local => &mut files.local_marked,
+            FileSource::Remote => &mut files.remote_marked,
+        };
+        if let Some(at) = marks.iter().position(|marked| marked == name) {
+            marks.remove(at);
+            false
+        } else {
+            marks.push(name.to_owned());
+            true
+        }
+    }
+
+    /// Marks the rows from the one the keyboard is on to the clicked one, both
+    /// included (R14).
+    ///
+    /// The range is the rows in the order the column shows them, so Shift+click marks
+    /// what the reader sees between the two rows and not what the server happened to
+    /// send between them.
+    pub fn mark_range(&mut self, session: SessionId, source: FileSource, from: &str, to: &str) {
+        let rows = self.rows(session, source);
+        let Some(start) = rows.iter().position(|row| row.name() == from) else {
+            return;
+        };
+        let Some(end) = rows.iter().position(|row| row.name() == to) else {
+            return;
+        };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let names: Vec<String> = rows[start..=end]
+            .iter()
+            .map(|row| row.name().to_owned())
+            .collect();
+        self.set_marked(session, source, names);
+    }
+
+    /// Replaces one column's marks.
+    pub fn set_marked(&mut self, session: SessionId, source: FileSource, names: Vec<String>) {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let marks = match source {
+            FileSource::Local => &mut files.local_marked,
+            FileSource::Remote => &mut files.remote_marked,
+        };
+        *marks = names;
+    }
+
+    /// Drops one column's marks. Returns whether it had any.
+    pub fn clear_marked(&mut self, session: SessionId, source: FileSource) -> bool {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        let marks = match source {
+            FileSource::Local => &mut files.local_marked,
+            FileSource::Remote => &mut files.remote_marked,
+        };
+        let had = !marks.is_empty();
+        marks.clear();
+        had
+    }
+
+    /// Marks every row one column shows, or drops the marks (R14).
+    pub fn mark_all(&mut self, session: SessionId, source: FileSource, on: bool) -> bool {
+        if !on {
+            return self.clear_marked(session, source);
+        }
+        let names: Vec<String> = self
+            .rows(session, source)
+            .iter()
+            .map(|row| row.name().to_owned())
+            .collect();
+        if names.is_empty() || names == self.marked(session, source) {
+            return false;
+        }
+        self.set_marked(session, source, names);
+        true
+    }
+
+    /// Asks one source to delete several entries, one request at a time (R14).
+    ///
+    /// Every name is checked against the listing on screen before anything is sent, so
+    /// a batch cannot name an entry that is not there. The first request leaves now and
+    /// the rest follow as each answer lands, because a browser holds one request at a
+    /// time and a second one would drop the first one's report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NameProblem`] when there is no listing, when the batch is empty, or
+    /// when one of the names is no longer in the directory on screen.
+    pub fn delete_many(
+        &mut self,
+        session: SessionId,
+        source: FileSource,
+        names: &[String],
+    ) -> Result<usize, NameProblem> {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return Err(NameProblem::NoDirectory);
+        };
+        let Some(browser) = side_mut(files, source) else {
+            return Err(NameProblem::NoDirectory);
+        };
+        if names.is_empty() {
+            return Err(NameProblem::Missing);
+        }
+        for name in names {
+            if browser.entry(name).is_none() {
+                return Err(NameProblem::Missing);
+            }
+        }
+        // A second batch replaces the first one's queue: the confirmation the user just
+        // gave is about the rows they see now.
+        let queue = match source {
+            FileSource::Local => &mut files.local_pending,
+            FileSource::Remote => &mut files.remote_pending,
+        };
+        queue.clear();
+        queue.extend(names.iter().cloned());
+        advance_deletions(files, source);
+        Ok(names.len())
+    }
+
     /// The local directory on screen, as a path of this computer.
     ///
     /// `None` when that directory has not been listed, or when the path is the
@@ -342,7 +730,12 @@ impl FileViews {
             let reported = files.reported.clone().filter(|_| files.follow);
             let request = match &reported {
                 Some(path) => {
+                    // The note says what the pending listing is: until the server
+                    // answers, the column is following that reported directory, and
+                    // saying "no directory reported yet" would contradict the request
+                    // that was just sent (R15).
                     files.follow_target = Some(path.clone());
+                    files.note = FollowNote::Following { path: path.clone() };
                     remote.begin_list(path.clone())
                 }
                 None => remote.begin_home(),
@@ -365,6 +758,12 @@ impl FileViews {
             files.local_browser = None;
             files.local_selected = None;
             files.remote_selected = None;
+            // The entries the marks and the queue name are gone with the listing: a
+            // reopened view cannot act on a row it has not read yet (R14).
+            files.local_marked.clear();
+            files.remote_marked.clear();
+            files.local_pending.clear();
+            files.remote_pending.clear();
         }
     }
 
@@ -388,8 +787,15 @@ impl FileViews {
     /// Asking by hand is what turns following off for the remote side: the user chose
     /// this directory, and the next `cd` in the shell must not take it away (R15).
     pub fn up_in(&mut self, session: SessionId, source: FileSource) -> bool {
-        self.stop_following(session, source);
-        self.ask_in(session, source, |browser| browser.up())
+        // A step the browser cannot take - the column is already at the root, and there
+        // is no parent to ask for - is not the user choosing a directory, so following
+        // stays on. Turning it off there would leave the switch saying the user took
+        // over while nothing moved (R15).
+        let moved = self.ask_in(session, source, |browser| browser.up());
+        if moved {
+            self.stop_following(session, source);
+        }
+        moved
     }
 
     /// Asks again for the remote directory shown.
@@ -484,9 +890,41 @@ impl FileViews {
             return false;
         }
         if !active {
+            // Another pane of the tab is the one being typed into, so this session's
+            // listing is left where it is. The report is remembered and followed once
+            // this session is the active one again, so the switch cannot say "following"
+            // while the listing shows a directory the shell already left (R15).
+            files.deferred_follow = true;
             return false;
         }
         follow_to(files, path)
+    }
+
+    /// Follows a directory report that arrived while its session was not the active
+    /// pane (R15).
+    ///
+    /// Called with the session the user is working in, so a report of a background tab
+    /// moves nothing: only coming back to that session does.
+    pub fn catch_up_follow(&mut self, active: Option<SessionId>) -> bool {
+        let Some(session) = active else {
+            return false;
+        };
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        if !files.deferred_follow {
+            return false;
+        }
+        if files.remote_browser.is_none() || !files.follow {
+            files.deferred_follow = false;
+            return false;
+        }
+        let Some(path) = files.reported.clone() else {
+            files.deferred_follow = false;
+            return false;
+        };
+        files.deferred_follow = false;
+        follow_to(files, &path)
     }
 
     /// Turns following off because the user browsed by hand (R15).
@@ -514,8 +952,13 @@ impl FileViews {
     ///
     /// Opening a row is browsing by hand, so the remote side stops following (R15).
     pub fn enter_in(&mut self, session: SessionId, source: FileSource, name: &str) -> bool {
-        self.stop_following(session, source);
-        self.ask_in(session, source, |browser| browser.open(name))
+        // Only a row this source really opened is browsing by hand: a click on a file,
+        // or on a folder that is no longer there, must not stop following either.
+        let opened = self.ask_in(session, source, |browser| browser.open(name));
+        if opened {
+            self.stop_following(session, source);
+        }
+        opened
     }
 
     /// Asks one source to list an absolute path it already speaks.
@@ -559,18 +1002,26 @@ impl FileViews {
     }
 
     /// Asks to delete one remote entry.
+    ///
+    /// The window always goes through delete_many so one deletion and many share the
+    /// same queue; this is the shorthand the module's own tests use.
+    #[cfg(test)]
     pub fn delete(&mut self, session: SessionId, name: &str) -> Result<(), NameProblem> {
         self.delete_in(session, FileSource::Remote, name)
     }
 
     /// Asks one source to delete one entry.
+    #[cfg(test)]
     pub fn delete_in(
         &mut self,
         session: SessionId,
         source: FileSource,
         name: &str,
     ) -> Result<(), NameProblem> {
-        self.mutate_in(session, source, |browser| browser.delete(name))
+        // One entry is the smallest batch there is, so both go through the same queue
+        // and the same "one request at a time" rule (R14).
+        self.delete_many(session, source, &[name.to_owned()])
+            .map(|_count| ())
     }
 
     /// Runs one change and delivers it to that source only.
@@ -607,6 +1058,14 @@ impl FileViews {
             if pump_side(files, FileSource::Local) {
                 changed = true;
             }
+            // A batch of deletions sends its next request only once the one before it
+            // and its listing have been answered (R14).
+            if advance_deletions(files, FileSource::Remote) {
+                changed = true;
+            }
+            if advance_deletions(files, FileSource::Local) {
+                changed = true;
+            }
             if settle_follow(files) {
                 changed = true;
             }
@@ -637,6 +1096,73 @@ impl FileViews {
     }
 }
 
+/// Orders two rows of one column (R14).
+///
+/// Folders come first whichever way the column is ordered: the folder a reader is about
+/// to open is not ranked against the files beside it. Inside one kind the column's own
+/// key decides, and a name breaks the remaining ties so the order cannot wobble between
+/// two listings of the same directory.
+fn compare_entries(left: &DirEntry, right: &DirEntry, sort: FileSort) -> Ordering {
+    let folders = right.is_directory().cmp(&left.is_directory());
+    if folders != Ordering::Equal {
+        return folders;
+    }
+    let by = match sort.key {
+        SortKey::Name => {
+            let order = left.name().to_lowercase().cmp(&right.name().to_lowercase());
+            if sort.descending {
+                order.reverse()
+            } else {
+                order
+            }
+        }
+        // A size the server did not report is not zero bytes: such an entry stays at
+        // the end of the column in both directions instead of pretending to be the
+        // smallest or the largest (R16).
+        SortKey::Size => match (left.size(), right.size()) {
+            (Some(one), Some(other)) => {
+                if sort.descending {
+                    other.cmp(&one)
+                } else {
+                    one.cmp(&other)
+                }
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+    };
+    by.then_with(|| left.name().to_lowercase().cmp(&right.name().to_lowercase()))
+}
+
+/// Sends the next deletion of one column's batch (R14).
+///
+/// One request at a time: a browser holds a single outstanding request, and a second
+/// one would drop the report of the first. A name that is no longer in the directory is
+/// skipped rather than reported, because the listing already shows what is left.
+fn advance_deletions(files: &mut SessionFiles, source: FileSource) -> bool {
+    let idle = side_mut(files, source)
+        .is_some_and(|browser| !browser.is_waiting() && !browser.is_changing());
+    if !idle {
+        return false;
+    }
+    let next = {
+        let queue = match source {
+            FileSource::Local => &mut files.local_pending,
+            FileSource::Remote => &mut files.remote_pending,
+        };
+        queue.pop_front()
+    };
+    let Some(name) = next else {
+        return false;
+    };
+    let request = side_mut(files, source).and_then(|browser| browser.delete(&name).ok());
+    match request {
+        Some(request) => deliver(files, source, request),
+        None => false,
+    }
+}
+
 /// The browser of one source.
 fn side_mut(files: &mut SessionFiles, source: FileSource) -> Option<&mut FileBrowser> {
     match source {
@@ -660,6 +1186,7 @@ fn pump_side(files: &mut SessionFiles, source: FileSource) -> bool {
         }
         changed = true;
         forget_missing_selection(files, source);
+        forget_missing_marks(files, source);
         if source == FileSource::Remote {
             // The last directory the server itself confirmed, which is where a
             // reported path that cannot be read returns to (R15).
@@ -679,6 +1206,35 @@ fn pump_side(files: &mut SessionFiles, source: FileSource) -> bool {
         }
     }
     changed
+}
+
+/// Drops the marks of entries the latest listing no longer contains (R14).
+///
+/// A marked row that a Refresh no longer returns cannot be part of a batch: the mark
+/// would name a file nothing can reach, and the batch would ask a server to delete it.
+fn forget_missing_marks(files: &mut SessionFiles, source: FileSource) {
+    let kept: Vec<String> = {
+        let marks = match source {
+            FileSource::Local => files.local_marked.clone(),
+            FileSource::Remote => files.remote_marked.clone(),
+        };
+        let browser = match source {
+            FileSource::Local => files.local_browser.as_ref(),
+            FileSource::Remote => files.remote_browser.as_ref(),
+        };
+        match browser {
+            Some(browser) => marks
+                .into_iter()
+                .filter(|name| browser.entry(name).is_some())
+                .collect(),
+            // No listing at all: nothing a mark could still name is on screen.
+            None => Vec::new(),
+        }
+    };
+    match source {
+        FileSource::Local => files.local_marked = kept,
+        FileSource::Remote => files.remote_marked = kept,
+    }
 }
 
 /// Drops a selection the latest listing no longer contains.
@@ -1228,6 +1784,36 @@ fn io_failure(error: std::io::Error, path: &str) -> BrowseFailure {
         }
     }
 }
+/// One entry a delete question is about (R14).
+///
+/// The name and the kind travel together from the listing, so the question states what
+/// is being deleted and whether it takes anything with it, and the request that follows
+/// cannot be about a different entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteTarget {
+    /// The entry as the listing named it.
+    pub name: String,
+    /// What the entry is, as the listing reported it.
+    pub kind: FileKind,
+}
+
+impl DeleteTarget {
+    /// One entry of a listing.
+    #[must_use]
+    pub fn new(name: impl Into<String>, kind: FileKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+        }
+    }
+
+    /// Whether deleting this entry takes other entries with it.
+    #[must_use]
+    pub fn is_folder(&self) -> bool {
+        self.kind.is_directory()
+    }
+}
+
 /// The question the file view is asking before anything is sent (R11, R10).
 ///
 /// A change to a server is asked for twice: once in the dialog, where the user sees
@@ -1264,16 +1850,18 @@ pub enum FilesDialog {
         /// Why the last attempt to send it was refused, when it was.
         problem: Option<NameProblem>,
     },
-    /// One entry is being deleted, with everything inside it.
+    /// One or more entries are being deleted, with everything inside a folder (R14).
+    ///
+    /// The entries are facts from the listing rather than something the user typed, and
+    /// every one of them is named in the question: a batch that says only "4 entries"
+    /// would ask the user to confirm a deletion they cannot check.
     Delete {
-        /// The session whose directory holds the entry.
+        /// The session whose directory holds the entries.
         session: SessionId,
-        /// Which source holds the entry.
+        /// Which source holds the entries.
         source: FileSource,
-        /// The entry as the listing named it.
-        name: String,
-        /// What the entry is, as the listing reported it.
-        kind: FileKind,
+        /// The entries as the listing named them, with what each one is.
+        entries: Vec<DeleteTarget>,
         /// Why the deletion could not be sent, when it could not.
         ///
         /// A confirmation that is answered with nothing is the one thing this dialog
@@ -1518,6 +2106,24 @@ impl FilesDialog {
             Self::Upload { problem, .. } | Self::Download { problem, .. } => problem.as_ref(),
             Self::NewDirectory { .. } | Self::Rename { .. } | Self::Delete { .. } => None,
         }
+    }
+
+    /// The entries a delete question is about, and nothing for any other question (R14).
+    #[must_use]
+    pub fn targets(&self) -> &[DeleteTarget] {
+        match self {
+            Self::Delete { entries, .. } => entries,
+            _ => &[],
+        }
+    }
+
+    /// How many of those entries are folders, which take their contents with them.
+    #[must_use]
+    pub fn target_folders(&self) -> usize {
+        self.targets()
+            .iter()
+            .filter(|target| target.is_folder())
+            .count()
     }
 }
 
@@ -2327,8 +2933,7 @@ mod tests {
         let dialog = FilesDialog::Delete {
             session,
             source: FileSource::Remote,
-            name: "docs".to_owned(),
-            kind: FileKind::Directory,
+            entries: vec![DeleteTarget::new("docs", FileKind::Directory)],
             problem: None,
         };
         assert_eq!(dialog.source(), FileSource::Remote);

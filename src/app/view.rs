@@ -52,9 +52,9 @@ use crate::app::copy::{self, Locale, Strings};
 #[cfg(any(test, feature = "ui-capture"))]
 use crate::app::files::BrowseChannel;
 use crate::app::files::{
-    FileSource, FileViews, FilesDialog, FilesStop, FollowNote, browse_failure_text, display_path,
-    kind_label, local_protocol_to_os, path_crumbs, path_problem_text, problem_text,
-    transfer_problem_text,
+    DeleteTarget, FileSort, FileSource, FileViews, FilesDialog, FilesStop, FollowNote, SortKey,
+    browse_failure_text, display_path, kind_label, local_protocol_to_os, path_crumbs,
+    path_problem_text, problem_text, transfer_problem_text,
 };
 use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
@@ -379,6 +379,11 @@ pub const REMOTE_TERMINAL_HEIGHT: f32 = 340.0;
 /// width is this length scaled by the text size, then clamped to the content area
 /// when only one column fits.
 pub const FILES_PANEL_WIDTH: f32 = 340.0;
+/// The narrowest window that docks the terminal and the files side by side (R14).
+///
+/// Both columns of the file view have to fit in half of it, plus the terminal's own
+/// minimum: below this the files take the terminal's place instead of squeezing both.
+pub const DOCK_MIN_WIDTH: f32 = (FILES_PANEL_WIDTH * 2.0 + 120.0) * 2.0 + 40.0;
 
 /// The widest one breadcrumb of a long path is drawn.
 ///
@@ -651,6 +656,17 @@ pub struct ShelluneView {
     files_field: Option<Entity<TextField>>,
     /// The remote path field of a transfer question, when it has one (R10).
     files_remote_field: Option<Entity<TextField>>,
+    /// The field that filters one column's names, per session and source (R14).
+    ///
+    /// It is a field of its own rather than one shared between sessions: a filter typed
+    /// into one session's column must not hide rows of another session's column.
+    files_filter_fields: std::collections::HashMap<(SessionId, FileSource), Entity<TextField>>,
+    /// Whether the file view has the whole area to itself (R14).
+    ///
+    /// A wide window shows the terminal and the files side by side; this is the switch
+    /// that gives the files the whole width when the user is working in them, and it
+    /// changes nothing about the session behind it.
+    files_focused: bool,
     /// Focus of the local column, so its keys are not the terminal's keys.
     files_local_focus: FocusHandle,
     /// Focus of the remote column.
@@ -1662,7 +1678,121 @@ impl ShelluneView {
         if self.files.open(id) {
             self.files.pump();
         }
+        self.ensure_files_filters(id, cx);
         cx.notify();
+    }
+
+    /// A file source a capture scripts with a failure instead of a listing (R14).
+    ///
+    /// The reason is the one a server that offers no SFTP subsystem gives, so the shot
+    /// shows the recovery entries this build draws for that case; nothing is contacted.
+    #[cfg(feature = "ui-capture")]
+    fn capture_browse_failed(reason: &'static str) -> Box<dyn BrowseChannel> {
+        struct Failing {
+            reason: &'static str,
+            answers: Vec<shellune_core::BrowseResponse>,
+        }
+        impl BrowseChannel for Failing {
+            fn send(&mut self, request: shellune_core::BrowseRequest) -> bool {
+                let request = match request {
+                    shellune_core::BrowseRequest::Home { request }
+                    | shellune_core::BrowseRequest::List { request, .. } => request,
+                    _ => return false,
+                };
+                self.answers.push(shellune_core::BrowseResponse::Failed {
+                    request,
+                    failure: shellune_core::BrowseFailure::Unavailable {
+                        reason: self.reason.to_owned(),
+                    },
+                });
+                true
+            }
+
+            fn drain(&mut self) -> Vec<shellune_core::BrowseResponse> {
+                std::mem::take(&mut self.answers)
+            }
+        }
+        Box::new(Failing {
+            reason,
+            answers: Vec::new(),
+        })
+    }
+
+    /// Opens the file view of a capture session and marks rows of one column (R14).
+    ///
+    /// The marks are the build's own state, so the shot shows what a batch bar really
+    /// covers; nothing is transferred and no server is asked.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_files_marked(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        names: &[&str],
+        cx: &mut Context<Self>,
+    ) {
+        self.capture_files(id, false, cx);
+        for name in names {
+            self.files.toggle_mark(id, source, name);
+        }
+        if let Some(first) = names.first() {
+            self.files.select(id, source, Some((*first).to_owned()));
+        }
+        cx.notify();
+    }
+
+    /// Opens the file view of a capture session whose server refused the read (R14).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_files_remote_failed(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        const HOME: &[(&str, shellune_core::FileKind, Option<u64>)] = &[
+            ("下载", shellune_core::FileKind::Directory, None),
+            ("项目 发布", shellune_core::FileKind::Directory, None),
+            ("草稿.txt", shellune_core::FileKind::File, Some(1_024)),
+        ];
+        self.files.attach(
+            id,
+            "legacy-web",
+            "deploy@10.0.0.31:22",
+            Self::capture_browse_failed("the server offers no sftp subsystem"),
+        );
+        self.files
+            .attach_local_for_test(id, Self::capture_browse("/C:/Users/me/项目 发布", HOME));
+        if self.files.open(id) {
+            self.files.pump();
+        }
+        self.ensure_files_filters(id, cx);
+        cx.notify();
+    }
+
+    /// How many rows of one column a capture has marked, and what the other column
+    /// holds, for a shot that says what it shows (R14).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_files_marks(&self) -> Option<(usize, usize)> {
+        let id = self.active_session()?;
+        Some((
+            self.files.marked(id, FileSource::Remote).len(),
+            self.files
+                .browser_in(id, FileSource::Local)?
+                .state()
+                .listing()
+                .map_or(0, |listing| listing.entries().len()),
+        ))
+    }
+
+    /// Whether the server's column states a failure while this computer's column still
+    /// holds a listing, for a shot that says what it shows (R14).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_files_isolation(&self) -> Option<(bool, usize)> {
+        let id = self.active_session()?;
+        let failed = self.files.browser(id)?.state().failure().is_some();
+        let local = self
+            .files
+            .browser_in(id, FileSource::Local)?
+            .state()
+            .listing()
+            .map_or(0, |listing| listing.entries().len());
+        Some((failed, local))
     }
 
     /// Puts one transfer in the session's strip, running or failed (R2, R6).
@@ -2110,6 +2240,8 @@ impl ShelluneView {
             files_dialog: None,
             files_field: None,
             files_remote_field: None,
+            files_filter_fields: std::collections::HashMap::new(),
+            files_focused: false,
             files_local_focus: cx.focus_handle(),
             files_remote_focus: cx.focus_handle(),
             files_local_scroll: gpui::ScrollHandle::new(),
@@ -10526,6 +10658,17 @@ impl ShelluneView {
                 );
             }
             match id.filter(|id| self.files.is_open(*id)) {
+                // A wide window keeps the terminal beside the files instead of behind
+                // them: the pane below still runs, and the file view is a column of its
+                // own (R14).
+                Some(open) if self.files_docked() => {
+                    frame = frame.child(self.files_with_terminal(
+                        open,
+                        pane.clone().into_any_element(),
+                        window,
+                        cx,
+                    ));
+                }
                 Some(open) => frame = frame.child(self.files_view(open, window, cx)),
                 None => frame = frame.child(pane.clone()),
             }
@@ -10740,6 +10883,63 @@ impl ShelluneView {
             .child(panes)
     }
 
+    /// The files and the terminal, arranged the way the window has room for (R14).
+    ///
+    /// A wide window docks the file view beside the terminal it belongs to. The focused
+    /// mode gives the files the whole area instead, and the narrow window (which never
+    /// has the room) keeps the switch inside the file view. The terminal is the same
+    /// session in every arrangement, so a layout change cannot end it or lose its output.
+    fn files_with_terminal(
+        &self,
+        id: SessionId,
+        terminal: gpui::AnyElement,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let files = self.files_view(id, window, cx);
+        if self.files_focused() {
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .child(files);
+        }
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .debug_selector(|| "files.split".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .child(terminal),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(1.0))
+                    .h_full()
+                    .bg(theme::swatch(palette::BORDER)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .w(self.files_area_width())
+                    .min_h(px(0.0))
+                    .child(files),
+            )
+    }
+
     /// "Upload" or "Download" in the interface language.
     fn direction_label(&self, direction: TransferDirection) -> &'static str {
         let strings = self.strings();
@@ -10815,7 +11015,7 @@ impl ShelluneView {
         if let Some(wide) = self.files_layout_override {
             return wide;
         }
-        self.viewport_width >= self.metrics().scale(FILES_PANEL_WIDTH * 2.0 + 120.0)
+        self.files_area_width() >= self.metrics().scale(FILES_PANEL_WIDTH * 2.0 + 120.0)
     }
 
     fn files_show(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
@@ -10831,10 +11031,210 @@ impl ShelluneView {
         if self.files.is_open(id) {
             self.close_files_question(id);
             self.files.close(id);
+            self.forget_files_filters(id);
+            self.files_on_close();
         } else if self.files.open(id) {
+            self.ensure_files_filters(id, cx);
+            // The keyboard lands on the server's column, which is the side a file view is
+            // opened for: the rows and the batch keys are reachable without a pointer
+            // from the first frame (R4, R14).
+            self.files_panel_focus_pending = Some(FileSource::Remote);
             self.watch_files(cx);
         }
         cx.notify();
+    }
+
+    /// The mode the file view is drawn in: docked beside the terminal, focused, or one
+    /// side at a time in a narrow window (R14).
+    fn files_focused(&self) -> bool {
+        self.files_focused
+    }
+
+    /// Whether the terminal stays on screen beside the files.
+    ///
+    /// Only a window with room for both columns of the file view *and* a usable terminal
+    /// docks them: below that the files take the terminal's place and the switch inside
+    /// the view moves between the two sources. Reading a listing next to the prompt it
+    /// came from is the point of a file workspace, so docking is what a large window
+    /// gets, and the focus switch gives the whole width to either side.
+    fn files_docked(&self) -> bool {
+        !self.files_focused && self.viewport_width >= self.metrics().scale(DOCK_MIN_WIDTH)
+    }
+
+    /// The width the file view itself has: half the window while docked, all of it
+    /// otherwise.
+    ///
+    /// The two columns of the file view are chosen from this, not from the window: a
+    /// docked view that counted the terminal's width would draw two columns into half a
+    /// window.
+    fn files_area_width(&self) -> gpui::Pixels {
+        if self.files_docked() {
+            self.viewport_width * 0.5 - px(1.0)
+        } else {
+            self.viewport_width
+        }
+    }
+
+    /// Switches between the docked file view and the focused one (R14).
+    fn files_toggle_focus(&mut self, cx: &mut Context<Self>) {
+        self.files_focused = !self.files_focused;
+        cx.notify();
+    }
+
+    /// Drops what the focused layout held for a view that was closed.
+    fn files_on_close(&mut self) {
+        self.files_focused = false;
+    }
+
+    /// Whether one column draws its filter row (R14).
+    ///
+    /// A listing is what a filter narrows, so the row exists only while there is one:
+    /// the field that holds its text is created with the view, but a column showing a
+    /// failure card has nothing to filter and no row to put it in.
+    fn files_filter_shown(&self, id: SessionId, source: FileSource) -> bool {
+        self.files_filter_fields.contains_key(&(id, source))
+            && self
+                .files
+                .browser_in(id, source)
+                .is_some_and(|browser| browser.state().listing().is_some())
+    }
+
+    /// Binds the filter field of each column of one session (R14).
+    ///
+    /// The fields are created when the view opens, so what the user types belongs to the
+    /// session that column belongs to, and a second session's column keeps its own text.
+    fn ensure_files_filters(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        for source in [FileSource::Local, FileSource::Remote] {
+            if self.files_filter_fields.contains_key(&(id, source)) {
+                continue;
+            }
+            let placeholder = self.strings().files_filter_placeholder;
+            let existing = self.files.filter_of(id, source).unwrap_or("").to_owned();
+            let field = cx.new(|cx| {
+                if existing.is_empty() {
+                    TextField::new(placeholder, cx)
+                } else {
+                    TextField::with_text(placeholder, &existing, cx)
+                }
+            });
+            let view = cx.entity().downgrade();
+            cx.observe(&field, move |_field_owner, text_field, cx| {
+                let text = text_field.read(cx).text().to_owned();
+                view.update(cx, |view, cx| {
+                    if view.files.set_filter(id, source, text) {
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            self.files_filter_fields.insert((id, source), field);
+        }
+    }
+
+    /// Drops the filter fields of one session.
+    fn forget_files_filters(&mut self, id: SessionId) {
+        self.files_filter_fields
+            .retain(|(session, _), _| *session != id);
+    }
+
+    /// The entries a batch action would act on, with what each one is (R14).
+    fn files_marked_targets(&self, id: SessionId, source: FileSource) -> Vec<DeleteTarget> {
+        let Some(browser) = self.files.browser_in(id, source) else {
+            return Vec::new();
+        };
+        self.files
+            .marked(id, source)
+            .iter()
+            .filter_map(|name| {
+                browser
+                    .entry(name)
+                    .map(|entry| DeleteTarget::new(entry.name(), entry.kind()))
+            })
+            .collect()
+    }
+
+    /// Uploads every marked local file into the remote directory on screen (R14).
+    ///
+    /// Each file becomes its own task, because a transfer is one path at a time; the
+    /// tasks are queued in the order the rows are marked, and the strip reports them
+    /// together.
+    fn files_upload_marked(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let names = self.files.marked(id, FileSource::Local);
+        if names.is_empty() {
+            return;
+        }
+        for name in &names {
+            self.files_transfer_named(id, FileSource::Local, name, cx);
+        }
+        self.files.clear_marked(id, FileSource::Local);
+        let count = copy::fill(
+            self.strings().files_uploaded_selected,
+            &[("count", &names.len().to_string())],
+        );
+        self.toast(Tone::Accent, count, None, cx);
+        cx.notify();
+    }
+
+    /// Downloads every marked remote file into the local directory on screen (R14).
+    fn files_download_marked(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let names = self.files.marked(id, FileSource::Remote);
+        if names.is_empty() {
+            return;
+        }
+        for name in &names {
+            self.files_transfer_named(id, FileSource::Remote, name, cx);
+        }
+        self.files.clear_marked(id, FileSource::Remote);
+        let count = copy::fill(
+            self.strings().files_downloaded_selected,
+            &[("count", &names.len().to_string())],
+        );
+        self.toast(Tone::Accent, count, None, cx);
+        cx.notify();
+    }
+
+    /// Asks about deleting every marked entry of one column (R14).
+    fn files_ask_delete_marked(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self.files_marked_targets(id, source);
+        if targets.is_empty() {
+            return;
+        }
+        self.files_ask_delete_many(id, source, targets, cx);
+    }
+
+    /// Copies the full path of every marked entry, one per line (R14).
+    fn files_copy_marked(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
+        let Some(directory) = self
+            .files
+            .browser_in(id, source)
+            .and_then(|browser| browser.current_directory())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let marked = self.files.marked(id, source);
+        if marked.is_empty() {
+            return;
+        }
+        let paths: Vec<String> = marked
+            .iter()
+            .map(|name| {
+                let path = shellune_core::join_path(&directory, name);
+                match source {
+                    FileSource::Local => files_menu::native_local_path(&path),
+                    FileSource::Remote => path,
+                }
+            })
+            .collect();
+        let text = paths.join("\n");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        self.toast(Tone::Positive, copy::ux().toast_path_copied, Some(text), cx);
     }
 
     fn files_up(&mut self, id: SessionId, source: FileSource, cx: &mut Context<Self>) {
@@ -10947,6 +11347,8 @@ impl ShelluneView {
     /// The poll loop sees at its next tick that no view is left open and stops.
     fn end_files(&mut self, id: SessionId) {
         self.close_files_question(id);
+        self.forget_files_filters(id);
+        self.files_on_close();
         self.files.detach(id);
         // A transfer of this session has nowhere left to go: its connection is the one
         // that just ended, so its tasks are cancelled while the tasks of every other
@@ -11017,14 +11419,34 @@ impl ShelluneView {
         kind: FileKind,
         cx: &mut Context<Self>,
     ) {
-        if self.files.browser_in(id, source).is_none() {
+        self.files_ask_delete_many(
+            id,
+            source,
+            vec![crate::app::files::DeleteTarget::new(name, kind)],
+            cx,
+        );
+    }
+
+    /// Asks whether several entries should be deleted, naming every one of them (R14).
+    ///
+    /// The question states what the batch really covers - the exact paths, how many of
+    /// them are folders, and that a folder goes with its contents - because a
+    /// confirmation that only counts the entries cannot be checked by the person
+    /// answering it.
+    fn files_ask_delete_many(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        entries: Vec<crate::app::files::DeleteTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        if entries.is_empty() || self.files.browser_in(id, source).is_none() {
             return;
         }
         self.files_dialog = Some(FilesDialog::Delete {
             session: id,
             source,
-            name: name.to_owned(),
-            kind,
+            entries,
             problem: None,
         });
         self.clear_files_fields();
@@ -11236,14 +11658,15 @@ impl ShelluneView {
             FilesDialog::Delete {
                 session,
                 source,
-                name,
+                entries,
                 ..
             } => {
-                if *source == FileSource::Remote {
-                    self.files.delete(*session, name)
-                } else {
-                    self.files.delete_in(*session, *source, name)
-                }
+                // A batch goes through the same queue as a single deletion: the first
+                // request leaves now and the rest follow as each answer lands (R14).
+                let names: Vec<String> = entries.iter().map(|target| target.name.clone()).collect();
+                self.files
+                    .delete_many(*session, *source, &names)
+                    .map(|_| ())
             }
             FilesDialog::Upload { .. } | FilesDialog::Download { .. } => Ok(()),
         };
@@ -11344,7 +11767,10 @@ impl ShelluneView {
                     .map(|source| ((*id, source), self.files.outcome_in(*id, source).cloned()))
             })
             .collect();
-        let listed = self.files.pump();
+        // A directory report that arrived while this session was in the background is
+        // followed now that it is the one on screen (R15).
+        let caught_up = self.files.catch_up_follow(self.active);
+        let listed = self.files.pump() || caught_up;
         if listed {
             self.announce_file_changes(&outcomes_before, cx);
         }
@@ -11486,8 +11912,45 @@ impl ShelluneView {
             self.files_step_stop(id, delta, window, cx);
             return true;
         }
+        // The batch keys belong to the listing itself: Shift with the arrows extends the
+        // marks to the row the keyboard moves to, Space marks the row it is on and moves
+        // on, and Ctrl+A marks every row the filter lets through. They come before the
+        // "modified keys are left alone" rule because they are what a batch is built
+        // with, and only while the listing holds the keys (R14).
+        let on_the_listing = self
+            .files_keyboard_stop(window, cx)
+            .is_some_and(|(at, stop)| at == source && stop == FilesStop::Body);
+        if on_the_listing
+            && (modifiers.control || modifiers.platform)
+            && key == "a"
+            && !modifiers.alt
+        {
+            self.files.mark_all(id, source, true);
+            cx.notify();
+            return true;
+        }
+        if on_the_listing
+            && modifiers.shift
+            && matches!(key, "up" | "down")
+            && !modifiers.control
+            && !modifiers.alt
+        {
+            let delta = if key == "up" { -1 } else { 1 };
+            self.files_move_selection_marked(id, source, delta, cx);
+            return true;
+        }
         if modifiers.modified() {
             return false;
+        }
+        if on_the_listing && key == "space" {
+            // A mark is made from the keyboard the same way it is made with Ctrl+click,
+            // and the cursor then moves on so a run of rows is marked by repeating Space.
+            if let Some(name) = self.files.selected(id, source).map(str::to_owned) {
+                self.files.toggle_mark(id, source, &name);
+                self.files_move_selection(id, source, 1, cx);
+            }
+            cx.notify();
+            return true;
         }
         if matches!(key, "pageup" | "pagedown" | "home" | "end") {
             if self
@@ -11636,6 +12099,14 @@ impl ShelluneView {
                 continue;
             }
             stops.push((source, FilesStop::Body));
+            // The filter sits directly under the path, so it comes before the toolbar's
+            // actions in reading order (R14). It is only a stop while a listing is on
+            // screen, because that is the only state in which the field is drawn: a
+            // failed read offers its typed entries instead, and a stop nothing drew
+            // would take the ring nowhere.
+            if self.files_filter_shown(id, source) {
+                stops.push((source, FilesStop::Filter));
+            }
             if source == FileSource::Remote {
                 stops.push((source, FilesStop::ToolbarUpload));
                 if self.files_without_a_listing(id) {
@@ -11721,6 +12192,14 @@ impl ShelluneView {
             FilesStop::QuestionRecursive => self.files_question_recursive_focus.clone(),
             FilesStop::QuestionConfirm => self.files_question_confirm_focus.clone(),
             FilesStop::QuestionCancel => self.files_question_cancel_focus.clone(),
+            FilesStop::Filter => {
+                let id = self.active?;
+                self.files_filter_fields
+                    .get(&(id, source))?
+                    .read(cx)
+                    .focus_handle()
+                    .clone()
+            }
             FilesStop::Follow => self.files_follow_focus.clone(),
             FilesStop::Transfers => self.files_transfer_focus.clone(),
             FilesStop::Close => self.files_close_focus.clone(),
@@ -11780,7 +12259,7 @@ impl ShelluneView {
             FilesStop::Body => None,
             // The switch back to the terminal is in the session bar above the column, so
             // no slice of the column can hide it. The transfer strip is its own box.
-            FilesStop::Close | FilesStop::Transfers | FilesStop::Follow => None,
+            FilesStop::Close | FilesStop::Transfers | FilesStop::Follow | FilesStop::Filter => None,
             FilesStop::ToolbarUpload | FilesStop::ToolbarDownload => {
                 self.files_panel_scroll(source).bounds_for_item(0)
             }
@@ -11897,7 +12376,7 @@ impl ShelluneView {
             FilesStop::ToolbarDownload | FilesStop::CardDownload => {
                 self.files_ask_download(id, None, cx);
             }
-            FilesStop::QuestionLocal | FilesStop::QuestionRemote => {
+            FilesStop::QuestionLocal | FilesStop::QuestionRemote | FilesStop::Filter => {
                 self.files_focus_stop(source, stop, window, cx);
             }
             FilesStop::QuestionSftp => self.files_choose_protocol(TransferProtocol::Sftp, cx),
@@ -12072,20 +12551,42 @@ impl ShelluneView {
 
     /// The names in one listing, in the order the column draws them.
     fn files_entry_names(&self, id: SessionId, source: FileSource) -> Vec<String> {
+        // The rows on screen, in the order they are read: an arrow key that followed the
+        // server's own order would jump over the column's sort and could land on a row
+        // the filter hides (R14).
         self.files
-            .browser_in(id, source)
-            .and_then(|browser| browser.state().listing())
-            .map(|listing| {
-                listing
-                    .entries()
-                    .iter()
-                    .map(|entry| entry.name().to_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+            .rows(id, source)
+            .iter()
+            .map(|entry| entry.name().to_owned())
+            .collect()
     }
 
     /// Moves the keyboard selection by one row, staying inside the listing.
+    /// Moves the keyboard's row and marks the rows it passes (R14).
+    ///
+    /// The row it came from is marked too, because that is the row the user was on when
+    /// they started the range: Shift+Down from the first row marks two rows, not one.
+    fn files_move_selection_marked(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        delta: isize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(name) = self.files.selected(id, source).map(str::to_owned)
+            && !self.files.is_marked(id, source, &name)
+        {
+            self.files.toggle_mark(id, source, &name);
+        }
+        self.files_move_selection(id, source, delta, cx);
+        if let Some(name) = self.files.selected(id, source).map(str::to_owned)
+            && !self.files.is_marked(id, source, &name)
+        {
+            self.files.toggle_mark(id, source, &name);
+        }
+        cx.notify();
+    }
+
     fn files_move_selection(
         &mut self,
         id: SessionId,
@@ -12618,22 +13119,7 @@ impl ShelluneView {
                         gpui::MouseButton::Right,
                         self.files_blank_menu_listener(id, source, cx),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .h(metrics.scale(28.0))
-                            .px(metrics.scale(spacing::SNUG))
-                            .border_b_1()
-                            .border_color(theme::swatch(palette::BORDER))
-                            .text_size(metrics.caption_size())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(div().flex_1().child(ux.files_name))
-                            .child(div().w(metrics.scale(80.0)).child(ux.files_size))
-                            .child(div().w(files_actions_width(metrics, source))),
-                    );
+                    .child(self.files_list_header(id, source, cx));
                 if path.as_deref().is_some_and(|path| path != "/") {
                     list = list.child(self.files_parent_row(id, source, cx));
                 }
@@ -12676,10 +13162,42 @@ impl ShelluneView {
                             ),
                     );
                 }
-                for (index, entry) in listing.entries().iter().enumerate() {
+                // The rows the column shows: the listing ordered by the column's own
+                // sort and reduced by its own filter (R14). Nothing here is invented;
+                // an entry the server sent is only left out when the filter says so.
+                let rows = self.files.rows(id, source);
+                if rows.is_empty() && !listing.is_empty() {
+                    // A filter that hides everything is not an empty folder, and saying
+                    // so is what tells the reader their text is why the list is blank.
+                    let none_id = files_element_id(source, "filter.none");
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_none()
+                            .gap(metrics.scale(spacing::HAIRLINE))
+                            .p(metrics.scale(spacing::SNUG))
+                            .debug_selector(move || none_id.to_string())
+                            .child(
+                                div()
+                                    .text_size(metrics.label_size())
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                    .child(SharedString::from(strings.files_filter_none)),
+                            ),
+                    );
+                }
+                for (index, entry) in rows.iter().enumerate() {
                     list = list.child(self.files_row(id, source, index, entry, cx));
                 }
-                list.into_any_element()
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .child(self.files_filter_row(id, source, cx))
+                    .child(list)
+                    .into_any_element()
             }
         };
 
@@ -12751,6 +13269,11 @@ impl ShelluneView {
             )
             .child(header)
             .child(crumb_row);
+        // The batch of one column sits under its path, where the rows it acts on are:
+        // what it covers is stated once, above the listing it came from (R14).
+        if !self.files.marked(id, source).is_empty() {
+            panel = panel.child(self.files_selection_bar(id, source, cx));
+        }
         if remote {
             panel = panel.child(self.files_follow_row(id, cx));
         }
@@ -13505,50 +14028,123 @@ impl ShelluneView {
                         ),
                 ));
             }
-            FilesDialog::Delete { name, kind, .. } => {
-                let target = directory
-                    .as_deref()
-                    .map(|directory| join_path(directory, name))
-                    .unwrap_or_else(|| name.clone());
-                rows.push((
-                    Vec::new(),
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                        .debug_selector(|| "files.question.target".to_owned())
-                        .child(SharedString::from(format!(
-                            "{}: {}",
-                            strings.files_target_label,
-                            display_path(dialog.source(), &target)
-                        ))),
-                ));
-                rows.push((
-                    Vec::new(),
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                        .debug_selector(|| "files.question.kind".to_owned())
-                        .child(SharedString::from(format!(
-                            "{}: {}",
-                            strings.files_kind_label,
-                            kind_label(*kind, strings)
-                        ))),
-                ));
-                rows.push((
-                    Vec::new(),
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .debug_selector(|| "files.question.note".to_owned())
-                        .child(SharedString::from(
-                            match (dialog.source(), kind.is_directory()) {
-                                (FileSource::Local, true) => strings.files_delete_recursive_local,
-                                (FileSource::Local, false) => strings.files_delete_file_local,
-                                (FileSource::Remote, true) => strings.files_delete_recursive,
-                                (FileSource::Remote, false) => strings.files_delete_file,
-                            },
-                        )),
-                ));
+            FilesDialog::Delete { entries, .. } => {
+                if let [only] = entries.as_slice() {
+                    let target = directory
+                        .as_deref()
+                        .map(|directory| join_path(directory, &only.name))
+                        .unwrap_or_else(|| only.name.clone());
+                    rows.push((
+                        Vec::new(),
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(|| "files.question.target".to_owned())
+                            .child(SharedString::from(format!(
+                                "{}: {}",
+                                strings.files_target_label,
+                                display_path(dialog.source(), &target)
+                            ))),
+                    ));
+                    rows.push((
+                        Vec::new(),
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .debug_selector(|| "files.question.kind".to_owned())
+                            .child(SharedString::from(format!(
+                                "{}: {}",
+                                strings.files_kind_label,
+                                kind_label(only.kind, strings)
+                            ))),
+                    ));
+                    rows.push((
+                        Vec::new(),
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "files.question.note".to_owned())
+                            .child(SharedString::from(
+                                match (dialog.source(), only.kind.is_directory()) {
+                                    (FileSource::Local, true) => {
+                                        strings.files_delete_recursive_local
+                                    }
+                                    (FileSource::Local, false) => strings.files_delete_file_local,
+                                    (FileSource::Remote, true) => strings.files_delete_recursive,
+                                    (FileSource::Remote, false) => strings.files_delete_file,
+                                },
+                            )),
+                    ));
+                } else {
+                    // Several entries: every one of them is named with its path, so the
+                    // question can be checked item by item before it is answered (R14).
+                    let folders = dialog.target_folders();
+                    let files = entries.len().saturating_sub(folders);
+                    let count = entries.len().to_string();
+                    rows.push((
+                        Vec::new(),
+                        div()
+                            .flex_wrap()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(|| "files.question.target".to_owned())
+                            .child(SharedString::from(format!(
+                                "{} {}",
+                                copy::fill(strings.files_delete_many_target, &[("count", &count)]),
+                                directory
+                                    .as_deref()
+                                    .map(|directory| display_path(dialog.source(), directory))
+                                    .unwrap_or_default()
+                            ))),
+                    ));
+                    for (index, entry) in entries.iter().enumerate() {
+                        let path = directory
+                            .as_deref()
+                            .map(|directory| join_path(directory, &entry.name))
+                            .unwrap_or_else(|| entry.name.clone());
+                        rows.push((
+                            Vec::new(),
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(metrics.scale(spacing::TIGHT))
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                                .debug_selector(move || format!("files.question.item.{index}"))
+                                .child(SharedString::from(format!(
+                                    "[{}]",
+                                    kind_label(entry.kind, strings)
+                                )))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "files.question.item.path.{index}"
+                                        )))
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .child(SharedString::from(display_path(
+                                            dialog.source(),
+                                            &path,
+                                        ))),
+                                ),
+                        ));
+                    }
+                    rows.push((
+                        Vec::new(),
+                        div()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .debug_selector(|| "files.question.note".to_owned())
+                            .child(SharedString::from(copy::fill(
+                                strings.files_delete_many_note,
+                                &[
+                                    ("files", &files.to_string()),
+                                    ("folders", &folders.to_string()),
+                                ],
+                            ))),
+                    ));
+                }
                 // A deletion the browser refuses says so here. Without it, confirming a
                 // delete of an entry that is no longer in the directory - removed by
                 // someone else, or gone since the last Refresh - would look like a button
@@ -13754,6 +14350,265 @@ impl ShelluneView {
     /// A folder opens on click; a file is selected on click and can be dragged to
     /// the other side. Rename, copy to the other side and delete are small icons at
     /// the end of the row, each with its name in a tooltip.
+    /// The header of one column's listing: the two keys it can be sorted by (R14).
+    ///
+    /// The keys are the column's own: pressing this computer's name header leaves the
+    /// server's order alone, and the arrow beside the key says which way it runs.
+    fn files_list_header(&self, id: SessionId, source: FileSource, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(metrics.scale(28.0))
+            .px(metrics.scale(spacing::SNUG))
+            .border_b_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .text_size(metrics.caption_size())
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::swatch(palette::TEXT_MUTED))
+            .child(self.files_sort_cell(id, source, SortKey::Name, cx))
+            .child(self.files_sort_cell(id, source, SortKey::Size, cx))
+            .child(div().w(files_actions_width(metrics, source)))
+    }
+
+    /// One sortable key of a column's header (R14).
+    fn files_sort_cell(
+        &self,
+        id: SessionId,
+        source: FileSource,
+        key: SortKey,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let sort = self
+            .files
+            .sort_of(id, source)
+            .unwrap_or_else(FileSort::name);
+        let label = match key {
+            SortKey::Name => ux.files_name,
+            SortKey::Size => ux.files_size,
+        };
+        let arrow = match (sort.key() == key, sort.descending()) {
+            (true, false) => " ↑",
+            (true, true) => " ↓",
+            _ => "",
+        };
+        let tip = match (key, sort.key() == key && sort.descending()) {
+            (SortKey::Name, true) => strings.files_sort_desc,
+            (SortKey::Name, false) => strings.files_sort_asc,
+            (SortKey::Size, true) => strings.files_sort_size_desc,
+            (SortKey::Size, false) => strings.files_sort_size_asc,
+        };
+        let prefix = match source {
+            FileSource::Remote => "files",
+            FileSource::Local => "files.local",
+        };
+        let key_name = match key {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+        };
+        let cell_id = format!("{prefix}.sort.{key_name}");
+        let arrow_id = format!("{prefix}.sort.arrow.{key_name}");
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        div()
+            .id(SharedString::from(cell_id.clone()))
+            .debug_selector(move || cell_id.clone())
+            .flex()
+            .items_center()
+            .gap(metrics.scale(2.0))
+            .rounded(px(radius::SMALL))
+            .cursor_pointer()
+            .when(key == SortKey::Name, |cell| cell.flex_1().min_w(px(0.0)))
+            .when(key == SortKey::Size, |cell| {
+                cell.flex_none().w(metrics.scale(80.0))
+            })
+            .hover(move |style| style.bg(hover))
+            .tooltip(components::tooltip(SharedString::from(tip)))
+            .on_click(cx.listener(move |view, _event, _window, cx| {
+                if view.files.sort_by(id, source, key) {
+                    cx.notify();
+                }
+            }))
+            .child(div().truncate().child(SharedString::from(label)))
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector(move || arrow_id.clone())
+                    .child(SharedString::from(arrow)),
+            )
+    }
+
+    /// The filter of one column: its field, how many names it lets through, and the
+    /// button that clears it (R14).
+    fn files_filter_row(&self, id: SessionId, source: FileSource, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let prefix = match source {
+            FileSource::Remote => "files",
+            FileSource::Local => "files.local",
+        };
+        let filter = self.files.filter_of(id, source).unwrap_or("").to_owned();
+        let mut row = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(move || format!("{prefix}.filter"));
+        if let Some(field) = self
+            .files_filter_fields
+            .get(&(id, source))
+            .filter(|_| self.files_filter_shown(id, source))
+        {
+            row = row.child(div().flex().flex_1().min_w(px(0.0)).child(field.clone()));
+        }
+        if let Some((shown, total)) = self.files.counts(id, source) {
+            let count = copy::fill(
+                strings.files_filter_count,
+                &[("shown", &shown.to_string()), ("total", &total.to_string())],
+            );
+            row = row.child(
+                div()
+                    .flex_none()
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .debug_selector(move || format!("{prefix}.filter.count"))
+                    .child(SharedString::from(count)),
+            );
+        }
+        // Every row the filter lets through, in one press: a batch of a whole folder
+        // starts here rather than by clicking each row (R14).
+        row = row.child(
+            self.text_button(
+                SharedString::from(format!("{prefix}.mark.all")),
+                strings.files_mark_all,
+                Variant::Ghost,
+                cx,
+                move |view, cx| {
+                    if view.files.mark_all(id, source, true) {
+                        cx.notify();
+                    }
+                },
+            )
+            .flex_none(),
+        );
+        if !filter.is_empty() {
+            let clear_id = format!("{prefix}.filter.clear");
+            row = row.child(
+                self.text_button(
+                    SharedString::from(clear_id),
+                    strings.files_filter_clear,
+                    Variant::Ghost,
+                    cx,
+                    move |view, cx| {
+                        if let Some(field) = view.files_filter_fields.get(&(id, source)).cloned() {
+                            field.update(cx, |field, cx| field.set_text("", cx));
+                        }
+                        if view.files.set_filter(id, source, "") {
+                            cx.notify();
+                        }
+                    },
+                )
+                .flex_none(),
+            );
+        }
+        row
+    }
+
+    /// What a column does with the entries it has marked (R14).
+    ///
+    /// The bar holds every batch action and says how to add to the marks, so a batch is
+    /// reachable with the keyboard and with the pointer from the same place.
+    fn files_selection_bar(
+        &self,
+        id: SessionId,
+        source: FileSource,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let prefix = match source {
+            FileSource::Remote => "files",
+            FileSource::Local => "files.local",
+        };
+        let marked = self.files.marked(id, source);
+        let count = marked.len().to_string();
+        let mut bar = components::banner(Tone::Accent, metrics)
+            .flex_wrap()
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(move || format!("{prefix}.selection"))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(move || format!("{prefix}.selection.count"))
+                    .child(SharedString::from(copy::fill(
+                        strings.files_marked_count,
+                        &[("count", &count)],
+                    ))),
+            )
+            // How the marks are made, said once where they are used: a batch that can
+            // only be built by guessing is a batch nobody finds (R14).
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .id(SharedString::from(format!("{prefix}.selection.hint")))
+                    .child(SharedString::from(strings.files_marked_hint)),
+            );
+        let is_remote = source == FileSource::Remote;
+        let action_id = |name: &str| SharedString::from(format!("{prefix}.mark.{name}"));
+        if is_remote {
+            bar = bar.child(self.text_button(
+                action_id("download"),
+                copy::fill(strings.files_download_selected, &[("count", &count)]),
+                Variant::Soft,
+                cx,
+                move |view, cx| view.files_download_marked(id, cx),
+            ));
+        } else {
+            bar = bar.child(self.text_button(
+                action_id("upload"),
+                copy::fill(strings.files_upload_selected, &[("count", &count)]),
+                Variant::Soft,
+                cx,
+                move |view, cx| view.files_upload_marked(id, cx),
+            ));
+        }
+        bar = bar
+            .child(self.text_button(
+                action_id("copy"),
+                copy::fill(strings.files_copy_selected, &[("count", &count)]),
+                Variant::Secondary,
+                cx,
+                move |view, cx| view.files_copy_marked(id, source, cx),
+            ))
+            .child(self.text_button(
+                action_id("delete"),
+                copy::fill(strings.files_delete_selected, &[("count", &count)]),
+                Variant::Danger,
+                cx,
+                move |view, cx| view.files_ask_delete_marked(id, source, cx),
+            ))
+            .child(self.text_button(
+                action_id("clear"),
+                strings.files_clear_marks,
+                Variant::Ghost,
+                cx,
+                move |view, cx| {
+                    if view.files.clear_marked(id, source) {
+                        cx.notify();
+                    }
+                },
+            ));
+        bar
+    }
     fn files_row(
         &self,
         id: SessionId,
@@ -13915,6 +14770,45 @@ impl ShelluneView {
         let hover = theme::swatch(palette::SURFACE_HOVER);
         let row_selector = format!("{prefix}.row.{index}");
         let selected = self.files.selected(id, source) == Some(name);
+        // The mark is what a batch acts on, so it is drawn on the row itself and its box
+        // is a target of its own: a click there changes the mark and nothing else (R14).
+        let marked = self.files.is_marked(id, source, name);
+        let mark_id = format!("{prefix}.mark.{index}");
+        let mark_label = if marked {
+            ux.files_unmark_row
+        } else {
+            ux.files_mark_row
+        };
+        let mark_name = name.to_owned();
+        let mark_box = div()
+            .id(SharedString::from(mark_id.clone()))
+            .debug_selector(move || mark_id.clone())
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(metrics.scale(16.0))
+            .rounded(px(radius::SMALL))
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(if marked {
+                palette::ACCENT
+            } else {
+                palette::TEXT_MUTED
+            }))
+            .cursor_pointer()
+            .tooltip(components::tooltip(SharedString::from(mark_label)))
+            .child(SharedString::from(if marked { "x" } else { "" }))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |view, _event: &gpui::MouseDownEvent, _window, cx| {
+                    // The box answers for itself: the row's own click would otherwise
+                    // select the row and clear the marks in the same press.
+                    cx.stop_propagation();
+                    view.files.toggle_mark(id, source, &mark_name);
+                    view.files.select(id, source, Some(mark_name.clone()));
+                    cx.notify();
+                }),
+            );
         // The row's buttons show under the pointer and on the selected row; the
         // rest of the list stays quiet. The same actions are on the right click.
         let row_group = SharedString::from(format!("{prefix}.group.{index}"));
@@ -13949,11 +14843,38 @@ impl ShelluneView {
             .px(metrics.scale(spacing::SNUG))
             .text_size(metrics.label_size())
             .when(selected, |row| row.bg(theme::swatch(palette::ACCENT_TINT)))
-            .when(!selected, |row| row.hover(move |style| style.bg(hover)))
-            .on_click(cx.listener(move |view, _event, _window, cx| {
-                view.files.select(id, source, Some(select_name.clone()));
-                cx.notify();
-            }))
+            .when(marked && !selected, |row| {
+                row.bg(theme::swatch(palette::SURFACE_SELECTED))
+            })
+            .when(!selected && !marked, |row| {
+                row.hover(move |style| style.bg(hover))
+            })
+            .on_click(
+                cx.listener(move |view, event: &gpui::ClickEvent, _window, cx| {
+                    // A plain click is one row and clears the batch; Ctrl adds one row to it
+                    // and Shift marks the range between the keyboard's row and this one, so
+                    // both ways of building a batch are pointer gestures (R14).
+                    let modifiers = event.modifiers();
+                    let name = select_name.clone();
+                    if modifiers.shift {
+                        let anchor = view
+                            .files
+                            .selected(id, source)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| name.clone());
+                        view.files.mark_range(id, source, &anchor, &name);
+                        view.files.select(id, source, Some(name));
+                    } else if modifiers.control || modifiers.platform {
+                        view.files.toggle_mark(id, source, &name);
+                        view.files.select(id, source, Some(name));
+                    } else {
+                        view.files.select(id, source, Some(name));
+                        view.files.clear_marked(id, source);
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(mark_box)
             .child(entry_row)
             .child(actions)
     }
@@ -14027,6 +14948,72 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn closing_for_test(&self) -> Option<SessionId> {
         self.closing
+    }
+
+    /// The rows one column shows, in the order it shows them, for a test (R14).
+    #[cfg(test)]
+    pub fn files_rows_for_test(&self, id: SessionId, source: FileSource) -> Vec<String> {
+        self.files
+            .rows(id, source)
+            .iter()
+            .map(|entry| entry.name().to_owned())
+            .collect()
+    }
+
+    /// How many names a column shows out of how many it holds, for a test (R14).
+    #[cfg(test)]
+    pub fn files_counts_for_test(
+        &self,
+        id: SessionId,
+        source: FileSource,
+    ) -> Option<(usize, usize)> {
+        self.files.counts(id, source)
+    }
+
+    /// Sets the text of one column's filter, for a test that would otherwise type.
+    ///
+    /// The state is the same one the field's own observer writes when a keystroke lands
+    /// in it: the observer only has to carry what the field holds, and a test that set
+    /// the value through the field would be updating the window from inside its own
+    /// update (R14).
+    #[cfg(test)]
+    pub fn files_filter_set_for_test(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.files.set_filter(id, source, text) {
+            cx.notify();
+        }
+    }
+
+    /// The entries one column has marked, for a test (R14).
+    #[cfg(test)]
+    pub fn files_marked_for_test(&self, id: SessionId, source: FileSource) -> Vec<String> {
+        self.files.marked(id, source)
+    }
+
+    /// Whether the file view is docked beside the terminal, for a test (R14).
+    #[cfg(test)]
+    pub fn files_docked_for_test(&self) -> bool {
+        self.files_docked()
+    }
+
+    /// The entries the open delete question is about, for a test (R14).
+    #[cfg(test)]
+    pub fn files_delete_question_for_test(&self) -> Option<Vec<String>> {
+        self.files_dialog
+            .as_ref()
+            .filter(|dialog| matches!(dialog, FilesDialog::Delete { .. }))
+            .map(|dialog| {
+                dialog
+                    .targets()
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect()
+            })
     }
 
     /// Replaces the text of the open question, for a test that types without a keyboard.

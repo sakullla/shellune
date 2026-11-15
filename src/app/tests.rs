@@ -24796,6 +24796,101 @@ async fn the_file_view_follows_the_directory_the_shell_reports(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn a_step_up_the_root_cannot_take_keeps_following_on(cx: &mut TestAppContext) {
+    // R15: only a directory the user really moved to is browsing by hand. At the root
+    // there is no parent, so the switch must not quietly turn itself off.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    let channel = files.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(id, "web", "deploy@10.0.0.5:22", Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    feed_session(cx, &view, id, &directory_report("/"));
+    click(cx, "session.files");
+    files.reply(1, "/", &[("etc", shellune_core::FileKind::Directory)]);
+    pump_files(cx, &view);
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/"));
+    assert!(cx.update(|_window, app| view.read(app).files_follows(id)));
+    let sent = files.requests().len();
+    press_key(cx, "left");
+    assert!(
+        cx.update(|_window, app| view.read(app).files_follows(id)),
+        "the step the column cannot take does not turn following off"
+    );
+    assert_eq!(
+        files.requests().len(),
+        sent,
+        "nothing is asked for a directory that has no parent"
+    );
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/"));
+}
+#[gpui::test]
+async fn following_opens_on_the_reported_directory_and_survives_the_background(
+    cx: &mut TestAppContext,
+) {
+    // Three edges R15 has to hold: the report that arrived before the view opened is the
+    // directory it opens on, a step up the column cannot take is not the user browsing,
+    // and a report that arrives while another session is in front waits for its own.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+
+    // 1. A report before the view exists is the directory the first listing asks for,
+    //    and the note says so instead of "no directory reported yet".
+    let channel = files.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(id, "web", "deploy@10.0.0.5:22", Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    feed_session(cx, &view, id, &directory_report("/var/log"));
+    click(cx, "session.files");
+    let first = files.requests().first().cloned();
+    assert!(
+        matches!(&first, Some(shellune_core::BrowseRequest::List { path, .. }) if path == "/var/log"),
+        "the first listing is the reported directory, not the login one: {first:?}"
+    );
+    files.reply(1, "/var/log", &[("syslog", shellune_core::FileKind::File)]);
+    pump_files(cx, &view);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_follow_note(id)),
+        Some(crate::app::files::FollowNote::Following {
+            path: "/var/log".to_owned()
+        }),
+        "the column says it follows the directory it was asked for"
+    );
+
+    // 2. A report that arrives while another session is in front moves nothing until
+    //    this session is the one on screen again.
+    let _second = live_remote_second(cx, &view, id);
+    feed_session(cx, &view, id, &directory_report("/etc"));
+    assert_eq!(
+        remote_path(cx, &view, id).as_deref(),
+        Some("/var/log"),
+        "the listing of a background session is left where it is"
+    );
+    show_remote_terminal(cx, &view, id);
+    pump_files(cx, &view);
+    let request = match files.requests().last().cloned() {
+        Some(shellune_core::BrowseRequest::List { path, request }) => {
+            assert_eq!(
+                path, "/etc",
+                "the report is followed once this session is in front"
+            );
+            request
+        }
+        other => panic!("coming back asks for the reported directory, got {other:?}"),
+    };
+    files.reply(request, "/etc", &[("hosts", shellune_core::FileKind::File)]);
+    pump_files(cx, &view);
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/etc"));
+}
+#[gpui::test]
 async fn browsing_by_hand_stops_the_following_and_the_switch_takes_it_back(
     cx: &mut TestAppContext,
 ) {
@@ -24966,6 +25061,299 @@ async fn the_follow_switch_is_a_keyboard_stop_and_answers_enter(cx: &mut TestApp
     assert!(cx.update(|_window, app| view.read(app).files_follows(id)));
 }
 
+/// The names one column shows, in the order it shows them (R14).
+fn column_rows(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+    source: FileSource,
+) -> Vec<String> {
+    cx.update(|_window, app| view.read(app).files_rows_for_test(id, source))
+}
+
+/// The entries one column has marked (R14).
+fn column_marked(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+    source: FileSource,
+) -> Vec<String> {
+    cx.update(|_window, app| view.read(app).files_marked_for_test(id, source))
+}
+
+/// Every deletion the scripted connection was asked for, in the order it was asked (R14).
+fn deleted_paths(answers: &FileAnswers) -> Vec<String> {
+    answers
+        .requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            shellune_core::BrowseRequest::Delete { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The names as the columns report them, which is what an assertion compares.
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[gpui::test]
+async fn each_column_sorts_and_filters_its_own_listing(cx: &mut TestAppContext) {
+    // R14 wants sorting and filtering to belong to one column: narrowing the server's
+    // side must leave this computer's side alone, and neither may reorder the other.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (remote, _local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[
+            ("b.txt", shellune_core::FileKind::File),
+            ("a.txt", shellune_core::FileKind::File),
+            ("logs", shellune_core::FileKind::Directory),
+        ],
+    );
+    assert_eq!(
+        column_rows(cx, &view, id, FileSource::Local),
+        names(&["logs", "a.txt", "b.txt"]),
+        "a folder stays first and the names run A to Z"
+    );
+    // The same key pressed again reverses the order, and the folder still leads.
+    click(cx, "files.local.sort.name");
+    assert_eq!(
+        column_rows(cx, &view, id, FileSource::Local),
+        names(&["logs", "b.txt", "a.txt"])
+    );
+    assert_eq!(
+        column_rows(cx, &view, id, FileSource::Remote),
+        names(&["docs", "notes.txt"]),
+        "the server's column keeps its own order"
+    );
+
+    // A filter is read from the column it was typed into, and costs no request.
+    let sent = remote.requests().len();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.files_filter_set_for_test(id, FileSource::Remote, "note", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        column_rows(cx, &view, id, FileSource::Remote),
+        names(&["notes.txt"])
+    );
+    assert_eq!(
+        cx.update(|_window, app| { view.read(app).files_counts_for_test(id, FileSource::Remote) }),
+        Some((1, 2)),
+        "the column says how many names the filter lets through"
+    );
+    assert_eq!(
+        column_rows(cx, &view, id, FileSource::Local),
+        names(&["logs", "b.txt", "a.txt"]),
+        "the other column is not filtered"
+    );
+    assert_eq!(
+        remote.requests().len(),
+        sent,
+        "filtering a listing asks the server for nothing"
+    );
+}
+
+#[gpui::test]
+async fn marking_rows_with_the_pointer_uploads_every_marked_file(cx: &mut TestAppContext) {
+    // R14 asks for a batch to be reachable with the pointer as well as the keyboard, and
+    // R16 for every file to become its own task: one transfer carries one path.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (remote, _local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[
+            ("a.txt", shellune_core::FileKind::File),
+            ("b.txt", shellune_core::FileKind::File),
+        ],
+    );
+    let transfers = TransferAnswers::accepting();
+    let channel = transfers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_transfers_for_test(id, Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // The box on each row is a target of its own.
+    click(cx, "files.local.mark.0");
+    click(cx, "files.local.mark.1");
+    assert_eq!(
+        column_marked(cx, &view, id, FileSource::Local),
+        names(&["a.txt", "b.txt"])
+    );
+    click(cx, "files.local.mark.upload");
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 2, "one task per marked file: {starts:?}");
+    assert_eq!(
+        starts[0].source.as_str(),
+        "C:\\work\\a.txt",
+        "the first task is the first marked row"
+    );
+    assert_eq!(
+        column_marked(cx, &view, id, FileSource::Local),
+        Vec::<String>::new(),
+        "the batch is done, so nothing is left marked"
+    );
+    let _ = remote;
+}
+
+#[gpui::test]
+async fn the_keyboard_marks_rows_and_a_batch_delete_names_every_entry(cx: &mut TestAppContext) {
+    // R14: a batch is built with the keyboard (Space marks the row under the cursor and
+    // moves on, Ctrl+A marks the column) and the question names every entry it covers,
+    // while the requests go out one at a time.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &files);
+    files.reply(
+        1,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Body)),
+        "the listing holds the keys"
+    );
+    press_key(cx, "down");
+    press_key(cx, "space");
+    press_key(cx, "space");
+    assert_eq!(
+        column_marked(cx, &view, id, FileSource::Remote),
+        names(&["docs", "notes.txt"]),
+        "Space marks the row it is on and moves to the next"
+    );
+
+    click(cx, "files.mark.delete");
+    assert_eq!(
+        cx.update(|_window, app| { view.read(app).files_delete_question_for_test() }),
+        Some(names(&["docs", "notes.txt"])),
+        "the question names every entry it would delete"
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.submit_files_change_for_test(cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        deleted_paths(&files),
+        names(&["/home/deploy/docs"]),
+        "only the first deletion has been asked for"
+    );
+    files.changed(
+        2,
+        shellune_core::MutationOutcome::new(
+            shellune_core::MutationAction::Delete {
+                path: "/home/deploy/docs".to_owned(),
+                kind: shellune_core::FileKind::Directory,
+            },
+            vec![shellune_core::MutationStep::done(
+                "/home/deploy/docs",
+                Some(shellune_core::FileKind::Directory),
+            )],
+        ),
+    );
+    pump_files(cx, &view);
+    files.reply(
+        3,
+        "/home/deploy",
+        &[("notes.txt", shellune_core::FileKind::File)],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        deleted_paths(&files),
+        names(&["/home/deploy/docs", "/home/deploy/notes.txt"]),
+        "the second deletion follows once the first answer and its listing arrived"
+    );
+}
+
+#[gpui::test]
+async fn a_wide_window_docks_the_files_beside_the_terminal_and_keeps_both(cx: &mut TestAppContext) {
+    // R14 asks a wide window to show the terminal and the files at once, and asks a
+    // layout switch to change neither the terminal nor either column's path.
+    let (view, cx) = remote_view(cx);
+    cx.simulate_resize(size(px(1680.0), px(940.0)));
+    cx.run_until_parked();
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &files);
+    files.reply(
+        1,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+    assert!(
+        cx.update(|_window, app| view.read(app).files_docked_for_test()),
+        "a window this wide docks the files beside the terminal"
+    );
+    let split = bounds_of(cx, "files.split");
+    assert!(
+        split.size.height > px(0.0),
+        "the two share one row: {split:?}"
+    );
+    let screen = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .map(|pane| pane.read(app).visible_text().join("\n"))
+            .unwrap_or_default()
+    });
+    assert!(
+        screen.contains("remote ready"),
+        "the terminal is still drawn beside the files: {screen:?}"
+    );
+
+    // The focus switch gives the files the whole width; the terminal and the paths stay.
+    let docked_width = bounds_of(cx, "files.panel").size.width;
+    click(cx, "files.mode.focus");
+    assert!(!cx.update(|_window, app| view.read(app).files_docked_for_test()));
+    // Focused, the file view has the whole client area rather than half of it. The
+    // selector of the docked row is not asked about here: a removed selector keeps the
+    // bounds of the frame that drew it.
+    let focused_width = bounds_of(cx, "files.panel").size.width;
+    assert!(
+        focused_width > docked_width,
+        "the files take the terminal's width too: {focused_width:?} against {docked_width:?}"
+    );
+    assert_eq!(
+        remote_path(cx, &view, id).as_deref(),
+        Some("/home/deploy"),
+        "the path survives the layout switch"
+    );
+    click(cx, "files.mode.dock");
+    assert!(cx.update(|_window, app| view.read(app).files_docked_for_test()));
+    assert!(cx.debug_bounds("files.split").is_some());
+    let docked_again = bounds_of(cx, "files.panel").size.width;
+    assert!(
+        docked_again < focused_width,
+        "the terminal has its half back: {docked_again:?}"
+    );
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/home/deploy"));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(id),
+        "the terminal is the same session in every arrangement"
+    );
+}
 #[gpui::test]
 async fn a_local_shell_cannot_drive_a_file_view(cx: &mut TestAppContext) {
     let Some((view, cx)) = two_shells(cx) else {

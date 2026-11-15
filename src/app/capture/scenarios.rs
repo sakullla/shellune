@@ -33,6 +33,7 @@ use shellune_storage::{
 
 use crate::app::ShelluneView;
 use crate::app::copy::Locale;
+use crate::app::files::FileSource;
 use crate::app::hosts::ConnectionChoice;
 use crate::app::keymap::Problem;
 use crate::app::nav::{Destination, Platform};
@@ -117,6 +118,23 @@ impl Variant {
     pub const fn comfortable(self) -> Self {
         Self {
             zoom: Zoom::Comfortable,
+            ..self
+        }
+    }
+
+    /// The same shot at 200% text, the ceiling of the text-size setting (R5).
+    pub const fn largest(self) -> Self {
+        Self {
+            zoom: Zoom::Largest,
+            ..self
+        }
+    }
+
+    /// The same shot at a named logical size, for layouts a default window cannot show.
+    pub const fn sized(self, width: f32, height: f32) -> Self {
+        Self {
+            width,
+            height,
             ..self
         }
     }
@@ -766,6 +784,47 @@ fn show_files_of(
     Ok(())
 }
 
+/// The file view with two rows of the server's column marked (R14).
+fn show_marked_files(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    let id = view.attach_capture_remote_session(&host, TRANSCRIPT.as_bytes(), Some(window), cx);
+    view.capture_files_marked(
+        id,
+        FileSource::Remote,
+        &["构建 产物.tar.zst", "部署 记录.log"],
+        cx,
+    );
+    if !view.files_visible(id) {
+        return Err("the file view did not open".to_owned());
+    }
+    Ok(())
+}
+
+/// The file view of a session whose server refused the read (R14).
+fn show_isolated_failure(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    let id = view.attach_capture_remote_session(&host, TRANSCRIPT.as_bytes(), Some(window), cx);
+    view.capture_files_remote_failed(id, cx);
+    if !view.files_visible(id) {
+        return Err("the file view did not open".to_owned());
+    }
+    Ok(())
+}
+
 /// The file view with a transfer in flight (R6).
 fn show_running_transfer(
     view: &mut ShelluneView,
@@ -887,6 +946,35 @@ fn files_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
 
 fn empty_files_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     files_ready_at(view, ("/home/deploy/备份/2026-10", 0))
+}
+
+fn marked_files_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    files_ready(view, _cx)?;
+    let (marked, local) = view
+        .capture_files_marks()
+        .ok_or_else(|| "no file view is open".to_owned())?;
+    if marked != 2 {
+        return Err(format!(
+            "the shot holds {marked} marked row(s), not the two the fixture marked"
+        ));
+    }
+    if local == 0 {
+        return Err("this computer's column is empty, so no batch bar could be shown".to_owned());
+    }
+    Ok(())
+}
+
+fn isolated_failure_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    let (failed, local) = view
+        .capture_files_isolation()
+        .ok_or_else(|| "no file view is open".to_owned())?;
+    if !failed {
+        return Err("the server's column does not state a failure".to_owned());
+    }
+    if local == 0 {
+        return Err("the failure cleared this computer's column as well".to_owned());
+    }
+    Ok(())
 }
 
 fn running_transfer_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
@@ -1747,7 +1835,56 @@ pub const SCENARIOS: &[Scenario] = &[
         variants: &[
             Variant::dark().chinese().comfortable(),
             Variant::dark().smallest(),
+            Variant::dark().smallest().largest(),
         ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_files,
+        ready: files_ready,
+    },
+    Scenario {
+        id: "files-marked",
+        title: "文件 · 多选与批量动作",
+        category: Category::Terminal,
+        fixture: "both columns answered from fixture listings, with two rows of the server's \
+                  column marked by the build itself",
+        evidence: "shows the marks, the batch bar and what each action covers; nothing was \
+                   transferred or deleted, and no server answered",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_marked_files,
+        ready: marked_files_ready,
+    },
+    Scenario {
+        id: "files-server-failed",
+        title: "文件 · 远端失败只影响远端",
+        category: Category::Terminal,
+        fixture: "the server's column answered with a refusal and this computer's column with \
+                  a listing, both from fixtures",
+        evidence: "shows the reason and the recovery entries of the server's column beside \
+                   this computer's unchanged list; no permission or disconnection was real",
+        quick: false,
+        variants: &[Variant::dark().chinese().smallest()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_isolated_failure,
+        ready: isolated_failure_ready,
+    },
+    Scenario {
+        id: "files-split",
+        title: "文件 · 同屏终端与文件",
+        category: Category::Terminal,
+        fixture: "a window wide enough to dock both, with the terminal's transcript and both \
+                  fixture listings",
+        evidence: "shows the terminal and the file view in one row, which is what a wide \
+                   window draws; the transcript is a fixture, not a live shell",
+        quick: false,
+        variants: &[Variant::dark().chinese().sized(1680.0, 940.0)],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_files,

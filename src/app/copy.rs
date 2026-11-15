@@ -578,6 +578,52 @@ pub struct Strings {
     pub files_local_unavailable: &'static str,
     /// Label of the root breadcrumb on this computer.
     pub files_local_root: &'static str,
+    /// Tooltip of the name header while the column is sorted by name, A to Z.
+    pub files_sort_asc: &'static str,
+    /// Tooltip of the name header while the column is sorted by name, Z to A.
+    pub files_sort_desc: &'static str,
+    /// Tooltip of the size header while the column is sorted by size, smallest first.
+    pub files_sort_size_asc: &'static str,
+    /// Tooltip of the size header while the column is sorted by size, largest first.
+    pub files_sort_size_desc: &'static str,
+    /// Placeholder of the field that filters one column's names.
+    pub files_filter_placeholder: &'static str,
+    /// How many names the filter lets through, out of how many the listing holds.
+    pub files_filter_count: &'static str,
+    /// Button that clears the filter of one column.
+    pub files_filter_clear: &'static str,
+    /// Said instead of the listing when the filter matches no name.
+    pub files_filter_none: &'static str,
+    /// How many entries one column has marked.
+    pub files_marked_count: &'static str,
+    /// Button that marks every name the filter lets through.
+    pub files_mark_all: &'static str,
+    /// Button that drops the marks of one column.
+    pub files_clear_marks: &'static str,
+    /// Button that uploads every marked local file. The count is filled in.
+    pub files_upload_selected: &'static str,
+    /// Button that downloads every marked remote file. The count is filled in.
+    pub files_download_selected: &'static str,
+    /// Button that deletes every marked entry. The count is filled in.
+    pub files_delete_selected: &'static str,
+    /// Menu line that deletes the whole marked batch, said where the row is right-clicked.
+    pub files_delete_marked: &'static str,
+    /// Button that copies the paths of every marked entry. The count is filled in.
+    pub files_copy_selected: &'static str,
+    /// How the marks are made, said beside them.
+    pub files_marked_hint: &'static str,
+    /// What deleting several entries really covers. The counts are filled in.
+    pub files_delete_many_note: &'static str,
+    /// What a multi-entry delete question is about.
+    pub files_delete_many_target: &'static str,
+    /// Button that shows the terminal and the files side by side again.
+    pub files_mode_dock: &'static str,
+    /// Button that gives the whole area to the files.
+    pub files_mode_focus: &'static str,
+    /// Toast: several uploads were queued. The count is filled in.
+    pub files_uploaded_selected: &'static str,
+    /// Toast: several downloads were queued. The count is filled in.
+    pub files_downloaded_selected: &'static str,
     /// Heading of the transfer list of a session.
     pub transfers_heading: &'static str,
     /// Said of a task the connection has taken but whose first byte has not arrived.
@@ -1352,6 +1398,29 @@ pub static ENGLISH: Strings = Strings {
     files_local_exists: "That name is already on this computer:",
     files_local_unavailable: "This folder cannot be listed:",
     files_local_root: "This computer",
+    files_sort_asc: "Sorted by name, A to Z; press to reverse",
+    files_sort_desc: "Sorted by name, Z to A; press to reverse",
+    files_sort_size_asc: "Sorted by size, smallest first; press to reverse",
+    files_sort_size_desc: "Sorted by size, largest first; press to reverse",
+    files_filter_placeholder: "Filter names",
+    files_filter_count: "{shown} of {total} names",
+    files_filter_clear: "Clear filter",
+    files_filter_none: "No name in this folder matches the filter.",
+    files_marked_count: "{count} selected",
+    files_mark_all: "Select all",
+    files_clear_marks: "Clear selection",
+    files_upload_selected: "Upload {count}",
+    files_download_selected: "Download {count}",
+    files_delete_selected: "Delete {count}",
+    files_delete_marked: "Delete the selection",
+    files_copy_selected: "Copy {count} paths",
+    files_marked_hint: "Ctrl+click adds a row to the selection; Shift+click marks a range; Space marks the row the keyboard is on.",
+    files_delete_many_note: "{files} file(s) and {folders} folder(s). A folder is deleted with everything inside it.",
+    files_delete_many_target: "Delete {count} entries in",
+    files_mode_dock: "Show terminal beside files",
+    files_mode_focus: "Focus on files",
+    files_uploaded_selected: "Uploading {count} file(s)",
+    files_downloaded_selected: "Downloading {count} file(s)",
     transfers_heading: "Transfers",
     transfers_queued_note: "Queued at the connection; no byte has moved yet.",
     transfers_remaining: "{time} left",
@@ -1862,6 +1931,29 @@ pub static CHINESE: Strings = Strings {
     files_local_exists: "这台电脑上已经有这个名称：",
     files_local_unavailable: "无法列出这个文件夹：",
     files_local_root: "这台电脑",
+    files_sort_asc: "按名称排序，A→Z；再次点击反向",
+    files_sort_desc: "按名称排序，Z→A；再次点击反向",
+    files_sort_size_asc: "按大小排序，从小到大；再次点击反向",
+    files_sort_size_desc: "按大小排序，从大到小；再次点击反向",
+    files_filter_placeholder: "筛选名称",
+    files_filter_count: "{shown}/{total} 项",
+    files_filter_clear: "清除筛选",
+    files_filter_none: "该目录没有名称符合筛选条件。",
+    files_marked_count: "已选 {count} 项",
+    files_mark_all: "全选",
+    files_clear_marks: "清除选择",
+    files_upload_selected: "上传 {count} 项",
+    files_download_selected: "下载 {count} 项",
+    files_delete_selected: "删除 {count} 项",
+    files_delete_marked: "删除所选项目",
+    files_copy_selected: "复制 {count} 条路径",
+    files_marked_hint: "Ctrl+点击加入选择，Shift+点击选中连续范围，空格键选中光标所在行。",
+    files_delete_many_note: "{files} 个文件，{folders} 个文件夹。文件夹会连同其中内容一起删除。",
+    files_delete_many_target: "删除以下 {count} 项，位置",
+    files_mode_dock: "同屏显示终端与文件",
+    files_mode_focus: "专注文件",
+    files_uploaded_selected: "正在上传 {count} 个文件",
+    files_downloaded_selected: "正在下载 {count} 个文件",
     transfers_heading: "传输",
     transfers_queued_note: "已交给连接排队，还没有开始传字节。",
     transfers_remaining: "剩余 {time}",
@@ -2503,6 +2595,10 @@ pub struct UxStrings {
     pub toast_path_copied: &'static str,
     pub files_open: &'static str,
     pub files_copy_path: &'static str,
+    /// Tooltip of the box that marks one row of a file column
+    pub files_mark_row: &'static str,
+    /// Tooltip of the same box once the row is marked
+    pub files_unmark_row: &'static str,
     pub drop_uploading_files: &'static str,
     pub settings_scheme: &'static str,
     pub settings_scheme_hint: &'static str,
@@ -3099,6 +3195,8 @@ impl UxStrings {
             self.toast_path_copied,
             self.files_open,
             self.files_copy_path,
+            self.files_mark_row,
+            self.files_unmark_row,
             self.drop_uploading_files,
             self.settings_scheme,
             self.settings_scheme_hint,
@@ -3486,6 +3584,8 @@ included",
     toast_path_copied: "Path copied",
     files_open: "Open",
     files_copy_path: "Copy path",
+    files_mark_row: "Add this row to the selection",
+    files_unmark_row: "Take this row out of the selection",
     drop_uploading_files: "Uploading {count} file(s)",
     settings_scheme: "Terminal colours",
     settings_scheme_hint: "Many command-line programs are made for a dark terminal. Text too close to its background is always made legible.",
@@ -3868,6 +3968,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     toast_path_copied: "已复制路径",
     files_open: "打开",
     files_copy_path: "复制路径",
+    files_mark_row: "把这一行加入选择",
+    files_unmark_row: "把这一行移出选择",
     drop_uploading_files: "正在上传 {count} 个文件",
     settings_scheme: "终端配色",
     settings_scheme_hint: "很多命令行程序按深色终端设计。与背景过于接近的文字始终会自动调整到可读。",

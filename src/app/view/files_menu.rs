@@ -197,13 +197,29 @@ impl ShelluneView {
                     Box::new(move |view, cx| view.copy_files_path(id, source, Some(&copied), cx)),
                 )));
                 lines.push(None);
-                lines.push(Some((
-                    strings.files_delete,
-                    Icon::Trash,
-                    true,
-                    "files.menu.delete",
-                    Box::new(move |view, cx| view.files_ask_delete(id, source, &name, kind, cx)),
-                )));
+                // A row the user marked is part of a batch, and deleting it must cover
+                // what the marks say rather than one row of them (R14).
+                let marked = self.files.marked(id, source);
+                let in_batch = marked.len() > 1 && marked.iter().any(|item| item == &name);
+                if in_batch {
+                    lines.push(Some((
+                        strings.files_delete_marked,
+                        Icon::Trash,
+                        true,
+                        "files.menu.delete",
+                        Box::new(move |view, cx| view.files_ask_delete_marked(id, source, cx)),
+                    )));
+                } else {
+                    lines.push(Some((
+                        strings.files_delete,
+                        Icon::Trash,
+                        true,
+                        "files.menu.delete",
+                        Box::new(move |view, cx| {
+                            view.files_ask_delete(id, source, &name, kind, cx)
+                        }),
+                    )));
+                }
             }
             None => {
                 lines.push(Some((
