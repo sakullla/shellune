@@ -450,6 +450,14 @@ pub struct ShelluneView {
     /// Sessions are kept apart by identity, never by position: nothing here reaches
     /// for "the current terminal" to decide where an event belongs.
     panes: Vec<OpenPane>,
+    /// Links the tests hand to the next serial start, by device name (R21).
+    ///
+    /// A reconnect opens the device the record names, which on a machine with no serial
+    /// port can only be the in-memory pair this crate builds. The queue lives here rather
+    /// than in a global so two windows never take each other's session, and a link is
+    /// taken once, so one session can never serve two opens.
+    #[cfg(test)]
+    scripted_serials: Vec<(String, crate::app::serial::SerialLink)>,
     /// The session whose terminal is on screen.
     active: Option<SessionId>,
     /// Why the last local start failed, when it did.
@@ -2006,6 +2014,8 @@ impl ShelluneView {
             root_focus: cx.focus_handle(),
             destination_focus: Destination::ALL.iter().map(|_| cx.focus_handle()).collect(),
             panes: Vec::new(),
+            #[cfg(test)]
+            scripted_serials: Vec::new(),
             active: None,
             local_error: None,
             shell_path,
@@ -3690,7 +3700,26 @@ impl ShelluneView {
         let grid = GridSize::initial();
         let font_size = self.workspace.local_font_size();
         let locale = self.workspace.locale();
+        // A test may have named the link this open should use: the device the record
+        // names can only be an in-memory pair on a machine with no port (R21).
+        #[cfg(test)]
+        let scripted: Option<crate::app::serial::SerialLink> =
+            self.take_scripted_serial(target.device());
         let pane = cx.new(|pane_cx| {
+            #[cfg(test)]
+            if let Some(link) = scripted {
+                return TerminalPane::start_serial_with(
+                    link,
+                    target.device(),
+                    &target.config().summary(),
+                    target.local_echo(),
+                    tag,
+                    grid,
+                    font_size,
+                    locale,
+                    pane_cx,
+                );
+            }
             TerminalPane::start_serial(&target, tag, grid, font_size, locale, pane_cx)
         });
         let state = pane.read(cx).state().clone();
@@ -3793,6 +3822,31 @@ impl ShelluneView {
         self.push_pane(tag, pane, cx);
         session.id()
     }
+
+    /// Names the link the next serial start of `device` should use (R21).
+    ///
+    /// This is what makes a reconnect testable on a machine with no serial port: the
+    /// reconnect path opens the device the *record* names, and that device here is the
+    /// in-memory pair. The link is taken once, at the open it was queued for.
+    #[cfg(test)]
+    pub fn queue_scripted_serial_for_test(
+        &mut self,
+        device: &str,
+        link: crate::app::serial::SerialLink,
+    ) {
+        self.scripted_serials.push((device.to_owned(), link));
+    }
+
+    /// Takes the link queued for `device`, if a test queued one.
+    #[cfg(test)]
+    fn take_scripted_serial(&mut self, device: &str) -> Option<crate::app::serial::SerialLink> {
+        let index = self
+            .scripted_serials
+            .iter()
+            .position(|(name, _)| name == device)?;
+        Some(self.scripted_serials.remove(index).1)
+    }
+
     /// Records that a desktop session cannot be started at all, and why.
     fn refuse_desktop(&mut self, session: SessionId, reason: String, cx: &mut Context<Self>) {
         // Another attempt cannot bring back a connection record that is gone, so the
@@ -3906,10 +3960,11 @@ impl ShelluneView {
         // The two kinds of pane end differently, which is what the variant keeps apart: a
         // terminal is closed, while a desktop or serial surface is released by its own
         // worker instead of being asked for a process it never had (R17, R18).
+        let mut closed = None;
         match &open.content {
             PaneContent::Terminal(pane) => {
                 let pane = pane.clone();
-                pane.update(cx, |pane, cx| pane.close(cx));
+                closed = pane.update(cx, |pane, cx| pane.close(cx));
             }
             PaneContent::Desktop(pane) => {
                 // The surface is stopped before its handle is dropped, so the
@@ -3918,6 +3973,10 @@ impl ShelluneView {
                 pane.update(cx, |pane, _cx| pane.stop());
             }
         }
+        // The pane has this moment left the tree, so a sentence kept inside it would
+        // never be read again: a port the driver still holds, and frames that never left
+        // the send queue, are said while there is still a window to say them in (R21).
+        self.raise_serial_close(closed, cx);
         // The connection of this session ends with its terminal, so its file view goes
         // with it instead of keeping a path and a listing that nothing backs any more.
         self.end_files(id);
@@ -4122,10 +4181,34 @@ impl ShelluneView {
     /// or its handle is dropped, so the remote side is told and no poll survives the
     /// session. Running it twice is harmless.
     fn end_session_surface(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let mut closed = None;
         for open in self.panes.iter().filter(|open| open.tag.session == id) {
-            if let PaneContent::Desktop(pane) = &open.content {
-                pane.update(cx, |pane, _cx| pane.stop());
+            match &open.content {
+                PaneContent::Desktop(pane) => pane.update(cx, |pane, _cx| pane.stop()),
+                // A serial pane keeps its tab after the device goes away, so its port is
+                // released here and not at the close (R17, R21): until it is, the writer
+                // thread and the queue of bytes waiting for the device outlive the
+                // session, and the port stays held by a line nothing is talking over.
+                PaneContent::Terminal(pane) => {
+                    closed = pane.update(cx, |pane, cx| pane.release_serial(cx));
+                }
             }
+        }
+        self.raise_serial_close(closed, cx);
+    }
+
+    /// Says what a serial close left behind, in the corner of the window (R21).
+    ///
+    /// One outlet for the two ways a serial line stops: a tab that is closed, and a
+    /// session whose device went away but whose tab stays. The words are the ones the
+    /// pane's own strip keeps, so the two never disagree about what remained.
+    fn raise_serial_close(
+        &mut self,
+        closed: Option<crate::app::terminal::SerialClose>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(close) = closed {
+            self.toast(Tone::Warning, close.note, Some(close.device), cx);
         }
     }
     /// Closes one session: its process, its terminal and its tab (R7).

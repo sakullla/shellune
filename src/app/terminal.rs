@@ -46,7 +46,9 @@ use crate::app::components;
 use crate::app::copy::Locale;
 use crate::app::glyphs;
 use crate::app::icons::Icon;
-use crate::app::serial::{NewlineFormat, PortScan, SerialLink, SerialPane, SerialTarget, describe};
+use crate::app::serial::{
+    CloseReport, NewlineFormat, PortScan, SerialLink, SerialPane, SerialTarget, describe,
+};
 use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, spacing};
 
 /// How often the pane looks for output from the shell.
@@ -81,6 +83,21 @@ pub fn monospace_family() -> &'static str {
     } else {
         "DejaVu Sans Mono"
     }
+}
+
+/// What a serial line left behind when its pane stopped driving it (R21).
+///
+/// A serial close is the one close whose result a person has to read: the driver may
+/// still hold the port, and frames the user typed may never have left the queue. The
+/// pane keeps the sentence on its strip, and the window shows the same words when the
+/// pane is dropped in the same breath - a tab that disappears with the reason inside it
+/// tells nobody anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerialClose {
+    /// The device the sentence is about.
+    pub device: String,
+    /// What remained: a port still held, or frames that were never sent.
+    pub note: String,
 }
 
 /// What happened to the shell behind a pane.
@@ -1012,29 +1029,20 @@ impl TerminalPane {
     ///
     /// The last screen stays on display: dropping the grid on close would hide what
     /// was on it, and the pane reports that it is no longer live either way.
-    pub fn close(&mut self, cx: &mut Context<Self>) {
-        let released = match self.source.as_mut() {
-            Some(PaneSource::Serial(link)) => Some(link.close()),
-            Some(source) => {
-                source.close();
-                None
+    ///
+    /// What a serial close left behind is returned as well as kept: the note belongs on
+    /// the pane for as long as it is drawn, and the window needs the same sentence for
+    /// the moment the pane is dropped - a tab that disappears with the reason still
+    /// inside it says nothing to anyone (R21).
+    pub fn close(&mut self, cx: &mut Context<Self>) -> Option<SerialClose> {
+        let mut closed = None;
+        match self.source.as_mut() {
+            Some(PaneSource::Serial(link)) => {
+                let report = link.close();
+                closed = self.keep_close_note(&report);
             }
-            None => None,
-        };
-        // A port the driver did not release is stated as such: the device is still held,
-        // and a session that said nothing would let the next open of the same port fail
-        // for a reason no one can see (R17, R21).
-        if let (Some(report), Some(serial)) = (released, self.serial.as_mut())
-            && (!report.released || report.note.is_some())
-        {
-            let held = self.locale.strings().serial_still_held;
-            serial.set_note(report.note.map(|note| {
-                if report.released {
-                    note
-                } else {
-                    format!("{held}: {note}")
-                }
-            }));
+            Some(source) => source.close(),
+            None => {}
         }
         self.source = None;
         self.polling = false;
@@ -1044,6 +1052,55 @@ impl TerminalPane {
             };
         }
         cx.notify();
+        closed
+    }
+
+    /// Releases the port of a serial pane whose session is already over (R17, R21).
+    ///
+    /// A device that went away, a read that failed and a close all end the connection,
+    /// and the writer thread together with the queue of bytes waiting for the device
+    /// must not outlive it: until the port is released the driver keeps the line open,
+    /// so the next open of the same device fails for a reason nothing on screen explains.
+    ///
+    /// The pane stays exactly as it is - it still names the device and the failure - and
+    /// the sentence about what remained is the one a close states.
+    pub fn release_serial(&mut self, cx: &mut Context<Self>) -> Option<SerialClose> {
+        let Some(PaneSource::Serial(link)) = self.source.as_mut() else {
+            return None;
+        };
+        let report = link.close();
+        self.source = None;
+        self.polling = false;
+        let closed = self.keep_close_note(&report);
+        cx.notify();
+        closed
+    }
+
+    /// Keeps what a close reported, and hands it to the window as well.
+    ///
+    /// A port the driver did not release is stated as such, and so are the frames that
+    /// never left the queue: a session that said nothing would let the next open of the
+    /// same port fail for a reason no one can see, or lose a frame the user typed with
+    /// no word about it (R17, R21). An older note is replaced, because only one line is
+    /// drawn and the newest fact about the line is the true one.
+    fn keep_close_note(&mut self, report: &CloseReport) -> Option<SerialClose> {
+        let note = report.note.as_ref()?;
+        let held = self.locale.strings().serial_still_held;
+        let sentence = if report.released {
+            note.clone()
+        } else {
+            format!("{held}: {note}")
+        };
+        if let Some(serial) = self.serial.as_mut() {
+            serial.set_note(Some(sentence.clone()));
+        }
+        Some(SerialClose {
+            device: self.serial.as_ref().map_or_else(
+                || self.origin.label().to_owned(),
+                |serial| serial.device().to_owned(),
+            ),
+            note: sentence,
+        })
     }
 
     /// A pane with a terminal but no process.
@@ -1215,6 +1272,17 @@ impl TerminalPane {
     #[must_use]
     pub fn is_serial(&self) -> bool {
         self.serial.is_some()
+    }
+
+    /// Whether the pane still holds a source it can send to, for a test.
+    ///
+    /// A serial pane whose session is over must answer `false`: while it answers
+    /// `true` the writer thread and the send queue are still alive behind a device
+    /// nothing is talking over (R21).
+    #[cfg(test)]
+    #[must_use]
+    pub fn holds_source(&self) -> bool {
+        self.source.is_some()
     }
 
     /// Chooses what the Return key sends, from the next send onwards.
@@ -4444,8 +4512,15 @@ impl EntityInputHandler for TerminalPane {
         }
         // A commit is program input, including one command that ends in a newline.
         // Multi-line and high-risk confirmation belongs to clipboard paste.
+        //
+        // It is also what a person typed, which is why it goes through the user send
+        // path and not straight into the source: on a serial line the chosen ending is
+        // written for a break the commit carries, and the local echo draws the text
+        // (R21). Without this a device that does not echo would leave a typist blind,
+        // because every printable character and every space arrives here - the key path
+        // only sees the characters that are not plain text.
         let bytes = encode_text(text);
-        self.write(&bytes, cx);
+        self.write_user(&bytes, cx);
         cx.notify();
     }
 

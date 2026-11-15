@@ -23493,3 +23493,500 @@ async fn closing_a_serial_session_releases_the_port_and_leaves_the_other_one_alo
         typed
     );
 }
+
+/// One in-memory port driven as a real session, with the bounds a test needs.
+///
+/// The session is the crate's own - reader thread, writer thread, bounded queue and
+/// close - over the in-memory FakePort; this machine has no serial device and no virtual
+/// pair, so a fake is the only way to move bytes, and nothing here is evidence about a
+/// UART, a driver or a cable.
+fn scripted_serial_port(
+    device: &str,
+    spec: shellune_serial::testing::FakeSpec,
+    close_timeout: std::time::Duration,
+) -> (SerialLink, Arc<FakePort>) {
+    let port = shellune_serial::testing::fake(device, spec);
+    let limits = shellune_serial::SessionLimits {
+        close_timeout,
+        ..shellune_serial::SessionLimits::default()
+    };
+    let session = shellune_serial::testing::session_over_with(
+        Arc::clone(&port),
+        shellune_serial::SerialConfig::default(),
+        limits,
+    );
+    (SerialLink::holding(session), port)
+}
+
+/// A link whose device reports a read failure, as an unplugged adapter does.
+fn unplugged_serial(device: &str) -> (SerialLink, Arc<FakePort>) {
+    let spec = shellune_serial::testing::FakeSpec::new().failing_reads(
+        shellune_serial::SerialError::new(shellune_serial::SerialCause::Disconnected)
+            .at(device)
+            .with_detail("the device was removed"),
+    );
+    scripted_serial_port(device, spec, std::time::Duration::from_secs(2))
+}
+
+#[gpui::test]
+async fn a_text_commit_on_a_serial_pane_echoes_once_and_rewrites_only_its_own_break(
+    cx: &mut TestAppContext,
+) {
+    use gpui::EntityInputHandler;
+
+    // A window and a device that says nothing at all: everything that appears on the
+    // grid below came from the user's own typing, which is the blind-typing case R21 is
+    // about.
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, device, _peer) = scripted_serial();
+    let id = mount_scripted_serial(&view, cx, "console", "COM3", true, link);
+
+    // This is the path a keyboard really drives: WM_CHAR reaches gpui as a text commit,
+    // and a commit calls the input handler, not the key encoder. Printable characters,
+    // spaces and committed Chinese input never reach the key path at all, so a pane that
+    // only echoed in the key path showed nothing while a user typed.
+    let commit = |cx: &mut VisualTestContext, text: &str| {
+        cx.update(|window, app| {
+            let pane = view
+                .read(app)
+                .pane_of(id)
+                .expect("the pane is mounted")
+                .clone();
+            pane.update(app, |pane, cx| {
+                pane.replace_text_in_range(None, text, window, cx);
+            });
+        });
+        cx.run_until_parked();
+    };
+
+    commit(cx, "hello");
+    let shown = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .expect("the pane is mounted")
+            .read(app)
+            .visible_text()
+    });
+    assert!(
+        shown.iter().any(|row| row.contains("hello")),
+        "a committed text is echoed into the grid, so typing is not blind: {shown:?}"
+    );
+    assert!(
+        wait_for(|| device.written() == b"hello"),
+        "and it reached the device once, in the order it was typed: {:?}",
+        device.written()
+    );
+
+    // A break that arrives through the text path obeys the chosen ending, exactly once:
+    // one line feed on the wire becomes one CR LF, not two.
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            let pane = view.pane_of(id).expect("the pane is mounted").clone();
+            pane.update(cx, |pane, cx| {
+                pane.set_serial_format(
+                    crate::app::serial::NewlineFormat::CarriageReturnLineFeed,
+                    cx,
+                );
+            });
+        });
+    });
+    commit(cx, "a\nb");
+    assert!(
+        wait_for(|| device.written() == b"helloa\r\nb"),
+        "the commit's line feed was rewritten once, and nothing else was: {:?}",
+        device.written()
+    );
+    let rows = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .expect("the pane is mounted")
+            .read(app)
+            .visible_text()
+    });
+    // The caret was still on the row the previous echo left it on, so the first line of
+    // the commit continues that row and the second one starts the next: one break, one
+    // row - a second rewriting would leave an empty row between them.
+    let a = rows
+        .iter()
+        .position(|row| row.trim_end() == "helloa")
+        .unwrap_or_else(|| panic!("the echoed lines are on the grid: {rows:?}"));
+    assert_eq!(
+        rows.get(a + 1).map(|row| row.trim_end()),
+        Some("b"),
+        "the echo of one break moves the caret one row down, not two: {rows:?}"
+    );
+
+    // What the device sends is drawn as it arrived: never echoed a second time, and
+    // never rewritten by the newline choice - the transcript has to agree with the wire.
+    device.push_from_device(b"from-device\r\n");
+    pump_serial_until(&view, cx, id, |pane| {
+        pane.visible_text()
+            .iter()
+            .any(|row| row.contains("from-device"))
+    });
+    let text = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .expect("the pane is mounted")
+            .read(app)
+            .visible_text()
+    });
+    let line = text
+        .iter()
+        .find(|row| row.contains("from-device"))
+        .expect("the device text is drawn");
+    assert_eq!(
+        line.matches("from-device").count(),
+        1,
+        "the device's own text is drawn once, not echoed: {line:?}"
+    );
+    assert_eq!(
+        device.written(),
+        b"helloa\r\nb",
+        "bytes the device sent were never written back to it: {:?}",
+        device.written()
+    );
+}
+
+#[gpui::test]
+async fn a_closed_serial_tab_still_says_which_frames_never_left(cx: &mut TestAppContext) {
+    // A driver that takes the first frame and then holds it: the second frame is still in
+    // the queue when the tab closes, which is the case a person has to be told about.
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, device) = scripted_serial_port(
+        "COM3",
+        shellune_serial::testing::FakeSpec::new().holding_writes(),
+        std::time::Duration::from_secs(2),
+    );
+    let id = mount_scripted_serial(&view, cx, "console", "COM3", false, link);
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            let pane = view.pane_of(id).expect("the pane is mounted").clone();
+            pane.update(cx, |pane, cx| {
+                pane.type_text("first", cx);
+                pane.type_text("second", cx);
+            });
+        });
+    });
+    // Let the writer take the first frame, so the second is really queued at the close.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.close_session(id, cx));
+    });
+    cx.run_until_parked();
+
+    let (gone, titles, entries, queued) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (
+            pane_gone(app, view, id),
+            view.toast_titles(),
+            view.toast_entries(),
+            view.workspace()
+                .session(id)
+                .map(|session| session.title().to_owned()),
+        )
+    });
+    assert!(gone, "the tab is closed");
+    assert!(
+        queued.is_some(),
+        "the session record survives the pane, so the tab it named is accounted for"
+    );
+    let note = titles
+        .iter()
+        .find(|title| title.contains("never sent"))
+        .unwrap_or_else(|| panic!("the corner says what was left behind: {titles:?}"));
+    let count: usize = note
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("the sentence starts with how many frames were left");
+    assert!(
+        count >= 1,
+        "the number of frames that never left is stated: {note}"
+    );
+    assert!(
+        note.contains("bytes)"),
+        "and so is how much of them there was: {note}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(tone, title)| *tone == Tone::Warning && title.contains("never sent")),
+        "a close that lost bytes is not reported as a success: {entries:?}"
+    );
+    assert!(
+        !titles.iter().any(|title| title.contains("still held")),
+        "a port that was really released is not called held: {titles:?}"
+    );
+    assert!(
+        device.written().is_empty(),
+        "the frame the driver was inside never reached the wire either: {:?}",
+        device.written()
+    );
+}
+
+#[gpui::test]
+async fn a_close_the_driver_never_answers_is_reported_after_the_tab_is_gone(
+    cx: &mut TestAppContext,
+) {
+    // A driver that ignores the cancellation request: the close waits, gives up and says
+    // the port is still held. The wait is shortened so the test does not sit for two
+    // seconds; the sequence is the application's.
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, device) = scripted_serial_port(
+        "COM4",
+        shellune_serial::testing::FakeSpec::new().ignoring_interrupt(),
+        std::time::Duration::from_millis(60),
+    );
+    let id = mount_scripted_serial(&view, cx, "console", "COM4", false, link);
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.close_session(id, cx));
+    });
+    cx.run_until_parked();
+    let strings = Locale::English.strings();
+    let titles = cx.update(|_window, app| {
+        let view = view.read(app);
+        assert!(
+            pane_gone(app, view, id),
+            "the tab keeps closing even when the port does not"
+        );
+        view.toast_titles()
+    });
+    let note = titles
+        .iter()
+        .find(|title| title.contains(strings.serial_still_held))
+        .unwrap_or_else(|| panic!("the corner says the port is still held: {titles:?}"));
+    assert!(
+        note.contains("did not stop within"),
+        "the sentence says what the driver did instead of stopping: {note}"
+    );
+    assert!(
+        !device.is_released(),
+        "and the port really was still held, so the sentence is true"
+    );
+    // Let the blocked read finish so the thread does not outlive the test.
+    device.release_driver();
+}
+
+#[gpui::test]
+async fn a_serial_session_that_lost_its_device_stops_driving_it(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, device) = unplugged_serial("COM3");
+    let id = mount_scripted_serial(&view, cx, "console", "COM3", false, link);
+
+    // The device goes away: the reader reports it and the session ends. The tab stays -
+    // it names the device and the reason - but the line must stop being driven.
+    pump_serial_until(&view, cx, id, |pane| !pane.state().accepts_input());
+    cx.run_until_parked();
+    let state = session_state(cx, &view, id);
+    assert!(
+        matches!(state, Some(SessionState::Disconnected(_))),
+        "the session states the loss instead of looking live: {state:?}"
+    );
+    let (holds, still_open, note, titles) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view.pane_of(id).expect("the pane is still there");
+        let pane = pane.read(app);
+        (
+            pane.holds_source(),
+            view.open_sessions().contains(&id),
+            pane.serial_note().map(str::to_owned),
+            view.toast_titles(),
+        )
+    });
+    assert!(
+        !holds,
+        "the pane let go of the device when the session ended, so the writer thread and the send queue do not outlive it"
+    );
+    assert!(
+        still_open,
+        "the tab stays: it is what tells the user which device went away"
+    );
+    assert!(
+        device.is_released(),
+        "the port is back with the system, so the device can be opened again"
+    );
+    assert!(
+        note.is_none()
+            || titles
+                .iter()
+                .any(|title| note.as_deref() == Some(title.as_str())),
+        "a note about the close is shown in the corner as well as on the strip: {note:?} / {titles:?}"
+    );
+    // Running the release twice is harmless: the session is over either way.
+    let again = cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .pane_of(id)
+            .expect("the pane is there")
+            .clone();
+        pane.update(app, |pane, cx| pane.release_serial(cx))
+    });
+    assert!(again.is_none(), "a second release has nothing left to say");
+}
+
+/// Whether a session has no pane any more, for a test.
+fn pane_gone(_app: &gpui::App, view: &ShelluneView, id: SessionId) -> bool {
+    view.pane_of(id).is_none() && !view.open_sessions().contains(&id)
+}
+
+#[gpui::test]
+async fn a_serial_session_reconnects_in_its_own_tab_without_replaying_the_old_queue(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("serial-reconnect");
+    // The record is really saved, because the reconnect reads it back from the book the
+    // way the application does: a session that is reopened is the one the user saved.
+    let record = serial_record("console", "COM3");
+    let mut book = HostBook::new();
+    book.insert_connection(record.clone())
+        .expect("the serial record is saved");
+    let store = dir.store();
+    store.save(&book).expect("the book saves");
+    let (view, cx) = cx
+        .add_window_view(move |_window, cx| ShelluneView::with_store(cx, Workspace::new(), store));
+    cx.run_until_parked();
+
+    let (old_link, old_device) = unplugged_serial("COM3");
+    let id = cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            view.attach_scripted_serial_for_test(
+                &record,
+                old_link,
+                "COM3",
+                "115200 8N1, none flow control",
+                false,
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    // The device goes away, which is what the reconnect entry answers.
+    pump_serial_until(&view, cx, id, |pane| !pane.state().accepts_input());
+    cx.run_until_parked();
+    assert!(
+        matches!(
+            session_state(cx, &view, id),
+            Some(SessionState::Disconnected(_))
+        ),
+        "the session ended before it is reopened"
+    );
+    let (old_pane, old_tag, name, kind, tabs) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view.pane_of(id).expect("the pane is there").clone();
+        let session = view.workspace().session(id).expect("the session is listed");
+        (
+            pane.clone(),
+            pane.read(app).tag(),
+            session.title().to_owned(),
+            session.kind().clone(),
+            view.open_sessions(),
+        )
+    });
+    assert_eq!(tabs, vec![id], "one tab was open before the reconnect");
+
+    // The device the record names is the in-memory pair here; the port of the previous
+    // attempt is gone, and the queue it still held went with it.
+    let (new_link, new_device, _new_peer) = scripted_serial();
+    cx.update(|_window, cx| {
+        view.update(cx, |view, _cx| {
+            view.queue_scripted_serial_for_test("COM3", new_link);
+        });
+    });
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.reconnect_session(id, cx));
+    });
+    cx.run_until_parked();
+
+    let (new_pane, state, generation, device, tabs, kind_after, name_after) =
+        cx.update(|_window, app| {
+            let view = view.read(app);
+            let pane = view
+                .pane_of(id)
+                .expect("the reconnected pane is there")
+                .clone();
+            let session = view.workspace().session(id).expect("the session is listed");
+            let device = pane
+                .read(app)
+                .serial()
+                .map(|serial| serial.device().to_owned());
+            (
+                pane.clone(),
+                session.state().clone(),
+                session.generation(),
+                device,
+                view.open_sessions(),
+                session.kind().clone(),
+                session.title().to_owned(),
+            )
+        });
+    assert_ne!(
+        new_pane.entity_id(),
+        old_pane.entity_id(),
+        "a reconnect is a new pane, not the old one restarted"
+    );
+    assert_eq!(tabs, vec![id], "the tab, its identity and its place stay");
+    assert_eq!(
+        (&kind_after, name_after.as_str()),
+        (&kind, name.as_str()),
+        "the session is still the same serial connection, named the same"
+    );
+    assert_eq!(
+        state,
+        SessionState::Connected,
+        "the new attempt really opened a device"
+    );
+    assert_eq!(
+        generation, 1,
+        "the reconnect is another generation, so a late event can be told apart"
+    );
+    assert_eq!(
+        device.as_deref(),
+        Some("COM3"),
+        "the device is the one the record names, never a similar port that happens to be attached"
+    );
+    assert!(
+        old_device.written().is_empty(),
+        "the port of the previous attempt received nothing that could be replayed: {:?}",
+        old_device.written()
+    );
+    assert!(
+        new_device.written().is_empty()
+            && cx.update(|_window, app| new_pane.read(app).sent().is_empty()),
+        "nothing typed into the lost session is sent again: {:?}",
+        new_device.written()
+    );
+
+    // An event that still carries the previous generation is refused instead of being
+    // drawn into the terminal that replaced it.
+    let accepted = cx.update(|_window, app| {
+        new_pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                old_tag,
+                vec![SourceEvent::Data(b"stale-from-the-old-port\r\n".to_vec())],
+                cx,
+            )
+        })
+    });
+    assert!(
+        !accepted,
+        "an event of the previous attempt must be refused"
+    );
+    let screen = cx.update(|_window, app| new_pane.read(app).visible_text().join("\n"));
+    assert!(
+        !screen.contains("stale-from-the-old-port"),
+        "the old port's output reached the new terminal: {screen:?}"
+    );
+
+    // The reconnected device really is the one driving the tab.
+    new_device.push_from_device(b"alive\r\n");
+    pump_serial_until(&view, cx, id, |pane| {
+        pane.visible_text().iter().any(|row| row.contains("alive"))
+    });
+    let screen = cx.update(|_window, app| new_pane.read(app).visible_text().join("\n"));
+    assert!(
+        screen.contains("alive"),
+        "the reconnected device reaches the tab: {screen:?}"
+    );
+}
