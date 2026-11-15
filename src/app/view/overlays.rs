@@ -71,6 +71,25 @@ fn attention_rows(
     marks
 }
 
+/// What a session's kind is called in the lists that carry it (R8).
+///
+/// One mapping for the palette and the all-tabs list, so the two cannot disagree about
+/// a tab: a remote desktop is never called local, and a serial session is named as the
+/// character device it is. The second value is whether the badge wears the remote tint,
+/// and the third is the stable word a test and the capture use to ask which kind a row
+/// shows: the label itself is translated, the word is not.
+fn kind_badge_parts(
+    kind: PaneKind,
+    strings: &'static copy::Strings,
+) -> (&'static str, bool, &'static str) {
+    match kind {
+        PaneKind::Local => (strings.session_kind_local, false, "local"),
+        PaneKind::Remote => (strings.session_kind_remote, true, "ssh"),
+        PaneKind::Desktop => (strings.session_kind_desktop, true, "desktop"),
+        PaneKind::Serial => (strings.session_kind_serial, false, "serial"),
+    }
+}
+
 /// How a host is described in the palette: its target, then a jump or ProxyCommand.
 fn host_palette_detail(host: &HostConfig) -> String {
     let mut detail = host.target();
@@ -231,12 +250,9 @@ impl ShelluneView {
                 continue;
             };
             let kind = PaneKind::of(session.kind());
-            let kind_label = match kind {
-                PaneKind::Local => strings.session_kind_local,
-                PaneKind::Remote => strings.session_kind_remote,
-                PaneKind::Desktop => strings.session_kind_desktop,
-                PaneKind::Serial => strings.session_kind_serial,
-            };
+            // The palette names the kind and nothing else of the badge: the tint and the
+            // stable word belong to the lists that draw a badge (R8).
+            let (kind_label, _, _) = kind_badge_parts(kind, strings);
             let target = match session.kind() {
                 SessionKind::Local { .. } => program_label(&session_target(&self.book, session)),
                 SessionKind::Remote { .. }
@@ -1722,64 +1738,74 @@ impl ShelluneView {
                 Some(id) => self.tab_title(id),
                 None => tab.display_title().to_owned(),
             };
-            let (kind_label, remote, target, state_label, tone) =
-                match session.and_then(|id| self.workspace.session(id)) {
-                    Some(session) => {
-                        let kind = PaneKind::of(session.kind());
-                        let remote = kind == PaneKind::Remote;
-                        let target = match session.kind() {
-                            SessionKind::Local { .. } => {
-                                program_label(&session_target(&self.book, session))
-                            }
-                            SessionKind::Remote { .. }
-                            | SessionKind::Rdp { .. }
-                            | SessionKind::Vnc { .. }
-                            | SessionKind::Serial { .. } => session_target(&self.book, session),
-                        };
-                        (
-                            if remote {
-                                strings.session_kind_remote
-                            } else {
-                                strings.session_kind_local
-                            },
-                            remote,
-                            target,
-                            copy::session_state_label(session.state(), locale),
-                            super::session_tone(session.state()),
-                        )
-                    }
-                    None => {
-                        let target = first_target(tab.root())
-                            .map(|target| match target {
-                                PaneTarget::Local { shell } => shell
-                                    .as_deref()
-                                    .map(program_label)
-                                    .unwrap_or_else(|| strings.session_kind_local.to_owned()),
-                                PaneTarget::Remote { host } => self
-                                    .book
-                                    .host(*host)
-                                    .map(|host| host.target())
-                                    .unwrap_or_else(|| host.to_string()),
-                                // A waiting desktop or serial pane names the connection it
-                                // would start, or the id when that record is gone.
-                                PaneTarget::Rdp { host }
-                                | PaneTarget::Vnc { host }
-                                | PaneTarget::Serial { host } => self
-                                    .book
-                                    .connection(*host)
-                                    .map(|record| record.target())
-                                    .unwrap_or_else(|| host.to_string()),
-                            })
-                            .unwrap_or_default();
-                        (
-                            strings.session_kind_local,
-                            false,
-                            target,
-                            strings.pane_pending.to_owned(),
-                            Tone::Warning,
-                        )
-                    }
-                };
+            let (kind_label, remote, kind_word, target, state_label, tone) = match session
+                .and_then(|id| self.workspace.session(id))
+            {
+                Some(session) => {
+                    let kind = PaneKind::of(session.kind());
+                    let (kind_label, remote, kind_word) = kind_badge_parts(kind, strings);
+                    let target = match session.kind() {
+                        SessionKind::Local { .. } => {
+                            program_label(&session_target(&self.book, session))
+                        }
+                        SessionKind::Remote { .. }
+                        | SessionKind::Rdp { .. }
+                        | SessionKind::Vnc { .. }
+                        | SessionKind::Serial { .. } => session_target(&self.book, session),
+                    };
+                    (
+                        kind_label,
+                        remote,
+                        kind_word,
+                        target,
+                        copy::session_state_label(session.state(), locale),
+                        super::session_tone(session.state()),
+                    )
+                }
+                None => {
+                    // A tab whose panes have no session yet still says what it would
+                    // start: a waiting desktop pane is a desktop tab, not a local one.
+                    let kind = first_target(tab.root())
+                        .map(|target| match target {
+                            PaneTarget::Local { .. } => PaneKind::Local,
+                            PaneTarget::Remote { .. } => PaneKind::Remote,
+                            PaneTarget::Rdp { .. } | PaneTarget::Vnc { .. } => PaneKind::Desktop,
+                            PaneTarget::Serial { .. } => PaneKind::Serial,
+                        })
+                        .unwrap_or(PaneKind::Local);
+                    let (kind_label, remote, kind_word) = kind_badge_parts(kind, strings);
+                    let target = first_target(tab.root())
+                        .map(|target| match target {
+                            PaneTarget::Local { shell } => shell
+                                .as_deref()
+                                .map(program_label)
+                                .unwrap_or_else(|| strings.session_kind_local.to_owned()),
+                            PaneTarget::Remote { host } => self
+                                .book
+                                .host(*host)
+                                .map(|host| host.target())
+                                .unwrap_or_else(|| host.to_string()),
+                            // A waiting desktop or serial pane names the connection it
+                            // would start, or the id when that record is gone.
+                            PaneTarget::Rdp { host }
+                            | PaneTarget::Vnc { host }
+                            | PaneTarget::Serial { host } => self
+                                .book
+                                .connection(*host)
+                                .map(|record| record.target())
+                                .unwrap_or_else(|| host.to_string()),
+                        })
+                        .unwrap_or_default();
+                    (
+                        kind_label,
+                        remote,
+                        kind_word,
+                        target,
+                        strings.pane_pending.to_owned(),
+                        Tone::Warning,
+                    )
+                }
+            };
             let accent = tab.accent();
             let selector = format!("tabs.list.row.{index}");
             let current = active == Some(tab_id);
@@ -1853,7 +1879,13 @@ impl ShelluneView {
                         .debug_selector(move || format!("tabs.list.accent-name.{index}"))
                         .child(copy::tab_accent_label(accent, locale))
                 }))
-                .child(components::kind_badge(kind_label, remote, metrics))
+                // What the tab is, in the same words the palette uses: a desktop tab is
+                // never drawn as a local one, which is what it said while the badge only
+                // knew local from remote (R8).
+                .child(
+                    components::kind_badge(kind_label, remote, metrics)
+                        .debug_selector(move || format!("tabs.list.kind.{kind_word}.{index}")),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -1903,7 +1935,22 @@ impl ShelluneView {
                             this.close_tab_list(window, cx);
                             this.open_tab_rename(rename, window, cx);
                         })),
-                );
+                )
+                // The board exists because a crowded strip cannot be clicked; closing
+                // has to be one press here too (R8). It goes through the entry the
+                // strip's own cross uses, so a running transfer is still asked about
+                // before it stops and only this tab is named.
+                .children(session.map(|id| {
+                    components::icon_only_button(Icon::Close, metrics)
+                        .id(SharedString::from(format!("tabs.list.close.{index}")))
+                        .debug_selector(move || format!("tabs.list.close.{index}"))
+                        .tooltip(components::tooltip(strings.tab_menu_close))
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab_list(window, cx);
+                            this.request_close_tab_anchor(id, cx);
+                        }))
+                }));
             rows = rows.child(row);
         }
         // The list takes the keyboard while it is open, so its arrows and Enter work

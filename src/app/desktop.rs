@@ -1381,8 +1381,10 @@ pub fn canvas_is_bgra(surface: &DesktopSurface) -> bool {
 }
 
 /// A link whose events and inputs come from a script, for the tests that prove the
-/// surface's ordering and release rules without an endpoint.
-#[cfg(test)]
+/// surface's ordering and release rules without an endpoint, and for the capture that
+/// photographs the chrome of a session no server on this machine can produce.
+#[cfg(any(test, feature = "ui-capture"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub mod scripted {
     use super::{Buttons, DesktopInput, DesktopLink, KeyCodes, LinkError, LinkEvent, Region};
     use std::sync::{Arc, Mutex};

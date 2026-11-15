@@ -3024,6 +3024,8 @@ pub struct UxStrings {
     pub batch_library_deleted: &'static str,
     /// Row meta: the hosts, steps and concurrency of a saved task
     pub batch_library_row_meta: &'static str,
+    /// How many saved tasks the library does not list, with the number filled in
+    pub batch_library_more: &'static str,
     /// A saved task that has no name
     pub batch_untitled: &'static str,
     /// Toast: the definition was saved and nothing ran
@@ -3058,6 +3060,10 @@ pub struct UxStrings {
     pub batch_history_when: &'static str,
     /// How many hosts of one stored run finished, out of how many
     pub batch_history_hosts: &'static str,
+    /// The output of a host whose log was not read
+    pub batch_history_output_unread: &'static str,
+    /// The same, with the reason the log could not be read
+    pub batch_history_output_unread_reason: &'static str,
     /// Button: copy the diagnostics of one run
     pub batch_diagnostics_copy: &'static str,
     /// Toast: the diagnostics were copied
@@ -3406,6 +3412,7 @@ impl UxStrings {
             self.batch_library_delete_no,
             self.batch_library_deleted,
             self.batch_library_row_meta,
+            self.batch_library_more,
             self.batch_untitled,
             self.batch_saved,
             self.batch_save_draft,
@@ -3423,6 +3430,8 @@ impl UxStrings {
             self.batch_history_no_host,
             self.batch_history_when,
             self.batch_history_hosts,
+            self.batch_history_output_unread,
+            self.batch_history_output_unread_reason,
             self.batch_diagnostics_copy,
             self.batch_diagnostics_copied,
             self.batch_run_background,
@@ -3795,6 +3804,7 @@ included",
     batch_library_delete_no: "Keep it",
     batch_library_deleted: "Task deleted",
     batch_library_row_meta: "{hosts} hosts · {steps} steps · {concurrency} at once",
+    batch_library_more: "and {count} more task(s), not listed",
     batch_untitled: "Untitled task",
     batch_saved: "Saved; nothing was run",
     batch_save_draft: "Save task",
@@ -3812,6 +3822,8 @@ included",
     batch_history_no_host: "Choose a host to read its output and timeline.",
     batch_history_when: "Started {time}",
     batch_history_hosts: "{done}/{total} hosts finished",
+    batch_history_output_unread: "This host's output was not read.",
+    batch_history_output_unread_reason: "This host's output could not be read: {reason}",
     batch_diagnostics_copy: "Copy diagnostics",
     batch_diagnostics_copied: "Diagnostics copied; no credential is in them",
     batch_run_background: "Keep running in background",
@@ -4179,6 +4191,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     batch_library_delete_no: "保留",
     batch_library_deleted: "任务已删除",
     batch_library_row_meta: "{hosts} 台主机 · {steps} 个步骤 · 并发 {concurrency}",
+    batch_library_more: "还有 {count} 个任务未列出",
     batch_untitled: "未命名任务",
     batch_saved: "已保存，未运行任何命令",
     batch_save_draft: "保存任务",
@@ -4196,6 +4209,8 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     batch_history_no_host: "选择一台主机查看它的输出与时间线。",
     batch_history_when: "开始于 {time}",
     batch_history_hosts: "{done}/{total} 台主机已结束",
+    batch_history_output_unread: "这个主机的输出没有读到。",
+    batch_history_output_unread_reason: "这个主机的输出没有读到：{reason}",
     batch_diagnostics_copy: "复制诊断",
     batch_diagnostics_copied: "诊断已复制，其中不含凭据",
     batch_run_background: "转入后台继续运行",

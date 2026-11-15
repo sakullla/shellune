@@ -228,8 +228,10 @@ fn read_message(stream: &mut TcpStream, message_type: u8) -> Option<ClientMessag
             let mut raw = vec![0u8; count * 4];
             stream.read_exact(&mut raw).ok()?;
             let encodings = raw
-                .chunks_exact(4)
-                .map(|chunk| i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| i32::from_be_bytes(*chunk))
                 .collect();
             Some(ClientMessage::Encodings(encodings))
         }
@@ -328,7 +330,6 @@ fn serve_session(
         let _ = stream.write_all(&cut);
     }
 
-    let mut requests = 0u32;
     loop {
         let mut header = [0u8; 1];
         match stream.read_exact(&mut header) {
@@ -338,13 +339,7 @@ fn serve_session(
         let Some(message) = read_message(&mut stream, header[0]) else {
             return;
         };
-        let served_frame = match message {
-            ClientMessage::UpdateRequest { incremental: false } => {
-                requests += 1;
-                true
-            }
-            _ => false,
-        };
+        let served_frame = matches!(message, ClientMessage::UpdateRequest { incremental: false });
         log.lock().expect("message log").push(message);
         if served_frame {
             let mut update = vec![0u8, 0];
@@ -545,7 +540,10 @@ fn the_vnc_pixel_depth_is_fixed_at_four_bytes() {
         matches!(client.set_vnc_colour_depth(3), Err(Error::Argument)),
         "three bytes per pixel is not a depth this backend can deliver"
     );
-    assert!(matches!(client.set_vnc_colour_depth(0), Err(Error::Argument)));
+    assert!(matches!(
+        client.set_vnc_colour_depth(0),
+        Err(Error::Argument)
+    ));
     assert!(matches!(client.set_vnc_colour_depth(4), Ok(())));
 }
 
@@ -558,7 +556,8 @@ fn an_rdp_session_reports_that_it_cannot_forward_clipboard_text() {
         return;
     }
     let mut rdp = DesktopClient::new(Protocol::Rdp).expect("rdp client");
-    rdp.set_server("127.0.0.1", a_closed_port()).expect("server");
+    rdp.set_server("127.0.0.1", a_closed_port())
+        .expect("server");
     match rdp.clipboard("hello") {
         Err(Error::Unavailable(reason)) => {
             assert!(reason.contains("clipboard"), "{reason}");
@@ -567,7 +566,8 @@ fn an_rdp_session_reports_that_it_cannot_forward_clipboard_text() {
     }
 
     let mut vnc = DesktopClient::new(Protocol::Vnc).expect("vnc client");
-    vnc.set_server("127.0.0.1", a_closed_port()).expect("server");
+    vnc.set_server("127.0.0.1", a_closed_port())
+        .expect("server");
     assert!(
         matches!(vnc.clipboard("hello"), Err(Error::State)),
         "a VNC session that is not connected reports the state, not the capability"
@@ -625,8 +625,8 @@ fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
     assert_eq!(frame.3, 16, "four pixels of four bytes per row");
     assert_eq!(frame.4, 4, "the desktop is four pixels wide");
     assert_eq!(frame.2.len(), 4 * 3 * 4);
-    for chunk in frame.2.chunks_exact(4) {
-        assert_eq!(chunk, pixel, "BGRA bytes as the peer sent them");
+    for chunk in frame.2.as_chunks::<4>().0 {
+        assert_eq!(chunk, &pixel, "BGRA bytes as the peer sent them");
     }
 
     // Text clipboard from the peer, whether it arrived before or after the frame.
@@ -819,7 +819,11 @@ fn cancelling_a_failing_vnc_handshake_touches_no_freed_session() {
         );
         client.wait_for_worker(PATIENCE).expect("the worker stops");
         drop(client);
-        assert_eq!(leaked_handles(), 0, "attempt {attempt}: the handle was released");
+        assert_eq!(
+            leaked_handles(),
+            0,
+            "attempt {attempt}: the handle was released"
+        );
     }
 }
 

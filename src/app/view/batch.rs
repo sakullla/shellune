@@ -329,9 +329,17 @@ impl ShelluneView {
 
     /// Reads what the batch runner reported, returning whether to keep watching.
     pub(super) fn poll_batch(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_watching = self.batch.is_watching();
         let watching = self.batch.pump();
         if !watching {
             self.batch_polling = false;
+            // The run this window was driving just ended, and its summary was written as
+            // it ended. A history page that is already on screen would otherwise keep
+            // listing the runs from before it, so staying on it does not mean a stale
+            // list: it is re-read once, when the run joins it.
+            if was_watching && self.batch.view() == crate::app::batch::BatchCenterView::History {
+                self.batch.refresh_history();
+            }
         }
         cx.notify();
         watching
@@ -405,7 +413,11 @@ impl ShelluneView {
     /// Every other surface is a list or a question, so it goes.
     pub(super) fn dismiss_batch(&mut self, cx: &mut Context<Self>) {
         use crate::app::batch::BatchCenterView;
-        if self.batch.has_active_run() && self.batch.view() == BatchCenterView::ActiveRun {
+        // Only a run that is still going keeps its page. A run that has ended is in the
+        // history, so its page can be dropped like any other surface: gating this on
+        // "a page exists" would leave a finished run with no way out through Escape or
+        // the header's close button.
+        if self.batch.is_watching() && self.batch.view() == BatchCenterView::ActiveRun {
             return;
         }
         if self.batch.close() || self.batch.hide() {
@@ -529,7 +541,10 @@ impl ShelluneView {
         use crate::app::batch::BatchCenterView;
         match self.batch.view() {
             BatchCenterView::Library => {
-                let count = self.batch.library().tasks().len();
+                // The mark can only be on a row that was drawn: a list longer than the
+                // rows on screen says how many it left out, and Enter may not open one
+                // of those, because a person cannot see what they would be opening.
+                let count = self.batch.library().tasks().len().min(MAX_LIBRARY_ROWS);
                 let current = self.batch.library_selected();
                 match event.keystroke.key.as_str() {
                     "down" if count > 0 => {
@@ -562,7 +577,9 @@ impl ShelluneView {
                     return false;
                 }
                 let visible = self.batch.history_visible();
-                let count = visible.len();
+                // The same rule as the library: the mark stays on a row that was drawn,
+                // so Enter never opens a run the list did not show.
+                let count = visible.len().min(MAX_HISTORY_ROWS);
                 let current = self.batch.history_selected();
                 match event.keystroke.key.as_str() {
                     "down" if count > 0 => {
@@ -808,7 +825,7 @@ impl ShelluneView {
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .debug_selector(|| "batch.library.more".to_owned())
                     .child(copy::fill(
-                        ux.batch_targets_more,
+                        ux.batch_library_more,
                         &[("count", &hidden.to_string())],
                     )),
             );
@@ -1600,7 +1617,27 @@ impl ShelluneView {
                     );
                 }
             }
-            _ => {
+            // A log that was not read is not a log that printed nothing: the empty state
+            // says "no output", so a read that failed has to say so instead of borrowing
+            // it, or a damaged or missing run log would read as a quiet host.
+            None => {
+                let text = match self.batch.problem() {
+                    Some(problem) => copy::fill(
+                        ux.batch_history_output_unread_reason,
+                        &[("reason", &redact_batch_text(problem))],
+                    ),
+                    None => ux.batch_history_output_unread.to_owned(),
+                };
+                output = output.child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .debug_selector(|| "batch.history.output.unread".to_owned())
+                        .child(SharedString::from(text)),
+                );
+            }
+            Some(_) => {
                 output = output.child(
                     div()
                         .flex_none()

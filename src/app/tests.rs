@@ -5788,6 +5788,14 @@ async fn the_three_views_and_the_search_read_the_one_saved_book(cx: &mut TestApp
         "saving a host is not connecting to it, so nothing is recent yet"
     );
     assert!(cx.debug_bounds("hosts.recent.0").is_none());
+    // An empty recent view is not a sentence with no way out: one press shows the whole
+    // list again, which is where the hosts that were never connected still are (R3).
+    click(cx, "hosts.recent.all");
+    assert!(
+        cx.debug_bounds("hosts.row.0").is_some(),
+        "the empty recent view offers the whole list"
+    );
+    click(cx, "hosts.view.recent");
 
     // The remote-connection step records a real connection through this path.
     let recorded = cx.update(|_window, app| {
@@ -5821,6 +5829,29 @@ async fn the_three_views_and_the_search_read_the_one_saved_book(cx: &mut TestApp
         cx.debug_bounds("hosts.list.0").is_some(),
         "no row is left after a search that matches nothing"
     );
+    // The reason, the conditions and the way out sit on the same screen: one press drops
+    // the phrase and the filters, and nothing else changes (R3).
+    assert!(
+        cx.debug_bounds("hosts.nomatch.clear").is_some(),
+        "a zero-result list offers the press that clears it"
+    );
+    click(cx, "hosts.nomatch.clear");
+    assert!(
+        cx.debug_bounds("hosts.list.3").is_some(),
+        "the list is back to every saved host"
+    );
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).book().hosts().len(),
+            3,
+            "clearing a search deletes no host"
+        );
+        assert_eq!(
+            view.read(app).hosts_state().search(),
+            "",
+            "the phrase is gone from the field the list reads"
+        );
+    });
 }
 
 #[gpui::test]
@@ -13781,6 +13812,125 @@ async fn the_tab_list_is_walked_with_the_keyboard_and_shows_the_shortcut_in_forc
     );
 }
 
+/// One row per protocol in the all-tabs list, and a cross that closes one tab (R8).
+///
+/// The strip draws only what fits, so a crowded window is read and managed in the list:
+/// a local shell, a remote desktop and a serial device have to be told apart there by
+/// name, kind and target, and the cross on a row has to close that tab and no other.
+#[gpui::test]
+async fn the_tab_list_names_each_tab_by_its_protocol_and_closes_only_that_one(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    let Some(shell) = start_local_session(cx, &view) else {
+        return;
+    };
+    let record = desktop_record("office");
+    let (link, _log) = ScriptedLink::new(Vec::new());
+    let desktop = mount_scripted_desktop(&view, cx, &record, link);
+    let (serial_link, _device, _peer) = scripted_serial();
+    let serial = mount_scripted_serial(&view, cx, "console", "COM254", false, serial_link);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![shell, desktop, serial],
+        "three sessions are three tabs, in the order they were opened"
+    );
+
+    click(cx, "tabs.list.open");
+    assert!(
+        cx.debug_bounds("tabs.list.row.2").is_some(),
+        "every tab has a row, whatever it is"
+    );
+    // A desktop session and a serial session are not local ones. Each row wears the
+    // kind its own session has, in the same words the palette uses, so a mixed strip
+    // can still be read (R8).
+    for selector in [
+        "tabs.list.kind.local.0",
+        "tabs.list.kind.desktop.1",
+        "tabs.list.kind.serial.2",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is drawn for the tab it belongs to"
+        );
+    }
+    assert!(
+        cx.debug_bounds("tabs.list.kind.local.1").is_none(),
+        "the desktop tab is never drawn as a local one"
+    );
+
+    // The pencil names the row's own tab and leaves the others as they are (R8).
+    let shell_before = cx.update(|_window, app| view.read(app).tab_label_for_test(shell));
+    click(cx, "tabs.list.rename.2");
+    assert!(
+        cx.update(|_window, app| view.read(app).tab_rename_open()),
+        "the pencil in the row names that tab"
+    );
+    cx.simulate_input("board");
+    cx.run_until_parked();
+    click(cx, "tab.rename.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(serial)),
+        "board",
+        "the name went to the serial tab the row belongs to"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(shell)),
+        shell_before,
+        "the shell beside it was not renamed"
+    );
+
+    // The list closed behind the name dialog, so it is opened again for the close.
+    click(cx, "tabs.list.open");
+    // The cross on a row closes the tab that row names, and the list closes behind it.
+    assert!(
+        cx.debug_bounds("tabs.list.close.1").is_some(),
+        "a row carries a close of its own"
+    );
+    click(cx, "tabs.list.close.1");
+    assert!(
+        !cx.update(|_window, app| view.read(app).tab_list_open()),
+        "the list closes behind the close it performed"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![shell, serial],
+        "only the tab whose row was closed went away"
+    );
+    assert_eq!(
+        session_state(cx, &view, desktop),
+        Some(SessionState::Closed),
+        "the desktop session really closed"
+    );
+    assert_eq!(
+        session_state(cx, &view, shell),
+        Some(SessionState::Connected),
+        "the shell beside it keeps running"
+    );
+    assert_eq!(
+        session_state(cx, &view, serial),
+        Some(SessionState::Connected),
+        "and so does the serial session"
+    );
+
+    // The rows left still name their own protocols, in the order they now stand.
+    click(cx, "tabs.list.open");
+    assert!(
+        cx.debug_bounds("tabs.list.kind.local.0").is_some(),
+        "the shell is still a shell"
+    );
+    assert!(
+        cx.debug_bounds("tabs.list.kind.serial.1").is_some(),
+        "the serial session moved up and is still named as one"
+    );
+    assert!(
+        cx.debug_bounds("tabs.list.close.1").is_some(),
+        "the closed tab's row is gone and its neighbour took the place"
+    );
+}
+
 #[gpui::test]
 async fn the_tab_name_dialog_and_the_tab_list_fit_the_smallest_window_at_large_text(
     cx: &mut TestAppContext,
@@ -20797,6 +20947,52 @@ async fn a_list_of_five_thousand_hosts_builds_only_the_rows_the_window_shows(
 }
 
 #[gpui::test]
+async fn a_list_of_five_thousand_connections_builds_only_the_rows_the_window_shows(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("scale-connections");
+    let store = dir.store();
+    let mut book = HostBook::new();
+    for index in 0..5_000 {
+        let record = shellune_core::ConnectionRecord::Rdp(
+            shellune_core::RdpConfig::new(
+                format!("desk {index}"),
+                format!("10.1.{}.{}:3389", index / 250, index % 250),
+                Some("alice"),
+            )
+            .expect("a valid RDP record"),
+        );
+        book.insert_connection(record)
+            .expect("the record is inserted");
+    }
+    store.save(&book).expect("the book saves");
+    let (view, cx) = hosts_view(cx, store);
+
+    assert!(
+        cx.debug_bounds("hosts.list.5000").is_some(),
+        "the list holds every saved connection, not a page of them"
+    );
+    let drawn = cx.update(|_window, app| view.read(app).hosts_rows_drawn());
+    assert!(drawn > 0, "the list drew no row at all");
+    assert!(
+        drawn <= 16,
+        "one frame built {drawn} rows of five thousand connections, so the list is not virtualized"
+    );
+    assert!(
+        cx.debug_bounds("hosts.connection.2000").is_none(),
+        "a connection far below the window was built although nobody could see it"
+    );
+    // Reading the list is not dialling it: a record of another protocol is not a
+    // session, and no attempt was made while the list was drawn (R2, R18).
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).workspace().item_count(Destination::Sessions),
+            0
+        );
+    });
+}
+
+#[gpui::test]
 async fn scrolling_five_thousand_hosts_brings_another_row_in_and_still_connects_nothing(
     cx: &mut TestAppContext,
 ) {
@@ -22514,6 +22710,565 @@ async fn the_task_centre_fits_the_minimum_window_and_speaks_both_languages(
     }
 }
 
+#[gpui::test]
+async fn a_run_that_ended_closes_with_escape_and_with_the_header_button(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-close-finished");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+
+    // Escape: a run that has ended is a page like any other, and its record is already in
+    // the history, so nothing is lost by putting it away.
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["uptime"]);
+    let (_factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                fixture_plan(
+                    &["build-01", "api-02"],
+                    HostScript::new(vec![StepScript::ok("up 12 days\n")]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_panel().page()),
+        crate::app::batch::BatchPage::Run,
+        "the page of the run that just ended is still on screen"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_panel().page()),
+        crate::app::batch::BatchPage::Closed,
+        "escape puts the page of a run that has ended away"
+    );
+
+    // The header's close button is the same dismissal and follows the same rule: a run
+    // that is still going keeps its page, because the page is the only place its state
+    // is visible, and a finished one goes.
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["journalctl -f"]);
+    let (_outcome, gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_confirm(
+                fixture_plan(
+                    &["build-01", "api-02"],
+                    HostScript::new(vec![StepScript::holding("tailing\n")]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.running_hosts() > 0)
+    }));
+    click(cx, "batch.run.close");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_panel().page()),
+        crate::app::batch::BatchPage::Run,
+        "a run that has not ended keeps its page"
+    );
+    gate.release();
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    click(cx, "batch.run.close");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_panel().page()),
+        crate::app::batch::BatchPage::Closed,
+        "the header closes the page of a run that has ended"
+    );
+}
+
+#[gpui::test]
+async fn a_stored_log_that_cannot_be_read_says_so_instead_of_showing_no_output(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("batch-log-unreadable");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 1);
+    write_commands(cx, &["uptime"]);
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let (_factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                fixture_plan(
+                    &["build-01"],
+                    HostScript::new(vec![StepScript::ok("up 12 days\n")]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    let run_id = cx.update(|_window, app| {
+        view.read(app)
+            .batch_panel()
+            .run()
+            .expect("a run page")
+            .run()
+            .id()
+    });
+
+    // The summary is intact and the log is damaged, which is what a half-written file
+    // looks like: the run can still be opened, but its output cannot be read. A line
+    // that is not an event and is not the last line is corruption, not a short tail.
+    let batch = shellune_storage::BatchStore::at(dir.store().root());
+    std::fs::write(
+        batch.log_path(run_id),
+        "not an event\nnot an event\nnot an event\n",
+    )
+    .expect("the run wrote its log");
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_history(cx));
+    });
+    cx.run_until_parked();
+    click(cx, "batch.history.open.0");
+
+    cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        assert!(
+            panel.stored_summary().is_some(),
+            "the summary of the run is still readable"
+        );
+        assert!(
+            panel.stored_host().is_some(),
+            "a host is chosen, so the page has something to say"
+        );
+        assert!(
+            panel.stored_detail_open().is_none(),
+            "nothing was read, because the log is gone"
+        );
+        let problem = panel
+            .problem()
+            .expect("the read failure is carried, not dropped");
+        assert!(!problem.is_empty(), "the reason is said");
+    });
+    assert!(
+        cx.debug_bounds("batch.history.output.unread").is_some(),
+        "the output pane says the log was not read"
+    );
+    assert!(
+        cx.debug_bounds("batch.history.output.empty").is_none(),
+        "and it does not claim the host printed nothing"
+    );
+    assert!(
+        cx.debug_bounds("batch.history.problem").is_some(),
+        "the reason is on the page"
+    );
+}
+
+#[gpui::test]
+async fn a_keyboard_mark_never_lands_on_a_row_the_list_did_not_draw(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-mark-rows");
+    seed(&dir.store(), batch_hosts());
+    let batch = shellune_storage::BatchStore::at(dir.store().root());
+
+    // Sixty-five saved tasks and sixty-five stored runs: both lists draw sixty rows and
+    // count the rest in a sentence, so the keyboard has to stop at the sixtieth.
+    let mut book = batch.load_tasks_upgrading().expect("a readable book");
+    for index in 0..65 {
+        let command = format!("run {index:02}");
+        let mut task = saved_task(&[command.as_str()], &["build-01"]);
+        task.set_name(Some(format!("task {index:02}")));
+        book.insert(task);
+    }
+    batch
+        .save_tasks(&book)
+        .expect("the saved tasks are written");
+    let confirmed = saved_task(&["uptime"], &["build-01"])
+        .confirm(1_700_000_000)
+        .expect("a confirmable task");
+    for index in 0..65 {
+        let run = shellune_core::BatchRun::planned(
+            &confirmed,
+            shellune_core::BatchRunId::new(),
+            1_700_000_000 + index,
+        );
+        batch.save_run(&run).expect("the run summary is written");
+    }
+
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_library(cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.library.row.59").is_some(),
+        "sixty rows are drawn"
+    );
+    assert!(
+        cx.debug_bounds("batch.library.row.60").is_none(),
+        "the sixty-first is only counted, not drawn"
+    );
+    // Sixty-one presses down: with the count of the whole list the mark would walk past
+    // the last row that was drawn, onto a row the list only counts.
+    for _ in 0..61 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.run_until_parked();
+    let selected = cx.update(|_window, app| view.read(app).batch_panel().library_selected());
+    assert!(
+        selected < 60,
+        "the mark stays on a row that was drawn: {selected}"
+    );
+    // Enter opens the marked row, so the row it opens is one the list showed.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let (marked, opened) = cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        let selected = panel.library_selected();
+        let marked = panel.library().tasks()[selected].steps()[0]
+            .command()
+            .to_owned();
+        (marked, panel.commands(app))
+    });
+    assert_eq!(
+        opened,
+        vec![marked],
+        "the keyboard opened the marked task, not one the list did not draw"
+    );
+
+    // The same rule on the stored runs.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_history(cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.history.row.59").is_some(),
+        "sixty stored runs are drawn"
+    );
+    for _ in 0..61 {
+        cx.simulate_keystrokes("down");
+    }
+    cx.run_until_parked();
+    let selected = cx.update(|_window, app| view.read(app).batch_panel().history_selected());
+    assert!(
+        selected < 60,
+        "the mark of the history stays on a drawn row: {selected}"
+    );
+    let marked = cx.update(|_window, app| {
+        view.read(app)
+            .batch_panel()
+            .history_visible()
+            .get(selected)
+            .map(|entry| entry.id())
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let opened = cx.update(|_window, app| view.read(app).batch_panel().stored_open());
+    assert_eq!(
+        opened, marked,
+        "the keyboard opened the marked run, not one the list did not draw"
+    );
+}
+
+#[gpui::test]
+async fn reordered_steps_keep_their_new_order_when_the_task_is_confirmed(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-reorder");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["uptime", "df -h /"]);
+
+    // Moving the second step before the first swaps the two, and changes nothing else:
+    // the order on screen is the order the run would use (R12).
+    click(cx, "batch.step.up.1");
+    let (commands, steps, targets, labels) = cx.update(|_window, app| {
+        let panel = view.read(app).batch_panel();
+        (
+            panel.commands(app),
+            panel.steps().len(),
+            panel.target_count(),
+            panel
+                .targets()
+                .iter()
+                .map(|target| target.label().to_owned())
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(
+        commands,
+        vec!["df -h /".to_owned(), "uptime".to_owned()],
+        "the fields follow the swap"
+    );
+    assert_eq!(steps, 2, "a swap adds and drops nothing");
+    assert_eq!(targets, 2, "and it does not change the targets");
+    assert_eq!(labels.len(), 2, "the preview holds the two targets");
+
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let (_factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                fixture_plan(
+                    &["build-01", "api-02"],
+                    HostScript::new(vec![
+                        StepScript::ok("/dev/sda1 40G\n"),
+                        StepScript::ok("up 12 days\n"),
+                    ]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    cx.update(|_window, app| {
+        let page = view.read(app).batch_panel().run().expect("a run page");
+        let frozen: Vec<String> = page
+            .confirmed()
+            .task()
+            .steps()
+            .iter()
+            .map(|step| step.command().to_owned())
+            .collect();
+        assert_eq!(
+            frozen,
+            vec!["df -h /".to_owned(), "uptime".to_owned()],
+            "the confirmation froze the order the editor shows"
+        );
+        assert_eq!(page.total_hosts(), 2, "two targets, as the preview said");
+        let run_labels: Vec<String> = page
+            .run()
+            .hosts()
+            .iter()
+            .map(|host| host.target().label().to_owned())
+            .collect();
+        assert_eq!(
+            run_labels, labels,
+            "the run keeps the targets the preview listed, in that order"
+        );
+    });
+}
+
+#[gpui::test]
+async fn a_run_that_ends_while_the_history_is_open_joins_the_list(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-history-live");
+    seed(&dir.store(), batch_hosts());
+    let (view, cx) = hosts_view(cx, dir.store());
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["journalctl -f"]);
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let (_outcome, gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_confirm(
+                fixture_plan(
+                    &["build-01", "api-02"],
+                    HostScript::new(vec![StepScript::holding("tailing\n")]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(|page| page.running_hosts() > 0)
+    }));
+    let run_id = cx.update(|_window, app| {
+        view.read(app)
+            .batch_panel()
+            .run()
+            .expect("a run page")
+            .run()
+            .id()
+    });
+
+    // The history is opened while the run is still going: it lists what is stored, which
+    // is nothing yet.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_history(cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).batch_panel().history_visible().len()),
+        0,
+        "a run that has not ended is not in the history"
+    );
+
+    gate.release();
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+    // Staying on that page was enough: the list re-read itself when the run ended, so it
+    // does not keep showing the past as it was before.
+    let listed = cx.update(|_window, app| {
+        view.read(app)
+            .batch_panel()
+            .history_visible()
+            .iter()
+            .map(|entry| entry.id())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        listed,
+        vec![run_id],
+        "the run that just ended joined the list on screen"
+    );
+    assert!(
+        cx.debug_bounds("batch.history.row.0").is_some(),
+        "and its row is drawn without leaving the page"
+    );
+}
+
+#[gpui::test]
+async fn two_hundred_percent_chinese_keeps_the_task_centre_inside_the_minimum_window(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("batch-centre-zoom");
+    seed(&dir.store(), batch_hosts());
+    let mut task = saved_task(
+        &["uptime", "df -h /", "journalctl -u shellune -n 40"],
+        &["build-01", "api-02"],
+    );
+    task.set_name(Some(
+        "a name long enough to be cut off in a narrow dialog".to_owned(),
+    ));
+    seed_task(&dir.store(), task);
+    let (view, cx) = hosts_view(cx, dir.store());
+
+    // One run that ended, so the history has a detail to draw as well as a list.
+    preview_batch(cx, &view, 2);
+    write_commands(cx, &["uptime"]);
+    use crate::app::view::batch::fixture::{HostScript, StepScript};
+    let (_factory, _gate) = cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.capture_batch_start(
+                fixture_plan(
+                    &["build-01", "api-02"],
+                    HostScript::new(vec![StepScript::ok("up 12 days\n")]),
+                ),
+                cx,
+            )
+        })
+    });
+    assert!(settle_batch(cx, &view, |view| {
+        view.batch_panel()
+            .run()
+            .is_some_and(crate::app::batch::BatchRunPage::is_finished)
+    }));
+
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    cx.dispatch_action(ToggleLanguage);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese
+    );
+
+    // The library, the history and the detail of one stored run: at 720x480 with the
+    // largest text, each dialog stays inside the window and draws what it promises (R5).
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_library(cx));
+    });
+    cx.run_until_parked();
+    assert_fits_inside(
+        bounds_of(cx, "batch.library"),
+        minimum_window(),
+        "the library dialog at 200% in Chinese",
+    );
+    for selector in ["batch.switch", "batch.library.row.0", "batch.library.new"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is drawn at the minimum window and 200% in Chinese"
+        );
+    }
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_history(cx));
+    });
+    cx.run_until_parked();
+    assert_fits_inside(
+        bounds_of(cx, "batch.history"),
+        minimum_window(),
+        "the history dialog at 200% in Chinese",
+    );
+    for selector in ["batch.switch", "batch.history.row.0"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is drawn at the minimum window and 200% in Chinese"
+        );
+    }
+
+    let opened =
+        cx.update(|_window, app| view.update(app, |view, cx| view.capture_batch_stored(0, cx)));
+    assert!(opened, "the stored run opens");
+    cx.run_until_parked();
+    assert_fits_inside(
+        bounds_of(cx, "batch.history"),
+        minimum_window(),
+        "the history detail at 200% in Chinese",
+    );
+    for selector in [
+        "batch.history.detail",
+        "batch.history.host.0",
+        "batch.history.output",
+        "batch.history.timeline.0",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is drawn at the minimum window and 200% in Chinese"
+        );
+    }
+}
+
+#[test]
+fn the_library_counts_tasks_in_tasks_and_not_in_hosts() {
+    for locale in Locale::ALL {
+        let strings = crate::app::copy::ux_for(locale);
+        let line = crate::app::copy::fill(strings.batch_library_more, &[("count", "7")]);
+        assert!(
+            line.contains('7'),
+            "the count is filled in in {locale:?}: {line}"
+        );
+        match locale {
+            Locale::Chinese => {
+                assert!(
+                    !line.contains('台'),
+                    "a saved task is not counted in hosts: {line}"
+                );
+                assert!(
+                    line.contains('条') || line.contains("个任务"),
+                    "the unit is a task: {line}"
+                );
+            }
+            Locale::English => assert!(line.contains("task"), "the unit is a task: {line}"),
+        }
+        assert_ne!(
+            strings.batch_library_more, strings.batch_targets_more,
+            "the library does not borrow the host sentence in {locale:?}"
+        );
+    }
+}
+
 #[test]
 fn the_diagnostics_name_the_hosts_and_carry_no_credential() {
     let task = saved_task(&["uptime"], &["build-01"]);
@@ -22678,6 +23433,120 @@ async fn a_double_click_on_a_host_row_connects_and_a_single_click_does_not(
     );
 }
 
+/// A book holding one saved record of another protocol, as a previous run left it.
+fn seed_connections(store: &HostStore, records: Vec<shellune_core::ConnectionRecord>) {
+    let mut book = HostBook::new();
+    for record in records {
+        book.insert_connection(record)
+            .expect("the connection is inserted");
+    }
+    store.save(&book).expect("the book saves");
+}
+
+#[gpui::test]
+async fn the_connect_button_of_a_saved_desktop_row_opens_its_own_surface(cx: &mut TestAppContext) {
+    let dir = TempDir::new("desktop-row-connect");
+    let record = desktop_record("office");
+    seed_connections(&dir.store(), vec![record.clone()]);
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    assert!(
+        cx.debug_bounds("hosts.connection.connect.0").is_some(),
+        "a record of another protocol carries the same labelled connect button"
+    );
+    click(cx, "hosts.connection.connect.0");
+    cx.run_until_parked();
+
+    // One press is one session, and it is the record's own protocol: a desktop
+    // surface in a tab of the application, not the SSH sign-in form (R2, R18).
+    let opened = cx.update(|_window, app| view.read(app).open_sessions());
+    assert_eq!(opened.len(), 1, "one press opens one session");
+    assert!(
+        cx.debug_bounds("remote.panel").is_none(),
+        "a desktop record never opens the SSH form"
+    );
+    assert!(
+        cx.debug_bounds("desktop.body").is_some(),
+        "the session is drawn as a remote desktop"
+    );
+}
+
+#[gpui::test]
+async fn the_connect_button_of_a_saved_serial_row_opens_its_own_device(cx: &mut TestAppContext) {
+    let dir = TempDir::new("serial-row-connect");
+    let config =
+        shellune_core::SerialConfig::new("console", "COM254").expect("a valid serial record");
+    seed_connections(
+        &dir.store(),
+        vec![shellune_core::ConnectionRecord::Serial(config)],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    click(cx, "hosts.connection.connect.0");
+    cx.run_until_parked();
+
+    let opened = cx.update(|_window, app| view.read(app).open_sessions());
+    assert_eq!(opened.len(), 1, "one press opens one session");
+    let serial = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(opened[0])
+            .is_some_and(|pane| pane.read(app).is_serial())
+    });
+    assert!(
+        serial,
+        "the record is opened as a serial session, not as a terminal that pretends"
+    );
+    assert!(
+        cx.debug_bounds("remote.panel").is_none(),
+        "a serial record never opens the SSH form"
+    );
+}
+
+#[gpui::test]
+async fn a_saved_desktop_row_only_says_connected_once_a_session_really_runs(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("desktop-row-state");
+    let record = desktop_record("office");
+    seed_connections(&dir.store(), vec![record.clone()]);
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    // Saving a record is not starting one. The row states no session, and it does not
+    // invent an "offline" either: idle is not a state a saved record has (R2).
+    assert!(
+        cx.debug_bounds("hosts.connection.open.0").is_none(),
+        "a record that was never started is not drawn as connected"
+    );
+
+    // One real session in this window, mounted through the same registration the start
+    // path uses; only the link is scripted, and nothing here is evidence about a server.
+    let desktop = (64u32, 48u32);
+    let (link, _log) = ScriptedLink::new(vec![
+        LinkEvent::State {
+            state: LinkState::Connected,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::Frame(solid(0, 0, 64, 48, desktop, [16, 32, 48, 255])),
+    ]);
+    mount_scripted_desktop(&view, cx, &record, link);
+
+    // Back on the list: the row now says what the session says, because it reads the
+    // sessions this window holds rather than the saved file.
+    cx.dispatch_action(GoToHosts);
+    cx.run_until_parked();
+    assert_eq!(destination_of(&view, cx), Destination::Hosts);
+    assert!(
+        cx.debug_bounds("hosts.connection.open.0").is_some(),
+        "the row of a record with a running session says it is connected"
+    );
+    assert!(
+        cx.debug_bounds("hosts.connection.0").is_some(),
+        "and it is still the same row, with the same actions"
+    );
+}
+
 #[gpui::test]
 async fn the_settings_page_scrolls_through_every_category_and_the_navigation_follows(
     cx: &mut TestAppContext,
@@ -22767,7 +23636,7 @@ fn mount_scripted_desktop(
 ) -> SessionId {
     let id = cx.update(|_window, cx| {
         view.update(cx, |view, cx| {
-            view.attach_scripted_desktop_for_test(record, Box::new(link), cx)
+            view.attach_scripted_desktop(record, Box::new(link), cx)
         })
     });
     cx.update(|_window, cx| {
@@ -23310,6 +24179,118 @@ async fn a_desktop_pane_takes_the_whole_window_and_gives_it_back(cx: &mut TestAp
     assert_eq!(
         log.shutdowns, 0,
         "going in and out of full screen does not rebuild the connection"
+    );
+}
+
+/// Mounts one live scripted desktop and puts it in full screen, for the tests that
+/// check what takes the window back (R18).
+fn desktop_in_full_screen(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> SessionId {
+    let (link, _log) = ScriptedLink::new(vec![
+        LinkEvent::State {
+            state: LinkState::Connected,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::Frame(solid(0, 0, 1600, 900, (1600, 900), [9, 9, 9, 255])),
+    ]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(view, cx, &record, link);
+    // The keys reach a pane the frame has drawn: the surface is measured here, as the
+    // full-screen test above measures it before it presses F11.
+    let _ = bounds_of(cx, "desktop.surface");
+    focus_desktop(view, cx, id);
+    cx.simulate_keystrokes("f11");
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        cx.update(|window, _app| window.is_fullscreen()),
+        "the pane asked for the window"
+    );
+    id
+}
+
+#[gpui::test]
+async fn full_screen_gives_the_window_back_when_another_page_is_chosen(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let id = desktop_in_full_screen(&view, cx);
+
+    cx.dispatch_action(crate::app::actions::GoToHosts);
+    cx.run_until_parked();
+    redraw(cx);
+
+    assert!(
+        !cx.update(|window, _app| window.is_fullscreen()),
+        "the window is a window again the moment its head would be needed"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_fullscreen()),
+        None,
+        "the full-screen state does not outlive the page it belonged to"
+    );
+    assert!(
+        cx.debug_bounds("session.header").is_some(),
+        "the page that took over has its head back"
+    );
+    // The session itself is untouched: it is still live behind the page.
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is still mounted")
+            .read(app)
+            .is_live()
+    }));
+}
+
+#[gpui::test]
+async fn full_screen_gives_the_window_back_when_the_desktop_tab_is_split(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    desktop_in_full_screen(&view, cx);
+
+    cx.dispatch_action(crate::app::actions::SplitPaneRight);
+    cx.run_until_parked();
+    redraw(cx);
+
+    assert!(
+        !cx.update(|window, _app| window.is_fullscreen()),
+        "a split desktop needs the head the full screen hid"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_fullscreen()),
+        None
+    );
+    assert!(
+        cx.debug_bounds("session.header").is_some(),
+        "the tab strip is back, so the split pane can be found"
+    );
+}
+
+#[gpui::test]
+async fn the_send_warning_is_drawn_once_before_the_first_frame(cx: &mut TestAppContext) {
+    // A send that fails before the picture arrives: the status card already carries
+    // the sentence, so the strip that sits over a picture must not repeat it (R18).
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(Vec::new());
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    let reason = crate::app::desktop::LinkError::State.reason();
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            if let Some(pane) = view.desktop_of(id).cloned() {
+                pane.update(cx, |pane, cx| pane.show_send_problem(&reason, cx));
+            }
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+
+    assert!(
+        cx.debug_bounds("desktop.status").is_some(),
+        "the card explains the session before any picture"
+    );
+    assert!(
+        cx.debug_bounds("desktop.notice").is_none(),
+        "the same sentence is not drawn twice while there is no picture"
     );
 }
 

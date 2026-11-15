@@ -202,8 +202,9 @@ impl DesktopPane {
     }
 
     /// A pane already holding a link, which is how the tests drive every rule the
-    /// window has without a server.
-    #[cfg(test)]
+    /// window has without a server, and how the capture photographs the chrome of a
+    /// session no server on this machine can produce.
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn with_link(
         target: DesktopTarget,
         link: Box<dyn DesktopLink>,
@@ -475,17 +476,19 @@ impl DesktopPane {
         .detach();
     }
 
-    /// Whether the surface is showing a live picture, for a test.
-    #[cfg(test)]
+    /// Whether the surface is showing a live picture, for a test or a capture.
+    #[cfg(any(test, feature = "ui-capture"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_live(&self) -> bool {
         matches!(self.phase, DesktopPhase::Live)
     }
 
-    /// Applies whatever the link has waiting, for a test.
+    /// Applies whatever the link has waiting, for a test or a capture.
     ///
-    /// The polling task waits on the window's timer, which a test cannot advance, so
-    /// a test drives the same call directly - exactly as the terminal pane does.
-    #[cfg(test)]
+    /// The polling task waits on the window's timer, which a test cannot advance and a
+    /// capture has no frame to spend on, so both drive the same call directly -
+    /// exactly as the terminal pane does.
+    #[cfg(any(test, feature = "ui-capture"))]
     pub fn pump_once(&mut self, cx: &mut Context<Self>) -> bool {
         self.drain(cx)
     }
@@ -716,6 +719,17 @@ impl DesktopPane {
             }
             Err(error) => self.send_problem = Some(error.reason()),
         }
+    }
+
+    /// Puts the send warning on the surface, for a test or a capture.
+    ///
+    /// The real path sets it when a send the user asked for fails, and clears it only
+    /// when a later send really carried something. This writes the same field so a
+    /// shot of the strip is the strip the failure draws, not a copy of it.
+    #[cfg(any(test, feature = "ui-capture"))]
+    pub fn show_send_problem(&mut self, reason: &str, cx: &mut Context<Self>) {
+        self.send_problem = Some(reason.to_owned());
+        cx.notify();
     }
 
     /// Releases everything the remote side may still think is held (R17).
@@ -1194,6 +1208,10 @@ impl Render for DesktopPane {
         }
         self.was_active = active;
         let picture = self.picture();
+        // Whether the picture is what the body shows. The status card below stands in
+        // for it while it is absent, and the warning strip belongs over the picture
+        // only: drawing both would say the same thing twice before the first frame.
+        let has_picture = picture.is_some();
         let entity = cx.entity().downgrade();
 
         let mut body = div()
@@ -1333,7 +1351,7 @@ impl Render for DesktopPane {
         if !matches!(self.phase, DesktopPhase::NotStarted) {
             body = body.child(self.controls(metrics, cx));
         }
-        if let Some(notice) = self.notice_strip(metrics) {
+        if has_picture && let Some(notice) = self.notice_strip(metrics) {
             body = body.child(notice);
         }
         if self.certificate.is_some() {

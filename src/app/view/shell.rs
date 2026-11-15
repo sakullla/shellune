@@ -753,8 +753,12 @@ impl ShelluneView {
         // The empty first run explains itself in a card; every other state shows the
         // servers themselves, which is a virtualized list that has to be given the
         // height left over instead of being scrolled as one long column (R18).
+        // A first run is a book with no saved record at all. A book holding only a
+        // desktop or serial connection is not a first run: the welcome card would
+        // draw over records the list is the only way to reach (R1, R3, R18).
         let welcome = matches!(state, SectionState::Empty | SectionState::Populated)
             && self.book.hosts().is_empty()
+            && self.book.connections().is_empty()
             && self.hosts.search().trim().is_empty()
             && !self.import.is_open();
         let hosts = if welcome {

@@ -1257,7 +1257,7 @@ mod tests {
         let upgraded = store
             .load_tasks_upgrading()
             .expect("the version 0 file is migrated");
-        assert_eq!(upgraded.tasks(), [saved.clone()]);
+        assert_eq!(upgraded.tasks(), std::slice::from_ref(&saved));
 
         // Afterwards it is a document this build writes, so nothing reports version 0.
         let strict = store

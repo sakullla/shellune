@@ -33,6 +33,8 @@ use shellune_storage::{
 
 use crate::app::ShelluneView;
 use crate::app::copy::Locale;
+use crate::app::desktop::scripted::{ScriptedLink, solid};
+use crate::app::desktop::{LinkError, LinkEvent, LinkFailure, LinkState};
 use crate::app::files::FileSource;
 use crate::app::hosts::ConnectionChoice;
 use crate::app::keymap::Problem;
@@ -50,6 +52,8 @@ pub enum Category {
     Home,
     /// A terminal with a session around it.
     Terminal,
+    /// A remote desktop session: an RDP or VNC surface in its tab.
+    Desktop,
     /// The settings page.
     Settings,
     /// A tool or palette open over a page.
@@ -63,6 +67,7 @@ impl Category {
         match self {
             Self::Home => "home",
             Self::Terminal => "terminal",
+            Self::Desktop => "desktop",
             Self::Settings => "settings",
             Self::Overlay => "overlay",
         }
@@ -559,6 +564,278 @@ fn serial_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Remote desktops
+// ---------------------------------------------------------------------------
+
+/// The desktop the scripted frames describe. Nothing is negotiated: the size is the
+/// one the regions claim.
+const DESKTOP_SIZE: (u32, u32) = (1280, 720);
+
+/// A saved RDP connection for a shot. Nothing dials it.
+fn capture_rdp_record() -> shellune_core::ConnectionRecord {
+    shellune_core::ConnectionRecord::Rdp(
+        shellune_core::RdpConfig::new("Design workstation", "10.0.0.40:3389", Some("alice"))
+            .expect("a valid RDP record"),
+    )
+}
+
+/// A saved VNC connection for a shot. Nothing dials it.
+fn capture_vnc_record() -> shellune_core::ConnectionRecord {
+    shellune_core::ConnectionRecord::Vnc(
+        shellune_core::VncConfig::new("Build monitor", "10.0.0.41:5900")
+            .expect("a valid VNC record"),
+    )
+}
+
+/// The regions the scripted desktop is made of: a wallpaper, a window with a title bar
+/// and a body, and a bar along the bottom.
+///
+/// They are flat colours on purpose. The shot is of the chrome the application draws
+/// around a picture - the controls, the zoom, the notice - and a photorealistic
+/// snapshot would suggest a server drew it.
+fn desktop_regions() -> Vec<LinkEvent> {
+    vec![
+        LinkEvent::Frame(solid(
+            0,
+            0,
+            1280,
+            720,
+            DESKTOP_SIZE,
+            [0x30, 0x28, 0x22, 0xff],
+        )),
+        LinkEvent::Frame(solid(
+            120,
+            96,
+            640,
+            420,
+            DESKTOP_SIZE,
+            [0xf4, 0xf4, 0xf4, 0xff],
+        )),
+        LinkEvent::Frame(solid(
+            120,
+            96,
+            640,
+            36,
+            DESKTOP_SIZE,
+            [0xb0, 0x6a, 0x2d, 0xff],
+        )),
+        LinkEvent::Frame(solid(
+            0,
+            688,
+            1280,
+            32,
+            DESKTOP_SIZE,
+            [0x2a, 0x26, 0x22, 0xff],
+        )),
+    ]
+}
+
+/// Mounts one scripted desktop and applies what its link already holds.
+fn mount_desktop(
+    view: &mut ShelluneView,
+    record: &shellune_core::ConnectionRecord,
+    events: Vec<LinkEvent>,
+    cx: &mut Context<ShelluneView>,
+) -> Result<SessionId, String> {
+    let (link, _log) = ScriptedLink::new(events);
+    let id = view.attach_scripted_desktop(record, Box::new(link), cx);
+    let pane = view
+        .desktop_of(id)
+        .cloned()
+        .ok_or_else(|| "the desktop surface was not mounted".to_owned())?;
+    pane.update(cx, |pane, cx| {
+        pane.pump_once(cx);
+    });
+    Ok(id)
+}
+
+/// An RDP session with its first picture: the controls, the zoom and the tab around it.
+fn show_desktop_rdp(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let mut events = vec![LinkEvent::State {
+        state: LinkState::Connected,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    }];
+    events.extend(desktop_regions());
+    let id = mount_desktop(view, &capture_rdp_record(), events, cx)?;
+    // The zoom is one of the controls the shot is about, so it is off its default.
+    if let Some(pane) = view.desktop_of(id).cloned() {
+        pane.update(cx, |pane, cx| pane.zoom_in(cx));
+    }
+    Ok(())
+}
+
+/// A VNC session the server refused: the card that says which step failed and what to
+/// do next.
+fn show_desktop_vnc_failed(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let reason = "the server refused the password";
+    let events = vec![
+        LinkEvent::State {
+            state: LinkState::Connecting,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::State {
+            state: LinkState::Failed(LinkFailure::Authentication),
+            failure: LinkFailure::Authentication,
+            detail: 0,
+            reason: reason.to_owned(),
+        },
+    ];
+    mount_desktop(view, &capture_vnc_record(), events, cx)?;
+    Ok(())
+}
+
+/// A live RDP session whose last send did not reach the remote side: the strip over the
+/// picture, which is the only place that sentence can be read.
+fn show_desktop_send_problem(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let mut events = vec![LinkEvent::State {
+        state: LinkState::Connected,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    }];
+    events.extend(desktop_regions());
+    let id = mount_desktop(view, &capture_rdp_record(), events, cx)?;
+    let reason = LinkError::State.reason();
+    if let Some(pane) = view.desktop_of(id).cloned() {
+        pane.update(cx, |pane, cx| pane.show_send_problem(&reason, cx));
+    }
+    Ok(())
+}
+
+/// Where a desktop shot has arrived: one session with a surface that has a picture.
+fn desktop_live_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    let shown = view
+        .open_sessions()
+        .into_iter()
+        .filter(|id| {
+            view.desktop_of(*id)
+                .is_some_and(|pane| pane.read(cx).surface().size() == DESKTOP_SIZE)
+        })
+        .count();
+    if shown != 1 {
+        return Err(format!("{shown} desktop surfaces hold a picture"));
+    }
+    Ok(())
+}
+
+/// Where a failed desktop shot has arrived: one session whose surface stopped with a
+/// reason, whichever failure the protocol layer named.
+fn desktop_failed_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    let phases: Vec<String> = view
+        .open_sessions()
+        .into_iter()
+        .filter_map(|id| {
+            view.desktop_of(id)
+                .map(|pane| format!("{:?}", pane.read(cx).phase()))
+        })
+        .collect();
+    let failed = view.open_sessions().into_iter().any(|id| {
+        view.desktop_of(id)
+            .is_some_and(|pane| pane.read(cx).phase().failure().is_some())
+    });
+    if !failed {
+        return Err(format!(
+            "the desktop session did not report a failure: {phases:?}"
+        ));
+    }
+    Ok(())
+}
+/// Writes a hosts file that cannot be read, so the failed state is the real one.
+fn damage_hosts(root: &Path) -> Result<(), String> {
+    let path = HostStore::at(root.to_path_buf()).path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("the run root could not be created: {error}"))?;
+    }
+    std::fs::write(&path, "{ this is not a host book }")
+        .map_err(|error| format!("the damaged fixture could not be written: {error}"))
+}
+
+/// Writes one book holding both kinds of record: saved hosts and desktop or serial
+/// connections, so the list draws the rows of another protocol beside them.
+fn seed_connections(root: &Path) -> Result<(), String> {
+    let mut book = shellune_storage::HostBook::new();
+    for host in saved_hosts()? {
+        book.apply(&HostEdit::create(host))
+            .map_err(|error| format!("the host fixture could not be built: {error}"))?;
+    }
+    for record in [
+        shellune_core::ConnectionRecord::Rdp(
+            shellune_core::RdpConfig::new("Design workstation", "10.0.0.40:3389", Some("alice"))
+                .map_err(|error| format!("the RDP fixture is invalid: {error}"))?,
+        ),
+        shellune_core::ConnectionRecord::Vnc(
+            shellune_core::VncConfig::new("Build monitor", "10.0.0.41:5900")
+                .map_err(|error| format!("the VNC fixture is invalid: {error}"))?,
+        ),
+        shellune_core::ConnectionRecord::Serial(
+            shellune_core::SerialConfig::new("Console cable", "COM3")
+                .map_err(|error| format!("the serial fixture is invalid: {error}"))?,
+        ),
+    ] {
+        book.insert_connection(record)
+            .map_err(|error| format!("the connection fixture could not be added: {error}"))?;
+    }
+    HostStore::at(root)
+        .save(&book)
+        .map_err(|error| format!("the connection fixture could not be written: {error}"))
+}
+
+/// Where the mixed-list shot has arrived: the list holds the saved connections too.
+fn connections_listed_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    let saved = view.book().connections().len();
+    if saved != 3 {
+        return Err(format!("{saved} connections are in the book, not three"));
+    }
+    Ok(())
+}
+
+/// Narrows the list with a phrase nothing matches, the way a person would.
+fn show_no_match(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.search_hosts("no-such-host", cx);
+    Ok(())
+}
+
+/// Where the zero-result shot has arrived: the phrase is the one the list reads, and
+/// it keeps nothing.
+fn no_match_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.hosts_state().search() != "no-such-host" {
+        return Err("the search phrase did not reach the list".to_owned());
+    }
+    Ok(())
+}
+
+/// Where the failed-store shot has arrived: the hosts destination reports the failure
+/// instead of an empty book.
+fn hosts_failed_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    match view.workspace().state(Destination::Hosts) {
+        SectionState::Failed => Ok(()),
+        other => Err(format!("the hosts page is {other:?}, not failed")),
+    }
+}
+
 /// Puts one display-only session on screen, titled like a real one.
 fn show_terminal(
     view: &mut ShelluneView,
@@ -1687,6 +1964,91 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: show_serial,
         ready: serial_ready,
+    },
+    Scenario {
+        id: "hosts-connections",
+        title: "主机 · 桌面与串口记录及其连接动作",
+        category: Category::Home,
+        fixture: "six saved hosts plus one RDP, one VNC and one serial record, written before the view starts",
+        evidence: "shows that the records of other protocols are listed beside the hosts with the same labelled connect button and no selection box; nothing was dialled and no session exists",
+        quick: true,
+        variants: &[Variant::dark().smallest(), Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_connections,
+        install: no_state,
+        ready: connections_listed_ready,
+    },
+    Scenario {
+        id: "home-no-match",
+        title: "首页 · 零结果筛选与清除",
+        category: Category::Home,
+        fixture: "six saved hosts with the phrase no-such-host typed into the search field",
+        evidence: "shows the reason, the current condition and the press that drops it over a real narrowed list; proves nothing about a search across a live server list",
+        quick: true,
+        variants: &[Variant::dark().smallest(), Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_no_match,
+        ready: no_match_ready,
+    },
+    Scenario {
+        id: "hosts-read-failed",
+        title: "主机 · 主机文件读不出来",
+        category: Category::Home,
+        fixture: "a hosts file holding text that is not a host book, written before the view starts",
+        evidence: "shows that an unreadable store is not drawn as an empty list, and which reason and retry it offers; proves nothing about a real disk failure",
+        quick: false,
+        variants: &[Variant::dark().smallest(), Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: damage_hosts,
+        install: no_state,
+        ready: hosts_failed_ready,
+    },
+    Scenario {
+        id: "desktop-rdp",
+        title: "远程桌面 · RDP 画面与控件",
+        category: Category::Desktop,
+        fixture: "a display-only RDP surface mounted on a scripted link: four flat regions and a connected state; no server was dialled",
+        evidence: "shows the tab, the control strip and the zoom the window draws around a picture; proves \
+                   nothing about a real RDP server, its frames, its input or its clipboard",
+        quick: true,
+        variants: &[
+            Variant::dark().smallest(),
+            Variant::dark().comfortable(),
+            Variant::dark().chinese(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_desktop_rdp,
+        ready: desktop_live_ready,
+    },
+    Scenario {
+        id: "desktop-vnc-failed",
+        title: "远程桌面 · VNC 认证失败",
+        category: Category::Desktop,
+        fixture: "a display-only VNC surface whose scripted link reports an authentication failure; no server was dialled",
+        evidence: "shows the card a refused sign-in leaves and the step it stopped on; proves nothing about a \
+                   real VNC server's handshake or security types",
+        quick: false,
+        variants: &[Variant::dark().smallest(), Variant::dark().chinese()],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_desktop_vnc_failed,
+        ready: desktop_failed_ready,
+    },
+    Scenario {
+        id: "desktop-send-problem",
+        title: "远程桌面 · 输入未送达的提示条",
+        category: Category::Desktop,
+        fixture: "a live display-only RDP surface with the send warning the pane draws after a send fails; no server was dialled",
+        evidence: "shows where the warning sits over a picture and that it does not replace it; proves nothing \
+                   about a real input path",
+        quick: false,
+        variants: &[Variant::dark().comfortable(), Variant::dark().chinese()],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_desktop_send_problem,
+        ready: desktop_live_ready,
     },
     Scenario {
         id: "terminal-local",

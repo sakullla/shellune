@@ -1,6 +1,6 @@
 # 跨功能走查记录（T10）
 
-本文件记录 T10 对 R1、R2、R6、R7、R12 的走查结果。当前外壳以 `02-shell-and-design-system.md` 为准。`01-task-flows.md` 是早期调研，`03-first-use-walkthrough.md` 是 T2 与 T11 的历史记录；其中“四个入口”“最大字号 115%”“本任务不引入动画”不描述现在的产品。
+本文件记录两轮走查：第 1—4 节是早期一轮（其 T10 对 R1、R2、R6、R7、R12）的历史记录，第 5 节是 2026-11-14 全产品精修（T11）的收口记录。当前外壳以 `02-shell-and-design-system.md` 为准。`01-task-flows.md` 是早期调研，`03-first-use-walkthrough.md` 是更早的历史记录；其中“四个入口”“最大字号 115%”“本任务不引入动画”不描述现在的产品。
 
 未在下面标成实测的平台和辅助功能，都是未验证。构建成功、令牌对比度计算和 GPUI 测试窗口不能代替那些项。
 
@@ -79,3 +79,69 @@
 - 实窗逐页走查：浅色/深色切换、200% 文字、中英文长文本、最小窗口拖动、仅键盘完成快速连接和主机编辑，都没有在第 2 节那个实窗里操作。200% 与最小窗口的结论来自 GPUI 测试窗口。
 - 指针目标至少 24×24：本轮没有用外部工具在实窗上量控件。未验证。
 - 实窗上的对比度取样：本轮没有用外部对比度检查器对运行中的窗口取样。令牌测试见第 3 节，不能写成实窗已测。
+
+## 5. 本轮（T11）全产品精修与真实界面证据
+
+这一节记录 2026-11-14 需求（R1、R2、R3、R4、R5、R6、R8、R11、R24）的收口工作。上面 1—4 节是早前一轮的历史记录：其中的平台读数、字号阶梯与「本轮没有跑门禁」的说法都不描述当前提交。当前外壳与共享控件以 `02-shell-and-design-system.md` 为准。
+
+### 5.1 本轮改了什么
+
+- **连接行有了主连接动作（R2）。** RDP、VNC、串口的记录在主机列表里与 SSH 主机并列，行尾是带字按钮 `hosts.connection.connect.{n}`，双击行同义；两者都走 `connect_saved_connection`，由记录自己的协议决定结果：SSH 打开登录表单，桌面在应用内开一个桌面标签，串口按记录里的设备名打开。编辑 / 复制 / 删除仍是安静图标，点行不会连带编辑或删除。
+- **「首次使用」按全部记录判定（R1、R3）。** 主页欢迎卡与主机页首次使用卡都要求 `book.hosts().is_empty() && book.connections().is_empty()`。一本只存了桌面或串口记录的主机文件不再被欢迎卡盖住：之前只看 SSH 主机，那些记录于是既没有列表也没有行可以到达。
+- **零结果与空历史各有出口（R3）。** 零结果状态除原因与提示外增加 `hosts.nomatch.clear`：清空搜索词与分组/状态筛选，不删任何记录。最近连接为空时给出 `hosts.recent.all`，一键回到全部主机。
+- **桌面全屏有了作用域（R18）。** 全屏只在「会话页、该会话是活动窗格、窗格仍在、标签里只有它这一个叶子」时成立；关掉、切标签、分屏或走到别的页面都由 `settle_desktop_fullscreen` 结束全屏并把窗口还给用户。此前这些路径会把标题与标签条留在隐藏状态，窗口没有可视出口。
+- **提示条只画在画面之上（R18）。** 发送失败的提示条 `desktop.notice` 只在有画面时绘制；没有画面时同一句话由状态卡 `desktop.status` 说一次，不再重复。
+- **全部标签看板写协议、能直接关闭（R8）。** 看板每行的类型徽标改由会话自己的协议决定（本机 / SSH 远程 / 远程桌面 / 串口，
+`kind_badge_parts` 一处给出，命令面板共用同一份映射）：此前只有 local/remote 两面，RDP、VNC 与串口标签会被画成"本地"。
+行末新增关闭（`tabs.list.close.{n}`），走顶栏标签同一个入口 `request_close_tab_anchor`，所以传输/转发的确认照旧、只关这一行那个标签。
+证据：`the_tab_list_names_each_tab_by_its_protocol_and_closes_only_that_one`（本机 + RDP + 串口三行，逐个徽标断言，点叉号后只剩另外两行且两者仍在运行）。
+- **非 SSH 连接行也有会话状态（R2）。** 记录行原来只有名称、协议、目标与分组；现在这个窗口真的持有该记录的桌面/串口会话且已连接时，
+名字后出现"已连接"chip（`hosts.connection.open.{n}`，`connection_is_open` 读真实会话）。只保存未启动的记录不写任何状态，
+也不写"离线"。证据：`a_saved_desktop_row_only_says_connected_once_a_session_really_runs`。
+- **门禁修复（前序遗留）。** `tests/desktop_native.rs` 的格式化、未使用计数与 `chunks_exact`→`as_chunks`；`crates/storage/src/batch.rs` 的 `cloned_ref_to_slice_refs`；`vendor/gpui/src/taffy.rs` 的 f32 字面量回退警告（显式 `0.0_f32` / `1.0_f32`）；T9 的 7 项批次修复按备份补丁 `t9b-repair.patch` 原样应用。
+
+### 5.2 命令与结果
+
+本机 Windows 11，工作区 `C:/Users/12976/project/shellune`，全部命令在此执行；日志与 PNG 都写在仓库外的 `C:/Users/12976/project/_evidence/t11/`。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过（退出码 0） |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 通过（退出码 0，日志 `t11-clippy-final.log`） |
+| `cargo test --workspace --all-features` | 通过（退出码 0）：32 个测试目标（含 7 个 0 用例的 doctest 目标）、1326 通过、0 失败、1 个 `#[ignore]`；主套件 `unittests src\main.rs` 630 通过（日志 `t11b-test.log`） |
+| `python scripts/capture-ui.py --out C:/Users/12976/project/_evidence/t11/ui2` | 53 个场景、200 张 PNG、`failures: []`、`status: ok`（`t11b-capture.log`、`capture-ui-manifest.json`） |
+
+上一轮完整运行出现过一次性启动竞态，各自单跑都通过：`tests/ssh_x11.rs`（`"sshd did not start listening on 51186"`）、
+`tests/serial_session.rs`（`a_device_that_goes_away_ends_the_session_and_frees_the_port`）、`tests/ssh_sftp.rs`
+（`the_directory_a_shell_reports_is_the_one_the_browser_lists`）、`src/app/tests.rs` 里 `shell.custom was never rendered`
+的 6 个。它们出现在本机一次性启动真实 OpenSSH（经 WSL）、串口伪设备与并行负载同时运行时，不在本轮改动的路径上。
+
+**收口这一轮同样的命令得到一次干净的退出码 0（0 失败、1 个 `#[ignore]`），因此本轮按实测记为通过；上面那次竞态作为环境事实保留，
+不写成"从未失败"，也不把它的失败当成已验证的根因。**
+
+### 5.3 捕获（本轮）
+
+`python scripts/capture-ui.py --out .../_evidence/t11/ui2`（完整轮，非 quick）：53 个场景、200 张 PNG、`failures: []`、`status: ok`、耗时 644 秒。窗口是隐藏的 GPUI 窗口，读回 GPU 后台缓冲；隔离见清单的 `isolation` 段（每场景独立临时根、凭据只在内存、不拨任何网络）。
+
+| 类别 | 张数 |
+| --- | --- |
+| `home` | 50 |
+| `overlay` | 70 |
+| `terminal` | 44 |
+| `settings` | 23 |
+| `desktop` | 13 |
+
+尺寸矩阵：720×480 有 35 张、1120×720 有 164 张、1680×940 有 1 张；文字大小 100% 172 张、115% 26 张、200% 2 张；语言英文 152 张、中文 48 张；主题深色 141 张、浅色 59 张。
+
+本轮新增的 21 张：`home-no-match-*`（零结果与清除按钮，含 720×480 与中文）、`hosts-read-failed-*`（主机文件读不出来，含 720×480 与中文）、`desktop-rdp-*`（RDP 画面与控件条、缩放、115% 与中文）、`desktop-vnc-failed-*`（认证失败卡片，含 720×480 与中文）、`desktop-send-problem-*`（画面上的提示条）。既有 `home-empty`、`home-hosts`、`hosts-5000`、`hosts-groups`、`hosts-selection`、`hosts-import`、`hosts-connection-*`、`settings*`、`overlay-tabs`、`batch-*`、`files-*`、`transfers-*`、`serial-session`、`terminal-*` 也都在这一轮里重拍。
+
+每张 PNG 的 `evidence_boundary` 写在清单里，页面上也能读到：桌面相关四张只证明这个应用在这些状态下画了什么，不证明真实 RDP/VNC 服务端或真实串口设备。
+
+### 5.4 未验证
+
+- **RDP/VNC 真实服务端**：本机没有可用服务端。`desktop-rdp`、`desktop-vnc-failed`、`desktop-send-problem` 用的是脚本链路（`desktop::scripted`），只证明应用在这些状态下画了什么，不证明真实画面、输入、剪贴板、证书决定或握手。
+- **真实串口设备或虚拟串口对**：本机没有。`serial-session` 是显示用窗格，不证明任何设备的收发、流控或拔出。
+- **实窗逐页走查**：浅色/深色、200% 文字、中英文长文本、最小窗口拖动以及纯键盘完成一次连接，本轮同样只在 GPUI 测试窗口与捕获里验证，没有在那个真实窗口里逐页操作。
+- **macOS / Linux**：未打开窗口。交叉 `cargo check` 只说明代码在那些目标上能编译。
+- **屏幕阅读器**：应用没有 AccessKit；焦点环、对比度算术与视觉测试都不等于屏幕阅读器兼容。
+

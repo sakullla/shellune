@@ -1526,8 +1526,15 @@ impl BatchCenter {
             .and_then(|run| run.hosts().first())
             .map(|host| host.target().host_id());
         self.history_detail = None;
+        self.problem = None;
         if let Some(host) = self.history_host {
-            let _ = self.open_stored_host(host);
+            // The first host is chosen for the user before the log is read, so a read
+            // that fails has to be said here: dropping it would leave the detail empty,
+            // and an empty detail reads as "this host printed nothing" when the truth is
+            // that the log could not be read.
+            if let Err(error) = self.open_stored_host(host) {
+                self.problem = Some(error);
+            }
         }
         Ok(())
     }

@@ -64,8 +64,10 @@ enum SnapshotRow {
 /// One connection of another protocol, with what its row shows (R2, R18).
 ///
 /// It has no checkbox: a selection is a batch or group-move target, and both are SSH
-/// operations. It has no connect button either: starting a desktop or serial session is
-/// not part of this build, so the row only edits, copies and deletes the record.
+/// operations, so a desktop or serial record is never silently pulled into one. Its
+/// main action is the same as a host row's - the labelled connect button at the end,
+/// with the row's own double press meaning the same - and the record's own protocol
+/// decides what pressing it starts (R2).
 struct ConnectionRowView {
     id: HostId,
     /// The row's number among the connection rows, for its selector.
@@ -75,6 +77,8 @@ struct ConnectionRowView {
     protocol: SharedString,
     target: SharedString,
     group: Option<SharedString>,
+    /// Whether this window already holds a running session for the record.
+    open: bool,
 }
 
 /// One host of the list, with what its row shows.
@@ -114,6 +118,22 @@ impl ShelluneView {
         self.workspace.sessions().items().iter().any(|session| {
             matches!(session.kind(), SessionKind::Remote { host } if *host == id)
                 && matches!(session.state(), SessionState::Connected)
+        })
+    }
+
+    /// Whether a saved desktop or serial record has a session running here (R2).
+    ///
+    /// The same rule as a host row's: the state is read from the sessions this window
+    /// already holds, never from the saved record, so a connection that was saved and
+    /// never started is not drawn as online. A record with no running session says
+    /// nothing rather than saying "not connected", because idle is not a state it has.
+    pub(super) fn connection_is_open(&self, id: HostId) -> bool {
+        self.workspace.sessions().items().iter().any(|session| {
+            matches!(
+                session.kind(),
+                SessionKind::Rdp { host } | SessionKind::Vnc { host } | SessionKind::Serial { host }
+                    if *host == id
+            ) && matches!(session.state(), SessionState::Connected)
         })
     }
 
@@ -413,7 +433,7 @@ impl ShelluneView {
             );
 
         if empty {
-            list_column = list_column.child(self.hosts_empty_list());
+            list_column = list_column.child(self.hosts_empty_list(cx));
         } else {
             list_column = list_column.child(self.hosts_virtual_list(rows, cx));
         }
@@ -713,22 +733,41 @@ impl ShelluneView {
         row
     }
 
-    /// What a list with no row says: the reason, and what would change it.
-    fn hosts_empty_list(&self) -> AnyElement {
+    /// What a list with no row says: the reason, and what would change it (R1, R3).
+    ///
+    /// A list emptied by a search or a filter names what narrowed it and offers one press
+    /// that drops all of it; an empty recent view offers the whole list. Neither is allowed
+    /// to be a sentence with no next step.
+    fn hosts_empty_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
         if self.hosts.view() == crate::app::hosts::HostView::Recent {
             return div()
+                .flex()
+                .flex_col()
+                .gap(metrics.scale(spacing::HAIRLINE))
                 .debug_selector(|| "hosts.recent.empty".to_owned())
-                .text_size(metrics.label_size())
-                .text_color(theme::swatch(palette::TEXT_MUTED))
-                .child(self.strings().hosts_recent_empty)
+                .child(
+                    div()
+                        .text_size(metrics.label_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(strings.hosts_recent_empty),
+                )
+                .child(
+                    components::compact_button(strings.hosts_view_all, Variant::Secondary, metrics)
+                        .id("hosts.recent.all")
+                        .debug_selector(|| "hosts.recent.all".to_owned())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.select_host_view(crate::app::hosts::HostView::All, cx);
+                        })),
+                )
                 .into_any_element();
         }
         let narrow = !self.hosts.search().trim().is_empty() || self.hosts.filter().is_narrowing();
         if !narrow {
             return div().into_any_element();
         }
-        let ux = copy::ux();
         div()
             .flex()
             .flex_col()
@@ -738,13 +777,21 @@ impl ShelluneView {
                 div()
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(self.strings().hosts_no_match),
+                    .child(strings.hosts_no_match),
             )
             .child(
                 div()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(ux.hosts_no_match_hint),
+            )
+            .child(
+                components::compact_button(ux.hosts_filter_clear, Variant::Secondary, metrics)
+                    .id("hosts.nomatch.clear")
+                    .debug_selector(|| "hosts.nomatch.clear".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.clear_host_narrowing(cx);
+                    })),
             )
             .into_any_element()
     }
@@ -864,6 +911,7 @@ impl ShelluneView {
                         protocol: SharedString::from(saved.protocol().label()),
                         target: SharedString::from(saved.target()),
                         group: saved.group_text().map(SharedString::from),
+                        open: self.connection_is_open(row.id),
                     }));
                     connections += 1;
                 }
@@ -1266,9 +1314,10 @@ fn host_row_element(
 /// One saved connection of another protocol inside the list.
 ///
 /// The row says what the connection is and what it would reach, and offers the three
-/// things that belong to a record: edit it, copy it, delete it. It has no connect
-/// button and no checkbox, because starting a desktop or serial session is not part of
-/// this build and a batch or group move only takes SSH hosts.
+/// things that belong to a record: edit it, copy it, delete it. Connecting is the row's
+/// one main action, said with the same labelled button a host row ends with, and it
+/// starts the record's own protocol instead of opening a form; there is no checkbox,
+/// because a batch or group move only takes SSH hosts.
 fn connection_row_element(
     connection: &ConnectionRowView,
     weak: &WeakEntity<ShelluneView>,
@@ -1280,6 +1329,7 @@ fn connection_row_element(
     let id = connection.id;
     let hover = theme::swatch(palette::SURFACE_HOVER);
     let edit = weak.clone();
+    let connect = weak.clone();
     let open_row = weak.clone();
     let copy = weak.clone();
     let delete = weak.clone();
@@ -1298,11 +1348,12 @@ fn connection_row_element(
         .border_1()
         .border_color(theme::clear())
         .hover(move |style| style.bg(hover))
-        // A row is the record: double pressing it opens the form that edits it. It
-        // never starts anything.
+        // A double press on the row connects it, as a host row does: the row is the
+        // record, and connecting is what a record is for. Editing stays on the pencil,
+        // so a press can never open a form the user did not ask for.
         .on_click(move |event, _window, cx| {
             if event.click_count() >= 2 {
-                let _ = open_row.update(cx, |view, cx| view.edit_saved_connection(id, cx));
+                let _ = open_row.update(cx, |view, cx| view.connect_saved_connection(id, cx));
             }
         })
         .child(super::host_avatar(connection.name.as_ref(), false, metrics))
@@ -1327,7 +1378,19 @@ fn connection_row_element(
                                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                                 .child(connection.name.clone()),
                         )
-                        .child(components::tag(connection.protocol.clone(), metrics)),
+                        .child(components::tag(connection.protocol.clone(), metrics))
+                        // A running session of this record says so, exactly as a host
+                        // row does, and a record that was only saved says nothing (R2).
+                        .when(connection.open, |line| {
+                            line.child(
+                                components::chip(
+                                    copy::ux().hosts_status_connected,
+                                    Tone::Positive,
+                                    metrics,
+                                )
+                                .debug_selector(move || format!("hosts.connection.open.{number}")),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -1396,6 +1459,27 @@ fn connection_row_element(
                             let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
                         }),
                 ),
+        )
+        .child(
+            components::icon_label_button(
+                Icon::Plug,
+                strings.remote_connect,
+                Variant::Soft,
+                metrics,
+            )
+            .h(metrics.compact_control_height())
+            .text_size(metrics.caption_size())
+            .id(SharedString::from(format!(
+                "hosts.connection.connect.{number}"
+            )))
+            .debug_selector(move || format!("hosts.connection.connect.{number}"))
+            .tooltip(components::tooltip(
+                crate::app::copy::ux().hosts_connect_hint,
+            ))
+            .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
+                let _ = connect.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+            }),
         )
 }
 

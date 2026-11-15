@@ -2889,6 +2889,103 @@ impl ShelluneView {
         self.open_remote(&host, cx);
     }
 
+    /// Types a phrase into the host search, as the user would (R3).
+    ///
+    /// The field is the search: writing it here goes through the same mirror typing
+    /// does, so a shot and a test see the list the phrase really narrows.
+    #[cfg(any(test, feature = "ui-capture"))]
+    pub fn search_hosts(&mut self, phrase: &str, cx: &mut Context<Self>) {
+        self.hosts_search
+            .update(cx, |field, cx| field.set_text(phrase, cx));
+        self.hosts.set_search(phrase);
+        cx.notify();
+    }
+
+    /// Drops the phrase and every filter that could empty the list (R3).
+    ///
+    /// It changes nothing about the records themselves: the search field is emptied,
+    /// which the panel mirrors as it does for typing, and the group and status filters
+    /// go back to their defaults. The list is restored; nothing is deleted.
+    pub(super) fn clear_host_narrowing(&mut self, cx: &mut Context<Self>) {
+        self.hosts_search
+            .update(cx, |field, cx| field.set_text(String::new(), cx));
+        self.hosts.set_search(String::new());
+        self.hosts.clear_filters();
+        cx.notify();
+    }
+
+    /// Connects a saved record with the protocol it was saved as (R2).
+    ///
+    /// This is the list row's main action for every kind of record, so one gesture
+    /// means one thing across the list: an SSH host opens its sign-in, a desktop
+    /// record opens its own surface, and a serial record opens its device. The
+    /// protocol decides here, once, instead of each row carrying its own idea of what
+    /// a press on it does.
+    pub(super) fn connect_saved_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        let Some(protocol) = self.book.connection(id).map(|record| record.protocol()) else {
+            return;
+        };
+        match protocol {
+            ProtocolKind::Ssh => self.connect_saved_host(id, cx),
+            ProtocolKind::Rdp | ProtocolKind::Vnc => self.open_desktop_connection(id, cx),
+            ProtocolKind::Serial => self.open_serial_connection(id, cx),
+        }
+    }
+
+    /// Starts a saved RDP or VNC record in a tab of its own (R2, R18).
+    ///
+    /// The list row has no placed pane behind it, so the session record opens the
+    /// tab: one press is one session, and the tab is where the attempt, its steps and
+    /// its failure are reported. A record that cannot describe a desktop is refused
+    /// with the reason instead of opening a tab that would fail on its first frame.
+    pub(super) fn open_desktop_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        let Some(record) = self.book.connection(id) else {
+            cx.notify();
+            return;
+        };
+        let Some(target) = crate::app::desktop::DesktopTarget::of_record(&record) else {
+            let reason = self.strings().session_reconnect_missing_host.to_owned();
+            self.toast(Tone::Warning, reason, None, cx);
+            return;
+        };
+        let (kind, pane_target) = match target.protocol() {
+            ProtocolKind::Vnc => (
+                SessionKind::Vnc { host: id },
+                shellune_core::PaneTarget::vnc(id),
+            ),
+            _ => (
+                SessionKind::Rdp { host: id },
+                shellune_core::PaneTarget::rdp(id),
+            ),
+        };
+        // A connection from the list is its own tab, exactly as a new shell is: a
+        // split the user armed and did not use must not swallow it.
+        self.workspace.clear_armed();
+        let session = self
+            .workspace
+            .register_session_not_started(kind, record.name(), pane_target);
+        self.start_desktop_session(session.id(), cx);
+    }
+
+    /// Opens a saved serial record in a tab of its own (R2, R21).
+    ///
+    /// The record names the device that is opened, whatever is attached now; a port
+    /// that will not open still gets its tab and its reason, which is what the
+    /// session record reports.
+    pub(super) fn open_serial_connection(&mut self, id: HostId, cx: &mut Context<Self>) {
+        let Some(record) = self.book.connection(id) else {
+            cx.notify();
+            return;
+        };
+        self.workspace.clear_armed();
+        let session = self.workspace.register_session_not_started(
+            SessionKind::Serial { host: id },
+            record.name(),
+            shellune_core::PaneTarget::serial(id),
+        );
+        self.start_serial_session(session.id(), cx);
+    }
+
     /// Opens the forwarding page on one saved host.
     pub(super) fn open_saved_forwards(&mut self, id: HostId, cx: &mut Context<Self>) {
         self.show_forwards_scope(crate::app::forwarding::ForwardScope::Host(id), cx);
@@ -3240,11 +3337,44 @@ impl ShelluneView {
         self.desktop_fullscreen
     }
 
-    /// The desktop surface of one session, for the tests that drive its frames.
-    #[cfg(test)]
+    /// The desktop surface of one session, for the tests that drive its frames and for
+    /// the capture that has to hand it the frames a scripted link holds.
+    #[cfg(any(test, feature = "ui-capture"))]
     #[must_use]
     pub fn desktop_of(&self, id: SessionId) -> Option<&Entity<desktop::DesktopPane>> {
         self.desktop_for(id)
+    }
+
+    /// Keeps the window-wide desktop surface only while it is the surface on screen.
+    ///
+    /// Full screen hides the head of the window, and the head is the only way to
+    /// another tab, to another page and to the window's own controls. So the state is
+    /// not a mode the window enters: it holds while the session that asked for it is
+    /// the one being drawn - its pane exists, the sessions page is the page, it is the
+    /// active pane, on the page that draws a session, and its tab holds nothing else.
+    /// Closing it, switching tab, splitting it, or walking to another page ends it and
+    /// gives the window back, which is the difference between a full screen and a
+    /// window with no exit (R18).
+    fn settle_desktop_fullscreen(&mut self, window: &mut Window) {
+        let Some(id) = self.desktop_fullscreen else {
+            return;
+        };
+        let shown_alone = self.workspace.destination() == Destination::LocalShells
+            && self.active == Some(id)
+            && self.desktop_for(id).is_some()
+            && self.workspace.layout().active_tab().is_some_and(|tab| {
+                matches!(
+                    tab.root(),
+                    crate::app::layout::Node::Leaf(leaf) if leaf.session() == Some(id)
+                )
+            });
+        if shown_alone {
+            return;
+        }
+        self.desktop_fullscreen = None;
+        if window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
     }
 
     /// Starts a saved record through the real start path, for the test that proves
@@ -3284,13 +3414,14 @@ impl ShelluneView {
     }
 
     /// Mounts a desktop surface on a scripted link, so the window-level rules can be
-    /// tested on a machine that has no RDP or VNC server.
+    /// tested and the chrome photographed on a machine that has no RDP or VNC server.
     ///
     /// It goes through the same registration, session record and placement the real
     /// start uses; only the link is scripted, which is what keeps the test from
-    /// proving a path the application does not take.
-    #[cfg(test)]
-    pub fn attach_scripted_desktop_for_test(
+    /// proving a path the application does not take - and what the capture's own
+    /// evidence line says about the shot.
+    #[cfg(any(test, feature = "ui-capture"))]
+    pub fn attach_scripted_desktop(
         &mut self,
         record: &ConnectionRecord,
         link: Box<dyn crate::app::desktop::DesktopLink>,
@@ -9364,8 +9495,12 @@ impl ShelluneView {
         }
 
         // An empty store with no search, no open form and no open import explains
-        // itself; anything else shows the tools and the list.
+        // itself; anything else shows the tools and the list. "Empty" means no saved
+        // record at all: a book holding only a desktop or serial connection is not a
+        // first use, and drawing the first-use card over it would put those records
+        // where no list and no row can reach them (R1, R3).
         if self.book.hosts().is_empty()
+            && self.book.connections().is_empty()
             && self.hosts.search().trim().is_empty()
             && !self.hosts.is_editing()
             && !self.import.is_open()
@@ -16378,19 +16513,9 @@ impl Render for ShelluneView {
         }
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);
-        // A pane that asked for the whole window and is gone - closed, or failed
-        // out of the tab - gives the window back: the head it hid is the only way
-        // to another tab, so a window stuck without one is not something a user can
-        // leave (R18).
-        if self
-            .desktop_fullscreen
-            .is_some_and(|id| self.desktop_for(id).is_none())
-        {
-            self.desktop_fullscreen = None;
-            if window.is_fullscreen() {
-                window.toggle_fullscreen();
-            }
-        }
+        // A pane that asked for the whole window keeps it only while it is the one
+        // surface on screen (R18).
+        self.settle_desktop_fullscreen(window);
         // In full screen the session keeps the whole window: no tab strip and no
         // session bar above the picture (R18). The pane's own controls are what
         // leave it again.
