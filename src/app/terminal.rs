@@ -534,6 +534,13 @@ pub struct TerminalPane {
     /// Taken by the window like the background notices are: the pane only holds
     /// what arrived since the last look.
     x11: Option<X11Status>,
+    /// The working directory the shell last stated with OSC 7 (R15).
+    ///
+    /// Taken by the window like the notices are: the pane reports that the shell
+    /// said where it is, and the window - which knows whether a file view is open
+    /// for this session - decides whether a directory follows. A pane whose shell
+    /// has said nothing keeps `None`, which is why nothing is ever assumed.
+    directory: Option<String>,
     /// What the shell could not be given when it started (R14, R15).
     ///
     /// Read once from the session and kept, because the notice belongs to this pane
@@ -704,6 +711,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            directory: None,
             environment_notes,
             serial: None,
         };
@@ -767,6 +775,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            directory: None,
             environment_notes: Vec::new(),
             serial: None,
         };
@@ -829,6 +838,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            directory: None,
             environment_notes: Vec::new(),
             serial: None,
         };
@@ -974,6 +984,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            directory: None,
             environment_notes: Vec::new(),
             serial: Some(SerialPane::new(device, settings, local_echo)),
         }
@@ -1157,6 +1168,7 @@ impl TerminalPane {
             shortcuts: TerminalShortcuts::defaults(),
             attention: TerminalAttention::default(),
             x11: None,
+            directory: None,
             environment_notes: Vec::new(),
             serial: None,
         }
@@ -1482,6 +1494,13 @@ impl TerminalPane {
             // window, which marks the tab only when it is not the one on screen (R7).
             self.attention.absorb(notices);
         }
+        if let Some(directory) = effects.directory {
+            // The shell stated where it is. The report is kept until the window reads
+            // it, so one that arrived between two frames is not lost; keeping only the
+            // newest is right, because each report replaces the previous position of
+            // the same shell (R15).
+            self.directory = Some(directory);
+        }
     }
 
     /// Takes the background notices this terminal produced since the last call.
@@ -1499,6 +1518,15 @@ impl TerminalPane {
     /// not touch the grid or the session state.
     pub fn take_x11_status(&mut self) -> Option<X11Status> {
         self.x11.take()
+    }
+
+    /// Takes the working directory the shell last reported with OSC 7 (R15).
+    ///
+    /// Reading it does not touch the grid, the blocks or the session state, and a
+    /// shell that never reported one leaves this `None` rather than the directory a
+    /// login usually starts in.
+    pub fn take_directory_report(&mut self) -> Option<String> {
+        self.directory.take()
     }
 
     /// The notices waiting to be collected, for the tests that check a tab mark.

@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use shellune_core::{
-    BrowseFailure, BrowseRequest, BrowseResponse, FileBrowser, FileKind, MutationAction,
-    MutationOutcome, MutationStep, NameProblem, SessionId, TransferProtocol, join_path,
-    normalize_path, parent_path,
+    BrowseFailure, BrowseRequest, BrowseResponse, BrowseState, FileBrowser, FileKind,
+    MutationAction, MutationOutcome, MutationStep, NameProblem, SessionId, TransferProtocol,
+    join_path, normalize_path, parent_path,
 };
 use shellune_ssh::FileLink;
 
@@ -97,6 +97,12 @@ pub enum FilesStop {
     QuestionConfirm,
     /// The question's cancelling button.
     QuestionCancel,
+    /// The switch that makes the remote column follow the shell's directory (R15).
+    ///
+    /// It is a stop of its own so following can be turned off or taken back without a
+    /// pointer, which matters when the reported directory is one this account may not
+    /// read: the switch is how the user takes over.
+    Follow,
     /// The transfer strip: the failure and its retry or cancel. Page Up/Down turn the
     /// strip when the row is taller than the slice the window keeps for it (R4).
     Transfers,
@@ -104,6 +110,26 @@ pub enum FilesStop {
     /// file view takes the terminal's place, so the way back has to be reachable with the
     /// keyboard as well as by Escape (R4).
     Close,
+}
+
+/// What the follow switch of one session is doing (R15).
+///
+/// The state is per session and per directory report, so two servers on two
+/// connections cannot describe each other's directories, and a file view says why it
+/// is not following instead of showing a path nobody reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowNote {
+    /// Following, and the shell of this session has not stated where it is yet.
+    ///
+    /// The listing keeps whatever the server really returned; it is not relabelled as
+    /// the login directory and it is not filled from ordinary output.
+    NoReport,
+    /// Following, and the listing shows where the shell said it is.
+    Following { path: String },
+    /// Following was turned off because the user browsed somewhere by hand.
+    Manual,
+    /// The reported directory could not be read, so the last readable one is shown.
+    Unreadable { path: String },
 }
 
 /// One browsable session: the remote connection, the local disk, and both views.
@@ -119,6 +145,22 @@ struct SessionFiles {
     shown: FileSource,
     local_selected: Option<String>,
     remote_selected: Option<String>,
+    /// Whether the remote column follows this session's own shell (R15).
+    follow: bool,
+    /// The last directory the shell of this session stated, usable or not tried yet.
+    ///
+    /// Only OSC 7 puts a value here: output that looks like a path never does.
+    reported: Option<String>,
+    /// The last remote directory the server really listed.
+    ///
+    /// It is where following returns to when a reported directory cannot be read, so a
+    /// refused path does not leave the column showing nothing.
+    last_good: Option<String>,
+    /// The directory a follow request is waiting for, so its answer can be told apart
+    /// from an answer to a request the user made.
+    follow_target: Option<String>,
+    /// What is said beside the follow switch.
+    note: FollowNote,
 }
 
 /// Every browsable session and which of them show a file view.
@@ -158,6 +200,13 @@ impl FileViews {
                 shown: FileSource::Remote,
                 local_selected: None,
                 remote_selected: None,
+                // Following is what a file view is for: it starts on, and a shell that
+                // has said nothing leaves the note saying so (R15).
+                follow: true,
+                reported: None,
+                last_good: None,
+                follow_target: None,
+                note: FollowNote::NoReport,
             },
         );
     }
@@ -286,7 +335,18 @@ impl FileViews {
         };
         if files.remote_browser.is_none() {
             let mut remote = FileBrowser::new(session, files.host.clone(), files.target.clone());
-            let request = remote.begin_home();
+            // A shell that already said where it is is the directory the user is
+            // working in, so the first listing is that one instead of the login
+            // directory (R15). A shell that said nothing keeps the login directory,
+            // which is what the server itself reports.
+            let reported = files.reported.clone().filter(|_| files.follow);
+            let request = match &reported {
+                Some(path) => {
+                    files.follow_target = Some(path.clone());
+                    remote.begin_list(path.clone())
+                }
+                None => remote.begin_home(),
+            };
             files.remote_browser = Some(remote);
             let _ = deliver(files, FileSource::Remote, request);
             let mut local = FileBrowser::new(session, machine_name(), "local");
@@ -324,7 +384,11 @@ impl FileViews {
     }
 
     /// Asks for the parent of one source.
+    ///
+    /// Asking by hand is what turns following off for the remote side: the user chose
+    /// this directory, and the next `cd` in the shell must not take it away (R15).
     pub fn up_in(&mut self, session: SessionId, source: FileSource) -> bool {
+        self.stop_following(session, source);
         self.ask_in(session, source, |browser| browser.up())
     }
 
@@ -338,13 +402,119 @@ impl FileViews {
         self.ask_in(session, source, |browser| Some(browser.refresh()))
     }
 
+    /// Whether the remote column of this session follows its own shell (R15).
+    #[must_use]
+    pub fn follows(&self, session: SessionId) -> bool {
+        self.sessions
+            .get(&session)
+            .is_some_and(|files| files.follow)
+    }
+
+    /// What the follow switch of this session is doing, when it has a view at all.
+    #[must_use]
+    pub fn follow_note(&self, session: SessionId) -> Option<FollowNote> {
+        let files = self.sessions.get(&session)?;
+        // A session with no view has nothing to say about following: no switch is
+        // drawn for it.
+        files.remote_browser.as_ref()?;
+        Some(files.note.clone())
+    }
+
+    /// Turns following on or off for one session.
+    ///
+    /// Turning it on returns to the directory the shell last reported, which is the
+    /// reason a switch exists: the user browsed away by hand and now wants the
+    /// terminal's directory back. Returning `true` means a listing was asked for.
+    pub fn set_follow(&mut self, session: SessionId, on: bool) -> bool {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        if !on {
+            files.follow = false;
+            files.follow_target = None;
+            files.note = FollowNote::Manual;
+            return false;
+        }
+        files.follow = true;
+        match files.reported.clone() {
+            Some(path) => follow_to(files, &path),
+            None => {
+                files.note = FollowNote::NoReport;
+                false
+            }
+        }
+    }
+
+    /// Records a working directory the shell of one session stated with OSC 7 (R15).
+    ///
+    /// `active` says whether this is the pane the user is working in. A split tab or
+    /// a background tab can hold a terminal of another session, and only the active
+    /// pane of this session may move this session's listing; the report is still
+    /// remembered, so turning following back on goes to where the shell now is.
+    ///
+    /// Returns whether a listing was asked for.
+    pub fn note_terminal_directory(
+        &mut self,
+        session: SessionId,
+        path: &str,
+        active: bool,
+    ) -> bool {
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        files.reported = Some(path.to_owned());
+        if !files.follow {
+            return false;
+        }
+        if files.note
+            == (FollowNote::Unreadable {
+                path: path.to_owned(),
+            })
+        {
+            // The same directory the server refused once is not asked for again on
+            // every prompt: the note stays until the shell moves somewhere else.
+            return false;
+        }
+        if files.remote_browser.is_none() {
+            // Nothing is open, so there is no listing to move; the report is kept for
+            // the open that follows.
+            files.note = FollowNote::Following {
+                path: path.to_owned(),
+            };
+            return false;
+        }
+        if !active {
+            return false;
+        }
+        follow_to(files, path)
+    }
+
+    /// Turns following off because the user browsed by hand (R15).
+    fn stop_following(&mut self, session: SessionId, source: FileSource) {
+        if source != FileSource::Remote {
+            return;
+        }
+        let Some(files) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        if !files.follow {
+            return;
+        }
+        files.follow = false;
+        files.follow_target = None;
+        files.note = FollowNote::Manual;
+    }
+
     /// Opens one remote entry.
     pub fn enter(&mut self, session: SessionId, name: &str) -> bool {
         self.enter_in(session, FileSource::Remote, name)
     }
 
     /// Opens one entry of one source.
+    ///
+    /// Opening a row is browsing by hand, so the remote side stops following (R15).
     pub fn enter_in(&mut self, session: SessionId, source: FileSource, name: &str) -> bool {
+        self.stop_following(session, source);
         self.ask_in(session, source, |browser| browser.open(name))
     }
 
@@ -353,6 +523,7 @@ impl FileViews {
     /// Remote paths are POSIX. Local paths are the protocol form [`local_protocol_to_os`]
     /// reverses, so a breadcrumb cannot point the remote browser at a local disk.
     pub fn list_at(&mut self, session: SessionId, source: FileSource, path: &str) -> bool {
+        self.stop_following(session, source);
         self.ask_in(session, source, |browser| Some(browser.begin_list(path)))
     }
 
@@ -436,6 +607,9 @@ impl FileViews {
             if pump_side(files, FileSource::Local) {
                 changed = true;
             }
+            if settle_follow(files) {
+                changed = true;
+            }
         }
         changed
     }
@@ -486,6 +660,16 @@ fn pump_side(files: &mut SessionFiles, source: FileSource) -> bool {
         }
         changed = true;
         forget_missing_selection(files, source);
+        if source == FileSource::Remote {
+            // The last directory the server itself confirmed, which is where a
+            // reported path that cannot be read returns to (R15).
+            if let Some(path) = side_mut(files, source)
+                .and_then(|browser| browser.current_directory())
+                .map(str::to_owned)
+            {
+                files.last_good = Some(path);
+            }
+        }
         if is_change {
             let Some(browser) = side_mut(files, source) else {
                 continue;
@@ -538,6 +722,81 @@ fn deliver(files: &mut SessionFiles, source: FileSource, request: BrowseRequest)
         });
     }
     false
+}
+
+/// Asks the remote side of one session for the directory the shell reported (R15).
+///
+/// A view that is already showing that directory is left alone, so a prompt that
+/// reports the same directory does not replace the listing on screen.
+fn follow_to(files: &mut SessionFiles, path: &str) -> bool {
+    let Some(browser) = files.remote_browser.as_mut() else {
+        return false;
+    };
+    if browser.path() == Some(path) && !browser.is_waiting() && !browser.is_changing() {
+        files.follow_target = None;
+        files.note = FollowNote::Following {
+            path: path.to_owned(),
+        };
+        return false;
+    }
+    // Only the newest request counts, and the browser drops an answer for any other
+    // one, so a listing that arrives late cannot put an older directory back (R15).
+    files.follow_target = Some(path.to_owned());
+    files.note = FollowNote::Following {
+        path: path.to_owned(),
+    };
+    let request = browser.begin_list(path);
+    deliver(files, FileSource::Remote, request)
+}
+
+/// Finishes a follow request once its answer arrived.
+///
+/// A directory the server refused is stated, and the column returns to the last
+/// directory it really listed: following is not allowed to leave the remote side
+/// pointing at a path nothing can read, and it does not silently stop either, because
+/// the note and the switch are how the user takes over (R15).
+fn settle_follow(files: &mut SessionFiles) -> bool {
+    let Some(target) = files.follow_target.clone() else {
+        return false;
+    };
+    let Some(browser) = files.remote_browser.as_ref() else {
+        files.follow_target = None;
+        return false;
+    };
+    if browser.is_waiting() || browser.is_changing() {
+        return false;
+    }
+    if browser.path() != Some(target.as_str()) {
+        // Another request went out in the meantime; its answer is the truth.
+        files.follow_target = None;
+        return false;
+    }
+    match browser.state() {
+        BrowseState::Ready(_) => {
+            files.follow_target = None;
+            files.last_good = Some(target.clone());
+            files.note = FollowNote::Following { path: target };
+            true
+        }
+        BrowseState::Failed(_) => {
+            files.follow_target = None;
+            files.note = FollowNote::Unreadable {
+                path: target.clone(),
+            };
+            let Some(good) = files.last_good.clone().filter(|good| *good != target) else {
+                // Nothing was ever read here, so there is nowhere to return to and the
+                // failure card stays with its own Refresh.
+                return true;
+            };
+            let Some(browser) = files.remote_browser.as_mut() else {
+                return true;
+            };
+            let request = browser.begin_list(good);
+            deliver(files, FileSource::Remote, request);
+            true
+        }
+        BrowseState::Loading => false,
+    }
 }
 
 /// The name of this computer, so the local column can be told from the remote host.
@@ -2157,5 +2416,255 @@ mod tests {
         let crumbs = path_crumbs("/C:/work");
         assert_eq!(crumbs[0].path, "/");
         assert_eq!(crumbs.last().unwrap().path, "/C:/work");
+    }
+
+    /// A view whose first listing already arrived at `/home/deploy`.
+    fn opened_at(session: SessionId, channel: &FakeChannel) -> FileViews {
+        let mut views = views(session, channel.clone());
+        channel.reply(1, "/home/deploy", &[("docs", FileKind::Directory)]);
+        views.open(session);
+        views.pump();
+        views
+    }
+
+    #[test]
+    fn a_view_opened_after_a_directory_report_starts_there() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = views(session, channel.clone());
+        assert!(!views.note_terminal_directory(session, "/var/log", true));
+        assert_eq!(
+            channel.requests(),
+            Vec::<BrowseRequest>::new(),
+            "nothing is asked before the view exists"
+        );
+
+        views.open(session);
+        match channel.requests().first() {
+            Some(BrowseRequest::List { path, .. }) => assert_eq!(path, "/var/log"),
+            other => panic!("the reported directory is asked for first, got {other:?}"),
+        }
+        channel.reply(1, "/var/log", &[("syslog", FileKind::File)]);
+        views.pump();
+        assert_eq!(
+            views.browser(session).and_then(FileBrowser::path),
+            Some("/var/log"),
+            "the first listing is the directory the shell reported"
+        );
+        assert_eq!(
+            views.follow_note(session),
+            Some(FollowNote::Following {
+                path: "/var/log".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_later_directory_report_moves_the_listing_of_its_own_session() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let first_channel = FakeChannel::accepting();
+        let second_channel = FakeChannel::accepting();
+        let mut views = opened_at(first, &first_channel);
+        views.attach(
+            second,
+            "db",
+            "deploy@10.0.0.8:22",
+            Box::new(second_channel.clone()),
+        );
+        second_channel.reply(1, "/home/deploy", &[]);
+        views.open(second);
+        views.pump();
+
+        // The active terminal of the first session changes directory.
+        assert!(views.note_terminal_directory(first, "/var/log", true));
+        let asked = first_channel.requests().last().cloned();
+        match asked {
+            Some(BrowseRequest::List { path, request }) => {
+                assert_eq!(path, "/var/log");
+                first_channel.reply(request, "/var/log", &[("syslog", FileKind::File)]);
+            }
+            other => panic!("a listing was asked for, got {other:?}"),
+        }
+        views.pump();
+        assert_eq!(
+            views.browser(first).and_then(FileBrowser::path),
+            Some("/var/log")
+        );
+        assert_eq!(
+            views.browser(second).and_then(FileBrowser::path),
+            Some("/home/deploy"),
+            "the other session's listing is untouched"
+        );
+    }
+
+    #[test]
+    fn browsing_by_hand_turns_following_off_until_the_switch_is_used_again() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = opened_at(session, &channel);
+
+        // The user opens a row, which is browsing rather than following.
+        assert!(views.enter(session, "docs"));
+        assert!(!views.follows(session));
+        assert_eq!(views.follow_note(session), Some(FollowNote::Manual));
+        views.note_terminal_directory(session, "/var/log", true);
+
+        // A shell that changes directory afterwards does not take the path back.
+        let before = channel.requests().len();
+        assert!(!views.note_terminal_directory(session, "/tmp", true));
+        assert_eq!(
+            channel.requests().len(),
+            before,
+            "a manual path is not overwritten by the next cd"
+        );
+
+        // Turning following on returns to the directory the shell last reported.
+        assert!(views.set_follow(session, true));
+        match channel.requests().last() {
+            Some(BrowseRequest::List { path, .. }) => assert_eq!(path, "/tmp"),
+            other => panic!("following returns to the reported directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_report_that_cannot_be_read_keeps_the_last_readable_directory() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = opened_at(session, &channel);
+        views.note_terminal_directory(session, "/var/log", true);
+        let request = match channel.requests().last() {
+            Some(BrowseRequest::List { request, .. }) => *request,
+            other => panic!("a listing was asked for, got {other:?}"),
+        };
+        channel.reply(request, "/var/log", &[("syslog", FileKind::File)]);
+        views.pump();
+        assert_eq!(
+            views.browser(session).and_then(FileBrowser::path),
+            Some("/var/log")
+        );
+
+        // The shell goes somewhere this account may not read.
+        views.note_terminal_directory(session, "/root/private", true);
+        let refused = match channel.requests().last() {
+            Some(BrowseRequest::List { path, request }) => {
+                assert_eq!(path, "/root/private");
+                *request
+            }
+            other => panic!("the reported directory is asked for, got {other:?}"),
+        };
+        channel
+            .0
+            .lock()
+            .expect("a free lock")
+            .answers
+            .push(BrowseResponse::Failed {
+                request: refused,
+                failure: BrowseFailure::PermissionDenied {
+                    path: "/root/private".to_owned(),
+                },
+            });
+        views.pump();
+
+        assert_eq!(
+            views.follow_note(session),
+            Some(FollowNote::Unreadable {
+                path: "/root/private".to_owned()
+            })
+        );
+        // The column is back on the last directory the server really listed.
+        match channel.requests().last() {
+            Some(BrowseRequest::List { path, .. }) => assert_eq!(path, "/var/log"),
+            other => panic!("the last readable directory is listed again, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_late_listing_does_not_put_an_older_directory_back() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = opened_at(session, &channel);
+        views.note_terminal_directory(session, "/var/log", true);
+        let first = match channel.requests().last() {
+            Some(BrowseRequest::List { path, request, .. }) => {
+                assert_eq!(path, "/var/log");
+                *request
+            }
+            other => panic!("a listing was asked for, got {other:?}"),
+        };
+        // The shell moves again before the first answer arrives.
+        views.note_terminal_directory(session, "/etc", true);
+        let second = match channel.requests().last() {
+            Some(BrowseRequest::List { path, request, .. }) => {
+                assert_eq!(path, "/etc");
+                *request
+            }
+            other => panic!("a listing was asked for, got {other:?}"),
+        };
+        assert!(second > first);
+
+        // The answer for the directory the user has left arrives last.
+        channel.reply(second, "/etc", &[("hosts", FileKind::File)]);
+        views.pump();
+        channel.reply(first, "/var/log", &[("syslog", FileKind::File)]);
+        views.pump();
+
+        assert_eq!(
+            views.browser(session).and_then(FileBrowser::path),
+            Some("/etc"),
+            "a late listing for a directory the user left changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_starts_again_starts_without_the_old_directory() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = opened_at(session, &channel);
+        views.note_terminal_directory(session, "/var/log", true);
+
+        // A reconnect ends the old connection and attaches a new one to the same
+        // session id, exactly as the window does.
+        views.detach(session);
+        let fresh = FakeChannel::accepting();
+        views.attach(
+            session,
+            "web",
+            "deploy@10.0.0.7:22",
+            Box::new(fresh.clone()),
+        );
+        assert_eq!(
+            views.follow_note(session),
+            None,
+            "no view is open, and nothing of the old report is left"
+        );
+
+        views.open(session);
+        assert_eq!(
+            fresh.requests().first(),
+            Some(&BrowseRequest::Home { request: 1 }),
+            "the new connection starts at the login directory it reports itself"
+        );
+    }
+
+    #[test]
+    fn a_report_from_a_pane_that_is_not_active_is_remembered_but_does_not_move_the_view() {
+        let session = SessionId::new();
+        let channel = FakeChannel::accepting();
+        let mut views = opened_at(session, &channel);
+        let before = channel.requests().len();
+
+        assert!(!views.note_terminal_directory(session, "/var/log", false));
+        assert_eq!(
+            channel.requests().len(),
+            before,
+            "a split pane that is not the active one does not move the listing"
+        );
+
+        assert!(views.set_follow(session, true));
+        match channel.requests().last() {
+            Some(BrowseRequest::List { path, .. }) => assert_eq!(path, "/var/log"),
+            other => panic!("the switch goes to the last report, got {other:?}"),
+        }
     }
 }

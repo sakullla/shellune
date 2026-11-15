@@ -492,6 +492,86 @@ fn server_names(server: &Harness, path: &str) -> Vec<String> {
     names
 }
 
+/// The directory a shell reports is the one the file view browses (R15).
+///
+/// The report is real: the remote shell prints the OSC 7 sequence an integrated shell
+/// prints, carrying the `$PWD` it holds after a `cd`, the terminal parser the window
+/// uses reads it, and the path that comes out is then listed over the same connection.
+/// Nothing injects a directory into the browser, and nothing asks the shell for its
+/// working directory with a command of its own.
+#[test]
+fn the_directory_a_shell_reports_is_the_one_the_browser_lists() {
+    if skip("directory following") {
+        return;
+    }
+    let server = own_server("osc7-follow");
+    let mut session = live(&server);
+    // The command is typed once the shell is really reading its terminal, which its
+    // first output says. Writing earlier would test this test's timing instead of the
+    // directory report.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let spoken = session.drain().iter().any(|event| {
+            matches!(
+                event,
+                RemoteEvent::Data(bytes) if !bytes.is_empty()
+            )
+        });
+        if spoken {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shell never said anything after the connection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // `cd` first, so the path is the shell's own idea of where it is rather than one
+    // this test typed.
+    session
+        .write(b"cd /var/log && printf '\\033]7;file://%s%s\\007' \"$(hostname)\" \"$PWD\"\r\n")
+        .expect("the shell accepts input");
+
+    let mut terminal = shellune_terminal::TerminalCore::new(100, 30, 1_000);
+    let deadline = Instant::now() + PATIENCE;
+    let mut printed = Vec::new();
+    loop {
+        for event in session.drain() {
+            match event {
+                RemoteEvent::Data(bytes) => {
+                    terminal.feed(&bytes);
+                    printed.extend_from_slice(&bytes);
+                }
+                RemoteEvent::Failed(error) => panic!("the shell stopped: {error}"),
+                _ => {}
+            }
+        }
+        if terminal.directory().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shell never reported a working directory; it printed {:?}",
+            String::from_utf8_lossy(&printed)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        terminal.directory(),
+        Some("/var/log"),
+        "the report is the directory the shell is in, not the login directory"
+    );
+
+    // The same authenticated connection lists that path, and what it holds is what the
+    // server holds: following a report is only useful if the reported path is readable.
+    let mut link = session.take_file_link().expect("the shell has a file link");
+    assert_eq!(
+        listed_names(&mut link, 1, "/var/log"),
+        server_names(&server, "/var/log"),
+        "the followed directory is the server's own directory"
+    );
+}
+
 /// The names the browser lists in one directory.
 fn listed_names(link: &mut FileLink, request: u64, path: &str) -> Vec<String> {
     let mut names: Vec<String> = list(link, request, path)

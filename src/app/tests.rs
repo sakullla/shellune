@@ -23990,3 +23990,304 @@ async fn a_serial_session_reconnects_in_its_own_tab_without_replaying_the_old_qu
         "the reconnected device reaches the tab: {screen:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Following the shell's directory (R15)
+// ---------------------------------------------------------------------------
+
+/// One OSC 7 report, as a shell with directory reporting writes it.
+fn directory_report(path: &str) -> Vec<u8> {
+    format!("\u{1b}]7;file://web{path}\u{7}").into_bytes()
+}
+
+/// Opens the file view of one session with a scripted connection.
+fn open_files_for(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+    answers: &FileAnswers,
+) {
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_files_for_test(
+                id,
+                "web",
+                "deploy@10.0.0.5:22",
+                Box::new(answers.clone()),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "session.files");
+}
+
+/// The remote path one session's file view shows.
+fn remote_path(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    id: SessionId,
+) -> Option<String> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .files_browser(id)
+            .and_then(|browser| browser.path().map(str::to_owned))
+    })
+}
+
+#[gpui::test]
+async fn the_file_view_follows_the_directory_the_shell_reports(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &answers);
+    answers.reply(
+        1,
+        "/home/deploy",
+        &[("docs", shellune_core::FileKind::Directory)],
+    );
+    pump_files(cx, &view);
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/home/deploy"));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_follow_note(id)),
+        Some(crate::app::files::FollowNote::NoReport),
+        "following waits for a report instead of pretending the login directory was one"
+    );
+
+    // The user runs cd /var/log, and the shell says so with OSC 7.
+    feed_session(cx, &view, id, &directory_report("/var/log"));
+    let request = match answers.requests().last().cloned() {
+        Some(shellune_core::BrowseRequest::List { path, request }) => {
+            assert_eq!(path, "/var/log", "the reported directory is listed");
+            request
+        }
+        other => panic!("following asks for the reported directory, got {other:?}"),
+    };
+    answers.reply(
+        request,
+        "/var/log",
+        &[("syslog", shellune_core::FileKind::File)],
+    );
+    pump_files(cx, &view);
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/var/log"));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_follow_note(id)),
+        Some(crate::app::files::FollowNote::Following {
+            path: "/var/log".to_owned()
+        })
+    );
+    assert!(
+        cx.debug_bounds("files.follow").is_some(),
+        "the switch that says the view follows is on screen"
+    );
+
+    // The report was a report: it is not part of what the terminal shows.
+    let screen = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(id)
+            .map(|pane| pane.read(app).visible_text().join("\n"))
+            .unwrap_or_default()
+    });
+    assert!(
+        !screen.contains("file://") && !screen.contains("7;"),
+        "the sequence is not drawn as text: {screen:?}"
+    );
+}
+
+#[gpui::test]
+async fn browsing_by_hand_stops_the_following_and_the_switch_takes_it_back(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &answers);
+    answers.reply(
+        1,
+        "/home/deploy",
+        &[("docs", shellune_core::FileKind::Directory)],
+    );
+    pump_files(cx, &view);
+    feed_session(cx, &view, id, &directory_report("/var/log"));
+    let request = match answers.requests().last().cloned() {
+        Some(shellune_core::BrowseRequest::List { request, .. }) => request,
+        other => panic!("following asks for the reported directory, got {other:?}"),
+    };
+    answers.reply(
+        request,
+        "/var/log",
+        &[("syslog", shellune_core::FileKind::File)],
+    );
+    pump_files(cx, &view);
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/var/log"));
+
+    // The user clicks an ancestor breadcrumb: that is browsing, not following.
+    click(cx, "files.crumb.0");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_follows(id)),
+        "browsing by hand turns following off"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_follow_note(id)),
+        Some(crate::app::files::FollowNote::Manual)
+    );
+
+    // A later cd must not take the path the user chose.
+    let before = answers.requests().len();
+    feed_session(cx, &view, id, &directory_report("/etc"));
+    assert_eq!(
+        answers.requests().len(),
+        before,
+        "a manual path is not replaced by the next directory the shell reports"
+    );
+
+    // The switch returns to where the shell is now.
+    click(cx, "files.follow");
+    match answers.requests().last().cloned() {
+        Some(shellune_core::BrowseRequest::List { path, request }) => {
+            assert_eq!(
+                path, "/etc",
+                "the switch goes to the last reported directory"
+            );
+            answers.reply(request, "/etc", &[("hosts", shellune_core::FileKind::File)]);
+        }
+        other => panic!("following asks for the reported directory, got {other:?}"),
+    }
+    pump_files(cx, &view);
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/etc"));
+    assert!(cx.update(|_window, app| view.read(app).files_follows(id)));
+}
+
+#[gpui::test]
+async fn a_directory_that_cannot_be_read_keeps_the_last_readable_one_and_says_why(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &answers);
+    answers.reply(
+        1,
+        "/home/deploy",
+        &[("docs", shellune_core::FileKind::Directory)],
+    );
+    pump_files(cx, &view);
+
+    feed_session(cx, &view, id, &directory_report("/root/private"));
+    let refused = match answers.requests().last().cloned() {
+        Some(shellune_core::BrowseRequest::List { path, request }) => {
+            assert_eq!(path, "/root/private");
+            request
+        }
+        other => panic!("the reported directory is asked for, got {other:?}"),
+    };
+    answers.fail(
+        refused,
+        shellune_core::BrowseFailure::PermissionDenied {
+            path: "/root/private".to_owned(),
+        },
+    );
+    pump_files(cx, &view);
+    // The window returns to the directory the server really listed.
+    let back = match answers.requests().last().cloned() {
+        Some(shellune_core::BrowseRequest::List { path, request }) => {
+            assert_eq!(path, "/home/deploy");
+            request
+        }
+        other => panic!("the last readable directory is listed again, got {other:?}"),
+    };
+    answers.reply(
+        back,
+        "/home/deploy",
+        &[("docs", shellune_core::FileKind::Directory)],
+    );
+    pump_files(cx, &view);
+
+    assert_eq!(remote_path(cx, &view, id).as_deref(), Some("/home/deploy"));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).files_follow_note(id)),
+        Some(crate::app::files::FollowNote::Unreadable {
+            path: "/root/private".to_owned()
+        }),
+        "the refusal is stated together with the last readable path"
+    );
+    assert!(
+        cx.debug_bounds("files.follow.note").is_some(),
+        "the degradation is on screen, not only in the state"
+    );
+}
+
+#[gpui::test]
+async fn the_follow_switch_is_a_keyboard_stop_and_answers_enter(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let answers = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &answers);
+    answers.reply(
+        1,
+        "/home/deploy",
+        &[("docs", shellune_core::FileKind::Directory)],
+    );
+    pump_files(cx, &view);
+
+    // The keyboard lands in the server column, which is where a session's files are
+    // browsed from.
+    cx.update(|window, app| view.read(app).focus_remote_files_for_test(window));
+    cx.run_until_parked();
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Body))
+    );
+
+    // Tab walks the file view's controls until the switch has the ring.
+    let mut reached = false;
+    for _ in 0..8 {
+        press_key(cx, "tab");
+        if files_stop(cx, &view) == Some((FileSource::Remote, FilesStop::Follow)) {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "the follow switch is reachable with the keyboard");
+
+    // Enter presses it, exactly as a click does.
+    press_key(cx, "enter");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_follows(id)),
+        "Enter turns following off"
+    );
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Follow)),
+        "the ring stays on the switch it just pressed"
+    );
+    press_key(cx, "enter");
+    assert!(cx.update(|_window, app| view.read(app).files_follows(id)));
+}
+
+#[gpui::test]
+async fn a_local_shell_cannot_drive_a_file_view(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let local = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("a local shell is on screen");
+    // A local shell has no file view at all, so its report has nowhere to go.
+    feed_session(cx, &view, local, &directory_report("/var/log"));
+    assert!(
+        cx.update(|_window, app| view.read(app).files_browser(local).is_none()),
+        "a local shell has no remote column to follow"
+    );
+    assert!(!cx.update(|_window, app| view.read(app).files_follows(local)));
+    let screen = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(local)
+            .map(|pane| pane.read(app).visible_text().join("\n"))
+            .unwrap_or_default()
+    });
+    assert!(
+        !screen.contains("file://"),
+        "the report is not drawn either: {screen:?}"
+    );
+}

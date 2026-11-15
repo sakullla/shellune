@@ -52,8 +52,9 @@ use crate::app::copy::{self, Locale, Strings};
 #[cfg(any(test, feature = "ui-capture"))]
 use crate::app::files::BrowseChannel;
 use crate::app::files::{
-    FileSource, FileViews, FilesDialog, FilesStop, browse_failure_text, display_path, kind_label,
-    local_protocol_to_os, path_crumbs, path_problem_text, problem_text, transfer_problem_text,
+    FileSource, FileViews, FilesDialog, FilesStop, FollowNote, browse_failure_text, display_path,
+    kind_label, local_protocol_to_os, path_crumbs, path_problem_text, problem_text,
+    transfer_problem_text,
 };
 use crate::app::forwarding::{ForwardCenter, ForwardConfirm};
 use crate::app::hosts::{
@@ -677,6 +678,8 @@ pub struct ShelluneView {
     files_question_recursive_focus: FocusHandle,
     files_question_confirm_focus: FocusHandle,
     files_question_cancel_focus: FocusHandle,
+    /// Focus of the file view's follow switch, so it is a keyboard stop (R4, R15).
+    files_follow_focus: FocusHandle,
     /// Focus of the session bar's switch back to the terminal (R4).
     ///
     /// The file view itself has no close button of its own: the bar above it already has
@@ -2119,6 +2122,7 @@ impl ShelluneView {
             files_question_recursive_focus: cx.focus_handle(),
             files_question_confirm_focus: cx.focus_handle(),
             files_question_cancel_focus: cx.focus_handle(),
+            files_follow_focus: cx.focus_handle(),
             files_close_focus: cx.focus_handle(),
             files_transfer_focus: cx.focus_handle(),
             transfers_scroll: gpui::ScrollHandle::new(),
@@ -8237,6 +8241,12 @@ impl ShelluneView {
             self.x11.insert(id, status);
             cx.notify();
         }
+        // A shell that stated its working directory tells the file view where to be
+        // (R15). Nothing else does: this report comes from OSC 7 only, never from
+        // output that happens to look like a path.
+        if let Some(path) = pane.update(cx, |pane, _cx| pane.take_directory_report()) {
+            self.note_terminal_directory(id, path, cx);
+        }
         let state = pane.read(cx).state().clone();
         let presentation = pane.read(cx).presentation();
         if self
@@ -10864,6 +10874,38 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Turns the file view's following of one terminal on or off (R15).
+    ///
+    /// Turning it back on returns to the directory the shell last reported, which is
+    /// the reason the switch exists: browsing by hand turned it off, and the user can
+    /// take the terminal's directory back with one click.
+    fn files_set_follow(&mut self, id: SessionId, on: bool, cx: &mut Context<Self>) {
+        if self.files.set_follow(id, on) {
+            self.watch_files(cx);
+        }
+        cx.notify();
+    }
+
+    /// Records a directory one terminal stated, and moves its file view if that is
+    /// what the view is for (R15).
+    ///
+    /// Only a protocol that has a file view of its own can drive one, and only the
+    /// report of the session's own shell is used: a local shell, a serial device or a
+    /// desktop session has no `FileViews` entry and therefore cannot reach this. The
+    /// active pane decides, so a split tab's other terminal does not move the listing
+    /// of the one the user is typing into.
+    fn note_terminal_directory(&mut self, id: SessionId, path: String, cx: &mut Context<Self>) {
+        if !self.allows(id, shellune_core::Capability::Files) || !self.files.can_browse(id) {
+            return;
+        }
+        let active = self.active == Some(id);
+        if self.files.note_terminal_directory(id, &path, active) {
+            // The listing was asked for, so its answer has to be collected.
+            self.watch_files(cx);
+        }
+        cx.notify();
+    }
+
     /// Drops the question of one session, if it has one.
     fn close_files_question(&mut self, id: SessionId) {
         if self
@@ -11606,6 +11648,12 @@ impl ShelluneView {
                 stops.push((source, FilesStop::CardUpload));
                 stops.push((source, FilesStop::CardDownload));
             }
+            // The follow switch is the last control of the remote column: it acts on
+            // the column's path, and the keyboard reaches it after what the column
+            // offers for its own entries (R4, R15).
+            if source == FileSource::Remote {
+                stops.push((source, FilesStop::Follow));
+            }
         }
         // The failure and its retry sit above the listing. They are a stop of their own
         // so a keyboard user reaches them without a pointer (R4).
@@ -11664,6 +11712,7 @@ impl ShelluneView {
             FilesStop::QuestionRecursive => self.files_question_recursive_focus.clone(),
             FilesStop::QuestionConfirm => self.files_question_confirm_focus.clone(),
             FilesStop::QuestionCancel => self.files_question_cancel_focus.clone(),
+            FilesStop::Follow => self.files_follow_focus.clone(),
             FilesStop::Transfers => self.files_transfer_focus.clone(),
             FilesStop::Close => self.files_close_focus.clone(),
         })
@@ -11722,7 +11771,7 @@ impl ShelluneView {
             FilesStop::Body => None,
             // The switch back to the terminal is in the session bar above the column, so
             // no slice of the column can hide it. The transfer strip is its own box.
-            FilesStop::Close | FilesStop::Transfers => None,
+            FilesStop::Close | FilesStop::Transfers | FilesStop::Follow => None,
             FilesStop::ToolbarUpload | FilesStop::ToolbarDownload => {
                 self.files_panel_scroll(source).bounds_for_item(0)
             }
@@ -11865,6 +11914,14 @@ impl ShelluneView {
             }
             FilesStop::QuestionConfirm => self.submit_files_change(cx),
             FilesStop::QuestionCancel => self.files_cancel_change(cx),
+            FilesStop::Follow => {
+                // Turning following off, or taking the terminal's directory back, is the
+                // same switch the pointer presses; the ring stays on it either way, so
+                // the keyboard does not lose its place (R4, R15).
+                let next = !self.files.follows(id);
+                self.files_set_follow(id, next, cx);
+                self.files_focus_stop(source, stop, window, cx);
+            }
             FilesStop::Transfers => self.transfer_keyboard_recover(id, cx),
             FilesStop::Close => {
                 // The same switch the pointer presses: the terminal is where this session
@@ -12205,6 +12262,64 @@ impl ShelluneView {
     /// One file column: the source it is, the path it shows and the entries of that source.
     /// One side of the file manager: where it is, its toolbar, the path as
     /// breadcrumbs, and the listing.
+    /// The switch that makes the remote column follow the shell's directory, and what
+    /// that is doing right now (R15).
+    ///
+    /// It says three things a path cannot: following is on and waiting for the shell,
+    /// following was turned off by browsing by hand, or the directory the shell
+    /// reported could not be read. Each of them is a state the user can act on with
+    /// the same switch, so a degradation is never drawn as a normal listing.
+    fn files_follow_row(&self, id: SessionId, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let on = self.files.follows(id);
+        let switch = components::segment(strings.files_follow, on, metrics)
+            .id("files.follow")
+            .debug_selector(|| "files.follow".to_owned())
+            // The switch is a keyboard stop of the file view, so it draws the ring when
+            // it holds the keys (R4, R15).
+            .track_focus(&self.files_follow_focus)
+            .focus(files_focus_ring)
+            .on_click(cx.listener(move |view, _event, _window, cx| {
+                view.files_set_follow(id, !on, cx);
+            }));
+        let note = match self.files.follow_note(id) {
+            Some(FollowNote::NoReport) => {
+                Some((Tone::Warning, strings.files_follow_no_report.to_owned()))
+            }
+            Some(FollowNote::Manual) => {
+                Some((Tone::Neutral, strings.files_follow_manual.to_owned()))
+            }
+            Some(FollowNote::Unreadable { path }) => Some((
+                Tone::Warning,
+                format!("{} {path}", strings.files_follow_unreadable),
+            )),
+            Some(FollowNote::Following { .. }) | None => None,
+        };
+        let mut row = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .flex_wrap()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::HAIRLINE))
+            .debug_selector(|| "files.follow.row".to_owned())
+            .child(switch);
+        if let Some((tone, text)) = note {
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    .text_size(metrics.caption_size())
+                    .text_color(tone.text())
+                    .debug_selector(|| "files.follow.note".to_owned())
+                    .child(SharedString::from(text)),
+            );
+        }
+        row
+    }
+
     fn files_panel(
         &self,
         id: SessionId,
@@ -12627,6 +12742,9 @@ impl ShelluneView {
             )
             .child(header)
             .child(crumb_row);
+        if remote {
+            panel = panel.child(self.files_follow_row(id, cx));
+        }
         if let Some(question) = self.files_question(id, source, cx) {
             panel = panel.child(question);
         } else if changing {
@@ -14043,6 +14161,26 @@ impl ShelluneView {
     #[cfg(any(test, feature = "ui-capture"))]
     pub fn files_browser(&self, id: SessionId) -> Option<&shellune_core::FileBrowser> {
         self.files.browser(id)
+    }
+
+    /// Puts the keyboard in the remote file column, for a test that walks its stops.
+    #[cfg(test)]
+    pub fn focus_remote_files_for_test(&self, window: &mut Window) {
+        window.focus(&self.files_remote_focus);
+    }
+
+    /// Whether the file view of one session follows its terminal, for a test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn files_follows(&self, id: SessionId) -> bool {
+        self.files.follows(id)
+    }
+
+    /// What the follow switch of one session says, for a test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn files_follow_note(&self, id: SessionId) -> Option<FollowNote> {
+        self.files.follow_note(id)
     }
 
     /// The local file view of one session, as the window holds it.

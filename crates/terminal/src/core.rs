@@ -32,6 +32,7 @@ use shellune_core::TerminalMode;
 
 use crate::blocks::{
     BlockBook, BlockFilter, GridAnchor, IntegrationEvent, IntegrationSplitter, Segment,
+    WorkingDirectory,
 };
 use crate::metrics::GridSize;
 use crate::palette;
@@ -61,6 +62,12 @@ pub struct TerminalEffects {
     /// boundary — no command line and no output — so a caller that marks a background
     /// tab cannot repeat what ran (R7).
     pub commands_finished: usize,
+    /// The working directory the shell last stated with OSC 7 during this chunk (R15).
+    ///
+    /// It is the shell's own report and nothing guessed from output: a chunk that
+    /// printed a path without an OSC 7 leaves this empty. Only the last report of the
+    /// chunk is kept, because each one replaces the previous state of the same shell.
+    pub directory: Option<String>,
 }
 
 impl TerminalEffects {
@@ -364,6 +371,12 @@ pub struct TerminalCore {
     title: Option<String>,
     /// OSC 133 / 633 markers, held when a chunk splits one.
     splitter: IntegrationSplitter,
+    /// The working directory the shell last stated with OSC 7 (R15).
+    ///
+    /// Kept beside the blocks because it is the same kind of fact: something the
+    /// shell said about itself, not something read off the grid. A new terminal
+    /// starts without one, which is what a reconnect gets.
+    directory: Option<WorkingDirectory>,
     /// Command blocks built from those markers. Not from prompt text.
     blocks: BlockBook,
     /// Classic, or command blocks when the shell actually reports them.
@@ -399,6 +412,7 @@ impl TerminalCore {
             grid,
             title: None,
             splitter: IntegrationSplitter::new(),
+            directory: None,
             blocks: BlockBook::new(),
             presentation: TerminalMode::Classic,
             lines_dropped: 0,
@@ -439,6 +453,14 @@ impl TerminalCore {
                         effects.commands_finished += 1;
                     }
                 }
+                Segment::Directory(directory) => {
+                    // The shell stated where it is. The report replaces the previous
+                    // one and is never drawn: the grid has already received nothing
+                    // for these bytes (R15).
+                    self.note_history();
+                    effects.directory = Some(directory.path().to_owned());
+                    self.directory = Some(directory);
+                }
             }
         }
         effects
@@ -453,6 +475,16 @@ impl TerminalCore {
         self.term.resize(grid);
         self.grid = grid;
         self.note_history();
+    }
+
+    /// The working directory the shell last reported with OSC 7 (R15).
+    ///
+    /// `None` means this shell has not said where it is, which is not the login
+    /// directory and not a guess: the file view says so instead of showing a path
+    /// nobody stated.
+    #[must_use]
+    pub fn directory(&self) -> Option<&str> {
+        self.directory.as_ref().map(WorkingDirectory::path)
     }
 
     /// Current grid size.
@@ -1225,6 +1257,50 @@ mod tests {
 
     fn core() -> TerminalCore {
         TerminalCore::new(40, 10, 100)
+    }
+
+    #[test]
+    fn a_shell_directory_report_never_reaches_the_grid_and_survives_a_split_chunk() {
+        let mut terminal = core();
+        let first = terminal.feed(b"\x1b]7;file://host/var");
+        assert_eq!(
+            first.directory, None,
+            "an unfinished report states nothing yet"
+        );
+        assert_eq!(terminal.directory(), None);
+
+        let second = terminal.feed(b"/log\x07$ ");
+        assert_eq!(second.directory.as_deref(), Some("/var/log"));
+        assert_eq!(terminal.directory(), Some("/var/log"));
+        // Only the prompt the shell printed after the report is on the grid.
+        let text = terminal.snapshot().text();
+        assert_eq!(text[0].trim_end(), "$");
+        assert!(
+            !text
+                .iter()
+                .any(|row| row.contains("file://") || row.contains("7;")),
+            "the report is not terminal text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_last_directory_of_a_chunk_is_the_one_the_shell_is_in() {
+        let mut terminal = core();
+        let effects = terminal
+            .feed(b"\x1b]7;file://host/home/dev\x07\x1b]7;file://host/home/dev/project\x1b\\");
+        assert_eq!(effects.directory.as_deref(), Some("/home/dev/project"));
+        assert_eq!(terminal.directory(), Some("/home/dev/project"));
+    }
+
+    #[test]
+    fn a_rejected_report_leaves_the_previous_directory_and_the_grid_alone() {
+        let mut terminal = core();
+        terminal.feed(b"\x1b]7;file://host/var/log\x07");
+        // A relative path says nothing about where the shell is.
+        let effects = terminal.feed(b"\x1b]7;file://hostrelative\x07ok");
+        assert_eq!(effects.directory, None);
+        assert_eq!(terminal.directory(), Some("/var/log"));
+        assert_eq!(terminal.snapshot().row_text(0).as_deref(), Some("ok"));
     }
 
     #[test]

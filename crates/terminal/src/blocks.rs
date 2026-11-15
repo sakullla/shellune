@@ -164,13 +164,104 @@ pub(crate) enum Segment {
     Bytes(Vec<u8>),
     /// A complete OSC 133 / OSC 633 marker. It is not part of the grid text.
     Event(IntegrationEvent),
+    /// A working directory a shell stated with OSC 7. Never part of the grid text.
+    Directory(WorkingDirectory),
+}
+
+/// Longest working directory a shell may report.
+///
+/// A path longer than this cannot be handed to a directory listing usefully, and the
+/// terminal would be holding bytes on behalf of a report it cannot use, so it is
+/// refused the same way a malformed one is (R15).
+const MAX_DIRECTORY_PATH: usize = 4096;
+
+/// A working directory a shell reported with OSC 7 (R15).
+///
+/// The value exists only when the whole report was usable: the `file` scheme, an
+/// absolute path, decodable percent escapes and no control character. Anything else
+/// yields no report at all, so a file view is never pointed at a path the shell did
+/// not really name. Nothing here is guessed from ordinary output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkingDirectory {
+    path: String,
+}
+
+impl WorkingDirectory {
+    /// The absolute POSIX path the shell reported.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Parses the body of an OSC 7 sequence, which is `file://<host>/<path>`.
+    ///
+    /// The host part is not compared with anything: a terminal on the client side
+    /// cannot see the server's own name, and the report is already bound to one
+    /// session by the step that consumes it. What decides whether the path is usable
+    /// is checked here.
+    fn parse(body: &[u8]) -> Option<Self> {
+        let rest = body.strip_prefix(b"file://")?;
+        // The authority ends at the first slash; an empty host is allowed, because a
+        // shell does not always know its own name.
+        let slash = rest.iter().position(|byte| *byte == b'/')?;
+        let path = decode_path(&rest[slash..])?;
+        Some(Self { path })
+    }
+}
+
+/// Percent-decodes one path and refuses it unless it is an absolute POSIX path of
+/// visible characters.
+fn decode_path(raw: &[u8]) -> Option<String> {
+    if raw.len() > MAX_DIRECTORY_PATH {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' {
+            let high = hex_digit(*raw.get(index + 1)?)?;
+            let low = hex_digit(*raw.get(index + 2)?)?;
+            decoded.push(high * 16 + low);
+            index += 3;
+        } else {
+            decoded.push(raw[index]);
+            index += 1;
+        }
+    }
+    let text = String::from_utf8(decoded).ok()?;
+    // A relative path is not a directory: it says nothing about where the shell is.
+    if !text.starts_with('/') {
+        return None;
+    }
+    if text.len() > MAX_DIRECTORY_PATH {
+        return None;
+    }
+    // A path with a control character cannot be shown or requested as one name, and a
+    // percent-encoded NUL lands here too.
+    if text
+        .chars()
+        .any(|character| (character as u32) < 0x20 || character == '\u{7f}')
+    {
+        return None;
+    }
+    Some(text)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Splits a byte stream so command markers can be handled beside the grid parser.
 ///
 /// An incomplete OSC at the end of a chunk is held until the terminator arrives,
-/// so a marker cut between two reads is still one marker. Any other sequence,
-/// including OSC 0 and OSC 52, is returned unchanged for the grid parser.
+/// so a marker cut between two reads is still one marker. An OSC 7 becomes a
+/// directory report; any other sequence, including OSC 0 and OSC 52, is returned
+/// unchanged for the grid parser.
 #[derive(Debug, Default)]
 pub(crate) struct IntegrationSplitter {
     held: Vec<u8>,
@@ -202,6 +293,14 @@ impl IntegrationSplitter {
                     self.held.drain(..n);
                     out.push(Segment::Event(event));
                 }
+                Take::Directory(n, directory) => {
+                    if !plain.is_empty() {
+                        out.push(Segment::Bytes(std::mem::take(&mut plain)));
+                    }
+                    let n = n.min(self.held.len());
+                    self.held.drain(..n);
+                    out.push(Segment::Directory(directory));
+                }
             }
         }
         if !plain.is_empty() {
@@ -215,6 +314,7 @@ enum Take {
     NeedMore,
     Plain(usize),
     Event(usize, IntegrationEvent),
+    Directory(usize, WorkingDirectory),
 }
 
 /// How long an unfinished OSC may be held before it is treated as ordinary text.
@@ -269,14 +369,30 @@ fn take_one(data: &[u8]) -> Take {
 }
 
 fn classify(body: &[u8], end: usize) -> Take {
-    let text = String::from_utf8_lossy(body);
-    let Some((code, rest)) = text.split_once(';') else {
+    let Some(separator) = body.iter().position(|byte| *byte == b';') else {
         return Take::Plain(end);
     };
-    if code != "133" && code != "633" {
-        return Take::Plain(end);
+    let rest = &body[separator + 1..];
+    match &body[..separator] {
+        // OSC 7 is the shell stating its working directory. It is not a command block
+        // and it is never drawn: the file view may follow it (R15). A report that
+        // cannot be used is not turned into a different path.
+        b"7" => {
+            return match WorkingDirectory::parse(rest) {
+                Some(directory) => Take::Directory(end, directory),
+                None => Take::Plain(end),
+            };
+        }
+        // OSC 0 and OSC 52 keep going to the grid, which already handles them.
+        b"133" | b"633" => {}
+        _ => return Take::Plain(end),
     }
-    match parse_marker(code, rest) {
+    let code = if &body[..separator] == b"133" {
+        "133"
+    } else {
+        "633"
+    };
+    match parse_marker(code, &String::from_utf8_lossy(rest)) {
         Some(event) => Take::Event(end, event),
         None => Take::Plain(end),
     }
@@ -675,6 +791,98 @@ mod tests {
         bytes
     }
 
+    fn directory(path: &str) -> Vec<u8> {
+        let mut bytes = b"\x1b]7;file://host".to_vec();
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0x07);
+        bytes
+    }
+
+    #[test]
+    fn an_osc_7_report_is_a_directory_and_never_grid_text() {
+        let segments = events(&directory("/var/log"));
+        assert_eq!(
+            segments,
+            vec![Segment::Directory(WorkingDirectory {
+                path: "/var/log".to_owned(),
+            })]
+        );
+    }
+
+    #[test]
+    fn an_osc_7_split_between_reads_is_still_one_report() {
+        let mut splitter = IntegrationSplitter::new();
+        assert!(splitter.push(b"\x1b]7;file://ser").is_empty());
+        assert!(splitter.push(b"ver/va").is_empty());
+        let segments = splitter.push(b"r/log\x1b\\tail");
+        assert_eq!(
+            segments,
+            vec![
+                Segment::Directory(WorkingDirectory {
+                    path: "/var/log".to_owned(),
+                }),
+                Segment::Bytes(b"tail".to_vec()),
+            ],
+            "a BEL and an ST terminator are the same report"
+        );
+    }
+
+    #[test]
+    fn a_percent_encoded_directory_is_decoded_once() {
+        let segments = events(&directory("/home/dev/%E6%96%87%E6%A1%A3%20dir"));
+        assert_eq!(
+            segments,
+            vec![Segment::Directory(WorkingDirectory {
+                path: "/home/dev/文档 dir".to_owned(),
+            })]
+        );
+    }
+
+    #[test]
+    fn an_unusable_osc_7_report_is_not_a_directory() {
+        // A relative path, a foreign scheme, a missing path, a control character, a
+        // broken escape and an over-long path all say nothing about where the shell is.
+        for body in [
+            "7;file://hostrelative",
+            "7;https://host/var/log",
+            "7;file://host",
+            "7;file://host/var/\u{1}log",
+            "7;file://host/var/%zz",
+            "7;file://host/var/%00",
+            "7;/var/log",
+        ] {
+            let segments = events(&osc(body));
+            assert!(
+                !segments
+                    .iter()
+                    .any(|segment| matches!(segment, Segment::Directory(_))),
+                "{body} is not a usable working directory"
+            );
+            assert!(
+                segments
+                    .iter()
+                    .all(|segment| !matches!(segment, Segment::Event(_))),
+                "{body} is not a command marker either"
+            );
+        }
+        let long = format!("7;file://host/{}", "a".repeat(5000));
+        assert!(
+            !events(&osc(&long))
+                .iter()
+                .any(|segment| matches!(segment, Segment::Directory(_)))
+        );
+    }
+
+    #[test]
+    fn osc_0_and_osc_52_still_reach_the_grid() {
+        let bytes = b"\x1b]0;a title\x07\x1b]52;c;Zm9v\x07text";
+        assert_eq!(
+            events(bytes),
+            vec![Segment::Bytes(bytes.to_vec())],
+            "the two OSC sequences the grid already handled are untouched"
+        );
+    }
+
     #[test]
     fn plain_text_and_other_osc_sequences_pass_through() {
         let segments = events(b"hello \x1b]0;title\x07\x1b[31m");
@@ -682,6 +890,7 @@ mod tests {
         match &segments[0] {
             Segment::Bytes(bytes) => assert_eq!(bytes, b"hello \x1b]0;title\x07\x1b[31m"),
             Segment::Event(_) => panic!("a title OSC is not a command marker"),
+            Segment::Directory(_) => panic!("a title OSC is not a working directory"),
         }
     }
 
