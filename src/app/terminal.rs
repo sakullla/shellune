@@ -197,6 +197,24 @@ pub enum SourceEvent {
     X11(X11Status),
 }
 
+/// Parse adjacent reads together; control events keep their position in the stream.
+fn coalesce_output(events: Vec<SourceEvent>) -> Vec<SourceEvent> {
+    let mut merged = Vec::new();
+    for event in events {
+        match event {
+            SourceEvent::Data(bytes) => {
+                if let Some(SourceEvent::Data(previous)) = merged.last_mut() {
+                    previous.extend_from_slice(&bytes);
+                } else {
+                    merged.push(SourceEvent::Data(bytes));
+                }
+            }
+            control => merged.push(control),
+        }
+    }
+    merged
+}
+
 impl SourceEvent {
     /// The pane's view of an event a remote session reported.
     ///
@@ -225,12 +243,9 @@ impl SourceEvent {
 impl PaneSource {
     fn write(&mut self, bytes: &[u8]) -> Result<bool, String> {
         match self {
-            Self::Local(session) => session
-                .write(bytes)
-                .map(|()| true)
-                .map_err(|error| error.to_string()),
-            Self::Remote(session) => session.write(bytes).map(|()| true),
-            Self::Chain(session) => session.write(bytes).map(|()| true),
+            Self::Local(session) => session.try_write(bytes).map_err(|error| error.to_string()),
+            Self::Remote(session) => session.try_write(bytes),
+            Self::Chain(session) => session.try_write(bytes),
             Self::Serial(link) => link.write(bytes),
         }
     }
@@ -508,6 +523,9 @@ pub struct TerminalPane {
     ///
     /// An unusable expression is its own answer: it is never drawn as "no matches".
     search_error: Option<String>,
+    input_busy: bool,
+    output_search_at: Option<std::time::Instant>,
+    output_search_pending: bool,
     search_hits: Vec<HistoryMatch>,
     /// Index of the match the viewport was last put on, counted from zero.
     search_at: usize,
@@ -718,6 +736,9 @@ impl TerminalPane {
             search_focused: false,
             search_query: String::new(),
             search_error: None,
+            input_busy: false,
+            output_search_at: None,
+            output_search_pending: false,
             search_hits: Vec::new(),
             search_at: 0,
             search_mark: None,
@@ -785,6 +806,9 @@ impl TerminalPane {
             search_focused: false,
             search_query: String::new(),
             search_error: None,
+            input_busy: false,
+            output_search_at: None,
+            output_search_pending: false,
             search_hits: Vec::new(),
             search_at: 0,
             search_mark: None,
@@ -851,6 +875,9 @@ impl TerminalPane {
             search_focused: false,
             search_query: String::new(),
             search_error: None,
+            input_busy: false,
+            output_search_at: None,
+            output_search_pending: false,
             search_hits: Vec::new(),
             search_at: 0,
             search_mark: None,
@@ -1000,6 +1027,9 @@ impl TerminalPane {
             search_focused: false,
             search_query: String::new(),
             search_error: None,
+            input_busy: false,
+            output_search_at: None,
+            output_search_pending: false,
             search_hits: Vec::new(),
             search_at: 0,
             search_mark: None,
@@ -1187,6 +1217,9 @@ impl TerminalPane {
             search_focused: false,
             search_query: String::new(),
             search_error: None,
+            input_busy: false,
+            output_search_at: None,
+            output_search_pending: false,
             search_hits: Vec::new(),
             search_at: 0,
             search_mark: None,
@@ -1425,7 +1458,7 @@ impl TerminalPane {
         if events.is_empty() {
             return true;
         }
-        for event in events {
+        for event in coalesce_output(events) {
             self.handle_event(event, cx);
         }
         cx.notify();
@@ -1465,14 +1498,36 @@ impl TerminalPane {
             serial.say(note);
             cx.notify();
         }
-        if events.is_empty() {
-            return self.state.accepts_input();
+        let was_alternate = self.alternate_screen();
+        let mut live = self.state.accepts_input();
+        let changed = !events.is_empty();
+        for event in coalesce_output(events) {
+            if let SourceEvent::Data(bytes) = event {
+                let effects = self.core.feed(&bytes);
+                self.apply_effects(effects, cx);
+                self.output_search_pending = true;
+                live = self.state.accepts_input();
+            } else {
+                live = self.handle_event(event, cx);
+            }
         }
-        let mut live = true;
-        for event in events {
-            live = self.handle_event(event, cx);
+        // A continuous log stream must not rescan all scrollback every 12 ms.
+        // User edits/navigation still refresh immediately. Flush the pending scan
+        // on a quiet poll or exit too, so the final output is never left stale.
+        let search_due = self
+            .output_search_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_millis(100));
+        if self.output_search_pending
+            && (search_due || !live || self.alternate_screen() != was_alternate)
+        {
+            self.recount_after_output(was_alternate);
+            self.output_search_pending = false;
+            self.output_search_at = Some(std::time::Instant::now());
+            cx.notify();
         }
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
         live
     }
 
@@ -1627,7 +1682,13 @@ impl TerminalPane {
             return true;
         };
         match source.write(bytes) {
-            Ok(accepted) => accepted,
+            Ok(accepted) => {
+                if !matches!(source, PaneSource::Serial(_)) && self.input_busy == accepted {
+                    self.input_busy = !accepted;
+                    cx.notify();
+                }
+                accepted
+            }
             Err(error) => {
                 // A write that fails happened on a session that was live: the program ran
                 // and the channel is gone, which is a loss and not a launch failure.
@@ -3089,6 +3150,16 @@ impl TerminalPane {
                                 metrics,
                             ))
                         }
+                    })
+                    .when(self.input_busy, |row| {
+                        row.child(components::chip(
+                            match self.locale {
+                                Locale::Chinese => "输入缓冲已满，本次输入未发送",
+                                Locale::English => "Input buffer full; this input was not sent",
+                            },
+                            Tone::Warning,
+                            metrics,
+                        ))
                     })
                     .when_some(self.integration_note(), |row, note| {
                         row.child(
@@ -4881,5 +4952,23 @@ mod ink_tests {
     #[test]
     fn text_hidden_on_purpose_stays_hidden() {
         assert_eq!(ink(rgb(0x334455), rgb(0x334455), false), rgb(0x334455));
+    }
+}
+
+#[cfg(test)]
+mod flood_batch_tests {
+    use super::*;
+    #[test]
+    fn adjacent_output_is_coalesced_without_moving_exit_or_status() {
+        let events = coalesce_output(vec![
+            SourceEvent::Data(vec![1]),
+            SourceEvent::Data(vec![2]),
+            SourceEvent::Exited(ExitReport::Clean),
+            SourceEvent::Data(vec![3]),
+        ]);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], SourceEvent::Data(bytes) if bytes == &[1, 2]));
+        assert!(matches!(&events[1], SourceEvent::Exited(ExitReport::Clean)));
+        assert!(matches!(&events[2], SourceEvent::Data(bytes) if bytes == &[3]));
     }
 }

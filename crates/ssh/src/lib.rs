@@ -29,6 +29,8 @@ pub mod agent;
 pub mod auth;
 pub mod batch;
 mod chain;
+mod output;
+mod input;
 pub mod error;
 pub mod forwarding;
 pub mod hostkey;

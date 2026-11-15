@@ -196,8 +196,9 @@ impl ChainRequest {
 
 /// A jump attempt, from the first refusal or prompt through the target shell.
 pub struct ChainSession {
+    input_budget: shellune_core::io_budget::InputBudget,
     commands: UnboundedSender<Command>,
-    events: UnboundedReceiver<ChainEvent>,
+    events: crate::output::Receiver<ChainEvent>,
     trust: Arc<AnswerSlot>,
     proxy: Arc<AnswerSlot>,
     cancel: Cancel,
@@ -218,7 +219,7 @@ impl ChainSession {
     #[must_use]
     pub fn connect(request: ChainRequest) -> Self {
         let (commands, command_rx) = unbounded_channel();
-        let (events_tx, events_rx) = unbounded_channel();
+        let (events_tx, events_rx) = crate::output::channel();
         let cancel = Cancel::new();
         let trust = Arc::new(AnswerSlot::new());
         let proxy = Arc::new(AnswerSlot::new());
@@ -254,6 +255,7 @@ impl ChainSession {
             x11: x11_gate,
         };
 
+        let worker_cancel = cancel.clone();
         thread::Builder::new()
             .name("shellune-ssh-chain".to_owned())
             .spawn(move || {
@@ -268,7 +270,8 @@ impl ChainSession {
                     }));
                     return;
                 };
-                runtime.block_on(run_chain(
+                runtime.block_on(async move {
+                    let running = run_chain(
                     request,
                     command_rx,
                     attempt,
@@ -277,11 +280,22 @@ impl ChainSession {
                     forward_events,
                     forward_gate,
                     x11_events,
-                ));
+                );
+                    tokio::pin!(running);
+                    tokio::select! {
+                        _ = &mut running => {},
+                        _ = worker_cancel.cancelled() => {
+                            if tokio::time::timeout(Duration::from_secs(1), &mut running).await.is_err() {
+                                let _ = failure_sender.send(ChainEvent::Failed(ChainFailure::Cancelled { hop: None }));
+                            }
+                        }
+                    }
+                });
             })
             .expect("the SSH chain thread can be created");
 
         Self {
+            input_budget: Default::default(),
             commands,
             events: events_rx,
             trust,
@@ -341,11 +355,27 @@ impl ChainSession {
     ///
     /// Returns the reason when the chain thread is gone.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.is_empty() {
-            return Ok(());
+        if self.try_write(bytes)? {
+            Ok(())
+        } else {
+            Err("terminal input buffer is full; input was not sent".to_owned())
         }
+    }
+
+    /// Queues input without blocking. `Ok(false)` means the entire write was refused.
+    pub fn try_write(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        if self.closed || self.commands.is_closed() {
+            return Err("the SSH connection is no longer open".to_owned());
+        }
+        if bytes.is_empty() {
+            return Ok(true);
+        }
+        let Some(chunk) = self.input_budget.reserve(bytes) else {
+            return Ok(false);
+        };
         self.commands
-            .send(Command::Write(bytes.to_vec()))
+            .send(Command::Write(chunk))
+            .map(|()| true)
             .map_err(|_| "the SSH connection is no longer open".to_owned())
     }
 
@@ -372,11 +402,7 @@ impl ChainSession {
 
     /// Every event that arrived since the last call.
     pub fn drain(&mut self) -> Vec<ChainEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = self.try_event() {
-            events.push(event);
-        }
-        events
+        self.events.drain()
     }
 
     /// The size the target shell was last told about.
@@ -522,7 +548,7 @@ struct LiveHop {
 struct HopHandler {
     location: HopLocation,
     known: KnownHostKey,
-    events: UnboundedSender<ChainEvent>,
+    events: crate::output::Sender<ChainEvent>,
     trust: Arc<AnswerSlot>,
     cancel: Cancel,
     progress: Arc<HandshakeProgress>,
@@ -696,7 +722,7 @@ impl HopHandler {
 
 /// The channels and deadlines one attempt shares across its hops.
 struct Attempt {
-    events: UnboundedSender<ChainEvent>,
+    events: crate::output::Sender<ChainEvent>,
     trust: Arc<AnswerSlot>,
     proxy: Arc<AnswerSlot>,
     cancel: Cancel,
@@ -1092,7 +1118,7 @@ async fn confirm_proxy(
     cancel: &Cancel,
     hop: &HopLocation,
     command: &str,
-    events: &UnboundedSender<ChainEvent>,
+    events: &crate::output::Sender<ChainEvent>,
 ) -> Result<(), ChainFailure> {
     if cancel.is_cancelled() {
         return Err(ChainFailure::Cancelled {
@@ -1391,6 +1417,8 @@ async fn drive_shell(
     tokio::spawn(transfer::serve(transfers, open_commands));
 
     if let Some((mut read_half, write_half)) = shell {
+        let write_half = Arc::new(write_half);
+        let (input, mut input_task) = crate::input::writer(write_half.clone());
         let mut exit_code: Option<u32> = None;
         let mut x11_open = true;
         loop {
@@ -1416,6 +1444,10 @@ async fn drive_shell(
                     forwards.shutdown(handle).await;
                     let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
                     return Ok(());
+                }
+                result = &mut input_task => {
+                    let reason = match result { Ok(Err(reason)) => reason, _ => "the SSH input worker stopped".to_owned() };
+                    return Err(ChainFailure::Hop { hop: Box::new(location.clone()), error: Box::new(ConnectError::Disconnected { reason }) });
                 }
                 notice = x11_events.recv(), if x11_open => {
                     match notice {
@@ -1457,7 +1489,7 @@ async fn drive_shell(
                             return Ok(());
                         }
                         Command::Write(bytes) => {
-                            if let Err(error) = write_half.data_bytes(bytes).await {
+                            if let Err(error) = input.send(bytes) {
                                 forwards.shutdown(handle).await;
                                 return Err(ChainFailure::Hop {
                                     hop: Box::new(location.clone()),
@@ -1485,7 +1517,7 @@ async fn drive_shell(
                 }
                 message = read_half.wait() => match message {
                     Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        if events.send(ChainEvent::Data(data.to_vec())).is_err() {
+                        if events.data(&data, ChainEvent::Data).await.is_err() {
                             forwards.shutdown(handle).await;
                             return Ok(());
                         }

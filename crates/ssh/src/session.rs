@@ -294,7 +294,7 @@ pub enum RemoteEvent {
 
 /// What the window tells the connection thread to do.
 pub(crate) enum Command {
-    Write(Vec<u8>),
+    Write(shellune_core::io_budget::InputChunk),
     Resize(PtySize),
     Close,
     /// Open an SFTP subsystem channel for the file browser of this connection.
@@ -336,11 +336,13 @@ pub(crate) enum Command {
 
 /// A remote session, from the first handshake to its last byte.
 pub struct RemoteSession {
+    input_budget: shellune_core::io_budget::InputBudget,
     commands: UnboundedSender<Command>,
+    stop: crate::transport::Cancel,
     decisions: UnboundedSender<TrustAnswer>,
     /// Tells the attempt to stop waiting for an answer it will never get.
     cancelled: UnboundedSender<()>,
-    events: UnboundedReceiver<RemoteEvent>,
+    events: crate::output::Receiver<RemoteEvent>,
     size: PtySize,
     closed: bool,
     /// The browsable side of this connection, until a file view takes it.
@@ -359,7 +361,7 @@ impl RemoteSession {
     #[must_use]
     pub fn connect(request: ConnectRequest) -> Self {
         let (commands, command_rx) = unbounded_channel();
-        let (events, event_rx) = unbounded_channel();
+        let (events, event_rx) = crate::output::channel();
         let (decisions, decision_rx) = unbounded_channel();
         let (cancelled, cancel_rx) = unbounded_channel();
         // The file browser of this connection: requests go to the connection thread,
@@ -389,6 +391,8 @@ impl RemoteSession {
         let open_commands = commands.clone();
 
         let failure_sender = events.clone();
+        let stop = crate::transport::Cancel::new();
+        let worker_stop = stop.clone();
         thread::Builder::new()
             .name("shellune-ssh".to_owned())
             .spawn(move || {
@@ -402,7 +406,8 @@ impl RemoteSession {
                     }));
                     return;
                 };
-                runtime.block_on(run(
+                runtime.block_on(async move {
+                    let running = run(
                     request,
                     Channels {
                         commands: command_rx,
@@ -417,12 +422,24 @@ impl RemoteSession {
                         x11_events,
                         open: open_commands,
                     },
-                ));
+                );
+                    tokio::pin!(running);
+                    tokio::select! {
+                        _ = &mut running => {},
+                        _ = worker_stop.cancelled() => {
+                            // Let trust cancellation and orderly disconnect report their
+                            // result, but never wait on a stalled socket indefinitely.
+                            let _ = tokio::time::timeout(Duration::from_millis(250), &mut running).await;
+                        }
+                    }
+                });
             })
             .expect("the SSH thread can be created");
 
         Self {
+            input_budget: Default::default(),
             commands,
+            stop,
             decisions,
             cancelled,
             events: event_rx,
@@ -486,11 +503,27 @@ impl RemoteSession {
     /// Returns the reason when the connection thread is gone, which is the moment the
     /// caller must stop believing input still reaches the shell.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.is_empty() {
-            return Ok(());
+        if self.try_write(bytes)? {
+            Ok(())
+        } else {
+            Err("terminal input buffer is full; input was not sent".to_owned())
         }
+    }
+
+    /// Queues input without blocking. `Ok(false)` means the entire write was refused.
+    pub fn try_write(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        if self.closed || self.commands.is_closed() {
+            return Err("the SSH connection is no longer open".to_owned());
+        }
+        if bytes.is_empty() {
+            return Ok(true);
+        }
+        let Some(chunk) = self.input_budget.reserve(bytes) else {
+            return Ok(false);
+        };
         self.commands
-            .send(Command::Write(bytes.to_vec()))
+            .send(Command::Write(chunk))
+            .map(|()| true)
             .map_err(|_| "the SSH connection is no longer open".to_owned())
     }
 
@@ -510,13 +543,9 @@ impl RemoteSession {
             .map_err(|_| "the SSH connection is no longer open".to_owned())
     }
 
-    /// Every event that arrived since the last call.
+    /// A bounded batch of pending events; poll again to consume remaining output.
     pub fn drain(&mut self) -> Vec<RemoteEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.events.try_recv() {
-            events.push(event);
-        }
-        events
+        self.events.drain()
     }
 
     /// The size the remote terminal was last told about.
@@ -534,6 +563,7 @@ impl RemoteSession {
             return;
         }
         self.closed = true;
+        self.stop.fire();
         let _ = self.commands.send(Command::Close);
         // A form that closes while its identity question is on screen must also end
         // the question: otherwise the attempt keeps waiting for an answer nobody can
@@ -584,7 +614,7 @@ impl Drop for RemoteSession {
 /// through.
 struct Channels {
     commands: UnboundedReceiver<Command>,
-    events: UnboundedSender<RemoteEvent>,
+    events: crate::output::Sender<RemoteEvent>,
     decisions: UnboundedReceiver<TrustAnswer>,
     cancelled: UnboundedReceiver<()>,
     files: sftp::Wiring,
@@ -774,6 +804,8 @@ async fn connect_and_shell(
     let mut forwards = forwarding::ForwardLoop::new(forward_events, gate, open_commands);
 
     if let Some((mut read_half, write_half)) = shell {
+        let write_half = Arc::new(write_half);
+        let (input, mut input_task) = crate::input::writer(write_half.clone());
         let mut exit_code: Option<u32> = None;
         let mut x11_open = true;
         loop {
@@ -786,6 +818,10 @@ async fn connect_and_shell(
                             reason: "the SSH connection closed".to_owned(),
                         });
                     }
+                }
+                result = &mut input_task => {
+                    let reason = match result { Ok(Err(reason)) => reason, _ => "the SSH input worker stopped".to_owned() };
+                    return Err(ConnectError::Disconnected { reason });
                 }
                 notice = x11_events.recv(), if x11_open => {
                     match notice {
@@ -829,7 +865,7 @@ async fn connect_and_shell(
                             return Ok(());
                         }
                         Command::Write(bytes) => {
-                            if let Err(error) = write_half.data_bytes(bytes).await {
+                            if let Err(error) = input.send(bytes) {
                                 forwards.shutdown(&handle).await;
                                 return Err(ConnectError::Disconnected {
                                     reason: error.to_string(),
@@ -863,7 +899,7 @@ async fn connect_and_shell(
                         // A terminal shows stderr and stdout in one grid, so both arrive
                         // as output; the distinction the protocol makes is not one the
                         // pane can draw.
-                        if events.send(RemoteEvent::Data(data.to_vec())).is_err() {
+                        if events.data(&data, RemoteEvent::Data).await.is_err() {
                             forwards.shutdown(&handle).await;
                             return Ok(());
                         }
@@ -1219,7 +1255,7 @@ struct ClientHandler {
     host: String,
     port: u16,
     known: KnownHostKey,
-    events: UnboundedSender<RemoteEvent>,
+    events: crate::output::Sender<RemoteEvent>,
     decisions: UnboundedReceiver<TrustAnswer>,
     /// Fires when the caller stopped wanting an answer: the form was closed.
     cancelled: UnboundedReceiver<()>,
@@ -1398,7 +1434,7 @@ impl client::Handler for ClientHandler {
 #[cfg(feature = "test-support")]
 pub struct ScriptedSession {
     session: Option<RemoteSession>,
-    events: UnboundedSender<RemoteEvent>,
+    events: crate::output::Sender<RemoteEvent>,
     answers: Arc<Mutex<Vec<TrustAnswer>>>,
 }
 
@@ -1408,7 +1444,7 @@ impl ScriptedSession {
     #[must_use]
     pub fn new() -> Self {
         let (commands, command_rx) = unbounded_channel();
-        let (events, event_rx) = unbounded_channel();
+        let (events, event_rx) = crate::output::channel();
         let (decisions, mut decision_rx) = unbounded_channel();
         let (cancelled, cancel_rx) = unbounded_channel();
         let answers = Arc::new(Mutex::new(Vec::new()));
@@ -1430,7 +1466,9 @@ impl ScriptedSession {
             .expect("the scripted session thread can be created");
         Self {
             session: Some(RemoteSession {
+                input_budget: Default::default(),
                 commands,
+                stop: crate::transport::Cancel::new(),
                 decisions,
                 cancelled,
                 events: event_rx,
@@ -1578,6 +1616,41 @@ mod tests {
             KnownHostKey::Unknown,
         );
         assert_eq!(request.target(), "deploy@web.example.org:2222");
+    }
+
+    #[test]
+    fn close_interrupts_a_silent_handshake_without_waiting_for_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let request = ConnectRequest::new(
+            "127.0.0.1",
+            listener.local_addr().unwrap().port(),
+            "test",
+            AuthMethod::password("unused"),
+            PtySize::default(),
+            KnownHostKey::Unknown,
+        )
+        .with_connection_policy(
+            ConnectionPolicy::default().with_connect_timeout(Duration::from_secs(60)),
+        );
+        let mut session = RemoteSession::connect(request);
+        let started = std::time::Instant::now();
+        let _peer = loop {
+            if let Ok((peer, _)) = listener.accept() {
+                break peer;
+            }
+            assert!(started.elapsed() < Duration::from_secs(3));
+            thread::sleep(Duration::from_millis(1));
+        };
+        session.close();
+        let closed = std::time::Instant::now();
+        while !session.commands.is_closed() && closed.elapsed() < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            session.commands.is_closed(),
+            "worker must stop during SSH banner wait"
+        );
     }
 
     #[test]

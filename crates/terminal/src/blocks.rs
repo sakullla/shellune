@@ -96,7 +96,7 @@ pub struct CommandBlock {
     pub id: CommandBlockId,
     /// Command text taken from an `E` marker or from the grid between input and output.
     pub command: String,
-    /// Output taken from the grid between output start and command end.
+    /// Bounded output tail from the grid; `[…]` marks an omitted prefix.
     pub output: String,
     /// Exit knowledge. Never invented from a process status.
     pub status: BlockStatus,
@@ -274,35 +274,45 @@ impl IntegrationSplitter {
 
     /// Appends `input` and returns every complete segment it now contains.
     pub(crate) fn push(&mut self, input: &[u8]) -> Vec<Segment> {
+        if self.held.is_empty() && !input.contains(&0x1b) {
+            return if input.is_empty() {
+                Vec::new()
+            } else {
+                vec![Segment::Bytes(input.to_vec())]
+            };
+        }
         self.held.extend_from_slice(input);
         let mut out = Vec::new();
         let mut plain = Vec::new();
+        let mut consumed = 0;
         loop {
-            match take_one(&self.held) {
+            match take_one(&self.held[consumed..]) {
                 Take::NeedMore => break,
                 Take::Plain(0) => break,
                 Take::Plain(n) => {
-                    let n = n.min(self.held.len());
-                    plain.extend(self.held.drain(..n));
+                    let n = n.min(self.held.len() - consumed);
+                    plain.extend_from_slice(&self.held[consumed..consumed + n]);
+                    consumed += n;
                 }
                 Take::Event(n, event) => {
                     if !plain.is_empty() {
                         out.push(Segment::Bytes(std::mem::take(&mut plain)));
                     }
-                    let n = n.min(self.held.len());
-                    self.held.drain(..n);
+                    let n = n.min(self.held.len() - consumed);
+                    consumed += n;
                     out.push(Segment::Event(event));
                 }
                 Take::Directory(n, directory) => {
                     if !plain.is_empty() {
                         out.push(Segment::Bytes(std::mem::take(&mut plain)));
                     }
-                    let n = n.min(self.held.len());
-                    self.held.drain(..n);
+                    let n = n.min(self.held.len() - consumed);
+                    consumed += n;
                     out.push(Segment::Directory(directory));
                 }
             }
         }
+        self.held.drain(..consumed);
         if !plain.is_empty() {
             out.push(Segment::Bytes(plain));
         }
@@ -475,8 +485,20 @@ fn tidy_command(text: &str) -> String {
     text.trim_matches(['\n', '\r']).trim().to_owned()
 }
 
+pub(crate) const MAX_BLOCK_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_FINISHED_BLOCK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FINISHED_BLOCKS: usize = 1000;
+
 fn tidy_output(text: &str) -> String {
-    text.trim_matches(['\n', '\r']).trim_end().to_owned()
+    let text = text.trim_matches(['\n', '\r']).trim_end();
+    if text.len() <= MAX_BLOCK_OUTPUT_BYTES {
+        return text.to_owned();
+    }
+    let mut start = text.len() - (MAX_BLOCK_OUTPUT_BYTES - "[…]\n".len());
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[…]\n{}", &text[start..])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -537,6 +559,7 @@ impl OpenBlock {
 #[derive(Debug, Default)]
 pub(crate) struct BlockBook {
     finished: Vec<CommandBlock>,
+    finished_bytes: usize,
     open: Option<OpenBlock>,
     next_id: u64,
     seen: bool,
@@ -629,8 +652,7 @@ impl BlockBook {
             && previous.phase != Phase::Prompt
         {
             // A new prompt without a command-end marker is not a successful command.
-            self.finished
-                .push(previous.close(BlockStatus::Unknown, None));
+            self.record(previous.close(BlockStatus::Unknown, None));
         }
         self.open = Some(OpenBlock::prompt(self.allocate()));
     }
@@ -701,7 +723,7 @@ impl BlockBook {
             ExitCodeField::Missing | ExitCodeField::Unreadable => BlockStatus::Unknown,
             ExitCodeField::Known(code) => BlockStatus::Exited(code),
         };
-        self.finished.push(open.close(status, duration));
+        self.record(open.close(status, duration));
         ended_a_command
     }
 
@@ -733,20 +755,56 @@ impl BlockBook {
         } else {
             Some(Matcher::compile(query, options)?)
         };
-        Ok(self
-            .blocks()
-            .into_iter()
-            .filter(|block| {
-                filter.matches(block.status)
-                    && matcher.as_ref().is_none_or(|matcher| {
-                        matcher.is_match(&block.command) || matcher.is_match(&block.output)
-                    })
-            })
-            .collect())
+        let matches = |block: &CommandBlock| {
+            filter.matches(block.status)
+                && matcher.as_ref().is_none_or(|matcher| {
+                    matcher.is_match(&block.command) || matcher.is_match(&block.output)
+                })
+        };
+        let mut found: Vec<_> = self
+            .finished
+            .iter()
+            .filter(|block| matches(block))
+            .cloned()
+            .collect();
+        if let Some(open) = &self.open
+            && open.phase != Phase::Prompt
+        {
+            let block = open.snapshot();
+            if matches(&block) {
+                found.push(block);
+            }
+        }
+        Ok(found)
     }
 
     pub(crate) fn get(&self, id: CommandBlockId) -> Option<CommandBlock> {
-        self.blocks().into_iter().find(|block| block.id == id)
+        self.finished
+            .iter()
+            .find(|block| block.id == id)
+            .cloned()
+            .or_else(|| {
+                self.open
+                    .as_ref()
+                    .filter(|open| open.id == id && open.phase != Phase::Prompt)
+                    .map(OpenBlock::snapshot)
+            })
+    }
+
+    fn record(&mut self, block: CommandBlock) {
+        self.finished_bytes += block.command.len() + block.output.len();
+        self.finished.push(block);
+        let mut remove = 0;
+        while self.finished.len() - remove > MAX_FINISHED_BLOCKS
+            || self.finished_bytes > MAX_FINISHED_BLOCK_BYTES
+        {
+            let old = &self.finished[remove];
+            self.finished_bytes -= old.command.len() + old.output.len();
+            remove += 1;
+        }
+        if remove > 0 {
+            self.finished.drain(..remove);
+        }
     }
 
     fn close_open(&mut self, status: BlockStatus, duration: Option<Duration>) {
@@ -756,7 +814,7 @@ impl BlockBook {
         if open.phase == Phase::Prompt && open.command.is_empty() {
             return;
         }
-        self.finished.push(open.close(status, duration));
+        self.record(open.close(status, duration));
     }
 
     fn ensure_open(&mut self) -> &mut OpenBlock {
@@ -779,6 +837,28 @@ impl BlockBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_retention_is_bounded_and_keeps_newest_commands() {
+        let mut book = BlockBook::new();
+        for id in 0..1200 {
+            book.record(CommandBlock {
+                id: CommandBlockId(id),
+                command: format!("command {id}"),
+                output: "x".repeat(16 * 1024),
+                status: BlockStatus::Exited(0),
+                duration: None,
+            });
+        }
+        assert!(book.finished.len() <= MAX_FINISHED_BLOCKS);
+        assert!(book.finished_bytes <= MAX_FINISHED_BLOCK_BYTES);
+        assert_eq!(book.finished.last().unwrap().command, "command 1199");
+        assert!(book.get(CommandBlockId(0)).is_none());
+        let text = tidy_output(&"中文".repeat(MAX_BLOCK_OUTPUT_BYTES));
+        assert!(text.len() <= MAX_BLOCK_OUTPUT_BYTES);
+        assert!(text.starts_with("[…]\n"));
+        assert!(text.ends_with("中文"));
+    }
 
     fn events(bytes: &[u8]) -> Vec<Segment> {
         IntegrationSplitter::new().push(bytes)

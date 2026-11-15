@@ -392,6 +392,7 @@ pub struct TerminalCore {
     /// `scrolling_history` from construction. The grid stops growing at this size
     /// and then rotates.
     scrollback: usize,
+    row_addresses: Vec<usize>,
 }
 
 impl TerminalCore {
@@ -418,6 +419,7 @@ impl TerminalCore {
             lines_dropped: 0,
             last_history: 0,
             scrollback,
+            row_addresses: Vec::new(),
         }
     }
 
@@ -936,7 +938,7 @@ impl TerminalCore {
                 } else {
                     self.blocks
                         .output_anchor()
-                        .and_then(|anchor| self.text_between(anchor, self.anchor_now()))
+                        .and_then(|anchor| self.output_between(anchor, self.anchor_now()))
                 };
                 self.blocks.finish(output, exit, now)
             }
@@ -954,7 +956,7 @@ impl TerminalCore {
         let Some(anchor) = self.blocks.output_anchor() else {
             return;
         };
-        let text = self.text_between(anchor, self.anchor_now());
+        let text = self.output_between(anchor, self.anchor_now());
         self.blocks.set_running_output(text);
     }
 
@@ -988,6 +990,28 @@ impl TerminalCore {
         let line = self.line_from_stable(anchor.stable)?;
         let column = anchor.column.min(self.grid.cols.saturating_sub(1));
         Some(Point::new(Line(line), Column(column)))
+    }
+
+    // Block previews retain a bounded tail. The classic grid keeps its configured
+    // scrollback independently. Avoid rescanning the entire command on every read.
+    fn output_between(&self, from: GridAnchor, to: GridAnchor) -> Option<String> {
+        let top = self.stable_line(-(self.history() as i32));
+        let earliest = top.max(to.stable.saturating_sub(128));
+        let clipped = from.stable < earliest;
+        let start = if clipped {
+            GridAnchor {
+                stable: earliest,
+                column: 0,
+            }
+        } else {
+            from
+        };
+        let text = self.text_between(start, to)?;
+        Some(if clipped {
+            format!("[…]\n{text}")
+        } else {
+            text
+        })
     }
 
     fn text_between(&self, from: GridAnchor, to: GridAnchor) -> Option<String> {
@@ -1134,10 +1158,12 @@ impl TerminalCore {
         let n = n.clamp(1, bytes.len());
         let before_history = self.history();
         let before_alt = self.on_alternate_screen();
-        let rows = self.line_addrs(depth);
+        let mut rows = std::mem::take(&mut self.row_addresses);
+        self.line_addrs(depth, &mut rows);
         self.parser.advance(&mut self.term, &bytes[..n]);
         *bytes = &bytes[n..];
         if self.on_alternate_screen() || self.on_alternate_screen() != before_alt {
+            self.row_addresses = rows;
             if !self.on_alternate_screen() {
                 self.note_history();
             }
@@ -1150,21 +1176,21 @@ impl TerminalCore {
             self.lines_dropped += self.dropped_in_rotation(&rows) as i64;
         }
         self.last_history = history;
+        self.row_addresses = rows;
     }
 
     /// Addresses of the rows a scroll of at most `depth` can move onto the top.
-    fn line_addrs(&self, depth: usize) -> Vec<usize> {
+    fn line_addrs(&self, depth: usize, addresses: &mut Vec<usize>) {
+        addresses.clear();
         let top = -i32::try_from(self.history()).unwrap_or(i32::MAX);
         let bottom = self.term.grid().bottommost_line().0;
         let depth = i32::try_from(depth).unwrap_or(i32::MAX);
         let end = top.saturating_add(depth).min(bottom);
         if end < top {
-            return Vec::new();
+            return;
         }
         let grid = self.term.grid();
-        (top..=end)
-            .map(|line| std::ptr::from_ref(&grid[Line(line)]).addr())
-            .collect()
+        addresses.extend((top..=end).map(|line| std::ptr::from_ref(&grid[Line(line)]).addr()));
     }
 
     /// How many rows rotated off the top, from a [`Self::line_addrs`] snapshot.

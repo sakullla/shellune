@@ -11,11 +11,12 @@
 //! for the exit status so an abnormal exit is noticed even when the shell prints
 //! nothing on its way out.
 
+use shellune_core::io_budget::{InputBudget, InputChunk};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -183,16 +184,18 @@ pub enum PtyEvent {
     Data(Vec<u8>),
     /// The shell ended.
     Exited(ExitReport),
-    /// The PTY could not be read any more.
+    /// Reading or writing the PTY failed.
     ReadFailed(String),
 }
 
 /// A running local shell attached to a PTY.
 pub struct LocalSession {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Option<Sender<InputChunk>>,
+    input_budget: InputBudget,
+    stopped: Arc<AtomicBool>,
     killer: Box<dyn ChildKiller + Send + Sync>,
-    events: Receiver<PtyEvent>,
+    events: Option<Receiver<PtyEvent>>,
     grid: GridSize,
     /// What was added to the shell's own environment, and what could not be.
     environment: ShellEnvironment,
@@ -268,34 +271,67 @@ impl LocalSession {
             .take_writer()
             .map_err(|error| classify(error.as_ref(), program))?;
 
-        let (sender, receiver) = channel();
+        let (sender, receiver) = sync_channel(128);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let writer = spawn_writer(writer, sender.clone(), stopped.clone());
         let progress = Arc::new(ReaderProgress::new());
         spawn_reader(reader, sender.clone(), Arc::clone(&progress));
         spawn_waiter(child, sender, progress);
 
         Ok(Self {
             master: pair.master,
-            writer,
+            writer: Some(writer),
+            input_budget: InputBudget::default(),
+            stopped,
             killer,
-            events: receiver,
+            events: Some(receiver),
             grid,
             environment: ShellEnvironment::default(),
             closed: false,
         })
     }
 
-    /// Sends bytes to the shell, as if typed.
+    /// Queues bytes for the shell writer without blocking the caller.
+    /// A later device write failure is reported as [`PtyEvent::ReadFailed`].
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the PTY is gone, which is the moment the caller
-    /// must stop believing input still reaches the shell.
+    /// Returns `WouldBlock` if the entire write cannot fit in the input budget,
+    /// or `BrokenPipe` when the writer is gone. Success means queued, not delivered.
     pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
+        if self.try_write(bytes)? {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "terminal input buffer is full; input was not sent",
+            ))
         }
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+    }
+
+    /// Queues input on the writer thread. `Ok(false)` refuses the entire write.
+    pub fn try_write(&mut self, bytes: &[u8]) -> std::io::Result<bool> {
+        let closed = || {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the local terminal is closed",
+            )
+        };
+        if self.closed {
+            return Err(closed());
+        }
+        if bytes.is_empty() {
+            return Ok(true);
+        }
+        let Some(chunk) = self.input_budget.reserve(bytes) else {
+            return Ok(false);
+        };
+        self.writer
+            .as_ref()
+            .ok_or_else(closed)?
+            .send(chunk)
+            .map_err(|_| closed())?;
+        Ok(true)
     }
 
     /// Tells the shell the window changed size.
@@ -316,15 +352,21 @@ impl LocalSession {
         Ok(())
     }
 
-    /// Every event that arrived since the last call.
+    /// A bounded batch of pending events; poll again to consume remaining output.
     pub fn drain(&self) -> Vec<PtyEvent> {
         let mut events = Vec::new();
-        loop {
-            match self.events.try_recv() {
-                Ok(event) => events.push(event),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+        let Some(receiver) = &self.events else {
+            return events;
+        };
+        let mut bytes = 0;
+        while events.len() < 64 && bytes < 64 * 1024 {
+            let Ok(event) = receiver.try_recv() else {
+                break;
+            };
+            if let PtyEvent::Data(data) = &event {
+                bytes += data.len();
             }
+            events.push(event);
         }
         events
     }
@@ -338,6 +380,9 @@ impl LocalSession {
             return;
         }
         self.closed = true;
+        self.stopped.store(true, Ordering::Release);
+        self.events.take(); // Wake a reader/waiter blocked on the full queue.
+        self.writer.take();
         let _ = self.killer.kill();
     }
 
@@ -426,6 +471,7 @@ struct ReaderProgress {
     last_read: AtomicU64,
     /// Whether the reader has stopped: the output ended or failed.
     done: AtomicBool,
+    sending: AtomicBool,
 }
 
 impl ReaderProgress {
@@ -434,6 +480,7 @@ impl ReaderProgress {
             started: Instant::now(),
             last_read: AtomicU64::new(0),
             done: AtomicBool::new(false),
+            sending: AtomicBool::new(false),
         }
     }
 
@@ -451,17 +498,40 @@ impl ReaderProgress {
     fn settle(&self) {
         let waited = Instant::now();
         while !self.done.load(Ordering::Acquire)
-            && self.quiet_for() < EXIT_SETTLE_QUIET
-            && waited.elapsed() < EXIT_SETTLE_LIMIT
+            && (self.sending.load(Ordering::Acquire)
+                || (self.quiet_for() < EXIT_SETTLE_QUIET && waited.elapsed() < EXIT_SETTLE_LIMIT))
         {
             thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
+fn spawn_writer(
+    mut writer: Box<dyn Write + Send>,
+    events: SyncSender<PtyEvent>,
+    stopped: Arc<AtomicBool>,
+) -> Sender<InputChunk> {
+    let (sender, receiver) = channel::<InputChunk>();
+    thread::Builder::new()
+        .name("shellune-pty-writer".to_owned())
+        .spawn(move || {
+            while let Ok(chunk) = receiver.recv() {
+                if stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Err(error) = writer.write_all(&chunk.bytes).and_then(|()| writer.flush()) {
+                    let _ = events.send(PtyEvent::ReadFailed(error.to_string()));
+                    break;
+                }
+            }
+        })
+        .expect("the PTY writer thread can be created");
+    sender
+}
+
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
-    sender: Sender<PtyEvent>,
+    sender: SyncSender<PtyEvent>,
     progress: Arc<ReaderProgress>,
 ) {
     thread::Builder::new()
@@ -474,6 +544,7 @@ fn spawn_reader(
                     Ok(read) => {
                         // Marked before it is sent: the waiter then sees fresh output and
                         // keeps waiting, so these bytes cannot fall behind the exit.
+                        progress.sending.store(true, Ordering::Release);
                         progress.mark_read();
                         if sender
                             .send(PtyEvent::Data(buffer[..read].to_vec()))
@@ -481,6 +552,8 @@ fn spawn_reader(
                         {
                             break;
                         }
+                        progress.mark_read();
+                        progress.sending.store(false, Ordering::Release);
                     }
                     Err(error) => {
                         // A closed PTY is how a normal exit ends; only a real
@@ -499,7 +572,7 @@ fn spawn_reader(
 
 fn spawn_waiter(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    sender: Sender<PtyEvent>,
+    sender: SyncSender<PtyEvent>,
     progress: Arc<ReaderProgress>,
 ) {
     thread::Builder::new()
@@ -566,6 +639,95 @@ fn classify(error: &(dyn std::error::Error + 'static), program: &str) -> ShellLa
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn reader_backpressure_preserves_bytes_and_drop_unblocks_it() {
+        let data = vec![b'x'; 2 * 1024 * 1024];
+        let (tx, rx) = sync_channel(128);
+        let progress = Arc::new(ReaderProgress::new());
+        spawn_reader(
+            Box::new(std::io::Cursor::new(data.clone())),
+            tx,
+            progress.clone(),
+        );
+        thread::sleep(Duration::from_millis(30));
+        assert!(!progress.done.load(Ordering::Acquire));
+        let mut received = Vec::new();
+        while let Ok(PtyEvent::Data(bytes)) = rx.recv_timeout(Duration::from_secs(2)) {
+            received.extend(bytes);
+        }
+        assert_eq!(received, data);
+
+        let (tx, rx) = sync_channel(1);
+        let progress = Arc::new(ReaderProgress::new());
+        spawn_reader(Box::new(std::io::Cursor::new(data)), tx, progress.clone());
+        drop(rx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !progress.done.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(progress.done.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn exit_settle_does_not_overtake_a_reader_waiting_for_queue_space() {
+        let progress = Arc::new(ReaderProgress::new());
+        progress.sending.store(true, Ordering::Release);
+        let (tx, rx) = channel();
+        let waiting = progress.clone();
+        let worker = thread::spawn(move || {
+            waiting.settle();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(EXIT_SETTLE_QUIET * 2).is_err());
+        progress.done.store(true, Ordering::Release);
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_blocked_local_write_keeps_its_budget_without_blocking_the_caller() {
+        struct BlockedWriter {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl Write for BlockedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (entered, waiting) = channel();
+        let (release, gate) = channel();
+        let (events, _receiver) = sync_channel(1);
+        let writer = spawn_writer(
+            Box::new(BlockedWriter {
+                entered,
+                release: gate,
+            }),
+            events,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let budget = InputBudget::default();
+        writer
+            .send(
+                budget
+                    .reserve(&vec![0; shellune_core::io_budget::INPUT_LIMIT])
+                    .unwrap(),
+            )
+            .unwrap();
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            budget.reserve(b"more").is_none(),
+            "in-flight input still counts"
+        );
+        release.send(()).unwrap();
+        drop(writer);
+    }
 
     fn shell(program: &str) -> LocalShell {
         LocalShell::new(program, program)

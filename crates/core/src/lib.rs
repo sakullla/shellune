@@ -22,6 +22,7 @@ mod forward;
 mod group;
 mod host;
 mod ids;
+pub mod io_budget;
 mod session;
 mod shell;
 mod snippet;
