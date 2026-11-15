@@ -624,6 +624,9 @@ pub struct Strings {
     pub files_uploaded_selected: &'static str,
     /// Toast: several downloads were queued. The count is filled in.
     pub files_downloaded_selected: &'static str,
+    /// Beside the transfer list: how many folders a batch left out. The count is
+    /// filled in.
+    pub files_batch_folders_skipped: &'static str,
     /// Heading of the transfer list of a session.
     pub transfers_heading: &'static str,
     /// Said of a task the connection has taken but whose first byte has not arrived.
@@ -1421,6 +1424,7 @@ pub static ENGLISH: Strings = Strings {
     files_mode_focus: "Focus on files",
     files_uploaded_selected: "Uploading {count} file(s)",
     files_downloaded_selected: "Downloading {count} file(s)",
+    files_batch_folders_skipped: "{count} folder(s) were not started: a batch copies files one at a time, and a folder is copied only when the recursive copy is chosen for it.",
     transfers_heading: "Transfers",
     transfers_queued_note: "Queued at the connection; no byte has moved yet.",
     transfers_remaining: "{time} left",
@@ -1954,6 +1958,7 @@ pub static CHINESE: Strings = Strings {
     files_mode_focus: "专注文件",
     files_uploaded_selected: "正在上传 {count} 个文件",
     files_downloaded_selected: "正在下载 {count} 个文件",
+    files_batch_folders_skipped: "{count} 个文件夹未启动：批量传输一次复制一个文件，文件夹只有在为它勾选递归复制时才会复制。",
     transfers_heading: "传输",
     transfers_queued_note: "已交给连接排队，还没有开始传字节。",
     transfers_remaining: "剩余 {time}",

@@ -155,7 +155,12 @@ impl ShelluneView {
                                 false,
                                 "files.menu.to_local",
                                 Box::new(move |view, cx| {
-                                    view.files_transfer_named(id, FileSource::Remote, &across, cx);
+                                    let _ = view.files_transfer_named(
+                                        id,
+                                        FileSource::Remote,
+                                        &across,
+                                        cx,
+                                    );
                                 }),
                             )));
                             lines.push(Some((
@@ -174,7 +179,8 @@ impl ShelluneView {
                             false,
                             "files.menu.to_remote",
                             Box::new(move |view, cx| {
-                                view.files_transfer_named(id, FileSource::Local, &across, cx);
+                                let _ =
+                                    view.files_transfer_named(id, FileSource::Local, &across, cx);
                             }),
                         ))),
                     }
@@ -198,10 +204,10 @@ impl ShelluneView {
                 )));
                 lines.push(None);
                 // A row the user marked is part of a batch, and deleting it must cover
-                // what the marks say rather than one row of them (R14).
-                let marked = self.files.marked(id, source);
-                let in_batch = marked.len() > 1 && marked.iter().any(|item| item == &name);
-                if in_batch {
+                // what the marks say rather than one row of them (R14). The Delete key
+                // asks the same question of the same row, so both entry points cover
+                // the same entries.
+                if self.files_row_in_batch(id, source, &name) {
                     lines.push(Some((
                         strings.files_delete_marked,
                         Icon::Trash,

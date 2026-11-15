@@ -620,6 +620,13 @@ pub struct ShelluneView {
     /// take the command has no field to point at, so the reason is kept here and shown
     /// with the transfer list of that session.
     transfer_problem: Option<(SessionId, TransferProblem)>,
+    /// How many folders the last batch left out because a folder is not expanded here.
+    ///
+    /// A batch copies one path per task and never wants a tree behind the user's back,
+    /// so the folders among the marks are counted instead of started. They are said
+    /// beside the list as one line, because a toast that counted them would report
+    /// uploads that do not exist (R14).
+    transfer_skipped_folders: Option<(SessionId, usize)>,
     /// The session whose close is waiting for the user's answer (R10).
     ///
     /// It exists only while a session with active transfers has been asked about:
@@ -2230,6 +2237,7 @@ impl ShelluneView {
             forward_confirm: None,
             forward_carriers: HashMap::new(),
             transfer_problem: None,
+            transfer_skipped_folders: None,
             closing: None,
             closing_app: false,
             app_close_confirmed: false,
@@ -4268,6 +4276,13 @@ impl ShelluneView {
         {
             self.transfer_problem = None;
         }
+        if self
+            .transfer_skipped_folders
+            .as_ref()
+            .is_some_and(|(session, _)| *session == id)
+        {
+            self.transfer_skipped_folders = None;
+        }
         // Both bridges belong to this connection: a display that stayed ready, or a
         // desktop or serial worker that kept running, would describe a session that is
         // over (R17, R18).
@@ -4555,7 +4570,12 @@ impl ShelluneView {
     /// Two ways reach this: the question's confirm button, whose three choices it reads,
     /// and a row button or a drop, which has no question and therefore uses the directory
     /// on screen and the host's own protocol.
-    fn start_upload(&mut self, id: SessionId, local: &str, cx: &mut Context<Self>) {
+    fn start_upload(
+        &mut self,
+        id: SessionId,
+        local: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TransferProblem> {
         let (directory, protocol, recursive) =
             self.transfer_question_for(id).unwrap_or_else(|| {
                 (
@@ -4567,7 +4587,7 @@ impl ShelluneView {
         let started =
             self.transfers
                 .upload_over(id, local, directory.as_deref(), protocol, recursive);
-        self.finish_transfer_question(id, started, cx);
+        self.finish_transfer_question(id, started, cx)
     }
 
     /// Starts the download the question described, or says why it cannot start.
@@ -4577,14 +4597,14 @@ impl ShelluneView {
         remote: &str,
         folder: &str,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), TransferProblem> {
         let (_, protocol, recursive) = self
             .transfer_question_for(id)
             .unwrap_or_else(|| (None, self.session_protocol(id), false));
         let started = self
             .transfers
             .download_over(id, remote, folder, protocol, recursive);
-        self.finish_transfer_question(id, started, cx);
+        self.finish_transfer_question(id, started, cx)
     }
 
     /// The remote directory the file view of this session is showing.
@@ -4639,24 +4659,30 @@ impl ShelluneView {
 
     /// Closes a transfer question and refreshes the window, or keeps it open with the
     /// reason it could not start.
+    ///
+    /// The answer is returned as well as drawn: a batch of marked entries asks for one
+    /// task per entry and has no question to put the reason in, so it counts what really
+    /// started and states the rest once.
     fn finish_transfer_question(
         &mut self,
         id: SessionId,
         started: Result<shellune_core::TransferId, TransferProblem>,
         cx: &mut Context<Self>,
-    ) {
-        match started {
+    ) -> Result<(), TransferProblem> {
+        let outcome = match started {
             Ok(_) => {
                 let source = self.files_dialog.as_ref().map(FilesDialog::source);
                 self.files_dialog = None;
                 self.clear_files_fields();
                 self.transfer_problem = None;
+                self.transfer_skipped_folders = None;
                 // The confirming control left the screen with the question, so the column
                 // it was about takes the keyboard instead of nothing doing so (R4).
                 if let Some(source) = source {
                     self.restore_files_focus(source, cx);
                 }
                 self.watch_files(cx);
+                Ok(())
             }
             Err(problem) => {
                 // A connection that cannot take the command is not a mistake in what was
@@ -4685,10 +4711,12 @@ impl ShelluneView {
                         self.transfer_problem = Some((id, problem));
                     }
                 }
+                Err(problem)
             }
-        }
+        };
         self.sync_transfer_section();
         cx.notify();
+        outcome
     }
 
     /// Cancels one transfer (R10).
@@ -10885,10 +10913,10 @@ impl ShelluneView {
 
     /// The files and the terminal, arranged the way the window has room for (R14).
     ///
-    /// A wide window docks the file view beside the terminal it belongs to. The focused
-    /// mode gives the files the whole area instead, and the narrow window (which never
-    /// has the room) keeps the switch inside the file view. The terminal is the same
-    /// session in every arrangement, so a layout change cannot end it or lose its output.
+    /// Only a window that can dock reaches this: the focused layout is drawn by the
+    /// caller instead, because the files take the whole area there rather than half of
+    /// it. The terminal is the same session in every arrangement, so a layout change
+    /// cannot end it or lose its output.
     fn files_with_terminal(
         &self,
         id: SessionId,
@@ -10897,15 +10925,6 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let files = self.files_view(id, window, cx);
-        if self.files_focused() {
-            return div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .child(files);
-        }
         div()
             .flex()
             .flex_row()
@@ -11005,6 +11024,12 @@ impl ShelluneView {
                 .transfer_problem
                 .as_ref()
                 .is_some_and(|(session, _)| *session == id)
+            // A batch that started nothing still has a reason to state, so the strip
+            // exists for it too; otherwise the line would be drawn nowhere.
+            || self
+                .transfer_skipped_folders
+                .as_ref()
+                .is_some_and(|(session, _)| *session == id)
     }
 
     /// Whether this computer and the server fit side by side.
@@ -11050,15 +11075,25 @@ impl ShelluneView {
         self.files_focused
     }
 
-    /// Whether the terminal stays on screen beside the files.
+    /// Whether this window has room to dock the files beside the terminal at all.
     ///
     /// Only a window with room for both columns of the file view *and* a usable terminal
     /// docks them: below that the files take the terminal's place and the switch inside
     /// the view moves between the two sources. Reading a listing next to the prompt it
     /// came from is the point of a file workspace, so docking is what a large window
     /// gets, and the focus switch gives the whole width to either side.
+    fn files_dock_capable(&self) -> bool {
+        self.viewport_width >= self.metrics().scale(DOCK_MIN_WIDTH)
+    }
+
+    /// Whether the terminal stays on screen beside the files.
+    ///
+    /// A window that cannot dock at all - the whole width of a narrow window is not
+    /// enough for the terminal and the files - keeps the files in the terminal's place,
+    /// so the focused layout is not a second arrangement there: switching to it would
+    /// only relabel the button, which is why the switch is not drawn either.
     fn files_docked(&self) -> bool {
-        !self.files_focused && self.viewport_width >= self.metrics().scale(DOCK_MIN_WIDTH)
+        !self.files_focused && self.files_dock_capable()
     }
 
     /// The width the file view itself has: half the window while docked, all of it
@@ -11158,40 +11193,93 @@ impl ShelluneView {
     ///
     /// Each file becomes its own task, because a transfer is one path at a time; the
     /// tasks are queued in the order the rows are marked, and the strip reports them
-    /// together.
+    /// together. The toast counts the tasks that exist, so a folder the batch left out
+    /// is not announced as an upload that started.
     fn files_upload_marked(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let names = self.files.marked(id, FileSource::Local);
-        if names.is_empty() {
-            return;
+        let started = self.files_transfer_marked(id, FileSource::Local, cx);
+        if started > 0 {
+            let count = copy::fill(
+                self.strings().files_uploaded_selected,
+                &[("count", &started.to_string())],
+            );
+            self.toast(Tone::Accent, count, None, cx);
         }
-        for name in &names {
-            self.files_transfer_named(id, FileSource::Local, name, cx);
-        }
-        self.files.clear_marked(id, FileSource::Local);
-        let count = copy::fill(
-            self.strings().files_uploaded_selected,
-            &[("count", &names.len().to_string())],
-        );
-        self.toast(Tone::Accent, count, None, cx);
         cx.notify();
     }
 
     /// Downloads every marked remote file into the local directory on screen (R14).
     fn files_download_marked(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let names = self.files.marked(id, FileSource::Remote);
-        if names.is_empty() {
-            return;
+        let started = self.files_transfer_marked(id, FileSource::Remote, cx);
+        if started > 0 {
+            let count = copy::fill(
+                self.strings().files_downloaded_selected,
+                &[("count", &started.to_string())],
+            );
+            self.toast(Tone::Accent, count, None, cx);
         }
-        for name in &names {
-            self.files_transfer_named(id, FileSource::Remote, name, cx);
-        }
-        self.files.clear_marked(id, FileSource::Remote);
-        let count = copy::fill(
-            self.strings().files_downloaded_selected,
-            &[("count", &names.len().to_string())],
-        );
-        self.toast(Tone::Accent, count, None, cx);
         cx.notify();
+    }
+
+    /// Starts one task per marked entry of one column and says what really started (R14).
+    ///
+    /// The tasks come in the order the rows were marked, and the marks are cleared once
+    /// the batch is done with them. A folder among the marks is left out and counted:
+    /// a batch copies one path per task and never expands a folder into a tree behind
+    /// the user's back, so a task for it could only be refused by the worker - and the
+    /// strip says that once, for all of them, instead of claiming transfers that were
+    /// never started. A file the connection refuses keeps its own reason beside the list;
+    /// every file of a batch is offered to the same connection, so one reason covers it.
+    ///
+    /// Returns how many tasks exist afterwards.
+    fn files_transfer_marked(
+        &mut self,
+        id: SessionId,
+        source: FileSource,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let names = self.files.marked(id, source);
+        if names.is_empty() {
+            return 0;
+        }
+        self.transfer_problem = None;
+        self.transfer_skipped_folders = None;
+        let mut started = 0;
+        let mut folders = 0;
+        let mut refused = None;
+        for name in &names {
+            if self
+                .files
+                .browser_in(id, source)
+                .and_then(|browser| browser.entry(name))
+                .is_some_and(|entry| entry.is_directory())
+            {
+                folders += 1;
+                continue;
+            }
+            match self.files_transfer_named(id, source, name, cx) {
+                Ok(()) => started += 1,
+                // A folder that reached the transfer after all is still a folder this
+                // batch left out, so it is said the same way.
+                Err(
+                    TransferProblem::DirectoryNeedsRecursion | TransferProblem::DirectoryNeedsScp,
+                ) => folders += 1,
+                Err(problem) => refused = refused.or(Some(problem)),
+            }
+        }
+        self.transfer_problem = refused.map(|problem| (id, problem));
+        self.transfer_skipped_folders = (folders > 0).then_some((id, folders));
+        self.files.clear_marked(id, source);
+        started
+    }
+
+    /// Whether one entry is part of a batch, so a deletion covers the marks (R14).
+    ///
+    /// The menu on a marked row and the Delete key both ask this one question, because a
+    /// batch that the pointer deletes whole and the keyboard deletes one row of would be
+    /// two different answers to the same state.
+    fn files_row_in_batch(&self, id: SessionId, source: FileSource, name: &str) -> bool {
+        let marked = self.files.marked(id, source);
+        marked.len() > 1 && marked.iter().any(|item| item == name)
     }
 
     /// Asks about deleting every marked entry of one column (R14).
@@ -11554,14 +11642,14 @@ impl ShelluneView {
         directory: &str,
         name: &str,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), TransferProblem> {
         let Some(folder) = local_protocol_to_os(directory) else {
             self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
             cx.notify();
-            return;
+            return Err(TransferProblem::DirectoryUnknown);
         };
         let path = folder.join(name);
-        self.start_upload(id, &path.to_string_lossy(), cx);
+        self.start_upload(id, &path.to_string_lossy(), cx)
     }
 
     /// Downloads one remote file into the local directory on screen.
@@ -11573,14 +11661,14 @@ impl ShelluneView {
         directory: &str,
         name: &str,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), TransferProblem> {
         let remote = join_path(directory, name);
         let Some(folder) = self.files.local_os_directory(id) else {
             self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
             cx.notify();
-            return;
+            return Err(TransferProblem::DirectoryUnknown);
         };
-        self.start_download(id, &remote, &folder.to_string_lossy(), cx);
+        self.start_download(id, &remote, &folder.to_string_lossy(), cx)
     }
 
     /// Closes the question without sending anything at all (R11).
@@ -11613,7 +11701,8 @@ impl ShelluneView {
         // creates a task that the list below then reports on.
         match &dialog {
             FilesDialog::Upload { session, text, .. } => {
-                self.start_upload(*session, text, cx);
+                // The question keeps the reason itself when the transfer is refused.
+                let _ = self.start_upload(*session, text, cx);
                 return;
             }
             FilesDialog::Download {
@@ -11622,7 +11711,7 @@ impl ShelluneView {
                 text,
                 ..
             } => {
-                self.start_download(*session, remote, text, cx);
+                let _ = self.start_download(*session, remote, text, cx);
                 return;
             }
             FilesDialog::NewDirectory { .. }
@@ -11840,9 +11929,11 @@ impl ShelluneView {
         onto: FileSource,
         drag: &FileDrag,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), TransferProblem> {
         if drag.session != id || drag.source == onto {
-            return;
+            // A drop that belongs to another session, or that would copy a column onto
+            // itself, is not a request this column takes: no task exists afterwards.
+            return Err(TransferProblem::CommandRefused);
         }
         match onto {
             FileSource::Remote => self.transfer_to_remote(id, &drag.directory, &drag.name, cx),
@@ -11860,7 +11951,7 @@ impl ShelluneView {
         source: FileSource,
         name: &str,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), TransferProblem> {
         let Some(directory) = self
             .files
             .browser_in(id, source)
@@ -11869,7 +11960,7 @@ impl ShelluneView {
         else {
             self.transfer_problem = Some((id, TransferProblem::DirectoryUnknown));
             cx.notify();
-            return;
+            return Err(TransferProblem::DirectoryUnknown);
         };
         self.files_accept_drop(
             id,
@@ -11884,7 +11975,7 @@ impl ShelluneView {
                 directory,
             },
             cx,
-        );
+        )
     }
 
     /// A key pressed while one file column has the keyboard.
@@ -12007,7 +12098,14 @@ impl ShelluneView {
                         .map(|entry| entry.kind())
                 });
                 if let (Some(name), Some(kind)) = (name, kind) {
-                    self.files_ask_delete(id, source, &name, kind, cx);
+                    // A row that is part of a batch is deleted as the batch it is: the
+                    // menu on that same row says "Delete the selection", so the key
+                    // cannot quietly remove less than the mark set the user built (R14).
+                    if self.files_row_in_batch(id, source, &name) {
+                        self.files_ask_delete_marked(id, source, cx);
+                    } else {
+                        self.files_ask_delete(id, source, &name, kind, cx);
+                    }
                 }
                 true
             }
@@ -13249,7 +13347,8 @@ impl ShelluneView {
                 style.bg(theme::swatch(palette::ACCENT_TINT))
             })
             .on_drop(cx.listener(move |view, drag: &FileDrag, _window, cx| {
-                view.files_accept_drop(id, source, drag, cx);
+                // The reason a refused drop could not start is already beside the list.
+                let _ = view.files_accept_drop(id, source, drag, cx);
             }))
             // Files from the system's file manager upload to the folder the server
             // side shows.
@@ -13365,6 +13464,27 @@ impl ShelluneView {
                     .text_color(Tone::Danger.text())
                     .debug_selector(|| "transfers.refused".to_owned())
                     .child(SharedString::from(transfer_problem_text(problem, strings))),
+            );
+        }
+        // What a batch left out is said once, in the words of how many: a folder is a
+        // tree this window does not expand on its own, so the line states the folders
+        // that were not started rather than leaving the user to count missing tasks.
+        if let Some((session, folders)) = &self.transfer_skipped_folders
+            && *session == id
+        {
+            card = card.child(
+                div()
+                    .flex_none()
+                    .p(metrics.scale(spacing::HAIRLINE))
+                    .rounded(px(radius::SMALL))
+                    .bg(theme::swatch(palette::SURFACE))
+                    .text_size(metrics.caption_size())
+                    .text_color(Tone::Warning.text())
+                    .debug_selector(|| "transfers.skipped".to_owned())
+                    .child(SharedString::from(copy::fill(
+                        strings.files_batch_folders_skipped,
+                        &[("count", &folders.to_string())],
+                    ))),
             );
         }
 
@@ -14733,7 +14853,12 @@ impl ShelluneView {
                         false,
                         cx,
                         move |view, cx| {
-                            view.files_transfer_named(id, FileSource::Remote, &transfer_name, cx)
+                            let _ = view.files_transfer_named(
+                                id,
+                                FileSource::Remote,
+                                &transfer_name,
+                                cx,
+                            );
                         },
                     ));
             } else {
@@ -14744,7 +14869,8 @@ impl ShelluneView {
                     false,
                     cx,
                     move |view, cx| {
-                        view.files_transfer_named(id, FileSource::Local, &transfer_name, cx)
+                        let _ =
+                            view.files_transfer_named(id, FileSource::Local, &transfer_name, cx);
                     },
                 ));
             }
@@ -15001,6 +15127,23 @@ impl ShelluneView {
         self.files_docked()
     }
 
+    /// What the transfer strip says about the folders a batch left out, for a test.
+    ///
+    /// The line is the one the strip draws: a batch that starts nothing still has a
+    /// reason to state, so a test can read it before any task exists.
+    #[cfg(test)]
+    pub fn transfer_skipped_folders_for_test(&self, id: SessionId) -> Option<String> {
+        self.transfer_skipped_folders
+            .as_ref()
+            .filter(|(session, _)| *session == id)
+            .map(|(_, count)| {
+                copy::fill(
+                    self.strings().files_batch_folders_skipped,
+                    &[("count", &count.to_string())],
+                )
+            })
+    }
+
     /// The entries the open delete question is about, for a test (R14).
     #[cfg(test)]
     pub fn files_delete_question_for_test(&self) -> Option<Vec<String>> {
@@ -15246,7 +15389,7 @@ impl ShelluneView {
         name: &str,
         cx: &mut Context<Self>,
     ) {
-        self.files_accept_drop(
+        let _ = self.files_accept_drop(
             id,
             onto,
             &FileDrag {

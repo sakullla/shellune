@@ -1634,6 +1634,7 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             files_show_remote,
             files_to_remote,
             files_to_local,
+            files_batch_folders_skipped,
             files_delete_recursive_local,
             files_delete_file_local,
             files_change_pending_local,
@@ -25354,6 +25355,258 @@ async fn a_wide_window_docks_the_files_beside_the_terminal_and_keeps_both(cx: &m
         "the terminal is the same session in every arrangement"
     );
 }
+#[gpui::test]
+async fn the_focus_switch_is_only_offered_where_the_window_can_dock(cx: &mut TestAppContext) {
+    // R14 asks for a switch between the docked and the focused layout. A window narrower
+    // than DOCK_MIN_WIDTH has no docked layout to leave, so the switch used to be drawn
+    // anyway and did nothing but relabel itself: the files already had the terminal's
+    // place. It is offered only where the press changes the arrangement.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &files);
+    files.reply(
+        1,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+
+    // The default 1120-pixel window: the files take the terminal's place, and the bar
+    // does not offer a second arrangement that would render identically.
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_docked_for_test()),
+        "a window this narrow does not dock the files"
+    );
+    assert!(
+        cx.debug_bounds("files.layout.dual").is_some(),
+        "the two columns share the whole width instead"
+    );
+    assert!(
+        cx.debug_bounds("files.mode.focus").is_none(),
+        "no layout switch is drawn where both modes render the same"
+    );
+    assert!(
+        cx.debug_bounds("files.mode.dock").is_none(),
+        "and the other label of that switch is not drawn either"
+    );
+
+    // A window that really can dock gets the switch, and the press changes the layout.
+    cx.simulate_resize(size(px(1680.0), px(940.0)));
+    cx.run_until_parked();
+    let switch = bounds_of(cx, "files.mode.focus");
+    assert!(
+        switch.size.width > px(0.0),
+        "a dockable window offers the focus switch: {switch:?}"
+    );
+    let docked_width = bounds_of(cx, "files.panel").size.width;
+    click(cx, "files.mode.focus");
+    assert!(!cx.update(|_window, app| view.read(app).files_docked_for_test()));
+    let focused_width = bounds_of(cx, "files.panel").size.width;
+    assert!(
+        focused_width > docked_width,
+        "the focused mode gives the files the terminal's half: {focused_width:?} against {docked_width:?}"
+    );
+    click(cx, "files.mode.dock");
+    assert!(cx.update(|_window, app| view.read(app).files_docked_for_test()));
+    assert!(
+        bounds_of(cx, "files.panel").size.width < focused_width,
+        "the terminal comes back on the same press"
+    );
+}
+
+#[gpui::test]
+async fn the_delete_key_covers_the_batch_the_menu_deletes(cx: &mut TestAppContext) {
+    // R14: one marked state has one answer. The menu on a marked row says "Delete the
+    // selection" and deletes the marks; the Delete key used to delete only the row under
+    // the cursor, so the two entry points disagreed about the same selection.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let files = FileAnswers::accepting();
+    open_files_for(cx, &view, id, &files);
+    files.reply(
+        1,
+        "/home/deploy",
+        &[
+            ("docs", shellune_core::FileKind::Directory),
+            ("notes.txt", shellune_core::FileKind::File),
+        ],
+    );
+    pump_files(cx, &view);
+    assert_eq!(
+        files_stop(cx, &view),
+        Some((FileSource::Remote, FilesStop::Body)),
+        "the listing holds the keys"
+    );
+    press_key(cx, "down");
+    press_key(cx, "space");
+    press_key(cx, "space");
+    assert_eq!(
+        column_marked(cx, &view, id, FileSource::Remote),
+        names(&["docs", "notes.txt"]),
+        "two rows are marked"
+    );
+
+    let handled = cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.files_key_for_test(id, FileSource::Remote, "delete", false, window, cx)
+        })
+    });
+    assert!(handled, "Delete belongs to the column");
+    let by_key = cx.update(|_window, app| view.read(app).files_delete_question_for_test());
+    assert_eq!(
+        by_key,
+        Some(names(&["docs", "notes.txt"])),
+        "the key asks about every marked entry, not only the row it sits on"
+    );
+    press_key(cx, "escape");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_question_open()),
+        "the question closes again"
+    );
+
+    // The menu on one of those marked rows covers exactly the same entries.
+    right_click(cx, "files.entry.1");
+    click(cx, "files.menu.delete");
+    let by_menu = cx.update(|_window, app| view.read(app).files_delete_question_for_test());
+    assert_eq!(
+        by_menu, by_key,
+        "the menu and the key delete the same entries for one selection"
+    );
+}
+
+#[gpui::test]
+async fn a_batch_counts_the_tasks_it_started_and_says_what_it_left_out(cx: &mut TestAppContext) {
+    // R14: a batch reports what really happened. A folder among the marks is not a task -
+    // a batch copies one path per task and never expands a folder into a tree behind the
+    // user's back - so the count leaves it out and the strip says how many were skipped,
+    // instead of announcing an upload that never started.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (remote, local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[
+            ("logs", shellune_core::FileKind::Directory),
+            ("a.txt", shellune_core::FileKind::File),
+            ("b.txt", shellune_core::FileKind::File),
+        ],
+    );
+    let transfers = TransferAnswers::accepting();
+    let channel = transfers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_transfers_for_test(id, Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    let _ = local;
+
+    // The whole local listing is marked: one folder and two files.
+    click(cx, "files.local.mark.0");
+    click(cx, "files.local.mark.1");
+    click(cx, "files.local.mark.2");
+    assert_eq!(
+        column_marked(cx, &view, id, FileSource::Local).len(),
+        3,
+        "three entries are marked"
+    );
+    click(cx, "files.local.mark.upload");
+    let starts = transfers.starts();
+    assert_eq!(
+        starts.len(),
+        2,
+        "one task per marked file and none for the folder: {starts:?}"
+    );
+    let strings = Locale::default().strings();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).toast_titles()),
+        vec![copy::fill(
+            strings.files_uploaded_selected,
+            &[("count", "2")]
+        )],
+        "the toast counts the tasks that exist, not the marks that were made"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_skipped_folders_for_test(id)),
+        Some(copy::fill(
+            strings.files_batch_folders_skipped,
+            &[("count", "1")]
+        )),
+        "the folder that was left out is stated once, with its own reason"
+    );
+    assert!(
+        cx.debug_bounds("transfers.skipped").is_some(),
+        "the line is on screen beside the transfer list"
+    );
+    let _ = (remote, local);
+}
+
+#[gpui::test]
+async fn a_download_batch_states_the_folder_it_left_out(cx: &mut TestAppContext) {
+    // The same rule on the other side: a marked remote folder is not a task either, so
+    // the count is the files that started and the line names the folder that did not.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let (remote, _local) = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[("a.txt", shellune_core::FileKind::File)],
+    );
+    let transfers = TransferAnswers::accepting();
+    let channel = transfers.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.attach_transfers_for_test(id, Box::new(channel), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        column_rows(cx, &view, id, FileSource::Remote),
+        names(&["docs", "notes.txt"]),
+        "the server's listing holds one folder and one file"
+    );
+    click(cx, "files.mark.0");
+    click(cx, "files.mark.1");
+    assert_eq!(
+        column_marked(cx, &view, id, FileSource::Remote),
+        names(&["docs", "notes.txt"]),
+        "both are marked, though only one of them can become a task"
+    );
+    click(cx, "files.mark.download");
+    let starts = transfers.starts();
+    assert_eq!(starts.len(), 1, "only the file became a task: {starts:?}");
+    let strings = Locale::default().strings();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).toast_titles()),
+        vec![copy::fill(
+            strings.files_downloaded_selected,
+            &[("count", "1")]
+        )],
+        "the download count is one task, not two marks"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_skipped_folders_for_test(id)),
+        Some(copy::fill(
+            strings.files_batch_folders_skipped,
+            &[("count", "1")]
+        )),
+        "the remote folder is stated the same way"
+    );
+    assert!(
+        cx.debug_bounds("transfers.skipped").is_some(),
+        "the line is on screen beside the transfer list"
+    );
+    let _ = remote;
+}
+
 #[gpui::test]
 async fn a_local_shell_cannot_drive_a_file_view(cx: &mut TestAppContext) {
     let Some((view, cx)) = two_shells(cx) else {
