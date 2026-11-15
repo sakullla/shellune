@@ -1,0 +1,35 @@
+[package]
+name = "shellune-serial"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Serial port backend for Shellune: enumerate, configure and run a bidirectional byte session."
+publish = false
+
+[features]
+# The in-memory port double the tests drive instead of a real device or a
+# com0com pair. Behind a feature so a release build carries none of it; the
+# application path always opens a real handle through the system API.
+test-support = []
+
+[target.'cfg(windows)'.dependencies]
+# The Windows backend is the system's own serial API: CreateFileW on the device,
+# the DCB for the line settings, overlapped reads and writes with a completion
+# event each, and CancelIoEx to stop them. The port list is the device map the
+# system maintains under HARDWARE\DEVICEMAP\SERIALCOMM.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Devices_Communication",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# The Unix backend is raw termios on the opened device, non-blocking reads and
+# writes, and a self-pipe polled beside the port so a close can wake a blocked
+# read without a signal.
+libc = "0.2.191"

@@ -6057,6 +6057,7 @@ dependencies = [
  "serde_json",
  "shellune-core",
  "shellune-desktop",
+ "shellune-serial",
  "shellune-ssh",
  "shellune-storage",
  "shellune-terminal",
@@ -6079,6 +6080,14 @@ name = "shellune-desktop"
 version = "0.4.4"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "shellune-serial"
+version = "0.4.4"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
