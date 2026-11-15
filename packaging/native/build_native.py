@@ -84,6 +84,9 @@ FREERDP = {
         "winpr/include/winpr/winpr.h",
     ],
 }
+FREERDP_MAC_PATCH = REPO_ROOT / "packaging/native/patches/freerdp-salted-mac-negotiation.patch"
+FREERDP_CONNECTION_ORIGINAL = "9d197d202d558b782cf600981c3fb940296b43bf437d6ebba1970b063e5f2713"
+FREERDP_CONNECTION_PATCHED = "ca4d99bb0482b6a2cf6f690086b3e3f0124949ab3607d9acc822ad24f37ed219"
 LIBVNC = {
     "name": "libvncserver",
     "version": "0.9.15",
@@ -506,7 +509,8 @@ def build_openssl(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
 def build_freerdp(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
                   source: pathlib.Path, force: bool) -> pathlib.Path | None:
     build = work / "build" / "freerdp"
-    pin = step_pin("freerdp", FREERDP, FREERDP_OPTIONS)
+    apply_freerdp_mac_patch(source)
+    pin = step_pin("freerdp", FREERDP, [*FREERDP_OPTIONS, freerdp_patch_pin()])
     if already_built(dist, FREERDP_LIBRARIES, force, "freerdp", pin):
         log("freerdp already installed")
         return build
@@ -522,6 +526,29 @@ def build_freerdp(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
     ])
     record_built(dist, "freerdp", pin)
     return build
+
+
+def freerdp_patch_pin() -> str:
+    return "salted-mac-patch=" + sha256_of(FREERDP_MAC_PATCH)
+
+
+def apply_freerdp_mac_patch(source: pathlib.Path) -> None:
+    """Only patch the pinned source, and accept repeat builds of that exact result."""
+    target = source / "libfreerdp/core/connection.c"
+
+    def digest() -> str:
+        # Normalize checkout line endings, without accepting other source edits.
+        return hashlib.sha256(target.read_text(encoding="utf-8").encode()).hexdigest()
+
+    current = digest()
+    if current == FREERDP_CONNECTION_PATCHED:
+        return
+    if current != FREERDP_CONNECTION_ORIGINAL:
+        raise SystemExit("FreeRDP MAC patch: unexpected connection.c; refusing to patch")
+    run(["git", "apply", "--unsafe-paths", "--directory=" + source.resolve().as_posix(),
+         str(FREERDP_MAC_PATCH)], cwd=REPO_ROOT)
+    if digest() != FREERDP_CONNECTION_PATCHED:
+        raise SystemExit("FreeRDP MAC patch: patched source checksum mismatch")
 
 
 def build_libvnc(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
@@ -565,6 +592,7 @@ def write_manifest(dist: pathlib.Path, include_dirs: list[pathlib.Path],
         "# freerdp=" + FREERDP["version"] + " " + FREERDP["commit"]
         + " (" + FREERDP["license"] + ")",
         "# freerdp tarball sha256=" + FREERDP["sha256"],
+        "# freerdp " + freerdp_patch_pin(),
         "# libvncserver=" + LIBVNC["version"] + " " + LIBVNC["commit"]
         + " (" + LIBVNC["license"] + ")",
         "# libvncserver tarball sha256=" + LIBVNC["sha256"],

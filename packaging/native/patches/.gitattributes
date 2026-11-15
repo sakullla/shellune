@@ -1,0 +1,2 @@
+# Unified diff context includes a space before original tabs and empty lines.
+*.patch text eol=lf -whitespace

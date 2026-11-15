@@ -45,10 +45,27 @@ VNC 握手每次读取等待从 2 秒调为 30 秒，TCP 连接预算为 30 秒�
 
 最终静态库的 TigerVNC 密码认证实测通过：0.407 秒收到首帧，取消耗时 1ms。桌面后端 5 个单元测试、15 个原生协议测试全部通过；桌面/串口 Clippy 检查通过。原生构建脚本的版本标记与失败立即退出检查通过。
 
+## 追加修复：xrdp 旧式 RDP 安全层 MAC
+
+已解决此前保留的 MAC 校验失败。在同一台测试机的 xrdp `0.10.1-3.1+deb13u2` 上，使用独立 `security_layer=rdp`、`crypt_level=high` 监听器复现：修复前约 1.11 秒断开，服务端记录 `MAC checksum error for non-FIPS PDU`。
+
+根因是 FreeRDP 3.33.1 在密钥交换完成时直接使用本地默认的 `SaltedChecksum=TRUE`，在收到服务端 General Capability Set 前就发送加盐 MAC 的 Client Info；xrdp 该版本只支持普通 MAC。能力交换之后，FreeRDP 原先也没有在客户端路径同步实际发送标志。[协议规定加盐 MAC 由能力交换决定](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/f390586a-3fdd-4a96-bbe0-a31575e92056)，[xrdp 上游也有相同错误的报告](https://github.com/neutrinolabs/xrdp/issues/3808)。
+
+修复以固定版本的原生依赖补丁交付：初始 Client Info 使用普通 MAC，在 Demand Active 之后、Confirm Active 之前按协商结果设置加盐标志；重连及重新激活时同步清除旧值。保留加密、MAC 校验以及支持方的加盐 MAC，不修改服务端校验逻辑或 TLS/NLA、证书策略。构建器校验补丁前后完整源文件哈希，补丁哈希进入构建标记及 manifest，触发静态库重建和 Rust 重新链接。
+
+| 本轮实测 | 首个非空帧 | 取消后 worker 退出 | 输入确认 |
+| --- | ---: | ---: | --- |
+| 旧式 RDP，无附加延迟 | 0.597 秒 | 2ms | 远端原始终端记录到 `0x61` |
+| 旧式 RDP，附加约 10 秒 RTT | 110.791 秒 | 34ms | 远端记录到 `0x61`，保持连接额外 20 秒 |
+| RDP / TLS，无附加延迟 | 1.182 秒 | 4ms | 远端记录到 `0x61` |
+
+TLS 拒绝证书仍返回 `CertificateRejected`，没有连接或画面事件。新增 C 回归直接链接实际静态库，检查加密 Client Info 的普通 MAC 标志及 Confirm Active 在普通/加盐模式间切换，覆盖旧连接状态和重新激活；该测试在未修补库上失败。测试通过传输回调截获 PDU，不等同于真实 Windows 加盐 MAC 服务端互操作验证。补丁首次应用、重复应用、意外源码修改拒绝也已验证；桌面后端 5 个单元测试及 15 个原生协议测试再次通过。
+
 ## 复现入口
 
 ```powershell
 python packaging/native/build_native.py --perl C:/path/to/perl.exe
+python packaging/native/test_rdp_mac.py
 cargo test -p shellune-desktop
 cargo test -p shellune-serial --features test-support
 cargo test --bin shellune
@@ -62,4 +79,6 @@ cargo run -p shellune-desktop --example probe -- rdp 127.0.0.1 13389 180
 python3 scripts/protocol-latency-proxy.py --listen 15993 --upstream 15991 --delay 3
 ```
 
-剩余边界：未验证实体串口的流控、拔插、DTR/RTS，未验证 Windows Server/NLA 和所有 VNC 安全类型、编码组合，也未做长期 RSS 或完整 UI 帧率基准。RDP 通过项使用 TLS；xrdp 的旧式 RDP 安全层仍出现服务端 MAC 校验错误，尚未解决，不列为通过。超高延迟下仍受协议握手往返次数影响，不能把这些首帧结果解释为交互流畅。RDP 剪贴板仍不受支持，会明确报告。
+`probe` 末尾可追加输入后的停留秒数，例如 `rdp 127.0.0.1 13389 180 20`。停留期间断开会判为失败；按键是否到达由远端独立记录确认。
+
+剩余边界：未验证实体串口的流控、拔插、DTR/RTS，未验证 Windows Server/NLA 和所有 VNC 安全类型、编码组合，也未做长期 RSS 或完整 UI 帧率基准。xrdp 旧式 RDP 和 TLS 均已通过本轮实测。超高延迟下仍受协议握手往返次数影响，不能把这些首帧结果解释为交互流畅。RDP 剪贴板仍不受支持，会明确报告。

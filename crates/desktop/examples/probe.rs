@@ -7,7 +7,7 @@ fn main() {
     let protocol = match args.get(1).map(String::as_str) {
         Some("rdp") => Protocol::Rdp,
         Some("vnc") => Protocol::Vnc,
-        _ => panic!("usage: probe rdp|vnc host port [timeout-seconds]"),
+        _ => panic!("usage: probe rdp|vnc host port [timeout-seconds] [input-settle-seconds]"),
     };
     let mut client = DesktopClient::new(protocol).expect("backend");
     client
@@ -25,6 +25,9 @@ fn main() {
     let mut frames = 0;
     let reject_certificate = std::env::var_os("SHELLUNE_PROBE_REJECT_CERTIFICATE").is_some();
     let mut asked_certificate = false;
+    let settle = Duration::from_secs(args.get(5).map_or(0, |s| s.parse().expect("settle")));
+    let mut input_sent = None;
+    let mut ended = false;
     while start.elapsed() < timeout {
         match client.recv_timeout(Duration::from_millis(100)) {
             Ok(Event::State {
@@ -39,6 +42,7 @@ fn main() {
                 );
                 connected |= state == State::Connected;
                 if matches!(state, State::Failed(_) | State::Closed) {
+                    ended = true;
                     break;
                 }
             }
@@ -66,10 +70,13 @@ fn main() {
             }
             _ => {}
         }
-        if connected && frames > 0 {
+        if connected && frames > 0 && input_sent.is_none() {
             client.key(0x1e, 0x61, true, false).expect("key down");
             client.key(0x1e, 0x61, false, false).expect("key up");
             client.pointer(30, 30, PointerButtons(0)).expect("pointer");
+            input_sent = Some(Instant::now());
+        }
+        if input_sent.is_some_and(|sent| sent.elapsed() >= settle) {
             break;
         }
     }
@@ -89,7 +96,10 @@ fn main() {
         );
     } else {
         assert!(
-            connected && frames > 0,
+            connected
+                && frames > 0
+                && !ended
+                && input_sent.is_some_and(|sent| sent.elapsed() >= settle),
             "endpoint must connect and deliver pixels"
         );
     }

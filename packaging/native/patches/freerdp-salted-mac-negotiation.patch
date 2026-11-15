@@ -1,0 +1,26 @@
+--- a/libfreerdp/core/connection.c
++++ b/libfreerdp/core/connection.c
+@@ -911,8 +911,10 @@
+ 
+ 	rdp->do_crypt = TRUE;
+ 
+-	if (settings->SaltedChecksum)
+-		rdp->do_secure_checksum = TRUE;
++	/* Salted MAC requires the server General Capability Set (MS-RDPBCGR
++	 * 5.3.6.1.1). Client Info is sent before that exchange. Reset this on
++	 * every connection, including reconnects. */
++	rdp->do_secure_checksum = FALSE;
+ 
+ 	if (settings->EncryptionMethods == ENCRYPTION_METHOD_FIPS)
+ 	{
+@@ -2349,6 +2351,10 @@
+ 	const UINT32 width = rdp->settings->DesktopWidth;
+ 	const UINT32 height = rdp->settings->DesktopHeight;
+ 
++	/* Demand Active has populated the negotiated general capabilities.
++	 * Assign both TRUE and FALSE so reactivation can change the mode. */
++	rdp->do_secure_checksum = rdp->settings->SaltedChecksum;
++
+ 	if (!rdp_send_confirm_active(rdp))
+ 		return STATE_RUN_FAILED;
+ 
