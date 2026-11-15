@@ -3080,6 +3080,18 @@ pub struct UxStrings {
     pub batch_run_save_failed: &'static str,
     /// A retry confirmation: what it will and will not do
     pub batch_retry_confirm: &'static str,
+    /// Tooltip for clearing a text field
+    pub field_clear: &'static str,
+    /// Floating pill in a scrolled-back terminal
+    pub terminal_jump_bottom: &'static str,
+    /// Context-menu action to return to the live terminal prompt
+    pub terminal_jump_bottom_short: &'static str,
+    /// Context-menu action to select the entire terminal buffer
+    pub terminal_select_all: &'static str,
+    /// Tooltip on the font-size badge to reset to the default size
+    pub terminal_font_reset: &'static str,
+    /// Context-menu action to copy a host or connection address
+    pub host_copy_target: &'static str,
 }
 
 impl UxStrings {
@@ -3457,6 +3469,12 @@ impl UxStrings {
             self.batch_host_cancelled,
             self.batch_host_skipped,
             self.batch_host_interrupted,
+            self.field_clear,
+            self.terminal_jump_bottom,
+            self.terminal_jump_bottom_short,
+            self.terminal_select_all,
+            self.terminal_font_reset,
+            self.host_copy_target,
         ]
     }
 }
@@ -3849,6 +3867,12 @@ included",
     batch_host_cancelled: "cancelled",
     batch_host_skipped: "skipped",
     batch_host_interrupted: "interrupted",
+    field_clear: "Clear",
+    terminal_jump_bottom: "Jump to bottom ({lines})",
+    terminal_jump_bottom_short: "Jump to bottom",
+    terminal_select_all: "Select all",
+    terminal_font_reset: "Reset font size ({size}px)",
+    host_copy_target: "Copy address",
 };
 
 /// Simplified Chinese.
@@ -4236,6 +4260,12 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     batch_host_cancelled: "已取消",
     batch_host_skipped: "已跳过",
     batch_host_interrupted: "已中断",
+    field_clear: "清空",
+    terminal_jump_bottom: "回到底部（{lines} 行）",
+    terminal_jump_bottom_short: "回到底部",
+    terminal_select_all: "全选",
+    terminal_font_reset: "恢复默认字号（{size}px）",
+    host_copy_target: "复制地址",
 };
 
 /// The redesigned-shell strings of the current language.

@@ -24283,6 +24283,7 @@ fn a_clean_exit_is_called_the_same_thing_on_the_tab_and_in_the_notice() {
 
 #[gpui::test]
 async fn a_desktop_that_cannot_be_reached_reports_what_the_backend_said(cx: &mut TestAppContext) {
+    let backend_built = shellune_desktop::backend_info(shellune_desktop::Protocol::Vnc).is_ok();
     // A port nothing is listening on: the pane really creates a handle in the
     // native backend, really dials, and reports the failure it is given. The
     // endpoint matrix in tests/rdp_vnc.rs is what proves a real server; this proves
@@ -24336,19 +24337,33 @@ async fn a_desktop_that_cannot_be_reached_reports_what_the_backend_said(cx: &mut
                 .unwrap_or_default(),
         )
     });
-    match state {
-        Some(SessionState::Failed(SessionFailure::ConnectionFailed { reason })) => {
+    match (backend_built, state) {
+        (true, Some(SessionState::Failed(SessionFailure::ConnectionFailed { reason }))) => {
             assert!(
                 reason.contains("127.0.0.1") || reason.contains("connect"),
                 "the reason names what the transport said: {reason}"
             );
         }
-        other => panic!("an unreachable endpoint is a start failure, not {other:?}"),
+        (
+            false,
+            Some(SessionState::Failed(
+                SessionFailure::ReconnectUnavailable { reason }
+                | SessionFailure::ConnectionFailed { reason },
+            )),
+        ) => {
+            assert!(
+                !reason.trim().is_empty(),
+                "even without a compiled native backend, synchronous failure updates the session state: {reason}"
+            );
+        }
+        (_, other) => panic!("an unreachable endpoint is a start failure, not {other:?}"),
     }
-    assert!(
-        reason.is_some(),
-        "the backend's own sentence is kept beside the session's state"
-    );
+    if backend_built {
+        assert!(
+            reason.is_some(),
+            "the backend's own sentence is kept beside the session's state"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -26597,9 +26612,14 @@ async fn marking_rows_with_the_pointer_uploads_every_marked_file(cx: &mut TestAp
     click(cx, "files.local.mark.upload");
     let starts = transfers.starts();
     assert_eq!(starts.len(), 2, "one task per marked file: {starts:?}");
+    let expected_first = if cfg!(windows) {
+        "C:\\work\\a.txt"
+    } else {
+        "/C:/work/a.txt"
+    };
     assert_eq!(
         starts[0].source.as_str(),
-        "C:\\work\\a.txt",
+        expected_first,
         "the first task is the first marked row"
     );
     assert_eq!(
@@ -27031,5 +27051,360 @@ async fn a_local_shell_cannot_drive_a_file_view(cx: &mut TestAppContext) {
     assert!(
         !screen.contains("file://"),
         "the report is not drawn either: {screen:?}"
+    );
+}
+
+#[gpui::test]
+async fn search_fields_show_clear_button_when_non_empty_and_clear_in_one_click(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("search-clear-button");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
+            stored_host("beta", "10.0.0.2", 22, "deploy", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    let alpha_id = cx.update(|_window, app| view.read(app).book().hosts()[0].id());
+
+    assert!(
+        cx.debug_bounds("field.clear").is_none(),
+        "an empty search field draws no clear button"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.search_hosts("beta", cx));
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "beta",
+        "programmatic search mirrors into the host filter"
+    );
+    let clear_bounds = bounds_of(cx, "field.clear");
+    assert!(
+        clear_bounds.size.width >= px(24.0) && clear_bounds.size.height >= px(24.0),
+        "the clear button meets the 24px minimum hit target: {clear_bounds:?}"
+    );
+
+    click(cx, "field.clear");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "",
+        "clicking clear empties the search phrase"
+    );
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        Some(alpha_id),
+        "clearing the search restores alpha as the first row"
+    );
+}
+
+#[gpui::test]
+async fn quick_connect_splits_user_host_port_on_tab_and_submits_on_enter(cx: &mut TestAppContext) {
+    let dir = TempDir::new("quick-split-submit");
+    seed(&dir.store(), Vec::new());
+    let store = HostStore::at(dir.path());
+    let trust = TrustStore::at(dir.path());
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, Workspace::new(), store, trust)
+    });
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "welcome.quick");
+    assert!(cx.debug_bounds("quick.panel").is_some());
+    type_into(cx, "quick.address", "deploy@127.0.0.1:2222");
+    // First Tab splits deploy@127.0.0.1:2222 into address/port/user and lands on port;
+    // two more Tabs advance port -> user -> password.
+    cx.simulate_keystrokes("tab tab tab");
+    cx.run_until_parked();
+    cx.simulate_input("s3cret");
+    cx.run_until_parked();
+
+    let prepared =
+        cx.update(|_window, app| view.update(app, |view, cx| view.prepare_quick_connection(cx)));
+    assert!(
+        prepared,
+        "split user@host:port produced a valid quick connection"
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| view.update(app, |view, cx| view.pump_remote_once(cx)));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "session.save_host");
+
+    let saved = cx.update(|_window, app| view.read(app).book().hosts().to_vec());
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].address(), "127.0.0.1");
+    assert_eq!(saved[0].user(), "deploy");
+    assert_eq!(saved[0].port().get(), 2222);
+
+    // Pressing Enter inside a Quick Connect field also starts the attempt directly.
+    click(cx, "nav.hosts");
+    click(cx, "welcome.quick");
+    type_into(cx, "quick.address", "ops@127.0.0.1:1");
+    cx.simulate_keystrokes("tab tab tab");
+    cx.run_until_parked();
+    cx.simulate_input("s3cret");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        1,
+        "pressing Enter inside Quick Connect starts the connection attempt"
+    );
+}
+
+#[gpui::test]
+async fn host_dialog_tab_and_shift_tab_walk_fields_in_visual_order(cx: &mut TestAppContext) {
+    let dir = TempDir::new("host-dialog-tab");
+    seed(&dir.store(), Vec::new());
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    click(cx, "hosts.new");
+    assert!(cx.debug_bounds("hosts.editor").is_some());
+
+    // Focus begins on address: typing writes into address, Tab moves to port, Tab moves to user,
+    // and Shift+Tab returns to port.
+    cx.simulate_input("10.0.0.42");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    cx.simulate_input("ubuntu");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-tab");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("backspace backspace");
+    cx.simulate_input("2200");
+    cx.run_until_parked();
+
+    click(cx, "hosts.save");
+    let saved = cx.update(|_window, app| view.read(app).book().hosts().to_vec());
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].address(), "10.0.0.42");
+    assert_eq!(saved[0].user(), "ubuntu");
+    assert_eq!(saved[0].port().get(), 2200);
+}
+
+#[gpui::test]
+async fn hosts_arrow_keys_and_context_menu_navigate_duplicate_and_dismiss_with_escape(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("hosts-keyboard-and-menu");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
+            stored_host("beta", "10.0.0.2", 22, "deploy", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+
+    let (alpha_id, beta_id) = cx.update(|_window, app| {
+        let hosts = view.read(app).book().hosts();
+        (hosts[0].id(), hosts[1].id())
+    });
+
+    click(cx, "hosts.search");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        None
+    );
+
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        Some(alpha_id),
+        "first Down selects the top host row"
+    );
+
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        Some(beta_id),
+        "second Down moves to the second host row"
+    );
+
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        Some(alpha_id),
+        "Up returns to the first host row"
+    );
+
+    // Right-click opens the context menu and Escape dismisses it cleanly.
+    right_click(cx, "hosts.row.0");
+    assert!(cx.update(|_window, app| view.read(app).host_menu_open()));
+    assert!(cx.debug_bounds("host.menu").is_some());
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).host_menu_open()));
+
+    // Context-menu Duplicate and inline Duplicate both open a pre-filled copy ready to save.
+    right_click(cx, "hosts.row.0");
+    click(cx, "host.menu.duplicate");
+    assert!(cx.debug_bounds("hosts.editor").is_some());
+    click(cx, "hosts.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        3
+    );
+
+    click(cx, "hosts.duplicate.0");
+    click(cx, "hosts.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        4
+    );
+
+    // Pressing Enter while the keyboard cursor highlights a host connects that host.
+    click(cx, "hosts.row.1");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote.panel").is_some(),
+        "Enter connects the keyboard-selected host row"
+    );
+}
+
+#[gpui::test]
+async fn terminal_scrollback_jump_pill_select_all_and_font_reset_work_end_to_end(
+    cx: &mut TestAppContext,
+) {
+    let mut initial = String::new();
+    for line in 0..45 {
+        initial.push_str(&format!("history-line-{line}\r\n"));
+    }
+    initial.push_str("live-bottom-prompt");
+    let (pane, cx) = pane_with(&initial, cx);
+
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 0);
+    assert!(
+        cx.debug_bounds("terminal.scroll_bottom").is_none(),
+        "pinned at the live bottom, no jump-to-bottom pill is drawn"
+    );
+
+    let center = bounds_of(cx, "terminal.row.0").center();
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    cx.simulate_event(ScrollWheelEvent {
+        position: center,
+        delta: ScrollDelta::Pixels(point(px(0.0), px(5.0 * cell.height))),
+        touch_phase: gpui::TouchPhase::Started,
+        ..Default::default()
+    });
+    cx.run_until_parked();
+
+    assert!(cx.update(|_window, app| pane.read(app).display_offset()) > 0);
+    assert!(
+        cx.debug_bounds("terminal.scrollbar.thumb").is_some(),
+        "scrolling into history shows the scrollbar position thumb"
+    );
+    let pill = bounds_of(cx, "terminal.scroll_bottom");
+    assert!(
+        pill.size.height >= px(24.0),
+        "jump-to-bottom pill meets the 24px minimum hit target: {pill:?}"
+    );
+
+    click(cx, "terminal.scroll_bottom");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).display_offset()),
+        0,
+        "clicking the pill jumps back to the live bottom"
+    );
+
+    // Select All from the terminal context menu covers scrollback + visible rows.
+    right_click(cx, "terminal.row.0");
+    assert!(cx.debug_bounds("terminal.menu.select_all").is_some());
+    click(cx, "terminal.menu.select_all");
+    right_click(cx, "terminal.row.0");
+    click(cx, "terminal.menu.copy");
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    assert!(
+        copied.contains("history-line-0") && copied.contains("live-bottom-prompt"),
+        "Select All copies both scrollback and live screen: {copied:?}"
+    );
+
+    // Clicking the font readout resets the font size back to DEFAULT_FONT_SIZE.
+    click(cx, "terminal.font.increase");
+    click(cx, "terminal.font.increase");
+    assert!(
+        cx.update(|_window, app| pane.read(app).font_size()) > shellune_terminal::DEFAULT_FONT_SIZE
+    );
+    click(cx, "terminal.font.reset");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).font_size()),
+        shellune_terminal::DEFAULT_FONT_SIZE,
+        "clicking the font readout resets the terminal font size to default"
+    );
+}
+
+#[gpui::test]
+async fn minimum_window_at_two_hundred_percent_keeps_hosts_row_and_actions_within_bounds(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("min-window-hosts-200");
+    seed(
+        &dir.store(),
+        vec![stored_host(
+            "prod-gateway",
+            "10.240.12.8",
+            22,
+            "deploy",
+            Some("Production"),
+        )],
+    );
+    let store = dir.store();
+    let trust = TrustStore::at(dir.path());
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Settings);
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    cx.dispatch_action(ToggleLanguage);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    click(cx, "nav.hosts");
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let row = bounds_of(cx, "hosts.row.0");
+    let connect = bounds_of(cx, "hosts.connect.0");
+    assert_within_width(row, viewport, "hosts.row.0 at 720x480 @ 200%");
+    assert_within_width(connect, viewport, "hosts.connect.0 at 720x480 @ 200%");
+    assert!(
+        cx.debug_bounds("hosts.duplicate.0").is_none(),
+        "narrow 200% viewport hides inline duplicate icon so primary actions never overflow"
     );
 }

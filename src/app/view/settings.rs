@@ -324,6 +324,9 @@ impl ShelluneView {
                     div()
                         .flex_none()
                         .pt(metrics.scale(spacing::LOOSE))
+                        .pb(metrics.scale(spacing::TIGHT))
+                        .border_b_1()
+                        .border_color(theme::swatch(palette::BORDER))
                         .child(self.settings_pickers(cx)),
                 )
                 .child(sections)
@@ -1018,6 +1021,15 @@ impl ShelluneView {
     fn settings_font_control(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let font = self.workspace.local_font_size();
+        let changed = (font - shellune_terminal::DEFAULT_FONT_SIZE).abs() >= f32::EPSILON;
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        let reset_tip = copy::fill(
+            copy::ux().terminal_font_reset,
+            &[(
+                "size",
+                &format!("{:.0}", shellune_terminal::DEFAULT_FONT_SIZE),
+            )],
+        );
         div()
             .flex()
             .flex_wrap()
@@ -1035,11 +1047,29 @@ impl ShelluneView {
             )
             .child(
                 div()
+                    .id("settings.font.value")
+                    .debug_selector(|| "settings.font.value".to_owned())
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .min_w(metrics.scale(44.0))
-                    .text_center()
+                    .min_h(metrics.hit_target())
+                    .px(metrics.scale(spacing::HAIRLINE))
+                    .rounded(px(radius::SMALL))
                     .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .debug_selector(|| "settings.font.value".to_owned())
+                    .when(changed, |badge| {
+                        badge
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .tooltip(components::tooltip(reset_tip))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.set_terminal_font_size(
+                                    shellune_terminal::DEFAULT_FONT_SIZE,
+                                    cx,
+                                );
+                            }))
+                    })
                     .child(SharedString::from(format!("{font:.0} px"))),
             )
             .child(

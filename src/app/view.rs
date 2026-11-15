@@ -534,6 +534,10 @@ pub struct ShelluneView {
     /// The list is handed a slice per frame; recording its width is what makes "only the
     /// visible rows are built" a measured fact rather than a claim about the code.
     hosts_rows_drawn: std::rc::Rc<std::cell::Cell<usize>>,
+    /// The host or connection row currently highlighted by keyboard navigation or a single click.
+    hosts_cursor: Option<HostId>,
+    /// The host or connection row whose right-click menu is open, and where the pointer opened it.
+    host_menu: Option<(HostId, gpui::Point<gpui::Pixels>)>,
     /// The connection form on screen. Other attempts keep theirs on [`Attempt::panel`].
     remote: Option<RemotePanel>,
     /// The jump chain the open form is collecting. Parked with the form.
@@ -2062,11 +2066,13 @@ impl ShelluneView {
         let hosts_search = cx.new(|cx| {
             let mut field = TextField::new(search_placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
+            field.set_clearable(true, cx);
             field
         });
         let keys_search = cx.new(|cx| {
             let mut field = TextField::new(strings.keys_search_placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
+            field.set_clearable(true, cx);
             field
         });
         // The connection page's three numbers are created once: a field rebuilt per draw
@@ -2187,6 +2193,8 @@ impl ShelluneView {
             group_destination_field: None,
             hosts_scroll: UniformListScrollHandle::new(),
             hosts_rows_drawn: std::rc::Rc::new(std::cell::Cell::new(0)),
+            hosts_cursor: None,
+            host_menu: None,
             remote: None,
             chain: None,
             attempts: Vec::new(),
@@ -2340,6 +2348,8 @@ impl ShelluneView {
         view.bind_keys_search(cx);
         view.bind_connection_fields(cx);
         view.bind_remote_fields(cx);
+        view.bind_quick_fields(cx);
+        view.bind_forward_fields(cx);
         view.restore_hosts(cx);
         view.restore_groups();
         view.restore_trust();
@@ -2911,7 +2921,129 @@ impl ShelluneView {
             .update(cx, |field, cx| field.set_text(String::new(), cx));
         self.hosts.set_search(String::new());
         self.hosts.clear_filters();
+        self.hosts_cursor = None;
         cx.notify();
+    }
+
+    /// Every connectable record currently visible in the host list, paired with its
+    /// row index inside `hosts.rows` so scrolling keeps the keyboard cursor in view.
+    pub(super) fn connectable_host_rows(&self) -> Vec<(usize, HostId)> {
+        let list = self
+            .hosts
+            .list(&self.book, &self.groups, &|id| self.host_is_open(id));
+        let mut snapshot_index = 0usize;
+        let mut out = Vec::new();
+        for row in list.rows() {
+            match row {
+                crate::app::hosts::HostListRow::Group(_) => {
+                    snapshot_index += 1;
+                }
+                crate::app::hosts::HostListRow::Host(host) => {
+                    if self.book.host(host.id).is_some() {
+                        out.push((snapshot_index, host.id));
+                        snapshot_index += 1;
+                    }
+                }
+                crate::app::hosts::HostListRow::Connection(conn) => {
+                    if self.book.connection(conn.id).is_some() {
+                        out.push((snapshot_index, conn.id));
+                        snapshot_index += 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Returns `hosts_cursor` only when it is still visible in the current filtered list.
+    pub(super) fn active_hosts_cursor(&self) -> Option<HostId> {
+        let cursor = self.hosts_cursor?;
+        self.connectable_host_rows()
+            .into_iter()
+            .any(|(_, id)| id == cursor)
+            .then_some(cursor)
+    }
+
+    /// Points the keyboard cursor at a saved host or connection without starting it.
+    pub(super) fn point_at_host(&mut self, id: HostId, cx: &mut Context<Self>) {
+        if self.hosts_cursor != Some(id) {
+            self.hosts_cursor = Some(id);
+            cx.notify();
+        }
+    }
+
+    /// Moves the host-list keyboard cursor up (`-1`) or down (`+1`) and scrolls to it.
+    pub(super) fn step_hosts_cursor(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let rows = self.connectable_host_rows();
+        if rows.is_empty() {
+            return false;
+        }
+        let target_pos = match self
+            .hosts_cursor
+            .and_then(|current| rows.iter().position(|(_, id)| *id == current))
+        {
+            Some(pos) => (pos as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
+            None if delta >= 0 => 0,
+            None => rows.len() - 1,
+        };
+        let (row_index, target_id) = rows[target_pos];
+        self.hosts_cursor = Some(target_id);
+        self.hosts_scroll
+            .scroll_to_item(row_index, gpui::ScrollStrategy::Top);
+        cx.notify();
+        true
+    }
+
+    /// Handles Up/Down/Enter navigation on the Hosts page when no modal or menu is open.
+    fn hosts_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.workspace.destination() != Destination::Hosts
+            || event.keystroke.modifiers.number_of_modifiers() != 0
+            || self.palette.is_some()
+            || self.batch.view().is_open()
+            || self.custom_shell_open
+            || self.host_fields.is_some()
+            || self.protocol_fields.is_some()
+            || self.hosts.group_editor().is_some()
+            || self.hosts.pending_delete().is_some()
+            || self.import.is_open()
+            || self.quick_open
+            || self.host_menu.is_some()
+            || self.tab_menu.is_some()
+            || self.shell_menu_open
+        {
+            return false;
+        }
+        let search_focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
+        let page_focused = self
+            .destination_focus(Destination::Hosts)
+            .is_focused(window);
+        if !search_focused && !page_focused {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "down" => self.step_hosts_cursor(1, cx),
+            "up" => self.step_hosts_cursor(-1, cx),
+            "enter" if page_focused => {
+                if let Some(id) = self.active_hosts_cursor() {
+                    self.connect_saved_connection(id, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// The keyboard-highlighted row on the Hosts page, for tests.
+    #[cfg(test)]
+    pub fn hosts_cursor(&self) -> Option<HostId> {
+        self.active_hosts_cursor()
     }
 
     /// Connects a saved record with the protocol it was saved as (R2).
@@ -3069,6 +3201,42 @@ impl ShelluneView {
             cx.notify();
         })
         .detach();
+
+        let submit_view = cx.entity().downgrade();
+        for field in [name.clone(), destination.clone()] {
+            let submit_view = submit_view.clone();
+            field.update(cx, |text_field, _cx| {
+                text_field.on_submit(move |_text, window, app| {
+                    let submit_view = submit_view.clone();
+                    window.defer(app, move |_window, app| {
+                        let _ = submit_view.update(app, |view, cx| {
+                            view.confirm_group_dialog(cx);
+                        });
+                    });
+                    false
+                });
+            });
+        }
+        let tab_view = cx.entity().downgrade();
+        let tab_name = name.clone();
+        let tab_destination = destination.clone();
+        TextField::wire_dynamic_tab_ring(
+            &[name.clone(), destination.clone()],
+            move |app| {
+                let Some(view) = tab_view.upgrade() else {
+                    return Vec::new();
+                };
+                let two_fields = view.read(app).hosts.group_editor().is_some_and(|editor| {
+                    matches!(editor.action(), GroupAction::Delete(_) | GroupAction::Move)
+                });
+                if two_fields {
+                    vec![tab_name.clone(), tab_destination.clone()]
+                } else {
+                    vec![tab_name.clone()]
+                }
+            },
+            cx,
+        );
 
         let handle = name.read(cx).focus_handle().clone();
         window.focus(&handle);
@@ -3755,8 +3923,11 @@ impl ShelluneView {
             .detach();
         self.panes.push(OpenPane {
             tag,
-            content: PaneContent::Desktop(pane),
+            content: PaneContent::Desktop(pane.clone()),
         });
+        // `pane.start` runs before this observer is registered, so any failure or stage
+        // already reported synchronously is copied into the session record immediately.
+        self.sync_desktop(pane, cx);
         if self.workspace.destination() != Destination::LocalShells {
             self.workspace.select(Destination::LocalShells);
             self.workspace
@@ -5570,7 +5741,9 @@ impl ShelluneView {
         search.update(cx, |field, _cx| {
             field.on_submit(move |_text, _window, app| {
                 view.update(app, |view, cx| {
-                    if let Some(id) = view.first_searched_host() {
+                    if let Some(id) = view.active_hosts_cursor() {
+                        view.connect_saved_connection(id, cx);
+                    } else if let Some(id) = view.first_searched_host() {
                         view.connect_saved_host(id, cx);
                     }
                     false
@@ -5582,6 +5755,7 @@ impl ShelluneView {
             let phrase = field.read(cx).text().to_owned();
             if view.hosts.search() != phrase {
                 view.hosts.set_search(phrase);
+                view.hosts_cursor = None;
                 cx.notify();
             }
         })
@@ -5735,14 +5909,17 @@ impl ShelluneView {
 
     /// Watches the connection page's three fields.
     fn bind_connection_fields(&mut self, cx: &mut Context<Self>) {
+        let mut ring = Vec::with_capacity(ConnectionField::ALL.len());
         for field in ConnectionField::ALL {
             let entity = self.connection_fields.get(field).clone();
+            ring.push(entity.clone());
             cx.observe(&entity, move |view, text_field, cx| {
                 let text = text_field.read(cx).text().to_owned();
                 view.set_connection_value(field, text, cx);
             })
             .detach();
         }
+        TextField::wire_tab_ring(&ring, cx);
     }
 
     /// Chooses what a host says about its own keepalive (R20).
@@ -5927,8 +6104,73 @@ impl ShelluneView {
         };
         self.host_connection_fields = Some(host_connection_fields);
         self.bind_host_connection_fields(cx);
+        self.bind_host_dialog_tab_ring(cx);
         self.focus_host_dialog = true;
         cx.notify();
+    }
+
+    /// Wires Tab and Shift+Tab across whichever SSH host fields are currently visible.
+    fn bind_host_dialog_tab_ring(&self, cx: &mut Context<Self>) {
+        let (Some(fields), Some(conn_fields)) = (
+            self.host_fields.as_ref(),
+            self.host_connection_fields.as_ref(),
+        ) else {
+            return;
+        };
+        let candidates = vec![
+            fields.address.clone(),
+            fields.port.clone(),
+            fields.user.clone(),
+            fields.identity.clone(),
+            fields.secret.clone(),
+            fields.name.clone(),
+            fields.group.clone(),
+            fields.proxy.clone(),
+            fields.startup.clone(),
+            conn_fields.interval.clone(),
+            conn_fields.misses.clone(),
+            conn_fields.timeout.clone(),
+        ];
+        let view = cx.entity().downgrade();
+        TextField::wire_dynamic_tab_ring(
+            &candidates,
+            move |app| {
+                let Some(view) = view.upgrade() else {
+                    return Vec::new();
+                };
+                let view = view.read(app);
+                let (Some(fields), Some(draft)) = (view.host_fields.as_ref(), view.hosts.draft())
+                else {
+                    return Vec::new();
+                };
+                let mut visible = vec![
+                    fields.address.clone(),
+                    fields.port.clone(),
+                    fields.user.clone(),
+                ];
+                if draft.auth().needs_key_path() {
+                    visible.push(fields.identity.clone());
+                }
+                if draft.needs_secret() {
+                    visible.push(fields.secret.clone());
+                }
+                visible.push(fields.name.clone());
+                visible.push(fields.group.clone());
+                if view.host_advanced {
+                    visible.push(fields.proxy.clone());
+                    visible.push(fields.startup.clone());
+                    if draft.connection().choice() == ConnectionChoice::Override
+                        && let Some(conn) = view.host_connection_fields.as_ref()
+                    {
+                        visible.push(conn.interval.clone());
+                        visible.push(conn.misses.clone());
+                        visible.push(conn.timeout.clone());
+                    }
+                }
+                visible
+            },
+            cx,
+        );
     }
 
     /// Closes the form without touching the saved records.
@@ -6062,9 +6304,19 @@ impl ShelluneView {
             .copied()
             .filter(|field| field.is_text())
             .collect();
+        let mut ring = Vec::with_capacity(typed.len());
         for field in typed {
+            if let Some(entity) = self
+                .protocol_fields
+                .as_ref()
+                .and_then(|fields| fields.get(field))
+                .cloned()
+            {
+                ring.push(entity);
+            }
             self.bind_protocol_field(field, cx);
         }
+        TextField::wire_tab_ring(&ring, cx);
         self.focus_host_dialog = true;
         cx.notify();
     }
@@ -6079,6 +6331,18 @@ impl ShelluneView {
         else {
             return;
         };
+        let view = cx.entity().downgrade();
+        entity.update(cx, |text_field, _cx| {
+            text_field.on_submit(move |_text, window, app| {
+                let view = view.clone();
+                window.defer(app, move |_window, app| {
+                    let _ = view.update(app, |view, cx| {
+                        let _ = view.save_connection(cx);
+                    });
+                });
+                false
+            });
+        });
         cx.observe(&entity, move |view, text_field, cx| {
             let text = text_field.read(cx).text().to_owned();
             if let Some(draft) = view.hosts.protocol_draft_mut() {
@@ -6339,6 +6603,7 @@ impl ShelluneView {
         let search = cx.new(|cx| {
             let mut field = TextField::new(copy::ux().import_search_placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
+            field.set_clearable(true, cx);
             field
         });
         cx.observe(&search, |view, field, cx| {
@@ -6518,6 +6783,220 @@ impl ShelluneView {
             cx.notify();
         })
         .detach();
+
+        let candidates = [password, key_path, passphrase];
+        let submit_view = cx.entity().downgrade();
+        for field in &candidates {
+            let submit_view = submit_view.clone();
+            field.update(cx, |text_field, _cx| {
+                text_field.on_submit(move |_text, window, app| {
+                    let submit_view = submit_view.clone();
+                    window.defer(app, move |_window, app| {
+                        let _ = submit_view.update(app, |view, cx| {
+                            let Some(panel) = view.remote.as_ref() else {
+                                return;
+                            };
+                            if panel.status().is_busy() || panel.status().is_asking() {
+                                return;
+                            }
+                            if panel.status().failure().is_some() {
+                                view.retry_remote(cx);
+                            } else {
+                                view.connect_remote(cx);
+                            }
+                        });
+                    });
+                    false
+                });
+            });
+        }
+        let tab_view = cx.entity().downgrade();
+        TextField::wire_dynamic_tab_ring(
+            &candidates,
+            move |app| {
+                let Some(view) = tab_view.upgrade() else {
+                    return Vec::new();
+                };
+                let view = view.read(app);
+                let Some(panel) = view.remote.as_ref() else {
+                    return Vec::new();
+                };
+                let method = panel.method();
+                let mut visible = Vec::new();
+                if method.takes_password() {
+                    visible.push(view.remote_fields.password.clone());
+                }
+                if method.needs_key_path() {
+                    visible.push(view.remote_fields.key_path.clone());
+                }
+                if method.needs_passphrase() {
+                    visible.push(view.remote_fields.passphrase.clone());
+                }
+                visible
+            },
+            cx,
+        );
+    }
+
+    /// Wires Enter submission, Tab traversal and `user@host:port` splitting on Quick Connect.
+    fn bind_quick_fields(&mut self, cx: &mut Context<Self>) {
+        let candidates = [
+            self.quick_address.clone(),
+            self.quick_port.clone(),
+            self.quick_user.clone(),
+            self.quick_password.clone(),
+            self.quick_key.clone(),
+            self.quick_passphrase.clone(),
+        ];
+        let submit_view = cx.entity().downgrade();
+        for field in &candidates {
+            let submit_view = submit_view.clone();
+            field.update(cx, |text_field, _cx| {
+                text_field.on_submit(move |_text, window, app| {
+                    let submit_view = submit_view.clone();
+                    window.defer(app, move |_window, app| {
+                        let _ = submit_view.update(app, |view, cx| {
+                            view.start_quick_connect(cx);
+                        });
+                    });
+                    false
+                });
+            });
+        }
+        let tab_view = cx.entity().downgrade();
+        let address_entity = self.quick_address.clone();
+        for field in &candidates {
+            let current = field.downgrade();
+            let tab_view = tab_view.clone();
+            let address_entity = address_entity.clone();
+            field.update(cx, |text_field, _cx| {
+                text_field.on_tab(move |shift, window, app| {
+                    let Some(me) = current.upgrade() else {
+                        return false;
+                    };
+                    if me == address_entity {
+                        let split_view = tab_view.clone();
+                        window.defer(app, move |_window, app| {
+                            let _ = split_view.update(app, |view, cx| {
+                                view.split_quick_address(cx);
+                            });
+                        });
+                    }
+                    let Some(view_entity) = tab_view.upgrade() else {
+                        return false;
+                    };
+                    let active = {
+                        let view = view_entity.read(app);
+                        let method = view.quick_method;
+                        let mut list = vec![
+                            view.quick_address.clone(),
+                            view.quick_port.clone(),
+                            view.quick_user.clone(),
+                        ];
+                        if method.takes_password() {
+                            list.push(view.quick_password.clone());
+                        }
+                        if method.needs_key_path() {
+                            list.push(view.quick_key.clone());
+                        }
+                        if method.needs_passphrase() {
+                            list.push(view.quick_passphrase.clone());
+                        }
+                        list
+                    };
+                    if active.len() < 2 {
+                        return false;
+                    }
+                    let Some(index) = active.iter().position(|entry| *entry == me) else {
+                        return false;
+                    };
+                    let next = if shift {
+                        (index + active.len() - 1) % active.len()
+                    } else {
+                        (index + 1) % active.len()
+                    };
+                    let handle = active[next].read(app).focus_handle().clone();
+                    window.focus(&handle);
+                    true
+                });
+            });
+        }
+    }
+
+    /// Splits `user@host:port` in the Quick Connect address field without overwriting an
+    /// explicit user or non-default port already typed in the form.
+    fn split_quick_address(&mut self, cx: &mut Context<Self>) -> bool {
+        let text = self.quick_address.read(cx).text().trim().to_owned();
+        let (user, rest) = match text.split_once('@') {
+            Some((user, rest)) if !user.is_empty() && !rest.is_empty() => {
+                (Some(user.to_owned()), rest.to_owned())
+            }
+            _ => (None, text),
+        };
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((host, port))
+                if !host.contains(':')
+                    && !host.starts_with('[')
+                    && !host.is_empty()
+                    && !port.is_empty()
+                    && port.chars().all(|ch| ch.is_ascii_digit()) =>
+            {
+                (host.to_owned(), Some(port.to_owned()))
+            }
+            _ => (rest, None),
+        };
+        if user.is_none() && port.is_none() {
+            return false;
+        }
+        let address_field = self.quick_address.clone();
+        address_field.update(cx, |field, cx| field.set_text(host, cx));
+        if let Some(user) = user
+            && self.quick_user.read(cx).text().trim().is_empty()
+        {
+            let user_field = self.quick_user.clone();
+            user_field.update(cx, |field, cx| field.set_text(user, cx));
+        }
+        if let Some(port) = port
+            && self.quick_port.read(cx).text().trim() == shellune_core::Port::DEFAULT.to_string()
+        {
+            let port_field = self.quick_port.clone();
+            port_field.update(cx, |field, cx| field.set_text(port, cx));
+        }
+        true
+    }
+
+    /// Wires Tab and Shift+Tab across the visible Port Forwarding form fields.
+    fn bind_forward_fields(&mut self, cx: &mut Context<Self>) {
+        let candidates = [
+            self.forward_listen_host.clone(),
+            self.forward_listen_port.clone(),
+            self.forward_target_host.clone(),
+            self.forward_target_port.clone(),
+        ];
+        let tab_view = cx.entity().downgrade();
+        TextField::wire_dynamic_tab_ring(
+            &candidates,
+            move |app| {
+                let Some(view) = tab_view.upgrade() else {
+                    return Vec::new();
+                };
+                let view = view.read(app);
+                let mut visible = vec![
+                    view.forward_listen_host.clone(),
+                    view.forward_listen_port.clone(),
+                ];
+                let dynamic = view
+                    .forwards
+                    .editor()
+                    .is_some_and(|editor| editor.kind == shellune_core::ForwardKind::Dynamic);
+                if !dynamic {
+                    visible.push(view.forward_target_host.clone());
+                    visible.push(view.forward_target_port.clone());
+                }
+                visible
+            },
+            cx,
+        );
     }
 
     /// Copies the form's values into the fields, for a form that just opened.
@@ -6787,6 +7266,7 @@ impl ShelluneView {
     /// reason, and what was typed is kept. The chosen method is the only one whose
     /// secret is collected.
     pub(crate) fn prepare_quick_connection(&mut self, cx: &mut Context<Self>) -> bool {
+        self.split_quick_address(cx);
         let strings = self.strings();
         let address = self.quick_address.read(cx).text().trim().to_owned();
         let port_text = self.quick_port.read(cx).text().trim().to_owned();
@@ -10148,6 +10628,8 @@ impl ShelluneView {
     fn note_content_focus(&mut self, window: &Window, cx: &gpui::App) {
         if self.palette.is_some()
             || self.host_fields.is_some()
+            || self.protocol_fields.is_some()
+            || self.host_menu.is_some()
             || self.tab_menu.is_some()
             || self.session_menu.is_some()
         {
@@ -10247,6 +10729,18 @@ impl ShelluneView {
         }
         if self.host_fields.is_some() {
             self.close_host_editor(cx);
+            return true;
+        }
+        if self.protocol_fields.is_some() {
+            self.close_connection_editor(cx);
+            return true;
+        }
+        if self.hosts.group_editor().is_some() {
+            self.close_group_dialog(cx);
+            return true;
+        }
+        if self.host_menu.is_some() {
+            self.close_host_menu(window, cx);
             return true;
         }
         if self.tab_rename.is_some() {
@@ -11281,11 +11775,13 @@ impl ShelluneView {
             let placeholder = self.strings().files_filter_placeholder;
             let existing = self.files.filter_of(id, source).unwrap_or("").to_owned();
             let field = cx.new(|cx| {
-                if existing.is_empty() {
+                let mut field = if existing.is_empty() {
                     TextField::new(placeholder, cx)
                 } else {
                     TextField::with_text(placeholder, &existing, cx)
-                }
+                };
+                field.set_clearable(true, cx);
+                field
             });
             let view = cx.entity().downgrade();
             cx.observe(&field, move |_field_owner, text_field, cx| {
@@ -14615,6 +15111,7 @@ impl ShelluneView {
             .flex()
             .flex_none()
             .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
             .h(metrics.scale(28.0))
             .px(metrics.scale(spacing::SNUG))
             .border_b_1()
@@ -14622,9 +15119,10 @@ impl ShelluneView {
             .text_size(metrics.caption_size())
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme::swatch(palette::TEXT_MUTED))
+            .child(div().flex_none().w(metrics.hit_target()))
             .child(self.files_sort_cell(id, source, SortKey::Name, cx))
             .child(self.files_sort_cell(id, source, SortKey::Size, cx))
-            .child(div().w(files_actions_width(metrics, source)))
+            .child(div().flex_none().w(files_actions_width(metrics, source)))
     }
 
     /// One sortable key of a column's header (R14).
@@ -15041,24 +15539,48 @@ impl ShelluneView {
             ux.files_mark_row
         };
         let mark_name = name.to_owned();
+        let mark_group = SharedString::from(format!("{prefix}.mark.group.{index}"));
+        let mark_accent = theme::swatch(palette::ACCENT);
+        let mark_square = if marked {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(metrics.scale(15.0))
+                .rounded(px(4.0))
+                .border_1()
+                .bg(mark_accent)
+                .border_color(mark_accent)
+                .child(icons::icon(
+                    Icon::Check,
+                    metrics.scale(11.0),
+                    theme::swatch(palette::ON_ACCENT),
+                ))
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(metrics.scale(15.0))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(theme::swatch(palette::BORDER_STRONG))
+                .group_hover(mark_group.clone(), move |style| {
+                    style.border_color(mark_accent)
+                })
+        };
         let mark_box = div()
             .id(SharedString::from(mark_id.clone()))
             .debug_selector(move || mark_id.clone())
+            .group(mark_group)
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .size(metrics.scale(16.0))
-            .rounded(px(radius::SMALL))
-            .text_size(metrics.caption_size())
-            .text_color(theme::swatch(if marked {
-                palette::ACCENT
-            } else {
-                palette::TEXT_MUTED
-            }))
+            .size(metrics.hit_target())
             .cursor_pointer()
             .tooltip(components::tooltip(SharedString::from(mark_label)))
-            .child(SharedString::from(if marked { "x" } else { "" }))
+            .child(mark_square)
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |view, _event: &gpui::MouseDownEvent, _window, cx| {
@@ -16584,6 +17106,10 @@ impl Render for ShelluneView {
                     && this.dismiss_floating(window, cx)
                 {
                     cx.stop_propagation();
+                    return;
+                }
+                if this.hosts_key(event, window, cx) {
+                    cx.stop_propagation();
                 }
             }))
             .on_action(
@@ -16783,6 +17309,7 @@ impl Render for ShelluneView {
             .children(self.custom_shell_overlay(window, cx))
             .children(self.shell_menu_overlay(window, cx))
             .children(self.files_menu_overlay(window, cx))
+            .children(self.host_menu_overlay(window, cx))
             .children(self.tab_menu_overlay(window, cx))
             .children(self.tab_rename_overlay(window, cx))
             .children(self.tab_list_overlay(window, cx))

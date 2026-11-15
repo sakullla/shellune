@@ -2729,6 +2729,8 @@ impl TerminalPane {
                         )
                     })
             };
+        let ux = crate::app::copy::ux_for(self.locale);
+        let scrolled_back = !self.alternate_screen() && self.core.display_offset() > 0;
         let menu = div()
             .flex()
             .flex_col()
@@ -2771,6 +2773,19 @@ impl TerminalPane {
                 }),
             )
             .child(
+                item(
+                    ux.terminal_select_all,
+                    &None,
+                    true,
+                    "terminal.menu.select_all",
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.core.select_all();
+                    this.menu = None;
+                    cx.notify();
+                })),
+            )
+            .child(
                 div()
                     .h(px(1.0))
                     .mx(metrics.scale(spacing::HAIRLINE))
@@ -2788,7 +2803,21 @@ impl TerminalPane {
                     this.menu = None;
                     this.toggle_search(window, cx);
                 })),
-            );
+            )
+            .when(scrolled_back, |menu| {
+                menu.child(
+                    item(
+                        ux.terminal_jump_bottom_short,
+                        &None,
+                        true,
+                        "terminal.menu.jump_bottom",
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.menu = None;
+                        this.reveal_input(cx);
+                    })),
+                )
+            });
         Some(
             gpui::deferred(
                 gpui::anchored().position(gpui::Point::default()).child(
@@ -2961,7 +2990,7 @@ impl TerminalPane {
                 .flex_col()
                 .flex_none()
                 .debug_selector(|| "serial.strip".to_owned())
-                .bg(theme::swatch(shell_palette::CANVAS))
+                .bg(theme::swatch(shell_palette::SURFACE))
                 .border_t_1()
                 .border_color(theme::faded(theme::swatch(shell_palette::BORDER), 0.8))
                 .child(row),
@@ -2985,6 +3014,17 @@ impl TerminalPane {
             }
         };
         let muted = theme::swatch(shell_palette::TEXT_MUTED);
+        let bar_height = metrics.hit_target().max(px(SHELL_BAR_HEIGHT));
+        let font_changed =
+            (self.font_size - shellune_terminal::DEFAULT_FONT_SIZE).abs() >= f32::EPSILON;
+        let reset_hover = theme::swatch(shell_palette::SURFACE_HOVER);
+        let reset_tip = crate::app::copy::fill(
+            crate::app::copy::ux_for(self.locale).terminal_font_reset,
+            &[(
+                "size",
+                &format!("{:.0}", shellune_terminal::DEFAULT_FONT_SIZE),
+            )],
+        );
         div()
             .id("terminal.bar")
             .debug_selector(|| "terminal.bar".to_owned())
@@ -2994,11 +3034,11 @@ impl TerminalPane {
             .gap(metrics.scale(spacing::TIGHT))
             // At least the bar's height; taller when the window's text is larger, so
             // the session's half it carries is never cut off at its bottom.
-            .min_h(px(SHELL_BAR_HEIGHT))
+            .min_h(bar_height)
             .flex_none()
             .pl(metrics.scale(spacing::BASE - 2.0))
             .pr(metrics.scale(spacing::HAIRLINE))
-            .bg(theme::swatch(shell_palette::CANVAS))
+            .bg(theme::swatch(shell_palette::SURFACE))
             .border_t_1()
             .border_color(theme::faded(theme::swatch(shell_palette::BORDER), 0.8))
             .text_size(metrics.caption_size())
@@ -3128,9 +3168,29 @@ impl TerminalPane {
                     )
                     .child(
                         div()
+                            .id("terminal.font.reset")
+                            .debug_selector(|| "terminal.font.reset".to_owned())
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .min_w(metrics.scale(34.0))
-                            .text_center()
+                            .h(metrics.hit_target())
+                            .px(metrics.scale(2.0))
+                            .rounded(px(theme::radius::SMALL))
                             .font_family(monospace_family())
+                            .when(font_changed, |badge| {
+                                badge
+                                    .cursor_pointer()
+                                    .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                                    .hover(move |style| style.bg(reset_hover))
+                                    .tooltip(components::tooltip(reset_tip))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.set_font_size(
+                                            shellune_terminal::DEFAULT_FONT_SIZE,
+                                            cx,
+                                        );
+                                    }))
+                            })
                             .child(SharedString::from(format!("{}px", self.font_size))),
                     )
                     .child(
@@ -3483,9 +3543,10 @@ impl TerminalPane {
     fn block_overlay(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let strings = self.locale.strings();
         let blocks = self.listed_blocks();
+        let bar_height = metrics.hit_target().max(px(SHELL_BAR_HEIGHT));
         let mut panel = div()
             .absolute()
-            .bottom(px(SHELL_BAR_HEIGHT))
+            .bottom(bar_height)
             .left(px(0.0))
             .right(px(0.0))
             // The bar grows with the text; the panel stops at a height that still
@@ -3869,6 +3930,93 @@ impl TerminalPane {
                     this.rerun_block(id, cx);
                 })),
             )
+    }
+
+    /// A subtle proportional scrollbar thumb when scrolled up in history.
+    fn scrollback_thumb(&self) -> Option<gpui::Div> {
+        if self.alternate_screen() {
+            return None;
+        }
+        let offset = self.core.display_offset();
+        let history = self.core.history();
+        if offset == 0 || history == 0 {
+            return None;
+        }
+        let rows = self.grid.rows.max(1);
+        let total = history + rows;
+        let fraction = (rows as f32 / total as f32).clamp(0.08, 1.0);
+        let progress = 1.0 - (offset as f32 / history as f32).clamp(0.0, 1.0);
+        let top_pct = progress * (1.0 - fraction);
+        Some(
+            div()
+                .absolute()
+                .right(px(2.0))
+                .top(gpui::relative(top_pct))
+                .h(gpui::relative(fraction))
+                .w(px(4.0))
+                .rounded_full()
+                .bg(theme::faded(theme::swatch(shell_palette::TEXT_MUTED), 0.45))
+                .debug_selector(|| "terminal.scrollbar.thumb".to_owned()),
+        )
+    }
+
+    /// A floating pill that shows how many lines above the live prompt the viewport is
+    /// and returns to the bottom in one click.
+    fn scroll_bottom_pill(
+        &self,
+        metrics: Metrics,
+        show_blocks: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        if self.alternate_screen() {
+            return None;
+        }
+        let offset = self.core.display_offset();
+        if offset == 0 {
+            return None;
+        }
+        let label = crate::app::copy::fill(
+            crate::app::copy::ux_for(self.locale).terminal_jump_bottom,
+            &[("lines", &offset.to_string())],
+        );
+        let hover = theme::swatch(shell_palette::SURFACE_HOVER);
+        let pill = div()
+            .id("terminal.scroll_bottom")
+            .debug_selector(|| "terminal.scroll_bottom".to_owned())
+            .absolute()
+            .right(metrics.scale(spacing::SNUG))
+            .when(show_blocks, |pill| pill.top(metrics.scale(spacing::SNUG)))
+            .when(!show_blocks, |pill| {
+                pill.bottom(metrics.scale(spacing::SNUG))
+            })
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .min_h(metrics.hit_target())
+            .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(2.0))
+            .rounded(px(theme::radius::LARGE))
+            .bg(theme::swatch(shell_palette::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(shell_palette::BORDER_STRONG))
+            .shadow_md()
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.reveal_input(cx);
+            }))
+            .child(crate::app::icons::icon(
+                Icon::ChevronDown,
+                metrics.small_icon_size(),
+                theme::swatch(shell_palette::ACCENT),
+            ))
+            .child(SharedString::from(label));
+        Some(pill)
     }
 
     fn viewport(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
@@ -4458,6 +4606,7 @@ impl Render for TerminalPane {
                 // A margin inside the frame keeps the first column off the border; the
                 // grid itself is measured inside it, so no cell is lost to the margin.
                 div()
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -4466,7 +4615,9 @@ impl Render for TerminalPane {
                     .pr(metrics.scale(spacing::HAIRLINE))
                     .py(metrics.scale(spacing::TIGHT))
                     .bg(color_of(palette::BACKGROUND))
-                    .child(self.viewport(window, cx)),
+                    .child(self.viewport(window, cx))
+                    .children(self.scrollback_thumb())
+                    .children(self.scroll_bottom_pill(metrics, show_blocks, cx)),
             )
             // A serial line states itself above the bar: its device, its settings and
             // the two send habits are what a person changes while the session runs, and

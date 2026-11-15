@@ -8,8 +8,10 @@
  * alone: the entry points install the client-common context, which is what creates the
  * bitmap cache gdi_init asserts on and which loads the channels this client needs.
  */
+#ifdef SD_WITH_RDP
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#endif
 #include "sd_internal.h"
 
 #ifdef SD_WITH_RDP

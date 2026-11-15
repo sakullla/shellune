@@ -62,6 +62,10 @@ pub enum Browse {
 /// empties itself, so pressing Enter again does not repeat the same submit.
 type SubmitHandler = Box<dyn Fn(String, &mut Window, &mut App) -> bool + 'static>;
 
+/// Moves focus to the adjacent field in a form when Tab (`false`) or Shift+Tab (`true`)
+/// is pressed. Returning `true` marks the keystroke handled.
+type TabHandler = Box<dyn Fn(bool, &mut Window, &mut App) -> bool + 'static>;
+
 // ---------------------------------------------------------------------------
 // The editing model
 // ---------------------------------------------------------------------------
@@ -431,6 +435,7 @@ pub struct TextField {
     placeholder: SharedString,
     focus: FocusHandle,
     submit: Option<SubmitHandler>,
+    tab: Option<TabHandler>,
     /// Whether the line is drawn as bullets.
     ///
     /// A password or a passphrase is typed into a field like any other, but what is
@@ -441,6 +446,8 @@ pub struct TextField {
     revealable: bool,
     /// Whether a masked field is showing its text for now.
     revealed: bool,
+    /// Whether a non-empty field offers a trailing clear button.
+    clearable: bool,
     /// Whether the field holds a path, and the system chooser can fill it.
     browse: Option<Browse>,
     /// A quiet icon before the text, such as the magnifier of a search field.
@@ -493,9 +500,11 @@ impl TextField {
             placeholder: placeholder.into(),
             focus: cx.focus_handle(),
             submit: None,
+            tab: None,
             masked: false,
             revealable: false,
             revealed: false,
+            clearable: false,
             browse: None,
             leading: None,
             selecting: false,
@@ -529,6 +538,14 @@ impl TextField {
     pub fn set_revealable(&mut self, revealable: bool, cx: &mut Context<Self>) {
         if self.revealable != revealable {
             self.revealable = revealable;
+            cx.notify();
+        }
+    }
+
+    /// Offers a trailing clear button whenever the field holds text.
+    pub fn set_clearable(&mut self, clearable: bool, cx: &mut Context<Self>) {
+        if self.clearable != clearable {
+            self.clearable = clearable;
             cx.notify();
         }
     }
@@ -612,6 +629,72 @@ impl TextField {
         self.submit = Some(Box::new(submit));
     }
 
+    /// Called when the user presses Tab (`false`) or Shift+Tab (`true`).
+    pub fn on_tab(&mut self, tab: impl Fn(bool, &mut Window, &mut App) -> bool + 'static) {
+        self.tab = Some(Box::new(tab));
+    }
+
+    /// Wires `Tab` and `Shift+Tab` to cycle focus across `fields` in visual order.
+    pub fn wire_tab_ring(fields: &[Entity<Self>], cx: &mut App) {
+        let len = fields.len();
+        if len < 2 {
+            return;
+        }
+        let ring: Vec<gpui::WeakEntity<Self>> = fields.iter().map(Entity::downgrade).collect();
+        for (index, field) in fields.iter().enumerate() {
+            let ring = ring.clone();
+            field.update(cx, |text_field, _cx| {
+                text_field.on_tab(move |shift, window, app| {
+                    let next = if shift {
+                        (index + len - 1) % len
+                    } else {
+                        (index + 1) % len
+                    };
+                    if let Some(target) = ring[next].upgrade() {
+                        let handle = target.read(app).focus_handle().clone();
+                        window.focus(&handle);
+                        return true;
+                    }
+                    false
+                });
+            });
+        }
+    }
+
+    /// Wires `Tab` and `Shift+Tab` across a form whose visible fields change dynamically.
+    pub fn wire_dynamic_tab_ring(
+        candidates: &[Entity<Self>],
+        visible: impl Fn(&App) -> Vec<Entity<Self>> + Clone + 'static,
+        cx: &mut App,
+    ) {
+        for field in candidates {
+            let current = field.downgrade();
+            let visible = visible.clone();
+            field.update(cx, |text_field, _cx| {
+                text_field.on_tab(move |shift, window, app| {
+                    let Some(me) = current.upgrade() else {
+                        return false;
+                    };
+                    let active = visible(app);
+                    if active.len() < 2 {
+                        return false;
+                    }
+                    let Some(index) = active.iter().position(|entry| *entry == me) else {
+                        return false;
+                    };
+                    let next = if shift {
+                        (index + active.len() - 1) % active.len()
+                    } else {
+                        (index + 1) % active.len()
+                    };
+                    let handle = active[next].read(app).focus_handle().clone();
+                    window.focus(&handle);
+                    true
+                });
+            });
+        }
+    }
+
     /// Whether the text is hidden on screen right now.
     fn hidden(&self) -> bool {
         self.masked && !self.revealed
@@ -679,6 +762,15 @@ impl TextField {
                 if consumed {
                     self.model.set_text("");
                     cx.notify();
+                }
+            }
+            "tab" if !modifiers.control && !modifiers.alt && !modifiers.platform => {
+                let consumed = match &self.tab {
+                    Some(tab) => tab(shift, window, cx),
+                    None => false,
+                };
+                if !consumed {
+                    return;
                 }
             }
             // Escape first drops a selection; on a bare caret it empties the field, the
@@ -994,7 +1086,8 @@ impl Render for TextField {
         let strings = Locale::current().strings();
         let reveal = self.masked && self.revealable;
         let revealed = self.revealed;
-        let trailing = reveal || self.browse.is_some();
+        let clear = self.clearable && !self.model.text().is_empty() && self.marked.is_none();
+        let trailing = clear || reveal || self.browse.is_some();
 
         div()
             .id(self.id.clone())
@@ -1084,6 +1177,45 @@ impl Render for TextField {
                     .overflow_hidden()
                     .child(LineElement { field: cx.entity() }),
             )
+            .when(clear, |field| {
+                let hover = theme::swatch(palette::SURFACE_HOVER);
+                let hover_text = theme::swatch(palette::TEXT_PRIMARY);
+                field.child(
+                    div()
+                        .id("field.clear")
+                        .debug_selector(|| "field.clear".to_owned())
+                        .group("field-clear")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size(metrics.hit_target())
+                        .rounded(px(radius::SMALL))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover))
+                        .tooltip(crate::app::components::tooltip(
+                            crate::app::copy::ux().field_clear,
+                        ))
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.marked = None;
+                            this.model.set_text("");
+                            this.scroll = px(0.0);
+                            window.focus(&this.focus);
+                            cx.notify();
+                        }))
+                        .child(
+                            icons::icon(
+                                Icon::Close,
+                                metrics.small_icon_size(),
+                                theme::swatch(palette::TEXT_MUTED),
+                            )
+                            .group_hover("field-clear", move |style| style.text_color(hover_text)),
+                        ),
+                )
+            })
             .when(reveal, |field| {
                 let hover = theme::swatch(palette::SURFACE_HOVER);
                 field.child(

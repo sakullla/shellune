@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN64)
+#if !defined(_WIN64) && !(defined(__LP64__) || defined(__x86_64__) || defined(__aarch64__))
 #error "sd_event offsets are asserted for 64-bit builds; update them with the type."
 #endif
 

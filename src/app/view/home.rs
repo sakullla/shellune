@@ -79,6 +79,8 @@ struct ConnectionRowView {
     group: Option<SharedString>,
     /// Whether this window already holds a running session for the record.
     open: bool,
+    /// Whether the keyboard cursor is on this row.
+    cursor: bool,
 }
 
 /// One host of the list, with what its row shows.
@@ -106,6 +108,11 @@ struct HostRowView {
     last_exact: Option<SharedString>,
     /// Whether the user picked it.
     selected: bool,
+    /// Whether the keyboard cursor is on this row.
+    cursor: bool,
+    /// Whether the viewport is wide enough to show the inline duplicate icon alongside
+    /// the forward, edit and delete icons without crowding narrow zoomed windows.
+    show_duplicate: bool,
 }
 
 impl ShelluneView {
@@ -147,11 +154,12 @@ impl ShelluneView {
         let list = self
             .hosts
             .list(&self.book, &self.groups, &|id| self.host_is_open(id));
+        let short = self.viewport_height < metrics.scale(320.0);
         let mut column = div()
             .flex()
             .flex_col()
             .flex_1()
-            .min_h(px(0.0))
+            .when(!short, |col| col.min_h(px(0.0)))
             .min_w(px(0.0))
             .gap(metrics.scale(spacing::TIGHT))
             .child(self.hosts_filters(&list, cx));
@@ -415,12 +423,13 @@ impl ShelluneView {
         let wide = self.group_column_fits();
         let rows = self.host_rows_snapshot(list);
         let empty = list.is_empty();
+        let short = self.viewport_height < metrics.scale(320.0);
         let mut list_column = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w(px(0.0))
-            .min_h(px(0.0))
+            .when(!short, |col| col.min_h(px(0.0)))
             .gap(metrics.scale(spacing::HAIRLINE))
             .child(
                 div()
@@ -442,7 +451,7 @@ impl ShelluneView {
             .flex()
             .flex_row()
             .flex_1()
-            .min_h(px(0.0))
+            .when(!short, |b| b.min_h(px(0.0)))
             .min_w(px(0.0))
             .gap(metrics.scale(spacing::SNUG))
             // The number of rows is part of the selector, so a test can tell "the
@@ -820,6 +829,11 @@ impl ShelluneView {
         } else {
             "hosts.row"
         };
+        let min_list_height = if self.viewport_height < metrics.scale(320.0) {
+            row_height * 2.0
+        } else {
+            px(0.0)
+        };
         uniform_list("hosts.rows", rows.len(), move |range, _window, _cx| {
             drawn.set(drawn.get().max(range.len()));
             let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
@@ -841,7 +855,7 @@ impl ShelluneView {
         })
         .track_scroll(self.hosts_scroll.clone())
         .flex_1()
-        .min_h(px(0.0))
+        .min_h(min_list_height)
         .min_w(px(0.0))
         .debug_selector(|| "hosts.rows".to_owned())
         .into_any_element()
@@ -852,6 +866,9 @@ impl ShelluneView {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
+        let cursor = self.active_hosts_cursor();
+        let show_duplicate = self.viewport_width >= self.metrics().scale(760.0);
+        let show_group_tag = self.viewport_width >= self.metrics().scale(540.0);
         let mut rows = Vec::with_capacity(list.len());
         let mut hosts = 0usize;
         let mut groups = 0usize;
@@ -874,7 +891,9 @@ impl ShelluneView {
                         number: hosts,
                         name: SharedString::from(saved.name().to_owned()),
                         target: SharedString::from(saved.target()),
-                        group: saved.group_text().map(SharedString::from),
+                        group: show_group_tag
+                            .then(|| saved.group_text().map(SharedString::from))
+                            .flatten(),
                         open: self.host_is_open(host.id),
                         last: self.book.recent_of(host.id).map(|recent| {
                             SharedString::from(format!(
@@ -897,6 +916,8 @@ impl ShelluneView {
                             ))
                         }),
                         selected: self.hosts.selected().contains(host.id),
+                        cursor: cursor == Some(host.id),
+                        show_duplicate,
                     }));
                     hosts += 1;
                 }
@@ -910,8 +931,11 @@ impl ShelluneView {
                         name: SharedString::from(saved.name().to_owned()),
                         protocol: SharedString::from(saved.protocol().label()),
                         target: SharedString::from(saved.target()),
-                        group: saved.group_text().map(SharedString::from),
+                        group: show_group_tag
+                            .then(|| saved.group_text().map(SharedString::from))
+                            .flatten(),
                         open: self.connection_is_open(row.id),
+                        cursor: cursor == Some(row.id),
                     }));
                     connections += 1;
                 }
@@ -1136,13 +1160,17 @@ fn host_row_element(
     let number = host.number;
     let id = host.id;
     let selected = host.selected;
+    let cursor = host.cursor;
+    let show_duplicate = host.show_duplicate;
     let hover = theme::swatch(palette::SURFACE_HOVER);
     let pick = weak.clone();
     let connect = weak.clone();
     let forwards = weak.clone();
     let edit = weak.clone();
+    let duplicate = weak.clone();
     let delete = weak.clone();
     let open_row = weak.clone();
+    let menu_row = weak.clone();
     // A row is a line on the page, not a card: the list reads as one surface and the
     // pointer, the selection and the keyboard are what lift a row out of it.
     let mut row = div()
@@ -1162,17 +1190,30 @@ fn host_row_element(
             row.bg(theme::swatch(palette::ACCENT_TINT))
                 .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.35))
         })
-        .when(!selected, |row| {
+        .when(!selected && cursor, |row| {
+            row.bg(theme::swatch(palette::SURFACE_SELECTED))
+                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.5))
+        })
+        .when(!selected && !cursor, |row| {
             row.border_color(theme::clear())
                 .hover(move |style| style.bg(hover))
         })
-        // A double click is the fastest way in: the row is the host, so opening it is
-        // what the row does, and the plug stays for a single, deliberate press.
+        // A single click points at the row; a double click opens it; a right click
+        // offers every action on the record.
         .on_click(move |event, _window, cx| {
             if event.click_count() >= 2 {
                 let _ = open_row.update(cx, |view, cx| view.connect_saved_host(id, cx));
+            } else {
+                let _ = open_row.update(cx, |view, cx| view.point_at_host(id, cx));
             }
         })
+        .on_mouse_down(
+            gpui::MouseButton::Right,
+            move |event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                let _ = menu_row.update(cx, |view, cx| view.open_host_menu(id, event, window, cx));
+            },
+        )
         .child(
             checkbox(selected, metrics)
                 .id(SharedString::from(format!("hosts.select.{number}")))
@@ -1222,7 +1263,8 @@ fn host_row_element(
                         .child(
                             components::copy_on_click(
                                 div()
-                                    .flex_none()
+                                    .min_w(px(0.0))
+                                    .truncate()
                                     .font_family(crate::app::terminal::monospace_family())
                                     .text_size(metrics.caption_size())
                                     .text_color(theme::swatch(palette::TEXT_MUTED)),
@@ -1285,6 +1327,20 @@ fn host_row_element(
                     let _ = edit.update(cx, |view, cx| view.edit_saved_host(id, cx));
                 }),
         )
+        .when(show_duplicate, |tools| {
+            tools.child(
+                components::icon_only_button(Icon::Copy, metrics)
+                    .size(metrics.scale(26.0))
+                    .id(SharedString::from(format!("hosts.duplicate.{number}")))
+                    .debug_selector(move || format!("hosts.duplicate.{number}"))
+                    .tooltip(components::tooltip(strings.connection_duplicate))
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        let _ = duplicate
+                            .update(cx, |view, cx| view.duplicate_saved_connection(id, cx));
+                    }),
+            )
+        })
         .child(
             components::danger_icon_button(Icon::Trash, metrics)
                 .size(metrics.scale(26.0))
@@ -1327,10 +1383,12 @@ fn connection_row_element(
 ) -> Stateful<Div> {
     let number = connection.number;
     let id = connection.id;
+    let cursor = connection.cursor;
     let hover = theme::swatch(palette::SURFACE_HOVER);
     let edit = weak.clone();
     let connect = weak.clone();
     let open_row = weak.clone();
+    let menu_row = weak.clone();
     let copy = weak.clone();
     let delete = weak.clone();
     div()
@@ -1346,16 +1404,30 @@ fn connection_row_element(
         .px(metrics.scale(spacing::TIGHT + 2.0))
         .rounded(px(radius::MEDIUM))
         .border_1()
-        .border_color(theme::clear())
-        .hover(move |style| style.bg(hover))
-        // A double press on the row connects it, as a host row does: the row is the
-        // record, and connecting is what a record is for. Editing stays on the pencil,
-        // so a press can never open a form the user did not ask for.
+        .when(cursor, |row| {
+            row.bg(theme::swatch(palette::SURFACE_SELECTED))
+                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.5))
+        })
+        .when(!cursor, |row| {
+            row.border_color(theme::clear())
+                .hover(move |style| style.bg(hover))
+        })
+        // A single press points at the row; a double press connects it; a right press
+        // opens the record's menu.
         .on_click(move |event, _window, cx| {
             if event.click_count() >= 2 {
                 let _ = open_row.update(cx, |view, cx| view.connect_saved_connection(id, cx));
+            } else {
+                let _ = open_row.update(cx, |view, cx| view.point_at_host(id, cx));
             }
         })
+        .on_mouse_down(
+            gpui::MouseButton::Right,
+            move |event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                let _ = menu_row.update(cx, |view, cx| view.open_host_menu(id, event, window, cx));
+            },
+        )
         .child(super::host_avatar(connection.name.as_ref(), false, metrics))
         .child(
             div()
@@ -1393,11 +1465,17 @@ fn connection_row_element(
                         }),
                 )
                 .child(
-                    div()
-                        .truncate()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                    div().flex().items_center().min_w(px(0.0)).child(
+                        components::copy_on_click(
+                            div()
+                                .truncate()
+                                .font_family(crate::app::terminal::monospace_family())
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED)),
+                            connection.target.to_string(),
+                        )
                         .child(connection.target.clone()),
+                    ),
                 ),
         )
         .child(

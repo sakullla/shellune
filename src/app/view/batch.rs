@@ -3196,6 +3196,7 @@ impl ShelluneView {
     /// # Errors
     ///
     /// Returns the model's refusal when a step cannot be added, such as the step limit.
+    #[cfg(feature = "ui-capture")]
     pub fn capture_batch_commands(
         &mut self,
         commands: &[&str],
@@ -3212,11 +3213,13 @@ impl ShelluneView {
     }
 
     /// Pauses the run on screen.
+    #[cfg(feature = "ui-capture")]
     pub fn capture_batch_pause(&mut self, cx: &mut Context<Self>) {
         self.pause_batch(cx);
     }
 
     /// Asks the run on screen to stop.
+    #[cfg(feature = "ui-capture")]
     pub fn capture_batch_cancel(&mut self, cx: &mut Context<Self>) {
         self.cancel_batch(cx);
     }

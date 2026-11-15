@@ -4,12 +4,12 @@
  * The socket is created here rather than by the library so a cancel can break a
  * blocking connect or handshake without racing the library's own state.
  */
-#include <winsock2.h>
-#include <ws2tcpip.h>
-
 #include "sd_internal.h"
 
 #ifdef SD_WITH_VNC
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include <rfb/rfbclient.h>
 /* rfbLog/rfbLogProc live in the server header; the client header only includes the

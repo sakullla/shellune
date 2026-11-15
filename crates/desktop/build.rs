@@ -61,6 +61,9 @@ fn main() {
     }
 
     build.compile("shellune_desktop_shim");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        println!("cargo:rustc-link-lib=pthread");
+    }
 }
 
 fn configure_native(text: &str, build: &mut cc::Build) {

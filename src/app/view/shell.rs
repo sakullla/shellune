@@ -465,10 +465,10 @@ impl ShelluneView {
                 .items_center()
                 .justify_between()
                 .gap(metrics.scale(spacing::TIGHT))
-                .min_h(px(terminal::SHELL_BAR_HEIGHT))
+                .min_h(metrics.hit_target().max(px(terminal::SHELL_BAR_HEIGHT)))
                 .pl(metrics.scale(spacing::BASE - 2.0))
                 .pr(metrics.scale(spacing::HAIRLINE))
-                .bg(theme::swatch(palette::CANVAS))
+                .bg(theme::swatch(palette::SURFACE))
                 .border_t_1()
                 .border_color(theme::faded(theme::swatch(palette::BORDER), 0.8))
                 .debug_selector(|| "session.bar".to_owned())
@@ -715,9 +715,13 @@ impl ShelluneView {
         // computer. It is capped and scrolls on its own, so the servers and their filters
         // keep the rest of the window instead of being pushed below the fold at the
         // minimum size (R8).
-        let cap = (self.viewport_height * 0.42)
-            .max(metrics.scale(120.0))
-            .min(metrics.scale(260.0));
+        let cap = if self.viewport_height < metrics.scale(320.0) {
+            (self.viewport_height * 0.22).max(metrics.scale(48.0))
+        } else {
+            (self.viewport_height * 0.42)
+                .max(metrics.scale(120.0))
+                .min(metrics.scale(260.0))
+        };
         let header = div()
             .id("home.header")
             .flex()
@@ -735,7 +739,9 @@ impl ShelluneView {
             )
             .child(self.home_local_section(!self.group_column_fits(), cx));
 
+        let short_viewport = self.viewport_height < metrics.scale(320.0);
         let mut column = div()
+            .id("home.scroll")
             .flex()
             .flex_col()
             .flex_1()
@@ -747,6 +753,9 @@ impl ShelluneView {
             .pt(metrics.scale(spacing::SNUG))
             .pb(metrics.scale(spacing::SNUG + 4.0))
             .gap(metrics.scale(spacing::SNUG))
+            .when(short_viewport, |col| {
+                col.overflow_y_scroll().overflow_x_hidden()
+            })
             .debug_selector(|| "home".to_owned())
             .child(header);
 
@@ -2189,6 +2198,7 @@ impl ShelluneView {
             // the text can still be shortened rather than only after a refused save.
             cx.observe(&field, |_view, _field, cx| cx.notify()).detach();
         }
+        TextField::wire_tab_ring(&[name.clone(), body.clone()], cx);
         let handle = name.read(cx).focus_handle().clone();
         self.snippet_panel.begin_edit(SnippetEditor {
             id,

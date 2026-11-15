@@ -156,10 +156,15 @@ impl ShelluneView {
         }
         self.shell_menu_open = false;
         self.tab_menu = None;
+        self.host_menu = None;
         // The field is made per opening so its placeholder is in the current language
         // and no earlier search is waiting in it.
         let placeholder = self.strings().palette_placeholder;
-        let field = cx.new(|cx| TextField::new(placeholder, cx));
+        let field = cx.new(|cx| {
+            let mut field = TextField::new(placeholder, cx);
+            field.set_clearable(true, cx);
+            field
+        });
         cx.observe(&field, |view, field, cx| {
             let query = field.read(cx).text().to_owned();
             if view.palette_query != query {
@@ -975,6 +980,190 @@ impl ShelluneView {
         }
     }
 
+    /// Opens the right-click menu of a saved host or connection row at the pointer.
+    pub(super) fn open_host_menu(
+        &mut self,
+        id: shellune_core::HostId,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shell_menu_open = false;
+        self.tab_menu = None;
+        self.remember_focus(window, cx);
+        self.hosts_cursor = Some(id);
+        self.host_menu = Some((id, event.position));
+        window.focus(&self.root_focus.clone());
+        cx.notify();
+    }
+
+    /// Whether a host right-click menu is open.
+    #[cfg(test)]
+    #[must_use]
+    pub fn host_menu_open(&self) -> bool {
+        self.host_menu.is_some()
+    }
+
+    /// Closes the host right-click menu and restores focus.
+    pub(super) fn close_host_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host_menu.take().is_some() {
+            self.restore_overlay_focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The right-click context menu of a saved host or connection row.
+    pub(super) fn host_menu_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        let (id, position) = self.host_menu?;
+        let record = self.book.connection(id)?;
+        let is_ssh = record.protocol() == shellune_core::ProtocolKind::Ssh;
+        let target = record.target();
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let viewport = window.viewport_size();
+        let item = |label: &'static str, selector: &'static str, danger: bool| {
+            let hover = if danger {
+                theme::swatch(Tone::Danger.tint())
+            } else {
+                theme::swatch(colors::SURFACE_HOVER)
+            };
+            div()
+                .id(selector)
+                .debug_selector(move || selector.to_owned())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(metrics.scale(spacing::BASE))
+                .h(metrics.scale(30.0))
+                .px(metrics.scale(spacing::TIGHT + 2.0))
+                .rounded(px(radius::MEDIUM))
+                .text_size(metrics.label_size())
+                .text_color(if danger {
+                    Tone::Danger.text()
+                } else {
+                    theme::swatch(colors::TEXT_PRIMARY)
+                })
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(label)
+        };
+        let divider = || {
+            div()
+                .h(px(1.0))
+                .mx(metrics.scale(spacing::HAIRLINE))
+                .my(metrics.scale(2.0))
+                .bg(theme::swatch(colors::BORDER))
+        };
+        let max_height =
+            (viewport.height - metrics.header_height() - metrics.scale(spacing::LOOSE))
+                .max(metrics.scale(120.0));
+        let mut menu = div()
+            .id("host.menu")
+            .debug_selector(|| "host.menu".to_owned())
+            .flex()
+            .flex_col()
+            .min_w(metrics.scale(200.0))
+            .max_h(max_height)
+            .overflow_y_scroll()
+            .p(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(colors::SURFACE_RAISED))
+            .border_1()
+            .border_color(theme::swatch(colors::BORDER_STRONG))
+            .shadow_lg()
+            .child(
+                item(strings.remote_connect, "host.menu.connect", false).on_click(cx.listener(
+                    move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.connect_saved_connection(id, cx);
+                    },
+                )),
+            );
+        if is_ssh {
+            menu = menu.child(
+                item(strings.forward_open, "host.menu.forwards", false).on_click(cx.listener(
+                    move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.open_saved_forwards(id, cx);
+                    },
+                )),
+            );
+        }
+        let delete_label = if is_ssh {
+            strings.host_delete
+        } else {
+            strings.connection_delete
+        };
+        menu = menu
+            .child(divider())
+            .child(
+                item(ux.host_copy_target, "host.menu.copy_target", false).on_click(cx.listener(
+                    move |this, _event, window, cx| {
+                        let copied = target.clone();
+                        this.close_host_menu(window, cx);
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied));
+                        window.dispatch_action(Box::new(crate::app::actions::ShowCopied), cx);
+                    },
+                )),
+            )
+            .child(
+                item(strings.host_edit, "host.menu.edit", false).on_click(cx.listener(
+                    move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.edit_saved_connection(id, cx);
+                    },
+                )),
+            )
+            .child(
+                item(strings.connection_duplicate, "host.menu.duplicate", false).on_click(
+                    cx.listener(move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.duplicate_saved_connection(id, cx);
+                    }),
+                ),
+            )
+            .child(divider())
+            .child(
+                item(delete_label, "host.menu.delete", true).on_click(cx.listener(
+                    move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.ask_delete_host(id, cx);
+                    },
+                )),
+            );
+
+        Some(
+            super::overlay_layer().child(
+                div()
+                    .relative()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .child(
+                        div()
+                            .id("host.menu.backdrop")
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .on_any_mouse_down(cx.listener(|this, _event, window, cx| {
+                                this.close_host_menu(window, cx);
+                            })),
+                    )
+                    .child(
+                        gpui::anchored()
+                            .position(clamp_menu(
+                                position,
+                                viewport,
+                                metrics.scale(210.0),
+                                metrics.header_height() + metrics.scale(2.0),
+                            ))
+                            .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                            .child(div().occlude().child(menu)),
+                    ),
+            ),
+        )
+    }
+
     /// Opens another session like `id`: the same shell, or the same host's form.
     pub fn duplicate_session(
         &mut self,
@@ -1634,6 +1823,7 @@ impl ShelluneView {
         }
         self.shell_menu_open = false;
         self.tab_menu = None;
+        self.host_menu = None;
         self.remember_focus(window, cx);
         // The list opens with the keyboard on the tab that is on screen, so Up and Down
         // start from where the user already is and Enter never guesses (R17).

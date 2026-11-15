@@ -582,6 +582,20 @@ impl TerminalCore {
         self.term.selection = Some(selection);
     }
 
+    /// Selects every line from the top of scrollback through the bottom of the screen.
+    pub fn select_all(&mut self) {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        if cols == 0 {
+            return;
+        }
+        let start = Point::new(grid.topmost_line(), Column(0));
+        let end = Point::new(grid.bottommost_line(), Column(cols - 1));
+        let mut selection = Selection::new(SelectionType::Lines, start, Side::Left);
+        selection.update(end, Side::Right);
+        self.term.selection = Some(selection);
+    }
+
     /// A picture of the visible grid.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
@@ -2465,5 +2479,24 @@ mod tests {
         assert_eq!(blocks[1].command, "echo after");
         assert_eq!(blocks[1].output, "after-out");
         assert!(blocks[1].status.is_success());
+    }
+
+    #[test]
+    fn select_all_covers_scrollback_and_visible_rows() {
+        let mut terminal = TerminalCore::new(32, 4, 100);
+        for index in 0..10 {
+            terminal.feed(format!("row-{index}\r\n").as_bytes());
+        }
+        terminal.feed(b"last-row");
+        assert!(terminal.history() > 0, "earlier rows entered scrollback");
+        assert!(!terminal.has_selection());
+
+        terminal.select_all();
+        assert!(terminal.has_selection());
+        let selected = terminal.selection_text().expect("selection text");
+        assert!(
+            selected.contains("row-0") && selected.contains("last-row"),
+            "select_all spans from oldest scrollback row to live bottom: {selected:?}"
+        );
     }
 }

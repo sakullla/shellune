@@ -25,6 +25,158 @@ static __inline char *sd_strdup(const char *text) {
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif !defined(SD_WITH_RDP) && !defined(SD_WITH_VNC)
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
+
+typedef pthread_mutex_t CRITICAL_SECTION;
+typedef int32_t LONG;
+typedef uint32_t DWORD;
+typedef void *LPVOID;
+#define WINAPI
+#ifndef FALSE
+#define FALSE 0
+#endif
+#ifndef TRUE
+#define TRUE 1
+#endif
+#define WAIT_OBJECT_0 0u
+#define WAIT_TIMEOUT 258u
+
+typedef struct sd_posix_handle {
+  int kind; /* 1 = auto-reset event, 2 = thread */
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  int signaled;
+  int exited;
+  pthread_t thread;
+  DWORD (*entry)(LPVOID);
+  LPVOID arg;
+} *HANDLE;
+
+static __inline void InitializeCriticalSection(CRITICAL_SECTION *cs) {
+  pthread_mutex_init(cs, NULL);
+}
+static __inline void DeleteCriticalSection(CRITICAL_SECTION *cs) {
+  pthread_mutex_destroy(cs);
+}
+static __inline void EnterCriticalSection(CRITICAL_SECTION *cs) {
+  pthread_mutex_lock(cs);
+}
+static __inline void LeaveCriticalSection(CRITICAL_SECTION *cs) {
+  pthread_mutex_unlock(cs);
+}
+static __inline LONG InterlockedExchange(volatile LONG *target, LONG value) {
+  return __atomic_exchange_n(target, value, __ATOMIC_SEQ_CST);
+}
+static __inline LONG InterlockedIncrement(volatile LONG *target) {
+  return __atomic_add_fetch(target, 1, __ATOMIC_SEQ_CST);
+}
+static __inline LONG InterlockedDecrement(volatile LONG *target) {
+  return __atomic_sub_fetch(target, 1, __ATOMIC_SEQ_CST);
+}
+static __inline LONG InterlockedCompareExchange(volatile LONG *dest, LONG exch,
+                                                LONG comp) {
+  LONG expected = comp;
+  __atomic_compare_exchange_n(dest, &expected, exch, 0, __ATOMIC_SEQ_CST,
+                              __ATOMIC_SEQ_CST);
+  return expected;
+}
+static __inline HANDLE CreateEventW(void *attr, int manual, int initial,
+                                    const void *name) {
+  (void)attr;
+  (void)manual;
+  (void)name;
+  HANDLE h = (HANDLE)calloc(1, sizeof(struct sd_posix_handle));
+  if (h == NULL) return NULL;
+  h->kind = 1;
+  h->signaled = initial ? 1 : 0;
+  pthread_mutex_init(&h->mutex, NULL);
+  pthread_cond_init(&h->cond, NULL);
+  return h;
+}
+static __inline void SetEvent(HANDLE h) {
+  if (h == NULL || h->kind != 1) return;
+  pthread_mutex_lock(&h->mutex);
+  h->signaled = 1;
+  pthread_cond_signal(&h->cond);
+  pthread_mutex_unlock(&h->mutex);
+}
+static __inline void *sd_posix_thread_trampoline(void *raw) {
+  HANDLE h = (HANDLE)raw;
+  h->entry(h->arg);
+  pthread_mutex_lock(&h->mutex);
+  h->exited = 1;
+  pthread_cond_broadcast(&h->cond);
+  pthread_mutex_unlock(&h->mutex);
+  return NULL;
+}
+static __inline HANDLE CreateThread(void *attr, size_t stack,
+                                    DWORD (*start)(LPVOID), LPVOID arg,
+                                    DWORD flags, DWORD *id) {
+  (void)attr;
+  (void)stack;
+  (void)flags;
+  (void)id;
+  HANDLE h = (HANDLE)calloc(1, sizeof(struct sd_posix_handle));
+  if (h == NULL) return NULL;
+  h->kind = 2;
+  h->entry = start;
+  h->arg = arg;
+  pthread_mutex_init(&h->mutex, NULL);
+  pthread_cond_init(&h->cond, NULL);
+  if (pthread_create(&h->thread, NULL, sd_posix_thread_trampoline, h) != 0) {
+    pthread_cond_destroy(&h->cond);
+    pthread_mutex_destroy(&h->mutex);
+    free(h);
+    return NULL;
+  }
+  return h;
+}
+static __inline DWORD WaitForSingleObject(HANDLE h, DWORD timeout_ms) {
+  if (h == NULL) return WAIT_TIMEOUT;
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_sec += (time_t)(timeout_ms / 1000u);
+  ts.tv_nsec += (long)((timeout_ms % 1000u) * 1000000u);
+  if (ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec += 1;
+    ts.tv_nsec -= 1000000000L;
+  }
+  pthread_mutex_lock(&h->mutex);
+  DWORD result = WAIT_TIMEOUT;
+  if (h->kind == 1) {
+    while (!h->signaled) {
+      if (timeout_ms == 0 ||
+          pthread_cond_timedwait(&h->cond, &h->mutex, &ts) == ETIMEDOUT) {
+        break;
+      }
+    }
+    if (h->signaled) {
+      h->signaled = 0;
+      result = WAIT_OBJECT_0;
+    }
+  } else if (h->kind == 2) {
+    while (!h->exited) {
+      if (timeout_ms == 0 ||
+          pthread_cond_timedwait(&h->cond, &h->mutex, &ts) == ETIMEDOUT) {
+        break;
+      }
+    }
+    if (h->exited) result = WAIT_OBJECT_0;
+  }
+  pthread_mutex_unlock(&h->mutex);
+  return result;
+}
+static __inline void CloseHandle(HANDLE h) {
+  if (h == NULL) return;
+  if (h->kind == 2) pthread_join(h->thread, NULL);
+  pthread_cond_destroy(&h->cond);
+  pthread_mutex_destroy(&h->mutex);
+  free(h);
+}
+static __inline DWORD GetLastError(void) { return (DWORD)errno; }
 #else
 #error "The native desktop shim currently has a verified Windows implementation only."
 #endif
