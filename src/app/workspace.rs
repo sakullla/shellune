@@ -1171,6 +1171,21 @@ impl Workspace {
         self.session(id).map(SessionStatus::of)
     }
 
+    /// Records that a remote session was offered an identity to verify.
+    ///
+    /// Split out from [Self::session_verified_and_authenticated] because a desktop
+    /// connection reports the steps one at a time: the certificate question, the
+    /// sign-in and the desktop being built are three moments a user watches, so the
+    /// record keeps them apart too (R19).
+    pub fn session_verifying_host(&mut self, id: SessionId) -> bool {
+        self.transition(id, |session| session.begin_host_verification().is_ok())
+    }
+
+    /// Records that a remote session is signing in.
+    pub fn session_authenticating(&mut self, id: SessionId) -> bool {
+        self.transition(id, |session| session.begin_authentication().is_ok())
+    }
+
     /// Records that a remote session verified the host identity and authenticated.
     ///
     /// The two steps are one call because they happen in one place: the user

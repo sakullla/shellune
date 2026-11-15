@@ -406,8 +406,6 @@ pub struct Strings {
     pub session_reconnect_not_wired: &'static str,
     /// Said where a selected session has no terminal to draw.
     pub session_no_terminal: &'static str,
-    /// Headline of a desktop pane that is dialling its endpoint.
-    pub desktop_connecting: &'static str,
     /// Headline of a desktop pane that is showing its remote screen.
     pub desktop_live: &'static str,
     /// Headline of a desktop pane whose session ended.
@@ -416,6 +414,24 @@ pub struct Strings {
     pub desktop_certificate_trust: &'static str,
     /// Button that refuses the certificate a desktop server presented.
     pub desktop_certificate_reject: &'static str,
+    /// Step of a desktop connection: the socket is being opened.
+    pub desktop_stage_connecting: &'static str,
+    /// Step of a desktop connection: the server is waiting for a certificate answer.
+    pub desktop_stage_certificate: &'static str,
+    /// Step of a desktop connection: the credentials are being decided.
+    pub desktop_stage_signing_in: &'static str,
+    /// Step of a desktop connection: the desktop itself is being built.
+    pub desktop_stage_establishing: &'static str,
+    /// Control that makes the desktop fill the whole window.
+    pub desktop_fullscreen_enter: &'static str,
+    /// Control that gives the window back its own layout.
+    pub desktop_fullscreen_exit: &'static str,
+    /// Zoom control: show the whole desktop in the space it has.
+    pub desktop_zoom_fit: &'static str,
+    /// Zoom control: one step larger.
+    pub desktop_zoom_in: &'static str,
+    /// Zoom control: one step smaller.
+    pub desktop_zoom_out: &'static str,
 
     /// Button that opens the file view of a remote session.
     pub files_open: &'static str,
@@ -1222,11 +1238,19 @@ pub static ENGLISH: Strings = Strings {
     session_reconnect_missing_host: "The saved host this session used is no longer there, so it cannot be connected to again.",
     session_reconnect_not_wired: "Starting this kind of session is not available yet, so nothing was started.",
     session_no_terminal: "This session has no terminal open",
-    desktop_connecting: "Connecting to the remote desktop",
     desktop_live: "Remote desktop",
     desktop_ended: "The remote desktop session ended",
     desktop_certificate_trust: "Trust and connect",
     desktop_certificate_reject: "Reject",
+    desktop_stage_connecting: "Opening the connection",
+    desktop_stage_certificate: "Waiting for the certificate decision",
+    desktop_stage_signing_in: "Signing in",
+    desktop_stage_establishing: "Building the remote desktop",
+    desktop_fullscreen_enter: "Full screen",
+    desktop_fullscreen_exit: "Leave full screen",
+    desktop_zoom_fit: "Fit",
+    desktop_zoom_in: "Larger",
+    desktop_zoom_out: "Smaller",
     files_open: "Files",
     files_up: "Up",
     files_refresh: "Refresh",
@@ -1709,11 +1733,19 @@ pub static CHINESE: Strings = Strings {
     session_reconnect_missing_host: "该会话使用的主机记录已被删除，无法再次连接。",
     session_reconnect_not_wired: "这类会话暂时还不能启动，所以没有启动任何东西。",
     session_no_terminal: "该会话当前没有终端",
-    desktop_connecting: "正在连接远程桌面",
     desktop_live: "远程桌面",
     desktop_ended: "远程桌面会话已结束",
     desktop_certificate_trust: "信任并连接",
     desktop_certificate_reject: "拒绝",
+    desktop_stage_connecting: "正在建立连接",
+    desktop_stage_certificate: "等待证书确认",
+    desktop_stage_signing_in: "正在认证",
+    desktop_stage_establishing: "正在建立远程桌面",
+    desktop_fullscreen_enter: "全屏",
+    desktop_fullscreen_exit: "退出全屏",
+    desktop_zoom_fit: "适应窗口",
+    desktop_zoom_in: "放大",
+    desktop_zoom_out: "缩小",
     files_open: "文件",
     files_up: "上级",
     files_refresh: "刷新",

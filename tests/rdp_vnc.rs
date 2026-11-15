@@ -204,6 +204,13 @@ enum Outcome {
     Verified(Vec<(&'static str, bool)>),
     /// This build has no backend for the protocol, so nothing was proven.
     Unbuilt(String),
+    /// The endpoint answered but the run did not prove what it was there to prove.
+    ///
+    /// Kept apart from [Self::Failed] so the report can say "not verified, and here
+    /// is why" instead of "wrong": a server that offers no security type this build
+    /// can negotiate proved nothing about encryption, and calling that a pass would
+    /// be the one thing this file must never do.
+    Unverified(String),
     /// The endpoint answered, and the answer was not the one required.
     Failed(String),
 }
@@ -247,6 +254,10 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     let mut failure: Option<Failure> = None;
     let mut first_frame = false;
     let mut certificate_asked = false;
+    // Whether every certificate question the server asked was answered, and whether
+    // the answer went through. A step that is never taken is not a step that passed:
+    // a server that asks for nothing has no answer to prove.
+    let mut certificate_answer_failed = false;
     let deadline = Instant::now() + PATIENCE;
     while Instant::now() < deadline {
         match client.recv_timeout(Duration::from_millis(100)) {
@@ -254,8 +265,12 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                 Event::Certificate { request_id, .. } => {
                     certificate_asked = true;
                     // The matrix trusts the certificate it was pointed at: the
-                    // decision itself is a user's, and the pane asks for it.
-                    let _ = client.answer_certificate(request_id, true);
+                    // decision itself is a user's, and the pane asks for it. An
+                    // answer that does not go through leaves the server waiting,
+                    // which is a failed run and not a silent one.
+                    if client.answer_certificate(request_id, true).is_err() {
+                        certificate_answer_failed = true;
+                    }
                 }
                 Event::Frame { width, height, .. } => {
                     if width > 0 && height > 0 {
@@ -280,8 +295,11 @@ fn verify(endpoint: &Endpoint) -> Outcome {
             Err(_) => continue,
         }
     }
-    steps.push(("authenticated", failure.is_none()));
     if endpoint.kind.expects_refusal() {
+        // For this endpoint a refusal is the required answer, so it is the one that
+        // is reported as passed - with the step it happened on, so the run cannot
+        // claim a sign-in it was meant to lose.
+        steps.push(("refused", failure == Some(Failure::Authentication)));
         return match failure {
             Some(Failure::Authentication) => Outcome::Verified(steps),
             Some(other) => Outcome::Failed(format!(
@@ -298,7 +316,13 @@ fn verify(endpoint: &Endpoint) -> Outcome {
             return Outcome::Failed("the session connected but drew no frame".to_owned());
         }
         steps.push(("first frame", true));
-        steps.push(("certificate answered", certificate_asked || true));
+        // One step per thing the run really did. The certificate step is only
+        // present when a certificate was asked for, and it is true only if the
+        // answer reached the server: an endpoint that asks for nothing does not get
+        // a pass it never earned.
+        if certificate_asked {
+            steps.push(("certificate answered", !certificate_answer_failed));
+        }
         // Input: one key press and one pointer move at the top-left corner, which
         // every desktop has room for.
         let key = client.key(0x1e, 0x61, true, false);
@@ -320,10 +344,14 @@ fn verify(endpoint: &Endpoint) -> Outcome {
     };
     // A failure is the right answer only where it was the expected one.
     match failure {
-        Failure::UnsupportedSecurity if endpoint.kind == Kind::VncTls => {
-            steps.push(("security type refused", true));
-            Outcome::Verified(steps)
-        }
+        // The TLS endpoint exists to prove that an encrypted VNC session can be
+        // opened. A server that answers with a security type this build cannot
+        // negotiate never opened one, so the run proved nothing about encryption:
+        // it is reported as not verified, never as passed.
+        Failure::UnsupportedSecurity if endpoint.kind == Kind::VncTls => Outcome::Unverified(
+            "the server offered no security type this build can negotiate, so no TLS or              VeNCrypt session was opened and encryption was not verified"
+                .to_owned(),
+        ),
         other => Outcome::Failed(format!(
             "{} reported {other:?} before the session was live",
             endpoint.kind.label()
@@ -364,6 +392,9 @@ fn the_endpoint_matrix_reports_every_endpoint_it_could_not_verify() {
                         Protocol::Vnc => "VNC",
                     }
                 )),
+                Outcome::Unverified(reason) => {
+                    unverified.push(format!("{}: not verified ({reason})", kind.label()));
+                }
                 Outcome::Failed(reason) => unverified.push(format!("{}: {reason}", kind.label())),
             },
         }

@@ -99,6 +99,10 @@ mod shell;
 mod titlebar;
 mod toasts;
 
+// The steps a desktop pane reports, for the tests that check the tab, the session
+// bar and the pane all say the same thing (R19).
+#[cfg(test)]
+pub use desktop::{DesktopPhase, DesktopStage};
 #[cfg(test)]
 pub use shell::Tool;
 pub use titlebar::{TRAFFIC_LIGHT_POSITION, custom_titlebar};
@@ -774,6 +778,12 @@ pub struct ShelluneView {
     /// shortcut shows every session instead, which is the only place closed records
     /// and their actions are listed while tabs are open.
     session_terminal: bool,
+    /// The desktop pane that asked for the whole window (R18).
+    ///
+    /// While it is set, the tab strip and the session bar are not drawn: a remote
+    /// desktop that fills the screen is what full screen means, and the pane's own
+    /// controls are what leave it again.
+    desktop_fullscreen: Option<SessionId>,
     /// Whether the sidebar is collapsed to its icons.
     rail_collapsed: bool,
     /// What the user chose for the palette.
@@ -2097,6 +2107,7 @@ impl ShelluneView {
             layout_error: None,
             split_drag: None,
             session_terminal: false,
+            desktop_fullscreen: None,
             #[cfg(test)]
             scripted: Vec::new(),
         };
@@ -2994,6 +3005,13 @@ impl ShelluneView {
         self.pane_for(id)
     }
 
+    /// The desktop pane that asked for the whole window, for the tests (R18).
+    #[cfg(test)]
+    #[must_use]
+    pub fn desktop_fullscreen(&self) -> Option<SessionId> {
+        self.desktop_fullscreen
+    }
+
     /// The desktop surface of one session, for the tests that drive its frames.
     #[cfg(test)]
     #[must_use]
@@ -3407,20 +3425,59 @@ impl ShelluneView {
         else {
             return;
         };
-        let phase = pane.read(cx).phase().clone();
+        let (phase, stage, fullscreen) = {
+            let pane = pane.read(cx);
+            (pane.phase().clone(), pane.stage(), pane.is_fullscreen())
+        };
+        // The whole window belongs to the pane that asked for it, and goes back to
+        // the tab strip the moment that pane stops asking (R18).
+        if fullscreen {
+            self.desktop_fullscreen = Some(session);
+        } else if self.desktop_fullscreen == Some(session) {
+            self.desktop_fullscreen = None;
+        }
         if let Some(failure) = phase.failure() {
             self.workspace.session_failed(session, failure);
-        } else if matches!(phase, desktop::DesktopPhase::Live) {
-            let pending = self
-                .workspace
-                .session(session)
-                .is_some_and(|session| session.state().is_pending());
-            if pending {
-                // The certificate decision and the accepted credentials happen
-                // inside the protocol, so both steps are recorded in one go before
-                // the session is called live (R17).
-                self.workspace.session_verified_and_authenticated(session);
-                self.workspace.session_connected(session);
+        } else {
+            // Each step the protocol reports is its own step in the record, so the
+            // tab and the session bar say "verifying the host" or "signing in"
+            // while it is true instead of jumping from connecting to connected
+            // (R19). A step the record has already passed is refused by the
+            // transition and changes nothing.
+            match stage {
+                desktop::DesktopStage::NotStarted | desktop::DesktopStage::Connecting => {}
+                desktop::DesktopStage::VerifyingCertificate => {
+                    self.workspace.session_verifying_host(session);
+                }
+                desktop::DesktopStage::Authenticating => {
+                    if self
+                        .workspace
+                        .session(session)
+                        .is_some_and(|session| session.state().is_pending())
+                    {
+                        self.workspace.session_verifying_host(session);
+                    }
+                    self.workspace.session_authenticating(session);
+                }
+                desktop::DesktopStage::Establishing => {
+                    let pending = self
+                        .workspace
+                        .session(session)
+                        .is_some_and(|session| session.state().is_pending());
+                    if pending {
+                        // The certificate decision and the accepted credentials
+                        // happen inside the protocol, so both steps are recorded in
+                        // one go when a step skipped reporting them before the
+                        // session reached the desktop (R17).
+                        self.workspace.session_verified_and_authenticated(session);
+                    }
+                    if matches!(phase, desktop::DesktopPhase::Live) {
+                        // Only a picture makes a desktop session live: a server
+                        // that accepted the session and drew nothing is still
+                        // building it, and the record says so.
+                        self.workspace.session_connected(session);
+                    }
+                }
             }
         }
         cx.notify();
@@ -14720,6 +14777,27 @@ impl Render for ShelluneView {
         }
         let metrics = self.metrics();
         let notice = self.notice_strip(cx);
+        // A pane that asked for the whole window and is gone - closed, or failed
+        // out of the tab - gives the window back: the head it hid is the only way
+        // to another tab, so a window stuck without one is not something a user can
+        // leave (R18).
+        if self
+            .desktop_fullscreen
+            .is_some_and(|id| self.desktop_for(id).is_none())
+        {
+            self.desktop_fullscreen = None;
+            if window.is_fullscreen() {
+                window.toggle_fullscreen();
+            }
+        }
+        // In full screen the session keeps the whole window: no tab strip and no
+        // session bar above the picture (R18). The pane's own controls are what
+        // leave it again.
+        let header = if self.desktop_fullscreen.is_some() {
+            None
+        } else {
+            Some(self.session_header(window, cx))
+        };
 
         div()
             .id("shellune.root")
@@ -14951,7 +15029,7 @@ impl Render for ShelluneView {
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
-                    .child(self.session_header(window, cx))
+                    .children(header)
                     .children(notice)
                     .children(self.close_transfer_question(cx))
                     .children(self.close_app_question(cx))

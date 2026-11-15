@@ -22393,3 +22393,662 @@ async fn a_desktop_that_cannot_be_reached_reports_what_the_backend_said(cx: &mut
         "the backend's own sentence is kept beside the session's state"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A desktop pane in the whole window, at a zoom step, and at every step of its
+// connection (R18-R20)
+// ---------------------------------------------------------------------------
+
+/// The saved record of an RDP host that refuses any certificate it cannot trust.
+fn desktop_record_rejecting_certificates(name: &str) -> shellune_core::ConnectionRecord {
+    let mut config = shellune_core::RdpConfig::new(name, "rdp.example.com", Some("desk"))
+        .expect("a valid RDP record");
+    config.set_certificate(shellune_core::RdpCertificatePolicy::Reject);
+    shellune_core::ConnectionRecord::Rdp(config)
+}
+
+/// Applies whatever the scripted link has queued, the way the poll does.
+fn pump_desktop(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: SessionId) {
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            if let Some(pane) = view.desktop_of(id).cloned() {
+                pane.update(cx, |pane, cx| {
+                    pane.pump_once(cx);
+                });
+            }
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// A copy of the canvas, so a test can prove a picture survived a change.
+fn desktop_canvas(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    id: SessionId,
+) -> Vec<u8> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .surface()
+            .pixels()
+            .to_vec()
+    })
+}
+
+/// Gives the desktop pane the keyboard without clicking it.
+fn focus_desktop(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: SessionId) {
+    let handle = cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .focus_handle()
+            .clone()
+    });
+    cx.update(|window, _app| window.focus(&handle));
+    cx.run_until_parked();
+}
+
+/// Draws the window once, the way the next frame will.
+///
+/// A change made from a key or a click is drawn on the frame after the event that
+/// caused it, so a test that reads measured bounds has to ask for that frame.
+fn redraw(cx: &mut VisualTestContext) {
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+}
+
+/// The pointer state the pane sent last.
+fn last_pointer(
+    log: &std::sync::Arc<std::sync::Mutex<crate::app::desktop::scripted::Log>>,
+) -> (u16, u16, Buttons) {
+    let log = log.lock().expect("the log is not poisoned").clone();
+    match log.inputs.last() {
+        Some(DesktopInput::Pointer { x, y, buttons }) => (*x, *y, *buttons),
+        other => panic!("a pointer state was not sent: {other:?}"),
+    }
+}
+
+#[gpui::test]
+async fn a_desktop_pane_takes_the_whole_window_and_gives_it_back(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let desktop = (1600u32, 900u32);
+    let (link, log) = ScriptedLink::new(vec![
+        LinkEvent::State {
+            state: LinkState::Connected,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::Frame(solid(0, 0, 1600, 900, desktop, [12, 34, 56, 255])),
+    ]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    let picture = bounds_of(cx, "desktop.surface");
+    let canvas = desktop_canvas(&view, cx, id);
+    let tag = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .session(id)
+            .map(|session| session.tag())
+    });
+    assert!(
+        cx.debug_bounds("session.header").is_some(),
+        "the tab strip is drawn while the desktop shares the window"
+    );
+
+    // F11 in the pane is the way in (R18).
+    focus_desktop(&view, cx, id);
+    cx.simulate_keystrokes("f11");
+    cx.run_until_parked();
+    redraw(cx);
+
+    assert!(
+        cx.update(|window, _app| window.is_fullscreen()),
+        "the pane asked the window for the whole screen"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_fullscreen()),
+        Some(id),
+        "the pane that asked is the one the window is showing"
+    );
+    let fullscreen = bounds_of(cx, "desktop.surface");
+    assert!(
+        fullscreen.size.height > picture.size.height,
+        "the picture is drawn in the space the tab strip gave back: {fullscreen:?} was {picture:?}"
+    );
+    assert_eq!(
+        fullscreen.origin.y,
+        px(0.0),
+        "nothing is drawn above a full-screen desktop: {fullscreen:?}"
+    );
+    // Nothing was rebuilt to do it: the link is the same one, the picture is the
+    // same pixels, and the tab is the same tab (R18).
+    assert_eq!(
+        desktop_canvas(&view, cx, id),
+        canvas,
+        "the frame that was on screen before full screen is still there"
+    );
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .is_live()
+    }));
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(id)
+            .map(|session| session.tag())),
+        tag,
+        "the tab identity is the one it had before"
+    );
+
+    // The pointer is mapped through the space the picture is drawn in, which is a
+    // different rectangle now: the same inverse still names the drawn pixel.
+    let centre = fullscreen.center();
+    cx.simulate_mouse_down(centre, MouseButton::Left, Modifiers::default());
+    let expected = crate::app::desktop::to_remote(fullscreen, desktop, centre)
+        .expect("the centre of the picture is on the desktop");
+    let (x, y, _buttons) = last_pointer(&log);
+    assert_eq!(
+        (x, y),
+        expected,
+        "a click in full screen names the remote pixel it is over"
+    );
+    cx.simulate_mouse_up(centre, MouseButton::Left, Modifiers::default());
+
+    // F11 again is the way out, and it puts everything back.
+    cx.simulate_keystrokes("f11");
+    cx.run_until_parked();
+    redraw(cx);
+
+    assert!(
+        !cx.update(|window, _app| window.is_fullscreen()),
+        "the window is a window again"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).desktop_fullscreen()),
+        None
+    );
+    let restored = bounds_of(cx, "desktop.surface");
+    assert!(
+        (f32::from(restored.size.height) - f32::from(picture.size.height)).abs() < 1.0
+            && (f32::from(restored.size.width) - f32::from(picture.size.width)).abs() < 1.0,
+        "the pane is back in the space it had: {restored:?} was {picture:?}"
+    );
+    assert_eq!(
+        restored.origin.y, picture.origin.y,
+        "the tab strip is back with the space it took: {restored:?} was {picture:?}"
+    );
+    assert_eq!(
+        desktop_canvas(&view, cx, id),
+        canvas,
+        "the round trip did not lose the picture"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(id)
+            .map(|session| session.tag())),
+        tag,
+        "the tab is where it was"
+    );
+    let log = log.lock().expect("the log is not poisoned").clone();
+    assert_eq!(
+        log.shutdowns, 0,
+        "going in and out of full screen does not rebuild the connection"
+    );
+}
+
+#[gpui::test]
+async fn the_zoom_control_scales_the_picture_and_the_pointer_follows_it(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let desktop = (1600u32, 900u32);
+    let (link, log) = ScriptedLink::new(vec![
+        LinkEvent::State {
+            state: LinkState::Connected,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::Frame(solid(0, 0, 1600, 900, desktop, [7, 7, 7, 255])),
+    ]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    assert!(
+        cx.debug_bounds("desktop.picture").is_none(),
+        "the fit step draws the whole pane, not a placed rectangle"
+    );
+
+    let larger = bounds_of(cx, "desktop.zoom.in").center();
+    cx.simulate_click(larger, Modifiers::default());
+    cx.run_until_parked();
+
+    let (zoom, pan) = cx.update(|_window, app| {
+        let pane = view
+            .read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app);
+        (pane.zoom(), pane.pan())
+    });
+    assert_eq!(
+        zoom,
+        crate::app::desktop::DesktopZoom::Percent(200),
+        "the larger control is one step in on the ladder"
+    );
+    let surface = bounds_of(cx, "desktop.surface");
+    let drawn = bounds_of(cx, "desktop.picture");
+    let expected = crate::app::desktop::content_rect_in(
+        surface,
+        desktop,
+        crate::app::desktop::DesktopZoom::Percent(200),
+        pan,
+    );
+    assert!(
+        (f32::from(drawn.size.width) - f32::from(expected.size.width)).abs() < 1.0
+            && (f32::from(drawn.size.height) - f32::from(expected.size.height)).abs() < 1.0,
+        "the picture is drawn in the rectangle the pointer is mapped through: {drawn:?} was {expected:?}"
+    );
+    assert!(
+        drawn.size.width > surface.size.width,
+        "a zoom step larger than the pane is cropped by it rather than shrunk back"
+    );
+
+    // The centre of the space is the centre of the remote desktop at any zoom.
+    let centre = surface.center();
+    cx.simulate_mouse_down(centre, MouseButton::Left, Modifiers::default());
+    let (x, y, _buttons) = last_pointer(&log);
+    assert_eq!(
+        (x, y),
+        (800, 450),
+        "a click at the centre of a zoomed picture is the centre of the desktop"
+    );
+    cx.simulate_mouse_up(centre, MouseButton::Left, Modifiers::default());
+
+    // Smaller steps back to the fit, and the fit is the whole desktop again.
+    let smaller = bounds_of(cx, "desktop.zoom.out").center();
+    for _ in 0..crate::app::desktop::DesktopZoom::LADDER.len() {
+        cx.simulate_click(smaller, Modifiers::default());
+        cx.run_until_parked();
+    }
+    let zoom = cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .zoom()
+    });
+    assert_eq!(
+        zoom,
+        crate::app::desktop::DesktopZoom::Fit,
+        "a fit picture is where zooming out ends"
+    );
+}
+
+#[gpui::test]
+async fn a_certificate_that_may_not_be_trusted_is_refused_at_once_and_releases_the_worker(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(vec![LinkEvent::Certificate {
+        request_id: 9,
+        host: "rdp.example.com".to_owned(),
+        subject: "CN=rdp".to_owned(),
+        issuer: "CN=ca".to_owned(),
+        fingerprint: "AA:BB".to_owned(),
+        flags: 1,
+    }]);
+    let record = desktop_record_rejecting_certificates("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+
+    let log = log.lock().expect("the log is not poisoned").clone();
+    assert_eq!(
+        log.answers,
+        vec![(9, false)],
+        "the refusal reached the server, with the request id it asked about"
+    );
+    assert_eq!(
+        log.shutdowns, 1,
+        "the worker is stopped instead of being held while the server waits"
+    );
+    let (state, phase, stage) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app);
+        (
+            view.workspace()
+                .session(id)
+                .map(|session| session.state().clone()),
+            pane.phase().clone(),
+            pane.failed_stage(),
+        )
+    });
+    assert_eq!(
+        state,
+        Some(SessionState::Failed(SessionFailure::HostKeyRejected)),
+        "the record says the certificate was refused"
+    );
+    assert!(
+        matches!(phase, crate::app::view::DesktopPhase::Ended(_)),
+        "the pane ended instead of staying in a connecting step"
+    );
+    assert_eq!(
+        stage,
+        Some(crate::app::view::DesktopStage::VerifyingCertificate),
+        "the step it stopped on is the one it was on"
+    );
+}
+
+#[gpui::test]
+async fn refusing_the_certificate_on_screen_answers_the_server_and_releases_the_connection(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(vec![LinkEvent::Certificate {
+        request_id: 4,
+        host: "rdp.example.com".to_owned(),
+        subject: "CN=rdp".to_owned(),
+        issuer: "CN=ca".to_owned(),
+        fingerprint: "CC:DD".to_owned(),
+        flags: 0,
+    }]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    assert!(
+        cx.debug_bounds("desktop.certificate").is_some(),
+        "the question is on screen before an answer is given"
+    );
+
+    let reject = bounds_of(cx, "desktop.certificate.reject").center();
+    cx.simulate_click(reject, Modifiers::default());
+    cx.run_until_parked();
+
+    let log = log.lock().expect("the log is not poisoned").clone();
+    assert_eq!(log.answers, vec![(4, false)], "the answer the user gave");
+    assert_eq!(
+        log.shutdowns, 1,
+        "a refused certificate does not leave the worker holding the connection"
+    );
+    let state = cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .session(id)
+            .map(|session| session.state().clone())
+    });
+    assert_eq!(
+        state,
+        Some(SessionState::Failed(SessionFailure::HostKeyRejected))
+    );
+}
+
+#[gpui::test]
+async fn a_clipboard_that_cannot_be_sent_is_stated_over_the_live_picture(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let desktop = (1600u32, 900u32);
+    let (link, _log) = ScriptedLink::failing_after(
+        vec![
+            LinkEvent::State {
+                state: LinkState::Connected,
+                failure: LinkFailure::None,
+                detail: 0,
+                reason: String::new(),
+            },
+            LinkEvent::Frame(solid(0, 0, 1600, 900, desktop, [3, 3, 3, 255])),
+        ],
+        crate::app::desktop::LinkError::State,
+    );
+    let feed = link.feed();
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    assert!(
+        cx.debug_bounds("desktop.notice").is_none(),
+        "nothing is wrong before anything was sent"
+    );
+
+    // An RDP connection cannot carry clipboard text upwards, so this paste cannot
+    // reach the remote side. It used to be dropped without a word because the only
+    // place the sentence was drawn is hidden by the picture itself.
+    focus_desktop(&view, cx, id);
+    cx.write_to_clipboard(ClipboardItem::new_string("pasted".to_owned()));
+    cx.simulate_keystrokes("ctrl-v");
+    cx.run_until_parked();
+    redraw(cx);
+
+    let notice = bounds_of(cx, "desktop.notice");
+    assert!(
+        notice.size.width > px(0.0) && notice.size.height > px(0.0),
+        "the sentence is drawn beside the picture that is already on screen"
+    );
+    // The next frame is not an answer to the failed send: it must not take the
+    // sentence away before it can be read.
+    feed.feed(vec![LinkEvent::Frame(solid(
+        0,
+        0,
+        8,
+        8,
+        desktop,
+        [9, 9, 9, 255],
+    ))]);
+    pump_desktop(&view, cx, id);
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("desktop.notice").is_some(),
+        "a frame that arrived does not clear a send that did not"
+    );
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .is_live()
+    }));
+}
+
+#[gpui::test]
+async fn a_desktop_connection_names_each_step_before_the_picture(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let desktop = (1600u32, 900u32);
+    let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
+        state: LinkState::Connecting,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    }]);
+    let feed = link.feed();
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+
+    let step = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            let view = view.read(app);
+            let pane = view
+                .desktop_of(id)
+                .expect("the surface is mounted")
+                .read(app);
+            (
+                pane.stage(),
+                view.workspace()
+                    .session(id)
+                    .map(|session| session.state().clone()),
+            )
+        })
+    };
+
+    let (stage, state) = step(cx);
+    assert_eq!(
+        stage,
+        crate::app::view::DesktopStage::Connecting,
+        "the first step is the connection itself"
+    );
+    assert_eq!(state, Some(SessionState::Connecting));
+    assert!(
+        cx.debug_bounds("desktop.status").is_some(),
+        "the step is stated on screen"
+    );
+
+    // The server asks about its certificate.
+    feed.feed(vec![LinkEvent::Certificate {
+        request_id: 2,
+        host: "rdp.example.com".to_owned(),
+        subject: "CN=rdp".to_owned(),
+        issuer: "CN=ca".to_owned(),
+        fingerprint: "EE:FF".to_owned(),
+        flags: 0,
+    }]);
+    pump_desktop(&view, cx, id);
+    let (stage, state) = step(cx);
+    assert_eq!(stage, crate::app::view::DesktopStage::VerifyingCertificate);
+    assert_eq!(
+        state,
+        Some(SessionState::VerifyingHost),
+        "the record says the host identity is being verified, not that it is connected"
+    );
+    assert!(cx.debug_bounds("desktop.certificate").is_some());
+
+    // The user accepts it, and the sign-in is the step after that.
+    let trust = bounds_of(cx, "desktop.certificate.trust").center();
+    cx.simulate_click(trust, Modifiers::default());
+    cx.run_until_parked();
+    let (stage, state) = step(cx);
+    assert_eq!(stage, crate::app::view::DesktopStage::Authenticating);
+    assert_eq!(state, Some(SessionState::Authenticating));
+
+    // The protocol accepts the session; the desktop itself is still being built.
+    feed.feed(vec![LinkEvent::State {
+        state: LinkState::Connected,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    }]);
+    pump_desktop(&view, cx, id);
+    let (stage, state) = step(cx);
+    assert_eq!(stage, crate::app::view::DesktopStage::Establishing);
+    assert_eq!(
+        state,
+        Some(SessionState::Authenticating),
+        "a session with no picture is not called connected"
+    );
+    assert!(!cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .is_live()
+    }));
+
+    // The first frame is the moment it is live.
+    feed.feed(vec![LinkEvent::Frame(solid(
+        0,
+        0,
+        1600,
+        900,
+        desktop,
+        [1, 1, 1, 255],
+    ))]);
+    pump_desktop(&view, cx, id);
+    let (_stage, state) = step(cx);
+    assert_eq!(state, Some(SessionState::Connected));
+
+    // Every step has its own words, so the card cannot say the same thing twice.
+    let english = Locale::English.strings();
+    let words = [
+        crate::app::view::DesktopStage::Connecting,
+        crate::app::view::DesktopStage::VerifyingCertificate,
+        crate::app::view::DesktopStage::Authenticating,
+        crate::app::view::DesktopStage::Establishing,
+    ]
+    .map(|stage| stage.headline(english));
+    let mut unique = words.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        words.len(),
+        "the steps are told apart: {words:?}"
+    );
+    assert_eq!(
+        crate::app::view::DesktopStage::VerifyingCertificate.headline(english),
+        "Waiting for the certificate decision"
+    );
+    assert_eq!(
+        crate::app::view::DesktopStage::Authenticating.headline(Locale::Chinese.strings()),
+        "正在认证"
+    );
+    assert!(
+        !crate::app::view::DesktopStage::Establishing
+            .headline(english)
+            .is_empty(),
+        "the last step has words of its own too"
+    );
+}
+
+#[gpui::test]
+async fn a_desktop_that_failed_while_signing_in_says_which_step_it_stopped_on(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(vec![
+        LinkEvent::Certificate {
+            request_id: 5,
+            host: "rdp.example.com".to_owned(),
+            subject: "CN=rdp".to_owned(),
+            issuer: "CN=ca".to_owned(),
+            fingerprint: "11:22".to_owned(),
+            flags: 0,
+        },
+        LinkEvent::State {
+            state: LinkState::Failed(LinkFailure::Authentication),
+            failure: LinkFailure::Authentication,
+            detail: 0,
+            reason: "the server rejected the logon".to_owned(),
+        },
+    ]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    let (stage, state, reason) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app);
+        (
+            pane.failed_stage(),
+            view.workspace()
+                .session(id)
+                .map(|session| session.state().clone()),
+            view.workspace()
+                .status(id)
+                .and_then(|status| status.diagnostic().map(str::to_owned)),
+        )
+    });
+    assert_eq!(
+        stage,
+        Some(crate::app::view::DesktopStage::VerifyingCertificate),
+        "the run stopped on the certificate step, so that is the step it names"
+    );
+    assert_eq!(
+        state,
+        Some(SessionState::Failed(SessionFailure::AuthenticationFailed))
+    );
+    assert!(
+        reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("credentials")),
+        "the reason is stated beside the step: {reason:?}"
+    );
+    assert!(
+        cx.debug_bounds("desktop.status").is_some(),
+        "the ended session keeps its card, and the card names the step"
+    );
+}

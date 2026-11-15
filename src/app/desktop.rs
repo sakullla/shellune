@@ -943,11 +943,78 @@ pub fn key_codes(key: &str) -> Option<KeyCodes> {
     None
 }
 
+/// How the picture is scaled into the space the window gives it (R18).
+///
+/// The ladder is fixed instead of free: every step is a value a user can name in
+/// the status line, and Fit is the state a pane starts in. A step above Fit makes
+/// the picture larger than the space it is drawn in, which is why a zoomed picture
+/// is panned rather than silently cropped - see [content_rect_in].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DesktopZoom {
+    /// The whole desktop, as large as it fits without cropping (the default).
+    #[default]
+    Fit,
+    /// A fixed percentage of the remote pixels.
+    Percent(u16),
+}
+
+impl DesktopZoom {
+    /// Every step of the ladder, smallest first.
+    pub const LADDER: [u16; 5] = [50, 75, 100, 150, 200];
+
+    /// The next step in, when there is one.
+    #[must_use]
+    pub fn zoomed_in(self) -> Self {
+        match self {
+            // Coming from Fit, the largest step is the useful one: the user asked
+            // for a bigger picture, not for the first rung of a ladder.
+            Self::Fit => Self::Percent(Self::LADDER[Self::LADDER.len() - 1]),
+            Self::Percent(current) => Self::Percent(
+                Self::LADDER
+                    .iter()
+                    .copied()
+                    .find(|step| *step > current)
+                    .unwrap_or(current),
+            ),
+        }
+    }
+
+    /// The next step out, which is Fit once the smallest step is passed.
+    #[must_use]
+    pub fn zoomed_out(self) -> Self {
+        match self {
+            Self::Fit => Self::Fit,
+            Self::Percent(current) => Self::LADDER
+                .iter()
+                .copied()
+                .rev()
+                .find(|step| *step < current)
+                .map_or(Self::Fit, Self::Percent),
+        }
+    }
+
+    /// Whether this is the fit-the-window step.
+    #[must_use]
+    pub fn is_fit(self) -> bool {
+        matches!(self, Self::Fit)
+    }
+
+    /// The percentage of the remote pixels, when this step names one.
+    #[must_use]
+    pub fn percent(self) -> Option<u16> {
+        match self {
+            Self::Fit => None,
+            Self::Percent(percent) => Some(percent),
+        }
+    }
+}
+
 /// The rectangle a desktop of that size fills inside a viewport.
 ///
 /// Asked of GPUI's own ObjectFit, so the pixel the window draws and the pixel the
 /// pointer is mapped through cannot disagree: the image is drawn with
-/// ObjectFit::Contain, and this is that same fit's geometry.
+/// ObjectFit::Contain, and this is that same fit's geometry. This is the Fit step
+/// of [DesktopZoom].
 #[must_use]
 pub fn content_rect(viewport: Bounds<Pixels>, desktop: (u32, u32)) -> Bounds<Pixels> {
     if desktop.0 == 0 || desktop.1 == 0 {
@@ -962,21 +1029,70 @@ pub fn content_rect(viewport: Bounds<Pixels>, desktop: (u32, u32)) -> Bounds<Pix
     )
 }
 
+/// The rectangle a desktop is drawn in at a zoom step, panned by that many pixels.
+///
+/// Fit is [content_rect]. A percentage draws the remote pixels at a fixed size and
+/// centres the result in the viewport; a picture larger than the viewport is
+/// cropped by it, and the pan is clamped so the picture always covers the viewport
+/// and never leaves a gap beside itself.
+#[must_use]
+pub fn content_rect_in(
+    viewport: Bounds<Pixels>,
+    desktop: (u32, u32),
+    zoom: DesktopZoom,
+    pan: (f32, f32),
+) -> Bounds<Pixels> {
+    let DesktopZoom::Percent(percent) = zoom else {
+        return content_rect(viewport, desktop);
+    };
+    if desktop.0 == 0 || desktop.1 == 0 {
+        return viewport;
+    }
+    let factor = f32::from(percent) / 100.0;
+    let width = desktop.0 as f32 * factor;
+    let height = desktop.1 as f32 * factor;
+    let (pan_x, pan_y) = clamp_pan(viewport, (width, height), pan);
+    Bounds {
+        origin: gpui::point(
+            viewport.origin.x + (viewport.size.width - px(width)) / 2.0 + px(pan_x),
+            viewport.origin.y + (viewport.size.height - px(height)) / 2.0 + px(pan_y),
+        ),
+        size: size(px(width), px(height)),
+    }
+}
+
+/// How far a picture of that size may be panned inside a viewport.
+///
+/// The bound is the overhang on each axis: a picture smaller than the viewport
+/// cannot move at all, and one larger than it covers the viewport everywhere
+/// between the two limits. Half of it is the offset from the centred position.
+#[must_use]
+pub fn clamp_pan(viewport: Bounds<Pixels>, picture: (f32, f32), pan: (f32, f32)) -> (f32, f32) {
+    let limit = |space: f32, extent: f32| ((extent - space).max(0.0)) / 2.0;
+    let x = limit(f32::from(viewport.size.width), picture.0);
+    let y = limit(f32::from(viewport.size.height), picture.1);
+    (pan.0.clamp(-x, x), pan.1.clamp(-y, y))
+}
+
 /// The remote pixel under a window position, or None when the position is in the
 /// letterbox around the picture.
 ///
-/// This is the inverse of content_rect: the same offset and the same scale, so a
-/// click on the drawn pixel reports the remote pixel that was drawn there.
+/// This is the inverse of content_rect_in: the same offset and the same scale, so
+/// a click on the drawn pixel reports the remote pixel that was drawn there. It
+/// stays true at every zoom step and under any pan, which is what makes the
+/// pointer usable while the picture is scaled or the window is full screen.
 #[must_use]
-pub fn to_remote(
+pub fn to_remote_in(
     viewport: Bounds<Pixels>,
     desktop: (u32, u32),
+    zoom: DesktopZoom,
+    pan: (f32, f32),
     position: gpui::Point<Pixels>,
 ) -> Option<(u16, u16)> {
     if desktop.0 == 0 || desktop.1 == 0 || viewport.size.width <= px(0.0) {
         return None;
     }
-    let rect = content_rect(viewport, desktop);
+    let rect = content_rect_in(viewport, desktop, zoom, pan);
     if !rect.contains(&position) {
         return None;
     }
@@ -990,6 +1106,17 @@ pub fn to_remote(
     let x = x.floor().clamp(0.0, (desktop.0 - 1) as f32) as u16;
     let y = y.floor().clamp(0.0, (desktop.1 - 1) as f32) as u16;
     Some((x, y))
+}
+
+/// The remote pixel under a window position at the Fit step.
+#[cfg_attr(not(test), allow(dead_code))]
+#[must_use]
+pub fn to_remote(
+    viewport: Bounds<Pixels>,
+    desktop: (u32, u32),
+    position: gpui::Point<Pixels>,
+) -> Option<(u16, u16)> {
+    to_remote_in(viewport, desktop, DesktopZoom::Fit, (0.0, 0.0), position)
 }
 
 /// One protocol implementation, behind the seam the surface talks to.
@@ -1275,9 +1402,27 @@ pub mod scripted {
         pub clipboard: Vec<String>,
     }
 
+    /// The queue a scripted link reads, so a test can hand the pane more events
+    /// after it has started - a second frame, a failure - the way a live peer does.
+    #[derive(Clone)]
+    pub struct ScriptedFeed {
+        events: Arc<Mutex<Vec<LinkEvent>>>,
+    }
+
+    impl ScriptedFeed {
+        /// Appends events to what the link will report on its next drain.
+        pub fn feed(&self, mut events: Vec<LinkEvent>) {
+            let mut queue = match self.events.lock() {
+                Ok(queue) => queue,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            queue.append(&mut events);
+        }
+    }
+
     /// A link backed by a queue and a log.
     pub struct ScriptedLink {
-        events: Vec<LinkEvent>,
+        events: Arc<Mutex<Vec<LinkEvent>>>,
         log: Arc<Mutex<Log>>,
         /// When set, every send fails with this error.
         fail: Option<LinkError>,
@@ -1289,7 +1434,7 @@ pub mod scripted {
             let log = Arc::new(Mutex::new(Log::default()));
             (
                 Self {
-                    events,
+                    events: Arc::new(Mutex::new(events)),
                     log: log.clone(),
                     fail: None,
                 },
@@ -1302,6 +1447,20 @@ pub mod scripted {
             let (mut link, log) = Self::new(Vec::new());
             link.fail = Some(error);
             (link, log)
+        }
+
+        /// A link that reports these events and then fails every send.
+        pub fn failing_after(events: Vec<LinkEvent>, error: LinkError) -> (Self, Arc<Mutex<Log>>) {
+            let (mut link, log) = Self::new(events);
+            link.fail = Some(error);
+            (link, log)
+        }
+
+        /// A handle that can add events after the pane has started.
+        pub fn feed(&self) -> ScriptedFeed {
+            ScriptedFeed {
+                events: self.events.clone(),
+            }
         }
 
         fn record(&self, input: DesktopInput) -> Result<(), LinkError> {
@@ -1326,7 +1485,10 @@ pub mod scripted {
         }
 
         fn drain(&mut self) -> Vec<LinkEvent> {
-            std::mem::take(&mut self.events)
+            match self.events.lock() {
+                Ok(mut queue) => std::mem::take(&mut *queue),
+                Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+            }
         }
 
         fn key(&self, codes: KeyCodes, down: bool) -> Result<(), LinkError> {
@@ -1442,6 +1604,116 @@ mod tests {
         assert_eq!(
             to_remote(window, desktop, point(px(500.0), px(500.0))),
             Some((400, 600))
+        );
+    }
+
+    #[test]
+    fn the_zoom_ladder_steps_one_rung_at_a_time_and_fit_is_the_way_back() {
+        assert_eq!(DesktopZoom::default(), DesktopZoom::Fit);
+        assert_eq!(DesktopZoom::Fit.zoomed_in(), DesktopZoom::Percent(200));
+        assert_eq!(
+            DesktopZoom::Percent(200).zoomed_out(),
+            DesktopZoom::Percent(150)
+        );
+        assert_eq!(
+            DesktopZoom::Percent(100).zoomed_in(),
+            DesktopZoom::Percent(150)
+        );
+        assert_eq!(
+            DesktopZoom::Percent(50).zoomed_out(),
+            DesktopZoom::Fit,
+            "below the smallest step the picture goes back to fitting the window"
+        );
+        assert_eq!(
+            DesktopZoom::Fit.zoomed_out(),
+            DesktopZoom::Fit,
+            "the fit step is where zooming out stops"
+        );
+        assert_eq!(
+            DesktopZoom::Percent(200).zoomed_in(),
+            DesktopZoom::Percent(200)
+        );
+        assert_eq!(DesktopZoom::Fit.percent(), None);
+        assert_eq!(DesktopZoom::Percent(150).percent(), Some(150));
+    }
+
+    #[test]
+    fn a_zoom_step_draws_the_remote_pixels_at_that_size_and_maps_them_back() {
+        let desktop = (1600, 900);
+        let window = viewport(800.0, 600.0);
+        let rect = content_rect_in(window, desktop, DesktopZoom::Percent(200), (0.0, 0.0));
+        assert_eq!(f32::from(rect.size.width), 3200.0);
+        assert_eq!(f32::from(rect.size.height), 1800.0);
+        assert_eq!(
+            f32::from(rect.origin.x),
+            -1200.0,
+            "a picture larger than the window is centred on it"
+        );
+        assert_eq!(
+            to_remote_in(
+                window,
+                desktop,
+                DesktopZoom::Percent(200),
+                (0.0, 0.0),
+                point(px(400.0), px(300.0))
+            ),
+            Some((800, 450)),
+            "the window centre is still the remote centre at 200%"
+        );
+    }
+
+    #[test]
+    fn panning_a_zoomed_picture_moves_the_pixel_the_pointer_names() {
+        let desktop = (1600, 900);
+        let window = viewport(800.0, 600.0);
+        let zoom = DesktopZoom::Percent(200);
+        assert_eq!(
+            to_remote_in(
+                window,
+                desktop,
+                zoom,
+                (0.0, 0.0),
+                point(px(400.0), px(300.0))
+            ),
+            Some((800, 450))
+        );
+        assert_eq!(
+            to_remote_in(
+                window,
+                desktop,
+                zoom,
+                (200.0, 100.0),
+                point(px(400.0), px(300.0))
+            ),
+            Some((700, 400)),
+            "a picture moved right and down puts an earlier remote pixel under the same spot"
+        );
+        // The pan is bounded by the overhang, so the picture always covers the window.
+        assert_eq!(
+            clamp_pan(window, (3200.0, 1800.0), (5000.0, -5000.0)),
+            (1200.0, -600.0)
+        );
+    }
+
+    #[test]
+    fn a_picture_smaller_than_the_window_cannot_be_panned_and_keeps_its_letterbox() {
+        let desktop = (1600, 900);
+        let window = viewport(800.0, 600.0);
+        let zoom = DesktopZoom::Percent(50);
+        let rect = content_rect_in(window, desktop, zoom, (100.0, 100.0));
+        assert_eq!(f32::from(rect.size.width), 800.0);
+        assert_eq!(f32::from(rect.size.height), 450.0);
+        assert_eq!(f32::from(rect.origin.y), 75.0);
+        assert_eq!(
+            to_remote_in(
+                window,
+                desktop,
+                zoom,
+                (100.0, 100.0),
+                point(px(400.0), px(10.0))
+            ),
+            None,
+            "the letterbox around a zoomed-out picture is not part of the desktop"
         );
     }
 
