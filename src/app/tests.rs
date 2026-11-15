@@ -25715,6 +25715,42 @@ async fn a_text_commit_on_a_serial_pane_echoes_once_and_rewrites_only_its_own_br
 }
 
 #[gpui::test]
+async fn serial_queue_refusal_does_not_echo_unsent_text(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let port = shellune_serial::testing::fake(
+        "COM3",
+        shellune_serial::testing::FakeSpec::new().holding_writes(),
+    );
+    let session = shellune_serial::testing::session_over_with(
+        port,
+        shellune_serial::SerialConfig::default(),
+        shellune_serial::SessionLimits {
+            queued_bytes: 4,
+            ..Default::default()
+        },
+    );
+    let id = mount_scripted_serial(
+        &view,
+        cx,
+        "console",
+        "COM3",
+        true,
+        SerialLink::holding(session),
+    );
+    cx.update(|_window, app| {
+        let pane = view.read(app).pane_of(id).unwrap().clone();
+        pane.update(app, |pane, cx| {
+            pane.type_text("sent", cx);
+            pane.type_text("refused", cx);
+            let shown = pane.visible_text().join("\n");
+            assert!(shown.contains("sent"));
+            assert!(!shown.contains("refused"));
+            assert!(pane.state().accepts_input());
+        });
+    });
+}
+
+#[gpui::test]
 async fn a_closed_serial_tab_still_says_which_frames_never_left(cx: &mut TestAppContext) {
     // A driver that takes the first frame and then holds it: the second frame is still in
     // the queue when the tab closes, which is the case a person has to be told about.

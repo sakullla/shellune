@@ -21,13 +21,15 @@
 //! with [`Error::Unavailable`] instead of pretending to connect.
 
 mod ffi;
+mod mailbox;
 
+use mailbox::Mailbox;
 use std::ffi::{CStr, CString, c_void};
 use std::fmt;
 use std::os::raw::c_char;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use ffi::SD_ABI_VERSION;
@@ -305,16 +307,15 @@ fn check_abi() -> Result<(), Error> {
     }
 }
 
-/// Where a translated event goes. A channel is the normal shape; a closure lets a
+/// Where a translated event goes. A mailbox is the normal shape; a closure lets a
 /// caller consume events without a queue, and is also how the native tests prove a
 /// panicking consumer cannot unwind into the protocol library.
 enum Sink {
-    Channel(Sender<Event>),
+    Channel(Arc<Mailbox>),
     Handler(Mutex<Box<dyn FnMut(Event) + Send>>),
 }
 
-/// Owns the sink the shim's callback pushes into. Dropping it closes the channel,
-/// which is how a consumer learns that no further event can arrive.
+/// Owns the sink the shim's callback pushes into.
 struct Inbox {
     sink: Sink,
 }
@@ -323,9 +324,9 @@ impl Inbox {
     fn deliver(&self, event: Event) {
         match &self.sink {
             Sink::Channel(sender) => {
-                // A closed receiver means the consumer is gone; the protocol work
-                // goes on, so nothing is retried here.
-                let _ = sender.send(event);
+                // Compositing is bounded and never waits for the UI: the shim
+                // holds its dispatch lock while this callback runs.
+                sender.deliver(event);
             }
             Sink::Handler(handler) => {
                 // A poisoned lock means the previous call panicked. The trampoline
@@ -349,7 +350,7 @@ pub struct DesktopClient {
     protocol: Protocol,
     handle: *mut ffi::sd_client,
     inbox: *mut Inbox,
-    receiver: Option<Receiver<Event>>,
+    receiver: Option<Arc<Mailbox>>,
     state: State,
 }
 
@@ -358,10 +359,12 @@ pub struct DesktopClient {
 unsafe impl Send for DesktopClient {}
 
 impl DesktopClient {
-    /// A session whose events arrive on a channel; read them with
+    /// A session with a bounded mailbox. Unconsumed frames are composited into
+    /// the latest dirty region; intermediate video frames are coalesced. Read with
     /// [`DesktopClient::recv_timeout`] or [`DesktopClient::track_state`].
     pub fn new(protocol: Protocol) -> Result<DesktopClient, Error> {
-        let (sender, receiver) = mpsc::channel();
+        let receiver = Arc::new(Mailbox::default());
+        let sender = Arc::clone(&receiver);
         DesktopClient::create(protocol, Sink::Channel(sender), Some(receiver))
     }
 
@@ -381,7 +384,7 @@ impl DesktopClient {
     fn create(
         protocol: Protocol,
         sink: Sink,
-        receiver: Option<Receiver<Event>>,
+        receiver: Option<Arc<Mailbox>>,
     ) -> Result<DesktopClient, Error> {
         check_abi()?;
         backend_info(protocol)?;
@@ -564,7 +567,7 @@ impl DesktopClient {
         let Some(receiver) = &self.receiver else {
             return events;
         };
-        while let Ok(event) = receiver.try_recv() {
+        for event in receiver.drain() {
             if let Event::State { state, .. } = &event {
                 self.state = *state;
             }
@@ -699,7 +702,12 @@ fn frame(event: &ffi::sd_event) -> Option<Event> {
     if bytes > MAX_FRAME_BYTES {
         return None;
     }
-    let pixels = unsafe { std::slice::from_raw_parts(event.pixels, bytes) }.to_vec();
+    // Copy only the dirty pixels, not the untouched desktop columns between rows.
+    let source = unsafe { std::slice::from_raw_parts(event.pixels, bytes) };
+    let mut pixels = Vec::with_capacity(row * height as usize);
+    for y in 0..height as usize {
+        pixels.extend_from_slice(&source[y * stride..y * stride + row]);
+    }
     Some(Event::Frame {
         x: event.x,
         y: event.y,
@@ -707,7 +715,7 @@ fn frame(event: &ffi::sd_event) -> Option<Event> {
         height,
         desktop_width: event.width,
         desktop_height: event.height,
-        stride: event.stride,
+        stride: row as u32,
         pixels,
     })
 }
@@ -752,4 +760,33 @@ pub fn failure_name(failure: Failure) -> String {
     unsafe { CStr::from_ptr(ffi::sd_failure_name(failure.raw())) }
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    #[test]
+    fn narrow_dirty_regions_do_not_copy_desktop_stride_padding() {
+        let mut source = [99u8; 64];
+        for row in 0..4 {
+            source[row * 16..row * 16 + 4].fill(row as u8);
+        }
+        // Zero is valid for every integer and pointer field in this ABI record.
+        let mut raw: ffi::sd_event = unsafe { std::mem::zeroed() };
+        raw.w = 1;
+        raw.h = 4;
+        raw.width = 4;
+        raw.height = 4;
+        raw.stride = 16;
+        raw.pixels = source.as_ptr();
+        let Event::Frame { stride, pixels, .. } = frame(&raw).unwrap() else {
+            panic!("frame");
+        };
+        assert_eq!(stride, 4);
+        assert_eq!(
+            pixels,
+            [vec![0; 4], vec![1; 4], vec![2; 4], vec![3; 4]].concat()
+        );
+    }
 }

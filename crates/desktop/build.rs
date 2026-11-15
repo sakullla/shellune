@@ -36,6 +36,12 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
         build.file(path);
     }
+    for header in ["sd_internal.h", "shellune_desktop_shim.h"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join("shim").join(header).display()
+        );
+    }
     build.include(manifest_dir.join("shim"));
     build.define("_CRT_SECURE_NO_WARNINGS", None);
     // The vendored headers are not warning-clean under MSVC /W4, and they are not

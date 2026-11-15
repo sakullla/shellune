@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SD_CONNECT_TIMEOUT_MS 10000u
+#define SD_CONNECT_TIMEOUT_MS 30000u
 #define SD_POLL_SLICE_MS 20u
 /* Bounds a single blocking recv during a handshake or the security probe.
  *
@@ -36,7 +36,8 @@
  * Sized for the slowest legitimate handshake read (a TLS handshake step on a slow
  * link), not for promptness: promptness comes from the shutdown, which is what
  * makes a cancel land in milliseconds. */
-#define SD_HANDSHAKE_RECV_TIMEOUT_MS 2000u
+#define SD_HANDSHAKE_RECV_TIMEOUT_MS 30000u
+#define SD_PROBE_RECV_TIMEOUT_MS 2000u
 
 typedef struct sd_vnc_session {
   sd_client *client;
@@ -44,6 +45,9 @@ typedef struct sd_vnc_session {
   SOCKET sock;
   int32_t connected;
   int32_t limit_hit;
+  /* LibVNCClient never frees the application-owned framebuffer, even when
+   * rfbInitClient frees its own rfbClient on a failed handshake. */
+  uint8_t *framebuffer;
   char reason[256];
 } sd_vnc_session;
 
@@ -118,7 +122,7 @@ static rfbBool sd_vnc_malloc_framebuffer(rfbClient *rfb) {
   sd_vnc_session *session = sd_vnc_of(rfb);
   uint32_t bytes_per_pixel = rfb->format.bitsPerPixel / 8u;
   uint64_t bytes = (uint64_t)rfb->width * (uint64_t)rfb->height * bytes_per_pixel;
-  if (bytes == 0 || bytes > SD_MAX_FRAME_BYTES) {
+  if (rfb->width <= 0 || rfb->height <= 0 || bytes == 0 || bytes > SD_MAX_FRAME_BYTES) {
     if (session != NULL) {
       session->limit_hit = 1;
       snprintf(session->reason, sizeof(session->reason),
@@ -127,8 +131,22 @@ static rfbBool sd_vnc_malloc_framebuffer(rfbClient *rfb) {
     }
     return FALSE;
   }
-  rfb->frameBuffer = (uint8_t *)calloc(1, (size_t)bytes);
-  return rfb->frameBuffer != NULL ? TRUE : FALSE;
+  if (session == NULL) return FALSE;
+  uint8_t *next = (uint8_t *)calloc(1, (size_t)bytes);
+  if (next == NULL) return FALSE;
+  free(session->framebuffer);
+  session->framebuffer = next;
+  rfb->frameBuffer = next;
+  return TRUE;
+}
+
+static char *sd_vnc_password(rfbClient *rfb) {
+  sd_vnc_session *session = sd_vnc_of(rfb);
+  if (session == NULL) return NULL;
+  EnterCriticalSection(&session->client->lock);
+  char *password = sd_strdup(session->client->password);
+  LeaveCriticalSection(&session->client->lock);
+  return password;
 }
 
 static rfbCredential *sd_vnc_credential(rfbClient *rfb, int credential_type) {
@@ -140,7 +158,10 @@ static rfbCredential *sd_vnc_credential(rfbClient *rfb, int credential_type) {
   if (session->client->password != NULL) password = sd_strdup(session->client->password);
   if (session->client->username != NULL) username = sd_strdup(session->client->username);
   LeaveCriticalSection(&session->client->lock);
-  if (password == NULL) return NULL;
+  if (password == NULL) {
+    free(username);
+    return NULL;
+  }
   rfbCredential *credential = (rfbCredential *)calloc(1, sizeof(rfbCredential));
   if (credential == NULL) {
     free(password);
@@ -212,6 +233,8 @@ static SOCKET sd_vnc_connect(sd_client *client, const char *host, uint16_t port,
     }
 
     if (connected) {
+      int no_delay = 1;
+      setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&no_delay, sizeof(no_delay));
       nonblocking = 0;
       ioctlsocket(sock, FIONBIO, &nonblocking);
       result = sock;
@@ -263,7 +286,7 @@ static int32_t sd_vnc_probe_rejects_our_security(sd_client *client, const char *
   SOCKET sock = sd_vnc_connect(client, host, port, &scratch);
   if (sock == INVALID_SOCKET) return 0;
 
-  DWORD recv_timeout = SD_HANDSHAKE_RECV_TIMEOUT_MS;
+  DWORD recv_timeout = SD_PROBE_RECV_TIMEOUT_MS;
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout,
              (int)sizeof(recv_timeout));
 
@@ -323,15 +346,11 @@ void sd_vnc_run(sd_client *client) {
   uint16_t port = 5900;
   uint32_t mask = SD_VNC_SECURITY_DEFAULT;
   uint32_t bytes_per_pixel = 4;
-  uint32_t width = 0;
-  uint32_t height = 0;
   EnterCriticalSection(&client->lock);
   host = sd_strdup(client->host);
   port = client->port != 0 ? client->port : 5900;
   mask = client->vnc_mask;
   bytes_per_pixel = client->vnc_bytes_per_pixel;
-  width = client->width;
-  height = client->height;
   LeaveCriticalSection(&client->lock);
 
   if (host == NULL) {
@@ -388,8 +407,9 @@ void sd_vnc_run(sd_client *client) {
   rfb->GotFrameBufferUpdate = sd_vnc_frame;
   rfb->GotXCutText = sd_vnc_cut_text;
   rfb->GetCredential = sd_vnc_credential;
+  rfb->GetPassword = sd_vnc_password;
   /* Only encodings this integration actually decodes end to end are requested. */
-  rfb->appData.encodingsString = sd_strdup("raw copyrect rre hextile zrle");
+  rfb->appData.encodingsString = "zrle copyrect hextile rre raw";
 
   rfb->format.bitsPerPixel = 32;
   rfb->format.depth = 24;
@@ -463,17 +483,18 @@ void sd_vnc_run(sd_client *client) {
                (int)sizeof(recv_timeout));
   }
 
-  /* Ask once for the whole framebuffer at the requested size. */
-  if (width != 0 && height != 0) {
-    SendFramebufferUpdateRequest(rfb, 0, 0, (int)width, (int)height, FALSE);
-  }
+  /* rfbInitClient already requested the actual server dimensions. A second
+   * request duplicates traffic and can exceed the server's smaller framebuffer. */
 
   session->connected = 1;
   sd_emit_state(client, SD_STATE_CONNECTED, SD_FAILURE_NONE, 0, NULL);
   failure = SD_FAILURE_NONE;
 
   while (!sd_is_cancelled(client)) {
-    int ready = WaitForMessage(rfb, SD_POLL_SLICE_MS * 1000);
+    /* ReadFromRFBServer may have buffered the next message while reading the
+     * previous one. select() sees only the socket, so waiting again can leave a
+     * complete frame parked until the server sends something else. */
+    int ready = rfb->buffered > 0 ? 1 : WaitForMessage(rfb, SD_POLL_SLICE_MS * 1000);
     if (ready < 0) {
       failure = SD_FAILURE_IO;
       snprintf(session->reason, sizeof(session->reason), "reading from the VNC server failed");
@@ -517,6 +538,7 @@ finish:
     session->sock = INVALID_SOCKET;
   }
   free(host);
+  free(session->framebuffer);
 
   if (failure == SD_FAILURE_CANCELLED) {
     sd_emit_state(client, SD_STATE_CLOSED, SD_FAILURE_CANCELLED, 0,

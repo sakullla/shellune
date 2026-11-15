@@ -261,7 +261,7 @@ impl SerialLink {
 
     /// Queues bytes for the device.
     ///
-    /// Returns `Ok` when the bytes were queued. A full queue is **not** an error of the
+    /// Returns `Ok(true)` when queued, `Ok(false)` when refused. A full queue is **not** an error of the
     /// session: the bytes were refused, the session is still open, and the pane says so
     /// while keeping the terminal live. Any other cause really did end the session and
     /// is reported as one.
@@ -269,18 +269,18 @@ impl SerialLink {
     /// # Errors
     ///
     /// The reason the session is no longer open, when it is not.
-    pub fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub fn write(&mut self, bytes: &[u8]) -> Result<bool, String> {
         match self.session.send(bytes) {
             Ok(_) => {
                 self.send_problem = None;
-                Ok(())
+                Ok(true)
             }
             // A refusal is a pause, not an end: the queue is full and the same bytes
             // can be typed again. Ending the session here would kill a device that is
             // merely slower than the typist.
             Err(error) if error.is(SerialCause::QueueFull) => {
                 self.send_problem = Some(describe(&error));
-                Ok(())
+                Ok(false)
             }
             Err(error) => Err(describe(&error)),
         }

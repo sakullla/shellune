@@ -32,7 +32,7 @@ static __inline char *sd_strdup(const char *text) {
 #define SD_INPUT_QUEUE 256u
 
 typedef struct sd_input_event {
-  uint32_t kind; /* 0 keyboard, 1 pointer */
+  uint32_t kind; /* 0 keyboard, 1 pointer transition, 2 pointer motion */
   uint32_t scancode;
   uint32_t keysym;
   int32_t down;
@@ -103,6 +103,7 @@ struct sd_client {
   sd_input_event inputs[SD_INPUT_QUEUE];
   uint32_t input_head;
   uint32_t input_count;
+  uint32_t queued_buttons;
   char *clipboard_text;
   uint32_t clipboard_len;
 };
@@ -117,7 +118,7 @@ void sd_emit_frame(sd_client *client, int32_t x, int32_t y, int32_t w, int32_t h
                    const uint8_t *pixels, uint32_t stride, uint32_t width,
                    uint32_t height);
 /* Asks the user; blocks the worker thread until answered, cancelled or timed out.
- * Returns 1 (accept and remember), 2 (accept for this session) or 0 (reject). */
+ * Returns 1 (accept), 2 (reject) or 0 (cancel/timeout). */
 int32_t sd_ask_certificate(sd_client *client, const char *host, const char *subject,
                            const char *issuer, const char *fingerprint,
                            uint32_t flags);

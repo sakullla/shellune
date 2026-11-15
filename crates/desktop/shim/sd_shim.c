@@ -490,9 +490,10 @@ sd_status sd_client_set_credentials(sd_client *client, const char *user,
 
 sd_status sd_client_set_size(sd_client *client, uint32_t width, uint32_t height) {
   if (client == NULL) return SD_ERR_ARGUMENT;
-  /* The size is a request: RDP negotiates it and VNC uses it for the first
-   * framebuffer request. Only zero and absurd values are refused. */
-  if (width == 0 || height == 0 || width > 16384 || height > 16384) {
+  /* RDP negotiates this size; VNC uses the server's own dimensions. Refuse
+   * requests that cannot fit the shared framebuffer memory budget. */
+  if (width == 0 || height == 0 || width > 16384 || height > 16384 ||
+      (uint64_t)width * height * 4u > SD_MAX_FRAME_BYTES) {
     return SD_ERR_ARGUMENT;
   }
   EnterCriticalSection(&client->lock);
@@ -571,6 +572,12 @@ sd_status sd_client_connect(sd_client *client) {
     client->thread = NULL;
   }
   InterlockedExchange(&client->cancel, 0);
+  EnterCriticalSection(&client->input_lock);
+  client->input_head = client->input_count = client->queued_buttons = 0;
+  free(client->clipboard_text);
+  client->clipboard_text = NULL;
+  client->clipboard_len = 0;
+  LeaveCriticalSection(&client->input_lock);
   InterlockedExchange(&client->cert_answer, 0);
   /* `running` is raised before the CONNECTING event so a consumer that reacts to
    * that event by cancelling finds the session already marked live. The thread
@@ -653,12 +660,27 @@ static sd_status sd_queue(sd_client *client, const sd_input_event *event) {
   if (status != SD_OK) return status;
 
   EnterCriticalSection(&client->input_lock);
+  sd_input_event next = *event;
+  if (next.kind == 1 && next.buttons == client->queued_buttons &&
+      (next.buttons & (SD_BUTTON_WHEEL_UP | SD_BUTTON_WHEEL_DOWN |
+                       SD_BUTTON_WHEEL_LEFT | SD_BUTTON_WHEEL_RIGHT)) == 0) {
+    next.kind = 2;
+    if (client->input_count > 0) {
+      uint32_t tail = (client->input_head + client->input_count - 1) % SD_INPUT_QUEUE;
+      if (client->inputs[tail].kind == 2) {
+        client->inputs[tail] = next;
+        LeaveCriticalSection(&client->input_lock);
+        return SD_OK;
+      }
+    }
+  }
   if (client->input_count == SD_INPUT_QUEUE) {
     LeaveCriticalSection(&client->input_lock);
     return SD_ERR_STATE;
   }
   uint32_t slot = (client->input_head + client->input_count) % SD_INPUT_QUEUE;
-  client->inputs[slot] = *event;
+  client->inputs[slot] = next;
+  if (next.kind != 0) client->queued_buttons = next.buttons;
   client->input_count++;
   LeaveCriticalSection(&client->input_lock);
   return SD_OK;

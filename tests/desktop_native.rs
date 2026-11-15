@@ -129,6 +129,10 @@ struct Scripted {
 
 impl Scripted {
     fn start(script: Script) -> Scripted {
+        Self::start_after(script, Duration::ZERO)
+    }
+
+    fn start_after(script: Script, delay: Duration) -> Scripted {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind the scripted peer");
         let port = listener.local_addr().expect("peer address").port();
         let messages = Arc::new(Mutex::new(Vec::new()));
@@ -141,6 +145,7 @@ impl Scripted {
             // refused handshake may be followed by the shim's security-type probe.
             while let Ok((stream, _)) = listener.accept() {
                 saw.store(true, Ordering::SeqCst);
+                thread::sleep(delay);
                 let _ = stream.set_nodelay(true);
                 match script.clone() {
                     Script::Silent => {
@@ -371,6 +376,18 @@ fn the_event_struct_is_the_one_the_header_declares() {
 }
 
 #[test]
+fn an_oversized_desktop_is_refused_before_the_backend_allocates_it() {
+    if !backends_built() {
+        return;
+    }
+    for protocol in [Protocol::Rdp, Protocol::Vnc] {
+        let mut client = DesktopClient::new(protocol).unwrap();
+        assert!(matches!(client.set_size(8192, 8192), Err(Error::Argument)));
+        client.set_size(3840, 2160).unwrap();
+    }
+}
+
+#[test]
 fn both_backends_report_the_libraries_they_link() {
     if !backends_built() {
         return;
@@ -396,6 +413,39 @@ fn both_backends_report_the_libraries_they_link() {
             "a build with a TLS backend must advertise both: {vnc}"
         );
     }
+}
+
+#[test]
+fn a_vnc_banner_delayed_three_seconds_still_connects() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start_after(
+        Script::Session {
+            width: 4,
+            height: 3,
+            pixel: [1, 2, 3, 0],
+            clipboard: None,
+        },
+        Duration::from_secs(3),
+    );
+    let mut client = DesktopClient::new(Protocol::Vnc).unwrap();
+    client.set_server("127.0.0.1", peer.port).unwrap();
+    client.connect().unwrap();
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Frame { .. })
+    });
+    assert!(states(&events).contains(&State::Connected), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Frame { .. })),
+        "{events:?}"
+    );
+    let start = Instant::now();
+    client.cancel().unwrap();
+    client.wait_for_worker(Duration::from_secs(2)).unwrap();
+    assert!(start.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
@@ -574,13 +624,9 @@ fn an_rdp_session_reports_that_it_cannot_forward_clipboard_text() {
     );
 }
 
-/// Ignored: with this scripted peer the first frame arrives only on some runs (the
-/// client's update request and the peer's response interleave with the handshake
-/// tail), so the test documents the intended sequence but is not a stable gate yet.
-/// Frame delivery and input must be proven against a real VNC server in T5 before any
-/// support is claimed; nothing here should be read as evidence that it works.
+/// Covers a clipboard and first frame buffered together. The worker must consume
+/// library-buffered bytes without waiting for another socket notification.
 #[test]
-#[ignore = "the scripted peer is not yet a stable frame-delivery fixture; T5 owns the real server matrix"]
 fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
     if !backends_built() {
         return;
@@ -643,12 +689,8 @@ fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
 
     // A frame can arrive while the handshake is still finishing, so wait for the
     // state the input path requires before sending anything.
-    let deadline = Instant::now() + PATIENCE;
-    while client.state() != State::Connected && Instant::now() < deadline {
-        client.track_state();
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(client.state(), State::Connected, "the session is connected");
+    // `pump` consumed Connected above. `state()` is a cache maintained only by
+    // track_state(), so waiting for it here would wait for an already-read event.
 
     // Input: the keysym form for VNC, and a pointer position with a left press.
     // A first frame may already have arrived while the handshake was finishing, so the

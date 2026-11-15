@@ -8,6 +8,8 @@
  * alone: the entry points install the client-common context, which is what creates the
  * bitmap cache gdi_init asserts on and which loads the channels this client needs.
  */
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
 #include "sd_internal.h"
 
 #ifdef SD_WITH_RDP
@@ -34,6 +36,8 @@ typedef struct sd_rdp_session {
   rdpContext *context;
   int32_t connected;
   uint32_t buttons;
+  int32_t certificate_rejected;
+  int32_t limit_hit;
 } sd_rdp_session;
 
 /* The entry points let FreeRDP allocate a context of this size, so the session can be
@@ -48,6 +52,21 @@ typedef struct sd_rdp_context {
 static sd_rdp_session *sd_session_of(rdpContext *context) {
   if (context == NULL) return NULL;
   return ((sd_rdp_context *)context)->session;
+}
+
+/* An embedded GUI must never fall back to client-common's stdin prompts.
+ * Credentials were supplied through settings; empty ones let non-NLA servers
+ * show their login desktop. NLA still validates them at the server. */
+static BOOL sd_rdp_authenticate(freerdp *instance, char **username, char **password,
+                                char **domain, rdp_auth_reason reason) {
+  (void)instance;
+  if (reason != AUTH_RDP && reason != AUTH_TLS && reason != AUTH_NLA &&
+      reason != AUTH_RDSTLS) return FALSE;
+  if (username == NULL || password == NULL || domain == NULL) return FALSE;
+  if (*username == NULL) *username = sd_strdup("");
+  if (*password == NULL) *password = sd_strdup("");
+  if (*domain == NULL) *domain = sd_strdup("");
+  return *username != NULL && *password != NULL && *domain != NULL;
 }
 
 /* ---- certificate questions ------------------------------------------------ */
@@ -65,7 +84,10 @@ static DWORD sd_rdp_verify_certificate(freerdp *instance, const char *host, UINT
    * decision, never an automatic accept. */
   int32_t decision =
       sd_ask_certificate(session->client, host, name, issuer, fingerprint, (uint32_t)flags);
-  return decision == 1 ? 1 : (decision == 2 ? 2 : 0);
+  session->certificate_rejected = decision != 1;
+  /* The shim uses 1=accept, 2=reject. FreeRDP uses 2=accept temporarily!
+   * Trust persistence belongs to the application, never FreeRDP's global store. */
+  return decision == 1 ? 2 : 0;
 }
 
 static DWORD sd_rdp_verify_changed_certificate(freerdp *instance, const char *host,
@@ -85,7 +107,8 @@ static DWORD sd_rdp_verify_changed_certificate(freerdp *instance, const char *ho
   const char *name = subject != NULL ? subject : common_name;
   int32_t decision =
       sd_ask_certificate(session->client, host, name, issuer, new_fingerprint, (uint32_t)flags);
-  return decision == 1 ? 1 : (decision == 2 ? 2 : 0);
+  session->certificate_rejected = decision != 1;
+  return decision == 1 ? 2 : 0;
 }
 
 /* ---- frame delivery ------------------------------------------------------- */
@@ -160,6 +183,12 @@ static BOOL sd_rdp_post_connect(freerdp *instance) {
   if (instance == NULL || instance->context == NULL) return FALSE;
   sd_rdp_session *session = sd_session_of(instance->context);
   if (session == NULL) return FALSE;
+  uint32_t width = freerdp_settings_get_uint32(instance->context->settings, FreeRDP_DesktopWidth);
+  uint32_t height = freerdp_settings_get_uint32(instance->context->settings, FreeRDP_DesktopHeight);
+  if (width == 0 || height == 0 || (uint64_t)width * height * 4u > SD_MAX_FRAME_BYTES) {
+    session->limit_hit = 1;
+    return FALSE;
+  }
   if (!gdi_init(instance, PIXEL_FORMAT_BGRA32)) return FALSE;
   if (instance->context->update == NULL) return FALSE;
   instance->context->update->BeginPaint = sd_rdp_begin_paint;
@@ -207,6 +236,16 @@ void sd_rdp_run(sd_client *client) {
     return;
   }
   session->client = client;
+  /* An RDP-only process may never have opened a Rust/VNC socket. FreeRDP's
+   * embedded client entry points leave Winsock initialization to the host. */
+  WSADATA sockets;
+  int socket_error = WSAStartup(MAKEWORD(2, 2), &sockets);
+  if (socket_error != 0) {
+    free(session);
+    sd_emit_state(client, SD_STATE_FAILED, SD_FAILURE_IO, socket_error,
+                  "could not initialize Windows sockets");
+    return;
+  }
 
   /* FreeRDP logs through WinPR to stderr; errors are enough here, and the reason a
    * connect failed is reported through freerdp_get_last_error_string. */
@@ -276,6 +315,10 @@ void sd_rdp_run(sd_client *client) {
       goto teardown;
     }
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
+    freerdp_settings_set_uint32(settings, FreeRDP_TcpConnectTimeout, 30000);
+    /* Activation needs several round trips; the library's 9s default cannot
+     * complete a session on a 6-10s RTT link. Cancellation still wakes its event. */
+    freerdp_settings_set_uint32(settings, FreeRDP_TcpAckTimeout, 120000);
     freerdp_settings_set_bool(settings, FreeRDP_NegotiateSecurityLayer, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, FALSE);
     freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE);
@@ -284,6 +327,7 @@ void sd_rdp_run(sd_client *client) {
     if (domain != NULL) freerdp_settings_set_string(settings, FreeRDP_Domain, domain);
 
     instance->VerifyCertificateEx = sd_rdp_verify_certificate;
+    instance->AuthenticateEx = sd_rdp_authenticate;
     instance->VerifyChangedCertificateEx = sd_rdp_verify_changed_certificate;
     instance->PostConnect = sd_rdp_post_connect;
 
@@ -300,6 +344,12 @@ void sd_rdp_run(sd_client *client) {
       if (sd_is_cancelled(client)) {
         status = SD_FAILURE_CANCELLED;
         reason = "connect cancelled";
+      } else if (session->certificate_rejected) {
+        status = SD_FAILURE_CERTIFICATE_REJECTED;
+        reason = "server certificate was not accepted";
+      } else if (session->limit_hit) {
+        status = SD_FAILURE_LIMIT;
+        reason = "desktop size exceeded the frame byte bound";
       } else {
         status = sd_rdp_failure_of(context, &detail);
         reason = sd_rdp_error_text(instance);
@@ -372,6 +422,7 @@ teardown:
   free(password);
   free(domain);
   free(session);
+  WSACleanup();
 
   if (status == SD_FAILURE_CANCELLED) {
     sd_emit_state(client, SD_STATE_CLOSED, SD_FAILURE_CANCELLED, 0,

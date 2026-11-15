@@ -300,7 +300,8 @@ def run_msvc(build_tools: pathlib.Path, work: pathlib.Path, name: str, lines: li
     vcvars = build_tools / "VC/Auxiliary/Build/vcvars64.bat"
     wrapper = work / ("step-" + name + ".cmd")
     body = ["@echo off", 'call "' + vcvars.as_posix() + '" >nul', "if errorlevel 1 exit /b 2"]
-    body.extend(lines)
+    for line in lines:
+        body.extend([line, "if errorlevel 1 exit /b %errorlevel%"])
     body.append("exit /b %errorlevel%")
     wrapper.write_text("\r\n".join(body) + "\r\n", encoding="utf-8")
     log("step " + name)
@@ -450,8 +451,10 @@ def ensure_source(work: pathlib.Path, spec: dict) -> pathlib.Path:
 
 ZLIB_OPTIONS = ("-DCMAKE_BUILD_TYPE=Release", "-DZLIB_BUILD_EXAMPLES=OFF",
                 "-DBUILD_SHARED_LIBS=OFF")
-OPENSSL_OPTIONS = ("Configure VC-WIN64A no-asm no-shared no-tests no-docs no-apps",
-                   'CFLAGS="/MD -O2"')
+# VNC password authentication needs DES from the legacy provider. no-module puts
+# that provider in libcrypto, so a portable build needs no external legacy.dll.
+OPENSSL_OPTIONS = ("Configure VC-WIN64A no-asm no-shared no-module no-tests no-docs no-apps",
+                   'CFLAGS="/MD -O2 /Z7"')
 
 
 def build_zlib(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
@@ -488,8 +491,8 @@ def build_openssl(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
     run_msvc(build_tools, work, "openssl", [
         "cd /d " + quoted(source),
         " ".join([
-            quoted(pathlib.Path(perl)), "Configure VC-WIN64A no-asm no-shared",
-            "no-tests no-docs no-apps", 'CFLAGS="/MD -O2"',
+            quoted(pathlib.Path(perl)), "Configure VC-WIN64A no-asm no-shared no-module",
+            "no-tests no-docs no-apps", 'CFLAGS="/MD -O2 /Z7"',
             "--prefix=" + quoted(dist),
             "--openssldir=" + quoted(dist / "ssl"),
             ">", quoted(log_path),
@@ -611,6 +614,20 @@ def self_test() -> int:
             raise SystemExit(
                 "self-test: a changed pin must rebuild even though the archive exists"
             )
+        if sys.platform == "win32":
+            vcvars = work / "VC/Auxiliary/Build/vcvars64.bat"
+            vcvars.parent.mkdir(parents=True)
+            vcvars.write_text("@exit /b 0\n")
+            marker = work / "must-not-exist"
+            try:
+                run_msvc(work, work, "fail-fast", [
+                    "cmd /c exit 7", "echo stale-build > " + quoted(marker),
+                ])
+            except subprocess.CalledProcessError as error:
+                assert error.returncode == 7
+            else:
+                raise SystemExit("self-test: a failed native command must stop the build")
+            assert not marker.exists(), "a later command ran after failure"
         log("self-test passed: pin stamping decides skip versus rebuild as documented")
         return 0
     finally:

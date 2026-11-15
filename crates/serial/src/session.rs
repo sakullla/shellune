@@ -561,11 +561,10 @@ impl Shared {
             if self.closing.load(Ordering::SeqCst) {
                 return;
             }
-            let (guard, _) = self
+            log = self
                 .rx_room
-                .wait_timeout(log, WAIT_TICK)
+                .wait(log)
                 .unwrap_or_else(PoisonError::into_inner);
-            log = guard;
         }
         log.pending_bytes += data.len();
         log.events.push_back(SerialEvent::Received(data.to_vec()));
@@ -599,8 +598,17 @@ impl Shared {
     }
 
     fn wake_everyone(&self) {
-        self.rx_room.notify_all();
-        self.send_room.notify_all();
+        // Closing is atomic, but waiters inspect it while holding these locks.
+        // Acquire each lock before notifying so close cannot land between their
+        // predicate check and wait. Idle workers then need no periodic polling.
+        {
+            let _events = lock(&self.events);
+            self.rx_room.notify_all();
+        }
+        {
+            let _send = lock(&self.send);
+            self.send_room.notify_all();
+        }
     }
 
     fn enqueue(&self, bytes: &[u8], wait: Option<Duration>) -> Result<u64, SerialError> {
@@ -644,7 +652,7 @@ impl Shared {
             }
             let (guard, _) = self
                 .send_room
-                .wait_timeout(state, (deadline - now).min(WAIT_TICK))
+                .wait_timeout(state, deadline - now)
                 .unwrap_or_else(PoisonError::into_inner);
             state = guard;
         }
@@ -661,11 +669,10 @@ impl Shared {
                 state.in_flight = frame.bytes.len();
                 return Some(frame);
             }
-            let (guard, _) = self
+            state = self
                 .send_room
-                .wait_timeout(state, WAIT_TICK)
+                .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
-            state = guard;
         }
     }
 
@@ -803,6 +810,22 @@ mod tests {
 
     fn config() -> SerialConfig {
         SerialConfig::default()
+    }
+
+    #[test]
+    fn closing_an_idle_writer_never_loses_its_wakeup() {
+        for _ in 0..100 {
+            let port = fake("idle", FakeSpec::new());
+            let mut session = session_over_with(
+                port,
+                config(),
+                SessionLimits {
+                    close_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(session.close(), CloseOutcome::Closed { .. }));
+        }
     }
 
     /// A close of a session whose queue really did hold frames says how many it

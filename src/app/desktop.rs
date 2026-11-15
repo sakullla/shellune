@@ -462,6 +462,7 @@ impl DesktopSurface {
             || height == 0
             || width > MAX_DESKTOP_EDGE
             || height > MAX_DESKTOP_EDGE
+            || u64::from(width) * u64::from(height) * 4 > shellune_desktop::MAX_FRAME_BYTES as u64
             || region.width <= 0
             || region.height <= 0
         {
@@ -496,6 +497,14 @@ impl DesktopSurface {
             let destination = (region.y as usize + line) * canvas_stride + region.x as usize * 4;
             self.pixels[destination..destination + row]
                 .copy_from_slice(&region.pixels[source..source + row]);
+            // RFB's fourth byte is padding, commonly zero. Remote desktop pixels
+            // are opaque; interpreting that padding as alpha hides the picture.
+            for pixel in self.pixels[destination..destination + row]
+                .as_chunks_mut::<4>()
+                .0
+            {
+                pixel[3] = 255;
+            }
         }
         self.applied += 1;
         self.dirty = true;
@@ -609,6 +618,7 @@ pub struct InputQueue {
     /// Where the pointer was last put, kept across flushes so a release queued
     /// after the queue was sent goes to the same pixel instead of the corner.
     position: (u16, u16),
+    motion_tail: bool,
 }
 
 impl InputQueue {
@@ -651,6 +661,7 @@ impl InputQueue {
     /// around it, which is what the remote side needs to produce the character the
     /// user typed; the pair keeps its order in the queue.
     pub fn push_key(&mut self, codes: KeyCodes, down: bool) {
+        self.motion_tail = false;
         if down {
             let needs_shift = codes.shift && !self.shift_held();
             if needs_shift {
@@ -662,7 +673,9 @@ impl InputQueue {
             }
             self.queued
                 .push_back(DesktopInput::Key { codes, down: true });
-            self.keys.push(codes);
+            if !self.keys.contains(&codes) {
+                self.keys.push(codes);
+            }
             return;
         }
         self.queued
@@ -688,6 +701,19 @@ impl InputQueue {
 
     /// Queues a pointer state.
     pub fn push_pointer(&mut self, x: u16, y: u16, buttons: Buttons) {
+        let motion = buttons == self.buttons;
+        if motion
+            && self.motion_tail
+            && let Some(DesktopInput::Pointer {
+                x: old_x, y: old_y, ..
+            }) = self.queued.back_mut()
+        {
+            *old_x = x;
+            *old_y = y;
+            self.position = (x, y);
+            return;
+        }
+        self.motion_tail = motion;
         self.buttons = buttons;
         self.position = (x, y);
         self.queued
@@ -696,6 +722,7 @@ impl InputQueue {
 
     /// Queues one wheel step at a position, keeping the buttons that are held.
     pub fn push_wheel(&mut self, x: u16, y: u16, step: Buttons) {
+        self.motion_tail = false;
         self.queued.push_back(DesktopInput::Pointer {
             x,
             y,
@@ -710,6 +737,7 @@ impl InputQueue {
 
     /// Queues text for the remote clipboard.
     pub fn push_clipboard(&mut self, text: impl Into<String>) {
+        self.motion_tail = false;
         self.queued.push_back(DesktopInput::Clipboard(text.into()));
     }
 
@@ -720,6 +748,7 @@ impl InputQueue {
     /// tracks modifiers per key sees each one let go before the button that may
     /// have started a drag.
     pub fn release_all(&mut self) -> usize {
+        self.motion_tail = false;
         if self.keys.is_empty() && !self.buttons.any_button() {
             return 0;
         }
@@ -760,9 +789,11 @@ impl InputQueue {
             match result {
                 Ok(()) => sent += 1,
                 Err(error) => {
-                    // The event that failed stays at the front, so a later flush
-                    // retries it before anything newer.
-                    pending.push_front(input);
+                    // Retry temporary backpressure. A permanently refused
+                    // clipboard/argument must not block every later key forever.
+                    if !matches!(error, LinkError::Unavailable(_) | LinkError::Argument) {
+                        pending.push_front(input);
+                    }
                     failure = Some(error);
                     break;
                 }
@@ -1775,6 +1806,13 @@ mod tests {
     }
 
     #[test]
+    fn vnc_padding_is_not_rendered_as_transparency() {
+        let mut surface = DesktopSurface::new();
+        assert!(surface.apply(&scripted::solid(0, 0, 2, 1, (2, 1), [10, 20, 30, 0])));
+        assert_eq!(surface.pixels(), &[10, 20, 30, 255, 10, 20, 30, 255]);
+    }
+
+    #[test]
     fn a_new_desktop_size_replaces_the_canvas() {
         let mut surface = DesktopSurface::new();
         assert!(surface.apply(&scripted::solid(0, 0, 2, 2, (2, 2), [4, 4, 4, 255])));
@@ -1831,6 +1869,59 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn delayed_pointer_motion_coalesces_without_moving_button_transitions() {
+        let mut queue = InputQueue::new();
+        let left = Buttons::LEFT;
+        queue.push_pointer(1, 1, left);
+        for x in 2..10_000 {
+            queue.push_pointer(x, 2, left);
+        }
+        queue.push_pointer(10_000, 3, Buttons::none());
+        queue.push_pointer(10_001, 4, Buttons::none());
+        assert_eq!(queue.len(), 4);
+        let (link, log) = scripted::ScriptedLink::new(Vec::new());
+        queue.flush(&link).unwrap();
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.inputs[0],
+            DesktopInput::Pointer {
+                x: 1,
+                y: 1,
+                buttons: left
+            }
+        );
+        assert_eq!(
+            log.inputs[1],
+            DesktopInput::Pointer {
+                x: 9999,
+                y: 2,
+                buttons: left
+            }
+        );
+        assert_eq!(
+            log.inputs[2],
+            DesktopInput::Pointer {
+                x: 10_000,
+                y: 3,
+                buttons: Buttons::none()
+            }
+        );
+    }
+
+    #[test]
+    fn key_repeat_does_not_grow_held_key_state() {
+        let mut queue = InputQueue::new();
+        let a = key_codes("a").unwrap();
+        for _ in 0..1000 {
+            queue.push_key(a, true);
+        }
+        assert_eq!(queue.held_keys(), &[a]);
+        queue.push_key(a, false);
+        assert!(queue.held_keys().is_empty());
+        assert_eq!(queue.release_all(), 0);
     }
 
     #[test]
@@ -1931,6 +2022,22 @@ mod tests {
                 down: false
             }
         );
+    }
+
+    #[test]
+    fn unsupported_clipboard_does_not_block_subsequent_keyboard_input() {
+        let (link, _) = scripted::ScriptedLink::failing(LinkError::Unavailable("clipboard".into()));
+        let mut queue = InputQueue::new();
+        queue.push_clipboard("text");
+        queue.push_key(key_codes("a").unwrap(), true);
+        assert!(queue.flush(&link).is_err());
+        assert_eq!(queue.len(), 1);
+        let (working, log) = scripted::ScriptedLink::new(Vec::new());
+        assert_eq!(queue.flush(&working), Ok(1));
+        assert!(matches!(
+            log.lock().unwrap().inputs[0],
+            DesktopInput::Key { .. }
+        ));
     }
 
     #[test]

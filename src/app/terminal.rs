@@ -223,11 +223,14 @@ impl SourceEvent {
 }
 
 impl PaneSource {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn write(&mut self, bytes: &[u8]) -> Result<bool, String> {
         match self {
-            Self::Local(session) => session.write(bytes).map_err(|error| error.to_string()),
-            Self::Remote(session) => session.write(bytes),
-            Self::Chain(session) => session.write(bytes),
+            Self::Local(session) => session
+                .write(bytes)
+                .map(|()| true)
+                .map_err(|error| error.to_string()),
+            Self::Remote(session) => session.write(bytes).map(|()| true),
+            Self::Chain(session) => session.write(bytes).map(|()| true),
             Self::Serial(link) => link.write(bytes),
         }
     }
@@ -1590,10 +1593,10 @@ impl TerminalPane {
         if !self.state.accepts_input() || outgoing.is_empty() {
             return;
         }
-        if echo {
+        let accepted = self.write(&outgoing, cx);
+        if accepted && echo {
             self.echo(&format.echo(&outgoing), cx);
         }
-        self.write(&outgoing, cx);
     }
 
     /// Shows a copy of what was just sent, as the local echo.
@@ -1612,23 +1615,27 @@ impl TerminalPane {
         cx.notify();
     }
 
-    fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+    fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> bool {
         if bytes.is_empty() || !self.state.accepts_input() {
-            return;
+            return false;
         }
         // Only a test keeps a copy of the byte stream; a release build would grow
         // it for the life of the session.
         #[cfg(test)]
         self.sent.extend_from_slice(bytes);
         let Some(source) = self.source.as_mut() else {
-            return;
+            return true;
         };
-        if let Err(error) = source.write(bytes) {
-            // A write that fails happened on a session that was live: the program ran
-            // and the channel is gone, which is a loss and not a launch failure.
-            let failure = self.origin.lost_failure(error);
-            self.state = PaneState::Lost(failure);
-            cx.notify();
+        match source.write(bytes) {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // A write that fails happened on a session that was live: the program ran
+                // and the channel is gone, which is a loss and not a launch failure.
+                let failure = self.origin.lost_failure(error);
+                self.state = PaneState::Lost(failure);
+                cx.notify();
+                false
+            }
         }
     }
 
