@@ -23269,6 +23269,79 @@ fn the_library_counts_tasks_in_tasks_and_not_in_hosts() {
     }
 }
 
+/// The row under the library that counts the rest counts tasks, and it is the row drawn.
+///
+/// The wording of the constant was checked before; this holds the drawn row to it. With
+/// sixty-five saved tasks the list draws sixty and says how many it left out, and that
+/// sentence belongs to the library: "还有 N 个任务未列出", never a sentence about N
+/// machines. The text a row is drawn with is not readable from a test window, so the
+/// assertion is made on the function the drawing code builds the row's text with.
+#[gpui::test]
+async fn the_library_row_that_counts_the_rest_uses_the_library_sentence(cx: &mut TestAppContext) {
+    let dir = TempDir::new("batch-library-more");
+    seed(&dir.store(), batch_hosts());
+    let batch = shellune_storage::BatchStore::at(dir.store().root());
+    let mut book = batch.load_tasks_upgrading().expect("a readable book");
+    for index in 0..65 {
+        let command = format!("run {index:02}");
+        let mut task = saved_task(&[command.as_str()], &["build-01"]);
+        task.set_name(Some(format!("task {index:02}")));
+        book.insert(task);
+    }
+    batch
+        .save_tasks(&book)
+        .expect("the saved tasks are written");
+
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.capture_batch_library(cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("batch.library.more").is_some(),
+        "sixty rows are drawn and the five left over are counted"
+    );
+
+    // The row is drawn with this text: the library's own sentence, filled with the
+    // number the list did not draw.
+    let ux = crate::app::copy::ux();
+    assert_eq!(
+        crate::app::view::batch::library_more_line(ux, 5).as_ref(),
+        crate::app::copy::fill(ux.batch_library_more, &[("count", "5")]).as_str(),
+        "the row's text is the library's own sentence, not another list's"
+    );
+
+    for locale in Locale::ALL {
+        let strings = crate::app::copy::ux_for(locale);
+        let line = crate::app::view::batch::library_more_line(strings, 5);
+        assert!(
+            line.contains('5'),
+            "the count is filled in in {locale:?}: {line}"
+        );
+        match locale {
+            Locale::Chinese => {
+                assert!(
+                    line.contains("个任务"),
+                    "the unit is a task in {locale:?}: {line}"
+                );
+                assert!(
+                    !line.contains('台'),
+                    "a saved task is not one of the machines: {line}"
+                );
+            }
+            Locale::English => assert!(
+                line.contains("task"),
+                "the unit is a task in {locale:?}: {line}"
+            ),
+        }
+        assert_ne!(
+            line.as_ref(),
+            crate::app::copy::fill(strings.batch_targets_more, &[("count", "5")]).as_str(),
+            "the library does not borrow the host sentence in {locale:?}"
+        );
+    }
+}
+
 #[test]
 fn the_diagnostics_name_the_hosts_and_carry_no_credential() {
     let task = saved_task(&["uptime"], &["build-01"]);
@@ -23495,6 +23568,123 @@ async fn the_connect_button_of_a_saved_serial_row_opens_its_own_device(cx: &mut 
     assert!(
         serial,
         "the record is opened as a serial session, not as a terminal that pretends"
+    );
+    assert!(
+        cx.debug_bounds("remote.panel").is_none(),
+        "a serial record never opens the SSH form"
+    );
+}
+
+/// Double-presses the name-and-target area of a connection row, not one of its controls.
+///
+/// The row's main action is a double press, as a host row's is, so the press has to land
+/// on the row itself: a point on the row's left, past the protocol avatar and the name,
+/// and left of the pencil, which belongs to editing. It is checked rather than assumed,
+/// because a press that drifted onto a button would test the button instead.
+fn double_click_connection_row(cx: &mut VisualTestContext) {
+    let row = bounds_of(cx, "hosts.connection.0");
+    let name_area = point(row.origin.x + px(90.0), row.center().y);
+    assert!(
+        name_area.x > row.origin.x && name_area.x < row.origin.x + row.size.width,
+        "the press is inside the row: {name_area:?} in {row:?}"
+    );
+    let edit = bounds_of(cx, "hosts.connection.edit.0");
+    assert!(
+        name_area.x < edit.origin.x,
+        "the press is on the row's name and target, not on a control: {name_area:?} is left of {edit:?}"
+    );
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: name_area,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: name_area,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn a_double_click_on_a_saved_desktop_row_opens_its_surface_and_not_a_form(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("desktop-row-double-click");
+    let record = desktop_record("office");
+    seed_connections(&dir.store(), vec![record]);
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    // One press only points at the row: the row is also where a person reads the
+    // record, so a single press may not start anything (R2).
+    click(cx, "hosts.connection.0");
+    let opened = cx.update(|_window, app| view.read(app).open_sessions());
+    assert!(
+        opened.is_empty(),
+        "a single press on the row starts nothing: {opened:?}"
+    );
+    assert!(
+        cx.debug_bounds("hosts.editor").is_none(),
+        "and it does not open the form either"
+    );
+
+    double_click_connection_row(cx);
+
+    let opened = cx.update(|_window, app| view.read(app).open_sessions());
+    assert_eq!(opened.len(), 1, "a double press opens one session");
+    assert!(
+        cx.debug_bounds("desktop.body").is_some(),
+        "it is the record's own surface, drawn as a remote desktop"
+    );
+    assert!(
+        cx.debug_bounds("hosts.editor").is_none(),
+        "a press on the row never opens the edit form"
+    );
+    assert!(
+        cx.debug_bounds("remote.panel").is_none(),
+        "a desktop record never opens the SSH form"
+    );
+}
+
+#[gpui::test]
+async fn a_double_click_on_a_saved_serial_row_opens_its_device_and_not_a_form(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("serial-row-double-click");
+    let config =
+        shellune_core::SerialConfig::new("console", "COM254").expect("a valid serial record");
+    seed_connections(
+        &dir.store(),
+        vec![shellune_core::ConnectionRecord::Serial(config)],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    click(cx, "hosts.connection.0");
+    let opened = cx.update(|_window, app| view.read(app).open_sessions());
+    assert!(
+        opened.is_empty(),
+        "a single press on the row starts nothing: {opened:?}"
+    );
+
+    double_click_connection_row(cx);
+
+    let opened = cx.update(|_window, app| view.read(app).open_sessions());
+    assert_eq!(opened.len(), 1, "a double press opens one device");
+    let serial = cx.update(|_window, app| {
+        view.read(app)
+            .pane_of(opened[0])
+            .is_some_and(|pane| pane.read(app).is_serial())
+    });
+    assert!(
+        serial,
+        "the row opens the serial session of the record, not a terminal that pretends"
+    );
+    assert!(
+        cx.debug_bounds("hosts.editor").is_none(),
+        "a press on the row never opens the edit form"
     );
     assert!(
         cx.debug_bounds("remote.panel").is_none(),

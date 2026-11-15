@@ -824,10 +824,7 @@ impl ShelluneView {
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .debug_selector(|| "batch.library.more".to_owned())
-                    .child(copy::fill(
-                        ux.batch_library_more,
-                        &[("count", &hidden.to_string())],
-                    )),
+                    .child(library_more_line(ux, hidden)),
             );
         }
         let footer = div()
@@ -2751,6 +2748,20 @@ impl ShelluneView {
         }
         column
     }
+}
+
+/// The sentence under the library that counts the tasks the list did not draw.
+///
+/// It is the library's own sentence - `batch_library_more` - and never the one a batch
+/// preview uses for its hosts: what is counted under this list are saved tasks, and a
+/// sentence about "还有 N 台" would count machines. It is a function rather than an
+/// expression inside the drawing code so that a test can hold the drawn row to that
+/// sentence instead of only to the wording of the constant.
+pub(crate) fn library_more_line(ux: &UxStrings, hidden: usize) -> SharedString {
+    SharedString::from(copy::fill(
+        ux.batch_library_more,
+        &[("count", &hidden.to_string())],
+    ))
 }
 
 /// One target of the preview.

@@ -111,10 +111,19 @@
 | `cargo test --workspace --all-features` | 通过（退出码 0）：32 个测试目标（含 7 个 0 用例的 doctest 目标）、1326 通过、0 失败、1 个 `#[ignore]`；主套件 `unittests src\main.rs` 630 通过（日志 `t11b-test.log`） |
 | `python scripts/capture-ui.py --out C:/Users/12976/project/_evidence/t11/ui2` | 53 个场景、200 张 PNG、`failures: []`、`status: ok`（`t11b-capture.log`、`capture-ui-manifest.json`） |
 
-上一轮完整运行出现过一次性启动竞态，各自单跑都通过：`tests/ssh_x11.rs`（`"sshd did not start listening on 51186"`）、
-`tests/serial_session.rs`（`a_device_that_goes_away_ends_the_session_and_frees_the_port`）、`tests/ssh_sftp.rs`
-（`the_directory_a_shell_reports_is_the_one_the_browser_lists`）、`src/app/tests.rs` 里 `shell.custom was never rendered`
-的 6 个。它们出现在本机一次性启动真实 OpenSSH（经 WSL）、串口伪设备与并行负载同时运行时，不在本轮改动的路径上。
+上一轮完整运行里还有几个一次性失败，各自单跑都通过：`tests/ssh_x11.rs`（`"sshd did not start listening on 51186"`）、
+`tests/serial_session.rs`（`a_device_that_goes_away_ends_the_session_and_frees_the_port`）、`src/app/tests.rs` 里
+`shell.custom was never rendered` 的 6 个。它们出现在本机一次性启动真实 OpenSSH（经 WSL）、串口伪设备与并行负载同时运行时，
+本轮没有复现，作为环境事实保留，不写成"从未失败"，也不把它们当成已验证的根因。
+
+其中 `tests/ssh_sftp.rs` 的 `the_directory_a_shell_reports_is_the_one_the_browser_lists` 起初也被算进这一类，**审查复现后
+定位到真实原因，不是启动竞态**：这个用例拿系统目录 `/var/log` 当稳定对照，而服务器 `ls -A` 与 SFTP 列举之间会插入瞬态文件
+（`wtmp.db-journal` 出现又消失），两次列举因此不同。修法是让用例在账号家目录下自建 `osc7-live` 目录，放四个已知条目（含一个
+带空格的名称），`cd` 进去后由 shell 打印 OSC 7，两次列举都比对这个目录，用例结束时删除。这还连带查出第二个来源：等待"shell 第一段输出"的写法会和连接事件同批到达的输出赛跑，
+一旦同批就被吞掉，等到 45 秒超时才失败；改为连上即写命令（伪终端会缓存输入），由 OSC 7 报告本身证明命令被执行。这是用例自身的不稳定，不是产品缺陷。
+
+同一个文件里重启服务器的那几个用例还有一处同类竞态：服务器先起在一个空闲端口、停掉、再在另一个更早选定的端口上重启，中间那个端口可能被并行测试占走（`sshd did not start listening on …`）。
+本文件因此给启动加了有限次重试（`START_ATTEMPTS`，换端口重试，全部失败才报错并列出每次的原因）；断言没有放宽，这只是不去测"谁先抢到端口"。
 
 **收口这一轮同样的命令得到一次干净的退出码 0（0 失败、1 个 `#[ignore]`），因此本轮按实测记为通过；上面那次竞态作为环境事实保留，
 不写成"从未失败"，也不把它的失败当成已验证的根因。**
@@ -133,7 +142,7 @@
 
 尺寸矩阵：720×480 有 35 张、1120×720 有 164 张、1680×940 有 1 张；文字大小 100% 172 张、115% 26 张、200% 2 张；语言英文 152 张、中文 48 张；主题深色 141 张、浅色 59 张。
 
-本轮新增的 21 张：`home-no-match-*`（零结果与清除按钮，含 720×480 与中文）、`hosts-read-failed-*`（主机文件读不出来，含 720×480 与中文）、`desktop-rdp-*`（RDP 画面与控件条、缩放、115% 与中文）、`desktop-vnc-failed-*`（认证失败卡片，含 720×480 与中文）、`desktop-send-problem-*`（画面上的提示条）。既有 `home-empty`、`home-hosts`、`hosts-5000`、`hosts-groups`、`hosts-selection`、`hosts-import`、`hosts-connection-*`、`settings*`、`overlay-tabs`、`batch-*`、`files-*`、`transfers-*`、`serial-session`、`terminal-*` 也都在这一轮里重拍。
+本轮新增 25 张、6 个场景（按 `ui2` 与 `ui-baseline` 两份清单的场景与 PNG 差值）：`hosts-connections-*`（4 张：协议行的名称、徽标、目标与连接按钮，含 720×480）、`home-no-match-*`（4 张：零结果与清除按钮，含 720×480 与中文）、`hosts-read-failed-*`（4 张：主机文件读不出来，含 720×480 与中文）、`desktop-rdp-*`（5 张：RDP 画面与控件条、115% 与中文）、`desktop-vnc-failed-*`（4 张：认证失败卡片，含 720×480 与中文）、`desktop-send-problem-*`（4 张：画面上的提示条，含 115% 与中文）。既有 `home-empty`、`home-hosts`、`hosts-5000`、`hosts-groups`、`hosts-selection`、`hosts-import`、`hosts-connection-*`、`settings*`、`overlay-tabs`、`batch-*`、`files-*`、`transfers-*`、`serial-session`、`terminal-*` 也都在这一轮里重拍。
 
 每张 PNG 的 `evidence_boundary` 写在清单里，页面上也能读到：桌面相关四张只证明这个应用在这些状态下画了什么，不证明真实 RDP/VNC 服务端或真实串口设备。
 

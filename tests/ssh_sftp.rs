@@ -203,10 +203,30 @@ fn accepted_authentications(server: &Harness) -> usize {
         .count()
 }
 
+/// How many times a server start is tried when it loses its port to another test.
+///
+/// A start binds a port the harness chose a moment earlier, so a test that starts a
+/// server at the same time can take it; sshd then reports that it did not start
+/// listening. That is a race over a port between parallel tests, not a condition of the
+/// product, so the start is retried with a new port instead of failing the case.
+const START_ATTEMPTS: usize = 4;
+
 /// A server of this test's own, so counting logins in it cannot see another test's.
 fn own_server(name: &str) -> Harness {
-    let server = Harness::start(name, Harness::free_port())
-        .unwrap_or_else(|reason| panic!("the server {name} could not be started: {reason}"));
+    let mut reasons = Vec::new();
+    let mut started = None;
+    for _ in 0..START_ATTEMPTS {
+        match Harness::start(name, Harness::free_port()) {
+            Ok(server) => {
+                started = Some(server);
+                break;
+            }
+            Err(reason) => reasons.push(reason),
+        }
+    }
+    let Some(server) = started else {
+        panic!("the server {name} could not be started: {reasons:?}");
+    };
     prepare(&server).unwrap_or_else(|reason| panic!("the fixtures of {name} failed: {reason}"));
     server
 }
@@ -421,9 +441,19 @@ fn a_server_without_sftp_says_so_and_keeps_the_terminal() {
         );
         return;
     }
-    let server = match Harness::start_without_sftp("sftp-none", Harness::free_port()) {
-        Ok(server) => server,
-        Err(reason) => panic!("the server without SFTP could not be started: {reason}"),
+    let mut reasons = Vec::new();
+    let mut started = None;
+    for _ in 0..START_ATTEMPTS {
+        match Harness::start_without_sftp("sftp-none", Harness::free_port()) {
+            Ok(server) => {
+                started = Some(server);
+                break;
+            }
+            Err(reason) => reasons.push(reason),
+        }
+    }
+    let Some(server) = started else {
+        panic!("the server without SFTP could not be started: {reasons:?}");
     };
     let mut session = live(&server);
     let mut link = session.take_file_link().expect("the session is browsable");
@@ -499,37 +529,53 @@ fn server_names(server: &Harness, path: &str) -> Vec<String> {
 /// uses reads it, and the path that comes out is then listed over the same connection.
 /// Nothing injects a directory into the browser, and nothing asks the shell for its
 /// working directory with a command of its own.
+///
+/// The directory the shell `cd`s into is one this test makes and fills itself, so both
+/// sides of the comparison below - what the server prints and what the browser lists -
+/// describe a directory nobody else writes to. A system directory looks like a
+/// convenient fixed path and is not one: `/var/log` gained and lost `wtmp.db-journal`
+/// while the two listings were taken, so the comparison failed now and then for a
+/// reason that had nothing to do with following a report.
 #[test]
 fn the_directory_a_shell_reports_is_the_one_the_browser_lists() {
     if skip("directory following") {
         return;
     }
     let server = own_server("osc7-follow");
+    let home = server.home();
+    // Fixed names, so the two listings can be compared with what was put here instead of
+    // only with each other; the directory is removed before it is made, because a
+    // previous run may have been interrupted before its cleanup.
+    let made = format!("{home}/osc7-live");
+    let known = ["alpha.txt", "beta.txt", "nested", "note with space.txt"];
+    server
+        .as_user(&format!(
+            "set -e
+rm -rf '{made}'
+mkdir -p '{made}/nested'
+printf 'alpha\n' > '{made}/alpha.txt'
+printf 'beta\n' > '{made}/beta.txt'
+printf 'notes\n' > '{made}/note with space.txt'"
+        ))
+        .expect("the directory the shell will report is made");
     let mut session = live(&server);
-    // The command is typed once the shell is really reading its terminal, which its
-    // first output says. Writing earlier would test this test's timing instead of the
-    // directory report.
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        let spoken = session.drain().iter().any(|event| {
-            matches!(
-                event,
-                RemoteEvent::Data(bytes) if !bytes.is_empty()
-            )
-        });
-        if spoken {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the shell never said anything after the connection"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // The command is typed as soon as the session is up. Waiting for the shell's first
+    // output would be a wait on something a test cannot observe reliably: the login
+    // banner and the prompt can arrive in the same batch as the connection itself, and
+    // a wait that only looks at what arrives afterwards then waits for output that was
+    // already delivered (45 seconds, once, under load). Input written to a pseudo
+    // terminal before the shell reads it waits in the terminal's own buffer, and what
+    // proves the command was executed is below: the report itself.
+    //
     // `cd` first, so the path is the shell's own idea of where it is rather than one
     // this test typed.
     session
-        .write(b"cd /var/log && printf '\\033]7;file://%s%s\\007' \"$(hostname)\" \"$PWD\"\r\n")
+        .write(
+            format!(
+                "cd '{made}' && printf '\\033]7;file://%s%s\\007' \"$(hostname)\" \"$PWD\"\r\n"
+            )
+            .as_bytes(),
+        )
         .expect("the shell accepts input");
 
     let mut terminal = shellune_terminal::TerminalCore::new(100, 30, 1_000);
@@ -558,17 +604,29 @@ fn the_directory_a_shell_reports_is_the_one_the_browser_lists() {
     }
     assert_eq!(
         terminal.directory(),
-        Some("/var/log"),
+        Some(made.as_str()),
         "the report is the directory the shell is in, not the login directory"
     );
 
     // The same authenticated connection lists that path, and what it holds is what the
     // server holds: following a report is only useful if the reported path is readable.
     let mut link = session.take_file_link().expect("the shell has a file link");
+    let listed = listed_names(&mut link, 1, &made);
+    let on_server = server_names(&server, &made);
+    // Both listings are taken, then the directory goes: a test that leaves its fixture
+    // behind makes the next run read it.
+    server
+        .as_user(&format!("rm -rf '{made}'"))
+        .expect("the fixture is cleaned up");
     assert_eq!(
-        listed_names(&mut link, 1, "/var/log"),
-        server_names(&server, "/var/log"),
+        listed, on_server,
         "the followed directory is the server's own directory"
+    );
+    let mut expected: Vec<String> = known.iter().map(|name| (*name).to_owned()).collect();
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "the listing is the directory the shell reported, and nothing else"
     );
 }
 
@@ -594,6 +652,13 @@ fn a_directory_is_created_renamed_and_deleted_on_the_server() {
     }
     let server = own_server("sftp-mutate");
     let home = server.home();
+    // The account's home is not wiped between runs, so a previous run that was
+    // interrupted would leave the two names this test makes behind, and the creation
+    // below would be a conflict before it started. Clearing them here keeps the case
+    // about creating, renaming and deleting a directory rather than about leftovers.
+    server
+        .as_user(&format!("rm -rf '{home}/新建 目录' '{home}/改名后'"))
+        .expect("the names this test makes are free");
     let mut session = live(&server);
     let mut link = session
         .take_file_link()
