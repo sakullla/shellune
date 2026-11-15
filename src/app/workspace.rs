@@ -352,6 +352,7 @@ impl SessionStatus {
 
     /// Whether the session ended the way it was asked to: a clean exit is not an error.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn ended_as_expected(&self) -> bool {
         match &self.state {
             SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
@@ -1090,14 +1091,39 @@ impl Workspace {
         title: &str,
         target: PaneTarget,
     ) -> Session {
-        let mut session = Session::new(kind, title);
-        // A session that has not been connected yet must not be listed as live.
-        let _ = session.begin_connecting();
+        let session = self.register_session_not_started(kind, title, target);
+        // A session that is about to be dialled says so, rather than looking idle
+        // while a process is on its way.
+        self.session_starting(session.id());
+        session
+    }
+
+    /// Registers a session that has not been started, and gives it a pane.
+    ///
+    /// The record stays in NotStarted: placing a tab, restoring a layout or saving a
+    /// connection opens nothing, so a desktop or serial session can exist as a
+    /// record without a worker behind it yet. Starting it is a separate,
+    /// explicit step (R18, R21).
+    pub fn register_session_not_started(
+        &mut self,
+        kind: SessionKind,
+        title: &str,
+        target: PaneTarget,
+    ) -> Session {
+        let session = Session::new(kind, title);
         let mut sessions = self.sessions.items().to_vec();
         sessions.push(session.clone());
         self.sessions.replace(SectionStatus::Ready, sessions);
         self.layout.attach(session.id(), target, session.title());
         session
+    }
+
+    /// Records that a registered session is now being started.
+    ///
+    /// Returns whether the record moved: a session that is already connecting, live
+    /// or closed is left as it is, so a second start cannot restart a live one.
+    pub fn session_starting(&mut self, id: SessionId) -> bool {
+        self.transition(id, |session| session.begin_connecting().is_ok())
     }
 
     /// Creates a session record for a local shell that is starting.
@@ -1130,10 +1156,13 @@ impl Workspace {
     /// longer has offers nothing, which is what a stale id deserves.
     #[must_use]
     pub fn capabilities(&self, id: SessionId) -> shellune_core::SessionCapabilities {
-        self.session(id).map_or_else(
-            || shellune_core::SessionCapabilities::of_protocol(shellune_core::ProtocolKind::Ssh),
-            |session| shellune_core::SessionCapabilities::of_kind(session.kind()),
-        )
+        match self.session(id) {
+            Some(session) => shellune_core::SessionCapabilities::of_kind(session.kind()),
+            // A stale id allows nothing. Answering with a protocol's set would have
+            // offered a session that is gone the files, batch or forwarding of one
+            // that is not.
+            None => shellune_core::SessionCapabilities::none(),
+        }
     }
 
     /// The status every surface states for one session.

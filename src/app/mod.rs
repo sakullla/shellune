@@ -21,6 +21,8 @@ pub mod batch;
 pub mod capture;
 pub mod components;
 pub mod copy;
+/// The RDP and VNC surfaces a desktop session draws (R18-R20, R23).
+pub mod desktop;
 pub mod files;
 pub mod forwarding;
 pub mod glyphs;

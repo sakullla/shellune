@@ -235,7 +235,9 @@ impl ShelluneView {
             self.allows(id, shellune_core::Capability::Files) && self.files.can_browse(id);
         let files_open = self.files.is_open(id);
         let unsaved = self.unsaved.iter().any(|(session, _)| *session == id);
-        let has_terminal = self.pane_for(id).is_some();
+        // A desktop surface is shown in the same tab and by the same bar; only a
+        // session that has neither a terminal nor a picture has nothing to open.
+        let has_terminal = self.pane_for(id).is_some() || self.desktop_for(id).is_some();
         // While the connection card is on screen it is the one place to act on the
         // attempt; the bar only says where it stands.
         let card = self.connection_inline();

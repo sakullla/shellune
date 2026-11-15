@@ -31,6 +31,15 @@ shellune-core = { path = "crates/core" }
 shellune-ssh = { path = "crates/ssh" }
 shellune-storage = { path = "crates/storage" }
 shellune-terminal = { path = "crates/terminal" }
+# The RDP/VNC sessions a desktop pane shows (R18-R20, R23). The same crate is what
+# the native tests drive directly, so it is a normal dependency as well as a test
+# one: a build without the native sources still compiles, and the pane reports the
+# reason instead of offering a connection that cannot open.
+shellune-desktop = { path = "crates/desktop" }
+# A rendered frame is handed to GPUI as an image, which is the only way a window
+# draws a framebuffer pixel by pixel. The version is the one GPUI itself uses, so
+# there is one image crate in the graph.
+image = "0.25.1"
 # Only the capture probe reports machine-readable results; the feature pulls it in.
 serde_json = { workspace = true, optional = true }
 

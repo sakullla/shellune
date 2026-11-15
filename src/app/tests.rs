@@ -22033,3 +22033,363 @@ fn request_real_close(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) -
         })
     })
 }
+
+// ---------------------------------------------------------------------------
+// Remote desktops in the workspace (R8, R10, R17-R20, R23)
+// ---------------------------------------------------------------------------
+
+use crate::app::desktop::scripted::{ScriptedLink, solid};
+use crate::app::desktop::{Buttons, DesktopInput, LinkEvent, LinkFailure, LinkState};
+
+/// A saved RDP connection, for the desktop tests.
+fn desktop_record(name: &str) -> shellune_core::ConnectionRecord {
+    shellune_core::ConnectionRecord::Rdp(
+        shellune_core::RdpConfig::new(name, "rdp.example.com", Some("desk"))
+            .expect("a valid RDP record"),
+    )
+}
+
+/// Mounts a scripted desktop surface and drains what its link already holds.
+///
+/// The polling task waits on the window's timer, which a test cannot advance, so
+/// the same call it would make is made here: everything else - the session
+/// record, the placement, the tab - goes through the path the application takes.
+fn mount_scripted_desktop(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    record: &shellune_core::ConnectionRecord,
+    link: ScriptedLink,
+) -> SessionId {
+    let id = cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            view.attach_scripted_desktop_for_test(record, Box::new(link), cx)
+        })
+    });
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            if let Some(pane) = view.desktop_of(id).cloned() {
+                pane.update(cx, |pane, cx| {
+                    pane.pump_once(cx);
+                });
+            }
+        })
+    });
+    cx.run_until_parked();
+    id
+}
+
+#[gpui::test]
+async fn a_desktop_tab_applies_every_region_in_the_order_it_arrived(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let desktop = (320u32, 200u32);
+    let (link, _log) = ScriptedLink::new(vec![
+        LinkEvent::State {
+            state: LinkState::Connected,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::Frame(solid(0, 0, 320, 200, desktop, [16, 32, 48, 255])),
+        LinkEvent::Frame(solid(8, 8, 16, 16, desktop, [200, 100, 50, 255])),
+    ]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+
+    let (size, applied, corner, inner, live, state) = cx.update(|_window, app| {
+        let view = view.read(app);
+        let pane = view
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app);
+        let surface = pane.surface();
+        let inner = (8 * 320 + 8) * 4;
+        (
+            surface.size(),
+            surface.applied(),
+            surface.pixels()[0..4].to_vec(),
+            surface.pixels()[inner..inner + 4].to_vec(),
+            pane.is_live(),
+            view.workspace()
+                .session(id)
+                .map(|session| session.state().clone()),
+        )
+    });
+    assert_eq!(size, desktop, "the first frame fixes the desktop size");
+    assert_eq!(
+        applied, 2,
+        "both regions were applied: a diff is never dropped in favour of a newer one"
+    );
+    assert_eq!(
+        corner,
+        vec![16, 32, 48, 255],
+        "the background region is drawn"
+    );
+    assert_eq!(
+        inner,
+        vec![200, 100, 50, 255],
+        "the later region is on top of the earlier one, in arrival order"
+    );
+    assert!(live, "a first frame is what makes the surface live");
+    assert_eq!(
+        state,
+        Some(SessionState::Connected),
+        "the record states what the surface reports"
+    );
+
+    // The picture really is drawn inside the tab: the element that carries the
+    // image was measured with a box of its own.
+    let picture = bounds_of(cx, "desktop.surface");
+    assert!(
+        picture.size.width > px(0.0) && picture.size.height > px(0.0),
+        "the frame is presented in the application tab: {picture:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_press_on_a_desktop_is_mapped_and_a_close_releases_it(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let desktop = (1600u32, 900u32);
+    let (link, log) = ScriptedLink::new(vec![LinkEvent::Frame(solid(
+        0,
+        0,
+        1600,
+        900,
+        desktop,
+        [1, 2, 3, 255],
+    ))]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+
+    let surface = bounds_of(cx, "desktop.surface");
+    let centre = surface.center();
+    let expected = crate::app::desktop::to_remote(surface, desktop, centre)
+        .expect("the centre of the picture is on the desktop");
+    cx.simulate_mouse_down(centre, MouseButton::Left, Modifiers::default());
+    let sent = log.lock().expect("the log is not poisoned").inputs.clone();
+    match sent.last() {
+        Some(DesktopInput::Pointer { x, y, buttons }) => {
+            assert_eq!(
+                (*x, *y),
+                expected,
+                "the press names the remote pixel under the pointer, not the offset in the pane"
+            );
+            assert!(buttons.contains(Buttons::LEFT), "the left button is held");
+        }
+        other => panic!("a pointer press was not sent: {other:?}"),
+    }
+
+    cx.simulate_mouse_up(centre, MouseButton::Left, Modifiers::default());
+    cx.update(|_window, cx| view.update(cx, |view, cx| view.close_session(id, cx)));
+    let log = log.lock().expect("the log is not poisoned").clone();
+    assert_eq!(
+        log.shutdowns, 1,
+        "closing the tab stops the protocol worker exactly once"
+    );
+    assert!(
+        matches!(log.inputs.last(), Some(DesktopInput::Pointer { buttons, .. }) if !buttons.any_button()),
+        "the button that was held is released before the session ends: {:?}",
+        log.inputs.last()
+    );
+    let open = cx.update(|_window, app| view.read(app).open_sessions());
+    assert!(!open.contains(&id), "the closed surface left the workspace");
+}
+
+#[gpui::test]
+async fn a_desktop_that_was_refused_states_one_reason_and_forgets_its_disclosure(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::Authentication),
+        failure: LinkFailure::Authentication,
+        detail: 0,
+        reason: "the server rejected the logon".to_owned(),
+    }]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+
+    let (state, headline, shown) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (
+            view.workspace()
+                .session(id)
+                .map(|session| session.state().clone()),
+            view.workspace()
+                .status(id)
+                .map(|status| status.headline(view.workspace().locale())),
+            view.workspace()
+                .status(id)
+                .and_then(|status| status.diagnostic().map(str::to_owned)),
+        )
+    });
+    assert_eq!(
+        state,
+        Some(SessionState::Failed(SessionFailure::AuthenticationFailed)),
+        "a refused credential is the credential problem, not a transport one"
+    );
+    assert_eq!(headline.as_deref(), Some("Failed"));
+    assert!(
+        shown.is_some_and(|reason| reason.contains("credentials")),
+        "the record states the fact it knows, without inventing a detail"
+    );
+    let layer = cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .layer_reason()
+            .map(str::to_owned)
+    });
+    assert!(
+        layer
+            .as_ref()
+            .is_some_and(|reason| reason.contains("logon")),
+        "the sentence the protocol layer gave is kept beside it: {layer:?}"
+    );
+
+    // The disclosure is a view fact about one session: opening it and then closing
+    // the session must not leave it behind for an id that a later session takes.
+    let details = bounds_of(cx, "terminal.failure.details");
+    cx.simulate_click(details.center(), Modifiers::default());
+    assert!(
+        cx.update(|_window, app| view.read(app).diagnostics_open(id)),
+        "the disclosure opened"
+    );
+    cx.update(|_window, cx| view.update(cx, |view, cx| view.close_session(id, cx)));
+    assert!(
+        !cx.update(|_window, app| view.read(app).diagnostics_open(id)),
+        "the disclosure is forgotten with the session it belonged to"
+    );
+}
+
+#[test]
+fn a_stale_session_allows_no_capability_at_all() {
+    let workspace = Workspace::new();
+    let capabilities = workspace.capabilities(SessionId::new());
+    assert!(
+        capabilities.is_empty(),
+        "a session the shell no longer has allows nothing"
+    );
+    for capability in Capability::ALL {
+        assert!(
+            !capabilities.allows(capability),
+            "{capability:?} was allowed for an id no session has"
+        );
+    }
+}
+
+#[test]
+fn a_desktop_record_can_be_registered_without_opening_anything() {
+    let mut workspace = Workspace::new();
+    let record = desktop_record("desk");
+    let session = workspace.register_session_not_started(
+        SessionKind::Rdp { host: record.id() },
+        record.name(),
+        PaneTarget::rdp(record.id()),
+    );
+    assert_eq!(
+        workspace.session(session.id()).map(|s| s.state().clone()),
+        Some(SessionState::Idle),
+        "placing a pane dials nothing"
+    );
+    assert!(
+        workspace.session_starting(session.id()),
+        "starting the pane is the step that moves the record"
+    );
+    assert_eq!(
+        workspace.session(session.id()).map(|s| s.state().clone()),
+        Some(SessionState::Connecting)
+    );
+    assert!(
+        !workspace.session_starting(session.id()),
+        "a second start does not restart a session that is already connecting"
+    );
+}
+
+#[test]
+fn a_clean_exit_is_called_the_same_thing_on_the_tab_and_in_the_notice() {
+    let ended = SessionState::Disconnected(SessionFailure::ProcessExited { code: Some(0) });
+    for locale in Locale::ALL {
+        assert_eq!(
+            copy::session_state_label(&ended, locale),
+            locale.strings().terminal_exited,
+            "a clean exit is not called a disconnect in {locale:?}"
+        );
+    }
+    let failed = SessionState::Disconnected(SessionFailure::ProcessExited { code: Some(1) });
+    assert_ne!(
+        copy::session_state_label(&failed, Locale::English),
+        ENGLISH.terminal_exited,
+        "an exit that failed keeps the wording of a failed connection"
+    );
+}
+
+#[gpui::test]
+async fn a_desktop_that_cannot_be_reached_reports_what_the_backend_said(cx: &mut TestAppContext) {
+    // A port nothing is listening on: the pane really creates a handle in the
+    // native backend, really dials, and reports the failure it is given. The
+    // endpoint matrix in tests/rdp_vnc.rs is what proves a real server; this proves
+    // the pane's own path to the backend is wired.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a probe port");
+    let port = listener.local_addr().expect("the probe address").port();
+    drop(listener);
+    let mut config =
+        shellune_core::VncConfig::new("unreachable", "127.0.0.1").expect("a valid record");
+    config.set_port(u32::from(port)).expect("a valid port");
+    let record = shellune_core::ConnectionRecord::Vnc(config);
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let id = cx.update(|_window, cx| {
+        view.update(cx, |view, cx| {
+            view.start_desktop_with_record_for_test(&record, cx)
+        })
+    });
+
+    // The protocol worker is a native thread, so the test polls the pane the way
+    // the window's timer would, until the attempt has ended.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut ended = false;
+    while std::time::Instant::now() < deadline {
+        let phase_ended = cx.update(|_window, cx| {
+            view.update(cx, |view, cx| {
+                let Some(pane) = view.desktop_of(id).cloned() else {
+                    return false;
+                };
+                pane.update(cx, |pane, cx| {
+                    pane.pump_once(cx);
+                    pane.phase().failure().is_some()
+                })
+            })
+        });
+        if phase_ended {
+            ended = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ended, "the attempt ended instead of hanging");
+
+    let (state, reason) = cx.update(|_window, app| {
+        let view = view.read(app);
+        (
+            view.workspace()
+                .session(id)
+                .map(|session| session.state().clone()),
+            view.desktop_of(id)
+                .map(|pane| pane.read(app).layer_reason().map(str::to_owned))
+                .unwrap_or_default(),
+        )
+    });
+    match state {
+        Some(SessionState::Failed(SessionFailure::ConnectionFailed { reason })) => {
+            assert!(
+                reason.contains("127.0.0.1") || reason.contains("connect"),
+                "the reason names what the transport said: {reason}"
+            );
+        }
+        other => panic!("an unreachable endpoint is a start failure, not {other:?}"),
+    }
+    assert!(
+        reason.is_some(),
+        "the backend's own sentence is kept beside the session's state"
+    );
+}

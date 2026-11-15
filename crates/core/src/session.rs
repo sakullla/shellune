@@ -741,6 +741,16 @@ pub struct SessionCapabilities {
 }
 
 impl SessionCapabilities {
+    /// A set with no capability at all.
+    ///
+    /// This is the answer for a session the shell no longer has: nothing is
+    /// reachable through a connection that is gone, so the set is empty rather
+    /// than borrowed from any protocol.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { mask: 0 }
+    }
+
     /// The capabilities a protocol offers.
     #[must_use]
     pub fn of_protocol(protocol: ProtocolKind) -> Self {

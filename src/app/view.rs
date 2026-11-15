@@ -86,6 +86,7 @@ use crate::app::{components, theme::radius};
 use shellune_storage::KeymapPreferences;
 
 pub(crate) mod batch;
+mod desktop;
 mod files_menu;
 mod forwarding;
 mod home;
@@ -183,14 +184,11 @@ struct OpenPane {
 enum PaneContent {
     /// A character terminal: local shell, SSH, or a serial device.
     Terminal(Entity<TerminalPane>),
-    /// A surface that is not a character grid.
+    /// A remote desktop: an RDP or VNC surface with its own protocol worker.
     ///
-    /// RDP and VNC draw their own frames, which arrive with the desktop layer; the
-    /// variant exists here so that the routing of every event already has one place to
-    /// put them, and so a close or a reconnect of such a session ends its worker instead
-    /// of a terminal that was never created.
-    #[allow(dead_code)]
-    Surface(PaneKind),
+    /// The pane holds the worker, so a close or a reconnect of such a session ends
+    /// that worker instead of a terminal that was never created (R17, R18).
+    Desktop(Entity<desktop::DesktopPane>),
 }
 
 impl PaneContent {
@@ -198,7 +196,15 @@ impl PaneContent {
     fn terminal(&self) -> Option<&Entity<TerminalPane>> {
         match self {
             Self::Terminal(pane) => Some(pane),
-            Self::Surface(_) => None,
+            Self::Desktop(_) => None,
+        }
+    }
+
+    /// The desktop surface behind this pane, when it is one.
+    fn desktop(&self) -> Option<&Entity<desktop::DesktopPane>> {
+        match self {
+            Self::Desktop(pane) => Some(pane),
+            Self::Terminal(_) => None,
         }
     }
 }
@@ -2988,6 +2994,85 @@ impl ShelluneView {
         self.pane_for(id)
     }
 
+    /// The desktop surface of one session, for the tests that drive its frames.
+    #[cfg(test)]
+    #[must_use]
+    pub fn desktop_of(&self, id: SessionId) -> Option<&Entity<desktop::DesktopPane>> {
+        self.desktop_for(id)
+    }
+
+    /// Starts a saved record through the real start path, for the test that proves
+    /// the pane dials through the native shim and reports what came back.
+    ///
+    /// The record is used as it is instead of being looked up in the host book: the
+    /// point of this hook is the link, not the store, and the store has its own
+    /// tests.
+    #[cfg(test)]
+    pub fn start_desktop_with_record_for_test(
+        &mut self,
+        record: &ConnectionRecord,
+        cx: &mut Context<Self>,
+    ) -> SessionId {
+        let target = crate::app::desktop::DesktopTarget::of_record(record)
+            .expect("the record is a desktop connection");
+        let (kind, pane_target) = match target.protocol() {
+            ProtocolKind::Vnc => (
+                SessionKind::Vnc { host: record.id() },
+                shellune_core::PaneTarget::vnc(record.id()),
+            ),
+            _ => (
+                SessionKind::Rdp { host: record.id() },
+                shellune_core::PaneTarget::rdp(record.id()),
+            ),
+        };
+        let session = self
+            .workspace
+            .register_session_not_started(kind, record.name(), pane_target);
+        self.workspace.session_starting(session.id());
+        let tag = session.tag();
+        let locale = self.workspace.locale();
+        let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, cx));
+        pane.update(cx, |pane, cx| pane.start(None, cx));
+        self.attach_desktop(tag, pane, cx);
+        session.id()
+    }
+
+    /// Mounts a desktop surface on a scripted link, so the window-level rules can be
+    /// tested on a machine that has no RDP or VNC server.
+    ///
+    /// It goes through the same registration, session record and placement the real
+    /// start uses; only the link is scripted, which is what keeps the test from
+    /// proving a path the application does not take.
+    #[cfg(test)]
+    pub fn attach_scripted_desktop_for_test(
+        &mut self,
+        record: &ConnectionRecord,
+        link: Box<dyn crate::app::desktop::DesktopLink>,
+        cx: &mut Context<Self>,
+    ) -> SessionId {
+        let target = crate::app::desktop::DesktopTarget::of_record(record)
+            .expect("the record is a desktop connection");
+        let (kind, pane_target) = match target.protocol() {
+            ProtocolKind::Vnc => (
+                SessionKind::Vnc { host: record.id() },
+                shellune_core::PaneTarget::vnc(record.id()),
+            ),
+            _ => (
+                SessionKind::Rdp { host: record.id() },
+                shellune_core::PaneTarget::rdp(record.id()),
+            ),
+        };
+        let session = self
+            .workspace
+            .register_session_not_started(kind, record.name(), pane_target);
+        self.workspace.session_starting(session.id());
+        let tag = session.tag();
+        let locale = self.workspace.locale();
+        let pane = cx.new(|cx| desktop::DesktopPane::with_link(target, link, locale, cx));
+        self.attach_desktop(tag, pane, cx);
+        session.id()
+    }
+
     /// The sessions the tab strip shows, in the order they were opened.
     ///
     /// Every session that is not closed has a tab: one that is still connecting has no
@@ -3029,6 +3114,14 @@ impl ShelluneView {
 
     fn active_pane(&self) -> Option<&Entity<TerminalPane>> {
         self.active.and_then(|id| self.pane_for(id))
+    }
+
+    /// The desktop surface of one session, whether or not it is on screen.
+    fn desktop_for(&self, id: SessionId) -> Option<&Entity<desktop::DesktopPane>> {
+        self.panes
+            .iter()
+            .find(|open| open.tag.session == id)
+            .and_then(|open| open.content.desktop())
     }
 
     /// The terminal whose paste or saved command is waiting for an answer (R17).
@@ -3154,10 +3247,15 @@ impl ShelluneView {
     /// window is busy with the event that started it - so the next draw also gives
     /// the terminal the keyboard with its own window.
     fn focus_pane(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(pane) = self.pane_for(id) else {
+        // A terminal and a desktop surface both take the keyboard; which one it is
+        // only decides whose handle is asked.
+        let handle = if let Some(pane) = self.pane_for(id) {
+            pane.read(cx).focus_handle().clone()
+        } else if let Some(pane) = self.desktop_for(id) {
+            pane.read(cx).focus_handle().clone()
+        } else {
             return;
         };
-        let handle = pane.read(cx).focus_handle().clone();
         self.pane_focus_pending = Some(id);
         if let Some(window) = cx.active_window() {
             let _ = window.update(cx, |_view, window, _cx| window.focus(&handle));
@@ -3263,6 +3361,158 @@ impl ShelluneView {
             self.showing_connection_form = false;
             self.focus_pane(tag.session, cx);
         }
+        cx.notify();
+    }
+
+    /// Adds a desktop surface for a session that just started and shows it.
+    ///
+    /// A desktop tab is a session tab like any other: it takes the screen only when
+    /// the user asked for it, and it keeps its own worker either way.
+    fn attach_desktop(
+        &mut self,
+        tag: EventTag,
+        pane: Entity<desktop::DesktopPane>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.observe(&pane, |view, pane, cx| view.sync_desktop(pane, cx))
+            .detach();
+        self.panes.push(OpenPane {
+            tag,
+            content: PaneContent::Desktop(pane),
+        });
+        if self.workspace.destination() != Destination::LocalShells {
+            self.workspace.select(Destination::LocalShells);
+            self.workspace
+                .set_context(shellune_core::PanelSection::None);
+        }
+        self.active = Some(tag.session);
+        self.session_terminal = true;
+        self.showing_connection_form = false;
+        self.focus_pane(tag.session, cx);
+        cx.notify();
+    }
+
+    /// Repeats what a desktop surface reports into the session record (R17).
+    ///
+    /// The pane is where the protocol state really is; the record is what the tab,
+    /// the session bar and the list read. Writing one into the other here is what
+    /// keeps a single wording for one session: a first frame makes it live, and a
+    /// protocol failure ends it with the reason the layer reported.
+    fn sync_desktop(&mut self, pane: Entity<desktop::DesktopPane>, cx: &mut Context<Self>) {
+        let Some(session) = self
+            .panes
+            .iter()
+            .find(|open| open.content.desktop().is_some_and(|held| *held == pane))
+            .map(|open| open.tag.session)
+        else {
+            return;
+        };
+        let phase = pane.read(cx).phase().clone();
+        if let Some(failure) = phase.failure() {
+            self.workspace.session_failed(session, failure);
+        } else if matches!(phase, desktop::DesktopPhase::Live) {
+            let pending = self
+                .workspace
+                .session(session)
+                .is_some_and(|session| session.state().is_pending());
+            if pending {
+                // The certificate decision and the accepted credentials happen
+                // inside the protocol, so both steps are recorded in one go before
+                // the session is called live (R17).
+                self.workspace.session_verified_and_authenticated(session);
+                self.workspace.session_connected(session);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Starts a waiting desktop pane: one session record, one surface (R18, R19).
+    ///
+    /// Nothing is dialled until this runs, which is what keeps a restored layout and
+    /// a placed pane from opening a socket on their own.
+    pub(super) fn open_desktop_leaf(
+        &mut self,
+        pane: shellune_core::PaneId,
+        host: HostId,
+        protocol: ProtocolKind,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.book.connection(host) else {
+            cx.notify();
+            return;
+        };
+        let (kind, target) = match protocol {
+            ProtocolKind::Vnc => (
+                SessionKind::Vnc { host },
+                shellune_core::PaneTarget::vnc(host),
+            ),
+            _ => (
+                SessionKind::Rdp { host },
+                shellune_core::PaneTarget::rdp(host),
+            ),
+        };
+        // The record starts as not started: a pane that is only placed is not a
+        // connection, and the start below is the one step that makes it one.
+        self.workspace.arm_adopt(pane);
+        let session = self
+            .workspace
+            .register_session_not_started(kind, record.name(), target);
+        self.start_desktop_session(session.id(), cx);
+    }
+
+    /// Starts the saved desktop connection of one session.
+    ///
+    /// The saved password, when the record says one may be in the store, goes from
+    /// the store into the link: the pane never keeps it, and nothing about it is
+    /// logged or drawn.
+    pub(super) fn start_desktop_session(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let record = self
+            .workspace
+            .session(session)
+            .and_then(|session| match session.kind() {
+                SessionKind::Rdp { host } | SessionKind::Vnc { host } => {
+                    self.book.connection(*host)
+                }
+                _ => None,
+            });
+        let Some(record) = record else {
+            let reason = self.strings().session_reconnect_missing_host.to_owned();
+            self.refuse_desktop(session, reason, cx);
+            return;
+        };
+        let Some(target) = crate::app::desktop::DesktopTarget::of_record(&record) else {
+            let reason = self.strings().session_reconnect_missing_host.to_owned();
+            self.refuse_desktop(session, reason, cx);
+            return;
+        };
+        let password = if record.remembers_secret() {
+            self.secrets
+                .load(record.id())
+                .ok()
+                .flatten()
+                .map(|secret| secret.expose().to_owned())
+        } else {
+            None
+        };
+        // The record says the attempt is being made before the socket is opened, so
+        // a tab never shows an idle session while a connection is dialling.
+        self.workspace.session_starting(session);
+        let tag = self
+            .workspace
+            .session(session)
+            .map_or(EventTag::new(session, 0), shellune_core::Session::tag);
+        let locale = self.workspace.locale();
+        let pane = cx.new(|cx| desktop::DesktopPane::new(target, locale, cx));
+        pane.update(cx, |pane, cx| pane.start(password.as_deref(), cx));
+        self.attach_desktop(tag, pane, cx);
+    }
+
+    /// Records that a desktop session cannot be started at all, and why.
+    fn refuse_desktop(&mut self, session: SessionId, reason: String, cx: &mut Context<Self>) {
+        // Another attempt cannot bring back a connection record that is gone, so the
+        // session stops offering one instead of looping (R12).
+        self.workspace
+            .session_failed(session, SessionFailure::ReconnectUnavailable { reason });
         cx.notify();
     }
 
@@ -3375,7 +3625,12 @@ impl ShelluneView {
                 let pane = pane.clone();
                 pane.update(cx, |pane, cx| pane.close(cx));
             }
-            PaneContent::Surface(_) => self.end_session_surface(id),
+            PaneContent::Desktop(pane) => {
+                // The surface is stopped before its handle is dropped, so the
+                // protocol worker is told and nothing keeps polling (R17).
+                let pane = pane.clone();
+                pane.update(cx, |pane, _cx| pane.stop());
+            }
         }
         // The connection of this session ends with its terminal, so its file view goes
         // with it instead of keeping a path and a listing that nothing backs any more.
@@ -3404,7 +3659,7 @@ impl ShelluneView {
     /// running.
     pub fn activate(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.workspace.layout_mut().focus_session(id);
-        if self.pane_for(id).is_none() {
+        if self.pane_for(id).is_none() && self.desktop_for(id).is_none() {
             if self.attempt_index(id).is_some() {
                 self.focus_attempt(id, cx);
             }
@@ -3433,11 +3688,17 @@ impl ShelluneView {
     /// lost and the next shortcut would land on the terminal that was just hidden.
     pub fn activate_in(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
         self.activate(id, cx);
-        if self.active == Some(id)
-            && let Some(pane) = self.pane_for(id)
-        {
-            let handle = pane.read(cx).focus_handle().clone();
-            window.focus(&handle);
+        if self.active == Some(id) {
+            let handle = self
+                .pane_for(id)
+                .map(|pane| pane.read(cx).focus_handle().clone())
+                .or_else(|| {
+                    self.desktop_for(id)
+                        .map(|pane| pane.read(cx).focus_handle().clone())
+                });
+            if let Some(handle) = handle {
+                window.focus(&handle);
+            }
         }
     }
 
@@ -3522,7 +3783,7 @@ impl ShelluneView {
         // desktop or serial worker that kept running, would describe a session that is
         // over (R17, R18).
         self.x11.remove(&id);
-        self.end_session_surface(id);
+        self.end_session_surface(id, cx);
         // The attempt that asked a trust, ProxyCommand or X11 question can no longer
         // answer it, so it is taken away with its panel and its secrets.
         self.discard_attempt(id);
@@ -3545,6 +3806,9 @@ impl ShelluneView {
         if self.snippet_note.is_some_and(|note| note.session == id) {
             self.snippet_note = None;
         }
+        // Which sentences were unfolded says nothing about a session that is over,
+        // and keeping the id would unfold the view of a session that reuses it.
+        self.diagnostics.remove(&id);
         // Layers that name this session describe something that is going away (R5).
         if self.session_menu.is_some_and(|(session, _)| session == id) {
             self.session_menu = None;
@@ -3567,12 +3831,16 @@ impl ShelluneView {
 
     /// Ends the surface of a session that is not a terminal (R17, R18).
     ///
-    /// This build starts neither a desktop nor a serial session, so there is nothing to
-    /// release yet. The entry point exists so close and reconnect cannot forget those
-    /// workers when they arrive, and so a session of either kind leaves through the same
-    /// door as every other one.
-    fn end_session_surface(&mut self, id: SessionId) {
-        let _ = id;
+    /// A desktop pane owns a protocol worker, and close, a lost connection and a
+    /// reconnect all have to release it: the surface is stopped here, before its tab
+    /// or its handle is dropped, so the remote side is told and no poll survives the
+    /// session. Running it twice is harmless.
+    fn end_session_surface(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        for open in self.panes.iter().filter(|open| open.tag.session == id) {
+            if let PaneContent::Desktop(pane) = &open.content {
+                pane.update(cx, |pane, _cx| pane.stop());
+            }
+        }
     }
     /// Closes one session: its process, its terminal and its tab (R7).
     ///
@@ -4432,11 +4700,25 @@ impl ShelluneView {
                 self.connect_when_ready(&host, cx);
                 cx.notify();
             }
-            // Starting a desktop or serial attempt is not part of this build: the
-            // session layer that would own it is not wired yet. The session keeps the
-            // reason it ended and says so, instead of opening a form that could not
-            // connect anything.
-            SessionKind::Rdp { .. } | SessionKind::Vnc { .. } | SessionKind::Serial { .. } => {
+            // A desktop session reconnects in its own tab (R17, R18): the record,
+            // the tab and the place stay, the surface of the previous attempt is
+            // released first, and the new attempt is another generation of the same
+            // session. Nothing is replayed - the new surface starts with an empty
+            // canvas and asks the server for its own first frame.
+            SessionKind::Rdp { .. } | SessionKind::Vnc { .. } => {
+                self.park_focused_form();
+                self.end_session_resources(id, ResourceEnd::Restarted, cx);
+                self.drop_pane(id, cx);
+                if !self.workspace.session_reconnecting(id) {
+                    let reason = self.strings().session_reconnect_not_wired.to_owned();
+                    self.refuse_reconnect(id, reason, cx);
+                    return;
+                }
+                self.start_desktop_session(id, cx);
+            }
+            // A serial attempt still belongs to the session layer that opens its
+            // device; the session keeps the reason it ended until that arrives.
+            SessionKind::Serial { .. } => {
                 let reason = self.strings().session_reconnect_not_wired.to_owned();
                 self.refuse_reconnect(id, reason, cx);
             }
@@ -9734,7 +10016,11 @@ impl ShelluneView {
         if destination != Destination::LocalShells {
             return false;
         }
-        let live = self.active.is_some_and(|id| self.pane_for(id).is_some());
+        // A desktop surface is a picture of a session just as a terminal is: the
+        // workspace draws it, not the home page (R18).
+        let live = self
+            .active
+            .is_some_and(|id| self.pane_for(id).is_some() || self.desktop_for(id).is_some());
         // A waiting pane is drawn in the workspace, and so is a connection being set up
         // in its own tab.
         live || self.workspace.layout().has_pending() || self.connection_inline()
@@ -13522,11 +13808,10 @@ impl ShelluneView {
         // A process that ended with status 0 keeps the neutral tone: the reason is still
         // stated, but a normal exit is not an error.
         let tone = status.tone();
-        let headline = if status.ended_as_expected() {
-            strings.terminal_exited.to_owned()
-        } else {
-            status.headline(locale)
-        };
+        // The same projection the tab, the session bar and the list read, so a
+        // process that exited cleanly is called the same thing in all four places
+        // (R17): the exit wording lives in the label, not in this notice.
+        let headline = status.headline(locale);
         let step = match status.step() {
             Some(SessionStep::Reconnect) => Some(strings.session_reconnect),
             Some(SessionStep::Close) => Some(strings.session_close),
@@ -14084,7 +14369,7 @@ impl ShelluneView {
             let id = session.id();
             // A row whose session still has a terminal opens it; one that has none
             // only reports, because there is nothing to show.
-            let openable = self.pane_for(id).is_some();
+            let openable = self.pane_for(id).is_some() || self.desktop_for(id).is_some();
             list = list.child(
                 div()
                     .id(("row", index))

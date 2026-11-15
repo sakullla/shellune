@@ -406,6 +406,16 @@ pub struct Strings {
     pub session_reconnect_not_wired: &'static str,
     /// Said where a selected session has no terminal to draw.
     pub session_no_terminal: &'static str,
+    /// Headline of a desktop pane that is dialling its endpoint.
+    pub desktop_connecting: &'static str,
+    /// Headline of a desktop pane that is showing its remote screen.
+    pub desktop_live: &'static str,
+    /// Headline of a desktop pane whose session ended.
+    pub desktop_ended: &'static str,
+    /// Button that accepts the certificate a desktop server presented.
+    pub desktop_certificate_trust: &'static str,
+    /// Button that refuses the certificate a desktop server presented.
+    pub desktop_certificate_reject: &'static str,
 
     /// Button that opens the file view of a remote session.
     pub files_open: &'static str,
@@ -1212,6 +1222,11 @@ pub static ENGLISH: Strings = Strings {
     session_reconnect_missing_host: "The saved host this session used is no longer there, so it cannot be connected to again.",
     session_reconnect_not_wired: "Starting this kind of session is not available yet, so nothing was started.",
     session_no_terminal: "This session has no terminal open",
+    desktop_connecting: "Connecting to the remote desktop",
+    desktop_live: "Remote desktop",
+    desktop_ended: "The remote desktop session ended",
+    desktop_certificate_trust: "Trust and connect",
+    desktop_certificate_reject: "Reject",
     files_open: "Files",
     files_up: "Up",
     files_refresh: "Refresh",
@@ -1694,6 +1709,11 @@ pub static CHINESE: Strings = Strings {
     session_reconnect_missing_host: "该会话使用的主机记录已被删除，无法再次连接。",
     session_reconnect_not_wired: "这类会话暂时还不能启动，所以没有启动任何东西。",
     session_no_terminal: "该会话当前没有终端",
+    desktop_connecting: "正在连接远程桌面",
+    desktop_live: "远程桌面",
+    desktop_ended: "远程桌面会话已结束",
+    desktop_certificate_trust: "信任并连接",
+    desktop_certificate_reject: "拒绝",
     files_open: "文件",
     files_up: "上级",
     files_refresh: "刷新",
@@ -2017,6 +2037,14 @@ pub static CHINESE: Strings = Strings {
 /// English reuses the domain label so the two cannot drift; Chinese is written
 /// here because the domain crate stays language-neutral.
 pub fn session_state_label(state: &SessionState, locale: Locale) -> String {
+    // A process that ended the way it was asked to is not a disconnect: the tab, the
+    // session bar, the list row and the notice all say the same word for it, so one
+    // session never reports two different things about the same end (R17).
+    if let SessionState::Disconnected(failure) = state
+        && failure.ended_as_expected()
+    {
+        return locale.strings().terminal_exited.to_owned();
+    }
     match locale {
         Locale::English => state.label().to_owned(),
         Locale::Chinese => match state {

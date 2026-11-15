@@ -254,7 +254,7 @@ impl ShelluneView {
         let strings = self.strings();
         let viewport = window.viewport_size();
         let closed = matches!(session.state(), SessionState::Closed);
-        let openable = self.pane_for(id).is_some();
+        let openable = self.pane_for(id).is_some() || self.desktop_for(id).is_some();
         let any_closed = !self.workspace.closed_sessions().is_empty();
 
         let mut menu = menu_card("session.menu", metrics);

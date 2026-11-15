@@ -99,7 +99,7 @@ impl ShelluneView {
     /// Shows the tab the layout just selected.
     pub(super) fn show_layout_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.workspace.layout().active_session() {
-            if self.pane_for(id).is_some() {
+            if self.pane_for(id).is_some() || self.desktop_for(id).is_some() {
                 self.activate_in(id, window, cx);
                 return;
             }
@@ -137,7 +137,7 @@ impl ShelluneView {
         }
         sessions_in_node(tab.root())
             .iter()
-            .any(|id| self.pane_for(*id).is_some())
+            .any(|id| self.pane_for(*id).is_some() || self.desktop_for(*id).is_some())
     }
 
     /// Splits the active pane. A local split starts the same shell. A remote split
@@ -294,15 +294,23 @@ impl ShelluneView {
             self.session_terminal = true;
         }
         if let Some(id) = session
-            && self.pane_for(id).is_some()
+            && (self.pane_for(id).is_some() || self.desktop_for(id).is_some())
         {
             self.showing_connection_form = false;
             // Moving the keyboard to a pane is looking at that pane's tab, so whatever
             // the tab was marked for has been seen — also when the tab was already on
             // screen and only the focused pane changed (R7).
             self.clear_viewed_attention(cx);
-            let handle = self.pane_for(id).unwrap().read(cx).focus_handle().clone();
-            window.focus(&handle);
+            let handle = self
+                .pane_for(id)
+                .map(|pane| pane.read(cx).focus_handle().clone())
+                .or_else(|| {
+                    self.desktop_for(id)
+                        .map(|pane| pane.read(cx).focus_handle().clone())
+                });
+            if let Some(handle) = handle {
+                window.focus(&handle);
+            }
             cx.notify();
             return;
         }
@@ -451,6 +459,7 @@ impl ShelluneView {
         if files.is_none()
             && let Some(id) = session_id
             && self.pane_for(id).is_none()
+            && self.desktop_for(id).is_none()
             && self.workspace.session(id).is_some()
         {
             column = column.children(self.standalone_session_bar(cx));
@@ -478,7 +487,13 @@ impl ShelluneView {
         {
             return Some(self.failure_notice(id, &status, cx));
         }
-        let failure = self.pane_for(id)?.read(cx).state().failure()?;
+        let failure = self
+            .pane_for(id)
+            .and_then(|pane| pane.read(cx).state().failure())
+            .or_else(|| {
+                self.desktop_for(id)
+                    .and_then(|pane| pane.read(cx).phase().failure())
+            })?;
         let status = crate::app::workspace::SessionStatus::ended(failure);
         Some(self.failure_notice(id, &status, cx))
     }
@@ -793,6 +808,12 @@ impl ShelluneView {
         }
         if leaf.is_pending() {
             frame = frame.child(self.pending_card(leaf, cx));
+        } else if let Some(id) = session
+            && let Some(surface) = self.desktop_for(id)
+        {
+            // A desktop pane draws its own canvas and its own status card; the
+            // window adds no chrome of its own around a remote screen (R18).
+            frame = frame.child(surface.clone());
         } else if let Some(id) = session
             && let Some(terminal) = self.pane_for(id)
         {
@@ -1264,10 +1285,16 @@ impl ShelluneView {
                 self.workspace.arm_adopt(pane);
                 self.open_remote_after_park(&host, cx);
             }
-            // Starting a desktop or serial pane belongs to the session layer that owns
-            // those workers, which is not wired in this build. The pane stays waiting,
-            // and no library context or device handle is created on a click.
-            PaneTarget::Rdp { .. } | PaneTarget::Vnc { .. } | PaneTarget::Serial { .. } => {
+            // A desktop pane starts its own protocol worker, one session per pane
+            // (R18, R19). A serial pane still waits for the layer that opens a
+            // device: it stays waiting, and no device handle is opened on a click.
+            PaneTarget::Rdp { host } => {
+                self.open_desktop_leaf(pane, host, shellune_core::ProtocolKind::Rdp, cx);
+            }
+            PaneTarget::Vnc { host } => {
+                self.open_desktop_leaf(pane, host, shellune_core::ProtocolKind::Vnc, cx);
+            }
+            PaneTarget::Serial { .. } => {
                 cx.notify();
             }
         }
