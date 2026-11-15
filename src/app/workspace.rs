@@ -22,9 +22,9 @@ use std::collections::BTreeMap;
 
 use crate::app::layout::SessionLayout;
 
-use crate::app::copy::{Locale, Strings};
+use crate::app::copy::{self, Locale, Strings};
 use crate::app::nav::Destination;
-use crate::app::theme::{Metrics, Motion, Zoom};
+use crate::app::theme::{Metrics, Motion, Tone, Zoom};
 
 /// What the user can do about a failure.
 ///
@@ -194,6 +194,224 @@ impl<T> Section<T> {
             SectionStatus::Ready => SectionState::Populated,
         }
     }
+}
+
+/// The one main status a session is stated with (R17).
+///
+/// Every surface that describes a session - the tab, the session bar, the sessions
+/// list, the notice above its terminal - asks this projection instead of assembling
+/// its own sentence from the state, the failure and the pane. That is what keeps a
+/// single session from being shown as "could not start" beside "disconnected": one
+/// session has exactly one phase at a time, and the phase is decided here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPhase {
+    /// Nothing has been started yet: a restored pane, or a record without a process.
+    NotStarted,
+    /// A process or a transport is on its way.
+    Starting,
+    /// The process or the transport is live.
+    Live,
+    /// It was live, or it tried to be, and it is over.
+    Ended,
+    /// The user closed it, so nothing will happen again.
+    Closed,
+}
+
+impl SessionPhase {
+    /// Whether the session is on screen as a working thing.
+    #[must_use]
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Live)
+    }
+
+    /// Whether the session is over and nothing will report from it again.
+    #[must_use]
+    pub fn is_over(self) -> bool {
+        matches!(self, Self::Ended | Self::Closed)
+    }
+}
+
+/// The one thing the user can do about a session, as its status states it (R17).
+///
+/// A status names at most one step, which is the whole point: two controls that both
+/// claim to be "the next step" make the reader choose between the interface and the
+/// session. The step is derived from the reason the session ended, so a cause that no
+/// further attempt can change stops offering one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStep {
+    /// Nothing is asked of the user; the connection is being made.
+    Wait,
+    /// Another process or transport can be started for this very session.
+    Reconnect,
+    /// Nothing can bring it back; the step is to close it.
+    Close,
+}
+
+/// One session status: its phase, its one next step and its raw diagnostic (R17).
+///
+/// The diagnostic is the reason in the wording of the layer that knows, kept for the
+/// disclosure the user can open and copy. It is read from the failure own text, which
+/// carries no credential, and it is passed through [sanitize_diagnostic] before it can
+/// reach the screen, so a reason that quotes an address cannot leak a password typed
+/// into it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionStatus {
+    state: SessionState,
+    step: Option<SessionStep>,
+    diagnostic: Option<String>,
+}
+
+impl SessionStatus {
+    /// The status of one session, from the record and nothing else.
+    #[must_use]
+    pub fn of(session: &Session) -> Self {
+        let state = session.state().clone();
+        let (step, diagnostic) = match &state {
+            SessionState::Idle => (None, None),
+            SessionState::Connecting
+            | SessionState::VerifyingHost
+            | SessionState::Authenticating => (Some(SessionStep::Wait), None),
+            SessionState::Connected => (None, None),
+            SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
+                // A refused reconnect is still an ended session; it just has a reason
+                // that another attempt cannot resolve, so its step is to close it.
+                let step = if failure.reconnect_can_help() {
+                    SessionStep::Reconnect
+                } else {
+                    SessionStep::Close
+                };
+                (Some(step), Some(failure.to_string()))
+            }
+            SessionState::Closed => (None, None),
+        };
+        Self {
+            state,
+            step,
+            diagnostic: diagnostic.map(|reason| sanitize_diagnostic(&reason)),
+        }
+    }
+
+    /// The status of a pane that stopped before its session record caught up.
+    ///
+    /// The pane and the record are two views of one process, and the window is what
+    /// carries one into the other. Until it has, the surface still needs one status
+    /// rather than a second wording of its own.
+    #[must_use]
+    pub fn ended(failure: SessionFailure) -> Self {
+        let step = if failure.reconnect_can_help() {
+            SessionStep::Reconnect
+        } else {
+            SessionStep::Close
+        };
+        Self {
+            step: Some(step),
+            diagnostic: Some(sanitize_diagnostic(&failure.to_string())),
+            state: SessionState::Failed(failure),
+        }
+    }
+    /// The single main status.
+    #[must_use]
+    pub fn phase(&self) -> SessionPhase {
+        match &self.state {
+            SessionState::Idle => SessionPhase::NotStarted,
+            SessionState::Connecting
+            | SessionState::VerifyingHost
+            | SessionState::Authenticating => SessionPhase::Starting,
+            SessionState::Connected => SessionPhase::Live,
+            SessionState::Disconnected(_) | SessionState::Failed(_) => SessionPhase::Ended,
+            SessionState::Closed => SessionPhase::Closed,
+        }
+    }
+
+    /// The localized headline: the one word the surfaces say about this session.
+    #[must_use]
+    pub fn headline(&self, locale: Locale) -> String {
+        copy::session_state_label(&self.state, locale)
+    }
+
+    /// The tone the headline and its dot are drawn in.
+    ///
+    /// A process that ended with status 0 is neutral: the state is still over, but
+    /// drawing it as a failure would make a user own exit look like a problem.
+    #[must_use]
+    pub fn tone(&self) -> Tone {
+        Tone::for_session_state(&self.state)
+    }
+
+    /// The one step that is offered, when there is one.
+    #[must_use]
+    pub fn step(&self) -> Option<SessionStep> {
+        self.step
+    }
+
+    /// The raw reason, free of anything that looks like a secret, for the disclosure.
+    #[must_use]
+    pub fn diagnostic(&self) -> Option<&str> {
+        self.diagnostic.as_deref()
+    }
+
+    /// Whether the session ended the way it was asked to: a clean exit is not an error.
+    #[must_use]
+    pub fn ended_as_expected(&self) -> bool {
+        match &self.state {
+            SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
+                failure.ended_as_expected()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Removes what must never be shown from a reason a lower layer produced.
+///
+/// A transport reason can quote the address it was talking to, and an address can
+/// carry a password typed into a URL. The two shapes that could carry one - the user
+/// information of a URL, and a name=value pair whose name says it is a secret - are
+/// cut down, so the disclosure can be read and copied without reproducing a secret.
+#[must_use]
+pub fn sanitize_diagnostic(reason: &str) -> String {
+    // First pass: drop the user information of every URL-shaped word.
+    let mut without_user = String::with_capacity(reason.len());
+    let mut rest = reason;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        without_user.push_str(head);
+        rest = tail;
+        let authority_end = rest
+            .find(['/', ' ', '?', '#', '"', '\\'])
+            .unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        match authority.rfind('@') {
+            // The name and the password in front of the '@' go; the host stays.
+            Some(at) => without_user.push_str(&authority[at + 1..]),
+            None => without_user.push_str(authority),
+        }
+        rest = &rest[authority_end..];
+    }
+    without_user.push_str(rest);
+
+    // Second pass: keep the name of a secret-shaped pair and drop its value.
+    let mut cleaned = String::with_capacity(without_user.len());
+    let mut rest = without_user.as_str();
+    loop {
+        let lowered = rest.to_ascii_lowercase();
+        let found = ["password=", "passphrase=", "secret=", "token="]
+            .iter()
+            .filter_map(|needle| lowered.find(needle).map(|at| (at, needle.len())))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, len)) = found else {
+            break;
+        };
+        cleaned.push_str(&rest[..at + len]);
+        rest = &rest[at + len..];
+        let value_end = rest
+            .find(['&', ' ', ',', ';', '"', '\'', ')', ']', '}'])
+            .unwrap_or(rest.len());
+        cleaned.push_str("<hidden>");
+        rest = &rest[value_end..];
+    }
+    cleaned.push_str(rest);
+    cleaned
 }
 
 /// Why a notice is shown under the header.
@@ -861,25 +1079,36 @@ impl Workspace {
         self.local_font_size = shellune_terminal::sanitize_font_size(size);
     }
 
-    /// Creates a session record for a local shell that is starting.
-    pub fn register_local_session(&mut self, shell: &LocalShell) -> Session {
-        let mut session = Session::new(
-            SessionKind::Local {
-                shell: Some(shell.program().to_owned()),
-            },
-            shell.name(),
-        );
+    /// Creates a session record for anything that is starting, and gives it a pane.
+    ///
+    /// One entry point for every protocol, so a local shell, an SSH connection, a
+    /// desktop and a serial device are registered, listed and placed the same way. The
+    /// target is what a later, explicit connect would open; nothing is dialled here.
+    pub fn register_session(
+        &mut self,
+        kind: SessionKind,
+        title: &str,
+        target: PaneTarget,
+    ) -> Session {
+        let mut session = Session::new(kind, title);
         // A session that has not been connected yet must not be listed as live.
         let _ = session.begin_connecting();
         let mut sessions = self.sessions.items().to_vec();
         sessions.push(session.clone());
         self.sessions.replace(SectionStatus::Ready, sessions);
-        self.layout.attach(
-            session.id(),
-            PaneTarget::local(Some(shell.program().to_owned())),
-            session.title(),
-        );
+        self.layout.attach(session.id(), target, session.title());
         session
+    }
+
+    /// Creates a session record for a local shell that is starting.
+    pub fn register_local_session(&mut self, shell: &LocalShell) -> Session {
+        self.register_session(
+            SessionKind::Local {
+                shell: Some(shell.program().to_owned()),
+            },
+            shell.name(),
+            PaneTarget::local(Some(shell.program().to_owned())),
+        )
     }
 
     /// Creates a session record for a host that is being connected to.
@@ -887,14 +1116,30 @@ impl Workspace {
     /// The record starts in `Connecting`, so a host that never answers is listed
     /// as a session that did not open rather than one that is live.
     pub fn register_remote_session(&mut self, host: &HostConfig) -> Session {
-        let mut session = Session::new(SessionKind::Remote { host: host.id() }, host.name());
-        let _ = session.begin_connecting();
-        let mut sessions = self.sessions.items().to_vec();
-        sessions.push(session.clone());
-        self.sessions.replace(SectionStatus::Ready, sessions);
-        self.layout
-            .attach(session.id(), PaneTarget::remote(host.id()), session.title());
-        session
+        self.register_session(
+            SessionKind::Remote { host: host.id() },
+            host.name(),
+            PaneTarget::remote(host.id()),
+        )
+    }
+
+    /// What one session can really do, from the protocol it was started with (R18).
+    ///
+    /// The single place a surface asks "may this session have files, batch, forwarding
+    /// or X11?" instead of matching the session kind itself. A session the shell no
+    /// longer has offers nothing, which is what a stale id deserves.
+    #[must_use]
+    pub fn capabilities(&self, id: SessionId) -> shellune_core::SessionCapabilities {
+        self.session(id).map_or_else(
+            || shellune_core::SessionCapabilities::of_protocol(shellune_core::ProtocolKind::Ssh),
+            |session| shellune_core::SessionCapabilities::of_kind(session.kind()),
+        )
+    }
+
+    /// The status every surface states for one session.
+    #[must_use]
+    pub fn status(&self, id: SessionId) -> Option<SessionStatus> {
+        self.session(id).map(SessionStatus::of)
     }
 
     /// Records that a remote session verified the host identity and authenticated.

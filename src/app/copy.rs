@@ -149,6 +149,16 @@ pub struct Strings {
     pub terminal_exited: &'static str,
     /// Terminal state: the shell was killed by a signal.
     pub terminal_terminated: &'static str,
+    /// Terminal state: the session was live and stopped answering.
+    ///
+    /// Kept apart from [Self::terminal_failed] because the advice differs: a session
+    /// that ran and was lost is worth reconnecting, while a program that never started
+    /// needs its path fixed (R17).
+    pub terminal_disconnected: &'static str,
+    /// Button that opens the raw diagnostic of a session that ended.
+    pub session_details_show: &'static str,
+    /// Button that closes that diagnostic again.
+    pub session_details_hide: &'static str,
     /// Terminal note: the login shell could not be asked for its environment (R14).
     pub terminal_environment_unavailable: &'static str,
     /// Terminal note: the login shell answered with something that is no environment.
@@ -1073,6 +1083,9 @@ pub static ENGLISH: Strings = Strings {
     terminal_failed: "Could not start",
     terminal_exited: "Exited",
     terminal_terminated: "Terminated",
+    terminal_disconnected: "Disconnected",
+    session_details_show: "Show details",
+    session_details_hide: "Hide details",
     terminal_environment_unavailable: "Login environment unavailable: this shell starts with the \
          environment the application inherited",
     terminal_environment_unreadable: "The login shell returned no readable environment: this shell \
@@ -1555,6 +1568,9 @@ pub static CHINESE: Strings = Strings {
     terminal_failed: "启动失败",
     terminal_exited: "已退出",
     terminal_terminated: "被终止",
+    terminal_disconnected: "连接已断开",
+    session_details_show: "展开诊断",
+    session_details_hide: "收起诊断",
     terminal_environment_unavailable: "未能读取登录环境：这个 Shell 使用应用继承的环境启动",
     terminal_environment_unreadable: "登录 Shell 没有返回可读的环境：这个 Shell 使用应用继承的环境启动",
     terminal_environment_locale_replaced: "当前 locale 不是 UTF-8：这个 Shell 改用 UTF-8 启动",

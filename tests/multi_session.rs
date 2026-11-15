@@ -104,6 +104,14 @@ impl Rig {
         read
     }
 
+    /// Whether a batch tagged with one process belongs to this rig.
+    ///
+    /// The same rule the pane applies: one session runs one process at a time, and an
+    /// event of any other process of it is refused instead of drawn (R17).
+    fn accepts(&self, tag: EventTag) -> bool {
+        tag == self.tag
+    }
+
     fn screen(&mut self) -> (Snapshot, String) {
         self.pump();
         let snapshot = self.core.snapshot();
@@ -356,6 +364,65 @@ mod interrupt {
     }
 }
 
+/// A session that starts another process keeps its identity and nothing else.
+///
+/// This is the rule the window relies on when a session is reconnected: the tab, its
+/// name and its place stay, the screen starts empty, and output of the process that was
+/// replaced is not drawn into the one that took its place. The two rigs below are two
+/// real shells; only their tags say which process is which, exactly as the pane decides
+/// it (R17).
+#[test]
+fn a_replacement_process_ignores_the_one_it_replaced() {
+    let (Some(mut old), mut replacement) = (Rig::start(), Rig::start()) else {
+        eprintln!("no shell on this machine, skipping");
+        return;
+    };
+    let Some(mut replacement) = replacement.take() else {
+        unreachable!()
+    };
+    // One session, two processes: the generation moves on, as a reconnect moves it.
+    replacement.tag = EventTag::new(old.tag.session, old.tag.generation + 1);
+    assert_eq!(
+        replacement.tag.session, old.tag.session,
+        "a reconnect keeps the tab identity"
+    );
+    assert_ne!(
+        replacement.tag, old.tag,
+        "and is a different process of it, so late events can be told apart"
+    );
+
+    old.run(&print_marker("OLD-PROCESS-MARKER"));
+    old.wait_for_marker(
+        "OLD-PROCESS-MARKER",
+        "the process that is about to be replaced",
+    );
+
+    // Whatever the old process still writes belongs to the old generation, so the
+    // replacement refuses it instead of drawing it on its own empty screen.
+    let stale = old.pump();
+    assert!(
+        !replacement.accepts(old.tag),
+        "an old batch of {stale} bytes was accepted by the replacement"
+    );
+    let (_, screen) = replacement.screen();
+    assert!(
+        !screen.contains("OLD-PROCESS-MARKER"),
+        "the replacement starts empty instead of replaying the old screen:\n{screen}"
+    );
+
+    // The old process is gone; the replacement answers in its own right.
+    old.pty.close();
+    replacement.run(&print_marker("NEW-PROCESS-MARKER"));
+    let screen = replacement.wait_for_marker("NEW-PROCESS-MARKER", "the replacement");
+    assert!(
+        screen.contains("NEW-PROCESS-MARKER"),
+        "the replacement stopped answering after the old process closed:\n{screen}"
+    );
+    assert!(
+        !screen.contains("OLD-PROCESS-MARKER"),
+        "the old screen came back with the new process:\n{screen}"
+    );
+}
 #[test]
 fn a_tag_names_one_session_and_one_process_of_it() {
     let session = SessionId::new();

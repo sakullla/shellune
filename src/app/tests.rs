@@ -18,10 +18,10 @@ use gpui::{
     ScrollWheelEvent, Size, TestAppContext, VisualTestContext, WindowId, div, point, px, size,
 };
 use shellune_core::{
-    Endpoint, EventTag, ForwardBook, ForwardRule, GroupBook, GroupPath, HostConfig, HostId,
-    LocalShell, PaneNode, PaneTarget, PanelConfig, PanelSection, Session, SessionId, SessionKind,
-    SessionState, SplitAxis, TerminalMode, Transfer, TransferDirection, WorkspaceSnapshot,
-    WorkspaceTab, X11Forwarding,
+    Capability, Endpoint, EventTag, ForwardBook, ForwardRule, GroupBook, GroupPath, HostConfig,
+    HostId, LocalShell, PaneNode, PaneTarget, PanelConfig, PanelSection, Session, SessionFailure,
+    SessionId, SessionKind, SessionState, SplitAxis, TabAccent, TerminalMode, Transfer,
+    TransferDirection, WorkspaceSnapshot, WorkspaceTab, X11Forwarding,
 };
 use shellune_ssh::X11Status;
 use shellune_storage::{
@@ -53,7 +53,7 @@ use crate::app::theme::{
 use crate::app::view::{AccentRow, CloseIntent, KeyRowControl, close_intent};
 use crate::app::workspace::{
     AttentionKind, AttentionSettings, Failure, PrimaryOutcome, Recovery, Section, SectionState,
-    Workspace,
+    SessionPhase, SessionStatus, SessionStep, Workspace, sanitize_diagnostic,
 };
 use crate::app::{
     DEFAULT_WINDOW_SIZE, MIN_WINDOW_SIZE, ReopenChoice, ShelluneView, key_bindings, reopen_choice,
@@ -1554,6 +1554,9 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             terminal_failed,
             terminal_exited,
             terminal_terminated,
+            terminal_disconnected,
+            session_details_show,
+            session_details_hide,
             terminal_environment_unavailable,
             terminal_environment_unreadable,
             terminal_environment_locale_replaced,
@@ -8126,6 +8129,435 @@ async fn a_remote_session_reconnects_through_the_form_without_replay(cx: &mut Te
     );
 }
 
+// ---------------------------------------------------------------------------
+// One session, one status: close, reconnect and the jump that drops (R17)
+// ---------------------------------------------------------------------------
+
+/// A scripted remote session whose middle hop drops while it is live.
+///
+/// The transport reports a chain failure as text that names the hop, and the window
+/// hands that text to the pane as a loss (`SourceEvent::Lost`). Injecting it here is the
+/// same step the real chain takes, so the projection is measured on the path the
+/// screenshot came from rather than on a sentence invented by the test.
+#[gpui::test]
+async fn a_dropped_jump_names_the_hop_and_states_one_status(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the live remote session has a terminal");
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+
+    // The middle hop is gone. This is what `ChainEvent::Failed` carries into the pane.
+    let reason = "the hop jump (10.0.0.9:22) was lost while reaching deploy@10.0.0.5:22";
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(tag, vec![SourceEvent::Lost(reason.to_owned())], cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // The record says it was live and is not any more, and the reason names the hop.
+    match session_state(cx, &view, id) {
+        Some(SessionState::Disconnected(failure)) => {
+            assert!(
+                failure.to_string().contains("jump"),
+                "the reason must name the hop that dropped: {failure}"
+            );
+        }
+        other => panic!("a lost session must be disconnected, got {other:?}"),
+    }
+    // The pane states a loss, never a launch that never happened: this is the half of
+    // the screenshot that used to say "could not start" beside "disconnected".
+    let (pane_state, pane_label) = cx.update(|_window, app| {
+        let pane = pane.read(app);
+        (pane.state().clone(), pane.state().label(Locale::English))
+    });
+    assert!(
+        matches!(pane_state, PaneState::Lost(_)),
+        "a session that ran and stopped is lost, not failed to start: {pane_state:?}"
+    );
+    assert_eq!(
+        pane_label, ENGLISH.terminal_disconnected,
+        "the pane must not call a lost connection a failed start"
+    );
+
+    // One statement on screen, with one next step and the raw reason behind a
+    // disclosure the user can open and copy.
+    assert!(
+        cx.debug_bounds("terminal.failure").is_some(),
+        "the reason the session stopped is stated once, above its last screen"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure.next").is_some(),
+        "one next step accompanies the reason"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure.diagnostic").is_none(),
+        "the raw reason waits behind the disclosure on the first screen"
+    );
+    click(cx, "terminal.failure.details");
+    assert!(
+        cx.debug_bounds("terminal.failure.diagnostic").is_some(),
+        "the disclosure opens the reason of the layer that knows"
+    );
+    // The session can be started again from its own tab.
+    assert!(
+        cx.update(|_window, app| view.read(app).offers_reconnect(id)),
+        "a lost connection offers the reconnect that can work"
+    );
+}
+
+#[gpui::test]
+async fn a_close_takes_the_resources_of_its_own_session_and_leaves_another(
+    cx: &mut TestAppContext,
+) {
+    // Two live remote sessions; the first has a file view, a transfer channel and a
+    // display bridge, which are the things a close has to take back (R17).
+    let (view, cx) = remote_view(cx);
+    let doomed = live_remote(cx, &view);
+    let survivor = live_remote_second(cx, &view, doomed);
+    // The session that will be closed is the one on screen, and it has a file view, so
+    // there is something to take back besides its terminal.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.activate(doomed, cx));
+    });
+    cx.run_until_parked();
+    open_files(cx, &view, doomed);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(doomed).cloned())
+        .expect("the doomed session has a terminal");
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::X11(X11Status::Failed {
+                    reason: "the display refused the connection".to_owned(),
+                    next_step: "Connect again to ask for a display.".to_owned(),
+                })],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).files_can_browse(doomed)),
+        "the session really had a file view to take back"
+    );
+    assert!(
+        cx.update(|_window, app| {
+            view.read(app)
+                .x11_status_for_test(doomed)
+                .map(|status| matches!(status, X11Status::Failed { .. }))
+        })
+        .unwrap_or(false),
+        "the session really had a display bridge to take back"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.close_session(doomed, cx));
+    });
+    cx.run_until_parked();
+
+    // Everything of that session is gone, and nothing of the other one is.
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_can_browse(doomed)),
+        "the file view of the closed session is gone with it"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).open_sessions().contains(&doomed)),
+        "the terminal of the closed session is gone"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions().contains(&survivor)),
+        "closing one session does not close another"
+    );
+    assert_eq!(
+        session_state(cx, &view, survivor),
+        Some(SessionState::Connected),
+        "the other connection keeps its state"
+    );
+    let sent = sent_after_typing(cx, &view, survivor, "still-answerable");
+    assert!(sent.contains("still-answerable"), "{sent:?}");
+    // The display bridge belonged to the closed connection, so nothing claims it now.
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).x11_status_for_test(doomed).cloned()),
+        None,
+        "the bridge of the closed session is not still advertised"
+    );
+}
+/// The one status of a session, and the one step it offers, for every way it can end.
+#[test]
+fn one_session_states_one_status_and_one_step() {
+    let mut session = Session::new(
+        SessionKind::Remote {
+            host: HostId::new(),
+        },
+        "web",
+    );
+    let waiting_to_start = SessionStatus::of(&session);
+    assert_eq!(
+        waiting_to_start.phase(),
+        SessionPhase::NotStarted,
+        "a record nobody started is not a connection"
+    );
+    assert_eq!(waiting_to_start.step(), None);
+
+    session.begin_connecting().expect("starts");
+    let connecting = SessionStatus::of(&session);
+    assert_eq!(connecting.phase(), SessionPhase::Starting);
+    assert_eq!(connecting.step(), Some(SessionStep::Wait));
+    assert_eq!(connecting.diagnostic(), None);
+    session.begin_host_verification().expect("verifies");
+    session.begin_authentication().expect("authenticates");
+    session.connected().expect("connects");
+    let live = SessionStatus::of(&session);
+    assert_eq!(live.phase(), SessionPhase::Live);
+    assert!(live.phase().is_live());
+    assert_eq!(live.step(), None, "a live session asks nothing of the user");
+
+    // A lost connection, a deadline and a rejected credential are three different
+    // situations: the first two can be tried again, the third needs another way in,
+    // and a clean exit is not an error at all.
+    let mut lost = session.clone();
+    lost.disconnected(SessionFailure::ConnectionLost)
+        .expect("lost");
+    let lost = SessionStatus::of(&lost);
+    assert_eq!(lost.phase(), SessionPhase::Ended);
+    assert_eq!(lost.step(), Some(SessionStep::Reconnect));
+    assert!(!lost.ended_as_expected());
+    assert_eq!(lost.tone(), Tone::Danger);
+
+    let mut timed_out = Session::new(
+        SessionKind::Remote {
+            host: HostId::new(),
+        },
+        "web",
+    );
+    timed_out.begin_connecting().expect("starts");
+    timed_out.fail(SessionFailure::TimedOut).expect("times out");
+    let timed_out = SessionStatus::of(&timed_out);
+    assert_eq!(timed_out.phase(), SessionPhase::Ended);
+    assert_eq!(timed_out.step(), Some(SessionStep::Reconnect));
+    assert!(
+        timed_out
+            .diagnostic()
+            .is_some_and(|reason| reason.contains("timed out")),
+        "the deadline states itself: {:?}",
+        timed_out.diagnostic()
+    );
+
+    let mut refused = Session::new(
+        SessionKind::Remote {
+            host: HostId::new(),
+        },
+        "web",
+    );
+    refused.begin_connecting().expect("starts");
+    refused.begin_host_verification().expect("verifies");
+    refused
+        .fail(SessionFailure::AuthenticationFailed)
+        .expect("refused");
+    let refused = SessionStatus::of(&refused);
+    assert_eq!(refused.step(), Some(SessionStep::Reconnect));
+    assert_ne!(
+        refused.diagnostic(),
+        timed_out.diagnostic(),
+        "a rejected credential and a deadline are not one sentence"
+    );
+
+    let mut exited = Session::new(SessionKind::Local { shell: None }, "shell");
+    exited.begin_connecting().expect("starts");
+    exited.connected().expect("connects");
+    exited
+        .disconnected(SessionFailure::ProcessExited { code: Some(0) })
+        .expect("exits");
+    let exited = SessionStatus::of(&exited);
+    assert!(exited.ended_as_expected(), "a clean exit ended as asked");
+    assert_eq!(
+        exited.tone(),
+        Tone::Neutral,
+        "a user's own exit is not an error"
+    );
+
+    // A refused reconnect is still an ended session, and its one step is to close it.
+    let mut refused_again = Session::new(
+        SessionKind::Remote {
+            host: HostId::new(),
+        },
+        "web",
+    );
+    refused_again.begin_connecting().expect("starts");
+    refused_again
+        .fail(SessionFailure::ReconnectUnavailable {
+            reason: "the saved host is gone".to_owned(),
+        })
+        .expect("refused");
+    let refused_again = SessionStatus::of(&refused_again);
+    assert_eq!(refused_again.step(), Some(SessionStep::Close));
+}
+
+/// A reason that quotes an address cannot carry a password into the interface.
+#[test]
+fn a_reason_that_quotes_an_address_cannot_leak_a_password() {
+    assert_eq!(
+        sanitize_diagnostic("could not reach ssh://deploy:hunter2@10.0.0.5:22/app"),
+        "could not reach ssh://10.0.0.5:22/app"
+    );
+    assert_eq!(
+        sanitize_diagnostic("auth failed (password=hunter2, retries=2)"),
+        "auth failed (password=<hidden>, retries=2)"
+    );
+    assert_eq!(
+        sanitize_diagnostic("the channel was closed"),
+        "the channel was closed",
+        "a reason with nothing to hide is left exactly as the layer wrote it"
+    );
+}
+
+/// Files, batch, forwarding and X11 belong to SSH, and the set is what the entries ask.
+#[test]
+fn a_desktop_or_serial_session_offers_no_files_batch_forwarding_or_x11() {
+    let mut workspace = Workspace::new();
+    let ssh = workspace.register_session(
+        SessionKind::Remote {
+            host: HostId::new(),
+        },
+        "web",
+        PaneTarget::remote(HostId::new()),
+    );
+    let desktop = workspace.register_session(
+        SessionKind::Rdp {
+            host: HostId::new(),
+        },
+        "desk",
+        PaneTarget::rdp(HostId::new()),
+    );
+    let vnc = workspace.register_session(
+        SessionKind::Vnc {
+            host: HostId::new(),
+        },
+        "vnc",
+        PaneTarget::vnc(HostId::new()),
+    );
+    let serial = workspace.register_session(
+        SessionKind::Serial {
+            host: HostId::new(),
+        },
+        "board",
+        PaneTarget::serial(HostId::new()),
+    );
+
+    for capability in [
+        Capability::Files,
+        Capability::Batch,
+        Capability::Forwarding,
+        Capability::X11,
+    ] {
+        assert!(
+            workspace.capabilities(ssh.id()).allows(capability),
+            "SSH offers {capability:?}"
+        );
+        for session in [desktop.id(), vnc.id(), serial.id()] {
+            assert!(
+                !workspace.capabilities(session).allows(capability),
+                "a session of another protocol must not allow {capability:?}"
+            );
+        }
+    }
+    // A desktop has a surface and no character grid; a serial device is the other way
+    // round, which is why the two are told apart instead of collapsed into "remote".
+    assert!(
+        workspace
+            .capabilities(desktop.id())
+            .allows(Capability::Desktop)
+    );
+    assert!(
+        !workspace
+            .capabilities(desktop.id())
+            .allows(Capability::Terminal)
+    );
+    assert!(
+        workspace
+            .capabilities(serial.id())
+            .allows(Capability::Terminal)
+    );
+    assert!(
+        !workspace
+            .capabilities(serial.id())
+            .allows(Capability::Desktop)
+    );
+    // No session was started by registering them: each is waiting, with its own tab.
+    for session in [ssh.id(), desktop.id(), vnc.id(), serial.id()] {
+        assert_eq!(
+            workspace.status(session).map(|status| status.phase()),
+            Some(SessionPhase::Starting),
+            "a restored or listed session waits for the user instead of dialling"
+        );
+    }
+    assert_eq!(workspace.tab_anchors().len(), 4);
+}
+
+/// A reconnect reuses the tab: its identity, its name, its colour and its place.
+#[test]
+fn a_reconnect_keeps_the_tabs_identity_name_colour_and_place() {
+    let mut workspace = Workspace::new();
+    let first = workspace.register_session(
+        SessionKind::Local {
+            shell: Some("pwsh".to_owned()),
+        },
+        "first",
+        PaneTarget::local(None),
+    );
+    let second = workspace.register_session(
+        SessionKind::Local {
+            shell: Some("pwsh".to_owned()),
+        },
+        "second",
+        PaneTarget::local(None),
+    );
+    let tab = workspace
+        .tab_of_session(first.id())
+        .expect("a tab of its own");
+    assert!(workspace.rename_tab(tab, Some("build shell".to_owned())));
+    assert!(workspace.recolor_tab(tab, Some(TabAccent::Teal)));
+    let before = workspace.tab_anchors();
+
+    assert!(workspace.session_connected(first.id()));
+    assert!(workspace.session_failed(first.id(), SessionFailure::ProcessExited { code: Some(0) }));
+    assert!(workspace.session_reconnecting(first.id()));
+
+    assert_eq!(
+        workspace.tab_of_session(first.id()),
+        Some(tab),
+        "the reconnected session keeps its tab"
+    );
+    assert_eq!(
+        workspace.tab_custom_title(tab),
+        Some("build shell"),
+        "and the name the user gave it"
+    );
+    assert_eq!(
+        workspace.tab_accent(tab),
+        Some(TabAccent::Teal),
+        "and its colour, which is not a status"
+    );
+    assert_eq!(
+        workspace.tab_anchors(),
+        before,
+        "and its place: no window or tab is added by a reconnect"
+    );
+    assert_eq!(
+        workspace.status(first.id()).map(|status| status.phase()),
+        Some(SessionPhase::Starting)
+    );
+    assert_eq!(
+        workspace.status(second.id()).map(|status| status.phase()),
+        Some(SessionPhase::Starting),
+        "the other session was not touched by the reconnect"
+    );
+}
 #[gpui::test]
 async fn leaving_the_application_closes_every_session(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));

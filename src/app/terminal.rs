@@ -87,8 +87,17 @@ pub fn monospace_family() -> &'static str {
 pub enum PaneState {
     /// The shell is running.
     Live,
-    /// The shell could not be started, or stopped accepting input or output.
+    /// The shell could not be started.
+    ///
+    /// Kept apart from [Self::Lost] because the next step differs: a program that never
+    /// ran needs its path or its permission fixed, while a session that was live and
+    /// stopped can be reconnected as it is (R17).
     Failed(SessionFailure),
+    /// The shell was live and stopped: a lost channel, a closed pipe, a dead peer.
+    ///
+    /// The reason still says what the layer reported; the variant says that the program
+    /// did run, so nothing on screen may call this a launch failure.
+    Lost(SessionFailure),
     /// The shell exited.
     Exited {
         /// How it ended.
@@ -107,7 +116,7 @@ impl PaneState {
     #[must_use]
     pub fn failure(&self) -> Option<SessionFailure> {
         match self {
-            Self::Failed(failure) => Some(failure.clone()),
+            Self::Failed(failure) | Self::Lost(failure) => Some(failure.clone()),
             Self::Exited { report } => report.session_failure(),
             Self::Live => None,
         }
@@ -120,6 +129,7 @@ impl PaneState {
         match self {
             Self::Live => strings.terminal_live.to_owned(),
             Self::Failed(_) => strings.terminal_failed.to_owned(),
+            Self::Lost(_) => strings.terminal_disconnected.to_owned(),
             Self::Exited { report } => match report {
                 ExitReport::Clean => strings.terminal_exited.to_owned(),
                 ExitReport::Code { code } => {
@@ -1006,8 +1016,9 @@ impl TerminalPane {
             }
             SourceEvent::Lost(reason) => {
                 // The session did start; what failed is reading it. Saying it "could
-                // not be started" would send the user to fix a launch that worked.
-                self.state = PaneState::Failed(self.origin.lost_failure(reason));
+                // not be started" would send the user to fix a launch that worked, so
+                // the pane states the loss as a loss (R17).
+                self.state = PaneState::Lost(self.origin.lost_failure(reason));
                 false
             }
             SourceEvent::X11(status) => {
@@ -1077,8 +1088,10 @@ impl TerminalPane {
             return;
         };
         if let Err(error) = source.write(bytes) {
+            // A write that fails happened on a session that was live: the program ran
+            // and the channel is gone, which is a loss and not a launch failure.
             let failure = self.origin.lost_failure(error);
-            self.state = PaneState::Failed(failure);
+            self.state = PaneState::Lost(failure);
             cx.notify();
         }
     }
@@ -2285,17 +2298,26 @@ impl TerminalPane {
                     // The program is named on the session bar and the tab; down here it
                     // is only repeated once it stopped, beside how it stopped.
                     .when(!live, |row| {
-                        row.child(
+                        // The program that stopped is named here; its state is only
+                        // spelled out when this bar is the session's only one. A pane
+                        // that hands its bar to the session already has the session's
+                        // own status beside the target, and saying it twice is what
+                        // let one session read as two different states (R17).
+                        let row = row.child(
                             div()
                                 .truncate()
                                 .debug_selector(|| "terminal.shell".to_owned())
                                 .child(SharedString::from(self.origin.label().to_owned())),
-                        )
-                        .child(components::chip(
-                            self.state.label(self.locale),
-                            tone,
-                            metrics,
-                        ))
+                        );
+                        if has_slot {
+                            row
+                        } else {
+                            row.child(components::chip(
+                                self.state.label(self.locale),
+                                tone,
+                                metrics,
+                            ))
+                        }
                     })
                     .when_some(self.integration_note(), |row, note| {
                         row.child(

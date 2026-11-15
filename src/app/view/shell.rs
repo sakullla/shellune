@@ -19,7 +19,7 @@ use shellune_ssh::X11Status;
 
 use super::{
     ELLIPSIS, ShelluneView, SnippetNote, brand_mark, files_focus_ring, host_avatar, may_reconnect,
-    program_label, session_tone,
+    program_label,
 };
 use crate::app::components::{self, Variant};
 use crate::app::copy;
@@ -221,22 +221,27 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
-        let live = matches!(session.state(), SessionState::Connected);
+        // One projection answers what this session is doing; the bar draws it and does
+        // not decide any of it again (R17).
+        let status = crate::app::workspace::SessionStatus::of(session);
+        let live = status.phase().is_live();
         let target = self.target_of(session);
-        let state_label = copy::session_state_label(session.state(), self.workspace.locale());
-        let tone = session_tone(session.state());
+        let state_label = status.headline(self.workspace.locale());
+        let tone = status.tone();
         let can_reconnect = may_reconnect(session);
-        let browsable = self.files.can_browse(id);
+        // Files are an SSH capability: the entry exists only for a session whose
+        // protocol has one, so a desktop or serial session has nothing to hide (R18).
+        let browsable =
+            self.allows(id, shellune_core::Capability::Files) && self.files.can_browse(id);
         let files_open = self.files.is_open(id);
         let unsaved = self.unsaved.iter().any(|(session, _)| *session == id);
         let has_terminal = self.pane_for(id).is_some();
         // While the connection card is on screen it is the one place to act on the
         // attempt; the bar only says where it stands.
         let card = self.connection_inline();
-        let ended = matches!(
-            session.state(),
-            SessionState::Disconnected(_) | SessionState::Failed(_) | SessionState::Closed
-        );
+        // "The session is over" is the projection's answer, not a second match on the
+        // state here: a fresh variant must not turn into a silently different page.
+        let ended = status.phase().is_over();
         let can_reconnect = can_reconnect && !card;
 
         let left = div()
@@ -1217,7 +1222,11 @@ impl ShelluneView {
     pub(super) fn set_terminal_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
         self.workspace.set_local_font_size(size);
         let size = self.workspace.local_font_size();
-        let panes: Vec<_> = self.panes.iter().map(|open| open.pane.clone()).collect();
+        let panes: Vec<_> = self
+            .panes
+            .iter()
+            .filter_map(|open| open.content.terminal().cloned())
+            .collect();
         for pane in panes {
             pane.update(cx, |pane, cx| pane.set_font_size(size, cx));
         }

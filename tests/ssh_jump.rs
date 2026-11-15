@@ -952,6 +952,111 @@ fn a_dropped_jump_names_the_jump_and_the_target_session_keeps_working() {
     direct_echo(&mut other, "OTHER-AFTER-DROP");
 }
 
+/// A peer that accepts a connection and hangs up at once, so a hop is lost mid-handshake.
+///
+/// This is the shape of the failure the interface screenshot came from - a jump host that
+/// dies between the TCP open and the key exchange - produced on demand instead of waited
+/// for. No OpenSSH server is needed, so the check runs everywhere; what it proves is which
+/// hop the chain blames, that the blame reaches the text the window shows, and that a
+/// second chain of another session keeps its own answer.
+#[test]
+fn a_hop_that_hangs_up_mid_handshake_names_itself_and_leaves_another_chain_alone() {
+    /// A listener that accepts one connection, drops it, and stops.
+    fn hanging_peer() -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a free port for the peer");
+        let port = listener
+            .local_addr()
+            .expect("the bound address of the peer")
+            .port();
+        let peer = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                // Dropping the socket is the fault: not one byte of key exchange.
+                drop(stream);
+            }
+        });
+        (port, peer)
+    }
+
+    fn chain_through(jump: &HostConfig, target: &HostConfig) -> ChainSession {
+        chain(
+            vec![jump.clone(), target.clone()],
+            target.id(),
+            vec![
+                HopAuth::new(
+                    jump.id(),
+                    AuthMethod::password("secret"),
+                    trusted("SHA256:never-presented"),
+                ),
+                HopAuth::new(
+                    target.id(),
+                    AuthMethod::password("secret"),
+                    trusted("SHA256:never-presented"),
+                ),
+            ],
+            Duration::from_secs(20),
+        )
+    }
+
+    // Two sessions, each with a jump host that hangs up as soon as it is dialled.
+    let (first_port, first_peer) = hanging_peer();
+    let (second_port, second_peer) = hanging_peer();
+    let first_jump = host("first-jump", first_port, "deploy");
+    let second_jump = host("second-jump", second_port, "deploy");
+    // The target says which hop reaches it: that is what makes the jump part of the
+    // chain instead of a second, unrelated host in the same vector.
+    let mut first_target = host("first-target", Harness::free_port(), "deploy");
+    first_target.set_jumps([first_jump.id()]);
+    let mut second_target = host("second-target", Harness::free_port(), "deploy");
+    second_target.set_jumps([second_jump.id()]);
+
+    let mut first = chain_through(&first_jump, &first_target);
+    let mut second = chain_through(&second_jump, &second_target);
+
+    let first_failure = wait_failed(&mut first);
+    let ChainFailure::Hop { hop, error } = &first_failure else {
+        panic!("expected the first hop to fail, got {first_failure}");
+    };
+    assert_eq!(
+        hop.host_id,
+        first_jump.id(),
+        "the failure must name the hop that hung up: {first_failure}"
+    );
+    assert_eq!(hop.index, 0, "the jump is the first hop of the chain");
+    assert!(
+        error.is_transport_failure() || matches!(error.as_ref(), ConnectError::Disconnected { .. }),
+        "a peer that hangs up is a transport failure, not a rejected credential: {error}"
+    );
+    // The window projects this failure as its reason, so the hop has to be in the text:
+    // that is what lets it name both the hop and the target on one screen.
+    let text = first_failure.to_string();
+    assert!(
+        text.contains("first-jump"),
+        "the reason must name the hop for the interface to show it: {text}"
+    );
+    assert!(
+        !text.contains("first-target"),
+        "the target was never reached, so it is not the hop that failed: {text}"
+    );
+
+    // The other chain answers for itself: closing one session says nothing about it.
+    let second_failure = wait_failed(&mut second);
+    let ChainFailure::Hop { hop, .. } = &second_failure else {
+        panic!("expected the second chain to fail on its own hop, got {second_failure}");
+    };
+    assert_eq!(
+        hop.host_id,
+        second_jump.id(),
+        "each chain blames its own hop: {second_failure}"
+    );
+    assert_ne!(
+        first_failure.to_string(),
+        second_failure.to_string(),
+        "two sessions must not report one failure between them"
+    );
+
+    first_peer.join().expect("the first peer finished");
+    second_peer.join().expect("the second peer finished");
+}
 #[test]
 fn a_confirmed_proxy_command_carries_a_real_shell_and_the_process_exits_afterwards() {
     if skip_without_server("proxy command shell") {

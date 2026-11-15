@@ -17,7 +17,7 @@ use gpui::{
     Stateful, UniformListScrollHandle, Window, div, px,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use shellune_core::X11Forwarding;
@@ -78,7 +78,8 @@ use crate::app::transfers::{
     PathProblem, TransferProblem, TransferViews, default_download_directory, file_name,
 };
 use crate::app::workspace::{
-    AttentionKind, Failure, Recovery, SectionState, SectionStatus, UnreadNotices, Workspace,
+    AttentionKind, Failure, Recovery, SectionState, SectionStatus, SessionPhase, SessionStatus,
+    SessionStep, UnreadNotices, Workspace,
 };
 use crate::app::{components, theme::radius};
 #[cfg(test)]
@@ -134,6 +135,21 @@ impl PaneKind {
     }
 }
 
+/// Why a session's connection resources are being ended (R17).
+///
+/// Close and reconnect both have to take back everything one connection owned - files,
+/// transfers, forwards, the display bridge, the desktop or serial worker and the
+/// questions still waiting in its name - and they have to do it the same way. The reason
+/// only decides what becomes of the transfers of that session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceEnd {
+    /// The user closed the session: its transfers are cancelled, not failed.
+    Closed,
+    /// The connection was lost or the program ended: its transfers fail with it.
+    ConnectionLost,
+    /// The session is starting another process. Its record, tab and place stay.
+    Restarted,
+}
 /// What one group change wrote, once the service accepted it.
 ///
 /// A creation touches only the tree, and every other change rewrites the hosts as well;
@@ -152,10 +168,39 @@ struct GroupOutcome {
 /// The pair is the unit of everything multi-session: an event, a close or a reconnect
 /// names a session, and the entry that carries that session is the only one touched.
 struct OpenPane {
-    /// Which session process the terminal shows.
+    /// Which session process this pane shows.
     tag: EventTag,
-    /// The terminal itself.
-    pane: Entity<TerminalPane>,
+    /// What it draws: a character terminal, or a surface of another protocol.
+    content: PaneContent,
+}
+
+/// What one open pane draws (R17, R18).
+///
+/// A session is a character terminal or a remote desktop surface, and the difference is
+/// structural rather than a flag every view has to remember: the entry holds one thing
+/// or the other, so routing an event, a close or a reconnect reaches the surface that
+/// really owns it and a desktop session cannot fall into the terminal path by accident.
+enum PaneContent {
+    /// A character terminal: local shell, SSH, or a serial device.
+    Terminal(Entity<TerminalPane>),
+    /// A surface that is not a character grid.
+    ///
+    /// RDP and VNC draw their own frames, which arrive with the desktop layer; the
+    /// variant exists here so that the routing of every event already has one place to
+    /// put them, and so a close or a reconnect of such a session ends its worker instead
+    /// of a terminal that was never created.
+    #[allow(dead_code)]
+    Surface(PaneKind),
+}
+
+impl PaneContent {
+    /// The terminal behind this pane, when it is one.
+    fn terminal(&self) -> Option<&Entity<TerminalPane>> {
+        match self {
+            Self::Terminal(pane) => Some(pane),
+            Self::Surface(_) => None,
+        }
+    }
 }
 
 /// The corner note that says a saved command waits in one pane's paste prompt (R6).
@@ -794,6 +839,13 @@ pub struct ShelluneView {
     /// Kept beside the session, not in its record: a display bridge ends with the
     /// connection, and a restarted connection asks again.
     x11: HashMap<SessionId, X11Status>,
+    /// The sessions whose raw diagnostic the user opened (R17).
+    ///
+    /// A disclosure is a view fact, not a session fact: which sentences are unfolded
+    /// says nothing about the connection, so it is not written to the layout. It is kept
+    /// per session so opening one does not unfold another, and it is forgotten with the
+    /// session it belonged to.
+    diagnostics: BTreeSet<SessionId>,
     /// Attempts a test scripted, kept so their answers can be inspected.
     #[cfg(test)]
     scripted: Vec<(SessionId, shellune_ssh::ScriptedSession)>,
@@ -1917,6 +1969,7 @@ impl ShelluneView {
             unsaved: Vec::new(),
             quick_save_notice: None,
             x11: HashMap::new(),
+            diagnostics: BTreeSet::new(),
             showing_connection_form: false,
             reconnect: None,
             remote_fields: RemoteFields {
@@ -2375,10 +2428,9 @@ impl ShelluneView {
         crate::app::apply_keymap(cx, &self.keymap);
         // The terminals' own toolbars name the shortcuts, so they follow the change.
         let shortcuts = terminal::TerminalShortcuts::of(&self.keymap);
-        for open in &self.panes {
+        for pane in self.panes.iter().filter_map(|open| open.content.terminal()) {
             let shortcuts = shortcuts.clone();
-            open.pane
-                .update(cx, |pane, cx| pane.set_shortcuts(shortcuts, cx));
+            pane.update(cx, |pane, cx| pane.set_shortcuts(shortcuts, cx));
         }
         if self.saved_preferences.is_some() {
             let now = self.current_preferences();
@@ -2956,11 +3008,23 @@ impl ShelluneView {
         self.tab_sessions()
     }
 
+    /// Whether one session may use a capability at all (R18).
+    ///
+    /// The protocol decides, and the decision is one value the whole window asks: an
+    /// RDP, VNC or serial session carries no files, batch, forwarding or X11 in its
+    /// capability set, so those entries are unreachable for it by construction instead
+    /// of being hidden beside a button that still exists. A session the shell no longer
+    /// has allows nothing it asked about, because the answer belongs to a connection
+    /// that is gone.
+    fn allows(&self, id: SessionId, capability: shellune_core::Capability) -> bool {
+        self.workspace.session(id).is_some() && self.workspace.capabilities(id).allows(capability)
+    }
+
     fn pane_for(&self, id: SessionId) -> Option<&Entity<TerminalPane>> {
         self.panes
             .iter()
             .find(|open| open.tag.session == id)
-            .map(|open| &open.pane)
+            .and_then(|open| open.content.terminal())
     }
 
     fn active_pane(&self) -> Option<&Entity<TerminalPane>> {
@@ -2975,18 +3039,27 @@ impl ShelluneView {
     /// and every other pane after it, so an answer cannot be lost behind a dialog that
     /// is never drawn.
     fn paste_prompt(&self, cx: &gpui::App) -> Option<(SessionId, Entity<TerminalPane>)> {
-        let waiting = |open: &OpenPane| open.pane.read(cx).awaits_paste_confirmation();
-        if let Some(open) = self
+        let waiting = |open: &OpenPane| {
+            open.content
+                .terminal()
+                .is_some_and(|pane| pane.read(cx).awaits_paste_confirmation())
+        };
+        if let Some((id, pane)) = self
             .panes
             .iter()
-            .find(|open| Some(open.tag.session) == self.active && waiting(open))
+            .filter(|open| Some(open.tag.session) == self.active && waiting(open))
+            .find_map(|open| open.content.terminal().map(|pane| (open.tag.session, pane)))
         {
-            return Some((open.tag.session, open.pane.clone()));
+            return Some((id, pane.clone()));
         }
         self.panes
             .iter()
-            .find(|open| waiting(open))
-            .map(|open| (open.tag.session, open.pane.clone()))
+            .filter(|open| waiting(open))
+            .find_map(|open| {
+                open.content
+                    .terminal()
+                    .map(|pane| (open.tag.session, pane.clone()))
+            })
     }
 
     /// Whether a paste confirmation is on screen.
@@ -3173,7 +3246,10 @@ impl ShelluneView {
         // described by the key the window really answers (R5).
         let shortcuts = terminal::TerminalShortcuts::of(&self.keymap);
         pane.update(cx, |pane, cx| pane.set_shortcuts(shortcuts, cx));
-        self.panes.push(OpenPane { tag, pane });
+        self.panes.push(OpenPane {
+            tag,
+            content: PaneContent::Terminal(pane),
+        });
         if focus {
             // A terminal that just opened is what the user asked for: show it, from
             // the hosts home or the settings alike.
@@ -3291,7 +3367,16 @@ impl ShelluneView {
             return false;
         };
         let open = self.panes.remove(index);
-        open.pane.update(cx, |pane, cx| pane.close(cx));
+        // The two kinds of pane end differently, which is what the variant keeps apart: a
+        // terminal is closed, while a desktop or serial surface is released by its own
+        // worker instead of being asked for a process it never had (R17, R18).
+        match &open.content {
+            PaneContent::Terminal(pane) => {
+                let pane = pane.clone();
+                pane.update(cx, |pane, cx| pane.close(cx));
+            }
+            PaneContent::Surface(_) => self.end_session_surface(id),
+        }
         // The connection of this session ends with its terminal, so its file view goes
         // with it instead of keeping a path and a listing that nothing backs any more.
         self.end_files(id);
@@ -3396,34 +3481,52 @@ impl ShelluneView {
         }
     }
 
-    /// Closes one session: its process, its terminal and its tab (R7).
+    /// Takes back everything one connection owned, and nothing that belongs to another.
     ///
-    /// Nothing else is closed. An attempt that has not become a terminal yet is ended
-    /// the same way, so a tab can be closed while its connection is still being made,
-    /// and the other sessions keep answering.
-    pub fn close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    /// Closing a session, a connection that was lost and a reconnect all pass through
+    /// here, so the resources a session can hold are ended in one place and in one order:
+    ///
+    /// * the port forwardings, including the carrier of a forward-only attempt;
+    /// * the transfers and the file view that were using the connection;
+    /// * the X11 display bridge, and the desktop or serial surface of the session itself;
+    /// * the questions that were waiting in this session name, because an answer can no
+    ///   longer be delivered over a connection that is gone.
+    ///
+    /// Every step names one session, so the input, output and polls of the others keep
+    /// running. Running it twice is harmless, which is what lets a close after a
+    /// disconnect take the same resources back again.
+    fn end_session_resources(&mut self, id: SessionId, why: ResourceEnd, cx: &mut Context<Self>) {
+        // Forwards first: a listener that outlived its connection would keep a port
+        // bound and a rule "running" with nothing behind it (R17).
         self.stop_session_forwards(id);
         if let Some(mut link) = self.forward_carriers.remove(&id) {
             link.close();
         }
         self.forwards.detach(id);
-        self.discard_attempt(id);
-        // The display bridge ends with the connection, so the bar stops claiming one.
-        self.x11.remove(&id);
-        self.unsaved.retain(|(session, _)| *session != id);
-        self.drop_pane(id, cx);
-        self.workspace.session_closed(id);
-        // A connecting attempt has no terminal, so closing it does not move the
-        // selection by itself. Point it at a session that is still open.
-        if self.active == Some(id) && self.pane_for(id).is_none() {
-            self.active = self
-                .panes
-                .last()
-                .map(|open| open.tag.session)
-                .or_else(|| self.attempts.first().map(|attempt| attempt.id));
+        // A lost connection fails its running transfers with that reason; a close or a
+        // restart cancels them. end_files then releases the channels and the question of
+        // that session file view.
+        if why == ResourceEnd::ConnectionLost {
+            self.transfers
+                .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
         }
-        // A form that was showing this session can no longer be live: it goes away with
-        // the session it belonged to, and takes the secrets it held with it.
+        self.end_files(id);
+        if self
+            .transfer_problem
+            .as_ref()
+            .is_some_and(|(session, _)| *session == id)
+        {
+            self.transfer_problem = None;
+        }
+        // Both bridges belong to this connection: a display that stayed ready, or a
+        // desktop or serial worker that kept running, would describe a session that is
+        // over (R17, R18).
+        self.x11.remove(&id);
+        self.end_session_surface(id);
+        // The attempt that asked a trust, ProxyCommand or X11 question can no longer
+        // answer it, so it is taken away with its panel and its secrets.
+        self.discard_attempt(id);
+        self.attempts.retain(|attempt| attempt.id != id);
         if self.form_session == Some(id) {
             self.form_session = None;
             if let Some(panel) = self.remote.as_mut() {
@@ -3435,6 +3538,62 @@ impl ShelluneView {
         }
         if self.reconnect == Some(id) {
             self.reconnect = None;
+        }
+        if self.closing == Some(id) {
+            self.closing = None;
+        }
+        if self.snippet_note.is_some_and(|note| note.session == id) {
+            self.snippet_note = None;
+        }
+        // Layers that name this session describe something that is going away (R5).
+        if self.session_menu.is_some_and(|(session, _)| session == id) {
+            self.session_menu = None;
+        }
+        if self.session_more.is_some_and(|(session, _)| session == id) {
+            self.session_more = None;
+        }
+        if self.tab_menu.is_some_and(|(session, _)| session == id) {
+            self.tab_menu = None;
+        }
+        if self
+            .tab_rename
+            .as_ref()
+            .is_some_and(|dialog| dialog.session == Some(id))
+        {
+            self.tab_rename = None;
+        }
+        cx.notify();
+    }
+
+    /// Ends the surface of a session that is not a terminal (R17, R18).
+    ///
+    /// This build starts neither a desktop nor a serial session, so there is nothing to
+    /// release yet. The entry point exists so close and reconnect cannot forget those
+    /// workers when they arrive, and so a session of either kind leaves through the same
+    /// door as every other one.
+    fn end_session_surface(&mut self, id: SessionId) {
+        let _ = id;
+    }
+    /// Closes one session: its process, its terminal and its tab (R7).
+    ///
+    /// Nothing else is closed. An attempt that has not become a terminal yet is ended
+    /// the same way, so a tab can be closed while its connection is still being made,
+    /// and the other sessions keep answering.
+    pub fn close_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.end_session_resources(id, ResourceEnd::Closed, cx);
+        // A host that was only saved as an unsaved quick connection goes with the
+        // session it belonged to; the record of a session that is still open does not.
+        self.unsaved.retain(|(session, _)| *session != id);
+        self.drop_pane(id, cx);
+        self.workspace.session_closed(id);
+        // A connecting attempt has no terminal, so closing it does not move the
+        // selection by itself. Point it at a session that is still open.
+        if self.active == Some(id) && self.pane_for(id).is_none() {
+            self.active = self
+                .panes
+                .last()
+                .map(|open| open.tag.session)
+                .or_else(|| self.attempts.first().map(|attempt| attempt.id));
         }
         // A name dialog or a tab menu for a tab that no longer exists would describe
         // something gone; it closes with the tab it belonged to.
@@ -3493,7 +3652,7 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) -> Option<SessionId> {
         let id = self.active?;
-        if !self.files.can_browse(id) {
+        if !self.allows(id, shellune_core::Capability::Files) || !self.files.can_browse(id) {
             return None;
         }
         if !self.files.is_open(id) {
@@ -4228,7 +4387,9 @@ impl ShelluneView {
                 };
                 // The old terminal is over: its process is gone, and the generation
                 // moves on so a late event from it can no longer reach the terminal
-                // that replaces it.
+                // that replaces it. Everything the old process held goes with it, in
+                // the same order a close uses (R17).
+                self.end_session_resources(id, ResourceEnd::Restarted, cx);
                 self.drop_pane(id, cx);
                 if !self.workspace.session_reconnecting(id) {
                     return;
@@ -4255,9 +4416,12 @@ impl ShelluneView {
                 // Nothing is connecting yet, so the record keeps the reason it ended
                 // until the form really starts a new attempt: a tab that said
                 // "connecting" over an empty form would claim a connection nobody made.
-                self.drop_pane(id, cx);
+                // The form that was on screen is parked on its own attempt first: the
+                // cleanup below takes this session's attempt, panel and questions away,
+                // and a different form on screen must not go with them.
                 self.park_focused_form();
-                self.discard_attempt(id);
+                self.end_session_resources(id, ResourceEnd::Restarted, cx);
+                self.drop_pane(id, cx);
                 self.reconnect = Some(id);
                 self.form_session = Some(id);
                 self.chain = Some(ChainDraft::prepare(self.book.hosts(), &host));
@@ -7385,7 +7549,11 @@ impl ShelluneView {
         let Some(id) = self
             .panes
             .iter()
-            .find(|open| open.pane.entity_id() == pane.entity_id())
+            .find(|open| {
+                open.content
+                    .terminal()
+                    .is_some_and(|open_pane| open_pane.entity_id() == pane.entity_id())
+            })
             .map(|open| open.tag.session)
         else {
             // The pane was closed: what it reports no longer describes a session the
@@ -7427,26 +7595,18 @@ impl ShelluneView {
                     .session_failure()
                     .unwrap_or(shellune_core::SessionFailure::ProcessExited { code: Some(0) });
                 self.workspace.session_failed(id, failure);
-                // A transfer that was running on this connection has lost it: it is
-                // reported as failed, never as completed and never as something the user
-                // cancelled, so a partial file is never presented as a finished one.
-                self.transfers
-                    .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
-                self.forwards.detach(id);
-                self.end_files(id);
-                // The display bridge ended with the connection; a bar that kept
-                // claiming it is available would describe a session that is gone.
-                self.x11.remove(&id);
+                // The connection is over, so what it owned ends with it: a transfer that
+                // was running on it is failed (never completed, never "cancelled" by
+                // someone who did not cancel it), the file view, the forwardings and the
+                // display bridge go with it. One door for every way a connection ends.
+                self.end_session_resources(id, ResourceEnd::ConnectionLost, cx);
             }
-            PaneState::Failed(failure) => {
+            PaneState::Failed(failure) | PaneState::Lost(failure) => {
+                // A program that never started and a session that was lost both end
+                // the session; what differs is the reason the record now states, and
+                // everything that belonged to the connection goes with it either way.
                 self.workspace.session_failed(id, failure);
-                self.transfers
-                    .session_lost(id, shellune_core::TransferFailure::ConnectionLost);
-                self.forwards.detach(id);
-                self.end_files(id);
-                // The display bridge ended with the connection; a bar that kept
-                // claiming it is available would describe a session that is gone.
-                self.x11.remove(&id);
+                self.end_session_resources(id, ResourceEnd::ConnectionLost, cx);
             }
         }
         cx.notify();
@@ -9033,8 +9193,8 @@ impl ShelluneView {
     /// Asks every terminal to draw again, so a new palette reaches the ones that are
     /// not on screen too.
     fn repaint_terminals(&self, cx: &mut Context<Self>) {
-        for open in &self.panes {
-            open.pane.update(cx, |_pane, cx| cx.notify());
+        for pane in self.panes.iter().filter_map(|open| open.content.terminal()) {
+            pane.update(cx, |_pane, cx| cx.notify());
         }
     }
 
@@ -9635,14 +9795,11 @@ impl ShelluneView {
         // The session record is asked first, not the pane: a refused reconnect is
         // recorded on the session and leaves the pane holding the reason its old
         // process ended, so a notice read from the pane alone would keep stating the
-        // older problem and never mention the reconnect at all.
-        let ended: Option<(SessionFailure, bool)> =
-            session.and_then(|session| match session.state() {
-                SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
-                    Some((failure.clone(), may_reconnect(session)))
-                }
-                _ => None,
-            });
+        // older problem and never mention the reconnect at all. The projection answers
+        // with one headline, one step and one reason (R17).
+        let ended: Option<SessionStatus> = session
+            .and_then(|session| self.workspace.status(session.id()))
+            .filter(|status| status.phase() == SessionPhase::Ended);
 
         let mut frame = div().flex().flex_col().flex_1().min_h(px(0.0));
 
@@ -9661,13 +9818,17 @@ impl ShelluneView {
         if let Some(pane) = self.active_pane() {
             // A shell that ended keeps its last screen, but the reason it stopped is
             // stated above it instead of being left for the user to guess.
-            let notice = if let Some((failure, reconnectable)) = ended {
-                Some(self.failure_notice(&failure, reconnectable))
-            } else {
-                pane.read(cx)
+            let notice = match (&ended, id) {
+                (Some(status), Some(id)) => Some(self.failure_notice(id, status, cx)),
+                // The pane can be ahead of the record for one frame; it still states one
+                // status, never a second wording beside the record's (R17).
+                (None, _) => pane
+                    .read(cx)
                     .state()
                     .failure()
-                    .map(|failure| self.failure_notice(&failure, false))
+                    .map(SessionStatus::ended)
+                    .and_then(|status| id.map(|id| self.failure_notice(id, &status, cx))),
+                (Some(_), None) => None,
             };
             if let Some(notice) = notice {
                 frame = frame.child(
@@ -9687,8 +9848,8 @@ impl ShelluneView {
             // it opened one, or a process that never started. The session still holds
             // the reason, so it is drawn where the terminal would be instead of being
             // recorded and shown nowhere.
-            let notice = if let Some((failure, reconnectable)) = ended {
-                self.failure_notice(&failure, reconnectable)
+            let notice = if let (Some(status), Some(id)) = (&ended, id) {
+                self.failure_notice(id, status, cx)
             } else {
                 // Nothing failed and there is nothing to draw: the reason is still
                 // said, because an empty panel would look like a terminal that is
@@ -13059,6 +13220,15 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// What X11 forwarding of one session last reported, for a test.
+    ///
+    /// The bridge is kept beside the session rather than in it, so this is the way a
+    /// test reads whether a close really took it back.
+    #[cfg(test)]
+    pub fn x11_status_for_test(&self, id: SessionId) -> Option<&X11Status> {
+        self.x11.get(&id)
+    }
+
     /// The session whose close is being asked about, for a test.
     #[cfg(test)]
     pub fn closing_for_test(&self) -> Option<SessionId> {
@@ -13337,31 +13507,56 @@ impl ShelluneView {
             .is_some_and(|pane| pane.read(cx).focus_handle().is_focused(window))
     }
 
-    /// Why a session ended, and what the user can do about it (R12).
+    /// Why a session ended, and what the user can do about it (R12, R17).
     ///
-    /// The reason and the next step are one notice because the requirement is about
-    /// both: an error the user cannot act on is only half reported. The step is the
-    /// action the session's own state allows - reconnect while it may be restarted,
-    /// close once it may not.
-    fn failure_notice(&self, failure: &SessionFailure, reconnectable: bool) -> Div {
+    /// One session states one status: the headline comes from the session projection, so
+    /// this notice, the tab, the session bar and the list row cannot disagree about what
+    /// happened. The next step is the single step the status allows - reconnect while
+    /// another attempt can help, close once it cannot - and the raw reason of the layer
+    /// that knows sits behind a disclosure, where it can be read and copied without
+    /// pushing the understandable sentence off the first screen.
+    fn failure_notice(&self, id: SessionId, status: &SessionStatus, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
-        let step = if reconnectable {
-            strings.session_reconnect
+        let locale = self.workspace.locale();
+        // A process that ended with status 0 keeps the neutral tone: the reason is still
+        // stated, but a normal exit is not an error.
+        let tone = status.tone();
+        let headline = if status.ended_as_expected() {
+            strings.terminal_exited.to_owned()
         } else {
-            strings.session_close
+            status.headline(locale)
         };
-        // A process that ended with status 0 is stated in the neutral tone: the reason
-        // is still shown, but a normal exit is not an error.
-        let tone = Tone::for_failure(failure);
-        components::banner(tone, metrics)
+        let step = match status.step() {
+            Some(SessionStep::Reconnect) => Some(strings.session_reconnect),
+            Some(SessionStep::Close) => Some(strings.session_close),
+            // Nothing is asked of the user while the connection is being made: a step
+            // that said "wait" would be a button that cannot be pressed.
+            Some(SessionStep::Wait) | None => None,
+        };
+        let open = self.diagnostics_open(id);
+        let toggle = if open {
+            strings.session_details_hide
+        } else {
+            strings.session_details_show
+        };
+        let mut banner = components::banner(tone, metrics)
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "terminal.failure".to_owned())
             .child(
                 div()
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(SharedString::from(failure.to_string())),
-            )
-            .child(
+                    .debug_selector(|| "terminal.failure.headline".to_owned())
+                    .child(SharedString::from(headline)),
+            );
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .min_w(px(0.0));
+        if let Some(step) = step {
+            actions = actions.child(
                 div()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
@@ -13370,9 +13565,55 @@ impl ShelluneView {
                         "{} · {step}",
                         strings.next_step
                     ))),
-            )
+            );
+        }
+        if status.diagnostic().is_some() {
+            actions = actions.child(self.text_button(
+                SharedString::from("terminal.failure.details"),
+                toggle,
+                Variant::Secondary,
+                cx,
+                move |view, cx| {
+                    view.toggle_diagnostic(id, cx);
+                },
+            ));
+        }
+        banner = banner.child(actions);
+        if open && let Some(reason) = status.diagnostic() {
+            // The raw reason, selectable by one click and never carrying a secret: it
+            // is the layer's own wording, which is what a bug report needs.
+            banner = banner.child(
+                self.copyable_text(
+                    "terminal.failure.diagnostic",
+                    reason.to_owned(),
+                    div()
+                        .min_w(px(0.0))
+                        .whitespace_normal()
+                        .font_family(terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY)),
+                    cx,
+                ),
+            );
+        }
+        banner
     }
 
+    /// Whether the raw diagnostic of one session is unfolded (R17).
+    ///
+    /// Only a session that states a reason has anything to unfold, so a live or a
+    /// connecting session answers no even when its id was opened once before.
+    pub fn diagnostics_open(&self, id: SessionId) -> bool {
+        self.diagnostics.contains(&id)
+    }
+
+    /// Opens or closes that disclosure, and says which way it went.
+    fn toggle_diagnostic(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if !self.diagnostics.remove(&id) {
+            self.diagnostics.insert(id);
+        }
+        cx.notify();
+    }
     /// One coloured notice line under a heading.
     fn notice_line(&self, text: String, tone: Tone) -> Div {
         let metrics = self.metrics();
@@ -13403,9 +13644,12 @@ impl ShelluneView {
             .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id())
             && self.workspace.destination() == Destination::LocalShells;
         let kind = PaneKind::of(session.kind());
-        let tone = session_tone(session.state());
-        let state_label = copy::session_state_label(session.state(), self.workspace.locale());
-        let live = session.state() == &SessionState::Connected;
+        // The projection decides the state, its word and its tone; the tab only draws
+        // them, so a tab and the bar under it cannot disagree (R17).
+        let status = SessionStatus::of(session);
+        let tone = status.tone();
+        let state_label = status.headline(self.workspace.locale());
+        let live = status.phase().is_live();
         let kind_label = match kind {
             PaneKind::Local => strings.session_kind_local,
             PaneKind::Remote => strings.session_kind_remote,
@@ -13880,27 +14124,31 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let locale = self.workspace.locale();
-        let tone = Tone::for_session_state(session.state());
+        // The row states the same status the tab and the bar do; it only adds the
+        // target here, because a list has to say what each entry talks to (R17).
+        let status = SessionStatus::of(session);
+        let tone = status.tone();
         let kind = theme::session_kind_label(session.kind(), strings.local_shell_fallback);
         let remote = PaneKind::of(session.kind()) == PaneKind::Remote;
         // A failed or lost session states why it ended and, next to it, the action its
         // own state allows (R12): a reason the user cannot act on is only half a
         // report, and this row is the one place a session without a terminal is still
         // shown.
-        let detail = match session.state() {
-            SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
-                let step = if may_reconnect(session) {
-                    strings.session_reconnect
-                } else {
-                    strings.session_close
+        let detail = match status.diagnostic() {
+            Some(reason) => {
+                let step = match status.step() {
+                    Some(SessionStep::Reconnect) => strings.session_reconnect,
+                    Some(SessionStep::Close) => strings.session_close,
+                    // Nothing is asked of the user while a connection is being made.
+                    Some(SessionStep::Wait) | None => "",
                 };
-                format!(
-                    "{} · {} · {step}",
-                    theme::session_failure_text(failure),
-                    strings.next_step
-                )
+                if step.is_empty() {
+                    reason.to_owned()
+                } else {
+                    format!("{reason} · {} · {step}", strings.next_step)
+                }
             }
-            _ => self.target_of(session),
+            None => self.target_of(session),
         };
         components::row(metrics)
             .child(
@@ -14032,8 +14280,11 @@ impl ShelluneView {
         let locale = self.workspace.locale();
         // Every open terminal keeps its own labels, so each one is told: the ones
         // that are not on screen must come back in the new language too.
-        let panes: Vec<Entity<TerminalPane>> =
-            self.panes.iter().map(|open| open.pane.clone()).collect();
+        let panes: Vec<Entity<TerminalPane>> = self
+            .panes
+            .iter()
+            .filter_map(|open| open.content.terminal().cloned())
+            .collect();
         for pane in panes {
             pane.update(cx, |pane, cx| pane.set_locale(locale, cx));
         }

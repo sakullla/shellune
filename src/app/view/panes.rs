@@ -11,8 +11,8 @@ use gpui::{
     SharedString, Window, div, px,
 };
 use shellune_core::{
-    LocalShell, PaneId, PaneTarget, PanelSection, SessionId, SessionKind, SessionState, SplitAxis,
-    TabId, TerminalMode, WorkspaceSnapshot,
+    LocalShell, PaneId, PaneTarget, PanelSection, SessionId, SessionKind, SplitAxis, TabId,
+    TerminalMode, WorkspaceSnapshot,
 };
 use shellune_storage::WorkspaceStore;
 
@@ -461,24 +461,26 @@ impl ShelluneView {
         column
     }
 
+    /// The one status of the session on screen, when it has ended (R17).
+    ///
+    /// The session record answers first: it is where a refused reconnect is written, so
+    /// a notice read from the pane alone would keep stating the older problem. The pane
+    /// is only asked while the record has not caught up with it, and either way the
+    /// drawing comes from the same projection, so one session never shows two states.
     fn active_failure_notice(
         &self,
         id: Option<SessionId>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
         let id = id?;
-        let session = self.workspace.session(id)?;
-        match session.state() {
-            SessionState::Disconnected(failure) | SessionState::Failed(failure) => {
-                Some(self.failure_notice(failure, crate::app::view::may_reconnect(session)))
-            }
-            _ => self.pane_for(id).and_then(|pane| {
-                pane.read(cx)
-                    .state()
-                    .failure()
-                    .map(|failure| self.failure_notice(&failure, false))
-            }),
+        if let Some(status) = self.workspace.status(id)
+            && status.phase() == crate::app::workspace::SessionPhase::Ended
+        {
+            return Some(self.failure_notice(id, &status, cx));
         }
+        let failure = self.pane_for(id)?.read(cx).state().failure()?;
+        let status = crate::app::workspace::SessionStatus::ended(failure);
+        Some(self.failure_notice(id, &status, cx))
     }
 
     fn layout_status_banners(&self) -> Vec<gpui::Div> {

@@ -259,6 +259,12 @@ impl ShelluneView {
                 };
                 if *saved == host
                     && matches!(session.state(), SessionState::Connected)
+                    // A forwarding listener is an SSH capability; asking the set keeps a
+                    // protocol without one from ever being offered as its carrier (R18).
+                    && self
+                        .workspace
+                        .capabilities(session.id())
+                        .allows(shellune_core::Capability::Forwarding)
                     && self.forwards.has_carrier(session.id())
                 {
                     Some(session.id())

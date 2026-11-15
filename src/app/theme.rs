@@ -899,11 +899,6 @@ pub fn session_kind_label(kind: &SessionKind, shell_fallback: &str) -> String {
     }
 }
 
-/// Text for a session failure, kept free of secrets because the domain type is.
-pub fn session_failure_text(failure: &SessionFailure) -> String {
-    failure.to_string()
-}
-
 /// Minimum contrast for body text (WCAG AA).
 #[cfg(test)]
 pub const BODY_CONTRAST_FLOOR: f64 = 4.5;
