@@ -113,6 +113,9 @@ struct HostRowView {
     /// Whether the viewport is wide enough to show the inline duplicate icon alongside
     /// the forward, edit and delete icons without crowding narrow zoomed windows.
     show_duplicate: bool,
+    /// Whether any host is picked, which keeps every checkbox in view: once a
+    /// selection has started, picking the next host must not need a hover first.
+    selecting: bool,
 }
 
 impl ShelluneView {
@@ -197,34 +200,11 @@ impl ShelluneView {
             );
         }
 
-        let mut statuses = components::segmented(metrics);
-        for status in HostStatusFilter::ALL {
-            let selected = self.hosts.filter().status() == status;
-            statuses = statuses.child(
-                components::segment(status.label(ux), selected, metrics)
-                    .id(status.debug_selector())
-                    .debug_selector(move || status.debug_selector().to_owned())
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.hosts.set_status_filter(status);
-                        cx.notify();
-                    })),
-            );
-        }
-
-        // The count is the same number the selection uses, said where the filters are:
-        // "shown of saved" answers both "how many are left" and "is this everything".
-        let count = format!(
-            "{} · {}",
-            view_label(self.hosts.view(), strings),
-            copy::fill(
-                ux.hosts_result_count,
-                &[
-                    ("shown", &list.matched_len().to_string()),
-                    ("total", &list.total().to_string()),
-                ],
-            )
-        );
-
+        // One toolbar line: find, choose how the list is arranged, and the two tools that
+        // work on the list as a whole. The status filter lives in the side column on a
+        // wide window - beside the groups, where the other narrowing is - and only takes a
+        // line of its own here when there is no column.
+        let wide = self.group_column_fits();
         let mut row = div()
             .flex()
             .flex_col()
@@ -245,33 +225,34 @@ impl ShelluneView {
                             .child(self.hosts_search.clone()),
                     )
                     .child(views)
-                    .child(self.batch_entry_button(cx))
-                    .child(self.import_button(cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::TIGHT))
                     .child(
                         div()
+                            .flex()
                             .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(ux.hosts_status_label),
-                    )
-                    .child(statuses)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(metrics.scale(80.0))
-                            .debug_selector(|| "hosts.count".to_owned())
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(count)),
+                            .items_center()
+                            .gap(metrics.scale(2.0))
+                            .child(self.batch_entry_button(cx))
+                            .child(self.toolbar_import_button(cx)),
                     ),
-            );
+            )
+            .when(!wide, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(ux.hosts_status_label),
+                        )
+                        .child(self.hosts_status_segments(cx)),
+                )
+            });
+        let _ = list;
 
         // A narrowed list says what narrows it, and offers one press to drop it: a
         // filter that hides hosts without naming itself is how a list looks empty for no
@@ -312,6 +293,78 @@ impl ShelluneView {
             );
         }
         row
+    }
+
+    /// The import entry of the toolbar: labelled on a wide window, an icon on a narrow one.
+    fn toolbar_import_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let button = if self.group_column_fits() {
+            components::icon_label_button(
+                Icon::Import,
+                strings.import_open,
+                Variant::Ghost,
+                metrics,
+            )
+        } else {
+            components::icon_only_button(Icon::Import, metrics).size(metrics.control_height())
+        };
+        button
+            .id("hosts.import")
+            .debug_selector(|| "hosts.import".to_owned())
+            .tooltip(components::tooltip(strings.import_open))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.open_import(cx);
+            }))
+    }
+
+    /// The status filter as one segmented control, for a window without the side column.
+    fn hosts_status_segments(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let mut statuses = components::segmented(metrics);
+        for status in HostStatusFilter::ALL {
+            let selected = self.hosts.filter().status() == status;
+            statuses = statuses.child(
+                components::segment(status.label(ux), selected, metrics)
+                    .id(status.debug_selector())
+                    .debug_selector(move || status.debug_selector().to_owned())
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.hosts.set_status_filter(status);
+                        cx.notify();
+                    })),
+            );
+        }
+        statuses
+    }
+
+    /// How many hosts the list shows of how many are saved.
+    ///
+    /// The count is the same number the selection uses: "shown of saved" answers both
+    /// "how many are left" and "is this everything".
+    fn hosts_count_line(&self, list: &HostList) -> Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let ux = copy::ux();
+        let count = format!(
+            "{} · {}",
+            view_label(self.hosts.view(), strings),
+            copy::fill(
+                ux.hosts_result_count,
+                &[
+                    ("shown", &list.matched_len().to_string()),
+                    ("total", &list.total().to_string()),
+                ],
+            )
+        );
+        div()
+            .flex_1()
+            .min_w(metrics.scale(80.0))
+            .truncate()
+            .debug_selector(|| "hosts.count".to_owned())
+            .text_size(metrics.caption_size())
+            .text_color(theme::swatch(palette::TEXT_MUTED))
+            .child(SharedString::from(count))
     }
 
     /// What the selection holds, what it covers, and what can be done with it.
@@ -408,7 +461,19 @@ impl ShelluneView {
     fn batch_entry_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let ux = copy::ux();
-        components::compact_button(ux.hosts_batch_open, Variant::Secondary, metrics)
+        // A narrow window keeps the toolbar on one line: the tool is its icon, and the
+        // tooltip says its name.
+        let button = if self.group_column_fits() {
+            components::icon_label_button(
+                Icon::Layers,
+                ux.hosts_batch_open,
+                Variant::Ghost,
+                metrics,
+            )
+        } else {
+            components::icon_only_button(Icon::Layers, metrics).size(metrics.control_height())
+        };
+        button
             .id("hosts.batch.open.list")
             .debug_selector(|| "hosts.batch.open.list".to_owned())
             .tooltip(components::tooltip(ux.hosts_batch_open_hint))
@@ -430,21 +495,42 @@ impl ShelluneView {
             .flex_1()
             .min_w(px(0.0))
             .when(!short, |col| col.min_h(px(0.0)))
-            .gap(metrics.scale(spacing::HAIRLINE))
+            .gap(metrics.scale(spacing::TIGHT))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .flex_wrap()
+                    .min_h(metrics.compact_control_height())
                     .gap(metrics.scale(spacing::TIGHT))
                     .when(!wide, |row| row.child(self.hosts_group_chooser(cx)))
+                    .child(self.hosts_count_line(list))
                     .when(wide, |row| row.child(self.group_column_actions(cx))),
             );
 
+        // The rows sit on one surface, so the list reads as one object beside the
+        // column that narrows it.
+        let surface = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .when(!short, |col| col.min_h(px(0.0)))
+            .p(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "hosts.surface".to_owned());
         if empty {
-            list_column = list_column.child(self.hosts_empty_list(cx));
+            list_column = list_column.child(
+                surface
+                    .px(metrics.scale(spacing::BASE))
+                    .py(metrics.scale(spacing::SNUG))
+                    .child(self.hosts_empty_list(cx)),
+            );
         } else {
-            list_column = list_column.child(self.hosts_virtual_list(rows, cx));
+            list_column = list_column.child(surface.child(self.hosts_virtual_list(rows, cx)));
         }
 
         let mut body = div()
@@ -553,7 +639,62 @@ impl ShelluneView {
                     .child(ux.hosts_group_empty),
             );
         }
-        column.child(rows)
+        // The statuses follow the groups in the same scrolling column, so they sit
+        // right under the last group instead of at the far end of the window.
+        column.child(rows.child(self.hosts_status_column(cx)))
+    }
+
+    /// The status filter as rows of the side column, under the groups: both narrow the
+    /// same list, so they sit together, and the toolbar keeps a single line.
+    fn hosts_status_column(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(metrics.scale(1.0))
+            .pt(metrics.scale(spacing::SNUG))
+            .mt(metrics.scale(spacing::HAIRLINE))
+            .border_t_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "hosts.statuses".to_owned())
+            .child(
+                div()
+                    .pl(metrics.scale(spacing::TIGHT))
+                    .pb(metrics.scale(spacing::HAIRLINE))
+                    .child(components::section_label(ux.hosts_status_label, metrics)),
+            );
+        for status in HostStatusFilter::ALL {
+            let chosen = self.hosts.filter().status() == status;
+            let tone = match status {
+                HostStatusFilter::Any => None,
+                HostStatusFilter::Connected => Some(Tone::Positive),
+                HostStatusFilter::Recent => Some(Tone::Accent),
+                HostStatusFilter::NeverConnected => Some(Tone::Neutral),
+            };
+            section = section.child(
+                tree_row_frame(chosen, metrics)
+                    .id(status.debug_selector())
+                    .debug_selector(move || status.debug_selector().to_owned())
+                    .pl(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(metrics.small_icon_size())
+                            .children(tone.map(|tone| components::status_dot(tone, metrics))),
+                    )
+                    .child(tree_row_label(status.label(ux).to_owned(), chosen, metrics))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.hosts.set_status_filter(status);
+                        cx.notify();
+                    })),
+            );
+        }
+        section
     }
 
     /// The first row of the group column: every saved host, which is no narrowing.
@@ -758,65 +899,87 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
-        if self.hosts.view() == crate::app::hosts::HostView::Recent {
-            // `items_start`: the button is as wide as its words, not a bar across
-            // the whole list.
-            return div()
+        // An empty list is a calm, centred note in the middle of the list's surface: an
+        // icon, what happened, and the one press that changes it. The button is as wide
+        // as its words, not a bar across the list.
+        let note = |selector: &'static str,
+                    icon: Icon,
+                    title: &'static str,
+                    hint: Option<&'static str>| {
+            div()
                 .flex()
                 .flex_col()
-                .items_start()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .pt(metrics.scale(spacing::TIGHT))
-                .debug_selector(|| "hosts.recent.empty".to_owned())
+                .items_center()
+                .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                .py(metrics.scale(spacing::LOOSE))
+                .debug_selector(move || selector.to_owned())
                 .child(
                     div()
-                        .text_size(metrics.label_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .child(strings.hosts_recent_empty),
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(metrics.scale(40.0))
+                        .mb(metrics.scale(spacing::HAIRLINE))
+                        .rounded_full()
+                        .bg(theme::swatch(palette::SURFACE_SELECTED))
+                        .child(icons::icon(
+                            icon,
+                            metrics.icon_size(),
+                            theme::swatch(palette::TEXT_MUTED),
+                        )),
                 )
                 .child(
-                    components::compact_button(strings.hosts_view_all, Variant::Secondary, metrics)
-                        .id("hosts.recent.all")
-                        .debug_selector(|| "hosts.recent.all".to_owned())
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.select_host_view(crate::app::hosts::HostView::All, cx);
-                        })),
+                    div()
+                        .text_size(metrics.body_size())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                        .child(title),
                 )
-                .into_any_element();
+                .children(hint.map(|hint| {
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .child(hint)
+                }))
+        };
+        if self.hosts.view() == crate::app::hosts::HostView::Recent {
+            return note(
+                "hosts.recent.empty",
+                Icon::Layers,
+                strings.hosts_recent_empty,
+                None,
+            )
+            .child(
+                components::compact_button(strings.hosts_view_all, Variant::Secondary, metrics)
+                    .mt(metrics.scale(spacing::HAIRLINE + 2.0))
+                    .id("hosts.recent.all")
+                    .debug_selector(|| "hosts.recent.all".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.select_host_view(crate::app::hosts::HostView::All, cx);
+                    })),
+            )
+            .into_any_element();
         }
         let narrow = !self.hosts.search().trim().is_empty() || self.hosts.filter().is_narrowing();
         if !narrow {
             return div().into_any_element();
         }
-        div()
-            .flex()
-            .flex_col()
-            .items_start()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .pt(metrics.scale(spacing::TIGHT))
-            .debug_selector(|| "hosts.nomatch".to_owned())
-            .child(
-                div()
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(strings.hosts_no_match),
-            )
-            .child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(ux.hosts_no_match_hint),
-            )
-            .child(
-                components::compact_button(ux.hosts_filter_clear, Variant::Secondary, metrics)
-                    .mt(metrics.scale(spacing::HAIRLINE))
-                    .id("hosts.nomatch.clear")
-                    .debug_selector(|| "hosts.nomatch.clear".to_owned())
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.clear_host_narrowing(cx);
-                    })),
-            )
-            .into_any_element()
+        note(
+            "hosts.nomatch",
+            Icon::Search,
+            strings.hosts_no_match,
+            Some(ux.hosts_no_match_hint),
+        )
+        .child(
+            components::compact_button(ux.hosts_filter_clear, Variant::Secondary, metrics)
+                .mt(metrics.scale(spacing::HAIRLINE + 2.0))
+                .id("hosts.nomatch.clear")
+                .debug_selector(|| "hosts.nomatch.clear".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.clear_host_narrowing(cx);
+                })),
+        )
+        .into_any_element()
     }
 
     /// The list itself: a uniform list that is asked for the rows it shows.
@@ -932,6 +1095,7 @@ impl ShelluneView {
                         selected: self.hosts.selected().contains(host.id),
                         cursor: cursor == Some(host.id),
                         show_duplicate,
+                        selecting: !self.hosts.selected().is_empty(),
                     }));
                     hosts += 1;
                 }
@@ -1243,9 +1407,15 @@ fn host_row_element(
         .px(metrics.scale(spacing::TIGHT + 2.0))
         .rounded(px(radius::MEDIUM))
         .border_1()
-        .when(selected, |row| {
+        // A picked row is a soft tint: picked rows sit next to each other, and an
+        // outline on each of them stacked into a grid of borders.
+        .when(selected && !cursor, |row| {
             row.bg(theme::swatch(palette::ACCENT_TINT))
-                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.35))
+                .border_color(theme::clear())
+        })
+        .when(selected && cursor, |row| {
+            row.bg(theme::swatch(palette::ACCENT_TINT))
+                .border_color(theme::faded(theme::swatch(palette::ACCENT), 0.5))
         })
         .when(!selected && cursor, |row| {
             row.bg(theme::swatch(palette::SURFACE_SELECTED))
@@ -1271,17 +1441,47 @@ fn host_row_element(
                 let _ = menu_row.update(cx, |view, cx| view.open_host_menu(id, event, window, cx));
             },
         )
-        .child(
-            checkbox(selected, metrics)
-                .id(SharedString::from(format!("hosts.select.{number}")))
-                .debug_selector(move || format!("hosts.select.{number}"))
-                .tooltip(components::tooltip(ux.hosts_select_start))
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    let _ = pick.update(cx, |view, cx| view.toggle_host_selection(id, cx));
-                }),
-        )
-        .child(super::host_avatar(host.name.as_ref(), selected, metrics))
+        // The checkbox shares the avatar's place, as in a mail client: the avatar
+        // shows at rest, and the box takes its place under the pointer, on the
+        // keyboard's row, or once a selection has started - so picking hosts costs
+        // the list no column of empty boxes.
+        .child({
+            let picking = selected || cursor || host.selecting;
+            let avatar = super::host_avatar(host.name.as_ref(), selected, metrics);
+            div()
+                .relative()
+                .flex_none()
+                .size(metrics.scale(36.0))
+                .child(if picking {
+                    avatar.opacity(0.0)
+                } else {
+                    avatar.group_hover("host-row", |style| style.opacity(0.0))
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            checkbox(selected, metrics)
+                                .when(!picking, |boxed| {
+                                    boxed
+                                        .opacity(0.0)
+                                        .group_hover("host-row", |style| style.opacity(1.0))
+                                })
+                                .id(SharedString::from(format!("hosts.select.{number}")))
+                                .debug_selector(move || format!("hosts.select.{number}"))
+                                .tooltip(components::tooltip(ux.hosts_select_start))
+                                .on_click(move |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = pick
+                                        .update(cx, |view, cx| view.toggle_host_selection(id, cx));
+                                }),
+                        ),
+                )
+        })
         .child(
             div()
                 .flex()
@@ -1357,11 +1557,18 @@ fn host_row_element(
     // The tools of a host are quiet icons; the one thing a row is for - connecting - is
     // the labelled button at its end. Every press stops at its button, so a quick
     // double press on an icon never also opens the host underneath it.
+    // They appear with the pointer or the keyboard cursor, so a list at rest shows
+    // names and the one labelled action, not a column of tool icons per host.
     let tools = div()
         .flex()
         .flex_none()
         .items_center()
         .gap(metrics.scale(2.0))
+        .when(!cursor, |tools| {
+            tools
+                .opacity(0.0)
+                .group_hover("host-row", |style| style.opacity(1.0))
+        })
         .child(
             components::icon_only_button(Icon::Forward, metrics)
                 .size(metrics.scale(26.0))
@@ -1485,9 +1692,6 @@ fn connection_row_element(
                 let _ = menu_row.update(cx, |view, cx| view.open_host_menu(id, event, window, cx));
             },
         )
-        // No checkbox (a selection is an SSH target), but its room is kept: the
-        // avatars and names of every row stand in one column.
-        .child(div().flex_none().size(metrics.hit_target()))
         .child(super::host_avatar(connection.name.as_ref(), false, metrics))
         .child(
             div()
@@ -1557,6 +1761,11 @@ fn connection_row_element(
                 .flex_none()
                 .items_center()
                 .gap(metrics.scale(2.0))
+                .when(!cursor, |tools| {
+                    tools
+                        .opacity(0.0)
+                        .group_hover("host-row", |style| style.opacity(1.0))
+                })
                 .child(
                     components::icon_only_button(Icon::Pencil, metrics)
                         .size(metrics.scale(26.0))

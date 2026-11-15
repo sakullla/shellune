@@ -636,6 +636,7 @@ impl ShelluneView {
         let strings = self.strings();
         let ux = copy::ux();
         let state = self.workspace.state(Destination::Hosts);
+        let record_count = self.book.hosts().len() + self.book.connections().len();
 
         let heading = div()
             .flex()
@@ -643,11 +644,13 @@ impl ShelluneView {
             .justify_between()
             .flex_wrap()
             .gap(metrics.scale(spacing::SNUG))
+            // The title and how many records it holds, on one line: the page explains
+            // itself through what it shows, so the sentence under the title is gone.
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .items_baseline()
+                    .gap(metrics.scale(spacing::TIGHT + 2.0))
                     .min_w(px(0.0))
                     .child(
                         div()
@@ -657,14 +660,13 @@ impl ShelluneView {
                             .debug_selector(|| "header.title".to_owned())
                             .child(ux.home_title),
                     )
-                    // On a short window the sentence under the title costs the list a row
-                    // and says nothing the page does not show; it goes first.
-                    .when(self.viewport_height >= metrics.scale(600.0), |column| {
-                        column.child(
+                    .when(record_count > 0, |line| {
+                        line.child(
                             div()
-                                .text_size(metrics.body_size())
-                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                .child(ux.home_subtitle),
+                                .text_size(metrics.title_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .debug_selector(|| "header.count".to_owned())
+                                .child(SharedString::from(record_count.to_string())),
                         )
                     }),
             )
@@ -783,7 +785,10 @@ impl ShelluneView {
                 .flex_1()
                 .min_h(px(0.0))
                 .gap(metrics.scale(spacing::SNUG))
-                .child(components::section_label(ux.home_hosts_section, metrics))
+                // A narrow window spends its height on the list: the eyebrow goes there.
+                .when(self.group_column_fits(), |section| {
+                    section.child(components::section_label(ux.home_hosts_section, metrics))
+                })
                 .child(hosts),
         );
 
@@ -844,15 +849,18 @@ impl ShelluneView {
                 );
             } else {
                 tiles = tiles.child(
-                    self.home_card(
+                    self.shell_launcher(
                         Icon::Terminal,
                         shell.name().to_owned(),
-                        program_label(shell.program()),
                         selected.then_some(strings.shell_default),
                     )
                     .id(("shell.choice", index))
                     .debug_selector(move || format!("shell.choice.{index}"))
-                    .tooltip(components::tooltip(ux.home_local_hint))
+                    .tooltip(components::tooltip(SharedString::from(format!(
+                        "{} · {}",
+                        program_label(shell.program()),
+                        ux.home_local_hint
+                    ))))
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         this.launch_choice(index, window, cx);
                     })),
@@ -874,14 +882,14 @@ impl ShelluneView {
             );
         } else {
             tiles = tiles.child(
-                self.home_card(
+                self.shell_launcher(
                     Icon::FolderOpen,
                     format!("{}{ELLIPSIS}", strings.shell_custom_button),
-                    strings.shell_custom_hint.to_owned(),
                     None,
                 )
                 .id("shell.custom")
                 .debug_selector(|| "shell.custom".to_owned())
+                .tooltip(components::tooltip(strings.shell_custom_hint))
                 .on_click(cx.listener(|this, _event, window, cx| {
                     this.open_custom_shell(window, cx);
                 })),
@@ -906,33 +914,32 @@ impl ShelluneView {
         section.child(tiles)
     }
 
-    /// One card of the home page: an icon tile, a name, a detail line and an
-    /// optional badge.
-    fn home_card(
-        &self,
-        icon: Icon,
-        name: String,
-        detail: String,
-        badge: Option<&'static str>,
-    ) -> Div {
+    /// One local shell as a launcher: an icon, the name and, for the default shell, a
+    /// quiet mark - one line, as wide as its words, so the row of shells reads like the
+    /// app launcher it is and leaves the window to the servers.
+    ///
+    /// The program behind the name is the tooltip's business, not the row's.
+    fn shell_launcher(&self, icon: Icon, name: String, badge: Option<&'static str>) -> Div {
         let metrics = self.metrics();
         let hover_border = theme::swatch(palette::BORDER_STRONG);
         let hover_bg = theme::swatch(palette::SURFACE_HOVER);
-        // A launcher, not a feature card: one line tall, so the servers below keep the
-        // window. The icon sits on the accent's quiet tint instead of a gradient tile -
-        // the accent is for the current object and the primary action, and a row of
-        // saturated tiles shouted louder than the button that adds a host.
+        let default = badge.is_some();
         div()
             .flex()
+            .flex_none()
             .items_center()
-            .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .w(metrics.scale(212.0))
-            .px(metrics.scale(spacing::SNUG - 2.0))
-            .py(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::MEDIUM))
+            .gap(metrics.scale(spacing::TIGHT))
+            .h(metrics.scale(36.0))
+            .pl(metrics.scale(spacing::HAIRLINE + 2.0))
+            .pr(metrics.scale(spacing::SNUG))
+            .rounded(px(radius::MEDIUM + 2.0))
             .bg(theme::swatch(palette::SURFACE_RAISED))
             .border_1()
-            .border_color(theme::swatch(palette::BORDER))
+            .border_color(theme::swatch(if default {
+                palette::BORDER_STRONG
+            } else {
+                palette::BORDER
+            }))
             .cursor_pointer()
             .hover(move |style| style.border_color(hover_border).bg(hover_bg))
             .child(
@@ -941,55 +948,30 @@ impl ShelluneView {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .size(metrics.scale(30.0))
-                    .rounded(px(radius::SMALL + 1.0))
+                    .size(metrics.scale(24.0))
+                    .rounded(px(radius::SMALL))
                     .bg(theme::swatch(palette::ACCENT_TINT))
                     .child(icons::icon(
                         icon,
-                        metrics.small_icon_size(),
+                        metrics.scale(13.0),
                         theme::swatch(palette::ACCENT_ON_TINT),
                     )),
             )
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    // The name has the whole line to itself, so a long one ("Windows
-                    // PowerShell") ends in an ellipsis instead of being cut under a
-                    // badge. The badge reads first on the detail line, in the accent,
-                    // at the same line height, so every card stays the same height.
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(metrics.body_size())
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(name)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .min_w(px(0.0))
-                            .gap(metrics.scale(spacing::HAIRLINE + 1.0))
-                            .text_size(metrics.caption_size())
-                            .children(badge.map(|badge| {
-                                div()
-                                    .flex_none()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::swatch(palette::ACCENT_ON_TINT))
-                                    .child(format!("{badge} ·"))
-                            }))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(SharedString::from(detail)),
-                            ),
-                    ),
+                    .flex_none()
+                    .text_size(metrics.label_size())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(name)),
             )
+            .children(badge.map(|badge| {
+                div()
+                    .flex_none()
+                    .text_size(metrics.caption_size())
+                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .child(badge)
+            }))
     }
 
     /// The first-run card of the servers section: what a host is, and the three

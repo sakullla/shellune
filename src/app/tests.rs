@@ -21380,6 +21380,62 @@ async fn the_narrow_window_folds_the_groups_into_a_filter(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn the_status_filter_sits_with_the_groups_on_a_wide_window(cx: &mut TestAppContext) {
+    let dir = TempDir::new("status-column");
+    let store = dir.store();
+    seed_many(&store, 12);
+    let (_view, cx) = hosts_view(cx, store);
+
+    // Wide: the statuses are rows of the side column, under the groups, and the
+    // toolbar keeps a single line.
+    let column = bounds_of(cx, "hosts.statuses");
+    let groups = bounds_of(cx, "hosts.groups");
+    let connected = bounds_of(cx, "hosts.status.connected");
+    assert!(
+        column.contains(&connected.center()),
+        "the status rows are drawn in the side column: {connected:?} in {column:?}"
+    );
+    assert!(
+        groups.contains(&column.center()),
+        "the statuses belong to the group column"
+    );
+    let toolbar = bounds_of(cx, "hosts.toolbar");
+    let search = bounds_of(cx, "hosts.search");
+    assert!(
+        toolbar.size.height < search.size.height * 1.6,
+        "the toolbar is one line on a wide window: {toolbar:?}"
+    );
+
+    // The row's tools wait for the pointer; the box and the avatar share one place.
+    let select = bounds_of(cx, "hosts.select.0");
+    let row = bounds_of(cx, "hosts.row.0");
+    assert!(row.contains(&select.center()));
+    click(cx, "hosts.status.connected");
+    assert!(
+        cx.debug_bounds("hosts.nomatch").is_some(),
+        "the side column's status narrows the list like the toolbar's did"
+    );
+}
+
+#[gpui::test]
+async fn the_narrow_window_keeps_the_status_filter_above_the_list(cx: &mut TestAppContext) {
+    let dir = TempDir::new("status-narrow");
+    let store = dir.store();
+    seed_many(&store, 12);
+    let (view, cx) = hosts_view_at(cx, store, minimum_window());
+    assert!(
+        !cx.update(|_window, app| view.read(app).group_column_fits()),
+        "no side column on a narrow window"
+    );
+    let toolbar = bounds_of(cx, "hosts.toolbar");
+    let connected = bounds_of(cx, "hosts.status.connected");
+    assert!(
+        toolbar.contains(&connected.center()),
+        "the statuses are part of the toolbar there: {connected:?} in {toolbar:?}"
+    );
+}
+
+#[gpui::test]
 async fn a_batch_move_takes_every_host_the_filters_kept_and_keeps_them_saved(
     cx: &mut TestAppContext,
 ) {

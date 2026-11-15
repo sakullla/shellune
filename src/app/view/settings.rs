@@ -453,8 +453,75 @@ impl ShelluneView {
                     })
                     .child(category.label(locale)),
             );
+        // The settings that are one control each share one card, one labelled row per
+        // setting, like a system settings panel: a category reads as one block instead
+        // of a heading and a card for every switch. The pages with lists of their own
+        // (shortcuts, connection policy) keep their own block under it.
+        let simple: Vec<Item> = category
+            .items()
+            .iter()
+            .copied()
+            .filter(|item| !matches!(item, Item::Shortcuts | Item::Policy))
+            .collect();
+        if !simple.is_empty() {
+            let count = simple.len();
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .min_w(px(0.0))
+                .rounded(px(radius::LARGE))
+                .bg(theme::swatch(palette::SURFACE_RAISED))
+                .border_1()
+                .border_color(theme::swatch(palette::BORDER))
+                .debug_selector({
+                    let selector = format!("settings.group.{}", category.id());
+                    move || selector.clone()
+                });
+            for (index, item) in simple.into_iter().enumerate() {
+                let chosen = item == shown;
+                let page = format!("settings.page.{}", item.id());
+                let card_id = format!("settings.card.{}", item.id());
+                card = card.child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .debug_selector(move || page.clone())
+                        .when(index + 1 < count, |row| {
+                            row.border_b_1()
+                                .border_color(theme::swatch(palette::BORDER))
+                        })
+                        // The chosen setting carries the accent edge, so the place the
+                        // navigation points at is found on the page as well.
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(2.0))
+                                .my(metrics.scale(spacing::SNUG))
+                                .rounded(px(1.0))
+                                .bg(if chosen {
+                                    theme::swatch(palette::ACCENT)
+                                } else {
+                                    theme::clear()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .debug_selector(move || card_id.clone())
+                                .child(self.settings_item_row(item, cx)),
+                        ),
+                );
+            }
+            section = section.child(card);
+        }
         for item in category.items() {
             let item = *item;
+            if !matches!(item, Item::Shortcuts | Item::Policy) {
+                continue;
+            }
             let chosen = item == shown;
             let selector = format!("settings.page.{}", item.id());
             // A category of one page named like the category needs no second heading.
@@ -788,38 +855,38 @@ impl ShelluneView {
 impl ShelluneView {
     /// The controls of one item, all of them inside one card.
     fn settings_item_body(&self, item: Item, cx: &mut Context<Self>) -> Div {
-        let metrics = self.metrics();
         match item {
             Item::Shortcuts => self.settings_keys_page(cx),
             Item::Policy => self.settings_connection_page(cx),
-            Item::HostsFile => self.settings_card(
-                item.id(),
-                vec![
-                    self.settings_row(
-                        "hosts-file",
-                        copy::ux().settings_hosts_file,
-                        "",
-                        components::copy_on_click(
-                            div()
-                                .max_w(metrics.scale(360.0))
-                                .truncate()
-                                .font_family(terminal::monospace_family())
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                .debug_selector(|| "settings.paths".to_owned()),
-                            self.store.path().display().to_string(),
-                        )
-                        .child(SharedString::from(super::home_relative(
-                            &self.store.path().display().to_string(),
-                        ))),
-                    ),
-                ],
+            _ => self.settings_item_row(item, cx),
+        }
+    }
+
+    /// The labelled row of a setting that is one control.
+    fn settings_item_row(&self, item: Item, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        match item {
+            Item::Shortcuts | Item::Policy => self.settings_item_body(item, cx),
+            Item::HostsFile => self.settings_row(
+                "hosts-file",
+                copy::ux().settings_hosts_file,
+                "",
+                components::copy_on_click(
+                    div()
+                        .max_w(metrics.scale(360.0))
+                        .truncate()
+                        .font_family(terminal::monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .debug_selector(|| "settings.paths".to_owned()),
+                    self.store.path().display().to_string(),
+                )
+                .child(SharedString::from(super::home_relative(
+                    &self.store.path().display().to_string(),
+                ))),
             ),
-            Item::Version => self.settings_card(item.id(), vec![self.settings_version_row()]),
-            _ => {
-                let row = self.settings_control_row(item, cx);
-                self.settings_card(item.id(), vec![row])
-            }
+            Item::Version => self.settings_version_row(),
+            _ => self.settings_control_row(item, cx),
         }
     }
 
@@ -828,64 +895,65 @@ impl ShelluneView {
     /// (R16).
     fn settings_control_row(&self, item: Item, cx: &mut Context<Self>) -> Div {
         let ux = copy::ux();
+        let label = item.label(self.workspace.locale());
         match item {
             Item::Theme => self.settings_row(
                 "theme",
-                "",
+                label,
                 ux.settings_theme_hint,
                 self.settings_theme_control(cx),
             ),
             Item::Language => self.settings_row(
                 "language",
-                "",
+                label,
                 ux.settings_language_hint,
                 self.settings_language_control(cx),
             ),
             Item::TextSize => self.settings_row(
                 "text-size",
-                "",
+                label,
                 ux.settings_text_size_hint,
                 self.settings_zoom_control(cx),
             ),
             Item::Motion => self.settings_row(
                 "motion",
-                "",
+                label,
                 ux.settings_motion_hint,
                 self.settings_motion_control(cx),
             ),
             Item::Scheme => self.settings_row(
                 "scheme",
-                "",
+                label,
                 ux.settings_scheme_hint,
                 self.settings_scheme_control(cx),
             ),
             Item::FontSize => self.settings_row(
                 "font-size",
-                "",
+                label,
                 ux.settings_font_size_hint,
                 self.settings_font_control(cx),
             ),
             Item::DefaultShell => self.settings_row(
                 "default-shell",
-                "",
+                label,
                 ux.settings_default_shell_hint,
                 self.settings_shell_control(cx),
             ),
             Item::BellNotice => self.settings_row(
                 "bell-notice",
-                "",
+                label,
                 ux.settings_bell_notice_hint,
                 self.settings_notice_control(AttentionKind::Bell, cx),
             ),
             Item::FinishedNotice => self.settings_row(
                 "finished-notice",
-                "",
+                label,
                 ux.settings_finished_notice_hint,
                 self.settings_notice_control(AttentionKind::CommandFinished, cx),
             ),
             Item::Import => self.settings_row(
                 "import",
-                "",
+                label,
                 ux.settings_import_hint,
                 components::icon_label_button(
                     crate::app::icons::Icon::Import,

@@ -2355,8 +2355,6 @@ pub struct UxStrings {
     pub search: &'static str,
     /// Hosts
     pub home_title: &'static str,
-    /// Open a shell on this computer, or connect to a server
-    pub home_subtitle: &'static str,
     /// This computer
     pub home_local_section: &'static str,
     /// Opens in a new tab
@@ -3106,7 +3104,6 @@ impl UxStrings {
             self.new_tab_menu,
             self.search,
             self.home_title,
-            self.home_subtitle,
             self.home_local_section,
             self.home_local_hint,
             self.home_hosts_section,
@@ -3487,7 +3484,6 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     new_tab_menu: "More ways to open a tab",
     search: "Search hosts and commands",
     home_title: "Hosts",
-    home_subtitle: "Open a shell on this computer, or connect to a server",
     home_local_section: "This computer",
     home_local_hint: "Opens in a new tab",
     home_hosts_section: "Servers",
@@ -3883,7 +3879,6 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     new_tab_menu: "更多打开方式",
     search: "搜索主机与命令",
     home_title: "主机",
-    home_subtitle: "在本机打开终端，或连接到服务器",
     home_local_section: "本机",
     home_local_hint: "在新标签中打开",
     home_hosts_section: "服务器",

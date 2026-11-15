@@ -444,21 +444,25 @@ pub fn status_dot(tone: Tone, metrics: Metrics) -> Div {
 /// It is a hairline block, not a pill: the mark's shape and the word carry the state,
 /// and the tone only agrees with them.
 pub fn chip(label: impl Into<SharedString>, tone: Tone, metrics: Metrics) -> Div {
+    // A soft pill: the tint and the mark carry the tone, so no outline is needed. A
+    // neutral chip is a plain word - its dash mark read as a minus sign in front of it.
     div()
         .flex()
         .flex_none()
         .items_center()
         .gap(metrics.scale(5.0))
         .h(metrics.scale(20.0))
-        .px(metrics.scale(7.0))
-        .rounded(px(radius::SMALL))
+        .px(metrics.scale(8.0))
+        .rounded_full()
         .bg(tone.chip_background())
         .border_1()
-        .border_color(theme::faded(tone.text(), 0.4))
+        .border_color(theme::faded(tone.text(), 0.16))
         .text_size(metrics.caption_size())
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(tone.text())
-        .child(status_mark(tone, metrics.scale(6.0)))
+        .when(tone != Tone::Neutral, |chip| {
+            chip.child(status_mark(tone, metrics.scale(6.0)))
+        })
         .child(label.into())
 }
 
@@ -470,8 +474,8 @@ pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .flex_none()
         .items_center()
         .h(metrics.scale(20.0))
-        .px(metrics.scale(7.0))
-        .rounded(px(radius::SMALL))
+        .px(metrics.scale(8.0))
+        .rounded_full()
         .bg(theme::swatch(palette::SURFACE_SELECTED))
         .text_size(metrics.caption_size())
         .text_color(theme::swatch(palette::TEXT_SECONDARY))
@@ -509,8 +513,8 @@ pub fn badge(count: usize, tone: Tone, metrics: Metrics) -> Div {
         .justify_center()
         .min_w(metrics.scale(18.0))
         .h(metrics.scale(18.0))
-        .px(metrics.scale(5.0))
-        .rounded(px(radius::SMALL))
+        .px(metrics.scale(6.0))
+        .rounded_full()
         .font_weight(gpui::FontWeight::MEDIUM)
         .bg(theme::swatch(background))
         .text_size(metrics.caption_size())
@@ -774,10 +778,10 @@ pub fn segmented(metrics: Metrics) -> Div {
         .max_w_full()
         .gap(metrics.scale(2.0))
         .p(metrics.scale(3.0))
-        .rounded(px(radius::MEDIUM))
+        .rounded(px(radius::MEDIUM + 1.0))
         .bg(theme::swatch(palette::SEGMENT_TRACK))
         .border_1()
-        .border_color(theme::swatch(palette::BORDER))
+        .border_color(theme::faded(theme::swatch(palette::BORDER), 0.7))
 }
 
 /// Em widths reserved so a label is at least as wide as a UI font, not the test font.
@@ -861,11 +865,12 @@ pub(crate) fn keycap_reserved_width(label: &str, metrics: Metrics) -> Pixels {
 
 /// A short label above a group of controls.
 pub fn section_label(label: impl Into<SharedString>, metrics: Metrics) -> Div {
+    // An eyebrow, not a heading: small and quiet, so the content under it leads.
     div()
         .flex_none()
-        .text_size(metrics.label_size())
+        .text_size(metrics.caption_size())
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+        .text_color(theme::swatch(palette::TEXT_MUTED))
         .child(label.into())
 }
 
