@@ -32278,3 +32278,237 @@ async fn a_status_card_rises_into_the_place_a_still_card_takes(cx: &mut TestAppC
     );
     theme::set_motion(Motion::Full);
 }
+
+/// A reason as long as the ones a shell or a jump host really reports: one unbroken
+/// path, then a sentence.
+const LONG_LOSS: &str = concat!(
+    r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe exited because the pipe ",
+    r"C:\Users\someone\AppData\Local\Temp\shellune-pty-0123456789abcdef was closed"
+);
+
+/// Ends the terminal of `id` with `reason`, the way a shell that stopped or a
+/// connection that dropped reaches its pane.
+fn lose_pane_with(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    id: SessionId,
+    reason: &str,
+) {
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the session has a terminal");
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(tag, vec![SourceEvent::Lost(reason.to_owned())], cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(matches!(
+        session_state(cx, view, id),
+        Some(SessionState::Disconnected(_))
+    ));
+}
+
+/// Whether a control of the session bar is on the bar's one line, beside where the
+/// session is, rather than wrapped onto the hidden line under it.
+fn on_the_line(control: gpui::Bounds<Pixels>, context: gpui::Bounds<Pixels>) -> bool {
+    let centre = control.center().y;
+    centre >= context.origin.y && centre <= context.origin.y + context.size.height
+}
+
+fn viewport_width(cx: &mut VisualTestContext) -> Pixels {
+    cx.update(|window, _app| window.viewport_size().width)
+}
+
+/// Whether `inner` lies wholly inside `outer`, to half a pixel.
+fn wholly_inside(inner: gpui::Bounds<Pixels>, outer: gpui::Bounds<Pixels>) -> bool {
+    inner.size.width > px(0.0)
+        && inner.size.height > px(0.0)
+        && inner.origin.x >= outer.origin.x - px(0.5)
+        && inner.origin.y >= outer.origin.y - px(0.5)
+        && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + px(0.5)
+        && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + px(0.5)
+}
+
+/// The ended session's card as the window lays it out now: on its veil over the grid
+/// and never over the bar, its headline on screen, and a Reconnect the pointer can
+/// press - on the card when the card has the room, in the bar otherwise (R3, R8, R9).
+///
+/// Returns the selector of the Reconnect that is on screen. `card_fits` asks for the
+/// whole card to stand inside the veil, which every layout at the design size gives.
+fn assert_ended_card_reachable(
+    cx: &mut VisualTestContext,
+    card_fits: bool,
+    what: &str,
+) -> &'static str {
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let window = gpui::Bounds::new(point(px(0.0), px(0.0)), viewport);
+    let overlay = bounds_of(cx, "terminal.status.overlay");
+    let context = bounds_of(cx, "session.context");
+    assert!(
+        wholly_inside(overlay, window),
+        "{what}: the veil stays in the window: {overlay:?}"
+    );
+    assert!(
+        overlay.origin.y + overlay.size.height <= context.origin.y + px(0.5),
+        "{what}: the veil covers the grid, not the bar under it: {overlay:?} over {context:?}"
+    );
+    let scroll = bounds_of(cx, "terminal.status.scroll");
+    assert!(
+        wholly_inside(scroll, overlay),
+        "{what}: the card's box is held inside the veil: {scroll:?} in {overlay:?}"
+    );
+    let card = bounds_of(cx, "terminal.failure");
+    assert!(
+        card.size.height <= viewport.height,
+        "{what}: the card is no taller than its content needs: {card:?}"
+    );
+    let headline = bounds_of(cx, "terminal.failure.headline");
+    // A card taller than its box starts at the box's top and scrolls down from there:
+    // nothing of it is pushed above the box, out of the scroll's reach.
+    assert!(
+        card.origin.y >= scroll.origin.y - px(0.5) && headline.origin.y >= card.origin.y,
+        "{what}: the card opens on its headline: {headline:?} in {scroll:?}"
+    );
+    let target = bounds_of(cx, "terminal.failure.target");
+    assert!(
+        wholly_inside(target, card),
+        "{what}: the target stays on the card: {target:?} in {card:?}"
+    );
+    // Cut to the card's width, not to its ellipsis alone.
+    assert!(
+        target.size.width >= card.size.width / 3.0,
+        "{what}: the target keeps the card's width to show itself in: {target:?} in {card:?}"
+    );
+    if card_fits {
+        assert!(
+            wholly_inside(card, scroll),
+            "{what}: the whole card stands in the veil: {card:?} in {scroll:?}"
+        );
+    }
+    let next = bounds_of(cx, "terminal.failure.next");
+    if wholly_inside(next, scroll) && wholly_inside(next, window) {
+        return "terminal.failure.next";
+    }
+    assert!(
+        !card_fits,
+        "{what}: a card that fits shows its step: {next:?} in {scroll:?}"
+    );
+    let bar_step = cx
+        .debug_bounds("session.reconnect")
+        .unwrap_or_else(|| panic!("{what}: the bar offers the reconnect the card cannot show"));
+    assert!(
+        wholly_inside(bar_step, window) && on_the_line(bar_step, context),
+        "{what}: the bar's reconnect is on screen, on the bar's line: {bar_step:?} beside          {context:?}"
+    );
+    "session.reconnect"
+}
+
+/// A local shell that ended - its target a full path, the default session of the app -
+/// keeps its card, its headline and a Reconnect on screen in `split`, at the design size
+/// and at 720x480 and 200%; the Reconnect that shows restarts it in place (R3, R8, R9).
+fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<SplitAxis>) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    // Measured where the card stands, not part way through its entrance.
+    while cx.update(|_window, app| view.read(app).workspace().motion()) != Motion::Reduced {
+        cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+        cx.run_until_parked();
+    }
+    click(cx, "header.primary");
+    if let Some(axis) = split {
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.split_active_for_test(axis, window, cx));
+        });
+        cx.run_until_parked();
+    }
+    let id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("a shell is on screen");
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs().len());
+    let others: Vec<SessionId> = cx
+        .update(|_window, app| view.read(app).active_leaf_sessions_for_test())
+        .into_iter()
+        .flatten()
+        .filter(|other| *other != id)
+        .collect();
+    lose_pane_with(&view, cx, id, LONG_LOSS);
+
+    let layout = format!("{split:?}");
+    assert_eq!(
+        assert_ended_card_reachable(cx, true, &format!("{layout} at the design size")),
+        "terminal.failure.next"
+    );
+    // The bar keeps its own Reconnect too: it is one of the entries the user is told
+    // about (R8), on the bar's one line beside where the session is.
+    assert!(
+        cx.update(|_window, app| view.read(app).offers_reconnect(id)),
+        "{layout}: the session can be reconnected"
+    );
+    let bar_step = bounds_of(cx, "session.reconnect");
+    let context = bounds_of(cx, "session.context");
+    assert!(
+        on_the_line(bar_step, context)
+            && bar_step.origin.x + bar_step.size.width <= viewport_width(cx) + px(0.5),
+        "{layout}: the bar's reconnect is on the bar's line: {bar_step:?} beside {context:?}"
+    );
+    // The raw reason, unfolded, makes the card taller but not one letter per line.
+    click(cx, "terminal.failure.details");
+    let card = bounds_of(cx, "terminal.failure");
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert!(
+        card.size.height <= viewport.height / 2.0,
+        "{layout}: the unfolded reason wraps at the card's width: {card:?}"
+    );
+    click(cx, "terminal.failure.details");
+
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    let step = assert_ended_card_reachable(cx, false, &format!("{layout} at 720x480 and 200%"));
+    click(cx, step);
+    assert!(
+        !matches!(
+            session_state(cx, &view, id),
+            Some(SessionState::Disconnected(_) | SessionState::Failed(_))
+        ),
+        "{layout}: pressing {step} starts the shell again"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs().len()),
+        tabs,
+        "{layout}: the reconnect happens in the tab it was pressed in"
+    );
+    for other in others {
+        assert_eq!(
+            session_state(cx, &view, other),
+            Some(SessionState::Connected),
+            "{layout}: the other pane is left alone"
+        );
+    }
+}
+
+#[gpui::test]
+async fn an_ended_shell_states_itself_in_a_card_that_fits_its_terminal(cx: &mut TestAppContext) {
+    an_ended_shell_card_reaches_its_step(cx, None);
+}
+
+#[gpui::test]
+async fn an_ended_shell_in_a_side_by_side_split_keeps_its_card_and_step_on_screen(
+    cx: &mut TestAppContext,
+) {
+    an_ended_shell_card_reaches_its_step(cx, Some(SplitAxis::LeftRight));
+}
+
+#[gpui::test]
+async fn an_ended_shell_in_a_stacked_split_keeps_its_card_and_step_on_screen(
+    cx: &mut TestAppContext,
+) {
+    an_ended_shell_card_reaches_its_step(cx, Some(SplitAxis::TopBottom));
+}

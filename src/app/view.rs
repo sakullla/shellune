@@ -5832,7 +5832,8 @@ impl ShelluneView {
             .map(|secret| secret.expose().to_owned())
     }
 
-    /// Whether the session bar offers the reconnect button for this session.
+    /// Whether this session can be started again: what the Reconnect of its bar and of
+    /// its ended card offer.
     #[cfg(test)]
     pub fn offers_reconnect(&self, id: SessionId) -> bool {
         self.workspace.session(id).is_some_and(may_reconnect)
@@ -16958,11 +16959,22 @@ impl ShelluneView {
             div()
                 .debug_selector(|| "terminal.failure.headline".to_owned())
                 .child(SharedString::from(headline)),
+            // One line, cut with an ellipsis: a target is often one long word - a
+            // shell's full path - and a word wrapped at every letter is what made the
+            // card taller than the window. A click copies the whole of it, as it does in
+            // the bar.
             target.map(|target| {
-                div()
-                    .font_family(terminal::monospace_family())
-                    .debug_selector(|| "terminal.failure.target".to_owned())
-                    .child(SharedString::from(target))
+                div().flex().min_w(px(0.0)).child(
+                    self.copyable_text(
+                        "terminal.failure.target",
+                        target,
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(terminal::monospace_family()),
+                        cx,
+                    ),
+                )
             }),
             metrics,
         )

@@ -3057,11 +3057,16 @@ impl TerminalPane {
     }
 
     /// The status card laid over the grid, when the window handed one in.
-    fn status_overlay(&self, metrics: Metrics) -> Option<gpui::Div> {
+    fn status_overlay(&self) -> Option<gpui::Div> {
         let card = self.status_slot.borrow_mut().take()?;
         // A veil of the terminal's own background: the last screen stays legible, the
         // card is plainly the thing in front. It takes no pointer, so a selection or a
         // scroll in the grid still reaches the grid around the card.
+        //
+        // The veil covers the grid and nothing else: a card taller than a short pane
+        // (a stacked split at 200%) is held in a box no taller than the veil and
+        // scrolls there, from its headline down, instead of running over the bar and
+        // out of the window. The bar keeps its own Reconnect for that case (R8).
         Some(
             div()
                 .absolute()
@@ -3069,10 +3074,26 @@ impl TerminalPane {
                 .flex()
                 .items_center()
                 .justify_center()
-                .p(metrics.scale(spacing::BASE))
+                .overflow_hidden()
                 .bg(theme::faded(color_of(palette::BACKGROUND), 0.55))
                 .debug_selector(|| "terminal.status.overlay".to_owned())
-                .child(card),
+                .child(
+                    div()
+                        .id("terminal.status.scroll")
+                        .debug_selector(|| "terminal.status.scroll".to_owned())
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .w_full()
+                        .min_h(px(0.0))
+                        .max_h_full()
+                        .overflow_y_scroll()
+                        // The margin scrolls with the card: it keeps the card off the
+                        // pane's edges and leaves its shadow room inside the box that
+                        // clips it, without taking height from a short pane.
+                        .p(px(spacing::LOOSE))
+                        .child(card),
+                ),
         )
     }
 
@@ -5306,7 +5327,7 @@ impl Render for TerminalPane {
                     .children(self.scroll_bottom_pill(tools, show_blocks, cx))
                     // Why the session ended is laid over the grid it ended on, not
                     // stacked above it: the grid keeps its size (R3).
-                    .children(self.status_overlay(metrics)),
+                    .children(self.status_overlay()),
             )
             // A serial line states itself above the bar: its device, its settings and
             // the two send habits are what a person changes while the session runs, and

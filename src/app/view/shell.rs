@@ -346,11 +346,11 @@ impl ShelluneView {
         // "The session is over" is the projection's answer, not a second match on the
         // state here: a fresh variant must not turn into a silently different page.
         let ended = status.phase().is_over();
-        // A session that ended states its reason and its one next step in the card over
-        // its terminal (R3, R17); the bar does not offer the same step a second time.
-        let failure_card = status.phase() == crate::app::workspace::SessionPhase::Ended;
-        let offers_reconnect = can_reconnect && !card;
-        let can_reconnect = offers_reconnect && !failure_card;
+        // A session that ended states its reason and its next step in the card over its
+        // terminal (R3, R17), and the bar keeps its Reconnect as well: it is one of the
+        // entries the user is told about (R8), and it is the one still in reach when a
+        // short pane leaves the card no room to show its own.
+        let can_reconnect = can_reconnect && !card;
 
         let left = div()
             .flex()
@@ -481,18 +481,21 @@ impl ShelluneView {
         // control that does not fit is left out whole instead of being cut through (R3).
         let mut right: Vec<AnyElement> = Vec::new();
         if can_reconnect {
+            // The card over the terminal names the step in words; the bar's entry is the
+            // icon and its tooltip, a control the size of its neighbours, so it is still
+            // whole in a split pane at 200% where a labelled button was cut through.
+            let tooltip = match self.keymap.label("session.reconnect") {
+                Some(shortcut) => format!("{} ({shortcut})", strings.session_reconnect),
+                None => strings.session_reconnect.to_owned(),
+            };
             right.push(
-                self.icon_text_button(
-                    SharedString::from("session.reconnect"),
-                    Icon::Refresh,
-                    strings.session_reconnect,
-                    Variant::Primary,
-                    cx,
-                    move |view, cx| view.reconnect_session(id, cx),
-                )
-                .h(metrics.scale(22.0))
-                .text_size(metrics.caption_size())
-                .into_any_element(),
+                self.bar_icon("session.reconnect", Icon::Refresh, tooltip, false)
+                    .size(metrics.hit_target())
+                    .flex_none()
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.reconnect_session(id, cx);
+                    }))
+                    .into_any_element(),
             );
         }
         if unsaved {
@@ -511,7 +514,7 @@ impl ShelluneView {
             );
         }
         // A session that ended for good has one thing left to do.
-        if ended && !offers_reconnect && !unsaved && !card {
+        if ended && !can_reconnect && !unsaved && !card {
             right.push(
                 self.icon_text_button(
                     SharedString::from("session.close"),
