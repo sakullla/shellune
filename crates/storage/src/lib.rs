@@ -3,8 +3,8 @@
 //!
 //! The crate owns the user-data files:
 //!
-//! * `HostBook` / `HostStore` — hosts, their group labels and the recent-connection
-//!   log. One book, so search, grouping and the recent view can never disagree
+//! * `HostBook` / `HostStore` — hosts, their group labels, the recent-connection
+//!   log and the favourite marks. One book, so search, grouping and the recent view can never disagree
 //!   about what a host is called or which address it uses. A host may also name a
 //!   jump chain and a ProxyCommand; those are references and command text. The
 //!   same book holds the connections whose protocol is not SSH, each carrying its

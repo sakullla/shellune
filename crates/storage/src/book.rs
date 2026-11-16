@@ -1,4 +1,5 @@
-//! The saved records: hosts, their group labels and the recent-connection log.
+//! The saved records: hosts, their group labels, the recent-connection log and
+//! the favourite marks.
 //!
 //! The SSH hosts are the host list this build has always written, and the
 //! connections of the other protocols are kept beside it with an explicit protocol
@@ -161,6 +162,14 @@ pub struct HostBook {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     connections: Vec<ConnectionRecord>,
     recents: Vec<RecentConnection>,
+    /// The records the user marked as favourites, in the order they were marked.
+    ///
+    /// Identifiers rather than copies, so a favourite is the record every other view
+    /// shows; an SSH host and a connection of another protocol are marked the same
+    /// way. Absent from a file without favourites, so such a book is written byte for
+    /// byte as before and an older file reads as having none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    favorites: Vec<HostId>,
 }
 
 impl Default for HostBook {
@@ -170,6 +179,7 @@ impl Default for HostBook {
             hosts: Vec::new(),
             connections: Vec::new(),
             recents: Vec::new(),
+            favorites: Vec::new(),
         }
     }
 }
@@ -305,8 +315,72 @@ impl HostBook {
             return Err(BookError::UnknownHost { id });
         };
         self.recents.retain(|recent| recent.host() != id);
+        self.favorites.retain(|favorite| *favorite != id);
         Ok(self.hosts.remove(index))
     }
+
+    /// The identifiers of the favourite records, in the order they were marked.
+    #[must_use]
+    pub fn favorites(&self) -> &[HostId] {
+        &self.favorites
+    }
+
+    /// Whether a record is marked as a favourite.
+    #[must_use]
+    pub fn is_favorite(&self, id: HostId) -> bool {
+        self.favorites.contains(&id)
+    }
+
+    /// Marks a saved record of any protocol as a favourite, or clears the mark.
+    ///
+    /// Returns whether the book changed, so marking a favourite twice (or clearing a
+    /// mark that is not there) reports nothing to save. A newly marked record goes to
+    /// the end of the list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BookError::UnknownHost`] when no record with that identifier is
+    /// saved, which leaves the book as it was.
+    pub fn set_favorite(&mut self, id: HostId, favorite: bool) -> Result<bool, BookError> {
+        if !self.contains_connection(id) {
+            return Err(BookError::UnknownHost { id });
+        }
+        let marked = self.is_favorite(id);
+        if favorite == marked {
+            return Ok(false);
+        }
+        if favorite {
+            self.favorites.push(id);
+        } else {
+            self.favorites.retain(|saved| *saved != id);
+        }
+        Ok(true)
+    }
+
+    /// Flips the favourite mark of a saved record and returns the new state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BookError::UnknownHost`] when no record with that identifier is
+    /// saved.
+    pub fn toggle_favorite(&mut self, id: HostId) -> Result<bool, BookError> {
+        let favorite = !self.is_favorite(id);
+        self.set_favorite(id, favorite)?;
+        Ok(favorite)
+    }
+
+    /// The favourite records of any protocol, in the order they were marked.
+    ///
+    /// An SSH host answers as [`ConnectionRecord::Ssh`], the same way
+    /// [`Self::connection`] presents it.
+    #[must_use]
+    pub fn favorite_hosts(&self) -> Vec<ConnectionRecord> {
+        self.favorites
+            .iter()
+            .filter_map(|id| self.connection(*id))
+            .collect()
+    }
+
     /// Every saved connection whose protocol is not SSH, in saved order.
     #[must_use]
     pub fn connections(&self) -> &[ConnectionRecord] {
@@ -449,6 +523,7 @@ impl HostBook {
     pub fn remove_connection(&mut self, id: HostId) -> Result<ConnectionRecord, BookError> {
         if let Some(slot) = self.hosts.iter().position(|host| host.id() == id) {
             self.recents.retain(|recent| recent.host() != id);
+            self.favorites.retain(|favorite| *favorite != id);
             return Ok(ConnectionRecord::Ssh(self.hosts.remove(slot)));
         }
         if let Some(slot) = self
@@ -456,6 +531,7 @@ impl HostBook {
             .iter()
             .position(|connection| connection.id() == id)
         {
+            self.favorites.retain(|favorite| *favorite != id);
             return Ok(self.connections.remove(slot));
         }
         Err(BookError::UnknownHost { id })
@@ -802,6 +878,19 @@ impl HostBook {
                 return Err(format!(
                     "the host {} has two recent-connection records",
                     recent.host()
+                ));
+            }
+        }
+        let mut marked = HashSet::new();
+        for favorite in &self.favorites {
+            if !ids.contains(favorite) {
+                return Err(format!(
+                    "a favourite refers to the unknown record {favorite}"
+                ));
+            }
+            if !marked.insert(*favorite) {
+                return Err(format!(
+                    "the record {favorite} is marked as a favourite twice"
                 ));
             }
         }

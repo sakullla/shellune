@@ -2215,3 +2215,242 @@ fn a_forged_credential_key_is_still_refused_by_the_audit() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Favourites
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_favourite_host_and_connection_survive_a_restart_in_the_order_they_were_marked() {
+    let dir = TempDir::new("favourites");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", None));
+    let db = saved(&store, host("db", "10.0.0.6", 22, "deploy", None));
+
+    let mut book = store.load().expect("the book loads");
+    let console = serial("Console", "COM3");
+    book.insert_connection(console.clone())
+        .expect("the connection is inserted");
+    assert!(book.favorites().is_empty(), "a fresh book has no favourite");
+    assert_eq!(book.set_favorite(console.id(), true), Ok(true));
+    assert_eq!(book.set_favorite(web.id(), true), Ok(true));
+    assert_eq!(
+        book.set_favorite(web.id(), true),
+        Ok(false),
+        "marking a favourite twice changes nothing"
+    );
+    assert_eq!(book.favorites(), &[console.id(), web.id()]);
+    store.save(&book).expect("the book saves");
+
+    let restarted = HostStore::at(dir.path()).load().expect("the file loads");
+    assert_eq!(restarted, book, "the favourites read back exactly as saved");
+    assert!(restarted.is_favorite(web.id()));
+    assert!(restarted.is_favorite(console.id()));
+    assert!(!restarted.is_favorite(db.id()));
+    assert_eq!(
+        restarted.favorite_hosts(),
+        vec![console.clone(), ConnectionRecord::Ssh(web.clone())],
+        "both protocols are listed, in the order they were marked"
+    );
+
+    let document: serde_json::Value =
+        serde_json::from_str(&dir.read_file()).expect("the file is JSON");
+    assert_eq!(document["favorites"][0], console.id().to_string());
+    assert_eq!(document["favorites"][1], web.id().to_string());
+    let mut keys = Vec::new();
+    collect_keys(&document, &mut keys);
+    for key in &keys {
+        assert!(
+            CONFIG_KEYS.contains(&key.as_str()),
+            "the saved document uses the key {key:?}, which is not on the allowlist"
+        );
+    }
+}
+
+#[test]
+fn clearing_and_toggling_a_favourite_updates_the_saved_marks() {
+    let dir = TempDir::new("favourite-toggle");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", None));
+
+    let mut book = store.load().expect("the book loads");
+    assert_eq!(book.toggle_favorite(web.id()), Ok(true));
+    assert!(book.is_favorite(web.id()));
+    assert_eq!(book.toggle_favorite(web.id()), Ok(false));
+    assert!(!book.is_favorite(web.id()));
+    assert_eq!(
+        book.set_favorite(web.id(), false),
+        Ok(false),
+        "clearing a mark that is not there changes nothing"
+    );
+    book.set_favorite(web.id(), true).expect("marked");
+    store.save(&book).expect("the book saves");
+    let mut book = store.load().expect("the book loads");
+    assert!(book.is_favorite(web.id()), "the mark survives a restart");
+    book.set_favorite(web.id(), false).expect("cleared");
+    store.save(&book).expect("the book saves");
+
+    let restarted = HostStore::at(dir.path()).load().expect("the file loads");
+    assert!(restarted.favorites().is_empty());
+}
+
+#[test]
+fn a_record_that_is_not_saved_cannot_become_a_favourite() {
+    let mut book = HostBook::new();
+    let stranger = HostId::new();
+    assert_eq!(
+        book.set_favorite(stranger, true),
+        Err(BookError::UnknownHost { id: stranger })
+    );
+    assert_eq!(
+        book.toggle_favorite(stranger),
+        Err(BookError::UnknownHost { id: stranger })
+    );
+    assert!(book.favorites().is_empty(), "a refused mark leaves nothing");
+}
+
+#[test]
+fn deleting_a_favourite_host_or_connection_drops_its_mark() {
+    let dir = TempDir::new("favourite-delete");
+    let store = dir.store();
+    let web = saved(&store, host("web", "10.0.0.5", 22, "deploy", None));
+    let db = saved(&store, host("db", "10.0.0.6", 22, "deploy", None));
+    let mut book = store.load().expect("the book loads");
+    let office = rdp("Office", "10.0.0.9", "alice");
+    let wall = vnc("Wall", "10.0.0.7");
+    book.insert_connection(office.clone()).expect("inserted");
+    book.insert_connection(wall.clone()).expect("inserted");
+    for id in [web.id(), db.id(), office.id(), wall.id()] {
+        book.set_favorite(id, true).expect("marked");
+    }
+
+    book.remove(web.id()).expect("the host is removed");
+    book.remove_connection(db.id())
+        .expect("an SSH host is removed as a connection");
+    book.remove_connection(office.id())
+        .expect("the desktop connection is removed");
+    assert_eq!(book.favorites(), &[wall.id()]);
+    store
+        .save(&book)
+        .expect("a book whose favourites were pruned saves");
+
+    let restarted = HostStore::at(dir.path())
+        .load()
+        .expect("the file loads, with no mark left pointing at a deleted record");
+    assert_eq!(restarted.favorites(), &[wall.id()]);
+    assert_eq!(restarted.favorite_hosts(), vec![wall]);
+}
+
+#[test]
+fn changing_the_protocol_of_a_favourite_keeps_its_mark() {
+    let mut book = HostBook::new();
+    let web = host("web", "10.0.0.5", 22, "deploy", None);
+    book.insert(web.clone()).expect("inserted");
+    book.set_favorite(web.id(), true).expect("marked");
+
+    // The same identifier, now a serial console: still the record the user marked.
+    let console = serial("web console", "COM3").reidentified(web.id());
+    book.update_connection(console.clone(), web.id())
+        .expect("the protocol changes");
+    assert!(book.is_favorite(web.id()));
+    assert_eq!(book.favorite_hosts(), vec![console]);
+}
+
+#[test]
+fn a_favourite_of_an_unknown_record_or_a_repeated_one_is_refused() {
+    let dir = TempDir::new("favourite-invalid");
+    let store = dir.store();
+    let id = HostId::new();
+    let stranger = HostId::new();
+    let record = format!(
+        r#"{{"id":"{id}","name":"web","address":"10.0.0.5","port":22,"user":"deploy","group":null}}"#
+    );
+
+    let dangling = format!(
+        r#"{{"version":{FORMAT_VERSION},"hosts":[{record}],"recents":[],"favorites":["{stranger}"]}}"#
+    );
+    dir.write_file(&dangling);
+    let error = store
+        .load()
+        .expect_err("a favourite of a record that is not saved is refused");
+    assert!(
+        matches!(&error, StorageError::Corrupt { reason, .. } if reason.contains(&stranger.to_string())),
+        "the refusal names the unknown record: {error:?}"
+    );
+    assert_eq!(dir.read_file(), dangling, "the file is left as it was");
+
+    let repeated = format!(
+        r#"{{"version":{FORMAT_VERSION},"hosts":[{record}],"recents":[],"favorites":["{id}","{id}"]}}"#
+    );
+    dir.write_file(&repeated);
+    let error = store
+        .load()
+        .expect_err("a record marked twice is not a file this build wrote");
+    assert!(
+        matches!(&error, StorageError::Corrupt { reason, .. } if reason.contains(&id.to_string())),
+        "the refusal names the repeated record: {error:?}"
+    );
+}
+
+#[test]
+fn a_book_without_favourites_is_written_byte_for_byte_as_before() {
+    // The empty book, exactly as the build before favourites wrote it.
+    let dir = TempDir::new("favourite-empty-shape");
+    dir.store()
+        .save(&HostBook::new())
+        .expect("the empty book saves");
+    assert_eq!(
+        dir.read_file(),
+        "{\n  \"version\": 1,\n  \"hosts\": [],\n  \"recents\": []\n}"
+    );
+
+    // A populated book: it writes only the keys an older build knew, and saving it
+    // again after a mark was set and cleared writes the same bytes.
+    let dir = TempDir::new("favourite-legacy-shape");
+    let store = dir.store();
+    let web = host("web", "10.0.0.5", 22, "deploy", Some("Prod"));
+    let id = web.id();
+    let console = serial("Console", "COM3");
+    let mut book = HostBook::new();
+    book.insert(web).expect("inserted");
+    book.insert_connection(console.clone()).expect("inserted");
+    book.record_connection(id, 1_700_000_000).expect("recorded");
+    store.save(&book).expect("the book saves");
+    let before = dir.read_file();
+    let document: serde_json::Value = serde_json::from_str(&before).expect("JSON");
+    let keys: Vec<&str> = document
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        document.get("favorites").is_none(),
+        "a book without favourites writes no favorites key: {document}"
+    );
+    assert_eq!(keys.len(), 4, "only the keys an older build knew: {keys:?}");
+
+    let mut book = store.load().expect("the book loads");
+    book.set_favorite(id, true).expect("marked");
+    book.set_favorite(console.id(), true).expect("marked");
+    store.save(&book).expect("the marked book saves");
+    assert_ne!(dir.read_file(), before, "the marks are really written");
+    let mut book = store.load().expect("the book loads");
+    book.set_favorite(id, false).expect("cleared");
+    book.set_favorite(console.id(), false).expect("cleared");
+    store.save(&book).expect("the cleared book saves");
+    assert_eq!(dir.read_file(), before);
+}
+
+#[test]
+fn an_older_host_file_reads_with_no_favourites() {
+    let dir = TempDir::new("favourite-legacy-read");
+    let id = HostId::new();
+    dir.write_file(&format!(
+        r#"{{"version":1,"hosts":[{{"id":"{id}","name":"web","address":"10.0.0.5","port":22,"user":"deploy","group":null}}],"recents":[]}}"#
+    ));
+    let book = dir.store().load().expect("an older file still loads");
+    assert!(book.favorites().is_empty());
+    assert!(!book.is_favorite(id));
+    assert!(book.favorite_hosts().is_empty());
+}
