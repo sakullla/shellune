@@ -116,9 +116,29 @@ pub struct ApplyPlan {
     preferences_changed: bool,
     keymap_changed: bool,
     fallbacks: Vec<PlatformFallback>,
+    trust_conflicts: Vec<TrustConflict>,
     secrets: Vec<(HostId, SecretString)>,
+    forgets: Vec<HostId>,
+    base: LocalState,
     next: LocalState,
     files: Vec<(&'static str, Vec<u8>)>,
+}
+
+/// A server both sides trust, but with different identities.
+///
+/// A merge keeps this machine's identity, because a stored identity is never
+/// replaced by a different one; a replace takes the document's. Either way the
+/// preview lists it so the user sees that a server's key differs between machines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustConflict {
+    /// The server name or address.
+    pub host: String,
+    /// The server port.
+    pub port: u16,
+    /// The fingerprint this machine trusts.
+    pub local_fingerprint: String,
+    /// The fingerprint the document trusts.
+    pub document_fingerprint: String,
 }
 
 impl fmt::Debug for ApplyPlan {
@@ -134,7 +154,9 @@ impl fmt::Debug for ApplyPlan {
             .field("snippets", &self.snippets)
             .field("known_hosts", &self.known_hosts)
             .field("preferences_changed", &self.preferences_changed)
+            .field("trust_conflicts", &self.trust_conflicts)
             .field("secrets", &self.secrets.len())
+            .field("forgets", &self.forgets)
             .field("files", &self.files().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
@@ -150,6 +172,12 @@ pub struct ApplyOutcome {
     pub files_written: Vec<&'static str>,
     /// How many passwords were saved to the credential store.
     pub secrets_saved: usize,
+    /// How many passwords were removed from the credential store because their
+    /// record is gone or no longer remembers one.
+    pub secrets_forgotten: usize,
+    /// Records whose password should have been removed but the credential store
+    /// refused; the entry is left behind and nothing reads it.
+    pub secrets_not_forgotten: Vec<HostId>,
     /// The local data as it now is, for the interface to reload.
     pub state: LocalState,
 }
@@ -160,6 +188,16 @@ impl ApplyPlan {
     /// `secrets` are the passwords opened from the document; each one whose
     /// record ends up in the combined book and can remember a password is planned
     /// to be saved, and its record is marked as remembering it.
+    ///
+    /// Whether a record remembers its password is a fact about this machine's
+    /// credential store, so it never comes from the document: a record remembers
+    /// when a password from `secrets` is saved for it, or when this machine's own
+    /// record already remembered (and its sign-in method still reads a secret);
+    /// otherwise it does not. A password this machine kept for a record that is
+    /// removed, or no longer remembers, is planned to be forgotten.
+    ///
+    /// `local` must be what [`LocalData::load`] reads now: [`ApplyPlan::apply`]
+    /// refuses to write when the files changed after planning.
     ///
     /// # Errors
     ///
@@ -176,7 +214,11 @@ impl ApplyPlan {
         let shared = document.shared();
         let section = document.platform(platform);
         let mut fallbacks = Vec::new();
-        let (hosts, secrets) = plan_book(
+        let BookPlan {
+            book: hosts,
+            to_save: secrets,
+            to_forget: forgets,
+        } = plan_book(
             shared.hosts(),
             &local.hosts,
             section.as_ref(),
@@ -187,7 +229,13 @@ impl ApplyPlan {
         let groups = plan_groups(shared.groups(), &local.groups, mode)?;
         let forwards = plan_forwards(shared.forwards(), &local.forwards, mode)?;
         let snippets = plan_snippets(shared.snippets(), &local.snippets, mode)?;
-        let known_hosts = plan_trust(shared.known_hosts(), &local.known_hosts, mode)?;
+        let mut trust_conflicts = Vec::new();
+        let known_hosts = plan_trust(
+            shared.known_hosts(),
+            &local.known_hosts,
+            mode,
+            &mut trust_conflicts,
+        )?;
         let preferences = plan_preferences(
             document,
             &local.preferences,
@@ -241,8 +289,11 @@ impl ApplyPlan {
             preferences_changed: next.preferences != local.preferences,
             keymap_changed: keymap_of(&next.preferences) != keymap_of(&local.preferences),
             fallbacks,
+            trust_conflicts,
             secrets,
+            forgets,
             files: changed_files(local, &next)?,
+            base: local.clone(),
             next,
         };
         Ok(plan)
@@ -288,6 +339,19 @@ impl ApplyPlan {
     #[must_use]
     pub fn secrets_to_import(&self) -> usize {
         self.secrets.len()
+    }
+
+    /// Records whose saved password applying removes from the credential store:
+    /// the record is removed, or its sign-in method no longer reads a secret.
+    #[must_use]
+    pub fn secrets_to_forget(&self) -> &[HostId] {
+        &self.forgets
+    }
+
+    /// Servers trusted on both sides with different identities.
+    #[must_use]
+    pub fn trust_conflicts(&self) -> &[TrustConflict] {
+        &self.trust_conflicts
     }
 
     /// Saved connections of every protocol.
@@ -352,22 +416,30 @@ impl ApplyPlan {
     /// Whether applying would change nothing at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.secrets.is_empty()
+        self.files.is_empty() && self.secrets.is_empty() && self.forgets.is_empty()
     }
 
     /// Writes the plan into the data directory.
+    ///
+    /// The data files are first read again and compared with the data the plan
+    /// was made from; when they differ (something was saved after the preview)
+    /// nothing is written and the caller plans again.
     ///
     /// Every data file is copied into a new snapshot (named after `reason`)
     /// before the first write; the changed files are then written one by one,
     /// each atomically, and the planned passwords are saved. When a step fails,
     /// every file already written gets its previous bytes back (or is removed if
     /// it did not exist) and every password already saved gets its previous value
-    /// back, so the data is what it was before.
+    /// back, so the data is what it was before. Last, the passwords nobody uses
+    /// any more are forgotten; a credential store that refuses only leaves an
+    /// unused entry behind, which is reported and does not undo the rest.
     ///
     /// # Errors
     ///
-    /// Returns [`PortableError::Snapshot`] when the snapshot could not be made
-    /// (nothing was written), and [`PortableError::Apply`] when a later step failed.
+    /// Returns [`PortableError::Changed`] when the data changed after planning
+    /// (nothing was written), [`PortableError::Local`] when it cannot be read,
+    /// [`PortableError::Snapshot`] when the snapshot could not be made (nothing
+    /// was written), and [`PortableError::Apply`] when a later step failed.
     pub fn apply(
         &self,
         data: &LocalData,
@@ -386,11 +458,16 @@ impl ApplyPlan {
         reason: &str,
         write: &mut FileWriter<'_>,
     ) -> Result<ApplyOutcome, PortableError> {
+        if data.load()? != self.base {
+            return Err(PortableError::Changed);
+        }
         if self.is_empty() {
             return Ok(ApplyOutcome {
                 snapshot: None,
                 files_written: Vec::new(),
                 secrets_saved: 0,
+                secrets_forgotten: 0,
+                secrets_not_forgotten: Vec::new(),
                 state: self.next.clone(),
             });
         }
@@ -451,10 +528,23 @@ impl ApplyPlan {
             }
         }
 
+        // The data is in place; a password left behind is only an unused entry,
+        // the same as when the application forgets one on deleting a record.
+        let mut secrets_forgotten = 0;
+        let mut secrets_not_forgotten = Vec::new();
+        for id in &self.forgets {
+            match secret_store.forget(*id) {
+                Ok(()) => secrets_forgotten += 1,
+                Err(_) => secrets_not_forgotten.push(*id),
+            }
+        }
+
         Ok(ApplyOutcome {
             snapshot: Some(snapshot),
             files_written: written,
             secrets_saved: saved.len(),
+            secrets_forgotten,
+            secrets_not_forgotten,
             state: self.next.clone(),
         })
     }
@@ -497,7 +587,49 @@ fn restore_secrets(store: &dyn SecretStore, saved: &[(HostId, Option<SecretStrin
     restored
 }
 
-/// The combined host book and the passwords to save with it.
+/// The combined host book and what changes in the credential store with it.
+struct BookPlan {
+    book: HostBook,
+    /// Passwords from the document to save.
+    to_save: Vec<(HostId, SecretString)>,
+    /// Records whose password this machine kept and nobody will read any more.
+    to_forget: Vec<HostId>,
+}
+
+/// Marks whether a record's secret is in the system credential store. An SSH
+/// host whose sign-in method reads no secret stays unmarked.
+fn set_remembers(record: &mut ConnectionRecord, remember: bool) {
+    match record {
+        ConnectionRecord::Ssh(host) => host.set_remember_secret(remember),
+        ConnectionRecord::Rdp(config) => config.set_remember_secret(remember),
+        ConnectionRecord::Vnc(config) => config.set_remember_secret(remember),
+        ConnectionRecord::Serial(_) => {}
+    }
+}
+
+/// The same book with no record marked as remembering a password.
+///
+/// Whether a record remembers is a fact about one machine's credential store, so
+/// it is left out of what a document shares.
+pub(super) fn without_remembered_secrets(book: &HostBook) -> Result<HostBook, PortableError> {
+    if !book
+        .records()
+        .iter()
+        .any(ConnectionRecord::remembers_secret)
+    {
+        return Ok(book.clone());
+    }
+    let records: Vec<ConnectionRecord> = book
+        .records()
+        .into_iter()
+        .map(|mut record| {
+            set_remembers(&mut record, false);
+            record
+        })
+        .collect();
+    build_book(&records, book.recents(), book.favorites())
+}
+
 fn plan_book(
     incoming: &HostBook,
     local: &HostBook,
@@ -505,7 +637,7 @@ fn plan_book(
     mode: ApplyMode,
     secrets: Option<&SecretBundle>,
     fallbacks: &mut Vec<PlatformFallback>,
-) -> Result<(HostBook, Vec<(HostId, SecretString)>), PortableError> {
+) -> Result<BookPlan, PortableError> {
     let local_records: HashMap<HostId, ConnectionRecord> = local
         .records()
         .into_iter()
@@ -559,27 +691,44 @@ fn plan_book(
         }
     };
 
+    // Whether a record remembers its password follows this machine's credential
+    // store, never the document: the machine that wrote it had its own store.
     let mut to_save = Vec::new();
-    if let Some(bundle) = secrets {
-        for record in &mut records {
-            let Some(secret) = bundle.get(record.id()) else {
-                continue;
-            };
-            match record {
-                ConnectionRecord::Ssh(host) => host.set_remember_secret(true),
-                ConnectionRecord::Rdp(config) => config.set_remember_secret(true),
-                ConnectionRecord::Vnc(config) => config.set_remember_secret(true),
-                ConnectionRecord::Serial(_) => {}
-            }
-            // An SSH host that signs in without a password cannot remember one, so
-            // its password is not saved either.
-            if record.remembers_secret() {
-                to_save.push((record.id(), secret.clone()));
-            }
+    for record in &mut records {
+        let id = record.id();
+        let secret = secrets.and_then(|bundle| bundle.get(id));
+        let kept_here = local_records
+            .get(&id)
+            .is_some_and(ConnectionRecord::remembers_secret);
+        set_remembers(record, secret.is_some() || kept_here);
+        // An SSH host that signs in without a password cannot remember one, so
+        // its password is not saved either.
+        if let Some(secret) = secret
+            && record.remembers_secret()
+        {
+            to_save.push((id, secret.clone()));
         }
     }
 
-    Ok((build_book(&records, &recents, &favorites)?, to_save))
+    // A password this machine kept is forgotten once its record is gone or no
+    // longer reads one, as deleting or editing the record in the application does.
+    let remembering: HashSet<HostId> = records
+        .iter()
+        .filter(|record| record.remembers_secret())
+        .map(ConnectionRecord::id)
+        .collect();
+    let to_forget = local
+        .records()
+        .iter()
+        .filter(|record| record.remembers_secret() && !remembering.contains(&record.id()))
+        .map(ConnectionRecord::id)
+        .collect();
+
+    Ok(BookPlan {
+        book: build_book(&records, &recents, &favorites)?,
+        to_save,
+        to_forget,
+    })
 }
 
 /// Puts this machine's private-key path or serial device into a record.
@@ -772,15 +921,44 @@ fn plan_snippets(
     Ok(book)
 }
 
+/// The combined server identities.
+///
+/// A merge is a union keyed by server: an identity only one side has is kept,
+/// one both sides agree on takes the document's entry, and when the two differ
+/// this machine's stays, because a stored identity is never replaced by a
+/// different one. Every such difference is reported, in both modes.
 fn plan_trust(
     incoming: &HostTrust,
     local: &HostTrust,
     mode: ApplyMode,
+    conflicts: &mut Vec<TrustConflict>,
 ) -> Result<HostTrust, PortableError> {
+    for entry in incoming.entries() {
+        if let Some(mine) = local.entry(entry.host(), entry.port())
+            && !same_identity(mine, entry)
+        {
+            conflicts.push(TrustConflict {
+                host: entry.host().to_owned(),
+                port: entry.port(),
+                local_fingerprint: mine.fingerprint().to_owned(),
+                document_fingerprint: entry.fingerprint().to_owned(),
+            });
+        }
+    }
     if mode == ApplyMode::Replace {
         return Ok(incoming.clone());
     }
-    let merged = merge_by(local.entries(), incoming.entries(), |entry| {
+    let agreed: Vec<TrustEntry> = incoming
+        .entries()
+        .iter()
+        .filter(|entry| {
+            local
+                .entry(entry.host(), entry.port())
+                .is_none_or(|mine| same_identity(mine, entry))
+        })
+        .cloned()
+        .collect();
+    let merged = merge_by(local.entries(), &agreed, |entry| {
         (entry.host().to_owned(), entry.port())
     });
     let trust: HostTrust = serde_json::from_value(serde_json::json!({
@@ -794,6 +972,13 @@ fn plan_trust(
         .validate()
         .map_err(|reason| PortableError::Corrupt { reason })?;
     Ok(trust)
+}
+
+/// Whether two entries name the same key for their server.
+fn same_identity(left: &TrustEntry, right: &TrustEntry) -> bool {
+    left.algorithm() == right.algorithm()
+        && left.fingerprint() == right.fingerprint()
+        && left.public_key() == right.public_key()
 }
 
 fn plan_preferences(

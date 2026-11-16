@@ -14,6 +14,7 @@ use shellune_storage::{
     ApplyMode, ExportOptions, GroupStore, HostBook, HostKey, HostStore, HostTrust, KdfParams,
     KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets, Platform, PlatformField,
     PortableError, Preferences, PreferencesStore, SNAPSHOT_LIMIT, SecretStore, ShelluneData,
+    TrustConflict,
 };
 
 const PASSWORD: &str = "correct-horse-battery-staple";
@@ -147,6 +148,21 @@ fn secrets_for(fixture: &Fixture) -> MemorySecrets {
     secrets
 }
 
+/// The same data on a machine whose credential store holds no password for it.
+fn without_saved_passwords(state: &LocalState) -> LocalState {
+    let mut state = state.clone();
+    for record in state.hosts.records() {
+        if let ConnectionRecord::Ssh(mut host) = record
+            && host.remembers_secret()
+        {
+            let id = host.id();
+            host.set_remember_secret(false);
+            state.hosts.update(host, id).expect("updated");
+        }
+    }
+    state
+}
+
 fn save_state(root: &Path, state: &LocalState) {
     HostStore::at(root).save(&state.hosts).expect("hosts");
     GroupStore::at(root).save(&state.groups).expect("groups");
@@ -204,7 +220,8 @@ fn a_document_round_trips_through_json_and_onto_another_machine() {
     let read = ShelluneData::from_json(&bytes).expect("read back");
     assert_eq!(read, document);
 
-    // A fresh Windows machine ends up with exactly the same data.
+    // A fresh Windows machine ends up with the same data, except that no record
+    // remembers a password: none was saved in its credential store.
     let root = scratch("round-trip");
     let data = LocalData::at(&root);
     let empty = data.load().expect("an empty directory is empty data");
@@ -224,8 +241,9 @@ fn a_document_round_trips_through_json_and_onto_another_machine() {
         .expect("applied");
     assert_eq!(applied.files_written.len(), 6);
     let loaded = data.load().expect("loads");
-    assert_eq!(loaded, fixture.state);
-    assert_eq!(applied.state, fixture.state);
+    let expected = without_saved_passwords(&fixture.state);
+    assert_eq!(loaded, expected);
+    assert_eq!(applied.state, expected);
     assert!(loaded.hosts.is_favorite(fixture.key_host));
     assert_eq!(loaded.hosts.recents().len(), 1);
 
@@ -813,8 +831,20 @@ fn merging_keeps_local_records_and_replacing_does_not() {
     assert_eq!(merge.hosts().added, 1, "{merge:?}");
     assert_eq!(merge.hosts().updated, 1);
     assert_eq!(merge.hosts().removed, 0);
-    assert_eq!(merge.known_hosts().updated, 1);
-    assert_eq!(merge.known_hosts().removed, 0);
+    assert_eq!(
+        merge.known_hosts(),
+        Default::default(),
+        "a different identity for the same server does not replace this machine's"
+    );
+    assert_eq!(
+        merge.trust_conflicts(),
+        &[TrustConflict {
+            host: "10.0.0.5".to_owned(),
+            port: 22,
+            local_fingerprint: trust_key(2).fingerprint,
+            document_fingerprint: trust_key(1).fingerprint,
+        }]
+    );
     assert_eq!(merge.snippets().added, 1);
     assert_eq!(merge.snippets().removed, 0);
     merge
@@ -855,8 +885,8 @@ fn merging_keeps_local_records_and_replacing_does_not() {
             .known_hosts
             .entry("10.0.0.5", 22)
             .map(|entry| entry.fingerprint().to_owned()),
-        Some(trust_key(1).fingerprint),
-        "the document's identity wins for the same server"
+        Some(trust_key(2).fingerprint),
+        "this machine's identity stays for the same server"
     );
     assert_eq!(merged.snippets.len(), 2);
     assert_eq!(
@@ -870,6 +900,8 @@ fn merging_keeps_local_records_and_replacing_does_not() {
         .expect("planned");
     assert_eq!(replace.hosts().removed, 1);
     assert_eq!(replace.known_hosts().removed, 1);
+    assert_eq!(replace.known_hosts().updated, 1);
+    assert_eq!(replace.trust_conflicts().len(), 1);
     assert_eq!(replace.snippets().removed, 1);
     replace
         .apply(&data, &MemorySecrets::new(), "replace")
@@ -878,6 +910,14 @@ fn merging_keeps_local_records_and_replacing_does_not() {
     assert!(replaced.hosts.host(mine_id).is_none());
     assert_eq!(replaced.hosts.connection_count(), 4);
     assert_eq!(replaced.known_hosts.entries().len(), 1);
+    assert_eq!(
+        replaced
+            .known_hosts
+            .entry("10.0.0.5", 22)
+            .map(|entry| entry.fingerprint().to_owned()),
+        Some(trust_key(1).fingerprint),
+        "a replace takes the document's identity"
+    );
     assert_eq!(replaced.snippets.len(), 1);
     assert_eq!(replaced.preferences.theme, None);
     assert_eq!(
@@ -1062,4 +1102,260 @@ fn the_sync_view_ignores_the_time_stamp_and_other_platforms() {
         first.sync_view(Platform::Windows).expect("view"),
         third.sync_view(Platform::Windows).expect("view")
     );
+}
+
+#[test]
+fn a_document_does_not_say_which_passwords_a_machine_remembers() {
+    let fixture = windows_machine();
+    let secrets = secrets_for(&fixture);
+    for options in [
+        options(Platform::Windows),
+        with_passphrase(Platform::Windows),
+    ] {
+        let document = ShelluneData::export(&fixture.state, &options, &secrets, None)
+            .expect("exported")
+            .document;
+        assert!(
+            document
+                .shared()
+                .hosts()
+                .records()
+                .iter()
+                .all(|record| !record.remembers_secret()),
+            "the shared records carry no remembered flag"
+        );
+        let text = String::from_utf8(document.to_json().expect("json")).expect("utf-8");
+        assert!(!text.contains("remember_secret"), "{text}");
+    }
+}
+
+#[test]
+fn remembering_a_password_follows_this_machine_not_the_document() {
+    let fixture = windows_machine();
+
+    // A document that (as another build could write it) says both hosts remember
+    // a password, without sealing any.
+    let exported = ShelluneData::export(
+        &fixture.state,
+        &options(Platform::Windows),
+        &MemorySecrets::new(),
+        None,
+    )
+    .expect("exported")
+    .document;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&exported.to_json().expect("json")).expect("value");
+    for host in value["shared"]["hosts"]["hosts"]
+        .as_array_mut()
+        .expect("hosts")
+    {
+        host["remember_secret"] = serde_json::Value::Bool(true);
+    }
+    let claiming =
+        ShelluneData::from_json(&serde_json::to_vec(&value).expect("bytes")).expect("read");
+    assert!(
+        claiming
+            .shared()
+            .hosts()
+            .host(fixture.password_host)
+            .expect("there")
+            .remembers_secret()
+    );
+
+    // A machine that has none of these records saves no password and so marks
+    // none as remembered, whether merging or replacing.
+    for mode in [ApplyMode::Merge, ApplyMode::Replace] {
+        let plan = claiming
+            .plan(&LocalState::default(), Platform::Windows, mode, None)
+            .expect("planned");
+        assert_eq!(plan.secrets_to_import(), 0);
+        assert!(plan.secrets_to_forget().is_empty());
+        assert!(
+            plan.result()
+                .hosts
+                .records()
+                .iter()
+                .all(|record| !record.remembers_secret()),
+            "{mode:?}"
+        );
+    }
+
+    // A machine that remembers both passwords keeps remembering them, and keeps
+    // the passwords, when a document from a machine without them arrives.
+    let root = scratch("remember-kept");
+    let data = LocalData::at(&root);
+    save_state(&root, &fixture.state);
+    let store = secrets_for(&fixture);
+    for mode in [ApplyMode::Merge, ApplyMode::Replace] {
+        let plan = exported
+            .plan(&data.load().expect("loads"), Platform::Windows, mode, None)
+            .expect("planned");
+        assert!(plan.is_empty(), "{mode:?}: {plan:?}");
+        assert_eq!(plan.hosts(), Default::default());
+        plan.apply(&data, &store, "pull").expect("applied");
+        let loaded = data.load().expect("loads");
+        assert!(
+            loaded
+                .hosts
+                .host(fixture.password_host)
+                .expect("kept")
+                .remembers_secret()
+        );
+        assert!(
+            loaded
+                .hosts
+                .host(fixture.key_host)
+                .expect("kept")
+                .remembers_secret()
+        );
+    }
+    assert_eq!(store.len(), 2, "the saved passwords are still there");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn passwords_nobody_reads_any_more_are_forgotten() {
+    let fixture = windows_machine();
+    let root = scratch("forget");
+    let data = LocalData::at(&root);
+
+    // This machine also has a host only it knows, with a remembered password.
+    let mut local = fixture.state.clone();
+    let mut mine = HostConfig::new("mine", "10.9.9.9", 22, "me").expect("host");
+    mine.set_auth(Some(AuthMethodKind::Password));
+    mine.set_remember_secret(true);
+    let mine_id = mine.id();
+    local.hosts.insert(mine).expect("inserted");
+    save_state(&root, &local);
+    let store = secrets_for(&fixture);
+    store
+        .save(mine_id, &SecretString::new("mine-password"))
+        .expect("saved");
+
+    // The document signs in to the web host with the agent now.
+    let mut incoming = fixture.state.clone();
+    let mut web = incoming
+        .hosts
+        .host(fixture.password_host)
+        .expect("there")
+        .clone();
+    web.set_auth(Some(AuthMethodKind::Agent));
+    incoming
+        .hosts
+        .update(web, fixture.password_host)
+        .expect("updated");
+    let document = ShelluneData::export(
+        &incoming,
+        &options(Platform::Windows),
+        &MemorySecrets::new(),
+        None,
+    )
+    .expect("exported")
+    .document;
+
+    // A merge keeps the local host and its password, and forgets the password
+    // the web host no longer uses.
+    let merge = document
+        .plan(
+            &data.load().expect("loads"),
+            Platform::Windows,
+            ApplyMode::Merge,
+            None,
+        )
+        .expect("planned");
+    assert_eq!(merge.secrets_to_forget(), &[fixture.password_host]);
+    let outcome = merge.apply(&data, &store, "merge").expect("applied");
+    assert_eq!(outcome.secrets_forgotten, 1);
+    assert!(outcome.secrets_not_forgotten.is_empty());
+    assert!(store.load(fixture.password_host).expect("read").is_none());
+    assert!(store.load(mine_id).expect("read").is_some());
+    let merged = data.load().expect("loads");
+    assert!(
+        !merged
+            .hosts
+            .host(fixture.password_host)
+            .expect("kept")
+            .remembers_secret()
+    );
+    assert!(merged.hosts.host(mine_id).expect("kept").remembers_secret());
+    assert!(
+        merged
+            .hosts
+            .host(fixture.key_host)
+            .expect("kept")
+            .remembers_secret()
+    );
+
+    // A replace removes the local host, so its password goes with it; a store
+    // that refuses only leaves the entry behind and the data is applied anyway.
+    let replace = document
+        .plan(&merged, Platform::Windows, ApplyMode::Replace, None)
+        .expect("planned");
+    assert_eq!(replace.hosts().removed, 1);
+    assert_eq!(replace.secrets_to_forget(), &[mine_id]);
+    let refused = replace
+        .apply(&data, &MemorySecrets::unavailable(), "replace")
+        .expect("applied");
+    assert_eq!(refused.secrets_forgotten, 0);
+    assert_eq!(refused.secrets_not_forgotten, vec![mine_id]);
+    assert!(data.load().expect("loads").hosts.host(mine_id).is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_plan_is_not_applied_over_data_saved_after_it() {
+    let fixture = windows_machine();
+    let root = scratch("stale");
+    let data = LocalData::at(&root);
+    save_state(&root, &LocalState::default());
+    let document = ShelluneData::export(
+        &fixture.state,
+        &options(Platform::Windows),
+        &MemorySecrets::new(),
+        None,
+    )
+    .expect("exported")
+    .document;
+    let plan = document
+        .plan(
+            &data.load().expect("loads"),
+            Platform::Windows,
+            ApplyMode::Merge,
+            None,
+        )
+        .expect("planned");
+
+    // Something is saved between the preview and the confirmation.
+    let mut later = LocalState::default();
+    later
+        .snippets
+        .create("saved later", "uptime")
+        .expect("snippet");
+    save_state(&root, &later);
+    let before = tree(&root);
+
+    let error = plan
+        .apply(&data, &MemorySecrets::new(), "import")
+        .expect_err("the data changed");
+    assert_eq!(error, PortableError::Changed);
+    assert_eq!(
+        tree(&root),
+        before,
+        "nothing was written, not even a snapshot"
+    );
+
+    // Planning again from the current data keeps what was saved.
+    let again = document
+        .plan(
+            &data.load().expect("loads"),
+            Platform::Windows,
+            ApplyMode::Merge,
+            None,
+        )
+        .expect("planned");
+    again
+        .apply(&data, &MemorySecrets::new(), "import")
+        .expect("applied");
+    assert_eq!(data.load().expect("loads").snippets.len(), 2);
+    let _ = std::fs::remove_dir_all(root);
 }

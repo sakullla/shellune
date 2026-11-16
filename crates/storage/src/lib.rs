@@ -77,6 +77,7 @@ pub use portable::{
     KdfParams, LocalData, LocalState, PORTABLE_FORMAT, PORTABLE_VERSION, Platform, PlatformData,
     PlatformFallback, PlatformField, PortableError, SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT,
     SecretBundle, SharedData, SharedPreferences, ShelluneData, Snapshot, SnapshotStore,
+    TrustConflict,
 };
 pub use preferences::{
     FILE_NAME as PREFERENCES_FILE_NAME, KeymapEntry, KeymapPreferences, Preferences,

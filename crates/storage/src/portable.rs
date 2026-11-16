@@ -47,7 +47,9 @@ use crate::snippets::SnippetStore;
 use crate::store::{HostStore, data_directory, write_atomic_file};
 use crate::trust::{HostTrust, TrustStore};
 
-pub use apply::{ApplyMode, ApplyOutcome, ApplyPlan, Change, PlatformFallback, PlatformField};
+pub use apply::{
+    ApplyMode, ApplyOutcome, ApplyPlan, Change, PlatformFallback, PlatformField, TrustConflict,
+};
 pub use crypto::{KdfParams, SecretBundle};
 pub use snapshot::{SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT, Snapshot, SnapshotStore};
 
@@ -199,6 +201,11 @@ pub enum PortableError {
         /// Why.
         reason: String,
     },
+    /// The data on this machine changed after the plan was made (for example a
+    /// save in the background), so applying it would lose that change. Nothing
+    /// was written; plan again from the current data.
+    #[error("the data on this machine changed after the preview. Nothing was changed")]
+    Changed,
     /// Applying stopped part way. Every file already written was put back when
     /// `restored` is true; the snapshot holds the previous files either way.
     #[error("{step} failed: {reason}. {}", restored_sentence(*restored))]
@@ -498,7 +505,9 @@ impl ShelluneData {
                 source_platform: platform.as_str().to_owned(),
                 source_app_version: options.app_version.clone(),
                 shared: SharedData {
-                    hosts: local.hosts.clone(),
+                    // Which passwords this machine's credential store holds is
+                    // not shared; the sealed block says which ones travel.
+                    hosts: apply::without_remembered_secrets(&local.hosts)?,
                     groups: local.groups.clone(),
                     forwards: local.forwards.clone(),
                     snippets: local.snippets.clone(),
