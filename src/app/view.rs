@@ -8333,6 +8333,18 @@ impl ShelluneView {
             .form_session
             .filter(|id| self.attempt_index(*id).is_some())
         {
+            // A form that was parked keeps its attempt after that attempt failed in
+            // the background. Dialling it again is a retry of an ended session: the
+            // record has to leave "failed" now, or the new attempt would run under a
+            // tab that still says it failed and could never become connected.
+            if self
+                .workspace
+                .session(id)
+                .is_some_and(|session| session.state().can_reconnect())
+                && !self.workspace.session_reconnecting(id)
+            {
+                return None;
+            }
             return Some(id);
         }
         if let Some(id) = self.form_session.filter(|id| {
@@ -9297,7 +9309,52 @@ impl ShelluneView {
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Idle);
         }
+        self.refill_saved_secret(cx);
         self.connect_remote(cx);
+    }
+
+    /// Puts a remembered secret back into an empty field before a retry.
+    ///
+    /// The previous attempt took the secret out of the form, so a retry of a host
+    /// that remembers its sign-in would otherwise ask for it again, unlike the
+    /// reconnect, which reads the store. Only the secret the host saved for the method
+    /// still on the form is used. A field the user filled in is left as it is, and a
+    /// store that cannot be read leaves the field empty for the form to ask.
+    fn refill_saved_secret(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.remote.as_ref() else {
+            return;
+        };
+        let Some(host) = self.book.host(panel.host().id()).cloned() else {
+            return;
+        };
+        let method = panel.method();
+        if host.auth().map(remote::MethodChoice::from_kind) != Some(method) {
+            return;
+        }
+        let empty = match method {
+            remote::MethodChoice::Password | remote::MethodChoice::Auto => {
+                panel.password().is_empty()
+            }
+            remote::MethodChoice::EncryptedKeyFile => panel.passphrase().is_empty(),
+            remote::MethodChoice::KeyFile | remote::MethodChoice::Agent => false,
+        };
+        if !empty {
+            return;
+        }
+        let Ok(Some(secret)) = self.saved_secret(&host) else {
+            return;
+        };
+        if secret.expose().is_empty() {
+            return;
+        }
+        if let Some(panel) = self.remote.as_mut() {
+            if method.needs_passphrase() {
+                panel.set_passphrase(secret.expose());
+            } else {
+                panel.set_password(secret.expose());
+            }
+        }
+        self.sync_remote_fields(cx);
     }
 
     /// Closes the connection form on screen and the attempt it belongs to.
