@@ -34,7 +34,8 @@ use crate::forwarding::{self, ForwardLink};
 use crate::hostkey::{HostKeyPrompt, KnownHostKey, PresentedKey};
 use crate::session::{
     Command, DialFailure, HandshakeProgress, HandshakeStage, Material, PtySize, TERM_VALUE,
-    authenticate, client_config, finish_dial, open_exec_channel, open_sftp_channel,
+    authenticate, client_config, disconnect_detail, finish_dial, open_exec_channel,
+    open_sftp_channel,
 };
 use crate::sftp::{self, ChannelFailure, FileLink};
 use crate::transfer::{self, TransferLink};
@@ -542,7 +543,9 @@ struct LiveHop {
     proxy: Option<ProxyProcess>,
     bridge: Option<tokio::task::JoinHandle<()>>,
     /// Set by this hop's handler when its own SSH connection ends.
-    lost: watch::Receiver<bool>,
+    lost: watch::Receiver<Option<String>>,
+    /// Cache completion so a finished russh handle is never polled twice.
+    ended: bool,
 }
 
 struct HopHandler {
@@ -667,7 +670,7 @@ impl Handler for HopHandler {
         &mut self,
         reason: client::DisconnectReason<Self::Error>,
     ) -> Result<(), Self::Error> {
-        self.gate.mark_lost();
+        self.gate.mark_lost(&reason);
         match reason {
             client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
             client::DisconnectReason::Error(error) => Err(error),
@@ -1090,6 +1093,7 @@ async fn open_hop(
         proxy: opened.proxy,
         bridge: opened.bridge,
         lost,
+        ended: false,
     })
 }
 
@@ -1293,7 +1297,7 @@ async fn drive_shell(
     let target = &mut target_slot[0];
     let location = target.location.clone();
     let handle = &mut target.handle;
-    let mut carrier_lost = gate.subscribe_lost();
+    let mut carrier_lost = target.lost.clone();
     let mut forwards = forwarding::ForwardLoop::new(forward_events, gate, open_commands.clone());
     let report_x11 = |status: X11Status| {
         let _ = events.send(ChainEvent::X11 {
@@ -1426,14 +1430,14 @@ async fn drive_shell(
                 biased;
                 index = hop_ended(jumps) => {
                     forwards.shutdown(handle).await;
-                    return Err(hop_disconnected(jumps[index].location.clone()));
+                    return Err(hop_disconnected(&jumps[index]));
                 }
                 changed = carrier_lost.changed() => {
-                    if changed.is_err() || *carrier_lost.borrow() {
+                    if changed.is_err() || carrier_lost.borrow().is_some() {
                         // The target carrier also drops when a jump in front of
                         // it drops. Name that jump when it has reported, or
                         // reports before the wait ends.
-                        let failure = blame_closed(jumps, &location).await;
+                        let failure = blame_closed(jumps, &location, disconnect_detail(&carrier_lost)).await;
                         forwards.shutdown(handle).await;
                         return Err(failure);
                     }
@@ -1525,14 +1529,15 @@ async fn drive_shell(
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status);
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    Some(ChannelMsg::Eof) => {}
+                    Some(ChannelMsg::Close) | None => {
                         // A jump that died looks like the shell closing. Prefer the
                         // hop that actually dropped when it says so quickly.
                         if exit_code.is_none()
                             && let Some(index) = jump_died(jumps).await
                         {
                             forwards.shutdown(handle).await;
-                            return Err(hop_disconnected(jumps[index].location.clone()));
+                            return Err(hop_disconnected(&jumps[index]));
                         }
                         let _ = events.send(ChainEvent::Exited { code: exit_code });
                         forwards.shutdown(handle).await;
@@ -1551,11 +1556,11 @@ async fn drive_shell(
             biased;
             index = hop_ended(jumps) => {
                 forwards.shutdown(handle).await;
-                return Err(hop_disconnected(jumps[index].location.clone()));
+                return Err(hop_disconnected(&jumps[index]));
             }
             changed = carrier_lost.changed() => {
-                if changed.is_err() || *carrier_lost.borrow() {
-                    let failure = blame_closed(jumps, &location).await;
+                if changed.is_err() || carrier_lost.borrow().is_some() {
+                    let failure = blame_closed(jumps, &location, disconnect_detail(&carrier_lost)).await;
                     forwards.shutdown(handle).await;
                     return Err(failure);
                 }
@@ -1619,39 +1624,42 @@ fn hop_ended(hops: &mut [LiveHop]) -> impl Future<Output = usize> + '_ {
 
 fn poll_dead_hop(hops: &mut [LiveHop], cx: &mut Context<'_>) -> Poll<usize> {
     for (index, hop) in hops.iter_mut().enumerate() {
-        if *hop.lost.borrow() || Pin::new(&mut hop.handle).poll(cx).is_ready() {
+        if hop.ended || hop.lost.borrow().is_some() || Pin::new(&mut hop.handle).poll(cx).is_ready()
+        {
+            hop.ended = true;
             return Poll::Ready(index);
         }
     }
     Poll::Pending
 }
 
-fn hop_disconnected(hop: HopLocation) -> ChainFailure {
+fn hop_disconnected(hop: &LiveHop) -> ChainFailure {
     ChainFailure::Hop {
-        hop: Box::new(hop),
+        hop: Box::new(hop.location.clone()),
         error: Box::new(ConnectError::Disconnected {
-            reason: "the connection to this hop closed".to_owned(),
+            reason: disconnect_detail(&hop.lost),
         }),
     }
 }
 
 /// Names an earlier hop when the target's carrier died because that hop did.
-async fn blame_closed(jumps: &mut [LiveHop], target: &HopLocation) -> ChainFailure {
+async fn blame_closed(jumps: &mut [LiveHop], target: &HopLocation, reason: String) -> ChainFailure {
     match jump_died(jumps).await {
-        Some(index) => hop_disconnected(jumps[index].location.clone()),
-        None => hop_disconnected(target.clone()),
+        Some(index) => hop_disconnected(&jumps[index]),
+        None => ChainFailure::Hop {
+            hop: Box::new(target.clone()),
+            error: Box::new(ConnectError::Disconnected { reason }),
+        },
     }
 }
 
 fn lost_hop(hops: &mut [LiveHop]) -> Option<usize> {
     let waker = std::task::Waker::noop();
     let mut context = Context::from_waker(waker);
-    for (index, hop) in hops.iter_mut().enumerate() {
-        if *hop.lost.borrow() || Pin::new(&mut hop.handle).poll(&mut context).is_ready() {
-            return Some(index);
-        }
+    match poll_dead_hop(hops, &mut context) {
+        Poll::Ready(index) => Some(index),
+        Poll::Pending => None,
     }
-    None
 }
 
 async fn jump_died(hops: &mut [LiveHop]) -> Option<usize> {

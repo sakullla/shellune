@@ -291,8 +291,8 @@ impl ObservedForwards {
 pub(crate) struct ForwardGate {
     inner: Mutex<GateInner>,
     events: UnboundedSender<ForwardEvent>,
-    /// Becomes true when the SSH connection that owns this gate is gone.
-    lost: watch::Sender<bool>,
+    /// The transport's reason when the SSH connection that owns this gate is gone.
+    lost: watch::Sender<Option<String>>,
 }
 
 struct GateInner {
@@ -320,7 +320,7 @@ pub(crate) struct InboundRule {
 
 impl ForwardGate {
     pub(crate) fn new(events: UnboundedSender<ForwardEvent>) -> Self {
-        let (lost, _) = watch::channel(false);
+        let (lost, _) = watch::channel(None);
         Self {
             inner: Mutex::new(GateInner {
                 rules: Vec::new(),
@@ -339,12 +339,34 @@ impl ForwardGate {
     }
 
     /// Notifies the session loop that this connection can no longer carry a rule.
-    pub(crate) fn mark_lost(&self) {
-        let _ = self.lost.send(true);
+    pub(crate) fn mark_lost(&self, reason: &client::DisconnectReason<crate::ConnectError>) {
+        let detail = match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => {
+                // This is server-supplied text displayed outside the terminal. Bound it
+                // and discard control characters, including terminal escape sequences.
+                let message: String = info
+                    .message
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(512)
+                    .collect();
+                format!(
+                    "the server closed the SSH connection ({:?}): {message}",
+                    info.reason_code
+                )
+            }
+            client::DisconnectReason::Error(
+                crate::ConnectError::Unreachable { reason }
+                | crate::ConnectError::Disconnected { reason },
+            ) => reason.clone(),
+            client::DisconnectReason::Error(error) => error.to_string(),
+        };
+        // Retain the cause even when the session loop subscribes after disconnect.
+        self.lost.send_replace(Some(detail));
     }
 
     /// Wakes when [`Self::mark_lost`] runs.
-    pub(crate) fn subscribe_lost(&self) -> watch::Receiver<bool> {
+    pub(crate) fn subscribe_lost(&self) -> watch::Receiver<Option<String>> {
         self.lost.subscribe()
     }
 

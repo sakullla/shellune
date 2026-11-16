@@ -92,6 +92,12 @@ pub fn client_config(policy: &ConnectionPolicy) -> client::Config {
     }
 }
 
+pub(crate) fn disconnect_detail(lost: &tokio::sync::watch::Receiver<Option<String>>) -> String {
+    lost.borrow()
+        .clone()
+        .unwrap_or_else(|| "the SSH connection closed".to_owned())
+}
+
 /// Size of a remote pseudo terminal, in characters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PtySize {
@@ -812,10 +818,10 @@ async fn connect_and_shell(
             tokio::select! {
                 biased;
                 changed = carrier_lost.changed() => {
-                    if changed.is_err() || *carrier_lost.borrow() {
+                    if changed.is_err() || carrier_lost.borrow().is_some() {
                         forwards.shutdown(&handle).await;
                         return Err(ConnectError::Disconnected {
-                            reason: "the SSH connection closed".to_owned(),
+                            reason: disconnect_detail(&carrier_lost),
                         });
                     }
                 }
@@ -907,7 +913,10 @@ async fn connect_and_shell(
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status);
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    // EOF closes only the server's output, not the channel. The exit
+                    // status may arrive afterwards (RFC 4254, sections 5.3 and 6.10).
+                    Some(ChannelMsg::Eof) => {}
+                    Some(ChannelMsg::Close) | None => {
                         let _ = events.send(RemoteEvent::Exited { code: exit_code });
                         forwards.shutdown(&handle).await;
                         let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
@@ -923,10 +932,10 @@ async fn connect_and_shell(
         tokio::select! {
             biased;
             changed = carrier_lost.changed() => {
-                if changed.is_err() || *carrier_lost.borrow() {
+                if changed.is_err() || carrier_lost.borrow().is_some() {
                     forwards.shutdown(&handle).await;
                     return Err(ConnectError::Disconnected {
-                        reason: "the SSH connection closed".to_owned(),
+                        reason: disconnect_detail(&carrier_lost),
                     });
                 }
             }
@@ -1415,7 +1424,7 @@ impl client::Handler for ClientHandler {
         &mut self,
         reason: client::DisconnectReason<Self::Error>,
     ) -> Result<(), Self::Error> {
-        self.gate.mark_lost();
+        self.gate.mark_lost(&reason);
         match reason {
             client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
             client::DisconnectReason::Error(error) => Err(error),

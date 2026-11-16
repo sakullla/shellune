@@ -41,6 +41,9 @@ pub mod transfer;
 mod transport;
 pub mod x11;
 
+#[cfg(test)]
+mod stability_tests;
+
 /// A disposable OpenSSH server, for the tests that need a real one.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testserver;
