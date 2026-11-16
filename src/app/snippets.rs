@@ -68,6 +68,11 @@ pub struct SnippetLibrary {
     read_problem: Option<String>,
     /// Why the last write failed, for the line under the list.
     write_problem: Option<String>,
+    /// Writes are held back while another writer replaces the data files; a change
+    /// is kept in the list and written by the window once that writer is done.
+    hold: bool,
+    /// The list changed while writes were held back.
+    held: bool,
 }
 
 impl SnippetLibrary {
@@ -84,12 +89,16 @@ impl SnippetLibrary {
                 book,
                 read_problem: None,
                 write_problem: None,
+                hold: false,
+                held: false,
             },
             Err(error) => Self {
                 read_problem: Some(error.to_string()),
                 store,
                 book: SnippetBook::new(),
                 write_problem: None,
+                hold: false,
+                held: false,
             },
         }
     }
@@ -98,6 +107,25 @@ impl SnippetLibrary {
     #[must_use]
     pub fn store(&self) -> &SnippetStore {
         &self.store
+    }
+
+    /// The saved commands as the window holds them.
+    #[must_use]
+    pub fn book(&self) -> &SnippetBook {
+        &self.book
+    }
+
+    /// Holds writes back: a change is kept in the list but not written until
+    /// [`Self::release_writes`]. Used while a sync or an import replaces the files.
+    pub fn hold_writes(&mut self) {
+        self.hold = true;
+    }
+
+    /// Stops holding writes back; returns whether the list changed meanwhile, so the
+    /// caller writes it (merged with what is on disk now).
+    pub fn release_writes(&mut self) -> bool {
+        self.hold = false;
+        std::mem::take(&mut self.held)
     }
 
     /// Every saved command, in the order the list shows them.
@@ -185,6 +213,12 @@ impl SnippetLibrary {
             let reason = format!("{} · {}", self.store.path().display(), problem.trim());
             self.write_problem = Some(reason.clone());
             return Err(SnippetSaveError::Write(reason));
+        }
+        if self.hold {
+            self.book = next;
+            self.held = true;
+            self.write_problem = None;
+            return Ok(());
         }
         match self.store.save(&next) {
             Ok(()) => {

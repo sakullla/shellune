@@ -4764,8 +4764,8 @@ sync_strings! {
     /// One status: failed
     result_failed: "Failed: {reason}", "失败：{reason}";
     /// Under a failure
-    retry_note: "Your changes are saved on this computer. Sync tries again after the next change or check.",
-        "本地修改已保存，下次修改或定时检查时会自动重试。";
+    retry_note: "Your changes are saved on this computer. Sync tries again by itself in a few minutes, and after the next change.",
+        "本地修改已保存。同步会在几分钟内自动重试，下次修改后也会重试。";
     /// Toast: uploaded
     toast_uploaded: "Uploaded to the cloud", "已上传到云端";
     /// Toast: pulled
@@ -4849,6 +4849,28 @@ sync_strings! {
         "同步过程中数据一直在变化，稍后会重试。";
     /// Detail suffix
     error_detail: "Details: {reason}", "详情：{reason}";
+    /// A failure kept from an earlier run whose reason this build does not know
+    error_last_failed: "The last sync failed.", "上次同步失败。";
+    /// Toast: edits made while data arrived could not all be kept
+    held_dropped: "Some changes could not be combined with the synced data",
+        "部分修改无法与同步来的数据合并";
+    /// Its detail
+    held_dropped_detail: "The data from the sync was kept for: {list}. Make those changes again.",
+        "以下内容保留了同步来的数据：{list}。请重新进行这些修改。";
+    /// Toast: edits made while data arrived could not be written
+    held_failed: "Changes made during the sync could not be saved", "同步期间的修改未能保存";
+    /// Data document: hosts
+    doc_hosts: "hosts", "主机";
+    /// Data document: groups
+    doc_groups: "groups", "分组";
+    /// Data document: forwards
+    doc_forwards: "port forwards", "端口转发";
+    /// Data document: saved commands
+    doc_snippets: "saved commands", "常用命令";
+    /// Data document: trusted keys
+    doc_trust: "trusted keys", "已信任指纹";
+    /// Data document: preferences
+    doc_preferences: "preferences", "偏好";
 }
 
 /// The sync strings of one language.

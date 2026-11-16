@@ -2624,7 +2624,7 @@ impl ShelluneView {
         if *saved == now {
             return false;
         }
-        let written = PreferencesStore::at(self.store.root()).save(&now).is_ok();
+        let written = self.write_preferences_file(&now).is_ok();
         self.saved_preferences = Some(now);
         written
     }
@@ -2772,7 +2772,7 @@ impl ShelluneView {
         }
         if self.saved_preferences.is_some() {
             let now = self.current_preferences();
-            match PreferencesStore::at(self.store.root()).save(&now) {
+            match self.write_preferences_file(&now) {
                 Ok(()) => {
                     self.saved_preferences = Some(now);
                     self.keymap_save_error = None;
@@ -3400,11 +3400,15 @@ impl ShelluneView {
         };
         let ux = copy::ux();
         let action = editor.action().clone();
+        // While a sync or an import replaces the files, the change is made on a
+        // scratch copy and written with the other held edits afterwards.
+        let writer = self.group_writer();
         let outcome = match &action {
             GroupAction::Create => group_path_from_text(editor.name())
                 .and_then(|path| path.ok_or_else(|| ux.hosts_group_name_required.to_owned()))
                 .and_then(|path| {
-                    self.group_service
+                    writer
+                        .service
                         .create_group(&self.groups, &path)
                         .map(|groups| GroupOutcome {
                             hosts: None,
@@ -3417,7 +3421,8 @@ impl ShelluneView {
                 .and_then(|path| path.ok_or_else(|| ux.hosts_group_name_required.to_owned()))
                 .and_then(|to| {
                     let tree = self.tree_with_branch(from)?;
-                    self.group_service
+                    writer
+                        .service
                         .rename_group(&self.book, &tree, from, &to)
                         .map(|update| GroupOutcome {
                             message: copy::fill(
@@ -3435,7 +3440,8 @@ impl ShelluneView {
                     Err(ux.hosts_select_start.to_owned())
                 } else {
                     group_path_from_text(editor.destination()).and_then(|destination| {
-                        self.group_service
+                        writer
+                            .service
                             .move_hosts(&self.book, &self.groups, &ids, destination.as_ref())
                             .map(|update| GroupOutcome {
                                 message: copy::fill(
@@ -3452,7 +3458,8 @@ impl ShelluneView {
             GroupAction::Delete(path) => {
                 group_path_from_text(editor.destination()).and_then(|destination| {
                     let tree = self.tree_with_branch(path)?;
-                    self.group_service
+                    writer
+                        .service
                         .delete_group(&self.book, &tree, path, destination.as_ref())
                         .map(|(update, _preview)| GroupOutcome {
                             message: copy::fill(
@@ -3467,6 +3474,7 @@ impl ShelluneView {
             }
         };
 
+        self.finish_group_write(writer);
         match outcome {
             Ok(outcome) => {
                 self.groups = outcome.groups;
@@ -6086,7 +6094,7 @@ impl ShelluneView {
                 return;
             }
         };
-        match self.store.save(&next) {
+        match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
                 self.note_data_changed(cx);
@@ -6861,7 +6869,7 @@ impl ShelluneView {
 
     /// Saves the records, and only then adopts them as the current state.
     fn commit_hosts(&mut self, next: HostBook, message: &str, cx: &mut Context<Self>) {
-        match self.store.save(&next) {
+        match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
                 self.note_data_changed(cx);
@@ -7074,7 +7082,7 @@ impl ShelluneView {
             return;
         }
 
-        match self.store.save(&next) {
+        match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
                 // The hosts are written; the forwarding rules below are a second file,
@@ -7093,7 +7101,11 @@ impl ShelluneView {
                     cx.notify();
                     return;
                 }
-                self.reload_forwards();
+                // While writes are held back the rules are already in the window, and
+                // the file still has the old ones until the held edits are written.
+                if !self.data_writes_held() {
+                    self.reload_forwards();
+                }
                 // A finished import still names every host and rule that did not land.
                 // The flag stays a failure while any of those remain, so the line is
                 // not the success text of a complete import.
@@ -7113,12 +7125,19 @@ impl ShelluneView {
     ///
     /// An empty plan does not create a forwarding file. A failure leaves the preview
     /// in place; the caller has already adopted the host book.
-    fn write_import_forwards(&self, plan: &shellune_storage::ImportPlan) -> Result<(), String> {
+    fn write_import_forwards(&mut self, plan: &shellune_storage::ImportPlan) -> Result<(), String> {
         if plan.forwards().is_empty() {
             return Ok(());
         }
-        let store = ForwardStore::at(self.store.root());
-        let mut book = store.load().map_err(|error| error.to_string())?;
+        // While writes are held back the file may be another writer's; the rules the
+        // window holds are the ones the held edits build on.
+        let mut book = if self.data_writes_held() {
+            self.forwards.book().clone()
+        } else {
+            ForwardStore::at(self.store.root())
+                .load()
+                .map_err(|error| error.to_string())?
+        };
         let mut added = false;
         for planned in plan.forwards() {
             let host = self
@@ -7144,7 +7163,12 @@ impl ShelluneView {
             added = true;
         }
         if added {
-            store.save(&book).map_err(|error| error.to_string())?;
+            self.write_forwards_file(&book)
+                .map_err(|error| error.to_string())?;
+            if self.data_writes_held() {
+                self.forwards.adopt(book);
+                self.sync_forward_section();
+            }
         }
         Ok(())
     }
@@ -7754,7 +7778,7 @@ impl ShelluneView {
             cx.notify();
             return;
         }
-        match self.store.save(&next) {
+        match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
                 self.note_data_changed(cx);
@@ -8487,7 +8511,7 @@ impl ShelluneView {
             self.abort_for_trust(id, error.to_string(), cx);
             return false;
         }
-        if let Err(error) = self.trust.save(&self.trust_book) {
+        if let Err(error) = self.write_trust_file() {
             self.trust_book = previous;
             self.abort_for_trust(id, error.to_string(), cx);
             return false;
@@ -8851,7 +8875,7 @@ impl ShelluneView {
             );
             return;
         }
-        if let Err(error) = self.trust.save(&self.trust_book) {
+        if let Err(error) = self.write_trust_file() {
             self.trust_book = previous;
             self.refuse_with(
                 id,
@@ -8871,7 +8895,7 @@ impl ShelluneView {
             // The file gets the book that was there before this answer, so nothing
             // the retracted acceptance added survives a restart.
             self.trust_book = previous;
-            let _ = self.trust.save(&self.trust_book);
+            let _ = self.write_trust_file();
             if let Some(mut session) = self.take_transport(id) {
                 session.close();
             }
@@ -9214,7 +9238,7 @@ impl ShelluneView {
             cx.notify();
             return false;
         }
-        match self.store.save(&next) {
+        match self.write_hosts_file(&next) {
             Ok(()) => {
                 self.book = next;
                 self.note_data_changed(cx);

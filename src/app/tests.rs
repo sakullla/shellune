@@ -29425,6 +29425,282 @@ async fn a_failed_sync_keeps_the_change_shows_a_marker_and_is_retried(cx: &mut T
     );
 }
 
+/// The host names saved in a data directory, sorted.
+fn names_on_disk(dir: &TempDir) -> Vec<String> {
+    let mut names: Vec<String> = dir
+        .store()
+        .load()
+        .expect("the host file reads")
+        .hosts()
+        .iter()
+        .map(|host| host.name().to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn hold_sync_finish(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) {
+    cx.update(|_window, app| view.update(app, |view, _cx| view.hold_sync_finish_for_test()));
+}
+
+fn sync_finish_held(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_window, app| view.read(app).sync_finish_held_for_test())
+}
+
+fn release_sync_finish(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) {
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.release_sync_finish_for_test(cx));
+    });
+    cx.run_until_parked();
+}
+
+fn data_writes_held(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_window, app| view.read(app).data_writes_held_for_test())
+}
+
+/// The race the window must not lose (R8, R10): a pull has written another machine's
+/// records to disk, and before the window reads them back it saves an edit of its own.
+/// The save must not write the window's stale copy over the records that arrived, and
+/// the edit must not be lost either: both end up on disk, in the window and - without
+/// a conflict question - in the cloud.
+#[gpui::test]
+async fn an_edit_saved_between_a_pull_and_its_adoption_keeps_what_arrived(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let machine_a = TempDir::new("race-a");
+    seed(
+        &machine_a.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let a = other_machine(&machine_a, &server);
+    let _ = a.sync().expect("A uploads");
+
+    let machine_b = TempDir::new("race-b");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&machine_b, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &machine_b, &secrets, Destination::Hosts);
+    assert_eq!(host_names(&view, cx), vec!["alpha"], "pulled at start");
+    let alpha = first_host_id(&view, cx);
+
+    // A adds a host, keeping alpha as it is, and uploads it.
+    let mut book = machine_a.store().load().expect("A reads");
+    book.insert(stored_host("beta", "10.0.0.2", 22, "root", None))
+        .expect("beta is added");
+    machine_a.store().save(&book).expect("A saves");
+    let _ = a.sync().expect("A uploads again");
+
+    // B's next check writes what A sent; the window has not read it back yet.
+    hold_sync_finish(&view, cx);
+    after_poll(cx);
+    assert!(
+        sync_finish_held(&view, cx),
+        "the job is done, its adoption is not"
+    );
+    assert_eq!(names_on_disk(&machine_b), vec!["alpha", "beta"]);
+    assert_eq!(
+        host_names(&view, cx),
+        vec!["alpha"],
+        "the window still shows the old book"
+    );
+    assert!(data_writes_held(&view, cx));
+
+    // In that gap the window saves: a favourite, and a connection that just came up.
+    toggle_favorite(&view, cx, alpha);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            assert!(view.record_host_connection(alpha, 1_800_000_000, cx));
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        names_on_disk(&machine_b),
+        vec!["alpha", "beta"],
+        "the saves did not write the stale book over the records that arrived"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).book().is_favorite(alpha)),
+        "the edit shows at once"
+    );
+
+    // The window takes the job in: the held edits are merged onto what arrived.
+    release_sync_finish(&view, cx);
+    assert!(!data_writes_held(&view, cx));
+    assert_eq!(host_names(&view, cx), vec!["alpha", "beta"]);
+    let on_disk = machine_b.store().load().expect("B reads");
+    assert_eq!(names_on_disk(&machine_b), vec!["alpha", "beta"]);
+    assert!(on_disk.is_favorite(alpha), "the favourite was kept");
+    assert_eq!(
+        on_disk
+            .recent_of(alpha)
+            .map(|recent| recent.last_connected_unix()),
+        Some(1_800_000_000),
+        "and so was the recorded connection"
+    );
+
+    // The merged data goes up as an ordinary change: no conflict, nothing lost.
+    after_debounce(cx);
+    assert!(!sync_conflict_open(&view, cx));
+    assert_eq!(sync_marker(&view, cx), None);
+    assert_eq!(cloud_host_names(&server), vec!["alpha", "beta"]);
+    assert!(cloud_document(&server).shared().hosts().is_favorite(alpha));
+
+    // A keeps its own host and receives B's favourite.
+    assert!(matches!(
+        a.sync().expect("A checks"),
+        shellune_sync::SyncOutcome::Pulled(_)
+    ));
+    assert_eq!(names_on_disk(&machine_a), vec!["alpha", "beta"]);
+    assert!(
+        machine_a
+            .store()
+            .load()
+            .expect("A reads")
+            .is_favorite(alpha)
+    );
+}
+
+#[gpui::test]
+async fn an_applied_backup_waits_for_a_running_sync_and_is_uploaded(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("backup-then-sync");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let backup = dir.path().join("backup.json");
+    write_backup(
+        &backup,
+        vec![stored_host("beta", "10.0.0.2", 22, "root", None)],
+        None,
+        &[],
+    );
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Settings);
+    assert_eq!(cloud_host_names(&server), vec!["alpha"]);
+
+    // A check is running (held once it ends) when the import is applied.
+    hold_sync_finish(&view, cx);
+    cx.update(|_window, app| view.update(app, |view, cx| view.check_sync_for_test(cx)));
+    cx.run_until_parked();
+    assert!(sync_finish_held(&view, cx));
+    read_backup(&view, cx, &backup);
+    assert_eq!(backup_stage(&view, cx), Some("import.preview"));
+    click(cx, "backup.import.apply");
+    assert_eq!(
+        backup_stage(&view, cx),
+        Some("import.applying"),
+        "the import waits for the slot the sync holds"
+    );
+    assert_eq!(
+        names_on_disk(&dir),
+        vec!["alpha"],
+        "nothing is applied while the sync holds the slot"
+    );
+
+    release_sync_finish(&view, cx);
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    assert_eq!(names_on_disk(&dir), vec!["alpha", "beta"]);
+    assert_eq!(host_names(&view, cx), vec!["alpha", "beta"]);
+    assert_eq!(
+        cloud_host_names(&server),
+        vec!["alpha"],
+        "nothing is sent before the debounce runs out"
+    );
+    after_debounce(cx);
+    assert_eq!(
+        cloud_host_names(&server),
+        vec!["alpha", "beta"],
+        "the imported data is uploaded like any other change"
+    );
+    assert_eq!(sync_marker(&view, cx), None);
+}
+
+#[gpui::test]
+async fn a_failed_sync_is_retried_after_a_minute_then_less_often(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("sync-backoff");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Hosts);
+    assert_eq!(cloud_host_names(&server), vec!["alpha"]);
+
+    server.set_offline(true);
+    let alpha = first_host_id(&view, cx);
+    toggle_favorite(&view, cx, alpha);
+    after_debounce(cx);
+    let (failed_once, _, failure) = sync_progress(&view, cx);
+    assert!(failure.is_some());
+    let advance = |cx: &mut VisualTestContext, seconds: u64| {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(seconds));
+        cx.run_until_parked();
+    };
+
+    advance(cx, 61);
+    assert_eq!(
+        sync_progress(&view, cx).0,
+        failed_once + 1,
+        "the first retry comes after a minute"
+    );
+    advance(cx, 61);
+    assert_eq!(
+        sync_progress(&view, cx).0,
+        failed_once + 1,
+        "the next waits twice as long"
+    );
+    advance(cx, 60);
+    assert_eq!(sync_progress(&view, cx).0, failed_once + 2);
+
+    // The network is back; the next retry - well before the 15-minute check - sends it.
+    server.set_offline(false);
+    advance(cx, 241);
+    assert_eq!(sync_progress(&view, cx).0, failed_once + 3);
+    assert_eq!(sync_progress(&view, cx).2, None);
+    assert_eq!(sync_marker(&view, cx), None);
+    assert!(cloud_document(&server).shared().hosts().is_favorite(alpha));
+
+    // A success ends the retries (the 15-minute check is still minutes away).
+    let settled = sync_progress(&view, cx).0;
+    advance(cx, 5 * 60);
+    assert_eq!(
+        sync_progress(&view, cx).0,
+        settled,
+        "nothing is retried after a success"
+    );
+}
+
+#[gpui::test]
+async fn the_hosts_keys_do_nothing_behind_the_sync_conflict_dialog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("hosts-keys-behind-sync");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
+            stored_host("beta", "10.0.0.2", 22, "deploy", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.update(|_window, app| view.update(app, |view, cx| view.open_sync_conflict_for_test(cx)));
+    cx.run_until_parked();
+    assert!(sync_conflict_open(&view, cx));
+    assert!(cx.debug_bounds("sync.conflict.dialog").is_some());
+    let search = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+    cx.update(|window, _app| window.focus(&search));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        None,
+        "the list behind the dialog does not move"
+    );
+}
+
 #[gpui::test]
 async fn a_host_whose_key_file_is_not_on_this_computer_says_so_in_the_list(
     cx: &mut TestAppContext,

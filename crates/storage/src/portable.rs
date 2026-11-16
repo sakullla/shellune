@@ -27,6 +27,7 @@
 
 mod apply;
 mod crypto;
+mod rebase;
 mod snapshot;
 
 use std::collections::BTreeMap;
@@ -51,6 +52,7 @@ pub use apply::{
     ApplyMode, ApplyOutcome, ApplyPlan, Change, PlatformFallback, PlatformField, TrustConflict,
 };
 pub use crypto::{KdfParams, SecretBundle};
+pub use rebase::{Rebased, Touched, rebase_state};
 pub use snapshot::{SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT, Snapshot, SnapshotStore};
 
 use crypto::SecretBlock;

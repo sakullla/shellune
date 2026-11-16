@@ -123,8 +123,7 @@ impl ShelluneView {
                     return;
                 }
             };
-        let store = ForwardStore::at(self.store.root());
-        if let Err(error) = store.save(&book) {
+        if let Err(error) = self.write_forwards_file(&book) {
             self.forwards.fail_editor(error.to_string());
             cx.notify();
             return;
@@ -143,8 +142,7 @@ impl ShelluneView {
         if book.insert(rule).is_err() {
             return;
         }
-        let store = ForwardStore::at(self.store.root());
-        if store.save(&book).is_err() {
+        if self.write_forwards_file(&book).is_err() {
             return;
         }
         self.forwards.adopt(book);
@@ -170,7 +168,7 @@ impl ShelluneView {
         let Ok(book) = self.forwards.without(id) else {
             return;
         };
-        if ForwardStore::at(self.store.root()).save(&book).is_err() {
+        if self.write_forwards_file(&book).is_err() {
             return;
         }
         self.forwards.adopt(book);

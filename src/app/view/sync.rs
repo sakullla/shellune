@@ -17,20 +17,32 @@
 //!   [`ShelluneView::note_data_changed`]; the workspace snapshot does not, and nothing
 //!   applied from the cloud is noted while it is being adopted, so a pull never echoes
 //!   back as an upload;
+//! * a job that may write the data files (a check, a pull, "use cloud data") and the
+//!   application of a backup share that one slot, so two writers never apply at once.
+//!   While such a writer runs - from its start until the window has read back what it
+//!   wrote - the window's own saves are *held back*: the edit shows at once, but its
+//!   file is not written over the one the writer may have just replaced. When the
+//!   writer is done the held edits are merged onto the files as they are then
+//!   (`LocalData::rebase`), written, read back, and uploaded like any other change; a
+//!   stale copy in memory never overwrites records that just arrived (R8, R10);
 //! * a failure never blocks the window or loses a local change: the change is already on
-//!   disk, the reason is shown in the settings and as a marker in the top bar, and the
-//!   next change or check tries again;
+//!   disk, the reason is shown in the settings and as a marker in the top bar, and sync
+//!   tries again after [`RETRY_FIRST`], doubling the wait up to [`RETRY_MAX`], as well
+//!   as after the next change or check;
 //! * a conflict is a question with three answers, and nothing is overwritten before the
 //!   user answers it. Dismissing it keeps the conflict (and the marker) until it is
 //!   answered; automatic checks do not ask again until it is, a manual one does.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div, px};
-use shellune_core::SecretString;
+use shellune_core::{ForwardBook, SecretString};
 use shellune_storage::{
-    KdfParams, LocalData, Platform as DataPlatform, PortableError, SecretStore,
+    ForwardStore, GroupService, HostBook, KdfParams, LocalData, LocalState, PersistError,
+    Platform as DataPlatform, PortableError, Preferences, PreferencesStore, SecretStore,
+    SnippetStore, StorageError, Touched,
 };
 use shellune_sync::{
     ConflictReport, LastResult, PullReport, Resolution, SyncConfig, SyncError, SyncOutcome,
@@ -54,6 +66,46 @@ pub(super) const DEBOUNCE: Duration = Duration::from_secs(5);
 /// How often the cloud is checked while automatic sync is on.
 pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// The wait before the first automatic retry after a failed sync.
+pub(super) const RETRY_FIRST: Duration = Duration::from_secs(60);
+
+/// The longest wait between automatic retries; each failure doubles the wait up to it.
+pub(super) const RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// Work that waits for the slot the sync jobs use (a backup import).
+type SlotTask = Box<dyn FnOnce(&mut ShelluneView, &mut Context<ShelluneView>)>;
+
+/// The window's saves, held back while another writer replaces the data files.
+struct DataGate {
+    /// The files as they were when the writer started; `None` when they could not be
+    /// read (the writer then fails on them too, and the held edits are written as is).
+    base: Option<Box<LocalState>>,
+    /// The documents the window changed meanwhile.
+    touched: Touched,
+}
+
+/// What became of the saves held back during a writer.
+#[derive(Debug, Default)]
+pub(super) struct HeldWrites {
+    /// Some file was written.
+    written: bool,
+    /// What is on disk now differs from what the window shows, so it is read back.
+    reload: bool,
+    /// The preferences are among what is read back.
+    preferences: bool,
+    /// Documents whose edits could not be combined with what arrived.
+    dropped: Vec<&'static str>,
+    /// Why the held edits could not be written at all.
+    failed: Option<String>,
+}
+
+/// A group change made while writes are held back goes through a scratch copy of the
+/// data directory, so the service's own writes do not touch the real files.
+pub(super) struct GroupWriter {
+    pub(super) service: GroupService,
+    scratch: Option<PathBuf>,
+}
+
 /// One sync the window asks the engine for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SyncJob {
@@ -73,6 +125,15 @@ impl SyncJob {
     /// Whether a person asked for it, so its outcome is worth a notification.
     fn manual(self) -> bool {
         !matches!(self, Self::Auto)
+    }
+
+    /// Whether it may write the data files of this computer: anything that can end in
+    /// a pull. An upload and "use this computer's data" only write the cloud.
+    fn writes_local(self) -> bool {
+        matches!(
+            self,
+            Self::Auto | Self::Check | Self::Pull | Self::Resolve(Resolution::UseRemote)
+        )
     }
 }
 
@@ -128,6 +189,21 @@ pub(super) struct SyncCenter {
     conflict_dismissed: bool,
     /// How many jobs ended, for the tests.
     finished: usize,
+    /// The window's saves held back while a writer runs.
+    gate: Option<DataGate>,
+    /// A backup import is being applied; it shares the slot with the jobs.
+    backup_running: bool,
+    /// A backup import waiting for the running job.
+    waiting_backup: Option<SlotTask>,
+    /// The wait before the next automatic retry.
+    retry_delay: Duration,
+    /// Bumped by every retry timer and every success; a timer only fires for the newest.
+    retry_generation: u64,
+    /// The tests stop a finished job before the window takes it in, to act in between.
+    #[cfg(test)]
+    hold_finish: bool,
+    #[cfg(test)]
+    held_finish: Option<(SyncJob, Result<SyncOutcome, SyncError>)>,
 }
 
 /// The cost of sealing passwords: the default, and the cheapest Argon2 accepts in tests.
@@ -203,6 +279,185 @@ fn sync_error_text(error: &SyncError, strings: &SyncStrings) -> String {
     }
 }
 
+/// The engine's wording of a credential-store failure, up to its detail. The store's
+/// error cannot be built outside the storage crate, so this one sentence is spelled
+/// out (it is the `#[error]` text of `SyncError::Credentials`).
+const CREDENTIALS_PREFIX: &str = "the sync credentials could not be read: ";
+
+/// A failure reason kept in `sync-state.json` (the engine's English sentence) in the
+/// window's language. The sentences are matched against the engine's own wording, so
+/// a reason this build does not know is shown under a general sentence, as saved.
+fn saved_reason_text(reason: &str, strings: &SyncStrings) -> String {
+    /// Stands in for the variable part of a sentence.
+    const MARK: &str = "\u{1}";
+    let detail = |reason: &str| copy::fill(strings.error_detail, &[("reason", reason)]);
+    // A status code is a number, so such a sentence is matched up to it.
+    let without_status = |said: &str| {
+        said.trim_end_matches(|c: char| c.is_ascii_digit() || c == ')')
+            .to_owned()
+    };
+    let split = |template: String| -> (String, String) {
+        match template.split_once(MARK) {
+            Some((before, after)) => (before.to_owned(), after.to_owned()),
+            None => (template, String::new()),
+        }
+    };
+    let inside = |template: String| -> Option<String> {
+        let (before, after) = split(template);
+        reason
+            .strip_prefix(&before)?
+            .strip_suffix(&after)
+            .map(str::to_owned)
+    };
+
+    let exact = [
+        (
+            SyncError::NotConfigured.to_string(),
+            strings.error_not_configured,
+        ),
+        (
+            SyncError::PassphraseMissing.to_string(),
+            strings.error_passphrase_missing,
+        ),
+        (
+            SyncError::NothingInCloud.to_string(),
+            strings.error_nothing_in_cloud,
+        ),
+        (SyncError::Busy.to_string(), strings.error_busy),
+        (WebDavError::Conflict.to_string(), strings.error_busy),
+        (
+            SyncError::RemoteDocument(PortableError::WrongPassphrase).to_string(),
+            strings.error_remote_passphrase,
+        ),
+    ];
+    if let Some((_, text)) = exact.iter().find(|(said, _)| said == reason) {
+        return (*text).to_owned();
+    }
+    if reason.starts_with(&without_status(
+        &WebDavError::Auth { status: 0 }.to_string(),
+    )) {
+        return strings.error_auth.to_owned();
+    }
+    if let Some(why) = inside(
+        WebDavError::Unreachable {
+            reason: MARK.to_owned(),
+        }
+        .to_string(),
+    ) {
+        return format!("{} {}", strings.error_unreachable, detail(&why));
+    }
+    if let Some(why) = inside(
+        WebDavError::InvalidAddress {
+            reason: MARK.to_owned(),
+        }
+        .to_string(),
+    ) {
+        return format!("{} {}", strings.error_address, detail(&why));
+    }
+    let (before, after) = split(
+        WebDavError::NotWritable {
+            path: MARK.to_owned(),
+            status: 0,
+        }
+        .to_string(),
+    );
+    if let Some((path, _)) = reason
+        .strip_prefix(&before)
+        .and_then(|rest| rest.split_once(without_status(&after).as_str()))
+    {
+        return copy::fill(strings.error_not_writable, &[("path", path)]);
+    }
+    let (status_before, _) = split(
+        WebDavError::Status {
+            method: MARK.to_owned(),
+            status: 0,
+            location: None,
+        }
+        .to_string(),
+    );
+    let protocol = inside(
+        WebDavError::Protocol {
+            reason: MARK.to_owned(),
+        }
+        .to_string(),
+    );
+    if reason.starts_with(&status_before) || protocol.is_some() {
+        return format!("{} {}", strings.error_server, detail(reason));
+    }
+    let document = SyncError::RemoteDocument(PortableError::WrongPassphrase).to_string();
+    let document_prefix = document
+        .strip_suffix(&PortableError::WrongPassphrase.to_string())
+        .unwrap_or(&document);
+    if let Some(rest) = reason.strip_prefix(document_prefix) {
+        return format!("{} {}", strings.error_remote_document, detail(rest));
+    }
+    if let Some(rest) = reason.strip_prefix(CREDENTIALS_PREFIX) {
+        return format!("{} {}", strings.error_credentials, detail(rest));
+    }
+    format!("{} {}", strings.error_last_failed, detail(reason))
+}
+
+/// A data document as the window names it.
+fn document_name(label: &str, strings: &SyncStrings) -> &'static str {
+    match label {
+        "saved hosts" => strings.doc_hosts,
+        "host groups" => strings.doc_groups,
+        "forwarding rules" => strings.doc_forwards,
+        "saved commands" => strings.doc_snippets,
+        "trusted server identities" => strings.doc_trust,
+        _ => strings.doc_preferences,
+    }
+}
+
+/// Whether the touched documents of `a` and `b` differ.
+fn touched_differ(a: &LocalState, b: &LocalState, touched: Touched) -> bool {
+    (touched.hosts && a.hosts != b.hosts)
+        || (touched.groups && a.groups != b.groups)
+        || (touched.forwards && a.forwards != b.forwards)
+        || (touched.snippets && a.snippets != b.snippets)
+        || (touched.known_hosts && a.known_hosts != b.known_hosts)
+        || (touched.preferences && a.preferences != b.preferences)
+}
+
+/// Writes the touched documents of `state` as they are, the way each save would have.
+fn write_documents(
+    root: &std::path::Path,
+    state: &LocalState,
+    touched: Touched,
+) -> Result<(), String> {
+    if touched.hosts {
+        shellune_storage::HostStore::at(root)
+            .save(&state.hosts)
+            .map_err(|error| error.to_string())?;
+    }
+    if touched.groups {
+        shellune_storage::GroupStore::at(root)
+            .save(&state.groups)
+            .map_err(|error| error.to_string())?;
+    }
+    if touched.forwards {
+        ForwardStore::at(root)
+            .save(&state.forwards)
+            .map_err(|error| error.to_string())?;
+    }
+    if touched.snippets {
+        SnippetStore::at(root)
+            .save(&state.snippets)
+            .map_err(|error| error.to_string())?;
+    }
+    if touched.known_hosts {
+        shellune_storage::TrustStore::at(root)
+            .save(&state.known_hosts)
+            .map_err(|error| error.to_string())?;
+    }
+    if touched.preferences {
+        PreferencesStore::at(root)
+            .save(&state.preferences)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 impl SyncCenter {
     /// The sync of the data in `root`, with secrets in `secrets`. Reads the saved
     /// settings and state; sends nothing.
@@ -271,6 +526,15 @@ impl SyncCenter {
             dialog: false,
             conflict_dismissed: false,
             finished: 0,
+            gate: None,
+            backup_running: false,
+            waiting_backup: None,
+            retry_delay: RETRY_FIRST,
+            retry_generation: 0,
+            #[cfg(test)]
+            hold_finish: false,
+            #[cfg(test)]
+            held_finish: None,
         }
     }
 
@@ -374,7 +638,7 @@ impl ShelluneView {
         if !self.sync.network || !self.sync.configured() {
             return;
         }
-        if self.sync.running.is_some() {
+        if self.sync_slot_busy() {
             self.sync.queued = match (self.sync.queued, job) {
                 (Some(waiting), SyncJob::Auto) => Some(waiting),
                 (_, job) => Some(job),
@@ -382,6 +646,9 @@ impl ShelluneView {
             return;
         }
         self.sync.running = Some(job);
+        if job.writes_local() {
+            self.hold_data_writes();
+        }
         let service = self.sync.service.clone();
         let work = cx.background_executor().spawn(async move {
             match job {
@@ -406,9 +673,21 @@ impl ShelluneView {
         result: Result<SyncOutcome, SyncError>,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(test)]
+        if self.sync.hold_finish {
+            self.sync.held_finish = Some((job, result));
+            return;
+        }
         self.sync.running = None;
         self.sync.finished += 1;
         self.sync.state = self.sync.service.state();
+        // What the window saved while the job ran is merged onto what the job left on
+        // disk before anything is read back.
+        let held = self.release_data_writes();
+        let mut adopted = false;
+        if result.is_ok() {
+            self.reset_sync_retry();
+        }
         let strings = self.sync_strings();
         match result {
             Ok(SyncOutcome::UpToDate) => {
@@ -425,7 +704,8 @@ impl ShelluneView {
             }
             Ok(SyncOutcome::Pulled(report)) => {
                 self.sync_settled();
-                self.adopt_pulled_data(&report, cx);
+                self.adopt_pulled_data(&report, held.preferences, cx);
+                adopted = true;
             }
             Ok(SyncOutcome::Conflict(report)) => {
                 self.sync.failure = None;
@@ -447,12 +727,269 @@ impl ShelluneView {
                 if job.manual() {
                     self.toast(Tone::Danger, strings.toast_failed, Some(text), cx);
                 }
+                self.schedule_sync_retry(cx);
             }
+        }
+        self.settle_held_writes(held, adopted, cx);
+        self.start_next_in_sync_slot(cx);
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
+    // The slot and the saves held back while a writer runs
+    // -----------------------------------------------------------------------
+
+    /// Whether a job or a backup import holds the slot.
+    pub(super) fn sync_slot_busy(&self) -> bool {
+        self.sync.running.is_some() || self.sync.backup_running
+    }
+
+    /// Starts what waited for the slot: a backup import first (a person is watching
+    /// it), then the queued job.
+    pub(super) fn start_next_in_sync_slot(&mut self, cx: &mut Context<Self>) {
+        if self.sync_slot_busy() {
+            return;
+        }
+        if let Some(task) = self.sync.waiting_backup.take() {
+            task(self, cx);
+            return;
         }
         if let Some(next) = self.sync.queued.take() {
             self.run_sync_job(next, cx);
         }
-        cx.notify();
+    }
+
+    /// Runs `task` (a backup import) when the slot is free: now, or when the running
+    /// job ends. A later request replaces one that still waits.
+    pub(super) fn when_sync_slot_free(&mut self, task: SlotTask, cx: &mut Context<Self>) {
+        if self.sync_slot_busy() {
+            self.sync.waiting_backup = Some(task);
+        } else {
+            task(self, cx);
+        }
+    }
+
+    /// Marks the slot as held by a backup import.
+    pub(super) fn set_backup_in_sync_slot(&mut self, running: bool) {
+        self.sync.backup_running = running;
+    }
+
+    /// Whether the window's saves are held back now.
+    pub(super) fn data_writes_held(&self) -> bool {
+        self.sync.gate.is_some()
+    }
+
+    /// Starts holding the window's saves back, remembering the files as they are.
+    pub(super) fn hold_data_writes(&mut self) {
+        if self.sync.gate.is_some() {
+            return;
+        }
+        let base = LocalData::at(self.store.root()).load().ok().map(Box::new);
+        self.snippets.hold_writes();
+        self.sync.gate = Some(DataGate {
+            base,
+            touched: Touched::default(),
+        });
+    }
+
+    /// The data files as the window holds them now.
+    fn data_in_memory(&self) -> LocalState {
+        LocalState {
+            hosts: self.book.clone(),
+            groups: self.groups.clone(),
+            forwards: self.forwards.book().clone(),
+            snippets: self.snippets.book().clone(),
+            known_hosts: self.trust_book.clone(),
+            preferences: self.saved_preferences.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Stops holding saves back and writes what was held, merged onto the files as the
+    /// writer left them. Nothing the writer put there is overwritten by a stale copy.
+    pub(super) fn release_data_writes(&mut self) -> HeldWrites {
+        let Some(mut gate) = self.sync.gate.take() else {
+            return HeldWrites::default();
+        };
+        if self.snippets.release_writes() {
+            gate.touched.snippets = true;
+        }
+        let touched = gate.touched;
+        if !touched.any() {
+            return HeldWrites::default();
+        }
+        let ours = self.data_in_memory();
+        let data = LocalData::at(self.store.root());
+        let rebased = gate
+            .base
+            .as_deref()
+            .and_then(|base| data.rebase(base, &ours, touched).ok());
+        match rebased {
+            Some(rebased) => HeldWrites {
+                written: rebased.written,
+                reload: touched_differ(&rebased.state, &ours, touched),
+                preferences: touched.preferences && rebased.state.preferences != ours.preferences,
+                dropped: rebased.dropped,
+                failed: None,
+            },
+            // The files could not be read before or after: the held edits are written
+            // as they are, which is what each save would have done.
+            None => match write_documents(self.store.root(), &ours, touched) {
+                Ok(()) => HeldWrites {
+                    written: true,
+                    ..HeldWrites::default()
+                },
+                Err(reason) => HeldWrites {
+                    failed: Some(reason),
+                    ..HeldWrites::default()
+                },
+            },
+        }
+    }
+
+    /// Finishes what releasing the held saves started: reads back what differs from the
+    /// screen, notes the written change for upload, and says what could not be kept.
+    pub(super) fn settle_held_writes(
+        &mut self,
+        held: HeldWrites,
+        adopted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if held.reload && !adopted {
+            self.adopt_imported_data(held.preferences, cx);
+        }
+        if held.written {
+            self.note_data_changed(cx);
+        }
+        let strings = self.sync_strings();
+        if !held.dropped.is_empty() {
+            let names: Vec<&str> = held
+                .dropped
+                .iter()
+                .map(|label| document_name(label, strings))
+                .collect();
+            self.toast(
+                Tone::Warning,
+                strings.held_dropped,
+                Some(copy::fill(
+                    strings.held_dropped_detail,
+                    &[("list", &names.join(", "))],
+                )),
+                cx,
+            );
+        }
+        if let Some(reason) = held.failed {
+            self.toast(
+                Tone::Danger,
+                strings.held_failed,
+                Some(copy::fill(strings.error_detail, &[("reason", &reason)])),
+                cx,
+            );
+        }
+    }
+
+    /// Writes the host book, or holds the write back while a writer runs.
+    pub(super) fn write_hosts_file(&mut self, book: &HostBook) -> Result<(), StorageError> {
+        if let Some(gate) = self.sync.gate.as_mut() {
+            gate.touched.hosts = true;
+            return Ok(());
+        }
+        self.store.save(book)
+    }
+
+    /// Writes the trusted identities the window holds, or holds the write back.
+    pub(super) fn write_trust_file(&mut self) -> Result<(), StorageError> {
+        if let Some(gate) = self.sync.gate.as_mut() {
+            gate.touched.known_hosts = true;
+            return Ok(());
+        }
+        self.trust.save(&self.trust_book)
+    }
+
+    /// Writes the forwarding rules, or holds the write back.
+    pub(super) fn write_forwards_file(&mut self, book: &ForwardBook) -> Result<(), PersistError> {
+        if let Some(gate) = self.sync.gate.as_mut() {
+            gate.touched.forwards = true;
+            return Ok(());
+        }
+        ForwardStore::at(self.store.root()).save(book)
+    }
+
+    /// Writes the preferences, or holds the write back.
+    pub(super) fn write_preferences_file(
+        &mut self,
+        preferences: &Preferences,
+    ) -> Result<(), PersistError> {
+        if let Some(gate) = self.sync.gate.as_mut() {
+            gate.touched.preferences = true;
+            return Ok(());
+        }
+        PreferencesStore::at(self.store.root()).save(preferences)
+    }
+
+    /// The group service for one change: the real one, or - while writes are held
+    /// back - one over a scratch directory, so the change is computed and checked the
+    /// same way without touching the files a writer may have just replaced.
+    pub(super) fn group_writer(&mut self) -> GroupWriter {
+        if self.sync.gate.is_none() {
+            return GroupWriter {
+                service: self.group_service.clone(),
+                scratch: None,
+            };
+        }
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let scratch = self.store.root().join(format!(
+            ".held-group-change-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        GroupWriter {
+            service: GroupService::at(&scratch),
+            scratch: Some(scratch),
+        }
+    }
+
+    /// Ends a group change: a held one marks the hosts and the tree as changed, and
+    /// its scratch directory is removed.
+    pub(super) fn finish_group_write(&mut self, writer: GroupWriter) {
+        let Some(scratch) = writer.scratch else {
+            return;
+        };
+        let _ = std::fs::remove_dir_all(&scratch);
+        if let Some(gate) = self.sync.gate.as_mut() {
+            gate.touched.hosts = true;
+            gate.touched.groups = true;
+        }
+    }
+
+    /// After a failure, tries again in a while: [`RETRY_FIRST`], then twice as long
+    /// each time up to [`RETRY_MAX`]. Only while automatic sync is on.
+    fn schedule_sync_retry(&mut self, cx: &mut Context<Self>) {
+        if !self.sync.automatic() {
+            return;
+        }
+        let delay = self.sync.retry_delay;
+        self.sync.retry_delay = (delay * 2).min(RETRY_MAX);
+        self.sync.retry_generation += 1;
+        let generation = self.sync.retry_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.sync.retry_generation == generation
+                    && view.sync.automatic()
+                    && view.sync.has_failure()
+                {
+                    view.run_sync_job(SyncJob::Auto, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A sync got through: the next failure waits [`RETRY_FIRST`] again, and a retry
+    /// still waiting is dropped.
+    fn reset_sync_retry(&mut self) {
+        self.sync.retry_delay = RETRY_FIRST;
+        self.sync.retry_generation += 1;
     }
 
     /// Both sides agree again: no failure and no conflict.
@@ -465,10 +1002,18 @@ impl ShelluneView {
 
     /// Shows what a pull wrote: every list and preference is read again, and the notes
     /// about it are one notification.
-    fn adopt_pulled_data(&mut self, report: &PullReport, cx: &mut Context<Self>) {
+    fn adopt_pulled_data(
+        &mut self,
+        report: &PullReport,
+        preferences: bool,
+        cx: &mut Context<Self>,
+    ) {
         let strings = self.sync_strings();
         self.sync.applying = true;
-        self.adopt_imported_data(report.preferences_changed || report.keymap_changed, cx);
+        self.adopt_imported_data(
+            preferences || report.preferences_changed || report.keymap_changed,
+            cx,
+        );
         self.key_presence.forget();
         self.sync.applying = false;
         let mut notes = Vec::new();
@@ -799,7 +1344,11 @@ impl ShelluneView {
                     strings.result_failed,
                     &[(
                         "reason",
-                        self.sync.failure.as_deref().unwrap_or(reason.as_str()),
+                        &self
+                            .sync
+                            .failure
+                            .clone()
+                            .unwrap_or_else(|| saved_reason_text(reason, strings)),
                     )],
                 ),
                 Some(Tone::Danger),
@@ -1134,7 +1683,9 @@ impl ShelluneView {
     pub fn sync_progress_for_test(&self) -> (usize, bool, Option<String>) {
         (
             self.sync.finished,
-            self.sync.running.is_some() || self.sync.queued.is_some(),
+            self.sync_slot_busy()
+                || self.sync.queued.is_some()
+                || self.sync.waiting_backup.is_some(),
             self.sync.failure.clone(),
         )
     }
@@ -1144,6 +1695,56 @@ impl ShelluneView {
     #[must_use]
     pub fn sync_conflict_open_for_test(&self) -> bool {
         self.sync_dialog_open()
+    }
+
+    /// Stops the next finished job before the window takes it in: what it wrote is on
+    /// disk, and the window has not read it back yet.
+    #[cfg(test)]
+    pub fn hold_sync_finish_for_test(&mut self) {
+        self.sync.hold_finish = true;
+    }
+
+    /// Whether a finished job is being held.
+    #[cfg(test)]
+    #[must_use]
+    pub fn sync_finish_held_for_test(&self) -> bool {
+        self.sync.held_finish.is_some()
+    }
+
+    /// Lets the held job be taken in.
+    #[cfg(test)]
+    pub fn release_sync_finish_for_test(&mut self, cx: &mut Context<Self>) {
+        self.sync.hold_finish = false;
+        if let Some((job, result)) = self.sync.held_finish.take() {
+            self.finish_sync_job(job, result, cx);
+        }
+    }
+
+    /// Whether the window's saves are held back.
+    #[cfg(test)]
+    #[must_use]
+    pub fn data_writes_held_for_test(&self) -> bool {
+        self.data_writes_held()
+    }
+
+    /// Checks the cloud as "resolve conflict" would without one: a sync in either
+    /// direction, started by a person.
+    #[cfg(test)]
+    pub fn check_sync_for_test(&mut self, cx: &mut Context<Self>) {
+        self.request_sync(SyncJob::Check, cx);
+    }
+
+    /// Opens the conflict question with a fixed report; nothing is resolved.
+    #[cfg(test)]
+    pub fn open_sync_conflict_for_test(&mut self, cx: &mut Context<Self>) {
+        self.sync.conflict = Some(ConflictReport {
+            first_sync: false,
+            remote_platform: "linux".to_owned(),
+            remote_app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            remote_created_unix: 1_794_816_000,
+        });
+        self.sync.dialog = true;
+        cx.notify();
     }
 
     /// What the connection test said: `None` before or while it runs, then whether it
@@ -1210,5 +1811,78 @@ impl ShelluneView {
     #[must_use]
     pub fn capture_sync_conflict_open(&self) -> bool {
         self.sync_dialog_open()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_failure_is_said_in_the_window_s_language() {
+        let zh = copy::sync_for(copy::Locale::Chinese);
+        let unreachable = SyncError::Remote(WebDavError::Unreachable {
+            reason: "connection timed out".to_owned(),
+        })
+        .to_string();
+        let said = saved_reason_text(&unreachable, zh);
+        assert!(said.starts_with(zh.error_unreachable), "{said}");
+        assert!(said.contains("connection timed out"), "{said}");
+
+        let auth = SyncError::Remote(WebDavError::Auth { status: 401 }).to_string();
+        assert_eq!(saved_reason_text(&auth, zh), zh.error_auth);
+
+        let folder = SyncError::Remote(WebDavError::NotWritable {
+            path: "/shellune".to_owned(),
+            status: 403,
+        })
+        .to_string();
+        assert_eq!(
+            saved_reason_text(&folder, zh),
+            copy::fill(zh.error_not_writable, &[("path", "/shellune")])
+        );
+
+        let status = SyncError::Remote(WebDavError::Status {
+            method: "PUT".to_owned(),
+            status: 507,
+            location: None,
+        })
+        .to_string();
+        assert!(saved_reason_text(&status, zh).starts_with(zh.error_server));
+
+        for (error, expected) in [
+            (SyncError::NothingInCloud, zh.error_nothing_in_cloud),
+            (SyncError::PassphraseMissing, zh.error_passphrase_missing),
+            (SyncError::Busy, zh.error_busy),
+            (
+                SyncError::RemoteDocument(PortableError::WrongPassphrase),
+                zh.error_remote_passphrase,
+            ),
+        ] {
+            assert_eq!(saved_reason_text(&error.to_string(), zh), expected);
+        }
+        let damaged = SyncError::RemoteDocument(PortableError::Corrupt {
+            reason: "bad json".to_owned(),
+        })
+        .to_string();
+        let said = saved_reason_text(&damaged, zh);
+        assert!(said.starts_with(zh.error_remote_document), "{said}");
+
+        let credentials = format!("{CREDENTIALS_PREFIX}the store is locked");
+        assert!(saved_reason_text(&credentials, zh).starts_with(zh.error_credentials));
+
+        let unknown = saved_reason_text("something new went wrong", zh);
+        assert!(unknown.starts_with(zh.error_last_failed), "{unknown}");
+        assert!(unknown.contains("something new went wrong"));
+    }
+
+    #[test]
+    fn the_credentials_sentence_matches_the_engine() {
+        // The one sentence spelled out here must stay the engine's own wording.
+        let source = include_str!("../../../crates/sync/src/engine.rs");
+        assert!(
+            source.contains(&format!("#[error(\"{CREDENTIALS_PREFIX}{{0}}\")]")),
+            "SyncError::Credentials still reads \"{CREDENTIALS_PREFIX}{{0}}\""
+        );
     }
 }

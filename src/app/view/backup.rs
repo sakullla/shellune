@@ -812,6 +812,32 @@ impl ShelluneView {
             return;
         }
         self.put_backup_stage(ImportStage::Applying);
+        cx.notify();
+        // A sync job may be writing the same files: the import waits for the slot
+        // the jobs share, so two writers never apply at once.
+        self.when_sync_slot_free(
+            Box::new(move |view, cx| view.start_backup_apply(preview, cx)),
+            cx,
+        );
+    }
+
+    /// Applies the preview on the background executor, holding the slot the sync jobs
+    /// use and holding the window's own saves back until the files are read again.
+    fn start_backup_apply(&mut self, preview: Box<BackupPreview>, cx: &mut Context<Self>) {
+        let still_open = matches!(
+            self.backup.as_ref(),
+            Some(BackupDialog::Import(ImportDialog {
+                stage: ImportStage::Applying,
+                ..
+            }))
+        );
+        if !still_open {
+            // Closed while it waited: nothing was written, and nothing is.
+            self.start_next_in_sync_slot(cx);
+            return;
+        }
+        self.set_backup_in_sync_slot(true);
+        self.hold_data_writes();
         let data = LocalData::at(self.store.root());
         let secrets = self.secrets.clone();
         let reason = match preview.mode {
@@ -835,6 +861,28 @@ impl ShelluneView {
     /// Shows what applying did: the result, a fresh preview of data that changed in
     /// between, or the preview again with the reason.
     fn finish_backup_apply(
+        &mut self,
+        preview: Box<BackupPreview>,
+        outcome: Result<ApplyOutcome, PortableError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_backup_in_sync_slot(false);
+        // What the window saved meanwhile is merged onto the imported files first.
+        let held = self.release_data_writes();
+        let changed = outcome.is_ok() && !preview.plan.is_empty();
+        self.show_backup_apply(preview, outcome, cx);
+        self.settle_held_writes(held, false, cx);
+        // The imported data is a change like any other: with automatic sync on it is
+        // uploaded after the debounce (R8).
+        if changed {
+            self.note_data_changed(cx);
+        }
+        self.start_next_in_sync_slot(cx);
+        cx.notify();
+    }
+
+    /// Shows what applying did and reads the written files back.
+    fn show_backup_apply(
         &mut self,
         mut preview: Box<BackupPreview>,
         outcome: Result<ApplyOutcome, PortableError>,
