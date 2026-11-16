@@ -43,6 +43,8 @@ pub enum Command {
     NewSnippet,
     /// Closes the session on screen.
     CloseTab(SessionId),
+    /// Starts the ended session of the pane on screen again, in its own tab (R8).
+    Reconnect(SessionId),
     /// Gives the tab of an open session a name of its own.
     RenameTab(SessionId),
     /// Drops the name of an open session's tab and shows its automatic title again.

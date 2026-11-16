@@ -42,9 +42,9 @@ use crate::app::actions::{
     FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoToForwards, GoToHosts, GoToLocalShells,
     GoToSessions, GoToSettings, GoToTransfers, MovePaneDown, MovePaneLeft, MovePaneRight,
     MovePaneUp, MoveTabLeft, MoveTabRight, NewLocalShell, NextDestination, NextTab, OpenPalette,
-    PreviousDestination, PreviousTab, ResizePaneDown, ResizePaneLeft, ResizePaneRight,
-    ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleLanguage,
+    PreviousDestination, PreviousTab, ReconnectSession, ResizePaneDown, ResizePaneLeft,
+    ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5,
+    SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleLanguage,
     ToggleSidebar, ZoomPane,
 };
 use crate::app::components::Variant;
@@ -5733,6 +5733,29 @@ impl ShelluneView {
         }
     }
 
+    /// The session a reconnect from the keyboard, the palette or a tab menu would
+    /// restart: the pane that has the keyboard, and only when another attempt can help.
+    ///
+    /// The other panes of a split tab are never touched; each has its own session.
+    pub(crate) fn reconnect_candidate(&self) -> Option<SessionId> {
+        self.active.filter(|id| self.may_reconnect_session(*id))
+    }
+
+    /// Whether one session has ended in a way another attempt can fix.
+    pub(crate) fn may_reconnect_session(&self, id: SessionId) -> bool {
+        self.workspace.session(id).is_some_and(may_reconnect)
+    }
+
+    /// Reconnects the pane that has the keyboard, in its own tab (R8).
+    ///
+    /// A live, connecting or closed session is left alone: the shortcut does nothing
+    /// rather than end something that is working.
+    pub(crate) fn reconnect_current(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.reconnect_candidate() {
+            self.reconnect_session(id, cx);
+        }
+    }
+
     /// What the credential store holds for a host, for tests.
     #[cfg(test)]
     pub fn saved_secret_for_test(&self, id: HostId) -> Option<String> {
@@ -8171,8 +8194,15 @@ impl ShelluneView {
     /// Dials the chain. A ProxyCommand stays unstarted until the user confirms it, and
     /// a trusted display channel is asked for only after its risks were accepted.
     fn dial_chain(&mut self, cx: &mut Context<Self>) {
+        // A reconnect is only checked here, never started: the record moves to
+        // "connecting" once, in `session_for_form`, right before its attempt exists.
+        // Moving it here as well made the second move fail, which left the tab
+        // claiming a connection nobody made and sent the next press to a new tab.
         if let Some(id) = self.reconnect
-            && !self.workspace.session_reconnecting(id)
+            && !self
+                .workspace
+                .session(id)
+                .is_some_and(|session| session.state().can_reconnect())
         {
             return;
         }
@@ -8286,7 +8316,12 @@ impl ShelluneView {
         cx.notify();
     }
 
-    /// The session this dial belongs to: a reconnect, a parked form, or a new record.
+    /// The session this dial belongs to: a reconnect, a parked form, a retry of the
+    /// form's own failed attempt, or a new record.
+    ///
+    /// A reconnect and a retry both stay in the tab they came from: the record is the
+    /// same, it moves to "connecting" exactly once here, and its generation moves on so
+    /// nothing from the previous attempt reaches the next one.
     fn session_for_form(&mut self, host: &HostConfig) -> Option<SessionId> {
         if let Some(id) = self.reconnect.take() {
             if !self.workspace.session_reconnecting(id) {
@@ -8297,6 +8332,14 @@ impl ShelluneView {
         if let Some(id) = self
             .form_session
             .filter(|id| self.attempt_index(*id).is_some())
+        {
+            return Some(id);
+        }
+        if let Some(id) = self.form_session.filter(|id| {
+            self.workspace.session(*id).is_some_and(|session| {
+                matches!(session.kind(), SessionKind::Remote { host: target } if *target == host.id())
+            })
+        }) && self.workspace.session_reconnecting(id)
         {
             return Some(id);
         }
@@ -9198,6 +9241,34 @@ impl ShelluneView {
         };
         self.form_session = Some(id);
         self.on_remote_failed(id, &error, cx);
+    }
+
+    /// Ends one real attempt the way its poll loop does when the server refuses it.
+    ///
+    /// Unlike [`Self::fail_remote_for_test`] this needs an attempt that was dialled
+    /// already, and it touches nothing else: the transport is closed and the reason is
+    /// written into the form and the session record.
+    #[cfg(test)]
+    pub(crate) fn fail_attempt_for_test(
+        &mut self,
+        id: SessionId,
+        error: shellune_ssh::ConnectError,
+        cx: &mut Context<Self>,
+    ) {
+        if self.attempt_index(id).is_none() {
+            return;
+        }
+        self.close_attempt_transport(id);
+        self.on_remote_failed(id, &error, cx);
+    }
+
+    /// The generation the attempt of one session was dialled for, while it runs.
+    #[cfg(test)]
+    pub(crate) fn attempt_generation_for_test(&self, id: SessionId) -> Option<u32> {
+        self.attempts
+            .iter()
+            .find(|attempt| attempt.id == id && attempt.link.is_some())
+            .map(|attempt| attempt.generation)
     }
 
     /// Records a jump-chain failure through the same path a hop uses.
@@ -17788,6 +17859,9 @@ impl Render for ShelluneView {
                     // and the next shortcut would otherwise go nowhere.
                     this.restore_focus(window, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ReconnectSession, _window, cx| {
+                this.reconnect_current(cx);
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
                 this.cycle_tab(1, window, cx);

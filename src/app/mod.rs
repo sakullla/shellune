@@ -86,6 +86,7 @@ pub mod actions {
             NewLocalShell,
             OpenPalette,
             CloseActiveTab,
+            ReconnectSession,
             NextTab,
             PreviousTab,
             SelectTab1,

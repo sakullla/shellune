@@ -2018,7 +2018,7 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
         Destination::PAGES.len()
             + 1
             + 6
-            + 4
+            + 5
             + crate::app::TAB_JUMP_COUNT
             + 2
             + 1
@@ -2029,7 +2029,7 @@ fn key_bindings_cover_every_destination_plus_the_shell_controls() {
             + 2
             + 3,
         "three pages and the settings comma, next and previous, zoom, new shell, language \
-         and dismiss; the palette, close tab, next and previous tab; one jump per \
+         and dismiss; the palette, close tab, reconnect, next and previous tab; one jump per \
          tab digit; split right and split down, zoom pane, focus, resize and move in \
          four directions, move tab left and right; the keyboard's upload and download; \
          and the three terminal actions (search, copy, paste)"
@@ -8443,6 +8443,366 @@ async fn a_remote_session_reconnects_through_the_form_without_replay(cx: &mut Te
         !screen.contains("first process"),
         "the new terminal starts empty instead of replaying the old screen: {screen:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A reconnect stays in its own tab, through the path a real click takes (R8)
+// ---------------------------------------------------------------------------
+
+/// One remote tab that connected through the form and then lost its server.
+///
+/// The host signs in with a remembered password on a port nothing serves: every dial
+/// after the first is the real one-click dial a saved host gets, through
+/// `connect_remote`'s chain, `dial_chain` and `session_for_form`, and the poll loop
+/// that would read the refusal never runs. The first connection is scripted because
+/// nothing could answer a real one; the password is remembered only after it.
+fn lost_remote_tab<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+    x11: X11Forwarding,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext, SessionId) {
+    use shellune_storage::SecretStore as _;
+    let mut host = stored_host("mirror", "127.0.0.1", 1, "deploy", None);
+    host.set_auth(Some(shellune_core::AuthMethodKind::Password));
+    host.set_remember_secret(true);
+    host.set_x11(x11);
+    let host_id = host.id();
+    seed(&dir.store(), vec![host]);
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    let shared: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let store = dir.store();
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_secrets_for_test(cx, workspace, store, shared)
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+
+    click(cx, "hosts.connect.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "nothing is remembered yet, so the form waits instead of dialling"
+    );
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.script_remote_attempt(
+                vec![
+                    shellune_ssh::RemoteEvent::Connected,
+                    shellune_ssh::RemoteEvent::Data(b"first process\r\n$ ".to_vec()),
+                ],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.pump_remote_once(cx);
+        });
+    });
+    cx.run_until_parked();
+    let id = cx
+        .update(|_window, app| view.read(app).active_session())
+        .expect("the connected session is on screen");
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the remote terminal exists");
+    let tag = cx.update(|_window, app| pane.read(app).tag());
+    cx.update(|_window, app| {
+        pane.update(app, |pane, cx| {
+            pane.adopt_events(
+                tag,
+                vec![SourceEvent::Lost("the channel was closed".to_owned())],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(matches!(
+        session_state(cx, &view, id),
+        Some(SessionState::Disconnected(_))
+    ));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![id]
+    );
+    secrets
+        .save(host_id, &shellune_core::SecretString::new("hunter2-secret"))
+        .expect("the password is kept");
+    (view, cx, id)
+}
+
+/// The remote sessions the window knows, whether or not they have a tab.
+fn remote_session_ids(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> Vec<SessionId> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .workspace()
+            .sessions()
+            .items()
+            .iter()
+            .filter(|session| session.kind().is_remote())
+            .map(|session| session.id())
+            .collect()
+    })
+}
+
+/// Asserts that the session is dialling again as its `generation`th attempt, in the
+/// one tab it always had.
+fn assert_redialled_in_place(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    id: SessionId,
+    generation: u32,
+    how: &str,
+) {
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![id],
+        "{how}: the tab keeps its place and no second tab is opened"
+    );
+    assert_eq!(
+        remote_session_ids(view, cx),
+        vec![id],
+        "{how}: no second session record was made"
+    );
+    assert_eq!(
+        session_state(cx, view, id),
+        Some(SessionState::Connecting),
+        "{how}: the original session is the one connecting"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .workspace()
+            .session(id)
+            .map(|session| session.generation())),
+        Some(generation),
+        "{how}: the record moved on exactly once"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).attempt_generation_for_test(id)),
+        Some(generation),
+        "{how}: an attempt was dialled for that generation"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        1,
+        "{how}: exactly one attempt is running"
+    );
+}
+
+/// Ends the running attempt of `id` the way a refusing server does.
+fn refuse_attempt(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: SessionId) {
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.fail_attempt_for_test(
+                id,
+                shellune_ssh::ConnectError::Refused {
+                    target: "127.0.0.1:1".to_owned(),
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// The reconnect shortcut of this platform, as the window binds it by default.
+fn reconnect_keystroke() -> String {
+    Keymap::defaults(Platform::current())
+        .keystroke("session.reconnect")
+        .expect("the reconnect has a default shortcut")
+        .to_owned()
+}
+
+#[gpui::test]
+async fn a_remote_reconnect_with_a_saved_password_dials_again_in_its_own_tab(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("reconnect-in-place");
+    let (view, cx, id) = lost_remote_tab(cx, &dir, X11Forwarding::Off);
+    go(cx, GoToLocalShells);
+
+    // The palette offers the reconnect of the pane on screen, with its shortcut.
+    cx.update(|_window, app| {
+        let view = view.read(app);
+        assert_eq!(view.reconnect_candidate(), Some(id));
+        assert!(
+            view.palette_shortcut(copy::ENGLISH.session_reconnect)
+                .is_some(),
+            "the palette lists the reconnect with the key that does it"
+        );
+    });
+
+    // The tab menu offers it too, and that is the press this test makes.
+    right_click(cx, "session.tab.0");
+    assert!(
+        cx.debug_bounds("tab.menu.reconnect").is_some(),
+        "an ended session's tab menu offers the reconnect"
+    );
+    click(cx, "tab.menu.reconnect");
+    assert_redialled_in_place(&view, cx, id, 1, "the tab menu");
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .remote_state()
+            .is_some_and(|panel| matches!(panel.status(), RemoteStatus::Connecting))),
+        "the form says it is connecting"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).reconnect_candidate()),
+        None,
+        "a session that is connecting is not offered another reconnect"
+    );
+
+    // The server refuses: the same tab says so and can be tried again.
+    refuse_attempt(&view, cx, id);
+    assert!(matches!(
+        session_state(cx, &view, id),
+        Some(SessionState::Failed(_))
+    ));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![id],
+        "a failed reconnect keeps its tab"
+    );
+
+    // The form's own retry dials in the same tab as well.
+    type_into(cx, "remote.password", "hunter2-secret");
+    click(cx, "remote.retry");
+    assert_redialled_in_place(&view, cx, id, 2, "the form's retry");
+
+    // And so does the shortcut, once that attempt failed too.
+    refuse_attempt(&view, cx, id);
+    cx.simulate_keystrokes(&reconnect_keystroke());
+    cx.run_until_parked();
+    assert_redialled_in_place(&view, cx, id, 3, "the shortcut");
+}
+
+#[gpui::test]
+async fn a_reconnect_that_asks_about_trusted_x11_first_still_dials_in_its_own_tab(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("reconnect-x11");
+    let (view, cx, id) = lost_remote_tab(cx, &dir, X11Forwarding::Trusted);
+
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.reconnect_session(id, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view
+            .read(app)
+            .remote_state()
+            .is_some_and(|panel| panel.status().x11_question().is_some())),
+        "the trusted display channel is asked about before anything is dialled"
+    );
+    assert!(
+        matches!(
+            session_state(cx, &view, id),
+            Some(SessionState::Disconnected(_))
+        ),
+        "nothing is connecting while the question is open"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "and nothing was dialled"
+    );
+
+    click(cx, "remote.x11.answer.restricted");
+    assert_redialled_in_place(&view, cx, id, 1, "the answered X11 question");
+}
+
+#[gpui::test]
+async fn reconnecting_one_pane_of_a_split_tab_leaves_the_other_pane_alone(cx: &mut TestAppContext) {
+    let Some((view, cx, left, right)) = split_tab(cx) else {
+        return;
+    };
+    let left_pane = cx
+        .update(|_window, app| view.read(app).pane_of(left).cloned())
+        .expect("the left pane has a terminal");
+    let right_pane = cx
+        .update(|_window, app| view.read(app).pane_of(right).cloned())
+        .expect("the right pane has a terminal");
+    let tag = cx.update(|_window, app| right_pane.read(app).tag());
+    cx.update(|_window, app| {
+        right_pane.update(app, |pane, cx| {
+            pane.adopt_events(tag, vec![SourceEvent::Lost("ended".to_owned())], cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(matches!(
+        session_state(cx, &view, right),
+        Some(SessionState::Disconnected(_))
+    ));
+    assert_eq!(
+        session_state(cx, &view, left),
+        Some(SessionState::Connected)
+    );
+
+    let keystroke = reconnect_keystroke();
+    cx.simulate_keystrokes(&keystroke);
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_leaf_sessions_for_test()),
+        vec![Some(left), Some(right)],
+        "both panes keep their places and their sessions"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs().len()),
+        1,
+        "the split is still one tab"
+    );
+    let generation = |cx: &mut VisualTestContext, id: SessionId| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .workspace()
+                .session(id)
+                .map(|session| session.generation())
+        })
+    };
+    assert_eq!(
+        generation(cx, right),
+        Some(1),
+        "the ended pane was reconnected"
+    );
+    assert_eq!(
+        generation(cx, left),
+        Some(0),
+        "the other pane was not touched"
+    );
+    let new_right = cx
+        .update(|_window, app| view.read(app).pane_of(right).cloned())
+        .expect("the reconnected pane has a terminal");
+    assert_ne!(new_right.entity_id(), right_pane.entity_id());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pane_of(left).map(|pane| pane.entity_id())),
+        Some(left_pane.entity_id()),
+        "the other pane keeps its own terminal"
+    );
+    assert_eq!(
+        session_state(cx, &view, left),
+        Some(SessionState::Connected)
+    );
+    assert_eq!(
+        session_state(cx, &view, right),
+        Some(SessionState::Connected)
+    );
+
+    // A live pane is not ended by the shortcut.
+    cx.simulate_keystrokes(&keystroke);
+    cx.run_until_parked();
+    assert_eq!(
+        generation(cx, right),
+        Some(1),
+        "a live session is left alone"
+    );
+    assert_eq!(generation(cx, left), Some(0));
 }
 
 // ---------------------------------------------------------------------------

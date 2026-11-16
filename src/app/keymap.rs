@@ -24,8 +24,8 @@ use crate::app::actions::{
     FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoToHosts, GoToLocalShells, GoToSettings,
     MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, MoveTabLeft, MoveTabRight,
     NewLocalShell, NextDestination, NextTab, OpenPalette, PreviousDestination, PreviousTab,
-    ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1, SelectTab2,
-    SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
+    ReconnectSession, ResizePaneDown, ResizePaneLeft, ResizePaneRight, ResizePaneUp, SelectTab1,
+    SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9,
     SplitPaneDown, SplitPaneRight, TerminalCopy, TerminalPaste, TerminalSearch, ToggleLanguage,
     ToggleSidebar, ZoomPane,
 };
@@ -287,6 +287,14 @@ pub const ACTIONS: &[ActionSpec] = &[
         name_en: "Close current session",
         name_zh: "关闭当前会话",
         defaults: &[DefaultKey::CloseSession],
+    },
+    ActionSpec {
+        id: "session.reconnect",
+        context: Context::Shell,
+        name_en: "Reconnect the current pane",
+        name_zh: "重新连接当前窗格",
+        // Shifted like the other window keys: Ctrl+R is the shell's history search.
+        defaults: &[DefaultKey::Modifier("shift-r")],
     },
     ActionSpec {
         id: "tab.next",
@@ -1028,6 +1036,7 @@ fn binding_for(spec: &'static ActionSpec, keystroke: &str) -> KeyBinding {
         "notice.dismiss" => KeyBinding::new(keystroke, DismissNotice, context),
         "palette.open" => KeyBinding::new(keystroke, OpenPalette, context),
         "tab.close" => KeyBinding::new(keystroke, CloseActiveTab, context),
+        "session.reconnect" => KeyBinding::new(keystroke, ReconnectSession, context),
         "tab.next" => KeyBinding::new(keystroke, NextTab, context),
         "tab.previous" => KeyBinding::new(keystroke, PreviousTab, context),
         "tab.move-left" => KeyBinding::new(keystroke, MoveTabLeft, context),
@@ -1445,6 +1454,24 @@ mod tests {
         let macos = Keymap::defaults(Platform::MacOs);
         assert_eq!(macos.keystroke("terminal.search"), Some("cmd-f"));
         assert_eq!(macos.label("terminal.search").as_deref(), Some("\u{2318}F"));
+    }
+
+    #[test]
+    fn the_reconnect_shortcut_is_shifted_and_reaches_past_a_terminal() {
+        // Ctrl+R is the shell's history search, so only the shifted form is taken, and
+        // the reconnect has to work while the ended terminal still has the keyboard.
+        let spec = action("session.reconnect").expect("the reconnect is in the catalogue");
+        assert_eq!(spec.context, Context::Shell);
+        for platform in [Platform::Windows, Platform::Linux] {
+            let keymap = Keymap::defaults(platform);
+            assert_eq!(keymap.keystroke("session.reconnect"), Some("ctrl-shift-r"));
+            assert_eq!(
+                keymap.label("session.reconnect").as_deref(),
+                Some("Ctrl+Shift+R")
+            );
+        }
+        let macos = Keymap::defaults(Platform::MacOs);
+        assert_eq!(macos.keystroke("session.reconnect"), Some("cmd-shift-r"));
     }
 
     #[test]

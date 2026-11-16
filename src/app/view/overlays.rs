@@ -427,6 +427,17 @@ impl ShelluneView {
             });
         }
 
+        if let Some(id) = self.reconnect_candidate() {
+            entries.push(Entry {
+                command: Command::Reconnect(id),
+                group: Group::Actions,
+                title: strings.session_reconnect.to_owned(),
+                detail: self.tab_title(id),
+                shortcut: self.keymap.label("session.reconnect"),
+                icon: Icon::Refresh,
+                current: false,
+            });
+        }
         if let Some(id) = self.active {
             entries.push(Entry {
                 command: Command::CloseTab(id),
@@ -662,6 +673,11 @@ impl ShelluneView {
             Command::ManageSnippets => self.open_snippets(false, cx),
             Command::NewSnippet => self.open_snippets(true, cx),
             Command::CloseTab(id) => self.request_close_session(id, cx),
+            Command::Reconnect(id) => {
+                if self.may_reconnect_session(id) {
+                    self.reconnect_session(id, cx);
+                }
+            }
             Command::RenameTab(id) => {
                 if let Some(tab) = self.workspace.tab_of_session(id) {
                     self.open_tab_rename(tab, window, cx);
@@ -1327,6 +1343,22 @@ impl ShelluneView {
         let has_others = tab_count > 1;
         let has_right = index + 1 < tab_count;
         let tab = self.workspace.tab_of_session(id);
+        // The tab is known by the pane that has its keyboard, so that is the one a
+        // reconnect restarts; the entry is only there when another attempt can help.
+        let reconnect = self.may_reconnect_session(id).then(|| {
+            item(
+                strings.session_reconnect,
+                "tab.menu.reconnect",
+                self.keymap.label("session.reconnect"),
+                true,
+            )
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                this.close_tab_menu(window, cx);
+                if this.may_reconnect_session(id) {
+                    this.reconnect_session(id, cx);
+                }
+            }))
+        });
         // The menu holds more than it used to (a name, the colours and the close
         // actions), so it caps its own height and scrolls: at 200% text in the
         // smallest window the last entry still has to be reachable (R4).
@@ -1347,6 +1379,9 @@ impl ShelluneView {
             .border_1()
             .border_color(theme::swatch(colors::BORDER_STRONG))
             .shadow_lg()
+            .when_some(reconnect, |menu, reconnect| {
+                menu.child(reconnect).child(divider())
+            })
             .child(
                 item(strings.tab_menu_duplicate, "tab.menu.duplicate", None, true).on_click(
                     cx.listener(move |this, _event, window, cx| {
