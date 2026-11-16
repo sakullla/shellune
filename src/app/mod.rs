@@ -13,6 +13,7 @@
 //! * [`workspace`] — the shell state and its honest section statuses;
 //! * [`snippets`] — the saved shortcut commands and the manager's own state (R6);
 //! * [`components`] — reusable view pieces;
+//! * [`update`] — where an update is and what each failure is called (R2, R3);
 //! * [`view`] — the composition the user actually sees.
 
 /// The batch task panel: its model, its preview and its run (R19, R21).
@@ -41,6 +42,9 @@ pub mod terminal;
 pub mod text_field;
 pub mod theme;
 pub mod transfers;
+/// Self-update: the stages of an update, its failures in words, and the seam the window
+/// calls the updater through (R2, R3).
+pub mod update;
 mod view;
 #[cfg(test)]
 pub use view::custom_titlebar as titlebar_for_test;

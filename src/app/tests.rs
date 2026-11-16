@@ -580,7 +580,19 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
         ),
         (
             "settings.category.about",
-            &[("version", "settings.row.about", &["status.version"][..])],
+            &[
+                ("version", "settings.row.about", &["status.version"][..]),
+                (
+                    "update",
+                    "settings.row.update-auto",
+                    &[
+                        "settings.update.auto.0",
+                        "settings.update.auto.1",
+                        "settings.update.check",
+                        "settings.update.status",
+                    ][..],
+                ),
+            ],
         ),
     ];
     for (category, items) in pages {
@@ -604,7 +616,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
             checked += 1;
         }
     }
-    assert_eq!(checked, 16, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
+    assert_eq!(checked, 17, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
     click(cx, "settings.category.terminal");
     click(cx, "settings.item.font-size");
     for selector in ["settings.font.less", "settings.font.more"] {
@@ -659,6 +671,7 @@ fn item_selector(item: &'static str) -> &'static str {
         "backup-import" => "settings.item.backup-import",
         // The sync page is named like its category, so the category is its row.
         "sync" => "settings.category.sync",
+        "update" => "settings.item.update",
         _ => "settings.item.version",
     }
 }
@@ -682,6 +695,7 @@ fn card_selector(item: &'static str) -> &'static str {
         "backup-import" => "settings.card.backup-import",
         "sync" => "settings.card.sync",
         "keys" => "settings.keys",
+        "update" => "settings.card.update",
         _ => "settings.card.version",
     }
 }
@@ -841,6 +855,7 @@ fn page_selector(item: &'static str) -> &'static str {
         "backup-export" => "settings.page.backup-export",
         "backup-import" => "settings.page.backup-import",
         "sync" => "settings.page.sync",
+        "update" => "settings.page.update",
         _ => "settings.page.version",
     }
 }
@@ -1067,7 +1082,7 @@ async fn the_minimum_window_reaches_every_settings_category_and_item_at_115_perc
         ("settings.category.keys", &["keys"][..]),
         ("settings.category.data", &["hosts-file", "import"][..]),
         ("settings.category.sync", &["sync"][..]),
-        ("settings.category.about", &["version"][..]),
+        ("settings.category.about", &["version", "update"][..]),
     ] {
         assert_within_width(bounds_of(cx, category), viewport, category);
         click(cx, category);
@@ -1082,7 +1097,7 @@ async fn the_minimum_window_reaches_every_settings_category_and_item_at_115_perc
             reached += 1;
         }
     }
-    assert_eq!(reached, 15, "not every settings item was reachable");
+    assert_eq!(reached, 16, "not every settings item was reachable");
 
     // The way out is on the page as it always was, so a person is never stranded here.
     assert_within_width(bounds_of(cx, "nav.hosts"), viewport, "the hosts entry");
@@ -5317,16 +5332,20 @@ struct TempDir {
 }
 
 impl TempDir {
+    /// A new directory in this run's own folder (see `scratch_run_root`), so a later run
+    /// with the same process id never reads it; it is removed when it is dropped.
     fn new(tag: &str) -> Self {
         static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "shellune-app-{}-{}-{tag}",
-            std::process::id(),
+        let path = crate::app::view::scratch_run_root().join(format!(
+            "dir-{}-{tag}",
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_file(&path);
         std::fs::create_dir_all(&path).expect("the test directory can be created");
+        // Dropping it removes it; what a window still held open then (a file view's
+        // folder) goes when the test's thread ends, after the window.
+        crate::app::view::remove_with_this_test(path.clone());
         Self { path }
     }
 
@@ -29923,4 +29942,740 @@ async fn an_empty_import_passphrase_is_asked_for_in_import_words(cx: &mut TestAp
         Some(copy::ENGLISH_BACKUP.import_passphrase_required.to_owned())
     );
     assert_eq!(backup_stage(&view, cx), Some("import.locked"));
+}
+
+// ---------------------------------------------------------------------------
+// Updates (R2, R3)
+// ---------------------------------------------------------------------------
+
+/// The release the update tests offer: far above any real version.
+const NEXT_VERSION: &str = "99.0.0";
+
+/// The window's update calls over a real updater that talks to a loopback server.
+///
+/// The check, the download and its signature check are the crate's own. The installer
+/// can be replaced by a fixed outcome - the Windows installer must not really start
+/// inside a test - and a restart is only recorded. Everything else, the portable swap
+/// included, is the real thing on files in a temporary folder.
+struct TestUpdates {
+    updater: shellune_update::Updater,
+    installer: Option<shellune_update::InstallOutcome>,
+    /// Runs when the install is called, and its answers are kept: what was on disk at
+    /// that moment.
+    probe: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    probed: std::sync::Mutex<Vec<bool>>,
+    relaunched: std::sync::Mutex<Vec<shellune_update::RestartTarget>>,
+}
+
+impl TestUpdates {
+    fn new(updater: shellune_update::Updater) -> Self {
+        Self {
+            updater,
+            installer: None,
+            probe: None,
+            probed: std::sync::Mutex::new(Vec::new()),
+            relaunched: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn relaunched(&self) -> Vec<shellune_update::RestartTarget> {
+        self.relaunched.lock().expect("the record").clone()
+    }
+
+    fn probed(&self) -> Vec<bool> {
+        self.probed.lock().expect("the record").clone()
+    }
+}
+
+impl crate::app::update::UpdateBackend for TestUpdates {
+    fn route(&self) -> shellune_update::InstallRoute {
+        self.updater.route().clone()
+    }
+
+    fn check(&self) -> Result<shellune_update::CheckOutcome, shellune_update::UpdateError> {
+        self.updater.check()
+    }
+
+    fn download(
+        &self,
+        release: &shellune_update::Release,
+        progress: &mut dyn FnMut(shellune_update::DownloadProgress),
+    ) -> Result<shellune_update::DownloadedUpdate, shellune_update::UpdateError> {
+        self.updater.download(release, progress)
+    }
+
+    fn install(
+        &self,
+        update: &shellune_update::DownloadedUpdate,
+    ) -> Result<shellune_update::InstallOutcome, shellune_update::UpdateError> {
+        if let Some(probe) = &self.probe {
+            self.probed.lock().expect("the record").push(probe());
+        }
+        match &self.installer {
+            // The Windows installer is not started inside a test; the file it would
+            // start is the verified download.
+            Some(outcome) => {
+                assert!(update.path().is_file(), "the verified file is there");
+                Ok(outcome.clone())
+            }
+            None => self.updater.install(update),
+        }
+    }
+
+    fn relaunch(&self, target: &shellune_update::RestartTarget) -> std::io::Result<()> {
+        self.relaunched
+            .lock()
+            .expect("the record")
+            .push(target.clone());
+        Ok(())
+    }
+
+    fn clean_up(&self) {
+        self.updater.clean_downloads();
+        crate::app::update::clean_portable_leftovers(self.updater.route());
+    }
+}
+
+/// A release server, a signing key and a folder holding the running "executable".
+struct UpdateFixture {
+    server: shellune_update::testing::HttpServer,
+    key: shellune_update::testing::TestKey,
+    folder: shellune_update::testing::TempFolder,
+    exe: PathBuf,
+}
+
+impl UpdateFixture {
+    fn new(label: &str) -> Self {
+        let folder = shellune_update::testing::TempFolder::new(label);
+        let exe = folder.path().join("shellune.exe");
+        std::fs::write(&exe, b"old shellune").expect("the running executable is written");
+        Self {
+            server: shellune_update::testing::HttpServer::start(),
+            key: shellune_update::testing::TestKey::generate(),
+            folder,
+            exe,
+        }
+    }
+
+    fn portable(&self) -> shellune_update::InstallRoute {
+        shellune_update::InstallRoute::WindowsPortable {
+            executable: self.exe.clone(),
+        }
+    }
+
+    fn installed(&self) -> shellune_update::InstallRoute {
+        shellune_update::InstallRoute::WindowsInstaller {
+            executable: self.exe.clone(),
+        }
+    }
+
+    fn downloads(&self) -> PathBuf {
+        self.folder.path().join("downloads")
+    }
+
+    fn updater(&self, route: shellune_update::InstallRoute) -> shellune_update::Updater {
+        shellune_update::Updater::new(shellune_update::testing::config(
+            self.server.url("latest.json"),
+            self.key.public_key(),
+            shellune_update::CURRENT_VERSION,
+            route,
+            &self.downloads(),
+        ))
+        .expect("the test key is usable")
+    }
+
+    /// The portable archive of the next version.
+    fn package() -> Vec<u8> {
+        shellune_update::testing::portable_zip("Shellune", b"new shellune")
+    }
+
+    /// Publishes `body` under `name` for `key`, with `signature` (`None`: signed right).
+    fn publish(
+        &self,
+        key: shellune_update::PlatformKey,
+        name: &str,
+        body: &[u8],
+        signature: Option<String>,
+    ) {
+        self.server.serve(name, body.to_vec());
+        let signature = signature.unwrap_or_else(|| self.key.sign(body, NEXT_VERSION));
+        self.server.serve(
+            "latest.json",
+            shellune_update::testing::manifest_json(
+                NEXT_VERSION,
+                Some("- Faster tabs\n- Signed updates"),
+                &[(key, self.server.url(name), signature)],
+            ),
+        );
+    }
+
+    fn publish_portable(&self, signature: Option<String>) {
+        self.publish(
+            shellune_update::PlatformKey::WindowsX86_64Portable,
+            "Shellune-portable.zip",
+            &Self::package(),
+            signature,
+        );
+    }
+
+    fn exe_bytes(&self) -> Vec<u8> {
+        std::fs::read(&self.exe).expect("the executable reads")
+    }
+
+    fn downloaded_files(&self) -> usize {
+        std::fs::read_dir(self.downloads()).map_or(0, |entries| entries.count())
+    }
+}
+
+/// A window on `destination` over `dir`, updating through `backend`.
+fn update_window<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+    backend: Arc<TestUpdates>,
+    destination: Destination,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(destination);
+    let store = dir.store();
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_update_for_test(cx, workspace, store, backend)
+    });
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// The stage's name, how many checks ended, and whether the window asked to exit.
+fn update_state(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+) -> (&'static str, usize, bool) {
+    cx.update(|_window, app| view.read(app).update_progress_for_test())
+}
+
+fn update_error(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> Option<String> {
+    cx.update(|_window, app| view.read(app).update_error_for_test())
+}
+
+/// Lets the delay before the automatic check run out, and the check finish.
+fn after_startup_delay(cx: &mut VisualTestContext) {
+    cx.executor()
+        .advance_clock(crate::app::update::STARTUP_CHECK_DELAY + std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+}
+
+/// Opens the update card in the settings.
+fn open_update_card(cx: &mut VisualTestContext) {
+    click(cx, "settings.category.about");
+    click(cx, "settings.item.update");
+    assert!(cx.debug_bounds("settings.card.update").is_some());
+}
+
+/// Checks by hand, from the card.
+fn check_now(cx: &mut VisualTestContext) {
+    open_update_card(cx);
+    click(cx, "settings.update.check");
+}
+
+#[gpui::test]
+async fn the_automatic_check_offers_a_new_release_and_its_chip_opens_the_card(
+    cx: &mut TestAppContext,
+) {
+    let fixture = UpdateFixture::new("auto");
+    fixture.publish_portable(None);
+    let dir = TempDir::new("update-auto");
+    let backend = Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
+    let (view, cx) = update_window(cx, &dir, backend, Destination::Hosts);
+    assert!(
+        fixture.server.requests().is_empty(),
+        "nothing is sent while the window starts"
+    );
+    assert!(cx.debug_bounds("topbar.update").is_none());
+
+    after_startup_delay(cx);
+    assert_eq!(update_state(&view, cx), ("available", 1, false));
+    assert_eq!(fixture.server.requests(), vec!["GET /latest.json"]);
+    assert!(
+        cx.debug_bounds("topbar.update").is_some(),
+        "a newer release is said in the top bar"
+    );
+
+    click(cx, "topbar.update");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().destination()),
+        Destination::Settings
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id()),
+        ("about", "update")
+    );
+    for selector in [
+        "settings.card.update",
+        "settings.update.available",
+        "settings.update.notes",
+        "settings.update.download",
+        "settings.update.release-page",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} is drawn");
+    }
+    assert_eq!(
+        fixture.exe_bytes(),
+        b"old shellune",
+        "nothing was installed"
+    );
+
+    // In the smallest window at the largest text the chip is a button of the top bar's
+    // size, and the window's own buttons stay inside the window.
+    show_settings_at_the_minimum_window_in_large_text(&view, cx);
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert_within_width(bounds_of(cx, "topbar.update"), viewport, "the update chip");
+    if cx.debug_bounds("window.controls").is_some() {
+        assert_within_width(
+            bounds_of(cx, "window.controls"),
+            viewport,
+            "the window buttons",
+        );
+    }
+}
+
+#[gpui::test]
+async fn an_automatic_check_fails_silently_and_a_manual_one_says_why(cx: &mut TestAppContext) {
+    let fixture = UpdateFixture::new("fails");
+    fixture.server.serve_status("latest.json", 503);
+    let dir = TempDir::new("update-fails");
+    let backend = Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
+    let (view, cx) = update_window(cx, &dir, backend, Destination::Settings);
+
+    after_startup_delay(cx);
+    assert_eq!(
+        update_state(&view, cx),
+        ("idle", 1, false),
+        "the check ran and its failure is not shown"
+    );
+    open_update_card(cx);
+    assert!(cx.debug_bounds("settings.update.error").is_none());
+    assert!(cx.debug_bounds("topbar.update").is_none());
+
+    click(cx, "settings.update.check");
+    assert_eq!(update_state(&view, cx), ("failed", 2, false));
+    assert_eq!(
+        update_error(&view, cx),
+        Some(copy::fill(
+            copy::ENGLISH_UPDATE.error_http,
+            &[("status", "503")]
+        ))
+    );
+    assert!(cx.debug_bounds("settings.update.error").is_some());
+    assert!(cx.debug_bounds("settings.update.retry").is_some());
+
+    // The server is back: trying again finds the release.
+    fixture.publish_portable(None);
+    click(cx, "settings.update.retry");
+    assert_eq!(update_state(&view, cx), ("available", 3, false));
+}
+
+#[gpui::test]
+async fn with_the_switch_off_the_start_sends_nothing_and_a_manual_check_still_works(
+    cx: &mut TestAppContext,
+) {
+    let fixture = UpdateFixture::new("off");
+    fixture.publish_portable(None);
+    let dir = TempDir::new("update-off");
+    let backend = Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
+    let (view, cx) = update_window(cx, &dir, backend, Destination::Settings);
+    open_update_card(cx);
+    click(cx, "settings.update.auto.1");
+    assert!(!cx.update(|_window, app| view.read(app).update_auto_check_for_test()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).current_preferences_for_test())
+            .auto_check_updates,
+        Some(false),
+        "the choice is what the preferences record"
+    );
+
+    after_startup_delay(cx);
+    assert!(
+        fixture.server.requests().is_empty(),
+        "with the switch off, the start sends nothing"
+    );
+    assert_eq!(update_state(&view, cx), ("idle", 0, false));
+
+    click(cx, "settings.update.check");
+    assert_eq!(update_state(&view, cx), ("available", 1, false));
+
+    // A saved choice is what the next start reads.
+    let saved = shellune_storage::Preferences {
+        auto_check_updates: Some(true),
+        ..Default::default()
+    };
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.use_saved_preferences_for_test(&saved, cx)
+        });
+    });
+    assert!(cx.update(|_window, app| view.read(app).update_auto_check_for_test()));
+}
+
+#[gpui::test]
+async fn a_saved_choice_to_not_check_keeps_the_start_quiet(cx: &mut TestAppContext) {
+    let fixture = UpdateFixture::new("saved-off");
+    fixture.publish_portable(None);
+    let dir = TempDir::new("update-saved-off");
+    let store = dir.store();
+    let (view, cx) = cx
+        .add_window_view(move |_window, cx| ShelluneView::with_store(cx, Workspace::new(), store));
+    let saved = shellune_storage::Preferences {
+        auto_check_updates: Some(false),
+        ..Default::default()
+    };
+    let backend: Arc<dyn crate::app::update::UpdateBackend> =
+        Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            // What a start reads from the file, then the updater the start hands over.
+            view.use_saved_preferences_for_test(&saved, cx);
+            view.use_update_backend_for_test(backend, cx);
+        });
+    });
+    cx.run_until_parked();
+    after_startup_delay(cx);
+    assert!(fixture.server.requests().is_empty());
+    assert_eq!(update_state(&view, cx), ("idle", 0, false));
+}
+
+#[gpui::test]
+async fn installing_asks_first_while_sessions_run_and_later_keeps_the_download(
+    cx: &mut TestAppContext,
+) {
+    let fixture = UpdateFixture::new("sessions");
+    fixture.publish_portable(None);
+    let dir = TempDir::new("update-sessions");
+    let backend = Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
+    let (view, cx) = update_window(cx, &dir, backend.clone(), Destination::Settings);
+    let (link, _device, _peer) = scripted_serial();
+    mount_scripted_serial(&view, cx, "Console cable", "COM9", false, link);
+    go(cx, crate::app::actions::GoToSettings);
+
+    check_now(cx);
+    click(cx, "settings.update.download");
+    assert_eq!(
+        update_state(&view, cx).0,
+        "ready",
+        "the file is downloaded and verified, and waits for the answer"
+    );
+    let lines = cx
+        .update(|_window, app| view.read(app).update_confirm_for_test())
+        .expect("the question is on screen");
+    assert_eq!(
+        lines,
+        vec![copy::fill(
+            copy::ENGLISH_UPDATE.confirm_serials,
+            &[("count", "1")]
+        )]
+    );
+    assert!(cx.debug_bounds("update.confirm.dialog").is_some());
+    assert!(cx.debug_bounds("update.confirm.line.0").is_some());
+
+    // Later: nothing is installed, and the download stays.
+    click(cx, "update.confirm.cancel");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).update_confirm_for_test()),
+        None,
+        "the question is gone"
+    );
+    assert_eq!(update_state(&view, cx), ("ready", 1, false));
+    assert_eq!(fixture.exe_bytes(), b"old shellune");
+    assert_eq!(fixture.downloaded_files(), 1, "the verified file is kept");
+    assert!(cx.debug_bounds("settings.update.install").is_some());
+
+    // Asked again, and confirmed: the portable executable is replaced in place.
+    click(cx, "settings.update.install");
+    assert!(cx.debug_bounds("update.confirm.dialog").is_some());
+    click(cx, "update.confirm.ok");
+    assert_eq!(update_state(&view, cx), ("restart", 1, false));
+    assert_eq!(fixture.exe_bytes(), b"new shellune");
+    let mut old = fixture.exe.clone().into_os_string();
+    old.push(".old");
+    assert_eq!(
+        std::fs::read(PathBuf::from(old)).expect("the previous executable is kept aside"),
+        b"old shellune"
+    );
+    assert!(cx.debug_bounds("settings.update.restart").is_some());
+    assert!(
+        backend.relaunched().is_empty(),
+        "nothing restarts without a press"
+    );
+
+    // The restart asks again, since the serial session still runs, then starts the new
+    // version and leaves.
+    click(cx, "settings.update.restart");
+    assert!(cx.debug_bounds("update.confirm.dialog").is_some());
+    click(cx, "update.confirm.ok");
+    assert_eq!(
+        backend.relaunched(),
+        vec![shellune_update::RestartTarget::Executable(
+            fixture.exe.clone()
+        )]
+    );
+    assert!(update_state(&view, cx).2, "the window exits");
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions())
+            .is_empty(),
+        "every session was closed on the way out"
+    );
+}
+
+#[gpui::test]
+async fn the_installer_route_starts_the_installer_and_exits(cx: &mut TestAppContext) {
+    let fixture = UpdateFixture::new("installer");
+    fixture.publish(
+        shellune_update::PlatformKey::WindowsX86_64,
+        "Shellune-setup.exe",
+        b"MZ a signed installer",
+        None,
+    );
+    let dir = TempDir::new("update-installer");
+    let mut backend = TestUpdates::new(fixture.updater(fixture.installed()));
+    backend.installer = Some(shellune_update::InstallOutcome::InstallerStarted);
+    let backend = Arc::new(backend);
+    let (view, cx) = update_window(cx, &dir, backend, Destination::Settings);
+
+    check_now(cx);
+    assert!(
+        cx.debug_bounds("settings.update.download").is_some(),
+        "the installed copy downloads the installer"
+    );
+    click(cx, "settings.update.download");
+    let (stage, _, exiting) = update_state(&view, cx);
+    assert_eq!(stage, "installing");
+    assert!(
+        exiting,
+        "nothing runs, so the installer starts at once and the window leaves"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).app_close_confirmed_for_test()),
+        "the exit is not asked about again"
+    );
+}
+
+#[gpui::test]
+async fn a_file_that_fails_its_signature_check_is_refused_and_nothing_changes(
+    cx: &mut TestAppContext,
+) {
+    let fixture = UpdateFixture::new("tampered");
+    let other = shellune_update::testing::TestKey::generate();
+    fixture.publish_portable(Some(other.sign(&UpdateFixture::package(), NEXT_VERSION)));
+    let dir = TempDir::new("update-tampered");
+    let backend = Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
+    let (view, cx) = update_window(cx, &dir, backend, Destination::Settings);
+
+    check_now(cx);
+    click(cx, "settings.update.download");
+    assert_eq!(update_state(&view, cx).0, "failed");
+    let error = update_error(&view, cx).expect("the failure is said");
+    assert!(
+        error.starts_with(copy::ENGLISH_UPDATE.error_signature_invalid),
+        "{error}"
+    );
+    assert!(cx.debug_bounds("settings.update.error").is_some());
+    assert!(
+        cx.debug_bounds("settings.update.unchanged").is_some(),
+        "the card says this copy was not changed"
+    );
+    assert_eq!(
+        fixture.exe_bytes(),
+        b"old shellune",
+        "the version is unchanged"
+    );
+    assert_eq!(
+        fixture.downloaded_files(),
+        0,
+        "the refused file was deleted"
+    );
+    assert!(
+        cx.debug_bounds("topbar.update").is_some(),
+        "the release is still known"
+    );
+
+    // Trying again downloads the same file again, and refuses it again.
+    click(cx, "settings.update.retry");
+    assert_eq!(update_error(&view, cx), Some(error.clone()));
+    assert_eq!(fixture.downloaded_files(), 0);
+
+    // Republished signed with the right key, but for another version: a new check
+    // reads it, and the download is refused and said otherwise.
+    fixture.publish_portable(Some(fixture.key.sign(&UpdateFixture::package(), "98.0.0")));
+    click(cx, "settings.update.check");
+    assert_eq!(update_state(&view, cx).0, "available");
+    click(cx, "settings.update.download");
+    let mismatch = update_error(&view, cx).expect("the failure is said");
+    assert_ne!(mismatch, error);
+    assert!(mismatch.contains("98.0.0"), "{mismatch}");
+    assert_eq!(fixture.exe_bytes(), b"old shellune");
+}
+
+#[gpui::test]
+async fn an_interrupted_download_is_said_as_such(cx: &mut TestAppContext) {
+    let fixture = UpdateFixture::new("interrupted");
+    let package = UpdateFixture::package();
+    fixture.publish_portable(None);
+    fixture
+        .server
+        .serve_truncated("Shellune-portable.zip", package.clone(), package.len() / 2);
+    let dir = TempDir::new("update-interrupted");
+    let backend = Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
+    let (view, cx) = update_window(cx, &dir, backend, Destination::Settings);
+
+    check_now(cx);
+    click(cx, "settings.update.download");
+    let error = update_error(&view, cx).expect("the failure is said");
+    assert!(
+        error.starts_with(copy::ENGLISH_UPDATE.error_interrupted),
+        "{error}"
+    );
+    assert_eq!(fixture.exe_bytes(), b"old shellune");
+    assert_eq!(
+        fixture.downloaded_files(),
+        0,
+        "the partial file was deleted"
+    );
+}
+
+#[gpui::test]
+async fn a_release_without_a_signature_or_a_file_for_this_copy_is_offered_on_its_page(
+    cx: &mut TestAppContext,
+) {
+    let fixture = UpdateFixture::new("page-only");
+    fixture.publish_portable(Some(String::new()));
+    let dir = TempDir::new("update-page-only");
+    let backend = Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
+    let (view, cx) = update_window(cx, &dir, backend, Destination::Settings);
+
+    check_now(cx);
+    assert_eq!(update_state(&view, cx).0, "available");
+    let missing = cx
+        .update(|_window, app| view.read(app).update_unavailable_for_test())
+        .expect("the reason is said");
+    assert_eq!(
+        missing,
+        copy::fill(
+            copy::ENGLISH_UPDATE.signature_missing_listed,
+            &[("platform", copy::ENGLISH_UPDATE.platform_windows_portable)]
+        )
+    );
+    assert!(cx.debug_bounds("settings.update.reason").is_some());
+    assert!(
+        cx.debug_bounds("settings.update.download").is_none(),
+        "an unsigned file is not offered for download"
+    );
+    click(cx, "settings.update.release-page");
+    assert_eq!(
+        cx.opened_url(),
+        Some(format!(
+            "{}/tag/v{NEXT_VERSION}",
+            shellune_update::RELEASES_URL
+        ))
+    );
+    assert!(
+        fixture
+            .server
+            .requests()
+            .iter()
+            .all(|request| !request.contains("portable.zip"))
+    );
+
+    // A release with nothing for this computer says that instead.
+    fixture.server.serve(
+        "latest.json",
+        shellune_update::testing::manifest_json(
+            NEXT_VERSION,
+            None,
+            &[(
+                shellune_update::PlatformKey::LinuxX86_64,
+                fixture.server.url("shellune.deb"),
+                "sig".to_owned(),
+            )],
+        ),
+    );
+    click(cx, "settings.update.check");
+    let no_asset = cx
+        .update(|_window, app| view.read(app).update_unavailable_for_test())
+        .expect("the reason is said");
+    assert_ne!(no_asset, missing);
+    assert_eq!(
+        no_asset,
+        copy::fill(
+            copy::ENGLISH_UPDATE.no_asset,
+            &[("platform", copy::ENGLISH_UPDATE.platform_windows_portable)]
+        )
+    );
+}
+
+/// An update that would exit while a sync holds the window's saves back (R3, R8): the
+/// installer is not started before the held edit is on disk.
+#[gpui::test]
+async fn an_update_waits_for_saves_held_by_a_sync_before_the_installer_starts(
+    cx: &mut TestAppContext,
+) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("update-held");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Settings);
+    let alpha = first_host_id(&view, cx);
+
+    let fixture = UpdateFixture::new("held");
+    fixture.publish(
+        shellune_update::PlatformKey::WindowsX86_64,
+        "Shellune-setup.exe",
+        b"MZ a signed installer",
+        None,
+    );
+    let mut backend = TestUpdates::new(fixture.updater(fixture.installed()));
+    backend.installer = Some(shellune_update::InstallOutcome::InstallerStarted);
+    let hosts = dir.store();
+    backend.probe = Some(Box::new(move || {
+        hosts.load().is_ok_and(|book| book.is_favorite(alpha))
+    }));
+    let backend = Arc::new(backend);
+    let handed: Arc<dyn crate::app::update::UpdateBackend> = backend.clone();
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.use_update_backend_for_test(handed, cx));
+    });
+    cx.run_until_parked();
+
+    // A check of the cloud has written its result; the window has not taken it in, so
+    // its saves are held back - and it saves a favourite in that gap.
+    hold_sync_finish(&view, cx);
+    after_poll(cx);
+    assert!(sync_finish_held(&view, cx));
+    assert!(data_writes_held(&view, cx));
+    toggle_favorite(&view, cx, alpha);
+
+    check_now(cx);
+    click(cx, "settings.update.download");
+    assert!(
+        cx.update(|_window, app| view.read(app).update_waiting_for_test()),
+        "the update waits for the held save"
+    );
+    assert_eq!(update_state(&view, cx).0, "ready");
+    assert!(!update_state(&view, cx).2, "the window does not exit yet");
+    assert!(backend.probed().is_empty(), "the installer was not started");
+
+    // The sync is taken in, the held favourite is written, and only then does the
+    // installer start and the window leave.
+    release_sync_finish(&view, cx);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(
+        backend.probed(),
+        vec![true],
+        "the favourite was on disk when the installer started"
+    );
+    assert!(update_state(&view, cx).2, "then the window exits");
 }

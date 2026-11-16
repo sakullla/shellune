@@ -202,6 +202,9 @@ impl ShelluneView {
             // A failed sync or a conflict waiting for an answer is said here, on every
             // page, and a press opens the sync settings (R8, R10).
             .children(self.sync_topbar_marker(cx))
+            // A newer release is said here on every page, and a press opens its card
+            // in the settings (R2).
+            .children(self.update_topbar_chip(cx))
             .child(trailing)
             .children(controls)
     }

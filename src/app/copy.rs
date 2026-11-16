@@ -2419,8 +2419,6 @@ pub struct UxStrings {
     pub settings_hosts_file: &'static str,
     /// Adds hosts from ~/.ssh/config after a preview
     pub settings_import_hint: &'static str,
-    /// About
-    pub settings_about: &'static str,
     /// Version
     pub settings_version: &'static str,
     /// Connection
@@ -3188,7 +3186,6 @@ impl UxStrings {
             self.settings_data,
             self.settings_hosts_file,
             self.settings_import_hint,
-            self.settings_about,
             self.settings_version,
             self.settings_connection,
             self.settings_connection_policy,
@@ -3594,7 +3591,6 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_data: "Data",
     settings_hosts_file: "Saved hosts",
     settings_import_hint: "Adds hosts from ~/.ssh/config after a preview",
-    settings_about: "About",
     settings_version: "Version",
     settings_connection: "Connection",
     settings_connection_policy: "Keepalive and timeout",
@@ -4015,7 +4011,6 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_data: "数据",
     settings_hosts_file: "主机文件",
     settings_import_hint: "预览后从 ~/.ssh/config 添加主机",
-    settings_about: "关于",
     settings_version: "版本",
     settings_connection: "连接",
     settings_connection_policy: "保活与超时",
@@ -4890,6 +4885,212 @@ pub fn sync_for(locale: Locale) -> &'static SyncStrings {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Updates (R2, R3)
+// ---------------------------------------------------------------------------
+
+/// Declares [`UpdateStrings`] and its two tables from one list, so a phrase cannot be
+/// added in one language and forgotten in the other.
+macro_rules! update_strings {
+    ($($(#[doc = $doc:literal])* $field:ident: $en:literal, $zh:literal;)*) => {
+        /// Strings of the about-and-updates page, the update chip and the question
+        /// asked before an install.
+        pub struct UpdateStrings {
+            $($(#[doc = $doc])* pub $field: &'static str,)*
+        }
+
+        impl UpdateStrings {
+            /// Every string of the table, in declaration order, for the completeness
+            /// test.
+            #[must_use]
+            #[cfg_attr(not(test), allow(dead_code))]
+            pub fn all(&self) -> Vec<&'static str> {
+                vec![$(self.$field),*]
+            }
+        }
+
+        /// The update strings in English.
+        pub static ENGLISH_UPDATE: UpdateStrings = UpdateStrings { $($field: $en,)* };
+        /// The update strings in Chinese.
+        pub static CHINESE_UPDATE: UpdateStrings = UpdateStrings { $($field: $zh,)* };
+    };
+}
+
+update_strings! {
+    /// Settings category: about and updates
+    settings_title: "About & updates", "关于与更新";
+    /// The update page in it
+    page_title: "Updates", "更新";
+    /// Under the page title
+    page_hint: "Shellune looks for new releases on GitHub. Every update file is checked against Shellune's signing key before anything is installed.",
+        "Shellune 从 GitHub 发布页查找新版本。任何更新文件都要先通过 Shellune 签名密钥的校验才会安装。";
+    /// Row: the running version
+    current_version: "Current version", "当前版本";
+    /// Switch: check automatically
+    auto: "Check for updates automatically", "自动检查更新";
+    /// Under it
+    auto_hint: "Once, about 20 seconds after Shellune starts. A choice of this computer only; it is not synced.",
+        "Shellune 启动约 20 秒后检查一次。仅对本机生效，不会同步。";
+    /// A switch that is on
+    on: "On", "开";
+    /// A switch that is off
+    off: "Off", "关";
+    /// Button: check now
+    check: "Check for updates", "检查更新";
+    /// While checking
+    checking: "Checking…", "正在检查…";
+    /// Not checked yet
+    status_idle: "Not checked since Shellune started.", "本次启动后尚未检查。";
+    /// The newest version
+    status_latest: "Shellune {version} is the newest version. Checked {date}.",
+        "已是最新版本（{version}），检查时间 {date}。";
+    /// Toast after a manual check: nothing new
+    toast_latest: "You have the newest version", "已是最新版本";
+    /// A newer release
+    available_title: "Shellune {version} is available", "发现新版本 Shellune {version}";
+    /// When it was published
+    available_date: "Published {date}", "发布于 {date}";
+    /// Heading of the notes
+    notes_label: "What's new", "更新说明";
+    /// No notes
+    no_notes: "This release has no notes here; the release page has the details.",
+        "此版本没有附带更新说明，详情见发布页。";
+    /// Button: download, then install
+    download_install: "Download and install", "下载并安装";
+    /// While downloading
+    downloading: "Downloading…", "正在下载…";
+    /// Progress with a known size
+    progress_of: "{percent}% · {done} of {total}", "{percent}% · 已下载 {done}，共 {total}";
+    /// Progress without one
+    progress_bytes: "{done} received", "已接收 {done}";
+    /// Downloaded and verified
+    ready: "Downloaded and verified. Ready to install.", "已下载并通过签名校验，等待安装。";
+    /// Button: install
+    install: "Install now", "立即安装";
+    /// While installing
+    installing: "Installing…", "正在安装…";
+    /// The Windows installer route
+    installer_note: "The installer runs silently: Shellune closes, and the new version starts by itself.",
+        "安装程序会静默运行：Shellune 将关闭，新版本会自动启动。";
+    /// Installed in place
+    restart_ready: "Shellune {version} is installed. Restart to use it.", "Shellune {version} 已安装，重启后生效。";
+    /// Button: restart
+    restart: "Restart now", "立即重启";
+    /// Button: the release page
+    release_page: "Open release page", "打开发布页";
+    /// Button: try again
+    retry: "Try again", "重试";
+    /// Failure heading: the check
+    failed_check: "Checking for updates failed", "检查更新失败";
+    /// Failure heading: the download
+    failed_download: "The update could not be downloaded", "更新下载失败";
+    /// Failure heading: the install
+    failed_install: "The update could not be installed", "更新安装失败";
+    /// Under every failure
+    unchanged: "Shellune {version} is still installed; nothing of it was changed.",
+        "当前仍是 Shellune {version}，未做任何改动。";
+    /// Only the release page: this packaging
+    manual_platform: "This installation is updated from the release page: download the new package there.",
+        "这种安装方式需要从发布页下载新版本手动更新。";
+    /// Only the release page: a debug build
+    manual_debug: "A development build does not install updates itself; download the release from its page.",
+        "开发构建不会自动安装更新，请从发布页下载。";
+    /// Only the release page: the folder cannot be written
+    manual_no_permission: "Shellune's folder cannot be written without administrator rights, so the update has to be installed from the release page.",
+        "Shellune 所在文件夹没有写入权限（需要管理员权限），请从发布页手动安装更新。";
+    /// Only the release page: no file for this computer
+    no_asset: "This release has no update file for {platform}, so it cannot be installed from here.",
+        "此版本没有适用于本机（{platform}）的更新文件，无法在此安装。";
+    /// Only the release page: the file is listed without a signature
+    signature_missing_listed: "The update file for {platform} is published without a signature, so it is not downloaded.",
+        "适用于本机（{platform}）的更新文件缺少签名，因此不会下载。";
+    /// Platform: Windows installer
+    platform_windows_installer: "Windows, installed", "Windows 安装版";
+    /// Platform: Windows portable
+    platform_windows_portable: "Windows, portable", "Windows 便携版";
+    /// Platform: macOS
+    platform_macos: "macOS, Apple silicon", "macOS（Apple 芯片）";
+    /// Platform: Linux
+    platform_linux: "Linux, deb package", "Linux（deb 包）";
+    /// Error: settings
+    error_config: "The update settings of this build cannot be used.", "此版本的更新设置无效。";
+    /// Error: the check went unanswered
+    error_check_timeout: "The update server did not answer in time.", "更新服务器响应超时。";
+    /// Error: the download went quiet
+    error_download_timeout: "The download timed out: the server stopped sending data. The partial file was deleted.",
+        "下载超时：服务器长时间没有发送数据。未完成的文件已删除。";
+    /// Error: unreachable
+    error_unreachable: "The update server could not be reached.", "无法连接到更新服务器。";
+    /// Error: HTTP status
+    error_http: "The update server answered HTTP {status}.", "更新服务器返回 HTTP {status}。";
+    /// Error: manifest
+    error_manifest: "The update information could not be read.", "无法读取更新信息。";
+    /// Error: no file for this computer
+    error_no_asset: "This release has no update file for this installation.", "此版本没有适用于本机的更新文件。";
+    /// Error: no signature
+    error_signature_missing: "The update file has no signature, so it was not downloaded.",
+        "更新文件缺少签名，已拒绝下载。";
+    /// Error: signature does not verify
+    error_signature_invalid: "Signature check failed: the downloaded file is not the one Shellune signed. It was deleted.",
+        "签名校验失败：下载的文件不是 Shellune 签名发布的文件，已删除。";
+    /// Error: signed for another version
+    error_version_mismatch: "Signature check failed: the file was signed for {signed}, not for version {expected}. It was deleted.",
+        "签名校验失败：文件的签名对应 {signed}，而不是版本 {expected}，已删除。";
+    /// Error: interrupted
+    error_interrupted: "The download was interrupted. The partial file was deleted.", "下载中断，未完成的文件已删除。";
+    /// Error: files
+    error_io: "An update file could not be read or written.", "无法读写更新文件。";
+    /// Error: install
+    error_install: "The update could not be put in place; the previous files were restored.",
+        "无法替换为新版本，已恢复原来的文件。";
+    /// Detail suffix
+    error_detail: "Details: {reason}", "详情：{reason}";
+    /// Top bar chip
+    chip: "New version v{version}", "新版本 v{version}";
+    /// Its tooltip
+    chip_hint: "Open About & updates", "打开关于与更新";
+    /// Question before installing
+    confirm_title: "Install the update now?", "现在安装更新？";
+    /// Question before restarting
+    confirm_restart_title: "Restart Shellune now?", "现在重启 Shellune？";
+    /// What the question says
+    confirm_intro: "These are still running and will be closed. Your tabs and layout are saved first and come back after the restart.",
+        "以下会话仍在运行，将会被关闭。标签与布局会先保存，重启后恢复。";
+    /// Count: terminals
+    confirm_terminals: "{count} terminal sessions", "{count} 个终端会话";
+    /// Count: transfers
+    confirm_transfers: "{count} file transfers", "{count} 个文件传输";
+    /// Count: remote desktops
+    confirm_desktops: "{count} remote desktops", "{count} 个远程桌面";
+    /// Count: serial sessions
+    confirm_serials: "{count} serial sessions", "{count} 个串口会话";
+    /// Button: install anyway
+    confirm_install: "Install and restart", "安装并重启";
+    /// Button: restart anyway
+    confirm_restart: "Restart", "重启";
+    /// Button: not now
+    later: "Later", "稍后";
+    /// Toast: the new version did not start
+    restart_failed: "The new version could not be started", "无法启动新版本";
+    /// Toast: waiting for held saves before installing
+    install_waits: "Saving your changes before the update", "正在保存修改，随后更新";
+    /// Its detail
+    install_waits_detail: "The update goes on as soon as the sync in progress ends and your changes are on disk.",
+        "当前同步结束、修改写入本机后，更新会继续进行。";
+    /// Toast: the update was called off because some edits were not kept
+    install_stopped: "The update was not installed so you can redo those changes",
+        "未进行更新，以便你重新进行这些修改";
+}
+
+/// The update strings of one language.
+#[must_use]
+pub fn update_for(locale: Locale) -> &'static UpdateStrings {
+    match locale {
+        Locale::English => &ENGLISH_UPDATE,
+        Locale::Chinese => &CHINESE_UPDATE,
+    }
+}
+
 /// Why a shortcut command cannot be saved, in a language.
 ///
 /// The domain crate words its refusals in English so they stay language-neutral; the
@@ -5044,6 +5245,32 @@ mod ux_tests {
                 "{version}",
                 "{date}",
                 "{reason}",
+            ] {
+                assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn both_update_tables_are_complete_and_translated() {
+        let english = ENGLISH_UPDATE.all();
+        let chinese = CHINESE_UPDATE.all();
+        assert_eq!(english.len(), chinese.len());
+        for (en, zh) in english.iter().zip(chinese.iter()) {
+            assert!(!en.trim().is_empty() && !zh.trim().is_empty());
+            assert_ne!(en, zh, "{en} is not translated");
+            for name in [
+                "{version}",
+                "{date}",
+                "{platform}",
+                "{count}",
+                "{reason}",
+                "{status}",
+                "{percent}",
+                "{done}",
+                "{total}",
+                "{expected}",
+                "{signed}",
             ] {
                 assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
             }

@@ -156,6 +156,14 @@ pub struct Preferences {
     /// reported as unreadable instead of being applied or quietly corrected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<ConnectionDefaults>,
+    /// Whether this computer looks for a new release a while after it starts (R2).
+    /// Absent means on.
+    ///
+    /// A choice about this installation, not about the user's data: it is in neither
+    /// the shared nor the per-platform part of a backup or sync document, so a pull or
+    /// an import keeps this computer's value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_check_updates: Option<bool>,
 }
 
 /// A preferences file at a known location.
@@ -264,9 +272,42 @@ mod tests {
             bell_notice: Some(false),
             command_notice: Some(true),
             connection: Some(ConnectionDefaults::new(45, 4, 12).expect("valid defaults")),
+            auto_check_updates: Some(false),
         };
         store.save(&preferences).expect("saves");
         assert_eq!(store.load(), preferences);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_update_check_choice_stays_on_this_computer() {
+        // A file written before the field existed says nothing, which means on.
+        let dir = scratch("auto-check");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let store = PreferencesStore::at(&dir);
+        std::fs::write(store.path(), br#"{"theme":"dark"}"#).expect("write");
+        assert_eq!(store.load().auto_check_updates, None);
+
+        // The choice is not part of what a backup or a sync carries, and applying such a
+        // document - merged or replacing - keeps this computer's value.
+        let local = Preferences {
+            theme: Some("light".to_owned()),
+            auto_check_updates: Some(false),
+            ..Preferences::default()
+        };
+        let shared = crate::portable::SharedPreferences::from_preferences(&Preferences {
+            theme: Some("dark".to_owned()),
+            auto_check_updates: Some(true),
+            ..Preferences::default()
+        });
+        let json = serde_json::to_string(&shared).expect("encodes");
+        assert!(!json.contains("auto_check"), "{json}");
+        for only_set in [true, false] {
+            let mut applied = local.clone();
+            shared.apply_to(&mut applied, only_set);
+            assert_eq!(applied.theme.as_deref(), Some("dark"));
+            assert_eq!(applied.auto_check_updates, Some(false));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

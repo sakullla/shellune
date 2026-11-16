@@ -1943,6 +1943,67 @@ fn sync_conflict_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     }
 }
 
+/// Opens the update card with a fixed newer release on offer, with its notes (R2). The
+/// window has no updater, so nothing is sent and nothing can be downloaded.
+fn show_update_available(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::Update)?;
+    view.capture_update_available(cx);
+    Ok(())
+}
+
+fn update_available_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("about", "update"))?;
+    match view.capture_update_stage() {
+        "available" => Ok(()),
+        other => Err(format!(
+            "the update card is {other}, not offering a release"
+        )),
+    }
+}
+
+/// Two local shells and a saved host are open when the install is asked for: the
+/// question counts them (R3). None of them runs a process or a connection.
+fn show_update_confirm(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    add_session(view, window, cx, SHOT_SHELL, TRANSCRIPT.as_bytes())?;
+    add_session(
+        view,
+        window,
+        cx,
+        SHOT_SPLIT_SHELL,
+        SPLIT_TRANSCRIPT.as_bytes(),
+    )?;
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.attach_capture_remote_session(
+        &host,
+        b"$ uptime\r\n 09:20:11 up 12 days\r\n$ ",
+        Some(window),
+        cx,
+    );
+    view.capture_update_confirm(window, cx);
+    Ok(())
+}
+
+fn update_confirm_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if !view.capture_update_confirm_open() {
+        return Err("the question before the install is not open".to_owned());
+    }
+    match view.capture_update_confirm_lines() {
+        0 => Err("the question lists no running session".to_owned()),
+        _ => Ok(()),
+    }
+}
+
 fn settings_connection_custom_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     settings_page_is_on(view, ("connection", "policy"))?;
     let defaults = view.connection_defaults();
@@ -2800,6 +2861,46 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_sync_conflict,
         install: show_sync_conflict,
         ready: sync_conflict_ready,
+    },
+    Scenario {
+        id: "settings-update-available",
+        title: "设置 · 关于与更新（发现新版本）",
+        category: Category::Settings,
+        fixture: "a fixed release one minor version above this build, with four lines of \
+                  notes and a signed portable file listed; the window has no updater",
+        evidence: "shows the automatic-check switch, the check button and the card of a \
+                   release on offer: version, date, notes, download and release page, plus \
+                   the new-version chip in the top bar; nothing was sent, and checking, \
+                   downloading, verifying and installing are proved by the GPUI tests \
+                   against a loopback release server",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: seed_hosts,
+        install: show_update_available,
+        ready: update_available_ready,
+    },
+    Scenario {
+        id: "update-confirm-sessions",
+        title: "浮层 · 安装更新前确认活动会话",
+        category: Category::Overlay,
+        fixture: "two local shells and a saved host on display-only panes, and the release \
+                  fixture of settings-update-available",
+        evidence: "shows the question asked before an install while sessions run and the \
+                   counts it lists; no process, connection or device is behind the panes, \
+                   nothing is installed, and both answers are proved by the GPUI tests",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().chinese().smallest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: seed_hosts,
+        install: show_update_confirm,
+        ready: update_confirm_ready,
     },
     Scenario {
         id: "overlay-palette",

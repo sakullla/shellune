@@ -101,6 +101,7 @@ mod shell;
 mod sync;
 mod titlebar;
 mod toasts;
+mod update;
 
 // The steps a desktop pane reports, for the tests that check the tab, the session
 // bar and the pane all say the same thing (R19).
@@ -614,6 +615,9 @@ pub struct ShelluneView {
     /// WebDAV sync: its settings, the job running in the background, the conflict
     /// question and the marker (R7, R8, R10).
     sync: sync::SyncCenter,
+    /// Self-update: the automatic check, the update card, the chip and the question
+    /// before an install (R2, R3).
+    update: update::UpdateCenter,
     /// Whether the private key files saved hosts name exist here, for the list (R9).
     key_presence: crate::app::hosts::KeyPresence,
     /// The manager's own keyboard target, so its list answers the arrow keys while no
@@ -2308,6 +2312,12 @@ impl ShelluneView {
             snippet_focus_pending: None,
             field_focus_pending: None,
             sync: sync_center,
+            // A capture draws offline, so it never has an updater to call.
+            update: update::UpdateCenter::new(if online {
+                default_update_backend()
+            } else {
+                Ok(None)
+            }),
             key_presence: crate::app::hosts::KeyPresence::new(),
             snippet_focus: cx.focus_handle(),
             forward_listen_host,
@@ -2449,6 +2459,9 @@ impl ShelluneView {
         // Every store is loaded: automatic sync pulls now, when a server is saved and
         // the switch is on, and nothing is sent otherwise (R8).
         view.start_sync(cx);
+        // Old update files are removed, and one check runs a while after the window
+        // opened when the automatic switch is on (R2).
+        view.start_updates(cx);
         view
     }
 
@@ -2549,6 +2562,9 @@ impl ShelluneView {
             self.workspace
                 .set_attention(AttentionKind::CommandFinished, command);
         }
+        // A file written before the switch existed means on (R2).
+        self.update
+            .set_auto_check(saved.auto_check_updates.unwrap_or(true));
         self.saved_preferences = Some(self.current_preferences());
     }
 
@@ -2614,6 +2630,8 @@ impl ShelluneView {
                     .as_ref()
                     .and_then(|saved| saved.connection)
             }),
+            // This computer's own choice; a backup or a sync does not carry it (R2).
+            auto_check_updates: Some(self.update.auto_check()),
         }
     }
 
@@ -11174,6 +11192,12 @@ impl ShelluneView {
         }
         // The sync conflict question: Escape is "not now", which changes nothing and
         // keeps the conflict until it is answered (R10).
+        // The question before an update: Escape is "later", and the update keeps
+        // waiting where it was (R3).
+        if self.update_confirm_open() {
+            self.cancel_update_confirm(cx);
+            return true;
+        }
         if self.sync_dialog_open() {
             self.resolve_sync_conflict(shellune_sync::Resolution::Cancel, cx);
             return true;
@@ -17886,6 +17910,7 @@ impl Render for ShelluneView {
             .children(self.group_dialog_overlay(window, cx))
             .children(self.backup_overlay(window, cx))
             .children(self.sync_overlay(window, cx))
+            .children(self.update_overlay(window, cx))
             .children(self.custom_shell_overlay(window, cx))
             .children(self.shell_menu_overlay(window, cx))
             .children(self.files_menu_overlay(window, cx))
@@ -18301,6 +18326,28 @@ fn default_secrets() -> std::sync::Arc<dyn SecretStore> {
     std::sync::Arc::new(shellune_storage::SystemSecrets)
 }
 
+/// The updater of the running copy; an unusable update setting is kept as the reason
+/// the page shows.
+#[cfg(not(test))]
+fn default_update_backend() -> Result<
+    Option<std::sync::Arc<dyn crate::app::update::UpdateBackend>>,
+    shellune_update::UpdateError,
+> {
+    shellune_update::Updater::from_environment().map(|updater| {
+        Some(std::sync::Arc::new(updater) as std::sync::Arc<dyn crate::app::update::UpdateBackend>)
+    })
+}
+
+/// None: a test window never reaches the release server unless the test hands it a
+/// backend of its own.
+#[cfg(test)]
+fn default_update_backend() -> Result<
+    Option<std::sync::Arc<dyn crate::app::update::UpdateBackend>>,
+    shellune_update::UpdateError,
+> {
+    Ok(None)
+}
+
 /// Memory only, so a test never reads or writes the machine's credential store.
 #[cfg(test)]
 fn default_secrets() -> std::sync::Arc<dyn SecretStore> {
@@ -18319,18 +18366,64 @@ fn default_trust() -> TrustStore {
     TrustStore::at(scratch_store().root())
 }
 
-/// A store in a directory of its own, unique to this test process.
+/// A store in a directory of its own, unique to this run of the tests, removed when the
+/// test that asked for it ends.
 #[cfg(test)]
 pub(crate) fn scratch_store() -> HostStore {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-    let unique = format!(
-        "shellune-app-{}-{}",
-        std::process::id(),
+    let dir = scratch_run_root().join(format!(
+        "store-{}",
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    );
-    HostStore::at(std::env::temp_dir().join(unique))
+    ));
+    remove_with_this_test(dir.clone());
+    HostStore::at(dir)
+}
+
+/// The folder every scratch directory of this test process lives in.
+///
+/// The name carries the process id *and* the time the process asked first, so a later
+/// run that is given the same process id never finds the files of an earlier one: a
+/// directory left by a run that was killed is never read as this run's data.
+#[cfg(test)]
+pub(crate) fn scratch_run_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        std::env::temp_dir().join(format!(
+            "shellune-app-run-{}-{started:x}",
+            std::process::id()
+        ))
+    })
+}
+
+/// Removes `dir` when the current test ends.
+///
+/// Every test runs on a thread of its own, and a thread's locals are dropped when it
+/// ends, after the test's window and stores are gone: that is the "test end" this
+/// hangs on, without a cleanup call in each of the tests.
+#[cfg(test)]
+pub(crate) fn remove_with_this_test(dir: std::path::PathBuf) {
+    struct ScratchDirs(RefCell<Vec<std::path::PathBuf>>);
+
+    impl Drop for ScratchDirs {
+        fn drop(&mut self) {
+            for dir in self.0.get_mut().drain(..) {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            // The run's folder goes with its last directory; while another test still
+            // has one in it, this does nothing.
+            let _ = std::fs::remove_dir(scratch_run_root());
+        }
+    }
+
+    thread_local! {
+        static SCRATCH_DIRS: ScratchDirs = const { ScratchDirs(RefCell::new(Vec::new())) };
+    }
+    let _ = SCRATCH_DIRS.try_with(|dirs| dirs.0.borrow_mut().push(dir));
 }
 
 /// A byte count as people read it: 12 B, 3.4 KB, 120 MB.

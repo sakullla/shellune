@@ -47,7 +47,7 @@ pub(super) enum Category {
     Data,
     /// WebDAV sync: the server, automatic sync and the status (R7, R8).
     Sync,
-    /// Name, tagline and version.
+    /// Name, tagline and version, and the updates (R2, R3).
     About,
 }
 
@@ -71,6 +71,7 @@ pub(crate) enum Item {
     ImportBackup,
     Sync,
     Version,
+    Update,
 }
 
 /// The items of every category, in the order the navigation lists them.
@@ -86,7 +87,7 @@ const DATA: [Item; 4] = [
     Item::ImportBackup,
 ];
 const SYNC: [Item; 1] = [Item::Sync];
-const ABOUT: [Item; 1] = [Item::Version];
+const ABOUT: [Item; 2] = [Item::Version, Item::Update];
 
 impl Category {
     /// Every category, in the order the navigation lists them.
@@ -148,7 +149,7 @@ impl Category {
             Self::Keys => ux.settings_keys,
             Self::Data => ux.settings_data,
             Self::Sync => copy::sync_for(locale).settings_title,
-            Self::About => ux.settings_about,
+            Self::About => copy::update_for(locale).settings_title,
         }
     }
 }
@@ -166,8 +167,17 @@ impl Item {
                 Category::Data
             }
             Self::Sync => Category::Sync,
-            Self::Version => Category::About,
+            Self::Version | Self::Update => Category::About,
         }
+    }
+
+    /// Whether the item is a page of several rows with a block of its own, rather than
+    /// one row of its category's shared card.
+    pub(super) fn own_page(self) -> bool {
+        matches!(
+            self,
+            Self::Shortcuts | Self::Policy | Self::Sync | Self::Update
+        )
     }
 
     /// Stable identifier, used by the page and card selectors.
@@ -190,6 +200,7 @@ impl Item {
             Self::ImportBackup => "backup-import",
             Self::Sync => "sync",
             Self::Version => "version",
+            Self::Update => "update",
         }
     }
 
@@ -214,6 +225,7 @@ impl Item {
             Self::ImportBackup => copy::backup_for(locale).settings_import,
             Self::Sync => copy::sync_for(locale).settings_title,
             Self::Version => ux.settings_version,
+            Self::Update => copy::update_for(locale).page_title,
         }
     }
 
@@ -238,6 +250,7 @@ impl Item {
             Self::ImportBackup => copy::backup_for(locale).settings_import_hint,
             Self::Sync => copy::sync_for(locale).settings_hint,
             Self::Version => "",
+            Self::Update => copy::update_for(locale).page_hint,
         }
     }
 }
@@ -488,7 +501,7 @@ impl ShelluneView {
             .items()
             .iter()
             .copied()
-            .filter(|item| !matches!(item, Item::Shortcuts | Item::Policy | Item::Sync))
+            .filter(|item| !item.own_page())
             .collect();
         if !simple.is_empty() {
             let count = simple.len();
@@ -546,16 +559,17 @@ impl ShelluneView {
         }
         for item in category.items() {
             let item = *item;
-            if !matches!(item, Item::Shortcuts | Item::Policy | Item::Sync) {
+            if !item.own_page() {
                 continue;
             }
             let chosen = item == shown;
             let selector = format!("settings.page.{}", item.id());
             // A category of one page named like the category needs no second heading.
             let named = !Self::single_named_item(category, locale);
-            let hint = match item {
-                Item::Shortcuts | Item::Policy | Item::Sync => item.hint(locale),
-                _ => "",
+            let hint = if item.own_page() {
+                item.hint(locale)
+            } else {
+                ""
             };
             section = section.child(
                 div()
@@ -886,6 +900,7 @@ impl ShelluneView {
             Item::Shortcuts => self.settings_keys_page(cx),
             Item::Policy => self.settings_connection_page(cx),
             Item::Sync => self.sync_settings_page(cx),
+            Item::Update => self.update_settings_page(cx),
             _ => self.settings_item_row(item, cx),
         }
     }
@@ -894,7 +909,7 @@ impl ShelluneView {
     fn settings_item_row(&self, item: Item, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         match item {
-            Item::Shortcuts | Item::Policy | Item::Sync => self.settings_item_body(item, cx),
+            item if item.own_page() => self.settings_item_body(item, cx),
             Item::HostsFile => self.settings_row(
                 "hosts-file",
                 copy::ux().settings_hosts_file,
@@ -1031,9 +1046,12 @@ impl ShelluneView {
                 })),
             ),
             // These have a page of their own, and a page is never built as one row.
-            Item::Shortcuts | Item::Policy | Item::Sync | Item::HostsFile | Item::Version => {
-                div().flex().flex_col()
-            }
+            Item::Shortcuts
+            | Item::Policy
+            | Item::Sync
+            | Item::Update
+            | Item::HostsFile
+            | Item::Version => div().flex().flex_col(),
         }
     }
 
@@ -1890,7 +1908,12 @@ impl ShelluneView {
     }
 
     /// Opens one item of one category.
-    fn settings_select_item(&mut self, category: Category, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn settings_select_item(
+        &mut self,
+        category: Category,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
         self.settings_nav.category = category;
         self.settings_nav.set_item(category, index);
         self.settings_nav.nav_focus = false;

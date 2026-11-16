@@ -202,6 +202,9 @@ pub(super) struct SyncCenter {
     conflict_dismissed: bool,
     /// How many jobs ended, for the tests.
     finished: usize,
+    /// How many releases of held saves could not keep every edit (some dropped, or none
+    /// written). An update that waited for the saves reads it to call itself off.
+    held_lost: u64,
     /// The window's saves held back while a writer runs.
     gate: Option<DataGate>,
     /// A backup import is being applied; it shares the slot with the jobs.
@@ -515,6 +518,7 @@ impl SyncCenter {
             dialog: false,
             conflict_dismissed: false,
             finished: 0,
+            held_lost: 0,
             gate: None,
             backup_running: false,
             waiting_backup: None,
@@ -773,6 +777,12 @@ impl ShelluneView {
         self.sync.gate.is_some()
     }
 
+    /// How many releases of held saves so far could not keep every edit. A caller that
+    /// waited for the saves compares it with the count from before it waited.
+    pub(super) fn held_writes_lost_count(&self) -> u64 {
+        self.sync.held_lost
+    }
+
     /// Whether saves the window already showed are held back and not yet on disk.
     pub(super) fn held_writes_pending(&self) -> bool {
         self.sync
@@ -942,6 +952,9 @@ impl ShelluneView {
                 Some(copy::fill(strings.error_detail, &[("reason", reason)])),
                 cx,
             );
+        }
+        if !held.dropped.is_empty() || held.failed.is_some() {
+            self.sync.held_lost += 1;
         }
         // A close that waited for these saves does not hide that some were not kept:
         // the window stays so the notices above can be read.
