@@ -544,6 +544,16 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
                     &["settings.paths"][..],
                 ),
                 ("import", "settings.row.import", &["settings.import"][..]),
+                (
+                    "backup-export",
+                    "settings.row.backup-export",
+                    &["settings.backup.export"][..],
+                ),
+                (
+                    "backup-import",
+                    "settings.row.backup-import",
+                    &["settings.backup.import"][..],
+                ),
             ],
         ),
         (
@@ -572,7 +582,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
             checked += 1;
         }
     }
-    assert_eq!(checked, 13, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
+    assert_eq!(checked, 15, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
     click(cx, "settings.category.terminal");
     click(cx, "settings.item.font-size");
     for selector in ["settings.font.less", "settings.font.more"] {
@@ -623,6 +633,8 @@ fn item_selector(item: &'static str) -> &'static str {
         "keys" => "settings.category.keys",
         "hosts-file" => "settings.item.hosts-file",
         "import" => "settings.item.import",
+        "backup-export" => "settings.item.backup-export",
+        "backup-import" => "settings.item.backup-import",
         _ => "settings.item.version",
     }
 }
@@ -642,6 +654,8 @@ fn card_selector(item: &'static str) -> &'static str {
         "finished-notice" => "settings.card.finished-notice",
         "hosts-file" => "settings.card.hosts-file",
         "import" => "settings.card.import",
+        "backup-export" => "settings.card.backup-export",
+        "backup-import" => "settings.card.backup-import",
         "keys" => "settings.keys",
         _ => "settings.card.version",
     }
@@ -799,6 +813,8 @@ fn page_selector(item: &'static str) -> &'static str {
         "keys" => "settings.page.keys",
         "hosts-file" => "settings.page.hosts-file",
         "import" => "settings.page.import",
+        "backup-export" => "settings.page.backup-export",
+        "backup-import" => "settings.page.backup-import",
         _ => "settings.page.version",
     }
 }
@@ -28097,5 +28113,749 @@ async fn the_minimum_window_at_two_hundred_percent_keeps_the_bar_and_the_filters
         bounds_of(cx, "hosts.toolbar"),
         viewport,
         "the list's filters after scrolling the page",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Backup export and import (R5, R6, R9)
+// ---------------------------------------------------------------------------
+
+/// A host that signs in with a password and remembers it.
+fn password_host(name: &str, address: &str) -> HostConfig {
+    let mut host = stored_host(name, address, 22, "deploy", None);
+    host.set_auth(Some(shellune_core::AuthMethodKind::Password));
+    host.set_remember_secret(true);
+    host
+}
+
+/// Writes a backup of `hosts` to `path`, as another machine would have exported it,
+/// with the passwords in `secrets` sealed under `passphrase` when one is given.
+fn write_backup(
+    path: &std::path::Path,
+    hosts: Vec<HostConfig>,
+    passphrase: Option<&str>,
+    secrets: &[(HostId, &str)],
+) {
+    let mut local = shellune_storage::LocalState::default();
+    for host in hosts {
+        local
+            .hosts
+            .apply(&HostEdit::create(host))
+            .expect("the host is inserted");
+    }
+    write_backup_of(
+        path,
+        &local,
+        shellune_storage::Platform::current(),
+        passphrase,
+        secrets,
+    );
+}
+
+/// Writes a backup of a whole local state, as a machine of `platform` exports it.
+fn write_backup_of(
+    path: &std::path::Path,
+    local: &shellune_storage::LocalState,
+    platform: shellune_storage::Platform,
+    passphrase: Option<&str>,
+    secrets: &[(HostId, &str)],
+) {
+    use shellune_storage::SecretStore as _;
+    let store = shellune_storage::MemorySecrets::new();
+    for (id, secret) in secrets {
+        store
+            .save(*id, &shellune_core::SecretString::new(*secret))
+            .expect("the password is kept");
+    }
+    let mut options = shellune_storage::ExportOptions::new(platform);
+    options.kdf = shellune_storage::KdfParams::new(8, 1, 1).expect("a cheap cost is accepted");
+    if let Some(passphrase) = passphrase {
+        options = options.with_passphrase(shellune_core::SecretString::new(passphrase));
+    }
+    shellune_storage::ShelluneData::export(local, &options, &store, None)
+        .expect("the backup is made")
+        .document
+        .write_to(path)
+        .expect("the backup is written");
+}
+
+/// The names of the saved hosts the window shows, sorted.
+fn host_names(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|_window, app| {
+        let mut names: Vec<String> = view
+            .read(app)
+            .book()
+            .hosts()
+            .iter()
+            .map(|host| host.name().to_owned())
+            .collect();
+        names.sort();
+        names
+    })
+}
+
+/// Which backup dialog is open, and at what stage.
+fn backup_stage(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> Option<&'static str> {
+    cx.update(|_window, app| view.read(app).backup_stage())
+}
+
+/// Reads a backup file as if the file chooser had returned it.
+fn read_backup(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, path: &std::path::Path) {
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.read_backup_for_test(path, cx));
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn exporting_a_backup_asks_for_one_passphrase_twice_and_names_unreadable_passwords(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("backup-export");
+    let prod = password_host("prod", "10.0.0.1");
+    let lab = password_host("lab", "10.0.0.2");
+    let prod_id = prod.id();
+    seed(&dir.store(), vec![prod, lab]);
+    let (view, cx) = settings_view(cx, &dir);
+    // Only prod's password is in the credential store; lab remembers one the store does
+    // not have, which the export reports by name rather than silently leaving out.
+    cx.update(|_window, app| {
+        view.read(app)
+            .secrets_for_test()
+            .save(prod_id, &shellune_core::SecretString::new("hunter2-secret"))
+            .expect("the password is kept");
+    });
+
+    click(cx, "settings.category.data");
+    click(cx, "settings.backup.export");
+    assert_eq!(backup_stage(&view, cx), Some("export"));
+    assert!(
+        cx.debug_bounds("backup.export.plain").is_some(),
+        "without the box ticked the dialog says no password goes along"
+    );
+
+    // Ticking the box asks for the passphrase, and the export cannot start without it.
+    click(cx, "backup.export.secrets");
+    assert!(cx.debug_bounds("backup.export.passphrase").is_some());
+    assert!(cx.debug_bounds("backup.export.confirm").is_some());
+    assert!(cx.debug_bounds("backup.export.refusal").is_some());
+    click(cx, "backup.export.save");
+    assert!(
+        !cx.did_prompt_for_new_path(),
+        "no file is asked for while the passphrase is missing"
+    );
+
+    // Two different passphrases are refused as well.
+    type_into(cx, "backup.export.passphrase", "pass-one");
+    type_into(cx, "backup.export.confirm", "pass-two");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).export_refusal_for_test(app)),
+        Some(copy::ENGLISH_BACKUP.passphrase_mismatch)
+    );
+    assert!(cx.debug_bounds("backup.export.refusal").is_some());
+    click(cx, "backup.export.save");
+    assert!(!cx.did_prompt_for_new_path());
+
+    // The same passphrase twice lets the save dialog open.
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).export_passphrases_for_test(app)),
+        Some(("pass-one".to_owned(), "pass-two".to_owned()))
+    );
+    clear_field(cx, "backup.export.confirm", 8);
+    type_into(cx, "backup.export.confirm", "pass-one");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).export_passphrases_for_test(app)),
+        Some(("pass-one".to_owned(), "pass-one".to_owned()))
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).export_refusal_for_test(app)),
+        None
+    );
+    click(cx, "backup.export.save");
+    assert!(
+        cx.did_prompt_for_new_path(),
+        "the system's save dialog opens"
+    );
+    let target = dir.path().join("my-backup.json");
+    let chosen = target.clone();
+    cx.simulate_new_path_selection(move |_directory| Some(chosen));
+    cx.run_until_parked();
+
+    assert_eq!(backup_stage(&view, cx), Some("export.done"));
+    let (path, secrets, unreadable, missing) = cx
+        .update(|_window, app| view.read(app).export_report_for_test())
+        .expect("the dialog reports what it wrote");
+    assert_eq!(path, target);
+    assert_eq!(secrets, Some(1), "prod's password is in the file");
+    assert!(unreadable.is_empty(), "the store answered every read");
+    assert_eq!(
+        missing,
+        vec!["lab".to_owned()],
+        "lab's is named as missing from the store"
+    );
+    assert!(cx.debug_bounds("backup.export.report").is_some());
+    assert!(cx.debug_bounds("backup.export.missing").is_some());
+
+    // The file holds the password only sealed, and the passphrase opens it.
+    let text = std::fs::read_to_string(&target).expect("the backup was written");
+    assert!(
+        !text.contains("hunter2-secret"),
+        "no password in clear text"
+    );
+    let document = shellune_storage::ShelluneData::read(&target).expect("the backup reads");
+    assert!(document.has_secrets());
+    assert_eq!(document.shared().hosts().hosts().len(), 2);
+    let bundle = document
+        .open_secrets(&shellune_core::SecretString::new("pass-one"))
+        .expect("the passphrase opens the passwords");
+    assert_eq!(
+        bundle.get(prod_id).map(shellune_core::SecretString::expose),
+        Some("hunter2-secret")
+    );
+}
+
+#[gpui::test]
+async fn an_export_without_passwords_writes_none(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-export-plain");
+    let prod = password_host("prod", "10.0.0.1");
+    let prod_id = prod.id();
+    seed(&dir.store(), vec![prod]);
+    let (view, cx) = settings_view(cx, &dir);
+    cx.update(|_window, app| {
+        view.read(app)
+            .secrets_for_test()
+            .save(prod_id, &shellune_core::SecretString::new("hunter2-secret"))
+            .expect("the password is kept");
+    });
+    click(cx, "settings.category.data");
+    click(cx, "settings.backup.export");
+    click(cx, "backup.export.save");
+    let target = dir.path().join("plain.json");
+    let chosen = target.clone();
+    cx.simulate_new_path_selection(move |_directory| Some(chosen));
+    cx.run_until_parked();
+    let (_, secrets, unreadable, missing) = cx
+        .update(|_window, app| view.read(app).export_report_for_test())
+        .expect("the dialog reports what it wrote");
+    assert_eq!(secrets, None);
+    assert!(
+        unreadable.is_empty() && missing.is_empty(),
+        "no password was asked for"
+    );
+    let text = std::fs::read_to_string(&target).expect("the backup was written");
+    assert!(!text.contains("hunter2-secret"));
+    assert!(
+        !shellune_storage::ShelluneData::read(&target)
+            .expect("the backup reads")
+            .has_secrets()
+    );
+}
+
+#[gpui::test]
+async fn importing_a_backup_previews_the_counts_then_merges_and_reloads_the_lists(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("backup-merge");
+    seed(
+        &dir.store(),
+        vec![stored_host("gamma", "10.0.0.3", 22, "root", None)],
+    );
+    let backup = dir.path().join("from-elsewhere.json");
+    let mut alpha = stored_host("alpha", "10.0.0.1", 22, "root", Some("prod"));
+    alpha.set_auth(Some(shellune_core::AuthMethodKind::KeyFile));
+    alpha.set_identity_file(Some("/nowhere/shellune-test/id_missing"));
+    let beta = stored_host("beta", "10.0.0.2", 22, "root", None);
+    write_backup(&backup, vec![alpha, beta], None, &[]);
+    let (view, cx) = settings_view(cx, &dir);
+
+    read_backup(&view, cx, &backup);
+    assert_eq!(backup_stage(&view, cx), Some("import.preview"));
+    let (hosts, _groups, _snippets, secrets, missing) = cx
+        .update(|_window, app| view.read(app).backup_preview_for_test())
+        .expect("the preview is on screen");
+    assert_eq!((hosts.added, hosts.updated, hosts.removed), (2, 0, 0));
+    assert_eq!(secrets, 0);
+    assert_eq!(
+        missing,
+        vec!["/nowhere/shellune-test/id_missing".to_owned()],
+        "the private key that is not on this computer is named"
+    );
+    for selector in [
+        "backup.import.source",
+        "backup.count.hosts",
+        "backup.count.groups",
+        "backup.count.secrets",
+        "backup.import.keys",
+        "backup.mode",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the preview does not draw {selector}"
+        );
+    }
+    assert_eq!(
+        host_names(&view, cx),
+        vec!["gamma"],
+        "a preview writes nothing"
+    );
+
+    click(cx, "backup.import.apply");
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    assert_eq!(
+        host_names(&view, cx),
+        vec!["alpha", "beta", "gamma"],
+        "the list shows the merged hosts without a restart"
+    );
+    let saved = dir.store().load().expect("the host file reads");
+    assert_eq!(saved.hosts().len(), 3);
+    assert!(
+        dir.path()
+            .join(shellune_storage::SNAPSHOT_DIRECTORY)
+            .is_dir(),
+        "the previous files were copied aside first"
+    );
+    click(cx, "backup.import.done");
+    assert_eq!(backup_stage(&view, cx), None);
+}
+
+#[gpui::test]
+async fn a_replace_asks_a_second_time_and_then_takes_the_file_as_a_whole(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-replace");
+    seed(
+        &dir.store(),
+        vec![stored_host("gamma", "10.0.0.3", 22, "root", None)],
+    );
+    let backup = dir.path().join("replace.json");
+    write_backup(
+        &backup,
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "root", None),
+            stored_host("beta", "10.0.0.2", 22, "root", None),
+        ],
+        None,
+        &[],
+    );
+    let (view, cx) = settings_view(cx, &dir);
+    read_backup(&view, cx, &backup);
+
+    click(cx, "backup.mode.1");
+    let (hosts, ..) = cx
+        .update(|_window, app| view.read(app).backup_preview_for_test())
+        .expect("the preview is on screen");
+    assert_eq!(
+        (hosts.added, hosts.removed),
+        (2, 1),
+        "replace counts gamma as removed"
+    );
+
+    // The first press only asks.
+    click(cx, "backup.import.apply");
+    assert_eq!(backup_stage(&view, cx), Some("import.preview"));
+    assert!(cx.debug_bounds("backup.import.confirm").is_some());
+    assert_eq!(
+        host_names(&view, cx),
+        vec!["gamma"],
+        "nothing was written yet"
+    );
+
+    // Going back to merge drops the question, so choosing replace again asks again
+    // rather than writing on the first press. (A drawn selector stays in the test
+    // window's map, so the question is read from the state, not from its absence.)
+    click(cx, "backup.mode.0");
+    click(cx, "backup.mode.1");
+    click(cx, "backup.import.apply");
+    assert_eq!(backup_stage(&view, cx), Some("import.preview"));
+    assert_eq!(host_names(&view, cx), vec!["gamma"], "still asking");
+
+    click(cx, "backup.import.apply");
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    assert_eq!(host_names(&view, cx), vec!["alpha", "beta"]);
+    assert_eq!(dir.store().load().expect("reads").hosts().len(), 2);
+}
+
+#[gpui::test]
+async fn a_wrong_passphrase_stays_on_the_question_and_changes_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-locked");
+    seed(
+        &dir.store(),
+        vec![stored_host("gamma", "10.0.0.3", 22, "root", None)],
+    );
+    let hosts_file = dir.path().join(shellune_storage::FILE_NAME);
+    let before = std::fs::read(&hosts_file).expect("the host file exists");
+    let backup = dir.path().join("locked.json");
+    let alpha = password_host("alpha", "10.0.0.1");
+    let alpha_id = alpha.id();
+    write_backup(
+        &backup,
+        vec![alpha],
+        Some("right horse"),
+        &[(alpha_id, "alpha-password")],
+    );
+    let (view, cx) = settings_view(cx, &dir);
+    read_backup(&view, cx, &backup);
+    assert_eq!(backup_stage(&view, cx), Some("import.locked"));
+
+    type_into(cx, "backup.import.passphrase", "wrong horse");
+    click(cx, "backup.import.unlock");
+    assert_eq!(
+        backup_stage(&view, cx),
+        Some("import.locked"),
+        "a wrong passphrase stays on the question"
+    );
+    let message = cx
+        .update(|_window, app| view.read(app).backup_message_for_test())
+        .expect("the reason is shown");
+    assert_eq!(message, copy::ENGLISH_BACKUP.wrong_passphrase);
+    assert!(cx.debug_bounds("backup.import.problem").is_some());
+    assert_eq!(
+        std::fs::read(&hosts_file).expect("the host file exists"),
+        before,
+        "nothing was written"
+    );
+    assert!(
+        !dir.path()
+            .join(shellune_storage::SNAPSHOT_DIRECTORY)
+            .exists(),
+        "not even a snapshot"
+    );
+    assert_eq!(host_names(&view, cx), vec!["gamma"]);
+
+    // The right passphrase opens the preview, and applying it keeps the password here.
+    type_into(cx, "backup.import.passphrase", "right horse");
+    click(cx, "backup.import.unlock");
+    assert_eq!(backup_stage(&view, cx), Some("import.preview"));
+    let (.., secrets, _) = cx
+        .update(|_window, app| view.read(app).backup_preview_for_test())
+        .expect("the preview is on screen");
+    assert_eq!(secrets, 1);
+    click(cx, "backup.import.apply");
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    let saved = cx.update(|_window, app| {
+        view.read(app)
+            .secrets_for_test()
+            .load(alpha_id)
+            .expect("the store answers")
+    });
+    assert_eq!(
+        saved.as_ref().map(shellune_core::SecretString::expose),
+        Some("alpha-password")
+    );
+    assert_eq!(host_names(&view, cx), vec!["alpha", "gamma"]);
+}
+
+#[gpui::test]
+async fn a_damaged_or_newer_backup_is_refused_and_nothing_is_written(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-refused");
+    seed(
+        &dir.store(),
+        vec![stored_host("gamma", "10.0.0.3", 22, "root", None)],
+    );
+    let hosts_file = dir.path().join(shellune_storage::FILE_NAME);
+    let before = std::fs::read(&hosts_file).expect("the host file exists");
+    let (view, cx) = settings_view(cx, &dir);
+
+    let damaged = concat!(
+        r#"{"format":"shellune-data","version":1,"created_unix":1,"#,
+        r#""source_platform":"linux","source_app_version":"0.4.7"}"#
+    );
+    let cases = [
+        (
+            "not-json.json",
+            "{ this is not json",
+            copy::ENGLISH_BACKUP.error_not_backup,
+        ),
+        (
+            "newer.json",
+            r#"{"format":"shellune-data","version":2}"#,
+            "format 2",
+        ),
+        ("damaged.json", damaged, copy::ENGLISH_BACKUP.error_corrupt),
+    ];
+    for (name, content, expected) in cases {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).expect("the test writes the file");
+        read_backup(&view, cx, &path);
+        assert_eq!(backup_stage(&view, cx), Some("import.refused"), "{name}");
+        let message = cx
+            .update(|_window, app| view.read(app).backup_message_for_test())
+            .expect("the reason is shown");
+        assert!(message.contains(expected), "{name}: {message}");
+        assert!(cx.debug_bounds("backup.import.refused").is_some());
+        click(cx, "backup.import.done");
+        assert_eq!(backup_stage(&view, cx), None);
+    }
+    assert_eq!(std::fs::read(&hosts_file).expect("exists"), before);
+    assert!(
+        !dir.path()
+            .join(shellune_storage::SNAPSHOT_DIRECTORY)
+            .exists()
+    );
+    assert_eq!(host_names(&view, cx), vec!["gamma"]);
+}
+
+#[gpui::test]
+async fn escape_closes_a_backup_dialog_without_writing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-escape");
+    let (view, cx) = settings_view(cx, &dir);
+    click(cx, "settings.category.data");
+    click(cx, "settings.backup.export");
+    click(cx, "backup.export.secrets");
+    type_into(cx, "backup.export.passphrase", "abc");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(backup_stage(&view, cx), None);
+}
+
+#[gpui::test]
+async fn the_empty_home_offers_to_restore_from_a_backup(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-home");
+    let (_view, cx) = hosts_view(cx, dir.store());
+    assert!(
+        cx.debug_bounds("hosts.empty.restore").is_some(),
+        "the first-run card offers the backup beside the SSH import"
+    );
+    assert!(cx.debug_bounds("hosts.import.open").is_some());
+}
+
+#[gpui::test]
+async fn a_replace_removes_the_passwords_of_connections_it_drops_and_names_them(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("backup-forget");
+    let prod = password_host("prod", "10.0.0.9");
+    let prod_id = prod.id();
+    seed(&dir.store(), vec![prod]);
+    let backup = dir.path().join("without-prod.json");
+    write_backup(
+        &backup,
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+        None,
+        &[],
+    );
+    let (view, cx) = settings_view(cx, &dir);
+    cx.update(|_window, app| {
+        view.read(app)
+            .secrets_for_test()
+            .save(prod_id, &shellune_core::SecretString::new("prod-password"))
+            .expect("the password is kept");
+    });
+    read_backup(&view, cx, &backup);
+
+    // A merge keeps prod, and with it its password.
+    let (forget, ..) = cx
+        .update(|_window, app| view.read(app).backup_notes_for_test())
+        .expect("the preview is on screen");
+    assert!(forget.is_empty(), "a merge removes no password");
+
+    click(cx, "backup.mode.1");
+    let (forget, ..) = cx
+        .update(|_window, app| view.read(app).backup_notes_for_test())
+        .expect("the preview is on screen");
+    assert_eq!(
+        forget,
+        vec!["prod".to_owned()],
+        "the preview names the password a replace removes"
+    );
+    assert!(cx.debug_bounds("backup.import.forget").is_some());
+
+    click(cx, "backup.import.apply");
+    click(cx, "backup.import.apply");
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).backup_applied_for_test()),
+        Some((0, Vec::new())),
+        "nothing was saved and the store removed what it was asked to"
+    );
+    let left = cx.update(|_window, app| {
+        view.read(app)
+            .secrets_for_test()
+            .load(prod_id)
+            .expect("the store answers")
+    });
+    assert!(left.is_none(), "prod's password is gone with prod");
+    assert_eq!(host_names(&view, cx), vec!["alpha"]);
+}
+
+#[gpui::test]
+async fn data_saved_after_the_preview_is_planned_again_and_not_written_over(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("backup-changed");
+    seed(
+        &dir.store(),
+        vec![stored_host("gamma", "10.0.0.3", 22, "root", None)],
+    );
+    let backup = dir.path().join("merge.json");
+    write_backup(
+        &backup,
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+        None,
+        &[],
+    );
+    let (view, cx) = settings_view(cx, &dir);
+    read_backup(&view, cx, &backup);
+
+    // Another save lands between the preview and the press.
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("gamma", "10.0.0.3", 22, "root", None),
+            stored_host("delta", "10.0.0.4", 22, "root", None),
+        ],
+    );
+    click(cx, "backup.import.apply");
+    assert_eq!(
+        backup_stage(&view, cx),
+        Some("import.preview"),
+        "the dialog stays on a preview of the data as it is now"
+    );
+    let message = cx
+        .update(|_window, app| view.read(app).backup_message_for_test())
+        .expect("the dialog says why");
+    assert_eq!(message, copy::ENGLISH_BACKUP.error_changed);
+    let mut on_disk: Vec<String> = dir
+        .store()
+        .load()
+        .expect("reads")
+        .hosts()
+        .iter()
+        .map(|host| host.name().to_owned())
+        .collect();
+    on_disk.sort();
+    assert_eq!(on_disk, vec!["delta", "gamma"], "nothing was written over");
+
+    click(cx, "backup.import.apply");
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    assert_eq!(
+        host_names(&view, cx),
+        vec!["alpha", "delta", "gamma"],
+        "the save that came in between is kept"
+    );
+}
+
+#[gpui::test]
+async fn the_preview_names_servers_whose_key_differs_and_paths_from_another_platform(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("backup-notes");
+    seed(
+        &dir.store(),
+        vec![stored_host("gamma", "10.0.0.3", 22, "root", None)],
+    );
+    let key = |byte: u8| {
+        HostKey::new(
+            "ssh-ed25519",
+            presented_key(byte).fingerprint,
+            presented_key(byte).public_key,
+        )
+        .expect("a valid identity")
+    };
+    let mut here = shellune_storage::HostTrust::new();
+    here.accept("10.0.0.5", 22, &key(1), 1)
+        .expect("the identity is accepted");
+    TrustStore::at(dir.path())
+        .save(&here)
+        .expect("the trust file is written");
+
+    // A machine of another platform made the backup: it has no section for this one,
+    // so alpha's key path is the one that machine used.
+    let key_file = dir.path().join("id_alpha");
+    std::fs::write(&key_file, "not a real key").expect("the test writes the file");
+    let key_path = key_file.display().to_string();
+    let mut alpha = stored_host("alpha", "10.0.0.1", 22, "root", None);
+    alpha.set_auth(Some(shellune_core::AuthMethodKind::KeyFile));
+    alpha.set_identity_file(Some(key_path.clone()));
+    let mut local = shellune_storage::LocalState::default();
+    local
+        .hosts
+        .apply(&HostEdit::create(alpha))
+        .expect("the host is inserted");
+    local
+        .known_hosts
+        .accept("10.0.0.5", 22, &key(2), 1)
+        .expect("the identity is accepted");
+    let other = shellune_storage::Platform::ALL
+        .into_iter()
+        .find(|platform| *platform != shellune_storage::Platform::current())
+        .expect("there is another platform");
+    let backup = dir.path().join("other-platform.json");
+    write_backup_of(&backup, &local, other, None, &[]);
+
+    let (view, cx) = settings_view(cx, &dir);
+    read_backup(&view, cx, &backup);
+    let (_, trust, fallbacks) = cx
+        .update(|_window, app| view.read(app).backup_notes_for_test())
+        .expect("the preview is on screen");
+    assert_eq!(trust, vec!["10.0.0.5:22".to_owned()]);
+    assert_eq!(fallbacks, vec![key_path]);
+    assert!(cx.debug_bounds("backup.import.trust").is_some());
+    assert!(
+        cx.debug_bounds("backup.import.fallbacks").is_some(),
+        "a path that exists here is still named as coming from the other machine"
+    );
+
+    // A merge keeps this machine's identity of the server.
+    click(cx, "backup.import.apply");
+    assert_eq!(backup_stage(&view, cx), Some("import.applied"));
+    let kept = TrustStore::at(dir.path())
+        .load()
+        .expect("the trust file reads");
+    assert_eq!(
+        kept.entry("10.0.0.5", 22)
+            .map(|entry| entry.fingerprint().to_owned()),
+        Some(presented_key(1).fingerprint)
+    );
+}
+
+#[gpui::test]
+async fn a_group_card_in_a_short_window_scrolls_the_page_to_the_narrowed_list(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("group-card-scroll");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "root", Some("Prod")),
+            stored_host("beta", "10.0.0.2", 22, "root", Some("Prod")),
+            stored_host("gamma", "10.0.0.3", 22, "root", Some("Stage")),
+        ],
+    );
+    let store = dir.store();
+    let trust = TrustStore::at(dir.path());
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_store_and_trust(cx, workspace, store, trust)
+    });
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(minimum_window());
+    focus_root(&view, cx);
+    cx.dispatch_action(CycleTextSize);
+    cx.dispatch_action(CycleTextSize);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().zoom()),
+        Zoom::Largest
+    );
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let card = bounds_of(cx, "home.group.0");
+    assert!(
+        card.center().y < viewport.height,
+        "the first group card can be pressed on the first screen: {card:?}"
+    );
+    let before = bounds_of(cx, "hosts.toolbar");
+
+    click(cx, "home.group.0");
+    cx.run_until_parked();
+    let after = bounds_of(cx, "hosts.toolbar");
+    assert!(
+        after.top() < before.top(),
+        "the page moved to the list: {before:?} -> {after:?}"
+    );
+    // The filters are taller than the window at this size; the page brings their
+    // start to the top of what is visible.
+    assert!(
+        after.top() >= px(0.0) && after.top() < viewport.height / 4.0,
+        "the narrowed list starts near the top of the window: {after:?}"
     );
 }

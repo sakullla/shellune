@@ -43,7 +43,7 @@ pub(super) enum Category {
     Notices,
     /// The action catalogue and the keys in force.
     Keys,
-    /// Where the hosts are saved, and the SSH import.
+    /// Where the hosts are saved, the SSH import, and the backup export and import.
     Data,
     /// Name, tagline and version.
     About,
@@ -65,6 +65,8 @@ pub(crate) enum Item {
     Shortcuts,
     HostsFile,
     Import,
+    ExportBackup,
+    ImportBackup,
     Version,
 }
 
@@ -74,7 +76,12 @@ const TERMINAL: [Item; 3] = [Item::Scheme, Item::FontSize, Item::DefaultShell];
 const CONNECTION: [Item; 1] = [Item::Policy];
 const NOTICES: [Item; 2] = [Item::BellNotice, Item::FinishedNotice];
 const KEYS: [Item; 1] = [Item::Shortcuts];
-const DATA: [Item; 2] = [Item::HostsFile, Item::Import];
+const DATA: [Item; 4] = [
+    Item::HostsFile,
+    Item::Import,
+    Item::ExportBackup,
+    Item::ImportBackup,
+];
 const ABOUT: [Item; 1] = [Item::Version];
 
 impl Category {
@@ -147,7 +154,9 @@ impl Item {
             Self::Policy => Category::Connection,
             Self::BellNotice | Self::FinishedNotice => Category::Notices,
             Self::Shortcuts => Category::Keys,
-            Self::HostsFile | Self::Import => Category::Data,
+            Self::HostsFile | Self::Import | Self::ExportBackup | Self::ImportBackup => {
+                Category::Data
+            }
             Self::Version => Category::About,
         }
     }
@@ -168,6 +177,8 @@ impl Item {
             Self::Shortcuts => "keys",
             Self::HostsFile => "hosts-file",
             Self::Import => "import",
+            Self::ExportBackup => "backup-export",
+            Self::ImportBackup => "backup-import",
             Self::Version => "version",
         }
     }
@@ -189,6 +200,8 @@ impl Item {
             Self::Shortcuts => ux.settings_keys,
             Self::HostsFile => ux.settings_hosts_file,
             Self::Import => locale.strings().import_open,
+            Self::ExportBackup => copy::backup_for(locale).settings_export,
+            Self::ImportBackup => copy::backup_for(locale).settings_import,
             Self::Version => ux.settings_version,
         }
     }
@@ -210,6 +223,8 @@ impl Item {
             Self::Shortcuts => ux.settings_keys_hint,
             Self::HostsFile => "",
             Self::Import => ux.settings_import_hint,
+            Self::ExportBackup => copy::backup_for(locale).settings_export_hint,
+            Self::ImportBackup => copy::backup_for(locale).settings_import_hint,
             Self::Version => "",
         }
     }
@@ -966,6 +981,40 @@ impl ShelluneView {
                 .on_click(cx.listener(|this, _event, window, cx| {
                     this.select(Destination::Hosts, window, cx);
                     this.open_import(cx);
+                })),
+            ),
+            // The backup rows open their dialogs over the settings page: the file they
+            // write or read is chosen with the system's own dialog (R5, R6).
+            Item::ExportBackup => self.settings_row(
+                "backup-export",
+                label,
+                item.hint(self.workspace.locale()),
+                components::icon_label_button(
+                    crate::app::icons::Icon::Transfer,
+                    copy::backup_for(self.workspace.locale()).export_open,
+                    components::Variant::Secondary,
+                    self.metrics(),
+                )
+                .id("settings.backup.export")
+                .debug_selector(|| "settings.backup.export".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.open_backup_export(cx);
+                })),
+            ),
+            Item::ImportBackup => self.settings_row(
+                "backup-import",
+                label,
+                item.hint(self.workspace.locale()),
+                components::icon_label_button(
+                    crate::app::icons::Icon::FolderOpen,
+                    copy::backup_for(self.workspace.locale()).import_open,
+                    components::Variant::Secondary,
+                    self.metrics(),
+                )
+                .id("settings.backup.import")
+                .debug_selector(|| "settings.backup.import".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.choose_backup_import(cx);
                 })),
             ),
             // These have a page of their own, and a page is never built as one row.

@@ -1785,6 +1785,97 @@ fn show_host_connection_override(
 }
 
 /// The connection page is on screen, showing the numbers the preferences file held.
+/// The backup a capture imports, written beside the stores of the run.
+const BACKUP_FIXTURE: &str = "capture-backup.json";
+
+/// Opens the export dialog over the data category, with the passwords included and one
+/// passphrase typed into both fields (R5).
+///
+/// Nothing is exported: the shot is the dialog before the save dialog would open.
+fn show_backup_export(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::ExportBackup)?;
+    view.capture_backup_export(cx);
+    Ok(())
+}
+
+fn backup_export_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    match view.backup_stage() {
+        Some("export") => Ok(()),
+        other => Err(format!("the export dialog is not open: {other:?}")),
+    }
+}
+
+/// Writes the saved hosts, and beside them a backup made on a Mac: two of the same
+/// hosts (one of them changed), two new ones - one naming a private key that is not on
+/// this machine - and one group of its own (R6).
+///
+/// The document is built and written before the view exists; the preview the shot shows
+/// is the real plan of applying it to the hosts on disk. Its time stamp is fixed, so the
+/// line that says where the file came from reads the same on every run.
+fn seed_backup_import(root: &Path) -> Result<(), String> {
+    seed_hosts(root)?;
+    let saved = saved_hosts()?;
+    let mut book = shellune_storage::HostBook::new();
+    let mut hosts: Vec<HostConfig> = saved.into_iter().take(2).collect();
+    if let Some(changed) = hosts.get_mut(1) {
+        changed.set_startup_command(Some("tmux attach || tmux"));
+    }
+    let mut mac = HostConfig::new("build-mac", "10.0.8.21", 22, "ci")
+        .map_err(|error| format!("the backup fixture host is not valid: {error}"))?;
+    mac.set_group(Some("构建"));
+    mac.set_auth(Some(shellune_core::AuthMethodKind::KeyFile));
+    mac.set_identity_file(Some("/Users/ci/.ssh/id_ed25519_build"));
+    let mut runner = HostConfig::new("runner-02", "10.0.8.22", 22, "ci")
+        .map_err(|error| format!("the backup fixture host is not valid: {error}"))?;
+    runner.set_group(Some("构建"));
+    hosts.push(mac);
+    hosts.push(runner);
+    for host in hosts {
+        book.apply(&HostEdit::create(host))
+            .map_err(|error| format!("the backup fixture could not be built: {error}"))?;
+    }
+    let local = shellune_storage::LocalState {
+        hosts: book,
+        ..shellune_storage::LocalState::default()
+    };
+    let mut options = shellune_storage::ExportOptions::new(shellune_storage::Platform::Macos);
+    options.created_unix = 1_794_816_000;
+    options.app_version = env!("CARGO_PKG_VERSION").to_owned();
+    shellune_storage::ShelluneData::export(
+        &local,
+        &options,
+        &shellune_storage::MemorySecrets::new(),
+        None,
+    )
+    .map_err(|error| format!("the backup fixture could not be made: {error}"))?
+    .document
+    .write_to(&root.join(BACKUP_FIXTURE))
+    .map_err(|error| format!("the backup fixture could not be written: {error}"))
+}
+
+/// Opens the import preview of the fixture backup over the data category (R6).
+fn show_backup_import_preview(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::ImportBackup)?;
+    let path = view.capture_data_root().join(BACKUP_FIXTURE);
+    view.capture_backup_import(&path, cx);
+    Ok(())
+}
+
+fn backup_import_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    match view.backup_stage() {
+        Some("import.preview") => Ok(()),
+        other => Err(format!("the import preview is not open: {other:?}")),
+    }
+}
+
 fn settings_connection_custom_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     settings_page_is_on(view, ("connection", "policy"))?;
     let defaults = view.connection_defaults();
@@ -2564,6 +2655,45 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_conflicting_keymap,
         install: show_settings_keys,
         ready: settings_keys_conflict_ready,
+    },
+    Scenario {
+        id: "settings-backup-export",
+        title: "设置 · 数据：导出备份（含密码与口令）",
+        category: Category::Settings,
+        fixture: "default data; the export dialog opened with the passwords ticked and one \
+                  passphrase typed into both fields",
+        evidence: "shows the checkbox, the two masked passphrase fields and the export button \
+                   this build draws; nothing was exported, and the passphrase checks and the \
+                   file written are proved by the GPUI tests, not by this frame",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: nothing,
+        install: show_backup_export,
+        ready: backup_export_ready,
+    },
+    Scenario {
+        id: "settings-backup-import-preview",
+        title: "设置 · 数据：导入备份的预览",
+        category: Category::Settings,
+        fixture: "six saved hosts, and a backup made on macOS holding two of them (one \
+                  changed), two new hosts in a group of their own and a private key path \
+                  that is not on this machine",
+        evidence: "shows the counts, the source line, the missing key and the merge/replace \
+                   choice of a real plan against the hosts on disk; nothing was applied, and \
+                   applying, replacing and refusing are proved by the GPUI tests",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().chinese().smallest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: seed_backup_import,
+        install: show_backup_import_preview,
+        ready: backup_import_ready,
     },
     Scenario {
         id: "overlay-palette",

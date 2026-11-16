@@ -66,8 +66,10 @@ struct CardRecord {
     number: usize,
     id: HostId,
     name: String,
-    /// What a connection would reach.
+    /// What a connection would reach, in full: the card's tooltip says it.
     target: String,
+    /// Whether the record is an SSH host, whose default port the card leaves out.
+    ssh: bool,
     /// When it was last reached, or which protocol it speaks.
     meta: Option<String>,
     /// Whether it is marked as a favourite.
@@ -1266,6 +1268,7 @@ impl ShelluneView {
                             id,
                             name: host.name().to_owned(),
                             target: host.target(),
+                            ssh: true,
                             meta: Some(when),
                             favorite: self.book.is_favorite(id),
                         },
@@ -1307,6 +1310,7 @@ impl ShelluneView {
                             id,
                             name: record.name().to_owned(),
                             target: record.target(),
+                            ssh: record.protocol() == shellune_core::ProtocolKind::Ssh,
                             meta,
                             favorite: true,
                         },
@@ -1448,16 +1452,21 @@ impl ShelluneView {
             id,
             name,
             target,
+            ssh,
             meta,
             favorite,
         } = card;
         let group = format!("{selector}-card");
         let more_group = group.clone();
+        // The card leaves out what every SSH host has, so the part that tells two hosts
+        // apart is what fits; the tooltip carries the whole target (R1).
+        let shown = card_target_text(&target, ssh);
+        let tooltip = card_tooltip(&target, ux.home_card_connect_hint);
         home_card_frame(metrics)
             .id(SharedString::from(format!("{selector}.{number}")))
             .debug_selector(move || format!("{selector}.{number}"))
             .group(SharedString::from(group))
-            .tooltip(components::tooltip(ux.home_card_connect_hint))
+            .tooltip(components::tooltip(SharedString::from(tooltip)))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.connect_saved_connection(id, cx);
             }))
@@ -1508,12 +1517,25 @@ impl ShelluneView {
                             .min_w(px(0.0))
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
+                            // One clamped line with an ellipsis rather than `truncate()`:
+                            // gpui measures a no-wrap text once, at its full length, and
+                            // keeps that layout when the card later gives it less room, so
+                            // the card clipped the address mid-character into what reads
+                            // as another address. A wrapping text is measured again at
+                            // the width it is given, and the clamp shortens it there with
+                            // an ellipsis.
                             .child(
                                 div()
+                                    .flex_1()
+                                    .flex_basis(px(0.0))
                                     .min_w(px(0.0))
-                                    .truncate()
+                                    .overflow_hidden()
+                                    .whitespace_normal()
+                                    .text_ellipsis()
+                                    .line_clamp(1)
                                     .font_family(crate::app::terminal::monospace_family())
-                                    .child(SharedString::from(target)),
+                                    .debug_selector(move || format!("{selector}.{number}.target"))
+                                    .child(SharedString::from(shown)),
                             )
                             .children(meta.map(|meta| {
                                 div()
@@ -2552,6 +2574,22 @@ fn checkbox(checked: bool, metrics: Metrics) -> Div {
 
 /// The frame of one dashboard card: a raised surface, a row of its contents, and the
 /// pointer's lift.
+/// The target a card draws: the SSH default port is left out, so the address keeps
+/// the room.
+#[must_use]
+pub(crate) fn card_target_text(target: &str, ssh: bool) -> String {
+    if ssh && let Some(stripped) = target.strip_suffix(":22") {
+        return stripped.to_owned();
+    }
+    target.to_owned()
+}
+
+/// The tooltip of a record card: the whole target, then what a press does.
+#[must_use]
+pub(crate) fn card_tooltip(target: &str, hint: &str) -> String {
+    format!("{target} · {hint}")
+}
+
 fn home_card_frame(metrics: Metrics) -> Div {
     let hover_border = theme::swatch(palette::BORDER_STRONG);
     let hover_bg = theme::swatch(palette::SURFACE_HOVER);
@@ -2624,4 +2662,30 @@ fn favorite_star(
             cx.stop_propagation();
             let _ = toggled.update(cx, |view, cx| view.toggle_favorite(id, cx));
         })
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::{card_target_text, card_tooltip};
+
+    #[test]
+    fn a_card_leaves_out_the_ssh_default_port_and_the_tooltip_keeps_it() {
+        assert_eq!(
+            card_target_text("deploy@192.0.2.24:22", true),
+            "deploy@192.0.2.24"
+        );
+        assert_eq!(
+            card_target_text("deploy@192.0.2.24:2222", true),
+            "deploy@192.0.2.24:2222",
+            "another port is part of the address"
+        );
+        assert_eq!(
+            card_target_text("10.0.0.7:22", false),
+            "10.0.0.7:22",
+            "a desktop on port 22 is not an SSH default"
+        );
+        assert!(
+            card_tooltip("deploy@192.0.2.24:22", "Connect").starts_with("deploy@192.0.2.24:22")
+        );
+    }
 }

@@ -22,6 +22,8 @@ pub const CONFIG_KEYS: &[&str] = &[
     "version",
     "hosts",
     "recents",
+    // The favourite marks: identifiers of saved records, nothing else.
+    "favorites",
     "id",
     "name",
     "address",

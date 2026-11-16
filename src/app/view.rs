@@ -86,6 +86,7 @@ use crate::app::{components, theme::radius};
 #[cfg(test)]
 use shellune_storage::KeymapPreferences;
 
+mod backup;
 pub(crate) mod batch;
 mod desktop;
 mod files_menu;
@@ -785,6 +786,8 @@ pub struct ShelluneView {
     palette_scroll: gpui::ScrollHandle,
     /// The settings page, which scrolls through every category.
     settings_scroll: gpui::ScrollHandle,
+    /// The home column, which scrolls as a whole in a short window (R1, R8).
+    home_scroll: gpui::ScrollHandle,
     /// A category the navigation scrolled to and the page has not drawn there yet.
     settings_pending_reveal: std::cell::Cell<bool>,
     /// The tab whose menu is open, and where the pointer opened it.
@@ -901,6 +904,8 @@ pub struct ShelluneView {
     /// The actions that are not worth a button of their own live here, so the head keeps
     /// one line instead of growing a row of controls for every low-frequency command.
     session_more: Option<(SessionId, gpui::Point<gpui::Pixels>)>,
+    /// The backup export or import dialog, while one is open (R5, R6).
+    backup: Option<backup::BackupDialog>,
     /// What X11 forwarding each session last reported (R11).
     ///
     /// Kept beside the session, not in its record: a display bridge ends with the
@@ -2320,6 +2325,7 @@ impl ShelluneView {
             palette_selected: 0,
             palette_scroll: gpui::ScrollHandle::new(),
             settings_scroll: gpui::ScrollHandle::new(),
+            home_scroll: gpui::ScrollHandle::new(),
             settings_pending_reveal: std::cell::Cell::new(false),
             tab_menu: None,
             tab_rename: None,
@@ -2332,6 +2338,7 @@ impl ShelluneView {
             paste_scroll: gpui::ScrollHandle::new(),
             session_menu: None,
             session_more: None,
+            backup: None,
             focus_host_dialog: false,
             focus_return: None,
             restore_focus_pending: false,
@@ -6062,6 +6069,13 @@ impl ShelluneView {
         self.hosts_cursor = None;
         self.hosts_scroll
             .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        // A short window scrolls the home column as a whole, so the narrowed list can be
+        // below the fold: the page goes to it. The list is the column's last child, after
+        // the heading, a local-shell failure when there is one, and the cards.
+        if self.home_scrolls_as_one_column() {
+            let list = 2 + usize::from(self.local_error.is_some());
+            self.home_scroll.scroll_to_top_of_item(list);
+        }
         cx.notify();
     }
 
@@ -11035,6 +11049,12 @@ impl ShelluneView {
         }
         if self.palette.is_some() {
             self.close_palette(window, cx);
+            return true;
+        }
+        // A backup dialog is a question over the settings page: Escape leaves it and
+        // writes nothing (R5, R6).
+        if self.backup.is_some() {
+            self.close_backup(cx);
             return true;
         }
         // A batch preview or a list is a question, so Escape is "not now". A run that
@@ -17732,6 +17752,7 @@ impl Render for ShelluneView {
             .children(self.host_dialog_overlay(window, cx))
             .children(self.connection_dialog_overlay(window, cx))
             .children(self.group_dialog_overlay(window, cx))
+            .children(self.backup_overlay(window, cx))
             .children(self.custom_shell_overlay(window, cx))
             .children(self.shell_menu_overlay(window, cx))
             .children(self.files_menu_overlay(window, cx))

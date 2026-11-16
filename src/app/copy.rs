@@ -4409,6 +4409,234 @@ pub fn ux_for(locale: Locale) -> &'static UxStrings {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Backup export and import (R5, R6, R9)
+// ---------------------------------------------------------------------------
+
+/// Declares [`BackupStrings`] and its two tables from one list, so a phrase cannot be
+/// added in one language and forgotten in the other.
+macro_rules! backup_strings {
+    ($($(#[doc = $doc:literal])* $field:ident: $en:literal, $zh:literal;)*) => {
+        /// Strings of the backup export and import in the settings' data category.
+        pub struct BackupStrings {
+            $($(#[doc = $doc])* pub $field: &'static str,)*
+        }
+
+        impl BackupStrings {
+            /// Every string of the table, in declaration order, for the completeness
+            /// test.
+            #[must_use]
+            #[cfg_attr(not(test), allow(dead_code))]
+            pub fn all(&self) -> Vec<&'static str> {
+                vec![$(self.$field),*]
+            }
+        }
+
+        /// The backup strings in English.
+        pub static ENGLISH_BACKUP: BackupStrings = BackupStrings { $($field: $en,)* };
+        /// The backup strings in Chinese.
+        pub static CHINESE_BACKUP: BackupStrings = BackupStrings { $($field: $zh,)* };
+    };
+}
+
+backup_strings! {
+    /// Settings row: export a backup
+    settings_export: "Export backup", "导出备份";
+    /// Under that row
+    settings_export_hint: "Saves hosts, groups, forwards, commands and preferences to one file",
+        "把主机、分组、转发、常用命令和偏好保存到一个文件";
+    /// Settings row: import a backup
+    settings_import: "Import backup", "导入备份";
+    /// Under that row
+    settings_import_hint: "Previews a backup file, then merges it or replaces this computer's data",
+        "先预览备份文件，再合并或覆盖本机数据";
+    /// The button of the export row
+    export_open: "Export…", "导出…";
+    /// The button of the import row
+    import_open: "Choose file…", "选择文件…";
+    /// Home first-run card: restore from a backup
+    home_restore: "Restore from backup", "从备份恢复";
+    /// Title of the export dialog
+    export_title: "Export backup", "导出备份";
+    /// What the export holds
+    export_intro: "The file holds your hosts, groups, port forwards, saved commands, trusted server keys and preferences. Private key files are not copied, only their paths.",
+        "文件包含主机、分组、端口转发、常用命令、已信任的服务器指纹和偏好设置。私钥文件本身不会被复制，只记录它们的路径。";
+    /// The checkbox
+    export_include_secrets: "Include saved passwords", "包含已保存的密码";
+    /// Under the checkbox, when it is on
+    export_secrets_hint: "The passwords are encrypted with a passphrase you choose. Without it nobody can read them, and Shellune cannot recover it.",
+        "密码会用你设置的口令加密。没有口令谁都无法读取，Shellune 也无法找回口令。";
+    /// Under the checkbox, when it is off
+    export_no_secrets: "No password will be written to the file.", "文件中不会写入任何密码。";
+    /// Label of the passphrase field
+    passphrase: "Passphrase", "口令";
+    /// Label of the confirmation field
+    passphrase_confirm: "Confirm passphrase", "确认口令";
+    /// Export refused: no passphrase
+    passphrase_required: "Enter a passphrase to protect the passwords", "请输入用于保护密码的口令";
+    /// Export refused: the two differ
+    passphrase_mismatch: "The two passphrases are not the same", "两次输入的口令不一致";
+    /// The export button
+    export_choose: "Choose where to save…", "选择保存位置…";
+    /// Export finished
+    export_done: "Backup saved", "备份已保存";
+    /// Where it went
+    export_done_path: "Saved to {path}", "已保存到 {path}";
+    /// How many passwords it holds
+    export_done_secrets: "{count} saved passwords are in the file, encrypted", "文件中包含 {count} 个已加密的密码";
+    /// It holds none
+    export_done_no_secrets: "The file holds no password", "文件中不含任何密码";
+    /// The passwords that could not be read
+    export_unreadable: "The credential store could not read the passwords of these connections, so they are not in the file:",
+        "凭据库无法读取以下连接的密码，因此未写入文件：";
+    /// The passwords the credential store does not have
+    export_missing: "These connections are marked as remembering a password, but the credential store has none for them, so it is not in the file:",
+        "以下连接标记为记住密码，但凭据库中没有对应的密码，因此未写入文件：";
+    /// Export failed
+    export_failed: "The backup could not be saved", "备份未能保存";
+    /// Close a finished dialog
+    close: "Close", "关闭";
+    /// Leave a dialog
+    cancel: "Cancel", "取消";
+    /// Title of the import dialog
+    import_title: "Import backup", "导入备份";
+    /// The file was refused
+    import_refused: "This file cannot be imported. Nothing on this computer was changed.",
+        "无法导入这个文件，本机数据没有任何改动。";
+    /// Ask for the passphrase
+    import_locked: "This backup holds encrypted passwords. Enter the passphrase it was exported with.",
+        "这个备份包含加密的密码，请输入导出时设置的口令。";
+    /// Open the passwords
+    import_unlock: "Unlock", "解锁";
+    /// Go on without them
+    import_skip_secrets: "Import without passwords", "不导入密码";
+    /// Wrong passphrase
+    wrong_passphrase: "The passphrase is wrong, or the file was changed after it was exported.",
+        "口令错误，或文件在导出后被改动过。";
+    /// Where the file came from
+    import_source: "Made on {platform} by Shellune {version}, {date}", "由 {platform} 上的 Shellune {version} 于 {date} 生成";
+    /// Count row: connections
+    preview_hosts: "Connections", "连接";
+    /// Count row: groups
+    preview_groups: "Groups", "分组";
+    /// Count row: forwards
+    preview_forwards: "Port forwards", "端口转发";
+    /// Count row: saved commands
+    preview_snippets: "Saved commands", "常用命令";
+    /// Count row: trusted keys
+    preview_known_hosts: "Trusted server keys", "已信任的服务器指纹";
+    /// Count row: preferences
+    preview_preferences: "Preferences", "偏好设置";
+    /// Count row: passwords
+    preview_secrets: "Saved passwords", "已保存的密码";
+    /// One count row's changes
+    preview_change: "{added} new · {updated} changed · {removed} removed", "新增 {added} · 更新 {updated} · 删除 {removed}";
+    /// Nothing of this kind changes
+    preview_unchanged: "No change", "无变化";
+    /// Preferences change
+    preview_preferences_changed: "Will change", "将会更改";
+    /// Including the keys
+    preview_keymap_changed: "Will change, including this computer's shortcuts", "将会更改，包括本机快捷键";
+    /// Passwords to save
+    preview_secrets_count: "{count} will be saved on this computer", "将在本机保存 {count} 个";
+    /// No password in the file
+    preview_secrets_none: "None in the file", "文件中没有";
+    /// Passwords skipped
+    preview_secrets_skipped: "Not imported", "不导入";
+    /// Private keys missing here
+    preview_missing_keys: "These private key files are not on this computer. The connections are imported; choose the key again before connecting:",
+        "以下私钥文件在本机不存在。连接仍会导入，连接前请重新选择私钥：";
+    /// The path came from another machine
+    preview_key_from: "path from {platform}", "{platform} 上的路径";
+    /// The passwords a plan removes, counted
+    preview_secrets_forget: "{count} saved on this computer will be removed", "将从本机移除 {count} 个";
+    /// The passwords a plan removes, named
+    preview_forget_names: "Passwords that will be removed from this computer, because their connection is removed or no longer signs in with one:",
+        "以下连接的密码将从本机移除，因为连接被删除或不再使用密码登录：";
+    /// One server whose trusted key differs
+    preview_trust_line: "{server}: this computer {local}, file {file}", "{server}：本机 {local}，文件 {file}";
+    /// Paths taken from another platform
+    preview_fallbacks: "The file has no paths of this computer for these connections, so the ones from {platform} are used. Check them before connecting:",
+        "文件中没有这些连接在本机的路径，因此沿用 {platform} 上的路径。连接前请确认：";
+    /// Trusted keys that differ
+    preview_trust_conflicts: "{count} servers have a different trusted key in the file. Merge keeps this computer's, replace uses the file's.",
+        "{count} 台服务器在文件中的已信任指纹与本机不同。合并时保留本机的，覆盖时使用文件中的。";
+    /// Label of the mode choice
+    mode_label: "How to apply", "应用方式";
+    /// Merge
+    mode_merge: "Merge", "合并";
+    /// Replace
+    mode_replace: "Replace", "覆盖";
+    /// What merge does
+    mode_merge_hint: "The file's version of a record wins; records only on this computer are kept.",
+        "同一条记录以文件为准，只在本机存在的记录会保留。";
+    /// What replace does
+    mode_replace_hint: "This computer's connections, groups, forwards, commands and trusted keys are replaced by the file's.",
+        "本机的连接、分组、转发、常用命令和已信任指纹会被文件内容整体替换。";
+    /// The second question of a replace
+    replace_confirm: "Replace deletes everything on this computer that is not in the file. A copy of the current data is kept in the snapshots folder first. Press Confirm replace to go on.",
+        "覆盖会删除本机上文件中没有的全部内容，应用前会先在快照文件夹保存一份当前数据。点击“确认覆盖”继续。";
+    /// Apply a merge
+    apply_merge: "Import", "导入";
+    /// Ask to replace
+    apply_replace: "Replace…", "覆盖…";
+    /// Really replace
+    apply_replace_confirm: "Confirm replace", "确认覆盖";
+    /// The file changes nothing
+    preview_nothing: "This computer already has everything in the file.", "本机已包含文件中的全部内容。";
+    /// Import finished
+    import_done: "Backup imported", "备份已导入";
+    /// The passwords saved by the import
+    import_done_secrets: "{count} passwords were saved on this computer.", "已在本机保存 {count} 个密码。";
+    /// The passwords the credential store would not remove
+    import_not_forgotten: "The credential store would not remove the passwords of these connections. Nothing uses them any more:",
+        "凭据库未能移除以下连接的密码，它们已不再被使用：";
+    /// What it did
+    import_done_body: "The lists and preferences now show the imported data. The previous data was copied to {path}.",
+        "列表和偏好已更新为导入后的数据。原数据已复制到 {path}。";
+    /// It did nothing
+    import_done_nothing: "Nothing needed to change.", "无需任何更改。";
+    /// Not a backup
+    error_not_backup: "This is not a Shellune backup file.", "这不是 Shellune 备份文件。";
+    /// A newer build made it
+    error_newer: "A newer Shellune made this backup (format {found}; this version reads up to {supported}). Update Shellune to import it.",
+        "这个备份由更新版本的 Shellune 生成（格式 {found}，当前版本最多支持 {supported}），请先更新 Shellune。";
+    /// Damaged
+    error_corrupt: "The backup file is damaged.", "备份文件已损坏。";
+    /// Could not read the file
+    error_read: "The file could not be read.", "无法读取这个文件。";
+    /// Could not write the file
+    error_write: "The file could not be written.", "无法写入这个文件。";
+    /// This machine's data could not be read
+    error_local: "The data on this computer could not be read.", "无法读取本机数据。";
+    /// The data changed after the preview
+    error_changed: "The data on this computer changed after the preview. The preview was refreshed; check it and apply again.",
+        "预览之后本机数据发生了变化。预览已刷新，请确认后再次应用。";
+    /// The snapshot failed
+    error_snapshot: "A copy of the current data could not be made, so nothing was changed.",
+        "无法先保存当前数据的副本，因此没有做任何更改。";
+    /// Applying stopped
+    error_apply: "Applying stopped part way.", "应用中途失败。";
+    /// And was undone
+    error_apply_restored: "The previous data was put back.", "已恢复原来的数据。";
+    /// And was not fully undone
+    error_apply_not_restored: "The previous data could not be put back completely; a copy is in {path}.",
+        "原来的数据未能完全恢复，副本在 {path}。";
+    /// Encrypting failed
+    error_encrypt: "The passwords could not be encrypted.", "无法加密密码。";
+    /// What went wrong, in the storage layer's words
+    error_detail: "Details: {reason}", "详情：{reason}";
+}
+
+/// The backup strings of one language.
+#[must_use]
+pub fn backup_for(locale: Locale) -> &'static BackupStrings {
+    match locale {
+        Locale::English => &ENGLISH_BACKUP,
+        Locale::Chinese => &CHINESE_BACKUP,
+    }
+}
+
 /// Why a shortcut command cannot be saved, in a language.
 ///
 /// The domain crate words its refusals in English so they stay language-neutral; the
@@ -4531,6 +4759,21 @@ mod ux_tests {
             relative_time(now - 800 * 86_400, now, Locale::English),
             "2 y ago"
         );
+    }
+
+    #[test]
+    fn both_backup_tables_are_complete_and_translated() {
+        let english = ENGLISH_BACKUP.all();
+        let chinese = CHINESE_BACKUP.all();
+        assert_eq!(english.len(), chinese.len());
+        for (en, zh) in english.iter().zip(chinese.iter()) {
+            assert!(!en.trim().is_empty() && !zh.trim().is_empty());
+            assert_ne!(en, zh, "{en} is not translated");
+            // A placeholder in one language is filled in the other as well.
+            for name in ["{path}", "{count}", "{platform}", "{version}", "{date}"] {
+                assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
+            }
+        }
     }
 
     #[test]

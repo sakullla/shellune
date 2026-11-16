@@ -628,6 +628,12 @@ impl ShelluneView {
     // Hosts home
     // -----------------------------------------------------------------------
 
+    /// Whether the window is too short for the heading, the cards and a list of its own
+    /// height, so the home column scrolls as one (R1, R8).
+    pub(super) fn home_scrolls_as_one_column(&self) -> bool {
+        self.viewport_height < self.metrics().scale(320.0)
+    }
+
     /// The home page as a dashboard (R1): the quick-connect bar on top, then the cards
     /// of what is used most - recent connections, favourites, groups - and under them
     /// every saved record in the full list with all of its tools.
@@ -652,9 +658,10 @@ impl ShelluneView {
             && self.hosts.search().trim().is_empty()
             && !self.import.is_open();
 
-        let short_viewport = self.viewport_height < metrics.scale(320.0);
+        let short_viewport = self.home_scrolls_as_one_column();
         let mut column = div()
             .id("home.scroll")
+            .track_scroll(&self.home_scroll)
             .flex()
             .flex_col()
             .flex_1()
@@ -1016,6 +1023,24 @@ impl ShelluneView {
                                     .on_click(cx.listener(
                                         |this, _event, _window, cx| {
                                             this.open_import(cx);
+                                        },
+                                    )),
+                                )
+                                // A new machine with a backup elsewhere starts here:
+                                // the file chooser, then the same preview the settings
+                                // page shows (R5, R6).
+                                .child(
+                                    components::icon_label_button(
+                                        Icon::FolderOpen,
+                                        copy::backup_for(self.workspace.locale()).home_restore,
+                                        Variant::Ghost,
+                                        metrics,
+                                    )
+                                    .id("hosts.empty.restore")
+                                    .debug_selector(|| "hosts.empty.restore".to_owned())
+                                    .on_click(cx.listener(
+                                        |this, _event, _window, cx| {
+                                            this.choose_backup_import(cx);
                                         },
                                     )),
                                 ),
