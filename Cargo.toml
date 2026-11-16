@@ -35,6 +35,8 @@ shellune-storage = { path = "crates/storage" }
 # WebDAV sync of the portable data file (settings, state, conflicts).
 shellune-sync = { path = "crates/sync" }
 shellune-terminal = { path = "crates/terminal" }
+# Self-update: the release manifest, signed downloads and the install routes.
+shellune-update = { path = "crates/update" }
 # The RDP/VNC sessions a desktop pane shows (R18-R20, R23). The same crate is what
 # the native tests drive directly, so it is a normal dependency as well as a test
 # one: a build without the native sources still compiles, and the pane reports the
@@ -90,6 +92,9 @@ shellune-desktop = { path = "crates/desktop" }
 shellune-serial = { path = "crates/serial", features = ["test-support"] }
 # The window's sync tests run against the crate's in-process WebDAV server.
 shellune-sync = { path = "crates/sync", features = ["test-support"] }
+# The window's update tests run against the crate's loopback HTTP server and sign
+# their packages with its throwaway keys.
+shellune-update = { path = "crates/update", features = ["test-support"] }
 
 [build-dependencies]
 embed-resource = "3.0.12"
@@ -103,6 +108,7 @@ members = [
     "crates/storage",
     "crates/sync",
     "crates/terminal",
+    "crates/update",
 ]
 # The patched third-party crates are dependencies, not members of this workspace.
 exclude = ["vendor"]

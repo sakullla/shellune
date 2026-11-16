@@ -1,0 +1,57 @@
+[package]
+name = "shellune-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Self-update for Shellune: the release manifest, signed downloads and the install routes."
+publish = false
+
+[features]
+# The release signing tool (src/bin/shellune-sign.rs) and the signing half of the
+# library. Only the release pipeline builds it; the application never signs.
+release-tools = ["dep:minisign"]
+# A loopback HTTP server and throwaway signing keys for tests (this crate's and the
+# window's). Behind a feature so a release build carries none of it.
+test-support = ["dep:minisign"]
+
+[[bin]]
+name = "shellune-sign"
+path = "src/bin/shellune-sign.rs"
+required-features = ["release-tools"]
+
+[dependencies]
+# The .sig files and the signing secret are base64 text.
+base64 = "0.22.1"
+# The `.app.tar.gz` macOS update.
+flate2 = "1.1.10"
+# Signature verification (pure Rust, no dependencies).
+minisign-verify = "0.3.0"
+# Signing and key generation: release tooling and tests only.
+minisign = { version = "0.10.0", optional = true }
+semver = "1.0.28"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# No xattr support: an archive's extended attributes (quarantine flags) are not
+# carried onto the installed application.
+tar = { version = "0.4.46", default-features = false }
+thiserror = { workspace = true }
+# The same blocking HTTP client the sync crate uses: rustls on ring, the system's
+# certificate verifier, SOCKS for an ALL_PROXY that names one. One TLS stack.
+ureq = { version = "3.4.2", default-features = false, features = [
+    "rustls",
+    "platform-verifier",
+    "socks-proxy",
+] }
+# Unique names for the staging folders and the generated key password.
+uuid = { workspace = true }
+# The Windows portable update: only stored and deflated entries are needed.
+zip = { version = "9.6.0", default-features = false, features = ["deflate-flate2"] }
+
+[target.'cfg(windows)'.dependencies]
+# Reading HKCU\Software\Shellune\InstallDir, which tells the installed copy from a
+# portable one.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Registry"] }
+
+[dev-dependencies]
+minisign = "0.10.0"
