@@ -4,7 +4,16 @@
 # macOS builds are signed with a fixed self-signed certificate held in the secrets
 # APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD and
 # APPLE_SIGNING_IDENTITY; a release without them fails. They are not notarised.
-# Windows and Linux artifacts are unsigned.
+# Windows and Linux artifacts are not code-signed.
+#
+# Every update file is signed for the in-app updater with shellune-sign (crates/update,
+# feature release-tools): the setup.exe, the portable zip, the macOS .app.tar.gz and
+# the deb each get a <file>.sig. The key is the secret SHELLUNE_UPDATER_KEY (base64
+# minisign secret key) with its password in SHELLUNE_UPDATER_KEY_PASSWORD; a run
+# without them fails before anything is built. The publish job checks that the key
+# matches shellune_update::PUBLIC_KEY, writes latest.json with
+# packaging/updater-manifest.py, and publishes it with every file in one release, so a
+# release never exists without its manifest.
 #
 # Release steps: set the version in Cargo.toml, write
 # docs/release/<version>-release-notes.md, merge, then push the tag v<version>. The
@@ -37,6 +46,21 @@ jobs:
             echo "::error::$notes is missing"
             exit 1
           fi
+      # Checked before any build, like the macOS certificate: every platform job signs
+      # its update files, and an unsigned release would be refused by the updater.
+      - name: Require the updater signing key
+        env:
+          SHELLUNE_UPDATER_KEY: ${{ secrets.SHELLUNE_UPDATER_KEY }}
+          SHELLUNE_UPDATER_KEY_PASSWORD: ${{ secrets.SHELLUNE_UPDATER_KEY_PASSWORD }}
+        run: |
+          missing=0
+          for name in SHELLUNE_UPDATER_KEY SHELLUNE_UPDATER_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::secret $name is not set; update files are signed for the in-app updater"
+              missing=1
+            fi
+          done
+          exit $missing
 
   windows:
     needs: version
@@ -58,12 +82,27 @@ jobs:
           choco install nsis -y --no-progress
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" "/DVERSION=$env:VERSION" packaging\windows\shellune.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # The updater installs the setup.exe on an installed copy (started with /S /R) and
+      # swaps shellune.exe from the zip on a portable one.
+      - name: Sign the update files
+        shell: bash
+        env:
+          SHELLUNE_UPDATER_KEY: ${{ secrets.SHELLUNE_UPDATER_KEY }}
+          SHELLUNE_UPDATER_KEY_PASSWORD: ${{ secrets.SHELLUNE_UPDATER_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for file in "dist/Shellune-$VERSION-setup.exe" "dist/Shellune-$VERSION-windows-x86_64-portable.zip"; do
+            cargo run --release -p shellune-update --features release-tools --bin shellune-sign -- \
+              sign "$file" --version "$VERSION"
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: shellune-windows-x86_64
           path: |
             dist/Shellune-${{ env.VERSION }}-windows-x86_64-portable.zip
+            dist/Shellune-${{ env.VERSION }}-windows-x86_64-portable.zip.sig
             dist/Shellune-${{ env.VERSION }}-setup.exe
+            dist/Shellune-${{ env.VERSION }}-setup.exe.sig
           if-no-files-found: error
 
   macos:
@@ -153,12 +192,33 @@ jobs:
             || { echo "::error::the signature does not carry the bundle identifier"; exit 1; }
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign --display --requirements - "$app"
+      # The in-app updater replaces the .app from this archive: Shellune.app at its top,
+      # the code signature inside. No AppleDouble files or extended attributes (the
+      # updater would not restore them anyway).
+      - name: Update archive
+        run: |
+          set -euo pipefail
+          archive="dist/Shellune-$VERSION-macos-arm64.app.tar.gz"
+          COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$archive" -C dist Shellune.app
+          tar -tzf "$archive" | head -n 5
+          tar -tzf "$archive" | grep -q '^Shellune.app/Contents/MacOS/shellune$' \
+            || { echo "::error::$archive does not hold Shellune.app/Contents/MacOS/shellune"; exit 1; }
+      - name: Sign the update archive
+        env:
+          SHELLUNE_UPDATER_KEY: ${{ secrets.SHELLUNE_UPDATER_KEY }}
+          SHELLUNE_UPDATER_KEY_PASSWORD: ${{ secrets.SHELLUNE_UPDATER_KEY_PASSWORD }}
+        run: |
+          cargo run --release -p shellune-update --features release-tools --bin shellune-sign -- \
+            sign "dist/Shellune-$VERSION-macos-arm64.app.tar.gz" --version "$VERSION"
       - name: Disk image
         run: python3 packaging/macos/make-dmg.py --app dist/Shellune.app --version "$VERSION"
       - uses: actions/upload-artifact@v7
         with:
           name: shellune-macos-arm64
-          path: dist/Shellune-${{ env.VERSION }}-macos-arm64.dmg
+          path: |
+            dist/Shellune-${{ env.VERSION }}-macos-arm64.dmg
+            dist/Shellune-${{ env.VERSION }}-macos-arm64.app.tar.gz
+            dist/Shellune-${{ env.VERSION }}-macos-arm64.app.tar.gz.sig
           if-no-files-found: error
 
   linux:
@@ -179,10 +239,21 @@ jobs:
       - run: cargo build --workspace --release
       - name: Deb package
         run: python3 packaging/linux/make-deb.py --binary target/release/shellune --version "$VERSION"
+      # The updater never installs the deb (it opens the release page); the signature
+      # lets latest.json list it like every other platform.
+      - name: Sign the deb
+        env:
+          SHELLUNE_UPDATER_KEY: ${{ secrets.SHELLUNE_UPDATER_KEY }}
+          SHELLUNE_UPDATER_KEY_PASSWORD: ${{ secrets.SHELLUNE_UPDATER_KEY_PASSWORD }}
+        run: |
+          cargo run --release -p shellune-update --features release-tools --bin shellune-sign -- \
+            sign "dist/shellune_${VERSION}_amd64.deb" --version "$VERSION"
       - uses: actions/upload-artifact@v7
         with:
           name: shellune-linux-x86_64
-          path: dist/shellune_${{ env.VERSION }}_amd64.deb
+          path: |
+            dist/shellune_${{ env.VERSION }}_amd64.deb
+            dist/shellune_${{ env.VERSION }}_amd64.deb.sig
           if-no-files-found: error
 
   publish:
@@ -196,10 +267,49 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+      - name: Require the updater signing key
+        env:
+          SHELLUNE_UPDATER_KEY: ${{ secrets.SHELLUNE_UPDATER_KEY }}
+          SHELLUNE_UPDATER_KEY_PASSWORD: ${{ secrets.SHELLUNE_UPDATER_KEY_PASSWORD }}
+        run: |
+          missing=0
+          for name in SHELLUNE_UPDATER_KEY SHELLUNE_UPDATER_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::secret $name is not set; nothing is published"
+              missing=1
+            fi
+          done
+          exit $missing
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Signatures from any other key are refused by every installed copy, so a
+      # replaced or mistyped secret stops the release here.
+      - name: Check the key against the one the app trusts
+        env:
+          SHELLUNE_UPDATER_KEY: ${{ secrets.SHELLUNE_UPDATER_KEY }}
+          SHELLUNE_UPDATER_KEY_PASSWORD: ${{ secrets.SHELLUNE_UPDATER_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          trusted=$(sed -n 's/^pub const PUBLIC_KEY: &str = "\(.*\)";$/\1/p' crates/update/src/lib.rs)
+          if [ -z "$trusted" ]; then
+            echo "::error::PUBLIC_KEY was not found in crates/update/src/lib.rs"
+            exit 1
+          fi
+          actual=$(cargo run --release -p shellune-update --features release-tools --bin shellune-sign -- public-key)
+          if [ "$actual" != "$trusted" ]; then
+            echo "::error::SHELLUNE_UPDATER_KEY belongs to $actual, but the app trusts $trusted"
+            exit 1
+          fi
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      # Refuses a missing file, a missing or empty signature, or one for another version.
+      - name: Write latest.json
+        run: |
+          python3 packaging/updater-manifest.py --version "$VERSION" --dist dist \
+            --notes-file "docs/release/$VERSION-release-notes.md" --output dist/latest.json
+          cat dist/latest.json
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
