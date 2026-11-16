@@ -54,7 +54,7 @@ use shellune_sync::{
 
 use super::ShelluneView;
 use super::settings::Category;
-use super::shell::ModalContent;
+use super::shell::{ModalContent, NoticeForm, notice_icon, notice_words};
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, SyncStrings};
 use crate::app::icons::Icon;
@@ -1594,36 +1594,53 @@ impl ShelluneView {
         self.settings_card("sync", rows)
     }
 
-    /// The marker in the top bar while the last sync failed or a conflict waits; a press
-    /// opens the sync settings.
-    pub(super) fn sync_topbar_marker(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    /// What the top row says while the last sync failed or a conflict waits: the
+    /// marker's word and tone.
+    pub(super) fn sync_notice(&self) -> Option<(&'static str, Tone)> {
         if !self.sync.configured() || self.sync.running.is_some() {
             return None;
         }
         let strings = self.sync_strings();
-        let (label, tone) = if self.sync.has_conflict() {
-            (strings.marker_conflict, Tone::Warning)
+        if self.sync.has_conflict() {
+            Some((strings.marker_conflict, Tone::Warning))
         } else if self.sync.has_failure() {
-            (strings.marker_failed, Tone::Danger)
+            Some((strings.marker_failed, Tone::Danger))
         } else {
-            return None;
-        };
+            None
+        }
+    }
+
+    /// The marker in the top bar while the last sync failed or a conflict waits; a press
+    /// opens the sync settings.
+    ///
+    /// Its form is the row's ([`ShelluneView::topbar_notice_form`]): the word, an icon in
+    /// the marker's tone with the word in its tooltip, or - in a compact row - nothing of
+    /// its own, the settings button carrying it (R2, R9).
+    pub(super) fn sync_topbar_marker(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let (label, tone) = self.sync_notice()?;
+        let strings = self.sync_strings();
         let metrics = self.metrics();
-        Some(
-            div()
-                .id("topbar.sync")
-                .debug_selector(|| "topbar.sync".to_owned())
-                .flex()
-                .flex_none()
-                .items_center()
-                .mr(metrics.scale(spacing::HAIRLINE))
-                .cursor_pointer()
-                .tooltip(components::tooltip(SharedString::from(strings.marker_hint)))
-                .child(components::chip(label, tone, metrics))
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.open_sync_settings(window, cx);
-                })),
-        )
+        let open = cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
+            this.open_sync_settings(window, cx);
+        });
+        match self.topbar_notice_form() {
+            NoticeForm::Folded => None,
+            NoticeForm::Icon => Some(
+                notice_icon(
+                    "topbar.sync",
+                    Icon::Refresh,
+                    tone,
+                    format!("{label} \u{b7} {}", strings.marker_hint),
+                    metrics,
+                )
+                .on_click(open),
+            ),
+            NoticeForm::Words => Some(
+                notice_words("topbar.sync", label, tone, metrics)
+                    .tooltip(components::tooltip(SharedString::from(strings.marker_hint)))
+                    .on_click(open),
+            ),
+        }
     }
 
     /// The conflict question over the window (R10).
@@ -1776,6 +1793,19 @@ impl ShelluneView {
         )
     }
 
+    /// Marks the last sync as failed, against a server that is saved but never asked,
+    /// so a test can see what the top row does with the marker.
+    #[cfg(test)]
+    pub fn fail_sync_for_test(&mut self, cx: &mut Context<Self>) {
+        self.sync.network = false;
+        self.sync.config = Some(SyncConfig {
+            url: "https://dav.example.invalid/shellune".to_owned(),
+            ..SyncConfig::default()
+        });
+        self.sync.failure = Some("offline".to_owned());
+        cx.notify();
+    }
+
     /// Whether the conflict question is on screen.
     #[cfg(test)]
     #[must_use]
@@ -1897,6 +1927,26 @@ impl ShelluneView {
         });
         self.sync.dialog = true;
         cx.notify();
+    }
+
+    /// Marks the last sync as failed against a saved server that is never asked, for a
+    /// capture of the top row's marker; the window stays offline.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_sync_failed(&mut self, cx: &mut Context<Self>) {
+        self.sync.network = false;
+        self.sync.config = Some(SyncConfig {
+            url: "https://dav.example.invalid/shellune".to_owned(),
+            ..SyncConfig::default()
+        });
+        self.sync.failure = Some(self.sync_strings().marker_failed.to_owned());
+        cx.notify();
+    }
+
+    /// Whether the top row has a sync marker to show, for a capture.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_sync_marked(&self) -> bool {
+        self.sync_notice().is_some()
     }
 
     /// Whether the conflict question is on screen, for a capture.

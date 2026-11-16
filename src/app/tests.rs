@@ -19877,6 +19877,169 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
     }
 }
 
+/// Asserts the current tab of the strip, the second one, is drawn whole in the top row
+/// whatever the row says beside it, and that nothing the row holds after the strip is
+/// pushed out of the window (R2, R9).
+fn assert_current_tab_whole_beside_notices(
+    cx: &mut VisualTestContext,
+    view: &Entity<ShelluneView>,
+    viewport: Size<Pixels>,
+    zoom: Zoom,
+    form: &str,
+) {
+    let metrics = Metrics::new(zoom);
+    let min = cx.update(|_window, app| view.read(app).tab_min_width_for_test());
+    assert_tab_in_view(cx, "session.tab.1");
+    assert_tab_holds_its_parts(cx, 1, min, metrics);
+    // The strip clips what it cannot hold, so its own box is not enough: the tab and
+    // its close button end before the first control after the strip begins.
+    let list = bounds_of(cx, "tabs.list.open");
+    for selector in ["session.tab.1", "session.tab.close.1"] {
+        let bounds = bounds_of(cx, selector);
+        assert!(
+            bounds.origin.x + bounds.size.width <= list.origin.x + px(0.5),
+            "{selector} ends before the list of every tab at {viewport:?} {zoom:?} ({form}): \
+             {bounds:?} then {list:?}"
+        );
+    }
+    for selector in [
+        "tabs.list.open",
+        "palette.open",
+        "nav.settings",
+        "topbar.batch",
+    ] {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+        assert_pointer_target(cx, selector);
+    }
+    if Platform::current() == Platform::Windows {
+        for selector in ["window.minimize", "window.maximize", "window.close"] {
+            assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+            assert_pointer_target(cx, selector);
+        }
+    }
+}
+
+#[gpui::test]
+async fn the_top_rows_notices_never_cut_the_current_tab(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tall = |width: f32| size(px(width), px(720.0));
+    // The widths around the row's thresholds at 200%: the smallest window, where the
+    // row is compact anyway; just past the full row's own threshold, where one notice
+    // used to cut the current tab; the design window; and room enough for the words.
+    let cases = [
+        (minimum_window(), Zoom::Regular),
+        (minimum_window(), Zoom::Largest),
+        (tall(1080.0), Zoom::Largest),
+        (tall(1140.0), Zoom::Largest),
+        (design_window(), Zoom::Largest),
+        (tall(1200.0), Zoom::Largest),
+        (tall(1920.0), Zoom::Largest),
+    ];
+
+    // A newer release alone, then with a failed sync beside it: each notice the row
+    // shows takes its room from the caption and the row's form, never from the tab.
+    for phase in ["update", "update+sync"] {
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.offer_update_for_test(cx);
+                if phase == "update+sync" {
+                    view.fail_sync_for_test(cx);
+                }
+            });
+        });
+        let notices: &[&'static str] = if phase == "update" {
+            &["topbar.update"]
+        } else {
+            &["topbar.update", "topbar.sync"]
+        };
+        let mut forms = Vec::new();
+        for (viewport, zoom) in cases {
+            cx.update(|_window, app| {
+                view.update(app, |view, cx| {
+                    view.workspace_mut_for_test().set_zoom(zoom);
+                    cx.notify();
+                });
+            });
+            cx.simulate_resize(viewport);
+            cx.run_until_parked();
+            let form = cx.update(|_window, app| view.read(app).topbar_notice_form_for_test());
+            let compact = cx.update(|_window, app| view.read(app).header_compact_for_test());
+            assert_eq!(
+                form == "folded",
+                compact,
+                "a compact row and only it folds the notices ({viewport:?}, {zoom:?})"
+            );
+            if viewport == minimum_window() && zoom == Zoom::Largest {
+                assert_eq!(form, "folded", "720x480 at 200% has no room for a notice");
+            }
+            forms.push(form);
+            assert_current_tab_whole_beside_notices(cx, &view, viewport, zoom, form);
+
+            let metrics = Metrics::new(zoom);
+            let settings = bounds_of(cx, "nav.settings");
+            for &notice in notices {
+                let bounds = bounds_of(cx, notice);
+                assert_fits_inside(bounds, viewport, notice);
+                match form {
+                    // Folded into the settings button: its mark is the button's own.
+                    "folded" => assert_stays_inside_box(bounds, settings, notice),
+                    "icon" => {
+                        assert_pointer_target(cx, notice);
+                        assert!(
+                            bounds.size.width <= metrics.scale(30.0) + px(0.5),
+                            "{notice} is an icon of the row's buttons: {bounds:?}"
+                        );
+                    }
+                    _ => assert!(
+                        bounds.size.width <= metrics.scale(200.0) + px(0.5),
+                        "{notice} keeps to its room as words: {bounds:?}"
+                    ),
+                }
+            }
+        }
+        for form in ["folded", "icon", "words"] {
+            assert!(
+                forms.contains(&form),
+                "the widths reach every form of the notices ({phase}): {forms:?}"
+            );
+        }
+
+        // In the compact row the settings button leads where the folded notice did: the
+        // sync settings for a failed sync, else the update card.
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.workspace_mut_for_test().set_zoom(Zoom::Largest);
+                cx.notify();
+            });
+        });
+        cx.simulate_resize(minimum_window());
+        cx.run_until_parked();
+        assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
+        click(cx, "nav.settings");
+        assert_eq!(
+            cx.update(|_window, app| view.read(app).workspace().destination()),
+            Destination::Settings
+        );
+        let page = cx.update(|_window, app| view.read(app).settings_page_id());
+        if phase == "update" {
+            assert_eq!(page, ("about", "update"), "the release leads to its card");
+        } else {
+            assert_eq!(page.0, "sync", "the failed sync leads to the sync settings");
+        }
+        cx.update(|window, app| view.update(app, |view, cx| view.select_tab(1, window, cx)));
+        cx.run_until_parked();
+        assert_current_tab_whole_beside_notices(
+            cx,
+            &view,
+            minimum_window(),
+            Zoom::Largest,
+            "folded",
+        );
+    }
+}
+
 #[gpui::test]
 async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut TestAppContext) {
     let Some((view, cx)) = two_shells(cx) else {

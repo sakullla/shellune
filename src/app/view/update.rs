@@ -38,7 +38,7 @@ use shellune_update::{
 
 use super::ShelluneView;
 use super::settings::Category;
-use super::shell::ModalContent;
+use super::shell::{ModalContent, NoticeForm, notice_icon, notice_words};
 use super::sync::PendingExit;
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, UpdateStrings};
@@ -50,9 +50,11 @@ use crate::app::update::{
     UpdateStep, error_text, notes_excerpt, progress_fraction, progress_text, unavailable_text,
 };
 
-/// The window width, before the text scale, from which the top bar's chip says "new
-/// version" in words; below it the chip is an arrow with the words in its tooltip.
-const TOPBAR_FULL_CHIP_WIDTH: f32 = 900.0;
+/// The window width, before the text scale, from which the top bar's chip may say "new
+/// version" in words; below it the chip is an arrow with the words in its tooltip. The
+/// top row's own rule for its notices ([`ShelluneView::topbar_notice_form`]) can ask
+/// for more.
+pub(super) const TOPBAR_FULL_CHIP_WIDTH: f32 = 900.0;
 
 /// How often an update that waits for held saves looks again.
 const HELD_WRITES_POLL: Duration = Duration::from_millis(200);
@@ -1008,47 +1010,46 @@ impl ShelluneView {
         )
     }
 
-    /// The chip in the top bar while a newer release is known; a press opens the card.
-    pub(super) fn update_topbar_chip(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    /// What the top row says while a newer release is known: the chip's words.
+    pub(super) fn update_notice(&self) -> Option<String> {
         let release = self.update.stage.release()?;
+        Some(copy::fill(
+            self.update_strings().chip,
+            &[("version", &release.version.to_string())],
+        ))
+    }
+
+    /// The chip in the top bar while a newer release is known; a press opens the card.
+    ///
+    /// The row decides its form ([`ShelluneView::topbar_notice_form`]): the words when
+    /// there is room for them, an accent arrow the size of the other top-bar buttons
+    /// with the words in its tooltip when there is not, and nothing of its own in a
+    /// compact row, where the settings button carries it (R2, R9).
+    pub(super) fn update_topbar_chip(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let label = self.update_notice()?;
         let strings = self.update_strings();
         let metrics = self.metrics();
-        let label = copy::fill(strings.chip, &[("version", &release.version.to_string())]);
-        let chip = div()
-            .id("topbar.update")
-            .debug_selector(|| "topbar.update".to_owned())
-            .flex()
-            .flex_none()
-            .items_center()
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _event, window, cx| {
-                this.open_update_settings(window, cx);
-            }));
-        // A narrow window shows an accent arrow the size of the other top-bar buttons,
-        // with the sentence in its tooltip: the words would push the window buttons
-        // past the edge (720x480 at 200%).
-        if self.viewport_width < metrics.scale(TOPBAR_FULL_CHIP_WIDTH) {
-            return Some(
-                chip.justify_center()
-                    .size(metrics.scale(30.0))
-                    .rounded(px(radius::MEDIUM))
-                    .bg(theme::swatch(palette::ACCENT_TINT))
-                    .tooltip(components::tooltip(SharedString::from(format!(
-                        "{label} \u{b7} {}",
-                        strings.chip_hint
-                    ))))
-                    .child(crate::app::icons::icon(
-                        Icon::ArrowUp,
-                        metrics.icon_size(),
-                        theme::swatch(palette::ACCENT),
-                    )),
-            );
+        let open = cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
+            this.open_update_settings(window, cx);
+        });
+        match self.topbar_notice_form() {
+            NoticeForm::Folded => None,
+            NoticeForm::Icon => Some(
+                notice_icon(
+                    "topbar.update",
+                    Icon::ArrowUp,
+                    Tone::Accent,
+                    format!("{label} \u{b7} {}", strings.chip_hint),
+                    metrics,
+                )
+                .on_click(open),
+            ),
+            NoticeForm::Words => Some(
+                notice_words("topbar.update", label, Tone::Accent, metrics)
+                    .tooltip(components::tooltip(SharedString::from(strings.chip_hint)))
+                    .on_click(open),
+            ),
         }
-        Some(
-            chip.mr(metrics.scale(spacing::HAIRLINE))
-                .tooltip(components::tooltip(SharedString::from(strings.chip_hint)))
-                .child(components::chip(label, Tone::Accent, metrics)),
-        )
     }
 
     /// The question before an install or a restart, listing what would stop.
@@ -1251,6 +1252,15 @@ impl ShelluneView {
         self.update.waiting.is_some()
     }
 
+    /// Puts a newer release on offer without asking any server, so a test can see what
+    /// the top row does with its notice.
+    #[cfg(test)]
+    pub fn offer_update_for_test(&mut self, cx: &mut Context<Self>) {
+        self.update.backend = None;
+        self.update.stage = UpdateStage::Available(capture_release());
+        cx.notify();
+    }
+
     /// Whether the automatic check is on.
     #[cfg(test)]
     #[must_use]
@@ -1265,6 +1275,15 @@ impl ShelluneView {
         self.update.backend = None;
         self.update.stage = UpdateStage::Available(capture_release());
         self.settings_reveal(Category::About);
+        cx.notify();
+    }
+
+    /// Puts the capture release on offer without opening anything, so the shot shows
+    /// the top row's notice over whatever page is on screen.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_update_notice(&mut self, cx: &mut Context<Self>) {
+        self.update.backend = None;
+        self.update.stage = UpdateStage::Available(capture_release());
         cx.notify();
     }
 
@@ -1302,7 +1321,7 @@ impl ShelluneView {
 }
 
 /// The release a capture shows: a fixed version one minor above this one, with notes.
-#[cfg(feature = "ui-capture")]
+#[cfg(any(test, feature = "ui-capture"))]
 fn capture_release() -> Release {
     let current = shellune_update::parse_version(shellune_update::CURRENT_VERSION)
         .unwrap_or_else(|_| shellune_update::parse_version("0.0.0").expect("a version"));

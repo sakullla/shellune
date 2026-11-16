@@ -564,6 +564,19 @@ fn show_tabs_connecting(
     Ok(())
 }
 
+/// The connecting-tab fixture with a newer release on offer and a failed sync, the two
+/// notices the top row carries on every page (R2, R9).
+fn show_tabs_notices(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_tabs_connecting(view, window, cx)?;
+    view.capture_update_notice(cx);
+    view.capture_sync_failed(cx);
+    Ok(())
+}
+
 /// One session in a tab of its own, split left and right, with the new pane active
 /// (R5, R12).
 fn show_split(
@@ -1615,6 +1628,17 @@ fn tabs_connecting_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     Ok(())
 }
 
+fn tabs_notices_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    tabs_connecting_ready(view, cx)?;
+    if view.capture_update_stage() != "available" {
+        return Err("no release is on offer, so the top row has no update notice".to_owned());
+    }
+    if !view.capture_sync_marked() {
+        return Err("the sync is not marked as failed".to_owned());
+    }
+    Ok(())
+}
+
 fn split_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     on_page(view, Destination::LocalShells, SectionState::Populated)?;
     let panes = view.workspace().layout().leaves().len();
@@ -2649,6 +2673,26 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_hosts,
         install: show_tabs_connecting,
         ready: tabs_connecting_ready,
+    },
+    Scenario {
+        id: "tabs-notices",
+        title: "终端 · 标题栏提示与当前标签",
+        category: Category::Terminal,
+        fixture: "the tabs-connecting fixture with a fixed newer release on offer and the \
+                  last sync marked as failed; the window has no updater and is offline",
+        evidence: "proves the top row's notices never take the current tab's room: with room \
+                   they are words, in a 720x480 window they are icons in their tone, and in \
+                   the compact row of 720x480 at 200% they fold into the settings button as \
+                   a mark, the current tab still whole; nothing was sent or installed",
+        quick: true,
+        variants: &[
+            Variant::dark().smallest(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_tabs_notices,
+        ready: tabs_notices_ready,
     },
     Scenario {
         id: "terminal-split",

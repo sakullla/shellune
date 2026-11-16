@@ -19,7 +19,7 @@ use gpui::{Context, Div, FontWeight, SharedString, Stateful, Window, div, px};
 use shellune_core::{BatchTarget, FailurePolicy, HostId, HostState, RunState, StepState};
 
 use super::ShelluneView;
-use super::shell::ModalContent;
+use super::shell::{ModalContent, NoticeForm};
 use crate::app::batch::{BatchRunPage, MAX_PREVIEW_ROWS};
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, UxStrings};
@@ -619,25 +619,77 @@ impl ShelluneView {
         let ux = copy::ux();
         let metrics = self.metrics();
         let selected = self.batch.view().is_open();
+        let notice = self.batch_notice();
+        let form = self.topbar_notice_form();
+        // A compact row has no room for the run's own indicator, so the entry carries
+        // it: a mark in the run's tone, the run's state in its tooltip, and a press that
+        // returns to the run - whose page switches to the saved tasks too (R2, R9, R13).
+        let folded = notice.clone().filter(|_| form == NoticeForm::Folded);
+        let tooltip = match &folded {
+            Some((label, _)) => format!("{label} · {}", ux.batch_run_background_hint),
+            None => format!("{} · {}", ux.batch_center_open, ux.batch_center_open_hint),
+        };
         let entry = components::icon_only_button(Icon::Layers, metrics)
+            .relative()
             .id("topbar.batch")
             .debug_selector(|| "topbar.batch".to_owned())
-            .tooltip(components::tooltip(SharedString::from(format!(
-                "{} · {}",
-                ux.batch_center_open, ux.batch_center_open_hint
-            ))))
+            .tooltip(components::tooltip(SharedString::from(tooltip)))
             .when(selected, |button| {
                 button.bg(theme::swatch(palette::SURFACE_SELECTED))
             })
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.open_batch_library(cx);
+            .when_some(folded.clone(), |button, (_, tone)| {
+                button.child(super::shell::notice_badge(
+                    tone,
+                    "topbar.batch.active",
+                    metrics,
+                ))
+            })
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if folded.is_some() && this.batch.show_active_run() {
+                    cx.notify();
+                } else {
+                    this.open_batch_library(cx);
+                }
             }));
         let mut controls = vec![entry];
-        let Some(page) = self.batch.run() else {
+        let Some((label, tone)) = notice else {
             return controls;
         };
+        let back = cx.listener(|this, _event: &gpui::ClickEvent, _window, cx| {
+            if this.batch.show_active_run() {
+                cx.notify();
+            }
+        });
+        match form {
+            NoticeForm::Folded => {}
+            NoticeForm::Icon => controls.push(
+                super::shell::notice_icon(
+                    "topbar.batch.active",
+                    Icon::Play,
+                    tone,
+                    format!("{label} · {}", ux.batch_run_background_hint),
+                    metrics,
+                )
+                .on_click(back),
+            ),
+            NoticeForm::Words => controls.push(
+                super::shell::notice_words("topbar.batch.active", label, tone, metrics)
+                    .tooltip(components::tooltip(SharedString::from(
+                        ux.batch_run_background_hint,
+                    )))
+                    .on_click(back),
+            ),
+        }
+        controls
+    }
+
+    /// What the top row says while this window drives a run: the run's state in words
+    /// and its tone (R11, R13). None once the run ended.
+    pub(super) fn batch_notice(&self) -> Option<(String, Tone)> {
+        let ux = copy::ux();
+        let page = self.batch.run()?;
         if page.is_finished() {
-            return controls;
+            return None;
         }
         let done = page.finished_hosts().to_string();
         let total = page.total_hosts().to_string();
@@ -652,27 +704,7 @@ impl ShelluneView {
                 &[("done", &done), ("total", &total)],
             )
         };
-        let tone = run_state_tone(page.state());
-        controls.push(
-            div()
-                .id("topbar.batch.active")
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(metrics.scale(spacing::HAIRLINE))
-                .cursor_pointer()
-                .debug_selector(|| "topbar.batch.active".to_owned())
-                .tooltip(components::tooltip(SharedString::from(
-                    ux.batch_run_background_hint,
-                )))
-                .child(components::chip(label, tone, metrics))
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    if this.batch.show_active_run() {
-                        cx.notify();
-                    }
-                })),
-        );
-        controls
+        Some((label, run_state_tone(page.state())))
     }
 
     // -----------------------------------------------------------------------

@@ -48,6 +48,93 @@ pub enum Tool {
 /// compact row ([`ShelluneView::header_compact`]).
 const HEADER_FULL_ROW: f32 = 460.0;
 
+/// The logical room one notice of the top row takes as an icon: a newer release, a
+/// failed or conflicting sync, a run this window drives (R2, R9).
+const NOTICE_ICON_ROOM: f32 = 30.0;
+
+/// The logical room one notice of the top row takes at most as words, its gap
+/// included: longer words end in an ellipsis, the whole sentence is in its tooltip.
+const NOTICE_WORDS_ROOM: f32 = 200.0;
+
+/// How the top row draws its notices (R2, R9).
+///
+/// The row's width is decided from the window's width, the text size and which notices
+/// there are, never from a measured layout, so every form has a known width and the
+/// current tab is never what gives way to a notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeForm {
+    /// As words in a chip of at most [`NOTICE_WORDS_ROOM`].
+    Words,
+    /// As an icon of [`NOTICE_ICON_ROOM`] in the notice's tone, the words in its tooltip.
+    Icon,
+    /// Folded into a control the row already has - the settings button for a release
+    /// or the sync, the task centre's entry for a run - as a mark in the notice's tone.
+    /// A compact row has no room for anything more.
+    Folded,
+}
+
+/// A notice of the top row drawn as an icon in its tone, the words in its tooltip.
+pub(super) fn notice_icon(
+    selector: &'static str,
+    icon: Icon,
+    tone: Tone,
+    tooltip: String,
+    metrics: theme::Metrics,
+) -> Stateful<Div> {
+    div()
+        .id(selector)
+        .debug_selector(move || selector.to_owned())
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(metrics.scale(NOTICE_ICON_ROOM))
+        .rounded(px(radius::MEDIUM))
+        .bg(tone.chip_background())
+        .cursor_pointer()
+        .tooltip(components::tooltip(SharedString::from(tooltip)))
+        .child(icons::icon(icon, metrics.icon_size(), tone.text()))
+}
+
+/// A notice of the top row drawn as words, never wider than [`NOTICE_WORDS_ROOM`].
+pub(super) fn notice_words(
+    selector: &'static str,
+    label: impl Into<SharedString>,
+    tone: Tone,
+    metrics: theme::Metrics,
+) -> Stateful<Div> {
+    div()
+        .id(selector)
+        .debug_selector(move || selector.to_owned())
+        .flex()
+        .flex_none()
+        .items_center()
+        .max_w(metrics.scale(NOTICE_WORDS_ROOM - spacing::HAIRLINE))
+        .mr(metrics.scale(spacing::HAIRLINE))
+        .cursor_pointer()
+        .child(components::chip_within(label, tone, metrics))
+}
+
+/// The mark a control carries for a notice folded into it, in the notice's tone and
+/// shape, with the notice's own selector over the whole control so a press on it is a
+/// press on the control.
+pub(super) fn notice_badge(tone: Tone, selector: &'static str, metrics: theme::Metrics) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .debug_selector(move || selector.to_owned())
+        .child(
+            div()
+                .absolute()
+                .top(metrics.scale(2.0))
+                .right(metrics.scale(2.0))
+                .p(px(1.5))
+                .rounded_full()
+                .bg(theme::swatch(palette::CHROME))
+                .child(components::status_dot(tone, metrics)),
+        )
+}
+
 /// The pieces of one centred dialog; the dialog itself is the shared
 /// [`components::modal`].
 pub(super) use crate::app::components::ModalContent;
@@ -171,22 +258,7 @@ impl ShelluneView {
                     this.toggle_palette(window, cx);
                 })),
             )
-            .child(
-                self.bar_icon(
-                    "nav.settings",
-                    Icon::Settings,
-                    match crate::app::keymap::page_action(Destination::Settings)
-                        .and_then(|spec| self.keymap.label(spec.id))
-                    {
-                        Some(shortcut) => format!("{} ({shortcut})", ux.settings_title),
-                        None => ux.settings_title.to_owned(),
-                    },
-                    self.workspace.destination() == Destination::Settings,
-                )
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.select(Destination::Settings, window, cx);
-                })),
-            );
+            .child(self.settings_button(cx));
 
         let controls = self.window_controls(window, cx);
         div()
@@ -509,14 +581,114 @@ impl ShelluneView {
     /// compact row drops the brand mark and the new-tab chevron (its shells are in the
     /// palette and on the hosts home's own menu), shows the hosts tab as its icon, the
     /// page tools at the pointer target's size, and only the current session tab; the
-    /// list of every tab beside the strip reaches the rest. It is decided from the
-    /// window's width and the text size alone, never from a measured layout, so the row
-    /// cannot flip between its two forms from one frame to the next.
+    /// list of every tab beside the strip reaches the rest; the notices the full row
+    /// would draw beside the page tools are folded into its controls
+    /// ([`NoticeForm::Folded`]). It is decided from the window's width, the text size
+    /// and which notices there are, never from a measured layout, so the row cannot flip
+    /// between its two forms from one frame to the next.
     pub(super) fn header_compact(&self) -> bool {
         let metrics = self.metrics();
+        // Each notice the full row would draw takes at least an icon's room beside the
+        // parts above; without that room the row folds them into its controls instead
+        // of letting the current tab give way (R2).
+        let notices = self.topbar_notice_count() as f32;
         self.viewport_width
-            < metrics.scale(HEADER_FULL_ROW)
+            < metrics.scale(HEADER_FULL_ROW + NOTICE_ICON_ROOM * notices)
                 + super::titlebar::window_controls_width(Platform::current())
+    }
+
+    /// How many notices the top row has to show: a newer release, a failed or
+    /// conflicting sync, a run this window drives (R2).
+    fn topbar_notice_count(&self) -> usize {
+        usize::from(self.update_notice().is_some())
+            + usize::from(self.sync_notice().is_some())
+            + usize::from(self.batch_notice().is_some())
+    }
+
+    /// How the top row draws its notices (R2, R9).
+    ///
+    /// A compact row folds them into its controls. A full row draws each as words when
+    /// the row has [`NOTICE_WORDS_ROOM`] for every one of them beside its own parts, and
+    /// as an icon otherwise; [`Self::header_compact`] already counts that icon's room,
+    /// so neither form takes the room of the current tab.
+    pub(super) fn topbar_notice_form(&self) -> NoticeForm {
+        if self.header_compact() {
+            return NoticeForm::Folded;
+        }
+        let metrics = self.metrics();
+        let notices = self.topbar_notice_count() as f32;
+        let words = metrics.scale(HEADER_FULL_ROW + NOTICE_WORDS_ROOM * notices)
+            + super::titlebar::window_controls_width(Platform::current());
+        if self.viewport_width >= words.max(metrics.scale(super::update::TOPBAR_FULL_CHIP_WIDTH)) {
+            NoticeForm::Words
+        } else {
+            NoticeForm::Icon
+        }
+    }
+
+    /// The top row's settings button.
+    ///
+    /// In a compact row it also carries the notices that lead into the settings - a
+    /// failed or conflicting sync, a newer release - as a mark in the first one's tone,
+    /// their words in its tooltip, and a press that opens the page the first one leads
+    /// to: the sync settings, else the update card. A full row draws them on their own
+    /// (R2, R9).
+    fn settings_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let ux = copy::ux();
+        let metrics = self.metrics();
+        let folded = self.topbar_notice_form() == NoticeForm::Folded;
+        let sync = self.sync_notice().filter(|_| folded);
+        let update = self.update_notice().filter(|_| folded);
+        let mut tooltip = match crate::app::keymap::page_action(Destination::Settings)
+            .and_then(|spec| self.keymap.label(spec.id))
+        {
+            Some(shortcut) => format!("{} ({shortcut})", ux.settings_title),
+            None => ux.settings_title.to_owned(),
+        };
+        for label in sync
+            .map(|(label, _)| label.to_owned())
+            .into_iter()
+            .chain(update.clone())
+        {
+            tooltip.push_str(" \u{b7} ");
+            tooltip.push_str(&label);
+        }
+        let leads_to_sync = sync.is_some();
+        let leads_to_update = update.is_some();
+        self.bar_icon(
+            "nav.settings",
+            Icon::Settings,
+            tooltip,
+            self.workspace.destination() == Destination::Settings,
+        )
+        .relative()
+        .when_some(sync, |button, (_, tone)| {
+            button.child(notice_badge(tone, "topbar.sync", metrics))
+        })
+        .when(leads_to_update, |button| {
+            // One mark is enough: a second one would sit on the first.
+            let tone = sync.map_or(Tone::Accent, |(_, tone)| tone);
+            button.child(notice_badge(tone, "topbar.update", metrics))
+        })
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            if leads_to_sync {
+                this.open_sync_settings(window, cx);
+            } else if leads_to_update {
+                this.open_update_settings(window, cx);
+            } else {
+                this.select(Destination::Settings, window, cx);
+            }
+        }))
+    }
+
+    /// How the top row draws its notices, for a test: "words", "icon" or "folded".
+    #[cfg(test)]
+    pub fn topbar_notice_form_for_test(&self) -> &'static str {
+        match self.topbar_notice_form() {
+            NoticeForm::Words => "words",
+            NoticeForm::Icon => "icon",
+            NoticeForm::Folded => "folded",
+        }
     }
 
     /// Whether the top row draws its compact form, for a test.

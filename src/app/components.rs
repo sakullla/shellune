@@ -481,11 +481,25 @@ pub fn pulsing_status_dot(
 /// It is a hairline block, not a pill: the mark's shape and the word carry the state,
 /// and the tone only agrees with them.
 pub fn chip(label: impl Into<SharedString>, tone: Tone, metrics: Metrics) -> Div {
+    chip_frame(tone, metrics).flex_none().child(label.into())
+}
+
+/// A [`chip`] that gives way to the box it is placed in: its words end in an ellipsis
+/// rather than running past the box, and the mark stays whole.
+pub fn chip_within(label: impl Into<SharedString>, tone: Tone, metrics: Metrics) -> Div {
+    chip_frame(tone, metrics)
+        .flex_initial()
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .child(div().min_w(px(0.0)).truncate().child(label.into()))
+}
+
+/// The pill, tint and mark of a chip, without its words.
+fn chip_frame(tone: Tone, metrics: Metrics) -> Div {
     // A soft pill: the tint and the mark carry the tone, so no outline is needed. A
     // neutral chip is a plain word - its dash mark read as a minus sign in front of it.
     div()
         .flex()
-        .flex_none()
         .items_center()
         .gap(metrics.scale(5.0))
         .h(metrics.scale(20.0))
@@ -500,7 +514,6 @@ pub fn chip(label: impl Into<SharedString>, tone: Tone, metrics: Metrics) -> Div
         .when(tone != Tone::Neutral, |chip| {
             chip.child(status_mark(tone, metrics.scale(6.0)))
         })
-        .child(label.into())
 }
 
 /// A quiet label for a grouping such as a host's group: no mark, because it is not a
