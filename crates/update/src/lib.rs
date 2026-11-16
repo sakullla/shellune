@@ -17,7 +17,8 @@
 //! Every call blocks; the application runs them on a background thread. Nothing
 //! here starts a thread, a timer or a user interface. A refused or interrupted
 //! download never touches the running copy, and an install that fails half way
-//! puts the old files back.
+//! puts the old files back. Update files are kept in a temporary folder until
+//! the next download or [`Updater::clean_downloads`] (call it at startup).
 //!
 //! Requests use the same client setup as WebDAV sync: `ureq` with rustls and the
 //! system certificate verifier, and the proxy named by `HTTPS_PROXY` /
@@ -52,7 +53,7 @@ pub use install::{
 pub use manifest::{Asset, Manifest, PlatformKey, is_newer, parse_version};
 pub use signature::{verify_bytes, verify_file};
 pub use updater::{
-    CheckOutcome, DownloadProgress, DownloadedUpdate, Release, Updater, UpdaterConfig,
+    CheckOutcome, DownloadProgress, DownloadedUpdate, Release, Unavailable, Updater, UpdaterConfig,
 };
 
 /// Where the newest release's manifest is published.

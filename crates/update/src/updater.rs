@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use semver::Version;
 
-use crate::http::{self, CHECK_TIMEOUT, Purpose};
+use crate::http::{self, CHECK_TIMEOUT, DOWNLOAD_IDLE_TIMEOUT, Purpose};
 use crate::install::{
     self, BundleFailure, InstallOutcome, InstallRoute, ManualReason, RestartTarget,
 };
@@ -34,12 +34,16 @@ pub struct UpdaterConfig {
     pub download_dir: PathBuf,
     /// How long the manifest request may take in total.
     pub check_timeout: Duration,
+    /// How long a download may go without receiving data. A download that keeps
+    /// receiving has no time limit.
+    pub download_idle_timeout: Duration,
 }
 
 impl UpdaterConfig {
     /// The running copy's settings: [`crate::endpoint`], [`PUBLIC_KEY`],
     /// [`CURRENT_VERSION`], [`install::current_route`], a `shellune-update`
-    /// folder in the system's temporary folder, and a 15-second check.
+    /// folder in the system's temporary folder, a 15-second check, and downloads
+    /// that give up after 60 seconds without data.
     ///
     /// # Panics
     ///
@@ -53,6 +57,7 @@ impl UpdaterConfig {
             route: install::current_route(),
             download_dir: std::env::temp_dir().join("shellune-update"),
             check_timeout: CHECK_TIMEOUT,
+            download_idle_timeout: DOWNLOAD_IDLE_TIMEOUT,
         }
     }
 }
@@ -69,9 +74,12 @@ pub struct Release {
     /// Its page, for the manual route and for reading more.
     pub release_page: String,
     /// The file this copy's route installs, when the release has a signed one.
-    /// `None` on the manual route, and when the release lacks the file or its
-    /// signature (the update is then offered through the release page only).
+    /// `None` when [`Self::unavailable`] says why not (the update is then offered
+    /// through the release page only).
     pub asset: Option<(PlatformKey, Asset)>,
+    /// Why this copy cannot download and install the release itself; `None`
+    /// exactly when [`Self::asset`] is set.
+    pub unavailable: Option<Unavailable>,
 }
 
 impl Release {
@@ -80,6 +88,31 @@ impl Release {
     pub fn installable(&self) -> bool {
         self.asset.is_some()
     }
+
+    /// The error [`Updater::download`] gives for this release when it is not
+    /// installable.
+    #[must_use]
+    pub fn unavailable_error(&self) -> Option<UpdateError> {
+        if self.asset.is_some() {
+            return None;
+        }
+        Some(match self.unavailable {
+            Some(Unavailable::SignatureMissing(_)) => UpdateError::SignatureMissing,
+            _ => UpdateError::NoInstallableAsset,
+        })
+    }
+}
+
+/// Why a newer release cannot be installed by this copy itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unavailable {
+    /// This copy is updated from the release page (see the reason).
+    ManualRoute(ManualReason),
+    /// The release has no file for this copy's platform and packaging.
+    NoAsset(PlatformKey),
+    /// The release lists the file for this copy, but without a signature: it is
+    /// not downloaded ([`UpdateError::SignatureMissing`]).
+    SignatureMissing(PlatformKey),
 }
 
 /// What a check found.
@@ -191,18 +224,26 @@ impl Updater {
                 latest: manifest.version.clone(),
             };
         }
-        let asset = self.config.route.platform_key().and_then(|key| {
-            manifest
-                .asset(key)
-                .filter(|asset| !asset.signature.trim().is_empty())
-                .map(|asset| (key, asset.clone()))
-        });
+        let (asset, unavailable) = match &self.config.route {
+            InstallRoute::Manual { reason } => (None, Some(Unavailable::ManualRoute(*reason))),
+            route => match route.platform_key() {
+                None => (None, Some(Unavailable::ManualRoute(ManualReason::Platform))),
+                Some(key) => match manifest.asset(key) {
+                    None => (None, Some(Unavailable::NoAsset(key))),
+                    Some(asset) if asset.signature.trim().is_empty() => {
+                        (None, Some(Unavailable::SignatureMissing(key)))
+                    }
+                    Some(asset) => (Some((key, asset.clone())), None),
+                },
+            },
+        };
         CheckOutcome::Available(Release {
             version: manifest.version.clone(),
             notes: manifest.notes.clone(),
             pub_date: manifest.pub_date.clone(),
             release_page: release_page(&manifest.version),
             asset,
+            unavailable,
         })
     }
 
@@ -228,15 +269,31 @@ impl Updater {
         Manifest::parse(&bytes)
     }
 
+    /// Removes the files left in the download folder by earlier downloads
+    /// (installed or abandoned update files, partial downloads). Call it when the
+    /// application starts; [`Self::download`] also calls it first.
+    ///
+    /// Only plain files directly in the folder are removed. A file that cannot
+    /// be removed now (an installer still running, another copy downloading) is
+    /// left for a later call. Returns how many files were removed.
+    pub fn clean_downloads(&self) -> usize {
+        clean_download_folder(&self.config.download_dir)
+    }
+
     /// Downloads the release's file into the download folder, calling `progress`
     /// as bytes arrive, and keeps it only when its signature verifies for the
-    /// release's version. A refused or broken download is deleted.
+    /// release's version. Earlier downloads are removed first
+    /// ([`Self::clean_downloads`]); a refused or broken download is deleted. The
+    /// download has no total time limit: it fails only after
+    /// [`UpdaterConfig::download_idle_timeout`] without data.
     ///
     /// # Errors
     ///
-    /// [`UpdateError::NoInstallableAsset`] for a release without a file for this
-    /// route, [`UpdateError::SignatureMissing`], the transport errors of
-    /// [`Self::check`], [`UpdateError::DownloadInterrupted`],
+    /// [`UpdateError::SignatureMissing`] for a release whose file for this route
+    /// is listed unsigned, [`UpdateError::NoInstallableAsset`] for any other
+    /// release without an installable file (see [`Release::unavailable`]), the
+    /// transport errors of [`Self::check`] ([`UpdateError::Timeout`] when the
+    /// server goes quiet), [`UpdateError::DownloadInterrupted`],
     /// [`UpdateError::SignatureInvalid`], [`UpdateError::VersionMismatch`] and
     /// [`UpdateError::Io`].
     pub fn download(
@@ -245,7 +302,9 @@ impl Updater {
         progress: &mut dyn FnMut(DownloadProgress),
     ) -> Result<DownloadedUpdate, UpdateError> {
         let Some((platform, asset)) = &release.asset else {
-            return Err(UpdateError::NoInstallableAsset);
+            return Err(release
+                .unavailable_error()
+                .unwrap_or(UpdateError::NoInstallableAsset));
         };
         if asset.signature.trim().is_empty() {
             return Err(UpdateError::SignatureMissing);
@@ -257,26 +316,31 @@ impl Updater {
                 &error,
             )
         })?;
+        clean_download_folder(folder);
         let target = folder.join(file_name(&asset.url, *platform, &release.version));
         let mut partial = target.clone().into_os_string();
         partial.push(".part");
         let partial = PathBuf::from(partial);
 
-        let fetched = fetch_to(&asset.url, &partial, progress)
-            .and_then(|()| {
-                verify_file(
-                    &self.config.public_key,
-                    &asset.signature,
-                    &partial,
-                    &release.version,
-                )
-            })
-            .and_then(|()| {
-                let _ = fs::remove_file(&target);
-                fs::rename(&partial, &target).map_err(|error| {
-                    UpdateError::io("the downloaded file cannot be renamed", &error)
-                })
-            });
+        let fetched = fetch_to(
+            &asset.url,
+            &partial,
+            self.config.download_idle_timeout,
+            progress,
+        )
+        .and_then(|()| {
+            verify_file(
+                &self.config.public_key,
+                &asset.signature,
+                &partial,
+                &release.version,
+            )
+        })
+        .and_then(|()| {
+            let _ = fs::remove_file(&target);
+            fs::rename(&partial, &target)
+                .map_err(|error| UpdateError::io("the downloaded file cannot be renamed", &error))
+        });
         if let Err(error) = fetched {
             let _ = fs::remove_file(&partial);
             return Err(error);
@@ -348,13 +412,26 @@ impl Updater {
     }
 }
 
-/// Streams `url` into `path`.
+/// Removes the plain files directly in `folder`; returns how many went.
+fn clean_download_folder(folder: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|entry| fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
+/// Streams `url` into `path`, giving up after `idle` without data.
 fn fetch_to(
     url: &str,
     path: &Path,
+    idle: Duration,
     progress: &mut dyn FnMut(DownloadProgress),
 ) -> Result<(), UpdateError> {
-    let agent = http::agent_for(url, Purpose::Download)?;
+    let agent = http::agent_for(url, Purpose::Download(idle))?;
     let mut response = agent.get(url).call().map_err(http::classify)?;
     let status = response.status().as_u16();
     if status != 200 {
@@ -385,12 +462,16 @@ fn fetch_to(
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                return Err(if error.kind() == std::io::ErrorKind::TimedOut {
-                    UpdateError::Timeout
-                } else {
-                    UpdateError::DownloadInterrupted {
-                        reason: error.to_string(),
+                // The body reader wraps ureq's own errors (a timeout among them)
+                // in an io::Error; unwrap them to tell a silent server apart.
+                return Err(match ureq::Error::from(error) {
+                    ureq::Error::Timeout(_) => UpdateError::Timeout,
+                    ureq::Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                        UpdateError::Timeout
                     }
+                    other => UpdateError::DownloadInterrupted {
+                        reason: other.to_string(),
+                    },
                 });
             }
         };

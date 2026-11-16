@@ -5,6 +5,11 @@
 //! `NO_PROXY` names the host (a loopback host never uses one), and redirects
 //! followed: release files are served from a redirect. The proxy is chosen for the
 //! first address and kept across its redirects.
+//!
+//! A download has no limit on its total time: a slow link that keeps delivering
+//! is waited for. It fails only when no data arrives for the idle limit
+//! ([`DOWNLOAD_IDLE_TIMEOUT`] by default): the agent has no body limit, only a
+//! per-read (and per-write) one, which restarts with every read.
 
 use std::time::Duration;
 
@@ -21,15 +26,16 @@ const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Waiting for a download's answer to start.
 const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Receiving a whole download.
-const DOWNLOAD_BODY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// The longest a download waits for its next bytes.
+pub(crate) const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What a request is for, which sets its time limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Purpose {
     /// The manifest, within this time.
     Check(Duration),
-    Download,
+    /// An update file, failing only after this long without data.
+    Download(Duration),
 }
 
 /// An agent for a request to `url`.
@@ -62,14 +68,17 @@ pub(crate) fn agent_for(url: &str, purpose: Purpose) -> Result<ureq::Agent, Upda
                 .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build(),
         );
-    let builder = match purpose {
-        Purpose::Check(limit) => builder.timeout_global(Some(limit)),
-        Purpose::Download => builder
+    Ok(match purpose {
+        Purpose::Check(limit) => builder.timeout_global(Some(limit)).build().into(),
+        Purpose::Download(idle) => builder
             .timeout_connect(Some(DOWNLOAD_CONNECT_TIMEOUT))
             .timeout_recv_response(Some(DOWNLOAD_RESPONSE_TIMEOUT))
-            .timeout_recv_body(Some(DOWNLOAD_BODY_TIMEOUT)),
-    };
-    Ok(builder.build().into())
+            .timeout_recv_body(None)
+            .timeout_per_read(Some(idle))
+            .timeout_per_write(Some(idle))
+            .build()
+            .into(),
+    })
 }
 
 /// Sorts a transport failure into what the user can act on.
@@ -208,7 +217,7 @@ mod tests {
             Err(UpdateError::InvalidConfig { .. })
         ));
         assert!(matches!(
-            agent_for("not a url", Purpose::Download),
+            agent_for("not a url", Purpose::Download(DOWNLOAD_IDLE_TIMEOUT)),
             Err(UpdateError::InvalidConfig { .. })
         ));
     }

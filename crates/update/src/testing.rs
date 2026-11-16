@@ -31,6 +31,9 @@ enum Route {
         /// the whole body).
         sent: Option<usize>,
         delay: Option<Duration>,
+        /// The body is sent in pieces of this many bytes, with this pause
+        /// before each piece after the first.
+        trickle: Option<(usize, Duration)>,
     },
     Redirect(String),
 }
@@ -100,6 +103,29 @@ impl HttpServer {
                 body: body.into(),
                 sent: None,
                 delay: None,
+                trickle: None,
+            },
+        );
+    }
+
+    /// `path` answers 200 with `body`, sent `chunk` bytes at a time with `pause`
+    /// between the pieces (a slow link, or with a long pause a server that goes
+    /// quiet in the middle of the body).
+    pub fn serve_trickled(
+        &self,
+        path: &str,
+        body: impl Into<Vec<u8>>,
+        chunk: usize,
+        pause: Duration,
+    ) {
+        self.route(
+            path,
+            Route::Body {
+                status: 200,
+                body: body.into(),
+                sent: None,
+                delay: None,
+                trickle: Some((chunk.max(1), pause)),
             },
         );
     }
@@ -113,6 +139,7 @@ impl HttpServer {
                 body: Vec::new(),
                 sent: None,
                 delay: None,
+                trickle: None,
             },
         );
     }
@@ -126,6 +153,7 @@ impl HttpServer {
                 body: body.into(),
                 sent: Some(sent),
                 delay: None,
+                trickle: None,
             },
         );
     }
@@ -139,6 +167,7 @@ impl HttpServer {
                 body: body.into(),
                 sent: None,
                 delay: Some(delay),
+                trickle: None,
             },
         );
     }
@@ -227,12 +256,14 @@ fn serve(stream: TcpStream, state: &Mutex<State>) {
             body: Vec::new(),
             sent: None,
             delay: None,
+            trickle: None,
         },
         _ => Route::Body {
             status: 405,
             body: Vec::new(),
             sent: None,
             delay: None,
+            trickle: None,
         },
     };
     match route {
@@ -247,6 +278,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>) {
             body,
             sent,
             delay,
+            trickle,
         } => {
             if let Some(delay) = delay {
                 std::thread::sleep(delay);
@@ -259,7 +291,19 @@ fn serve(stream: TcpStream, state: &Mutex<State>) {
             let sent = sent.unwrap_or(body.len()).min(body.len());
             let _ = stream
                 .write_all(head.as_bytes())
-                .and_then(|()| stream.write_all(&body[..sent]))
+                .and_then(|()| match trickle {
+                    None => stream.write_all(&body[..sent]),
+                    Some((chunk, pause)) => {
+                        for (index, piece) in body[..sent].chunks(chunk).enumerate() {
+                            if index > 0 {
+                                std::thread::sleep(pause);
+                            }
+                            stream.write_all(piece)?;
+                            stream.flush()?;
+                        }
+                        Ok(())
+                    }
+                })
                 .and_then(|()| stream.flush());
         }
     }
@@ -375,6 +419,7 @@ pub fn config(
         route,
         download_dir: download_dir.to_path_buf(),
         check_timeout: Duration::from_secs(5),
+        download_idle_timeout: Duration::from_secs(5),
     }
 }
 

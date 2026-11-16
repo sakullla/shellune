@@ -182,6 +182,8 @@ fn a_check_offers_newer_releases_only() {
         Some(PlatformKey::WindowsX86_64Portable)
     );
     assert!(release.installable());
+    assert_eq!(release.unavailable, None);
+    assert_eq!(release.unavailable_error(), None);
 
     for current in ["1.0.0", "1.0.1"] {
         assert_eq!(
@@ -195,18 +197,34 @@ fn a_check_offers_newer_releases_only() {
     }
 
     // The installed route wants the setup file, which this release lacks; Linux is
-    // manual: both are told about the release without a file to install.
-    for route in [
-        InstallRoute::WindowsInstaller {
-            executable: downloads.path().join("shellune.exe"),
-        },
-        InstallRoute::Manual {
-            reason: ManualReason::Platform,
-        },
+    // manual: both are told about the release without a file to install, and why.
+    for (route, why) in [
+        (
+            InstallRoute::WindowsInstaller {
+                executable: downloads.path().join("shellune.exe"),
+            },
+            Unavailable::NoAsset(PlatformKey::WindowsX86_64),
+        ),
+        (
+            InstallRoute::Manual {
+                reason: ManualReason::Platform,
+            },
+            Unavailable::ManualRoute(ManualReason::Platform),
+        ),
     ] {
-        let release = available(&updater(&server, &key, "0.4.7", route, downloads.path()));
+        let checker = updater(&server, &key, "0.4.7", route, downloads.path());
+        let release = available(&checker);
         assert_eq!(release.asset, None);
         assert!(!release.installable());
+        assert_eq!(release.unavailable, Some(why));
+        assert_eq!(
+            release.unavailable_error(),
+            Some(UpdateError::NoInstallableAsset)
+        );
+        assert_eq!(
+            checker.download(&release, &mut |_| {}),
+            Err(UpdateError::NoInstallableAsset)
+        );
     }
 
     // The manifest is fetched through a redirect, as GitHub serves it.
@@ -419,16 +437,35 @@ fn tampered_unsigned_and_misversioned_files_are_refused() {
         assert_eq!(files_in(app.path()), ["shellune.exe"]);
     }
 
-    // A manifest entry without a signature is not offered for install, and a
-    // release that claims one anyway is refused before any download.
-    publish_portable(&server, &zip, String::new());
+    // A manifest entry without a signature is not offered for install; the
+    // release says the file is unsigned (not missing), the download refuses it as
+    // such without a request, and a release that claims a blank signature anyway
+    // is refused the same way.
+    for blank in ["", "  \n"] {
+        publish_portable(&server, &zip, blank.to_owned());
+        let checker = updater(&server, &key, "0.4.7", route.clone(), downloads.path());
+        let release = available(&checker);
+        assert_eq!(release.asset, None);
+        assert!(!release.installable());
+        assert_eq!(
+            release.unavailable,
+            Some(Unavailable::SignatureMissing(
+                PlatformKey::WindowsX86_64Portable
+            ))
+        );
+        assert_eq!(
+            release.unavailable_error(),
+            Some(UpdateError::SignatureMissing)
+        );
+        let before = server.requests().len();
+        assert_eq!(
+            checker.download(&release, &mut |_| {}),
+            Err(UpdateError::SignatureMissing)
+        );
+        assert_eq!(server.requests().len(), before);
+    }
     let updater = updater(&server, &key, "0.4.7", route, downloads.path());
     let mut release = available(&updater);
-    assert_eq!(release.asset, None);
-    assert_eq!(
-        updater.download(&release, &mut |_| {}),
-        Err(UpdateError::NoInstallableAsset)
-    );
     release.asset = Some((
         PlatformKey::WindowsX86_64Portable,
         Asset {
@@ -436,12 +473,107 @@ fn tampered_unsigned_and_misversioned_files_are_refused() {
             signature: " ".to_owned(),
         },
     ));
+    release.unavailable = None;
     let before = server.requests().len();
     assert_eq!(
         updater.download(&release, &mut |_| {}),
         Err(UpdateError::SignatureMissing)
     );
     assert_eq!(server.requests().len(), before);
+    assert_eq!(fs::read(&executable).unwrap(), OLD_EXE);
+}
+
+#[test]
+fn earlier_downloads_are_cleaned_up_at_start_and_before_a_download() {
+    let server = HttpServer::start();
+    let key = TestKey::generate();
+    let app = TempFolder::new("clean-app");
+    let downloads = TempFolder::new("clean-downloads");
+    let (route, _) = portable_route(app.path());
+    let zip = portable_zip("Shellune-1.0.0-windows-x86_64-portable", NEW_EXE);
+    publish_portable(&server, &zip, key.sign(&zip, "1.0.0"));
+    let updater = updater(&server, &key, "0.4.7", route, downloads.path());
+
+    // Nothing to clean, even without the folder.
+    let missing = TempFolder::new("clean-missing");
+    let mut settings = updater.config().clone();
+    settings.download_dir = missing.path().join("absent");
+    assert_eq!(Updater::new(settings).unwrap().clean_downloads(), 0);
+
+    // Leftovers of earlier versions: installed files and a partial download. A
+    // folder inside is not the updater's and stays.
+    let leftovers = [
+        "Shellune-0.9.0-windows-x86_64-portable.zip",
+        "Shellune-0.9.5-windows-x86_64-setup.exe",
+        "Shellune-0.9.9-windows-x86_64-portable.zip.part",
+    ];
+    let seed = || {
+        for name in leftovers {
+            fs::write(downloads.path().join(name), b"old update").unwrap();
+        }
+        fs::create_dir_all(downloads.path().join("keep")).unwrap();
+    };
+    seed();
+    assert_eq!(updater.clean_downloads(), leftovers.len());
+    assert_eq!(files_in(downloads.path()), ["keep"]);
+    assert_eq!(updater.clean_downloads(), 0);
+
+    // A download removes them first and keeps only the new file.
+    seed();
+    let update = updater.download(&available(&updater), &mut |_| {}).unwrap();
+    assert_eq!(
+        files_in(downloads.path()),
+        ["Shellune-1.0.0-windows-x86_64-portable.zip", "keep"]
+    );
+    assert_eq!(fs::read(update.path()).unwrap(), zip);
+
+    // After the install (or at the next start) the downloaded file goes too.
+    updater.install(&update).unwrap();
+    assert_eq!(updater.clean_downloads(), 1);
+    assert_eq!(files_in(downloads.path()), ["keep"]);
+}
+
+#[test]
+fn a_download_waits_for_a_slow_server_but_not_a_silent_one() {
+    let server = HttpServer::start();
+    let key = TestKey::generate();
+    let app = TempFolder::new("idle-app");
+    let downloads = TempFolder::new("idle-downloads");
+    let (route, executable) = portable_route(app.path());
+    // Large enough for several pieces.
+    let filler: Vec<u8> = (0..20_000u32).flat_map(u32::to_le_bytes).collect();
+    let zip = portable_zip("Shellune-1.0.0-windows-x86_64-portable", &filler);
+    publish_portable(&server, &zip, key.sign(&zip, "1.0.0"));
+    let mut settings = updater(&server, &key, "0.4.7", route, downloads.path())
+        .config()
+        .clone();
+    settings.download_idle_timeout = Duration::from_millis(600);
+    let updater = Updater::new(settings).unwrap();
+    let release = available(&updater);
+    let path = "files/Shellune-1.0.0-windows-x86_64-portable.zip";
+
+    // A slow link: every piece arrives within the idle limit, the whole body takes
+    // well over it. It is waited for.
+    let chunk = zip.len().div_ceil(8);
+    server.serve_trickled(path, zip.clone(), chunk, Duration::from_millis(250));
+    let started = std::time::Instant::now();
+    let mut seen = 0;
+    let update = updater.download(&release, &mut |_| seen += 1).unwrap();
+    assert!(started.elapsed() > Duration::from_millis(1500));
+    assert!(seen > 2, "progress was reported along the way");
+    assert_eq!(fs::read(update.path()).unwrap(), zip);
+
+    // A server that goes quiet in the middle of the body times out, and the
+    // partial file is removed.
+    server.serve_trickled(path, zip.clone(), zip.len() / 2, Duration::from_secs(3));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        updater.download(&release, &mut |_| {}),
+        Err(UpdateError::Timeout)
+    );
+    assert!(started.elapsed() < Duration::from_millis(2500));
+    assert!(files_in(downloads.path()).is_empty());
+    assert_eq!(fs::read(&executable).unwrap(), OLD_EXE);
 }
 
 #[test]

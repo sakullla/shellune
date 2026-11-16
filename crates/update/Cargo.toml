@@ -38,7 +38,8 @@ tar = { version = "0.4.46", default-features = false }
 thiserror = { workspace = true }
 # The same blocking HTTP client the sync crate uses: rustls on ring, the system's
 # certificate verifier, SOCKS for an ALL_PROXY that names one. One TLS stack.
-ureq = { version = "3.4.2", default-features = false, features = [
+# 3.5 for the per-read timeout a download uses instead of a total one.
+ureq = { version = "3.5.2", default-features = false, features = [
     "rustls",
     "platform-verifier",
     "socks-proxy",
