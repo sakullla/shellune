@@ -697,6 +697,10 @@ impl SyncService {
             remote_core |= state.last_secrets_hash.as_deref() != Some(theirs.as_str());
             same_core &= mine.secrets.as_deref() == Some(theirs.as_str());
             bundle = Some(opened);
+        } else {
+            // Turning password sync off is a change here (the cloud must drop
+            // the sealed block), even when the records match the cloud's.
+            same_core &= !secrets_changed;
         }
         let changes = if same_core {
             CoreChanges {

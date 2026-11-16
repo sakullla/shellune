@@ -1494,3 +1494,48 @@ fn with_passwords_synced_a_password_changed_in_the_cloud_is_not_only_recents() {
     expect_conflict(b.service.sync());
     assert_eq!(data_files(&b.root), files);
 }
+
+#[test]
+fn turning_password_sync_off_here_is_kept_when_the_cloud_only_connected() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let a = Machine::new("merge-secrets-off-a", Platform::Linux);
+    let b = Machine::new("merge-secrets-off-b", Platform::Linux);
+    for machine in [&a, &b] {
+        machine.connect(&server);
+        machine.update_config(|config| config.sync_secrets = true);
+        machine
+            .service
+            .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
+            .expect("saved");
+    }
+    let mut web_id = None;
+    a.edit(|state| {
+        let mut web = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("host");
+        web.set_auth(Some(AuthMethodKind::Password));
+        web.set_remember_secret(true);
+        web_id = Some(web.id());
+        state.hosts.insert(web).expect("inserted");
+        add_host(state, "db");
+    });
+    let web_id = web_id.expect("web");
+    a.secrets
+        .save(web_id, &SecretString::new(HOST_PASSWORD))
+        .expect("saved");
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert!(remote_text(&server).contains("\"secrets\""));
+
+    // A turns password sync off (its records match the cloud's); B only
+    // connects and uploads. The merge keeps A's change: the passwords leave
+    // the cloud, and the next sync has nothing left to do.
+    a.update_config(|config| config.sync_secrets = false);
+    b.edit(|state| connect_to(state, "db", 1_000));
+    expect_uploaded(b.service.sync());
+    assert!(remote_text(&server).contains("\"secrets\""));
+    expect_merged(a.service.sync());
+    let text = remote_text(&server);
+    assert!(!text.contains("\"secrets\""), "{text}");
+    assert_eq!(recent_of(&a, "db"), Some((1_000, 1)));
+    assert_eq!(remote_recent(&server, "db"), Some((1_000, 1)));
+    expect_up_to_date(a.service.sync());
+}
