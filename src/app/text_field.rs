@@ -452,6 +452,9 @@ pub struct TextField {
     browse: Option<Browse>,
     /// A quiet icon before the text, such as the magnifier of a search field.
     leading: Option<Icon>,
+    /// Whether the field is the page's main entry: taller, rounder and resting on the
+    /// page at the low elevation, like the home page's quick-connect bar.
+    prominent: bool,
     /// Whether the left button is down after a press in the field: dragging selects.
     selecting: bool,
     /// How far the line is scrolled left so the caret stays in view.
@@ -507,6 +510,7 @@ impl TextField {
             clearable: false,
             browse: None,
             leading: None,
+            prominent: false,
             selecting: false,
             scroll: px(0.0),
             menu: None,
@@ -554,6 +558,18 @@ impl TextField {
     pub fn set_leading_icon(&mut self, icon: Icon, cx: &mut Context<Self>) {
         self.leading = Some(icon);
         cx.notify();
+    }
+
+    /// Draws the field as the page's main entry: a taller, rounder box on the surface
+    /// layer at the low elevation, with the same focus ring every field has.
+    ///
+    /// Only the home page's quick-connect bar asks for it; every other field keeps the
+    /// regular form-field look.
+    pub fn set_prominent(&mut self, prominent: bool, cx: &mut Context<Self>) {
+        if self.prominent != prominent {
+            self.prominent = prominent;
+            cx.notify();
+        }
     }
 
     /// Makes the field a path field: a button at its end opens the system chooser, and
@@ -1088,24 +1104,49 @@ impl Render for TextField {
         let revealed = self.revealed;
         let clear = self.clearable && !self.model.text().is_empty() && self.marked.is_none();
         let trailing = clear || reveal || self.browse.is_some();
+        let prominent = self.prominent;
+        // The main entry rests on the page at the low elevation; its focus ring is drawn
+        // on top of that rest, so the ring and the lift are both there while it types.
+        let rest = if prominent {
+            theme::Elevation::Low.shadows()
+        } else {
+            Vec::new()
+        };
+        let inset = if prominent {
+            spacing::SNUG
+        } else {
+            spacing::SNUG - 2.0
+        };
 
         div()
             .id(self.id.clone())
             .relative()
             .flex()
             .items_center()
-            .gap(metrics.scale(spacing::HAIRLINE))
+            .gap(metrics.scale(if prominent {
+                spacing::TIGHT - 2.0
+            } else {
+                spacing::HAIRLINE
+            }))
             .flex_1()
             .min_w(px(0.0))
-            .h(metrics.control_height())
-            .pl(metrics.scale(spacing::SNUG - 2.0))
-            .pr(metrics.scale(if trailing {
-                spacing::HAIRLINE
+            .h(if prominent {
+                metrics.scale(40.0)
             } else {
-                spacing::SNUG - 2.0
+                metrics.control_height()
+            })
+            .pl(metrics.scale(inset))
+            .pr(metrics.scale(if trailing { spacing::HAIRLINE } else { inset }))
+            .rounded(px(if prominent {
+                radius::XLARGE
+            } else {
+                radius::MEDIUM
             }))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::CANVAS))
+            .bg(theme::swatch(if prominent {
+                palette::SURFACE
+            } else {
+                palette::CANVAS
+            }))
             .border_1()
             .border_color(if focused {
                 accent
@@ -1115,18 +1156,25 @@ impl Render for TextField {
             // A soft ring outside the border marks the field that has the keyboard,
             // so it reads at a glance without the border alone carrying it.
             .when(focused, |field| {
-                field.shadow(vec![BoxShadow {
+                let mut ring = rest.clone();
+                ring.push(BoxShadow {
                     color: theme::faded(accent, 0.22).into(),
                     offset: point(px(0.0), px(0.0)),
                     blur_radius: px(0.0),
                     spread_radius: px(3.0),
-                }])
+                });
+                field.shadow(ring)
             })
+            .when(!focused && prominent, |field| field.shadow(rest.clone()))
             .when(!focused, |field| {
                 let hover = theme::swatch(palette::TEXT_MUTED);
                 field.hover(move |style| style.border_color(hover))
             })
-            .text_size(metrics.label_size())
+            .text_size(if prominent {
+                metrics.body_size()
+            } else {
+                metrics.label_size()
+            })
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .track_focus(&self.focus)
             .cursor_text()
@@ -1164,7 +1212,11 @@ impl Render for TextField {
             .children(self.leading.map(|icon| {
                 icons::icon(
                     icon,
-                    metrics.small_icon_size(),
+                    if prominent {
+                        metrics.icon_size()
+                    } else {
+                        metrics.small_icon_size()
+                    },
                     theme::swatch(palette::TEXT_MUTED),
                 )
                 .flex_none()

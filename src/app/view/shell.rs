@@ -1039,7 +1039,9 @@ impl ShelluneView {
             // on both sides and takes the same room back as padding: the cards stay
             // aligned with the list and their resting shadow is not cut. Below, the
             // room is only the resting shadow's reach and is not taken back, so a band
-            // that has to scroll still ends a full gap above the list's heading.
+            // that has to scroll still ends a full gap above the list's heading. That
+            // room is counted inside the cap, so the shadow does not take height from
+            // the list in a short window.
             let shadow_room = metrics.scale(spacing::TIGHT);
             let shadow_below = metrics.scale(spacing::HAIRLINE);
             column = column.child(
@@ -1050,7 +1052,7 @@ impl ShelluneView {
                     .flex_col()
                     .flex_none()
                     .min_h(px(0.0))
-                    .max_h(cap + shadow_below)
+                    .max_h(cap)
                     .mx(-shadow_room)
                     .px(shadow_room)
                     .pb(shadow_below)
