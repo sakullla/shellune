@@ -1236,10 +1236,12 @@ fn a_state_from_before_the_merge_keeps_the_conflict_rule_once() {
     let store = crate::SyncStateStore::at(&b.root);
     let mut state = store.load();
     assert!(state.last_synced_core_hash.is_some());
+    assert!(state.last_remote_core_hash.is_some());
     state.last_synced_core_hash = None;
+    state.last_remote_core_hash = None;
     store.save(&state).expect("saved");
     let text = std::fs::read_to_string(store.path()).expect("state");
-    assert!(!text.contains("last_synced_core_hash"), "{text}");
+    assert!(!text.contains("core_hash"), "{text}");
 
     a.edit(|state| readdress(state, "web", "10.5.5.5"));
     expect_uploaded(a.service.sync());
@@ -1247,6 +1249,7 @@ fn a_state_from_before_the_merge_keeps_the_conflict_rule_once() {
     expect_conflict(b.service.sync());
     expect_pulled(b.service.resolve(Resolution::UseRemote));
     assert!(b.service.state().last_synced_core_hash.is_some());
+    assert!(b.service.state().last_remote_core_hash.is_some());
 
     // From now on the merge applies.
     a.edit(|state| readdress(state, "web", "10.6.6.6"));
@@ -1255,6 +1258,124 @@ fn a_state_from_before_the_merge_keeps_the_conflict_rule_once() {
     expect_merged(b.service.sync());
     assert_eq!(address_of(&b, "web"), "10.6.6.6");
     assert_eq!(recent_of(&b, "db"), Some((2_000, 1)));
+}
+
+/// A Windows machine and a Linux machine that synced `web` and `db` (Windows
+/// uploaded them, Linux pulled them).
+fn synced_cross_platform_pair(name: &str, server: &WebDavServer) -> (Machine, Machine) {
+    let windows = Machine::new(&format!("{name}-windows"), Platform::Windows);
+    let linux = Machine::new(&format!("{name}-linux"), Platform::Linux);
+    windows.connect(server);
+    linux.connect(server);
+    windows.edit(|state| {
+        add_host(state, "web");
+        add_host(state, "db");
+    });
+    expect_uploaded(windows.service.sync());
+    expect_pulled(linux.service.sync());
+    (windows, linux)
+}
+
+#[test]
+fn across_platforms_a_cloud_that_only_connected_merges_with_records_changed_here() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_cross_platform_pair("merge-cross-remote", &server);
+
+    // Linux B changes a record; Windows A only connects and uploads. The cloud
+    // was last written by Windows, so its Linux view never equalled B's data.
+    b.edit(|state| readdress(state, "web", "10.3.0.1"));
+    a.edit(|state| connect_to(state, "db", 1_700_001_000));
+    expect_uploaded(a.service.sync());
+    let report = expect_merged(b.service.sync());
+    assert!(report.snapshot.is_some());
+    assert_eq!(address_of(&b, "web"), "10.3.0.1", "B's change stays");
+    assert_eq!(recent_of(&b, "db"), Some((1_700_001_000, 1)), "A's arrived");
+    assert_eq!(remote_recent(&server, "db"), Some((1_700_001_000, 1)));
+    expect_up_to_date(b.service.sync());
+    expect_pulled(a.service.sync());
+    assert_eq!(address_of(&a, "web"), "10.3.0.1");
+    assert_eq!(a.load().hosts, b.load().hosts);
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
+
+    // The same after B pulled a record A added on the other platform.
+    a.edit(|state| {
+        add_host(state, "cache");
+    });
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    b.edit(|state| readdress(state, "cache", "10.3.0.2"));
+    a.edit(|state| connect_to(state, "web", 1_700_001_100));
+    expect_uploaded(a.service.sync());
+    expect_merged(b.service.sync());
+    assert_eq!(address_of(&b, "cache"), "10.3.0.2");
+    assert_eq!(recent_of(&b, "web"), Some((1_700_001_100, 1)));
+    expect_pulled(a.service.sync());
+    assert_eq!(a.load().hosts, b.load().hosts);
+
+    // Records changed on both platforms are still a conflict.
+    a.edit(|state| readdress(state, "db", "10.3.0.3"));
+    expect_uploaded(a.service.sync());
+    b.edit(|state| readdress(state, "web", "10.3.0.4"));
+    expect_conflict(b.service.sync());
+}
+
+#[test]
+fn across_platforms_connecting_here_merges_with_records_changed_in_the_cloud() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_cross_platform_pair("merge-cross-local", &server);
+
+    // Windows A only connects; Linux B changes a record and uploads.
+    a.edit(|state| connect_to(state, "web", 1_700_002_000));
+    b.edit(|state| readdress(state, "db", "10.4.0.1"));
+    expect_uploaded(b.service.sync());
+    expect_merged(a.service.sync());
+    assert_eq!(address_of(&a, "db"), "10.4.0.1", "B's change arrived");
+    assert_eq!(recent_of(&a, "web"), Some((1_700_002_000, 1)), "A's kept");
+    assert_eq!(remote_recent(&server, "web"), Some((1_700_002_000, 1)));
+    expect_up_to_date(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert_eq!(a.load().hosts, b.load().hosts);
+    expect_up_to_date(b.service.sync());
+
+    // The other way round: Linux B only connects and uploads; Windows A changes
+    // a record.
+    b.edit(|state| connect_to(state, "db", 1_700_002_100));
+    expect_uploaded(b.service.sync());
+    a.edit(|state| readdress(state, "web", "10.4.0.2"));
+    expect_merged(a.service.sync());
+    assert_eq!(address_of(&a, "web"), "10.4.0.2");
+    assert_eq!(recent_of(&a, "db"), Some((1_700_002_100, 1)));
+    expect_pulled(b.service.sync());
+    assert_eq!(a.load().hosts, b.load().hosts);
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
+}
+
+#[test]
+fn the_same_records_on_both_sides_merge_whatever_the_last_sync_recorded() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_pair("merge-same-core", &server);
+    // Both sides made the same change to the records (as after a merge whose
+    // upload went through but whose local write did not) and connected
+    // differently: nothing of either side's records can be lost.
+    a.edit(|state| {
+        readdress(state, "web", "10.5.0.1");
+        connect_to(state, "web", 100);
+    });
+    expect_uploaded(a.service.sync());
+    b.edit(|state| {
+        readdress(state, "web", "10.5.0.1");
+        connect_to(state, "db", 200);
+    });
+    expect_merged(b.service.sync());
+    assert_eq!(address_of(&b, "web"), "10.5.0.1");
+    assert_eq!(recent_of(&b, "web"), Some((100, 1)));
+    assert_eq!(recent_of(&b, "db"), Some((200, 1)));
+    expect_pulled(a.service.sync());
+    assert_eq!(a.load().hosts, b.load().hosts);
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
 }
 
 #[test]

@@ -290,6 +290,26 @@ struct Remote {
     mark: String,
 }
 
+impl Remote {
+    /// What the cloud holds, as the state records it, when this version stays.
+    fn seen(&self) -> Seen {
+        Seen {
+            etag: self.etag.clone(),
+            mark: self.mark.clone(),
+            core_hash: self.core_hash.clone(),
+        }
+    }
+}
+
+/// What the cloud holds after a successful sync, as the state records it.
+struct Seen {
+    etag: Option<String>,
+    mark: String,
+    /// The fingerprint of the cloud document's view for this platform without
+    /// the recent connections.
+    core_hash: Option<String>,
+}
+
 enum Step {
     Done(SyncOutcome),
     Retry,
@@ -617,7 +637,7 @@ impl SyncService {
         };
         match decide(direction, facts) {
             Action::Nothing => {
-                self.remember(&remote_id, remote.etag.clone(), remote.mark.clone(), &mine)?;
+                self.remember(&remote_id, &remote.seen(), &mine)?;
                 Ok(Step::Done(SyncOutcome::UpToDate))
             }
             Action::Upload => {
@@ -633,9 +653,15 @@ impl SyncService {
     }
 
     /// Tells whether each side changed more than its recent connections since the
-    /// last sync. `None` when that cannot be told: the last sync was recorded by a
-    /// build that did not keep the data without recents, or the cloud's passwords
-    /// do not open with this machine's passphrase.
+    /// last sync: this machine's data against what it held then, the cloud's
+    /// document against what the cloud held then (the two views differ when
+    /// another platform wrote it). `None` when that cannot be told: the last sync
+    /// was recorded by a build that did not keep the data without recents, or the
+    /// cloud's passwords do not open with this machine's passphrase.
+    ///
+    /// Both sides holding the same records and passwords (only the recents
+    /// differ) counts as neither having changed them, whatever the baseline says:
+    /// a merge then loses nothing.
     fn check_core(
         &self,
         config: &SyncConfig,
@@ -645,10 +671,14 @@ impl SyncService {
         document: &ShelluneData,
         remote: &Remote,
     ) -> Result<Option<CoreCheck>, SyncError> {
-        let Some(baseline) = state.last_synced_core_hash.as_deref() else {
+        let (Some(baseline), Some(remote_baseline)) = (
+            state.last_synced_core_hash.as_deref(),
+            state.last_remote_core_hash.as_deref(),
+        ) else {
             return Ok(None);
         };
-        let mut remote_core = remote.core_hash.as_deref() != Some(baseline);
+        let mut remote_core = remote.core_hash.as_deref() != Some(remote_baseline);
+        let mut same_core = remote.core_hash.as_deref() == Some(mine.core.as_str());
         let mut bundle = None;
         if config.sync_secrets {
             // The sealed block is sealed afresh on every upload, so whether the
@@ -665,15 +695,21 @@ impl SyncService {
                 }),
             );
             remote_core |= state.last_secrets_hash.as_deref() != Some(theirs.as_str());
+            same_core &= mine.secrets.as_deref() == Some(theirs.as_str());
             bundle = Some(opened);
         }
-        Ok(Some(CoreCheck {
-            changes: CoreChanges {
+        let changes = if same_core {
+            CoreChanges {
+                local: false,
+                remote: false,
+            }
+        } else {
+            CoreChanges {
                 local: mine.core != baseline || secrets_changed,
                 remote: remote_core,
-            },
-            bundle,
-        }))
+            }
+        };
+        Ok(Some(CoreCheck { changes, bundle }))
     }
 
     /// Merges both sides when at least one only connected to hosts: the records
@@ -742,23 +778,23 @@ impl SyncService {
                     .map_err(SyncError::Local)?;
             (plan, Some(export.document))
         };
-        let (etag, mark) = match upload {
+        let seen = match upload {
             Some(upload) => {
                 let bytes = upload.to_json().map_err(SyncError::Local)?;
                 let Some(etag) = put(client, Some(remote), &bytes)? else {
                     return Ok(Step::Retry);
                 };
-                let view = hash(&upload.sync_view(self.platform).map_err(SyncError::Local)?);
-                (etag, remote_mark(&view, &bytes, config.sync_secrets))
+                self.seen_upload(config, &upload, etag, &bytes)
+                    .map_err(SyncError::Local)?
             }
-            None => (remote.etag.clone(), remote.mark.clone()),
+            None => remote.seen(),
         };
         let applied = match plan.apply(&self.data, &*self.secrets, "sync-merge") {
             Err(PortableError::Changed) => return Ok(Step::Retry),
             other => other.map_err(SyncError::Local)?,
         };
         let mine = self.fingerprint(config, &applied.state)?;
-        self.remember(remote_id, etag, mark, &mine)?;
+        self.remember(remote_id, &seen, &mine)?;
         Ok(Step::Done(SyncOutcome::Merged(Box::new(pull_report(
             &plan,
             applied,
@@ -882,14 +918,10 @@ impl SyncService {
         let Some(etag) = put(client, base, &bytes)? else {
             return Ok(Step::Retry);
         };
-        let view_hash = hash(
-            &export
-                .document
-                .sync_view(self.platform)
-                .map_err(SyncError::Local)?,
-        );
-        let mark = remote_mark(&view_hash, &bytes, config.sync_secrets);
-        self.remember(remote_id, etag, mark, mine)?;
+        let seen = self
+            .seen_upload(config, &export.document, etag, &bytes)
+            .map_err(SyncError::Local)?;
+        self.remember(remote_id, &seen, mine)?;
         Ok(Step::Done(SyncOutcome::Uploaded(UploadReport {
             created: base.is_none(),
             secrets_included: export.secrets_included,
@@ -929,7 +961,7 @@ impl SyncService {
             other => other.map_err(SyncError::Local)?,
         };
         let mine = self.fingerprint(config, &applied.state)?;
-        self.remember(remote_id, remote.etag.clone(), remote.mark.clone(), &mine)?;
+        self.remember(remote_id, &remote.seen(), &mine)?;
         Ok(Step::Done(SyncOutcome::Pulled(Box::new(pull_report(
             &plan,
             applied,
@@ -937,19 +969,30 @@ impl SyncService {
         )))))
     }
 
-    /// Records what both sides hold after a successful sync.
-    fn remember(
+    /// What the cloud holds after this machine wrote `document` as `bytes`.
+    fn seen_upload(
         &self,
-        remote_id: &str,
+        config: &SyncConfig,
+        document: &ShelluneData,
         etag: Option<String>,
-        mark: String,
-        mine: &Fingerprint,
-    ) -> Result<(), SyncError> {
+        bytes: &[u8],
+    ) -> Result<Seen, PortableError> {
+        let view = hash(&document.sync_view(self.platform)?);
+        Ok(Seen {
+            etag,
+            mark: remote_mark(&view, bytes, config.sync_secrets),
+            core_hash: Some(hash(&document.core_view(self.platform)?)),
+        })
+    }
+
+    /// Records what both sides hold after a successful sync.
+    fn remember(&self, remote_id: &str, seen: &Seen, mine: &Fingerprint) -> Result<(), SyncError> {
         let store = SyncStateStore::at(self.data.root());
         let mut state = store.load();
         state.remote = Some(remote_id.to_owned());
-        state.last_remote_etag = etag;
-        state.last_remote_hash = Some(mark);
+        state.last_remote_etag.clone_from(&seen.etag);
+        state.last_remote_hash = Some(seen.mark.clone());
+        state.last_remote_core_hash.clone_from(&seen.core_hash);
         state.last_synced_hash = Some(mine.view.clone());
         state.last_synced_core_hash = Some(mine.core.clone());
         state.last_secrets_hash.clone_from(&mine.secrets);

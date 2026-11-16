@@ -230,6 +230,14 @@ pub struct SyncState {
     /// next successful sync records it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced_core_hash: Option<String>,
+    /// The fingerprint of the cloud document's view for this platform without
+    /// the recent-connection log, as the cloud held it after the last successful
+    /// sync (downloaded, uploaded or merged). The cloud is compared with this,
+    /// not with the local data: the two views differ whenever another platform
+    /// wrote the cloud file last, so comparing across them would take a cloud
+    /// that only connected to hosts for one that changed records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_remote_core_hash: Option<String>,
     /// A keyed fingerprint of the saved passwords as they were last synced; `None`
     /// when passwords were not synced. Changing a password, the passphrase, or the
     /// choice to sync passwords is a local change.
@@ -395,6 +403,7 @@ mod tests {
             last_remote_hash: Some("aa".to_owned()),
             last_synced_hash: Some("bb".to_owned()),
             last_synced_core_hash: Some("cc".to_owned()),
+            last_remote_core_hash: Some("dd".to_owned()),
             last_secrets_hash: None,
             last_result: Some(LastResult::Failed {
                 reason: "offline".to_owned(),
@@ -415,6 +424,7 @@ mod tests {
         let older = store.load();
         assert_eq!(older.last_synced_hash.as_deref(), Some("bb"));
         assert_eq!(older.last_synced_core_hash, None);
+        assert_eq!(older.last_remote_core_hash, None);
         std::fs::write(store.path(), b"garbage").expect("written");
         assert_eq!(store.load(), SyncState::default());
         let _ = std::fs::remove_dir_all(root);
