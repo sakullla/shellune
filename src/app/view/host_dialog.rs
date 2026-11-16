@@ -7,12 +7,13 @@
 //! fields are asked for.
 
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, MouseButton, SharedString, Stateful, Window, div, px};
+use gpui::{Context, Div, FontWeight, SharedString, Stateful, Window, div, px};
 use shellune_core::{
     AuthMethodKind, HostId, ProtocolKind, RdpCertificatePolicy, SerialFlow, SerialParity,
     SerialStopBits, TransferProtocol, VncSecurity, X11Forwarding,
 };
 
+use super::shell::{ModalBehaviour, ModalContent};
 use super::{HostFields, ShelluneView};
 use crate::app::components::{self, Variant};
 use crate::app::copy;
@@ -760,10 +761,7 @@ impl ShelluneView {
         let draft = self.hosts.draft()?.clone();
         let metrics = self.metrics();
         let strings = self.strings();
-        let viewport = window.viewport_size();
         let editing = draft.editing().is_some();
-        let width = px(600.0).min(viewport.width - metrics.scale(spacing::LOOSE) * 2.0);
-        let max_height = viewport.height - metrics.scale(spacing::LOOSE) * 2.0;
 
         let line = |left: Div, right: Div| {
             div()
@@ -786,15 +784,13 @@ impl ShelluneView {
         // What a person needs to reach a server comes first - where, who, how - and
         // only that is required. Naming and grouping follow; everything a first host
         // never needs folds away under one line that says what is inside.
+        // The dialog's own body scrolls; this column only lays the form out.
         let mut body = div()
-            .id("hosts.editor.body")
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::SNUG + 2.0))
             .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::BASE))
-            .overflow_y_scroll()
-            .track_scroll(&self.host_body_scroll);
+            .py(metrics.scale(spacing::BASE));
         // A new record may be of another protocol. The chooser is here so the form the
         // user sees is always the one the chosen protocol really has (R2, R18); a saved
         // host keeps the protocol it was saved with, so editing never shows it.
@@ -873,163 +869,73 @@ impl ShelluneView {
                     .child(SharedString::from(message.text().to_owned()))
             });
 
-        let header = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .px(metrics.scale(spacing::LOOSE))
-            .pt(metrics.scale(spacing::BASE + 2.0))
-            .pb(metrics.scale(spacing::TIGHT))
+        let (header, subtitle) = self.modal_header(
+            Some(Icon::Server),
+            if editing {
+                strings.host_editor_edit
+            } else {
+                strings.host_editor_new
+            }
+            .to_owned(),
+            Some(ux.host_dialog_intro.to_owned()),
+            "hosts.editor.close",
+            cx,
+            |this, cx| this.close_host_editor(cx),
+        );
+
+        // The refusal takes a line of its own above the actions; the actions stay on
+        // the right, the one that connects last and filled.
+        let footer = components::modal_footer(metrics)
+            .children(refusal.map(|refusal| refusal.w_full()))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::SNUG))
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(metrics.scale(36.0))
-                            .rounded(px(radius::MEDIUM))
-                            .bg(theme::swatch(palette::ACCENT_TINT))
-                            .child(icons::icon(
-                                Icon::Server,
-                                metrics.icon_size(),
-                                theme::swatch(palette::ACCENT_ON_TINT),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .min_w(px(0.0))
-                            .child(
-                                div()
-                                    .text_size(metrics.heading_size())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(if editing {
-                                        strings.host_editor_edit
-                                    } else {
-                                        strings.host_editor_new
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(ux.host_dialog_intro),
-                            ),
-                    ),
+                self.text_button(
+                    SharedString::from("hosts.cancel"),
+                    strings.host_cancel,
+                    Variant::Ghost,
+                    cx,
+                    |view, cx| view.close_host_editor(cx),
+                )
+                .h(metrics.control_height()),
             )
             .child(
-                components::icon_only_button(Icon::Close, metrics)
-                    .id("hosts.editor.close")
-                    .debug_selector(|| "hosts.editor.close".to_owned())
-                    .tooltip(components::tooltip(strings.host_dialog_close))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.close_host_editor(cx);
-                    })),
-            );
-
-        let footer = div()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .gap(metrics.scale(spacing::SNUG))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::BASE))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .children(refusal)
+                self.text_button(
+                    SharedString::from("hosts.save"),
+                    strings.host_save,
+                    Variant::Secondary,
+                    cx,
+                    |view, cx| {
+                        let _ = view.save_host(cx);
+                    },
+                )
+                .h(metrics.control_height()),
+            )
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        self.text_button(
-                            SharedString::from("hosts.cancel"),
-                            strings.host_cancel,
-                            Variant::Ghost,
-                            cx,
-                            |view, cx| view.close_host_editor(cx),
-                        )
-                        .h(metrics.control_height()),
-                    )
-                    .child(
-                        self.text_button(
-                            SharedString::from("hosts.save"),
-                            strings.host_save,
-                            Variant::Secondary,
-                            cx,
-                            |view, cx| {
-                                let _ = view.save_host(cx);
-                            },
-                        )
-                        .h(metrics.control_height()),
-                    )
-                    .child(
-                        self.icon_text_button(
-                            SharedString::from("hosts.save_connect"),
-                            Icon::Plug,
-                            strings.host_save_connect,
-                            Variant::Primary,
-                            cx,
-                            |view, cx| view.save_and_connect(cx),
-                        )
-                        .h(metrics.control_height()),
-                    ),
+                self.icon_text_button(
+                    SharedString::from("hosts.save_connect"),
+                    Icon::Plug,
+                    strings.host_save_connect,
+                    Variant::Primary,
+                    cx,
+                    |view, cx| view.save_and_connect(cx),
+                )
+                .h(metrics.control_height()),
             );
 
-        let dialog = div()
-            .id("hosts.editor")
-            .debug_selector(|| "hosts.editor".to_owned())
-            .w(width)
-            .max_h(max_height)
-            .flex()
-            .flex_col()
-            .rounded(px(radius::XLARGE))
-            .bg(theme::swatch(palette::OVERLAY))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow(theme::Elevation::High.shadows())
-            .overflow_hidden()
-            .occlude()
-            .child(header)
-            .child(body)
-            .child(footer);
-
-        Some(
-            super::overlay_layer().child(
-                div()
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .child(
-                        div()
-                            .id("hosts.editor.backdrop")
-                            .absolute()
-                            .inset_0()
-                            .bg(theme::scrim())
-                            .occlude()
-                            // A press on the dimmed window does not discard what
-                            // was typed; the dialog closes with its buttons or Esc.
-                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                cx.stop_propagation();
-                            }),
-                    )
-                    .child(dialog),
-            ),
-        )
+        Some(self.modal_with(
+            window,
+            "hosts.editor",
+            600.0,
+            ModalContent {
+                header,
+                subtitle,
+                body: body.into_any_element(),
+                footer: Some(footer),
+            },
+            ModalBehaviour {
+                scroll: Some(self.host_body_scroll.clone()),
+                dismiss: None,
+            },
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1137,10 +1043,7 @@ impl ShelluneView {
         let draft = self.hosts.protocol_draft()?.clone();
         let metrics = self.metrics();
         let strings = self.strings();
-        let viewport = window.viewport_size();
         let editing = draft.editing().is_some();
-        let width = px(600.0).min(viewport.width - metrics.scale(spacing::LOOSE) * 2.0);
-        let max_height = viewport.height - metrics.scale(spacing::LOOSE) * 2.0;
 
         let line = |left: Div, right: Div| {
             div()
@@ -1152,15 +1055,13 @@ impl ShelluneView {
         };
         let rule = || div().h(px(1.0)).bg(theme::swatch(palette::BORDER));
 
+        // The dialog's own body scrolls; this column only lays the form out.
         let mut body = div()
-            .id("connection.editor.body")
             .flex()
             .flex_col()
             .gap(metrics.scale(spacing::SNUG + 2.0))
             .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::BASE))
-            .overflow_y_scroll()
-            .track_scroll(&self.host_body_scroll);
+            .py(metrics.scale(spacing::BASE));
 
         if !editing {
             body = body.child(self.protocol_chooser(draft.protocol(), cx));
@@ -1437,135 +1338,60 @@ impl ShelluneView {
                     .child(SharedString::from(message.text().to_owned()))
             });
 
-        let header = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .px(metrics.scale(spacing::LOOSE))
-            .pt(metrics.scale(spacing::BASE + 2.0))
-            .pb(metrics.scale(spacing::TIGHT))
+        let (header, subtitle) = self.modal_header(
+            Some(Icon::Plug),
+            if editing {
+                strings.connection_editor_edit
+            } else {
+                strings.connection_editor_new
+            }
+            .to_owned(),
+            Some(draft.protocol().label().to_owned()),
+            "connection.editor.close",
+            cx,
+            |this, cx| this.close_connection_editor(cx),
+        );
+
+        let footer = components::modal_footer(metrics)
+            .children(refusal.map(|refusal| refusal.w_full()))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::SNUG))
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .min_w(px(0.0))
-                            .child(
-                                div()
-                                    .text_size(metrics.heading_size())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(if editing {
-                                        strings.connection_editor_edit
-                                    } else {
-                                        strings.connection_editor_new
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                                    .child(draft.protocol().label()),
-                            ),
-                    ),
+                self.text_button(
+                    SharedString::from("connection.cancel"),
+                    strings.host_cancel,
+                    Variant::Ghost,
+                    cx,
+                    |view, cx| view.close_connection_editor(cx),
+                )
+                .h(metrics.control_height()),
             )
             .child(
-                components::icon_only_button(Icon::Close, metrics)
-                    .id("connection.editor.close")
-                    .debug_selector(|| "connection.editor.close".to_owned())
-                    .tooltip(components::tooltip(strings.host_dialog_close))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.close_connection_editor(cx);
-                    })),
+                self.text_button(
+                    SharedString::from("connection.save"),
+                    strings.host_save,
+                    Variant::Primary,
+                    cx,
+                    |view, cx| {
+                        let _ = view.save_connection(cx);
+                    },
+                )
+                .h(metrics.control_height()),
             );
 
-        let footer = div()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .gap(metrics.scale(spacing::SNUG))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::BASE))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .children(refusal)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        self.text_button(
-                            SharedString::from("connection.cancel"),
-                            strings.host_cancel,
-                            Variant::Ghost,
-                            cx,
-                            |view, cx| view.close_connection_editor(cx),
-                        )
-                        .h(metrics.control_height()),
-                    )
-                    .child(
-                        self.text_button(
-                            SharedString::from("connection.save"),
-                            strings.host_save,
-                            Variant::Primary,
-                            cx,
-                            |view, cx| {
-                                let _ = view.save_connection(cx);
-                            },
-                        )
-                        .h(metrics.control_height()),
-                    ),
-            );
-
-        let dialog = div()
-            .id("connection.editor")
-            .debug_selector(|| "connection.editor".to_owned())
-            .w(width)
-            .max_h(max_height)
-            .flex()
-            .flex_col()
-            .rounded(px(radius::XLARGE))
-            .bg(theme::swatch(palette::OVERLAY))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow(theme::Elevation::High.shadows())
-            .overflow_hidden()
-            .occlude()
-            .child(header)
-            .child(body)
-            .child(footer);
-
-        Some(
-            super::overlay_layer().child(
-                div()
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .child(
-                        div()
-                            .id("connection.editor.backdrop")
-                            .absolute()
-                            .inset_0()
-                            .bg(theme::scrim())
-                            .occlude()
-                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                cx.stop_propagation();
-                            }),
-                    )
-                    .child(dialog),
-            ),
-        )
+        Some(self.modal_with(
+            window,
+            "connection.editor",
+            600.0,
+            ModalContent {
+                header,
+                subtitle,
+                body: body.into_any_element(),
+                footer: Some(footer),
+            },
+            ModalBehaviour {
+                scroll: Some(self.host_body_scroll.clone()),
+                dismiss: None,
+            },
+        ))
     }
 }
 

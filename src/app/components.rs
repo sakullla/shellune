@@ -2017,18 +2017,93 @@ pub struct ModalContent {
     pub footer: Option<Div>,
 }
 
+/// What a press on the dimmed page around a [`modal`] does.
+pub type ModalDismiss = Box<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static>;
+
+/// How one dialog differs from the shared behaviour of [`modal`].
+#[derive(Default)]
+pub struct ModalBehaviour {
+    /// The handle the scrolling body reports to, for a dialog that scrolls a field
+    /// into view itself (the host editor).
+    pub scroll: Option<gpui::ScrollHandle>,
+    /// What a press on the scrim does. `None` keeps the dialog open: a form keeps what
+    /// was typed until it is closed on purpose. Only a dialog with nothing to lose - a
+    /// shortcut being captured - closes on a press outside.
+    pub dismiss: Option<ModalDismiss>,
+}
+
+/// The fixed row of actions at the bottom of a [`modal`].
+///
+/// The actions sit on the right in reading order, the primary one last, and wrap
+/// under each other when the dialog is narrower than the row (720x480 at 200%). A
+/// hairline separates them from the scrolling body, so the row stays put while the
+/// body moves under it.
+pub fn modal_footer(metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_end()
+        .flex_wrap()
+        .gap(metrics.scale(spacing::TIGHT))
+        .px(metrics.scale(spacing::LOOSE))
+        .py(metrics.scale(spacing::SNUG))
+        .border_t_1()
+        .border_color(theme::swatch(palette::BORDER))
+}
+
+/// The icon tile at the head of a [`modal`]: the accent tint for an ordinary dialog,
+/// the tone's tint for a question about something that cannot be undone.
+pub fn modal_icon(icon: Icon, tone: Option<Tone>, metrics: Metrics) -> Div {
+    let (fill, ink) = match tone {
+        Some(tone) => (theme::swatch(tone.tint()), tone.text()),
+        None => (
+            theme::swatch(palette::ACCENT_TINT),
+            theme::swatch(palette::ACCENT_ON_TINT),
+        ),
+    };
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(metrics.scale(32.0))
+        .rounded(px(radius::MEDIUM))
+        .bg(fill)
+        .child(icons::icon(icon, metrics.icon_size(), ink))
+}
+
 /// A centred dialog over a dimmed page.
 ///
 /// The dialog is the overlay layer at the highest elevation, with the largest panel
 /// radius; the body scrolls between a fixed header and footer. The scrim takes every
 /// press so nothing behind it can be used, but a press on it does not close the
 /// dialog: what was typed is kept until the user closes it on purpose. With motion
-/// allowed the dialog settles into place.
+/// allowed the dialog fades in and settles into place.
 pub fn modal(
     viewport: gpui::Size<Pixels>,
     id: &'static str,
     width: f32,
     content: ModalContent,
+    metrics: Metrics,
+) -> Div {
+    modal_with(
+        viewport,
+        id,
+        width,
+        content,
+        ModalBehaviour::default(),
+        metrics,
+    )
+}
+
+/// [`modal`] with its own scroll handle or its own answer to a press outside.
+pub fn modal_with(
+    viewport: gpui::Size<Pixels>,
+    id: &'static str,
+    width: f32,
+    content: ModalContent,
+    behaviour: ModalBehaviour,
     metrics: Metrics,
 ) -> Div {
     let ModalContent {
@@ -2037,6 +2112,7 @@ pub fn modal(
         body,
         footer,
     } = content;
+    let ModalBehaviour { scroll, dismiss } = behaviour;
     // The inset stays a small edge gap. Scaling it with the text turned a 200% minimum
     // window into a short dialog, and the failure's next line was drawn past the client
     // edge where it could not be read (R4).
@@ -2067,10 +2143,27 @@ pub fn modal(
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_y_scroll()
+                .when_some(scroll, |body, handle| body.track_scroll(&handle))
                 .children(subtitle)
                 .child(body),
         )
         .children(footer.map(|footer| footer.flex_none()));
+    let backdrop = div()
+        .id(SharedString::from(format!("{id}.backdrop")))
+        .debug_selector(move || format!("{id}.backdrop"))
+        .absolute()
+        .inset_0()
+        .bg(theme::scrim())
+        .occlude();
+    let backdrop = match dismiss {
+        Some(dismiss) => backdrop.on_any_mouse_down(move |event, window, cx| {
+            cx.stop_propagation();
+            dismiss(event, window, cx);
+        }),
+        None => backdrop.on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+            cx.stop_propagation();
+        }),
+    };
     div()
         .relative()
         .flex()
@@ -2078,21 +2171,11 @@ pub fn modal(
         .justify_center()
         .w(viewport.width)
         .h(viewport.height)
-        .child(
-            div()
-                .id(SharedString::from(format!("{id}.backdrop")))
-                .absolute()
-                .inset_0()
-                .bg(theme::scrim())
-                .occlude()
-                .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
-                    cx.stop_propagation();
-                }),
-        )
+        .child(backdrop)
         .child(theme::enter(
             dialog,
             SharedString::from(format!("{id}.enter")),
-            Enter::Fade,
+            Enter::Settle,
         ))
 }
 

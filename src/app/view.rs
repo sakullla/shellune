@@ -1634,6 +1634,39 @@ impl ShelluneView {
         self.hosts.pending_delete().is_some()
     }
 
+    /// Opens the empty form for a new host, for a capture (R5). Nothing is saved.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_new_host(&mut self, cx: &mut Context<Self>) {
+        self.open_create_host(cx);
+    }
+
+    /// Whether the host form is open, and on a new record rather than a saved one.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_new_host_open(&self) -> bool {
+        self.host_fields.is_some()
+            && self
+                .hosts
+                .draft()
+                .is_some_and(|draft| draft.editing().is_none())
+    }
+
+    /// Asks to close one session, the way its tab's close button does, for a capture
+    /// (R5). With work running on it the question is asked and nothing is closed.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_ask_close(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.request_close_session(id, cx);
+    }
+
+    /// Whether the question asked before a session with running work closes is on
+    /// screen.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_close_question(&self) -> bool {
+        self.closing
+            .is_some_and(|id| self.close_needs_confirmation(id))
+    }
+
     /// What the connection page is refusing, for the tests (R20).
     #[cfg(test)]
     #[must_use]
@@ -5316,7 +5349,7 @@ impl ShelluneView {
     }
 
     /// The question shown before a session with active transfers is closed (R9).
-    fn close_transfer_question(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn close_transfer_question(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let id = self.closing?;
         let active: Vec<Transfer> = self
             .transfers
@@ -5343,54 +5376,125 @@ impl ShelluneView {
                 active.len()
             )
         };
-        let mut question = components::banner(Tone::Danger, metrics)
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .mx(metrics.scale(spacing::SNUG))
-            .mt(metrics.scale(spacing::SNUG))
-            .w_auto()
-            .debug_selector(|| "session.close.question".to_owned())
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .debug_selector(|| "session.close.question.text".to_owned())
-                    .child(SharedString::from(heading)),
-            );
-        question = self.interrupted_task_lines(question, "session.close.task", &active, metrics);
+        let mut list = Self::close_question_list("session.close.list", metrics);
+        list = self.interrupted_task_lines(list, "session.close.task", &active, metrics);
         if !rules.is_empty() {
             if !active.is_empty() {
-                question = question.child(
+                list = list.child(
                     div()
+                        .pt(metrics.scale(spacing::HAIRLINE))
                         .text_size(metrics.caption_size())
+                        .font_weight(metrics.medium_weight())
                         .text_color(theme::swatch(palette::TEXT_PRIMARY))
                         .child(strings.forward_close_rules),
                 );
             }
-            question =
-                self.interrupted_forward_lines(question, "session.close.forward", &rules, metrics);
+            list = self.interrupted_forward_lines(list, "session.close.forward", &rules, metrics);
         }
-        Some(
-            question.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .child(self.text_button(
-                        SharedString::from("session.close.cancel"),
-                        strings.transfers_close_cancel,
-                        Variant::Secondary,
-                        cx,
-                        |view, cx| view.cancel_close_session(cx),
-                    ))
-                    .child(self.text_button(
-                        SharedString::from("session.close.confirm"),
-                        strings.transfers_close_confirm,
-                        Variant::Danger,
-                        cx,
-                        move |view, cx| view.confirm_close_session(cx),
-                    )),
-            ),
+        let cancel = self
+            .text_button(
+                SharedString::from("session.close.cancel"),
+                strings.transfers_close_cancel,
+                Variant::Ghost,
+                cx,
+                |view, cx| view.cancel_close_session(cx),
+            )
+            .h(metrics.control_height());
+        let confirm = self
+            .text_button(
+                SharedString::from("session.close.confirm"),
+                strings.transfers_close_confirm,
+                Variant::Danger,
+                cx,
+                move |view, cx| view.confirm_close_session(cx),
+            )
+            .h(metrics.control_height());
+        Some(self.close_question_dialog(
+            window,
+            "session.close.question",
+            heading,
+            list,
+            [cancel, confirm],
+            "session.close.dismiss",
+            cx,
+            |view, cx| view.cancel_close_session(cx),
+        ))
+    }
+
+    /// The box the tasks a close would stop are listed in: a quiet well inside the
+    /// dialog, one line per task.
+    fn close_question_list(selector: &'static str, metrics: Metrics) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w(px(0.0))
+            .gap(metrics.scale(spacing::HAIRLINE))
+            .px(metrics.scale(spacing::SNUG))
+            .py(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::MEDIUM))
+            .bg(theme::swatch(palette::CHROME))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(move || selector.to_owned())
+    }
+
+    /// A question asked before a close stops running work, as a dialog over the window
+    /// (R5, R9).
+    ///
+    /// The danger tile and the question head it, the work that would stop is listed in
+    /// the body, and the footer keeps the way out first and the close last, in the
+    /// danger colour. Nothing behind it can be pressed while it is asked; Escape and
+    /// the close button keep everything running.
+    #[allow(clippy::too_many_arguments)]
+    fn close_question_dialog(
+        &self,
+        window: &Window,
+        id: &'static str,
+        heading: String,
+        list: Div,
+        actions: [Stateful<Div>; 2],
+        close_id: &'static str,
+        cx: &mut Context<Self>,
+        close: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Div {
+        let metrics = self.metrics();
+        let (header, subtitle) = self.modal_header_lead(
+            Some(components::modal_icon(
+                Icon::Close,
+                Some(Tone::Danger),
+                metrics,
+            )),
+            heading,
+            None,
+            None,
+            close_id,
+            cx,
+            close,
+        );
+        let body = div()
+            .flex()
+            .flex_col()
+            .px(metrics.scale(spacing::LOOSE))
+            .pt(metrics.scale(spacing::TIGHT))
+            .pb(metrics.scale(spacing::BASE))
+            .child(list)
+            .into_any_element();
+        let [cancel, confirm] = actions;
+        self.modal(
+            window,
+            id,
+            480.0,
+            shell::ModalContent {
+                header,
+                subtitle,
+                body,
+                footer: Some(
+                    components::modal_footer(metrics)
+                        .child(cancel)
+                        .child(confirm),
+                ),
+            },
         )
     }
 
@@ -5524,7 +5628,7 @@ impl ShelluneView {
     }
 
     /// The question shown before the application closes with transfers still running.
-    fn close_app_question(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn close_app_question(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         if !self.closing_app {
             return None;
         }
@@ -5546,55 +5650,49 @@ impl ShelluneView {
         } else {
             strings.transfers_close_app_question
         };
-        let mut question = components::banner(Tone::Danger, metrics)
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .mx(metrics.scale(spacing::SNUG))
-            .mt(metrics.scale(spacing::SNUG))
-            .w_auto()
-            .debug_selector(|| "app.close.question".to_owned())
-            .child(
-                div()
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .debug_selector(|| "app.close.question.text".to_owned())
-                    .child(SharedString::from(heading)),
-            );
-        question = self.interrupted_task_lines(question, "app.close.task", &active, metrics);
+        let mut list = Self::close_question_list("app.close.list", metrics);
+        list = self.interrupted_task_lines(list, "app.close.task", &active, metrics);
         if !rules.is_empty() && !active.is_empty() {
-            question = question.child(
+            list = list.child(
                 div()
+                    .pt(metrics.scale(spacing::HAIRLINE))
                     .text_size(metrics.caption_size())
+                    .font_weight(metrics.medium_weight())
                     .text_color(theme::swatch(palette::TEXT_PRIMARY))
                     .child(strings.forward_close_app),
             );
         }
-        question = self.interrupted_forward_lines(question, "app.close.forward", &rules, metrics);
+        list = self.interrupted_forward_lines(list, "app.close.forward", &rules, metrics);
+        let cancel = self
+            .text_button(
+                SharedString::from("app.close.cancel"),
+                strings.transfers_close_app_cancel,
+                Variant::Ghost,
+                cx,
+                |view, cx| view.cancel_close_app(cx),
+            )
+            .h(metrics.control_height());
         let confirm = components::compact_button(
             strings.transfers_close_app_confirm,
             Variant::Danger,
             metrics,
         )
+        .h(metrics.control_height())
         .id("app.close.confirm")
         .debug_selector(|| "app.close.confirm".to_owned())
         .on_click(cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
             this.confirm_close_app(window, cx);
         }));
-        Some(
-            question.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(metrics.scale(spacing::HAIRLINE))
-                    .child(self.text_button(
-                        SharedString::from("app.close.cancel"),
-                        strings.transfers_close_app_cancel,
-                        Variant::Secondary,
-                        cx,
-                        |view, cx| view.cancel_close_app(cx),
-                    ))
-                    .child(confirm),
-            ),
-        )
+        Some(self.close_question_dialog(
+            window,
+            "app.close.question",
+            heading.to_owned(),
+            list,
+            [cancel, confirm],
+            "app.close.dismiss",
+            cx,
+            |view, cx| view.cancel_close_app(cx),
+        ))
     }
 
     /// Direction, host, source and target of a task a close would interrupt.
@@ -10657,9 +10755,6 @@ impl ShelluneView {
             );
         }
 
-        if let Some(id) = self.hosts.pending_delete() {
-            column = column.child(self.host_delete_bar(id, cx));
-        }
         // Where the records live is a fact for the data settings, not a line that costs
         // the list a row on every visit.
         column.child(self.hosts_management(cx))
@@ -11067,8 +11162,21 @@ impl ShelluneView {
         row
     }
 
-    /// The question shown before a host is deleted.
-    fn host_delete_bar(&self, id: HostId, cx: &mut Context<Self>) -> Div {
+    /// The question shown before a host is deleted, as a dialog over the page (R5).
+    ///
+    /// Deleting is the one action on the page that cannot be undone, so it is asked in
+    /// a dialog that holds the page until it is answered: the danger tile and the
+    /// question, the record it names, what is and is not removed, then the way out and
+    /// the removal - the removal last and in the danger colour. Escape keeps the host.
+    pub(super) fn host_delete_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if self.workspace.destination() != Destination::Hosts {
+            return None;
+        }
+        let id = self.hosts.pending_delete()?;
         let metrics = self.metrics();
         let strings = self.strings();
         // The question is asked for a host or for a connection of another protocol, so it
@@ -11081,54 +11189,79 @@ impl ShelluneView {
         } else {
             strings.connection_delete_question
         };
-
-        components::banner(Tone::Danger, metrics)
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(metrics.scale(spacing::SNUG))
-            .debug_selector(|| "hosts.confirm".to_owned())
+        let (header, subtitle) = self.modal_header_lead(
+            Some(components::modal_icon(
+                Icon::Trash,
+                Some(Tone::Danger),
+                metrics,
+            )),
+            question.to_owned(),
+            None,
+            None,
+            "hosts.confirm.close",
+            cx,
+            |this, cx| this.cancel_delete_host(cx),
+        );
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::LOOSE))
+            .pt(metrics.scale(spacing::TIGHT))
+            .pb(metrics.scale(spacing::BASE))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(metrics.scale(1.0))
+                    .w_full()
                     .min_w(px(0.0))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(metrics.label_size())
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(SharedString::from(format!("{question} {target}"))),
-                    )
-                    .child(
-                        div()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(strings.host_delete_note),
-                    ),
+                    .whitespace_normal()
+                    .text_size(metrics.body_size())
+                    .font_weight(metrics.medium_weight())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "hosts.confirm.target".to_owned())
+                    .child(SharedString::from(target)),
             )
             .child(
                 div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(self.text_button(
-                        SharedString::from("hosts.confirm.delete"),
-                        strings.host_delete_confirm,
-                        Variant::Danger,
-                        cx,
-                        |view, cx| view.confirm_delete_host(cx),
-                    ))
-                    .child(self.text_button(
-                        SharedString::from("hosts.confirm.cancel"),
-                        strings.host_cancel,
-                        Variant::Secondary,
-                        cx,
-                        |view, cx| view.cancel_delete_host(cx),
-                    )),
+                    .w_full()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(strings.host_delete_note),
             )
+            .into_any_element();
+        let footer = components::modal_footer(metrics)
+            .child(
+                self.text_button(
+                    SharedString::from("hosts.confirm.cancel"),
+                    strings.host_cancel,
+                    Variant::Ghost,
+                    cx,
+                    |view, cx| view.cancel_delete_host(cx),
+                )
+                .h(metrics.control_height()),
+            )
+            .child(
+                self.text_button(
+                    SharedString::from("hosts.confirm.delete"),
+                    strings.host_delete_confirm,
+                    Variant::Danger,
+                    cx,
+                    |view, cx| view.confirm_delete_host(cx),
+                )
+                .h(metrics.control_height()),
+            );
+        Some(self.modal(
+            window,
+            "hosts.confirm",
+            440.0,
+            shell::ModalContent {
+                header,
+                subtitle,
+                body,
+                footer: Some(footer),
+            },
+        ))
     }
 
     /// A small command button that runs one action.
@@ -11406,6 +11539,19 @@ impl ShelluneView {
     /// menu is the shell's surface, and the program must not receive an Escape that
     /// was meant for it. With nothing floating the key goes on to the program.
     fn dismiss_floating(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // A question asked before a close stops running work is the topmost dialog.
+        // Escape is its way out: everything keeps running (R5, R9).
+        if self.closing_app && (self.transfers.any_active() || self.forwards.any_active()) {
+            self.cancel_close_app(cx);
+            return true;
+        }
+        if self
+            .closing
+            .is_some_and(|id| self.close_needs_confirmation(id))
+        {
+            self.cancel_close_session(cx);
+            return true;
+        }
         // A paste or a saved command waiting for an answer is the topmost layer. Escape
         // drops it without writing anything and gives the keyboard back to the terminal
         // that asked (R17).
@@ -11457,6 +11603,13 @@ impl ShelluneView {
         }
         if self.hosts.group_editor().is_some() {
             self.close_group_dialog(cx);
+            return true;
+        }
+        // The deletion question is a dialog: Escape is the way out, and keeps the host.
+        if self.workspace.destination() == Destination::Hosts
+            && self.hosts.pending_delete().is_some()
+        {
+            self.cancel_delete_host(cx);
             return true;
         }
         if self.host_menu.is_some() {
@@ -18347,8 +18500,6 @@ impl Render for ShelluneView {
                     .h_full()
                     .children(header)
                     .children(notice)
-                    .children(self.close_transfer_question(cx))
-                    .children(self.close_app_question(cx))
                     .child(self.destination_panel(window, cx)),
             )
             // Floating layers, drawn after the page and so above it, the later the
@@ -18362,6 +18513,7 @@ impl Render for ShelluneView {
             .children(self.host_dialog_overlay(window, cx))
             .children(self.connection_dialog_overlay(window, cx))
             .children(self.group_dialog_overlay(window, cx))
+            .children(self.host_delete_overlay(window, cx))
             .children(self.backup_overlay(window, cx))
             .children(self.sync_overlay(window, cx))
             .children(self.update_overlay(window, cx))
@@ -18377,6 +18529,10 @@ impl Render for ShelluneView {
             .children(self.palette_overlay(window, cx))
             .children(self.key_capture_overlay(window, cx))
             .children(self.paste_overlay(window, cx))
+            // A question asked before work is stopped is answered before anything
+            // else: it is drawn over every other layer.
+            .children(self.close_transfer_question(window, cx))
+            .children(self.close_app_question(window, cx))
             .children(self.toast_stack(cx))
     }
 }

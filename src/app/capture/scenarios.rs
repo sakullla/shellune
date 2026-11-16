@@ -1103,6 +1103,48 @@ fn delete_question_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     Ok(())
 }
 
+/// The empty form a new host starts from, as the dialog draws it (R5).
+fn show_new_host(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_new_host(cx);
+    Ok(())
+}
+
+fn new_host_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if !view.capture_new_host_open() {
+        return Err("the new host form is not open".to_owned());
+    }
+    Ok(())
+}
+
+/// The question asked before a session that is copying a file closes (R5, R9).
+///
+/// The transfer is the one the transfer strip scenario seeds: the queue holds it as a
+/// worker's events would, and no byte moves. The close is asked the way the tab's close
+/// button asks it, so the shot is the question and nothing was closed.
+fn show_close_question(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_running_transfer(view, window, cx)?;
+    let id = view
+        .active_session()
+        .ok_or_else(|| "no session".to_owned())?;
+    view.capture_ask_close(id, cx);
+    Ok(())
+}
+
+fn close_question_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if !view.capture_close_question() {
+        return Err("the close question is not open".to_owned());
+    }
+    Ok(())
+}
+
 /// A notification over the terminal, as an action would raise it (R2).
 fn show_notification(
     view: &mut ShelluneView,
@@ -2596,6 +2638,40 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_hosts,
         install: show_delete_question,
         ready: delete_question_ready,
+    },
+    Scenario {
+        id: "host-new",
+        title: "对话框 · 新建主机",
+        category: Category::Overlay,
+        fixture: "six saved hosts and the empty form a new host starts from",
+        evidence: "shows the shared dialog: header, scrolling form and the footer's action order; \
+                   nothing was saved and no connection was made",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_new_host,
+        ready: new_host_ready,
+    },
+    Scenario {
+        id: "close-question",
+        title: "对话框 · 关闭前询问",
+        category: Category::Overlay,
+        fixture: "a remote session with one transfer the queue holds, and its tab's close asked for",
+        evidence: "shows the question, the task it would stop and the way out; nothing was closed, \
+                   cancelled or transferred",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_close_question,
+        ready: close_question_ready,
     },
     Scenario {
         id: "notification",

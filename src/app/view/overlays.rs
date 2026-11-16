@@ -2349,16 +2349,8 @@ impl ShelluneView {
                     .child(strings.tab_rename_hint),
             )
             .into_any_element();
-        let footer = div()
-            .flex()
-            .items_center()
+        let footer = components::modal_footer(metrics)
             .justify_between()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(colors::BORDER))
             .child(
                 components::compact_button(strings.tab_rename_auto, Variant::Ghost, metrics)
                     .id("tab.rename.auto")
@@ -2564,16 +2556,7 @@ impl ShelluneView {
                     .child(strings.terminal_paste_safe),
             )
             .into_any_element();
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_end()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(colors::BORDER))
+        let footer = components::modal_footer(metrics)
             .child(self.text_button(
                 SharedString::from("terminal.paste.cancel"),
                 strings.terminal_paste_cancel,

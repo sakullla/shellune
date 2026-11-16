@@ -1002,16 +1002,7 @@ impl ShelluneView {
     /// The footer row of a backup dialog.
     fn backup_footer(&self) -> Div {
         let metrics = self.metrics();
-        div()
-            .flex()
-            .items_center()
-            .justify_end()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
+        components::modal_footer(metrics)
     }
 
     /// The main button of a backup dialog, drawn quiet and inert while it cannot act.

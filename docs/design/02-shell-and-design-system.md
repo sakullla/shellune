@@ -151,8 +151,21 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   （`settings_pending_reveal`），滚轮一动即恢复跟随。最后一个分类之后留出约 60% 视口高度的空白，保证任何分类都能
   滚到顶部。只有右侧滚动，导航不动。窗口窄到两栏放不下时，导航折叠为顶部的分类 / 子项选择条，内容仍是同一个
   连续页面。没有标题的设置行不再留一行空白，说明文字与右侧控件垂直居中。偏好保存在 `preferences.json`。
-- **弹窗**（`modal`）：新建 / 编辑主机、连接到主机、快速连接、导入 SSH 配置、端口转发、传输都在居中弹窗里，
-  点遮罩不关闭（不丢失已填内容），用右上角关闭或 Esc。
+  **视觉（R5）**：左侧导航是一块 chrome 层面板（`CHROME` 底 + 弱边 + 圆角 10），当前分类为浅底 + 2px accent
+  细条（展开时细条交给当前子项）；每组设置是共享的 `components::card`（surface + 弱边 + 圆角 10 + Low，行自带
+  内边距与分隔线）。开 / 关类设置全部是开关（`ShelluneView::switch_control` → `components::switch`）：整块
+  （状态词“开 / 关” + 开关）是一个 ≥ 24px 的指针目标，按一下翻转并立即生效，选择器为
+  `settings.notice.bell`、`settings.notice.finished`、`settings.keepalive`、`settings.sync.auto`、
+  `settings.sync.secrets`、`settings.update.auto`（状态词为 `<选择器>.state`）。多选一仍用分段控件，数值用统一的输入框。
+- **弹窗**（`modal`）：新建 / 编辑主机（`hosts.editor`）、编辑桌面 / 串口连接（`connection.editor`）、连接到主机、
+  快速连接、导入 SSH 配置、端口转发、传输、备份、同步冲突、更新确认、删除主机确认（`hosts.confirm`）、关闭会话 /
+  关闭应用前的询问（`session.close.question` / `app.close.question`）、快捷键录制（`keys.capture.dialog`）全部是同一个
+  `components::modal`：头部是图标块 + 标题 + 关闭按钮（危险问题的图标块用 danger tint），主体滚动，底部
+  `components::modal_footer` 右对齐、可换行，按“退路在前、主操作在后”排列——主操作为 Primary 实心，次操作为
+  Secondary / Ghost，删除与关闭为 Danger。进入时淡入并从上方 8px 落定（`Enter::Settle`，减少动效时直接出现）。
+  点遮罩不关闭（不丢失已填内容），用右上角关闭或 Esc；只有不会丢内容的快捷键录制在点遮罩时取消。删除确认与关闭
+  询问原先是页内横幅，现在是对话框：Esc 等于“取消 / 保持运行”，不删除、不停止任何东西；其余对话框的焦点顺序与
+  Esc / Enter 语义不变。截图场景：`host-new`、`close-question`、`confirm-delete-host`。
 - **新建 / 编辑主机**（`view/host_dialog.rs`）：按"要连上一台服务器需要什么"排序——地址 + 端口、用户名、登录方式，
   然后是"名称（可选）"与"分组（可选）"，其余全部折进**高级设置**（跳板机、代理命令、启动命令、文件传输、X11、保活；
   `hosts.advanced`）。折叠头写出里面有什么，用到了任何一项时带"已设置"标记，编辑这样的主机时默认展开
@@ -570,7 +583,7 @@ gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动�
    `AnimationDurationFactor=0`；读不到时视为未要求。窗口首次绘制时读取，之后在窗口重新获得焦点或系统
    外观变化时重读（Linux 需要调用 `gsettings`，在后台线程读取）。截图固定为减少动效。
 
-当前使用：对话框（`components::modal`）与 toast 用 Fade；等待徽记与加载条用 BASE；会话状态卡用 Rise；
+当前使用：对话框（`components::modal`）用 Settle；toast 用 Fade；等待徽记与加载条用 BASE；会话状态卡用 Rise；
 首页卡片依次淡入（`components::enter_in_turn`，每次序晚 `TURN_DELAY` 40ms、淡入 BASE、只动透明度），
 首次使用卡片用 Rise。
 
@@ -1148,7 +1161,7 @@ Windows 安装器的启动与重启）。
   一次。自动检查失败不提示（下次启动再试），手动检查失败在卡片上写明原因。开关是本机偏好
   （`preferences.json` 的 `auto_check_updates`，缺省为开），不进入备份与同步文档，拉取或导入不会改它；关闭后启动不发
   任何请求，手动“检查更新”仍可用。截图与默认测试窗口没有 updater，不发请求。
-- 设置“关于与更新”分类：版本行（当前版本）+ 更新页（`settings.card.update`）：自动检查开关（`settings.update.auto.*`）、
+- 设置“关于与更新”分类：版本行（当前版本）+ 更新页（`settings.card.update`）：自动检查开关（`settings.update.auto`）、
   检查按钮（`settings.update.check`）、状态区：
   - 发现新版本：版本号、发布日期、更新说明（过长时按行截断，详见发布页）、“下载并安装”（`settings.update.download`）
     与“打开发布页”（`settings.update.release-page`）；
@@ -1178,7 +1191,7 @@ Windows 安装器的启动与重启）。
 
 | 行 | 控件 | 说明 |
 | --- | --- | --- |
-| 保活 | 开 / 关（`settings.keepalive.0` / `.1`） | 关就是把间隔写成 0，与 OpenSSH 的 `ServerAliveInterval 0` 同义 |
+| 保活 | 开关（`settings.keepalive`） | 关就是把间隔写成 0，与 OpenSSH 的 `ServerAliveInterval 0` 同义 |
 | 保活间隔 | 秒数输入框（`settings.policy.keepalive-interval`） | 静默这么久之后发一次探测；0 表示关闭 |
 | 未响应探测 | 次数输入框（`settings.policy.keepalive-misses`） | 1–100；0 被拒绝，因为"永远不判定断开"不是可达的语义 |
 | 连接超时 | 秒数输入框（`settings.policy.connect-timeout`） | 1–600；只覆盖拨号与密钥交换，不覆盖人工确认指纹的时间 |
@@ -1431,7 +1444,7 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 **迁移进度（地基任务之后）。** 已迁到组件：三处勾选框、`view/shell.rs` 的对话框外壳、会话行菜单与 toast。
 以下仍是手写外观（已换成新令牌与层级，但未用共享组件），由后续界面任务替换，替换完成后删去对应条目：
 
-- 对话框外壳：`view/host_dialog.rs` 的 `hosts.editor` 与 `connection.editor`、`view/overlays.rs` 的命令面板外壳（设置与对话框任务）。
+- 对话框外壳：`view/overlays.rs` 的命令面板外壳（其余界面任务）。主机与连接编辑器、删除确认、关闭询问与快捷键录制已迁到 `modal`。
 - 菜单卡片：`view/overlays.rs` 的主机菜单与标签菜单、`terminal.rs` 的 `terminal.menu`、`text_field.rs` 的
   `field.menu`、`view/files_menu.rs` 的 `files.menu`、`view.rs` 的 `shell.picker`（其余界面任务）。
 - 勾选框：文件列表的标记方框（`view.rs`，其余界面任务）。
@@ -1450,7 +1463,8 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 | `row` / `row_with_state` + `stacked` | 列表行：surface 底，悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
 | `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单（尚未迁移的见上）：raised + 强边 + 圆角 10 + Mid；条目 30 高，禁用项保留位置，危险项悬停为 danger tint |
 | `menu_panel` + `menu_item` + `menu_item_face` | 取值菜单（选中项保留选中外观） |
-| `modal(viewport, id, width, ModalContent)` | 对话框外壳（尚未迁移的见上）：scrim 遮罩（按下不关闭），overlay + 强边 + 圆角 14 + High，头部固定、主体滚动、底部固定，进入时 Fade |
+| `modal(viewport, id, width, ModalContent)` / `modal_with(..., ModalBehaviour)` | 对话框外壳（尚未迁移的见上）：scrim 遮罩（按下不关闭；`ModalBehaviour::dismiss` 仅给无内容可丢的对话框），overlay + 强边 + 圆角 14 + High，头部固定、主体滚动（`{id}.body`，可交给调用方的 `ScrollHandle`）、底部固定，遮罩为 `{id}.backdrop`，进入时 Settle |
+| `modal_footer` / `modal_icon(icon, tone)` | 对话框底部动作行（顶部分隔线、右对齐、可换行，主操作最后）；头部图标块（默认 accent tint，危险问题用色调 tint） |
 | `dialog_face` / `dialog_panel` / `dialog_header` | 对话框表面令牌与内嵌标题块 |
 | `toast(tone, icon, title, detail)` | 通知：raised + 强边 + 圆角 10 + Mid，色调图标圆底；关闭按钮与位置由调用方加，进入时 Fade |
 | `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 14）+ 标题 + 可选一行说明 + 可选动作；不带状态色调；调用方在外层加自己的选择器 |

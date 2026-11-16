@@ -512,8 +512,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
                 "policy",
                 "settings.row.keepalive-interval",
                 &[
-                    "settings.keepalive.0",
-                    "settings.keepalive.1",
+                    "settings.keepalive",
                     "settings.policy.keepalive-interval",
                     "settings.policy.keepalive-misses",
                     "settings.policy.connect-timeout",
@@ -526,12 +525,12 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
                 (
                     "bell-notice",
                     "settings.row.bell-notice",
-                    &["settings.notice.bell.0", "settings.notice.bell.1"][..],
+                    &["settings.notice.bell"][..],
                 ),
                 (
                     "finished-notice",
                     "settings.row.finished-notice",
-                    &["settings.notice.finished.0", "settings.notice.finished.1"][..],
+                    &["settings.notice.finished"][..],
                 ),
             ],
         ),
@@ -566,10 +565,8 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
                     "settings.sync.username",
                     "settings.sync.password",
                     "settings.sync.remote-dir",
-                    "settings.sync.auto.0",
-                    "settings.sync.auto.1",
-                    "settings.sync.secrets.0",
-                    "settings.sync.secrets.1",
+                    "settings.sync.auto",
+                    "settings.sync.secrets",
                     "settings.sync.save",
                     "settings.sync.test",
                     "settings.sync.upload",
@@ -586,8 +583,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
                     "update",
                     "settings.row.update-auto",
                     &[
-                        "settings.update.auto.0",
-                        "settings.update.auto.1",
+                        "settings.update.auto",
                         "settings.update.check",
                         "settings.update.status",
                     ][..],
@@ -1874,7 +1870,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             host_startup_placeholder,
             host_startup_note,
             host_save_connect,
-            host_dialog_close,
             remote_saved_secret_failed,
             host_jump_title,
             host_jump_empty,
@@ -5600,7 +5595,7 @@ async fn the_connection_page_edits_the_numbers_and_refuses_zero_probes(cx: &mut 
 
     // Zero is a value: the switch writes it, and the page stops claiming the link is
     // being watched.
-    click(cx, "settings.keepalive.1");
+    click(cx, "settings.keepalive");
     let off = cx.update(|_window, app| view.read(app).connection_defaults());
     assert_eq!(off.keepalive_interval_secs(), 0);
     assert!(off.policy().keepalive().is_none());
@@ -5614,7 +5609,7 @@ async fn the_connection_page_edits_the_numbers_and_refuses_zero_probes(cx: &mut 
     );
 
     // Switching it on again restores the interval that was last in force.
-    click(cx, "settings.keepalive.0");
+    click(cx, "settings.keepalive");
     let on = cx.update(|_window, app| view.read(app).connection_defaults());
     assert_eq!(on.keepalive_interval_secs(), 30);
 
@@ -6355,6 +6350,31 @@ async fn deleting_a_host_asks_first_and_the_file_follows(cx: &mut TestAppContext
     assert!(
         cx.debug_bounds("hosts.list.2").is_some(),
         "cancelling keeps both hosts listed"
+    );
+
+    // The question is the shared dialog over a dimmed page: the way out comes first and
+    // the removal last, and Escape is a way out that deletes nothing (R5).
+    click(cx, "hosts.delete.0");
+    assert!(
+        cx.debug_bounds("hosts.confirm.backdrop").is_some(),
+        "the deletion question dims the page behind it"
+    );
+    let keep = bounds_of(cx, "hosts.confirm.cancel");
+    let remove = bounds_of(cx, "hosts.confirm.delete");
+    assert!(
+        keep.origin.x < remove.origin.x || keep.origin.y < remove.origin.y,
+        "the removal is the last action: keep {keep:?}, delete {remove:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().pending_delete().is_none()),
+        "Escape drops the question"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        2,
+        "Escape deletes nothing"
     );
 
     click(cx, "hosts.delete.0");
@@ -12920,6 +12940,37 @@ async fn closing_a_session_with_a_running_transfer_warns_first_and_cancels_only_
         "the session and its transfer are untouched"
     );
 
+    // The question is the shared dialog over the window: the way out comes first, the
+    // close last, both inside the window, and Escape keeps everything running (R5).
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| view.request_close_session(first, cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("session.close.question.backdrop").is_some(),
+        "the close question dims the window behind it"
+    );
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let keep = bounds_of(cx, "session.close.cancel");
+    let stop = bounds_of(cx, "session.close.confirm");
+    assert!(
+        keep.origin.x < stop.origin.x || keep.origin.y < stop.origin.y,
+        "closing is the last action: keep {keep:?}, close {stop:?}"
+    );
+    assert_within_width(stop, viewport, "the close action");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).closing_for_test()),
+        None,
+        "Escape answers the question with the way out"
+    );
+    assert!(first_transfers.cancels().is_empty(), "Escape stops nothing");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).transfer_active_count(first)),
+        1
+    );
+
     // Confirming closes the session, cancels its own task and leaves the other one alone.
     cx.update(|_window, app| {
         view.update(app, |view, cx| view.request_close_session(first, cx));
@@ -19097,7 +19148,7 @@ async fn the_two_reminders_switch_separately_and_are_written_down(cx: &mut TestA
 
     // Both start on; switching the bell off leaves the command one alone.
     click(cx, "settings.item.bell-notice");
-    click(cx, "settings.notice.bell.1");
+    click(cx, "settings.notice.bell");
     let settings = cx.update(|_window, app| view.read(app).workspace().attention_settings());
     assert!(!settings.bell, "the bell reminder is off");
     assert!(settings.finished, "the command reminder is untouched");
@@ -19133,7 +19184,7 @@ async fn the_two_reminders_switch_separately_and_are_written_down(cx: &mut TestA
     // And switching it off removes the mark it already made.
     click(cx, "nav.settings");
     click(cx, "settings.item.finished-notice");
-    click(cx, "settings.notice.finished.1");
+    click(cx, "settings.notice.finished");
     assert!(
         unread_of(cx, &view, background).is_empty(),
         "no mark of a kind whose reminder is off is left behind"
@@ -30454,7 +30505,7 @@ async fn syncing_passwords_needs_a_passphrase_before_it_is_saved(cx: &mut TestAp
     configure_sync(&dir, &secrets, &server, false);
     let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Settings);
     click(cx, "settings.category.sync");
-    click(cx, "settings.sync.secrets.0");
+    click(cx, "settings.sync.secrets");
     assert!(cx.debug_bounds("settings.sync.passphrase").is_some());
     click(cx, "settings.sync.save");
     assert_eq!(
@@ -31695,7 +31746,7 @@ async fn with_the_switch_off_the_start_sends_nothing_and_a_manual_check_still_wo
     let backend = Arc::new(TestUpdates::new(fixture.updater(fixture.portable())));
     let (view, cx) = update_window(cx, &dir, backend, Destination::Settings);
     open_update_card(cx);
-    click(cx, "settings.update.auto.1");
+    click(cx, "settings.update.auto");
     assert!(!cx.update(|_window, app| view.read(app).update_auto_check_for_test()));
     assert_eq!(
         cx.update(|_window, app| view.read(app).current_preferences_for_test())
@@ -32594,4 +32645,133 @@ async fn an_ended_shell_in_a_stacked_split_keeps_its_card_and_step_on_screen(
     cx: &mut TestAppContext,
 ) {
     an_ended_shell_card_reaches_its_step(cx, Some(SplitAxis::TopBottom));
+}
+
+#[gpui::test]
+async fn the_host_dialog_is_the_shared_dialog_and_keeps_its_actions_in_the_minimum_window(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, _dir) = dialog_view(cx, Vec::new());
+    click(cx, "hosts.new");
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    let viewport = cx.update(|window, _app| window.viewport_size());
+
+    // The form is drawn in the shared dialog: a dimmed page, a fixed header, a body
+    // that scrolls and a fixed row of actions (R5).
+    assert!(
+        cx.debug_bounds("hosts.editor.backdrop").is_some(),
+        "the host form dims the page behind it"
+    );
+    assert!(cx.debug_bounds("hosts.editor.body").is_some());
+    let dialog = bounds_of(cx, "hosts.editor");
+    assert_within_width(dialog, viewport, "the host dialog");
+    assert!(
+        dialog.origin.y >= px(-0.5)
+            && dialog.origin.y + dialog.size.height <= viewport.height + px(0.5),
+        "the host dialog leaves the window vertically: {dialog:?} in {viewport:?}"
+    );
+    for action in ["hosts.cancel", "hosts.save", "hosts.save_connect"] {
+        let bounds = bounds_of(cx, action);
+        assert_inside_box(bounds, dialog, action);
+        assert!(
+            bounds.origin.y + bounds.size.height <= dialog.origin.y + dialog.size.height + px(0.5),
+            "{action} is drawn below the dialog: {bounds:?} in {dialog:?}"
+        );
+    }
+    let cancel = bounds_of(cx, "hosts.cancel");
+    let connect = bounds_of(cx, "hosts.save_connect");
+    assert!(
+        connect.origin.x > cancel.origin.x || connect.origin.y > cancel.origin.y,
+        "the primary action is the last one: cancel {cancel:?}, connect {connect:?}"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_window, app| view.read(app).hosts_state().is_editing()),
+        "Escape still closes the dialog without saving"
+    );
+    assert!(cx.update(|_window, app| view.read(app).book().hosts().is_empty()));
+}
+
+#[gpui::test]
+async fn a_settings_switch_is_one_pointer_target_that_flips_its_setting(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    show_settings_at_the_minimum_window_in_large_text(&view, cx);
+    click(cx, "settings.category.notices");
+    click(cx, "settings.item.bell-notice");
+    scroll_fully_into_view(cx, "settings.scroll", "settings.notice.bell");
+
+    // One switch, with its state written beside it, and a target a finger can hit at the
+    // largest text (R5, R9).
+    let switch = bounds_of(cx, "settings.notice.bell");
+    assert!(
+        switch.size.width >= px(24.0) && switch.size.height >= px(24.0),
+        "the switch is smaller than a 24px pointer target: {switch:?}"
+    );
+    assert!(
+        cx.debug_bounds("settings.notice.bell.state").is_some(),
+        "the switch says its state in words as well"
+    );
+    let bell = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).workspace().attention_settings().bell)
+    };
+    let before = bell(cx);
+    click(cx, "settings.notice.bell");
+    assert_eq!(bell(cx), !before, "a press flips the setting");
+    click(cx, "settings.notice.bell");
+    assert_eq!(bell(cx), before, "and a second press flips it back");
+}
+
+#[gpui::test]
+async fn the_shortcut_capture_is_the_shared_dialog_and_a_press_outside_cancels_it(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    click(cx, "nav.settings");
+    click(cx, "settings.category.keys");
+    click(cx, "settings.keys.change.nav.settings");
+
+    // The capture is drawn in the shared dialog, over a dimmed window (R5).
+    assert!(cx.debug_bounds("keys.capture").is_some());
+    assert!(
+        cx.debug_bounds("keys.capture.dialog.backdrop").is_some(),
+        "the capture dims the window behind it"
+    );
+    let dialog = bounds_of(cx, "keys.capture.dialog");
+    assert_inside_box(
+        bounds_of(cx, "keys.capture.cancel"),
+        dialog,
+        "keys.capture.cancel",
+    );
+
+    // Nothing typed can be lost here, so a press on the dimmed window outside the
+    // dialog is a way out, as it was before, and the binding is untouched.
+    let corner = point(
+        dialog.origin.x / 2.0,
+        dialog.origin.y + dialog.size.height / 2.0,
+    );
+    cx.simulate_click(corner, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).capturing_for()),
+        None,
+        "a press outside the dialog cancels the capture"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .keymap()
+            .keystroke("nav.settings")
+            .map(str::to_owned)),
+        Keymap::defaults(Platform::current())
+            .keystroke("nav.settings")
+            .map(str::to_owned),
+        "cancelling leaves the binding as it was"
+    );
 }

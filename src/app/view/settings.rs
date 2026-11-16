@@ -505,15 +505,12 @@ impl ShelluneView {
             .collect();
         if !simple.is_empty() {
             let count = simple.len();
-            let mut card = div()
-                .flex()
-                .flex_col()
+            // The shared card: surface, hairline edge, the card radius and the low
+            // elevation. Its rows carry their own padding and separators.
+            let mut card = components::card(metrics)
                 .w_full()
-                .min_w(px(0.0))
-                .rounded(px(radius::LARGE))
-                .bg(theme::swatch(palette::SURFACE))
-                .border_1()
-                .border_color(theme::swatch(palette::BORDER))
+                .p(px(0.0))
+                .gap(px(0.0))
                 .debug_selector({
                     let selector = format!("settings.group.{}", category.id());
                     move || selector.clone()
@@ -632,6 +629,8 @@ impl ShelluneView {
         let metrics = self.metrics();
         let locale = self.workspace.locale();
         let ringed = !self.pointer_input || self.settings_nav.nav_focus;
+        // The navigation is chrome, not content: it stands on the chrome layer as a
+        // panel of its own beside the cards it points into (R5).
         let mut column = div()
             .flex()
             .flex_col()
@@ -639,6 +638,11 @@ impl ShelluneView {
             .w(metrics.scale(NAV_WIDTH))
             .min_w(px(0.0))
             .gap(metrics.scale(spacing::HAIRLINE))
+            .p(metrics.scale(spacing::TIGHT))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::CHROME))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "settings.nav".to_owned());
         // The mark follows what is on screen, so scrolling the page moves it.
         let in_view = self.settings_category_in_view();
@@ -679,6 +683,21 @@ impl ShelluneView {
                     .when(chosen && ringed && !expanded, |row| {
                         row.border_color(theme::swatch(palette::FOCUS_RING))
                     })
+                    // The chosen category carries the accent bar beside its fill, so
+                    // the state is not told by the fill alone; an open category hands
+                    // the bar to its chosen page.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(2.0))
+                            .h(metrics.scale(14.0))
+                            .rounded(px(1.0))
+                            .bg(if chosen && !expanded {
+                                theme::swatch(palette::ACCENT)
+                            } else {
+                                theme::clear()
+                            }),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -1258,25 +1277,18 @@ impl ShelluneView {
     /// marked, so turning one off leaves the bell byte, the command blocks and every
     /// disconnect reason exactly as they were.
     fn settings_notice_control(&self, kind: AttentionKind, cx: &mut Context<Self>) -> Div {
-        let ux = copy::ux();
         let notifications = self.workspace.attention_settings();
         let on = match kind {
             AttentionKind::Bell => notifications.bell,
             AttentionKind::CommandFinished => notifications.finished,
         };
-        let label = |state: bool| if state { ux.notice_on } else { ux.notice_off }.to_owned();
         let id = match kind {
             AttentionKind::Bell => "settings.notice.bell",
             AttentionKind::CommandFinished => "settings.notice.finished",
         };
-        self.segments(
-            id,
-            vec![(label(on), on), (label(!on), !on)],
-            cx,
-            move |view, index, cx| {
-                view.set_attention_notice(kind, index == 0, cx);
-            },
-        )
+        div().child(self.switch_control(id, on, cx, move |view, on, cx| {
+            view.set_attention_notice(kind, on, cx);
+        }))
     }
 
     /// The connection page: the keepalive and timeout numbers every host is dialled with
@@ -1290,15 +1302,9 @@ impl ShelluneView {
         let metrics = self.metrics();
         let ux = copy::ux();
         let on = self.connection_draft.keepalive_on();
-        let switching = self.segments(
-            "settings.keepalive",
-            vec![
-                (ux.notice_on.to_owned(), on),
-                (ux.notice_off.to_owned(), !on),
-            ],
-            cx,
-            |view, index, cx| view.set_connection_keepalive(index == 0, cx),
-        );
+        let switching = self.switch_control("settings.keepalive", on, cx, |view, on, cx| {
+            view.set_connection_keepalive(on, cx);
+        });
         let window = match self.connection_draft.detection_window_secs() {
             Some(seconds) => copy::fill(ux.connection_window, &[("seconds", &seconds.to_string())]),
             None => ux.connection_window_off.to_owned(),
@@ -1421,16 +1427,11 @@ impl ShelluneView {
     /// past the window as well (R8, 720x480).
     pub(super) fn settings_card(&self, id: &'static str, rows: Vec<Div>) -> Div {
         let count = rows.len();
-        let mut card = div()
-            .flex()
-            .flex_col()
+        let metrics = self.metrics();
+        let mut card = components::card(metrics)
             .w_full()
-            .min_w(px(0.0))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .shadow(theme::Elevation::Low.shadows())
+            .p(px(0.0))
+            .gap(px(0.0))
             .debug_selector(move || format!("settings.card.{id}"));
         for (index, row) in rows.into_iter().enumerate() {
             card = card.child(row.when(index + 1 < count, |row| {

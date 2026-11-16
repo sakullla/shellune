@@ -1459,12 +1459,7 @@ impl ShelluneView {
                       on: bool,
                       cx: &mut Context<Self>,
                       pick: fn(&mut Self, bool, &mut Context<Self>)| {
-            view.segments(
-                id,
-                vec![(strings.on.to_owned(), on), (strings.off.to_owned(), !on)],
-                cx,
-                move |view, index, cx| pick(view, index == 0, cx),
-            )
+            view.switch_control(id, on, cx, pick)
         };
         let mut rows = vec![
             self.sync_field_row("sync-url", strings.url, strings.url_hint, &self.sync.url),
@@ -1730,16 +1725,7 @@ impl ShelluneView {
                     }
                 }),
             );
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_end()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
+        let footer = components::modal_footer(metrics)
             .child(self.text_button(
                 SharedString::from("sync.conflict.cancel"),
                 strings.cancel,

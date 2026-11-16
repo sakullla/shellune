@@ -137,7 +137,7 @@ pub(super) fn notice_badge(tone: Tone, selector: &'static str, metrics: theme::M
 
 /// The pieces of one centred dialog; the dialog itself is the shared
 /// [`components::modal`].
-pub(super) use crate::app::components::ModalContent;
+pub(super) use crate::app::components::{ModalBehaviour, ModalContent};
 
 impl ShelluneView {
     // -----------------------------------------------------------------------
@@ -1414,50 +1414,60 @@ impl ShelluneView {
         let ux = copy::ux();
         let locale = self.workspace.locale();
         let platform = self.keymap.platform();
-        let viewport = window.viewport_size();
-        let width = px(460.0).min(viewport.width - metrics.scale(spacing::LOOSE) * 2.0);
-
         let current = self.keymap.label(spec.id);
-        let card = div()
-            .occlude()
+        let (header, subtitle) = self.modal_header(
+            Some(Icon::Key),
+            ux.keys_capture_title.to_owned(),
+            None,
+            "keys.capture.close",
+            cx,
+            |this, cx| this.keys_capture_cancel(cx),
+        );
+        // The action being bound and the combination in force now, then the refusal of
+        // the last combination pressed, if any, and how to leave.
+        let body = div()
             .flex()
             .flex_col()
-            .w(width)
             .gap(metrics.scale(spacing::SNUG))
-            .p(metrics.scale(spacing::LOOSE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow(theme::Elevation::Mid.shadows())
+            .px(metrics.scale(spacing::LOOSE))
+            .pt(metrics.scale(spacing::TIGHT))
+            .pb(metrics.scale(spacing::BASE))
             .debug_selector(|| "keys.capture".to_owned())
             .child(
                 div()
-                    .text_size(metrics.title_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(ux.keys_capture_title),
-            )
-            .child(
-                div()
-                    .text_size(metrics.body_size())
-                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(SharedString::from(spec.name(locale))),
-            )
-            .child(
-                div()
                     .flex()
-                    .items_center()
+                    .flex_col()
                     .gap(metrics.scale(spacing::TIGHT))
+                    .px(metrics.scale(spacing::BASE))
+                    .py(metrics.scale(spacing::SNUG))
+                    .rounded(px(radius::MEDIUM))
+                    .bg(theme::swatch(palette::CHROME))
+                    .border_1()
+                    .border_color(theme::swatch(palette::BORDER))
                     .child(
                         div()
+                            .whitespace_normal()
+                            .text_size(metrics.body_size())
+                            .font_weight(metrics.medium_weight())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(spec.name(locale))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(
-                                current
-                                    .clone()
-                                    .unwrap_or_else(|| ux.keys_unbound.to_owned()),
-                            )),
+                            .child(match current {
+                                Some(current) => {
+                                    components::keycap(current, metrics).into_any_element()
+                                }
+                                None => div()
+                                    .child(SharedString::from(ux.keys_unbound))
+                                    .into_any_element(),
+                            }),
                     ),
             )
             .when_some(capture.problem.as_ref(), |card, problem| {
@@ -1469,49 +1479,45 @@ impl ShelluneView {
             })
             .child(
                 div()
+                    .whitespace_normal()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(ux.keys_capture_hint),
             )
-            .child(
-                div().flex().justify_end().child(
-                    components::compact_button(ux.keys_capture_cancel, Variant::Ghost, metrics)
-                        .id("keys.capture.cancel")
-                        .debug_selector(|| "keys.capture.cancel".to_owned())
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.keys_capture_cancel(cx);
-                        })),
-                ),
-            );
-
-        Some(
-            super::overlay_layer().child(
-                div()
-                    .relative()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .child(
-                        div()
-                            .id("keys.capture.backdrop")
-                            .absolute()
-                            .inset_0()
-                            .occlude()
-                            .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
-                                this.keys_capture_cancel(cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(card),
-                    ),
-            ),
-        )
+            .into_any_element();
+        let footer = components::modal_footer(metrics).child(
+            components::compact_button(ux.keys_capture_cancel, Variant::Ghost, metrics)
+                .h(metrics.control_height())
+                .id("keys.capture.cancel")
+                .debug_selector(|| "keys.capture.cancel".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.keys_capture_cancel(cx);
+                })),
+        );
+        // Nothing typed can be lost here, so a press outside the dialog is a way out,
+        // as it was when the capture was a card.
+        let dismiss: components::ModalDismiss = Box::new(cx.listener(
+            |this, _event: &gpui::MouseDownEvent, _window, cx| {
+                this.keys_capture_cancel(cx);
+            },
+        ));
+        Some(self.modal_with(
+            window,
+            "keys.capture.dialog",
+            460.0,
+            ModalContent {
+                header,
+                subtitle,
+                body,
+                footer: Some(footer),
+            },
+            ModalBehaviour {
+                scroll: None,
+                dismiss: Some(dismiss),
+            },
+        ))
     }
+
     /// A segmented control whose segments call `pick` with their index.
     pub(super) fn segments(
         &self,
@@ -1554,6 +1560,47 @@ impl ShelluneView {
             );
         }
         control
+    }
+
+    /// A setting that is on or off, as a switch with its state word beside it (R5).
+    ///
+    /// The whole of it is the pointer target - at least a finger high - and a press
+    /// flips the state and calls `set` with the new one. The word says the state in
+    /// text as well, so it is not told by the knob's side and colour alone.
+    pub(super) fn switch_control(
+        &self,
+        id: &'static str,
+        on: bool,
+        cx: &mut Context<Self>,
+        set: impl Fn(&mut Self, bool, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            .min_h(metrics.hit_target())
+            .cursor_pointer()
+            .child(
+                div()
+                    .min_w(metrics.scale(24.0))
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(if on {
+                        palette::TEXT_PRIMARY
+                    } else {
+                        palette::TEXT_SECONDARY
+                    }))
+                    .debug_selector(move || format!("{id}.state"))
+                    .child(if on { ux.notice_on } else { ux.notice_off }),
+            )
+            .child(components::switch(on, metrics))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                set(this, !on, cx);
+            }))
     }
 
     /// Sets the theme and repaints the terminals in it.
@@ -1620,6 +1667,25 @@ impl ShelluneView {
         ))
     }
 
+    /// [`Self::modal`] with its own scroll handle or its own answer to a press outside.
+    pub(super) fn modal_with(
+        &self,
+        window: &Window,
+        id: &'static str,
+        width: f32,
+        content: ModalContent,
+        behaviour: ModalBehaviour,
+    ) -> Div {
+        super::overlay_layer().child(components::modal_with(
+            window.viewport_size(),
+            id,
+            width,
+            content,
+            behaviour,
+            self.metrics(),
+        ))
+    }
+
     /// The header of a dialog: an optional icon tile, a title, a subtitle and a
     /// close button.
     pub(super) fn modal_header(
@@ -1647,21 +1713,7 @@ impl ShelluneView {
         close: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> (Div, Option<Div>) {
         let metrics = self.metrics();
-        let lead = icon.map(|icon| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(metrics.scale(32.0))
-                .rounded(px(radius::MEDIUM))
-                .bg(theme::swatch(palette::ACCENT_TINT))
-                .child(icons::icon(
-                    icon,
-                    metrics.icon_size(),
-                    theme::swatch(palette::ACCENT),
-                ))
-        });
+        let lead = icon.map(|icon| components::modal_icon(icon, None, metrics));
         self.modal_header_lead(lead, title, subtitle, badge, close_id, cx, close)
     }
 
@@ -2074,15 +2126,7 @@ impl ShelluneView {
         let can_background = self.form_session.is_some() && !failed;
         let can_cancel = panel.status().is_busy() || asking;
         let footer = (can_background || can_cancel).then(|| {
-            div()
-                .flex()
-                .justify_end()
-                .flex_wrap()
-                .gap(metrics.scale(spacing::TIGHT))
-                .px(metrics.scale(spacing::LOOSE))
-                .py(metrics.scale(spacing::SNUG))
-                .border_t_1()
-                .border_color(theme::swatch(palette::BORDER))
+            components::modal_footer(metrics)
                 .when(can_cancel, |row| {
                     row.child(self.text_button(
                         SharedString::from("remote.cancel"),
@@ -2202,14 +2246,7 @@ impl ShelluneView {
             )
             .into_any_element();
         let can_run = !self.shell_path.read(cx).text().trim().is_empty();
-        let footer = div()
-            .flex()
-            .justify_end()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
+        let footer = components::modal_footer(metrics)
             .child(self.text_button(
                 SharedString::from("shell.custom.cancel"),
                 ux.fwd_cancel,
@@ -2824,16 +2861,8 @@ impl ShelluneView {
             )
             .when(!self.snippets.can_write(), |button| button.opacity(0.5));
         let close_footer = close.clone();
-        let footer = div()
-            .flex()
-            .items_center()
+        let footer = components::modal_footer(metrics)
             .justify_between()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
             .child(new_button)
             .child(self.text_button(
                 SharedString::from("snippets.dialog.footer.close"),

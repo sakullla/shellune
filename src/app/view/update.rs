@@ -800,14 +800,11 @@ impl ShelluneView {
             "update-auto",
             strings.auto,
             strings.auto_hint,
-            self.segments(
+            self.switch_control(
                 "settings.update.auto",
-                vec![
-                    (strings.on.to_owned(), self.update.auto_check),
-                    (strings.off.to_owned(), !self.update.auto_check),
-                ],
+                self.update.auto_check,
                 cx,
-                |view, index, cx| view.set_update_auto_check(index == 0, cx),
+                |view, on, cx| view.set_update_auto_check(on, cx),
             ),
         )];
         let stage = &self.update.stage;
@@ -1119,16 +1116,7 @@ impl ShelluneView {
                     }
                 }),
             );
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_end()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .py(metrics.scale(spacing::SNUG))
-            .border_t_1()
-            .border_color(theme::swatch(palette::BORDER))
+        let footer = components::modal_footer(metrics)
             .child(self.text_button(
                 SharedString::from("update.confirm.cancel"),
                 strings.later,

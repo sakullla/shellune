@@ -841,8 +841,6 @@ pub struct Strings {
     pub x11_bar_failed: &'static str,
     /// Host dialog: save and open a connection at once.
     pub host_save_connect: &'static str,
-    /// Tooltip of the dialog's close button.
-    pub host_dialog_close: &'static str,
     /// Connection form: a remembered secret could not be read; the reason follows.
     pub remote_saved_secret_failed: &'static str,
     /// Theme value: follow the operating system.
@@ -1536,7 +1534,6 @@ pub static ENGLISH: Strings = Strings {
     x11_bar_ready: "X11",
     x11_bar_failed: "X11 failed",
     host_save_connect: "Save and connect",
-    host_dialog_close: "Close",
     remote_saved_secret_failed: "The saved password could not be read",
     theme_system: "System",
     theme_light: "Light",
@@ -2072,7 +2069,6 @@ pub static CHINESE: Strings = Strings {
     x11_bar_ready: "X11",
     x11_bar_failed: "X11 失败",
     host_save_connect: "保存并连接",
-    host_dialog_close: "关闭",
     remote_saved_secret_failed: "无法读取已保存的密码",
     theme_system: "跟随系统",
     theme_light: "浅色",
