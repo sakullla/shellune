@@ -1202,7 +1202,7 @@ impl ShelluneView {
         )
         .w(metrics.tab_max_width())
         .flex_shrink()
-        .min_w(metrics.tab_min_width())
+        .min_w(self.tab_min_width())
         .tooltip(crate::app::components::tooltip(tooltip))
         .on_click(cx.listener(move |this, _event, window, cx| {
             this.select_tab(index, window, cx);
@@ -1218,7 +1218,10 @@ impl ShelluneView {
             .children(accent.map(|accent| {
                 super::tab_accent_mark(accent, metrics, format!("session.tab.accent.{index}"))
             }))
-            .child(super::tab_icon(Icon::Terminal, selected, metrics))
+            // As a session tab: a compact row's one tab gives its icon to the title.
+            .when(!self.header_compact(), |body| {
+                body.child(super::tab_icon(Icon::Terminal, selected, metrics))
+            })
             .child(super::tab_title_label(
                 title,
                 selected,

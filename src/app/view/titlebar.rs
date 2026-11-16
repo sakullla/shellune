@@ -27,6 +27,23 @@ pub fn custom_titlebar(platform: Platform) -> bool {
     matches!(platform, Platform::Windows | Platform::MacOs)
 }
 
+/// The width of one Windows window button, in pixels. The system scales its own caption
+/// buttons with the display, not with the window's text size, so neither does this.
+const CAPTION_BUTTON_WIDTH: f32 = 46.0;
+
+/// The room the window buttons this row draws itself take at its right end (R2).
+///
+/// Only Windows draws them; elsewhere the system's own buttons sit outside the row
+/// (Linux) or are allowed for at its left end (macOS, [`traffic_light_room`]).
+#[must_use]
+pub fn window_controls_width(platform: Platform) -> gpui::Pixels {
+    if platform == Platform::Windows {
+        px(CAPTION_BUTTON_WIDTH * 3.0)
+    } else {
+        px(0.0)
+    }
+}
+
 /// The height of one macOS window button, in points. The system draws the buttons, so
 /// they keep this size whatever text size the window uses.
 const TRAFFIC_LIGHT_SIZE: f32 = 14.0;
@@ -138,7 +155,7 @@ impl ShelluneView {
                 // The platform's own caption button width: the system scales it with
                 // the display, not with the window's text size, so a large text size
                 // does not push the buttons out of a small window.
-                .w(px(46.0))
+                .w(px(CAPTION_BUTTON_WIDTH))
                 .h(height)
                 .occlude()
                 // The click is handled here and stops here, so the command runs once

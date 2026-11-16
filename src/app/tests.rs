@@ -19715,8 +19715,14 @@ fn assert_tab_in_view(cx: &mut VisualTestContext, selector: &'static str) {
 }
 
 /// Asserts every part of the strip's tab at `index` stays inside that tab, and that the
-/// tab keeps the strip's width range (R2, R4).
-fn assert_tab_holds_its_parts(cx: &mut VisualTestContext, index: usize, metrics: Metrics) {
+/// tab keeps the strip's width range (R2, R4): from the narrowest the row as drawn
+/// allows (`min`) to the widest a tab grows.
+fn assert_tab_holds_its_parts(
+    cx: &mut VisualTestContext,
+    index: usize,
+    min: Pixels,
+    metrics: Metrics,
+) {
     let tab: &'static str = Box::leak(format!("session.tab.{index}").into_boxed_str());
     let bounds = bounds_of(cx, tab);
     for part in ["dot", "title", "close"] {
@@ -19725,7 +19731,7 @@ fn assert_tab_holds_its_parts(cx: &mut VisualTestContext, index: usize, metrics:
         assert_stays_inside_box(bounds_of(cx, selector), bounds, selector);
     }
     assert!(
-        bounds.size.width >= metrics.tab_min_width() - px(0.5)
+        bounds.size.width >= min - px(0.5)
             && bounds.size.width <= metrics.tab_max_width() + px(0.5),
         "{tab} keeps the strip's width range: {bounds:?}"
     );
@@ -19733,6 +19739,19 @@ fn assert_tab_holds_its_parts(cx: &mut VisualTestContext, index: usize, metrics:
         cx,
         Box::leak(format!("session.tab.close.{index}").into_boxed_str()),
     );
+}
+
+/// Asserts the pinned hosts tab is drawn whole: inside the window, before the strip,
+/// and with its word inside it when it shows one (R2).
+fn assert_hosts_tab_whole(cx: &mut VisualTestContext, viewport: Size<Pixels>) {
+    let hosts = bounds_of(cx, "nav.hosts");
+    assert_fits_inside(hosts, viewport, "the hosts tab");
+    let strip = bounds_of(cx, "session.tabs");
+    assert!(
+        hosts.origin.x + hosts.size.width <= strip.origin.x + px(0.5),
+        "the hosts tab ends where the strip starts: {hosts:?} then {strip:?}"
+    );
+    assert_pointer_target(cx, "nav.hosts");
 }
 
 #[gpui::test]
@@ -19769,14 +19788,14 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
         "the whole name is the tab's title; the strip only cuts what it draws"
     );
 
-    // At 720x480 and 200% text the row has no room left for the strip at all, so its
-    // tabs are not required to be in view there - the list of every tab is how they
-    // are reached - but each one still holds its own parts.
-    for (viewport, zoom, in_view) in [
-        (design_window(), Zoom::Regular, true),
-        (minimum_window(), Zoom::Regular, true),
-        (design_window(), Zoom::Largest, true),
-        (minimum_window(), Zoom::Largest, false),
+    // At 720x480 and 200% text the full row does not fit, so the row draws its compact
+    // form: the hosts tab as its icon and the current session tab alone, whole, with
+    // the list of every tab beside it to reach the other one.
+    for (viewport, zoom) in [
+        (design_window(), Zoom::Regular),
+        (minimum_window(), Zoom::Regular),
+        (design_window(), Zoom::Largest),
+        (minimum_window(), Zoom::Largest),
     ] {
         cx.update(|_window, app| {
             view.update(app, |view, cx| {
@@ -19787,17 +19806,62 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
         cx.simulate_resize(viewport);
         cx.run_until_parked();
         let metrics = Metrics::new(zoom);
-        // The current tab is in view; the other one is reached with the strip's own
-        // scroll button when the window is too narrow for both.
-        if in_view {
-            assert_tab_in_view(cx, "session.tab.1");
+        let compact = cx.update(|_window, app| view.read(app).header_compact_for_test());
+        assert_eq!(
+            compact,
+            viewport == minimum_window() && zoom == Zoom::Largest,
+            "only 720x480 at 200% needs the compact row ({viewport:?}, {zoom:?})"
+        );
+        let min = cx.update(|_window, app| view.read(app).tab_min_width_for_test());
+        assert_hosts_tab_whole(cx, viewport);
+        if !compact {
+            assert_stays_inside_box(
+                bounds_of(cx, "nav.hosts.title"),
+                bounds_of(cx, "nav.hosts"),
+                "the hosts tab's word",
+            );
         }
-        assert_tab_holds_its_parts(cx, 1, metrics);
-        scroll_tab_strip_to_start(cx, &view);
-        if in_view {
-            assert_tab_in_view(cx, "session.tab.0");
+        // Nothing beside the strip is pushed out of the window.
+        for selector in [
+            "tabs.list.open",
+            "header.primary",
+            "palette.open",
+            "nav.settings",
+        ] {
+            assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+            assert_pointer_target(cx, selector);
         }
-        assert_tab_holds_its_parts(cx, 0, metrics);
+        if Platform::current() == Platform::Windows {
+            for selector in ["window.minimize", "window.maximize", "window.close"] {
+                assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+                assert_pointer_target(cx, selector);
+            }
+        }
+        // The current tab is in view, connecting and whole.
+        assert_tab_in_view(cx, "session.tab.1");
+        assert_tab_holds_its_parts(cx, 1, min, metrics);
+        // The connecting tab breathes when motion is allowed and is still otherwise.
+        let breathing = cx.debug_bounds("session.tab.dot.1.pulse").is_some();
+        assert_eq!(
+            breathing,
+            cx.update(|_window, _app| theme::motion_allowed()),
+            "the connecting tab's dot breathes exactly when motion is allowed"
+        );
+        // The other one is reached with the strip's own scroll button when the window
+        // is too narrow for both, and from the list of every tab in a compact row.
+        if compact {
+            click(cx, "tabs.list.open");
+            click(cx, "tabs.list.row.0");
+            assert_eq!(
+                cx.update(|_window, app| view.read(app).active_session()),
+                Some(long),
+                "the list reaches the tab the compact row does not show"
+            );
+        } else {
+            scroll_tab_strip_to_start(cx, &view);
+        }
+        assert_tab_in_view(cx, "session.tab.0");
+        assert_tab_holds_its_parts(cx, 0, min, metrics);
         // The long name is cut inside its own tab: the title ends before the close
         // button starts.
         let title = bounds_of(cx, "session.tab.title.0");
@@ -19805,13 +19869,6 @@ async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut
         assert!(
             title.origin.x + title.size.width <= close.origin.x + px(0.5),
             "the long title stops before its close button at {zoom:?}: {title:?} then {close:?}"
-        );
-        // The connecting tab breathes when motion is allowed and is still otherwise.
-        let breathing = cx.debug_bounds("session.tab.dot.1.pulse").is_some();
-        assert_eq!(
-            breathing,
-            cx.update(|_window, _app| theme::motion_allowed()),
-            "the connecting tab's dot breathes exactly when motion is allowed"
         );
         assert!(
             cx.debug_bounds("session.tab.dot.0.pulse").is_none(),
@@ -19874,6 +19931,47 @@ async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut Test
         }
     }
 
+    // At 720x480 and 200% text the compact row shows the current tab alone and whole,
+    // and every control beside it - the list of the other nineteen among them - and the
+    // window buttons stay inside the window and take the pointer.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.workspace_mut_for_test().set_zoom(Zoom::Largest);
+            cx.notify();
+        });
+    });
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
+    assert_tab_in_view(cx, "session.tab.19");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_strip_ends_for_test()),
+        (false, false),
+        "the compact strip hides nothing past its ends: it shows one tab"
+    );
+    assert_hosts_tab_whole(cx, minimum_window());
+    for selector in [
+        "tabs.list.open",
+        "header.primary",
+        "palette.open",
+        "nav.settings",
+    ] {
+        assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
+        assert_pointer_target(cx, selector);
+    }
+    if Platform::current() == Platform::Windows {
+        for selector in ["window.minimize", "window.maximize", "window.close"] {
+            assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
+            assert_pointer_target(cx, selector);
+        }
+    }
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            view.workspace_mut_for_test().set_zoom(Zoom::Regular);
+            cx.notify();
+        });
+    });
+
     // The strip scrolls back to its first tab with its own button, and then says that
     // the tabs run on past the right end instead.
     cx.simulate_resize(design_window());
@@ -19930,7 +20028,9 @@ async fn the_tab_list_keeps_the_marks_readable_in_the_smallest_window_at_large_t
     };
     let background = cx.update(|_window, app| view.read(app).open_tabs())[0];
     let viewport = minimum_window();
-    cx.simulate_resize(viewport);
+    // The marks are first read on the strip of the design window, the narrowest that
+    // still draws every tab at this size.
+    cx.simulate_resize(design_window());
     focus_root(&view, cx);
     for _ in 0..Zoom::ALL.len() {
         if cx.update(|_window, app| view.read(app).workspace().zoom()) == Zoom::Largest {
@@ -19942,9 +20042,8 @@ async fn the_tab_list_keeps_the_marks_readable_in_the_smallest_window_at_large_t
     feed_session(cx, &view, background, b"\x07");
     feed_session(cx, &view, background, REPORTED_COMMAND);
 
-    // The strip has no room for a tab at this size, so its marks are clipped with the
-    // tab they belong to (R4 allows the strip to fall back); inside the tab's own box
-    // they still stay put rather than sliding over the neighbouring tab.
+    // The marks stay inside the tab's own box rather than sliding over the
+    // neighbouring tab.
     let tab = bounds_of(cx, "session.tab.0");
     for selector in [
         "session.tab.mark.bell.0",
@@ -19972,8 +20071,12 @@ async fn the_tab_list_keeps_the_marks_readable_in_the_smallest_window_at_large_t
         assert_stays_inside_box(bounds_of(cx, selector), tab, selector);
     }
 
-    // The list of every tab is the way to read the marks here: it fits the window and
-    // writes each mark out in full.
+    // In the smallest window the compact row shows the current tab alone, so the list
+    // of every tab is the way to read the marks there: it fits the window and writes
+    // each mark out in full.
+    cx.simulate_resize(viewport);
+    cx.run_until_parked();
+    assert!(cx.update(|_window, app| view.read(app).header_compact_for_test()));
     assert_fits_inside(
         bounds_of(cx, "tabs.list.open"),
         viewport,

@@ -1307,15 +1307,16 @@ impl ShelluneView {
                     icon: Icon,
                     shortcut: Option<String>,
                     enabled: bool| {
-            components::menu_entry(label, selector, Some(icon), enabled, false, metrics)
-                .children(shortcut.map(|shortcut| {
+            components::menu_entry(label, selector, Some(icon), enabled, false, metrics).children(
+                shortcut.map(|shortcut| {
                     div()
                         .ml_auto()
                         .pl(metrics.scale(spacing::BASE))
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(colors::TEXT_MUTED))
                         .child(shortcut)
-                }))
+                }),
+            )
         };
         let divider = || components::menu_divider(metrics);
 
@@ -1360,12 +1361,11 @@ impl ShelluneView {
                     Icon::Copy,
                     None,
                     true,
-                ).on_click(
-                    cx.listener(move |this, _event, window, cx| {
-                        this.close_tab_menu(window, cx);
-                        this.duplicate_session(id, window, cx);
-                    }),
-                ),
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.close_tab_menu(window, cx);
+                    this.duplicate_session(id, window, cx);
+                })),
             )
             .child(
                 item(
@@ -2418,7 +2418,9 @@ impl ShelluneView {
         let open = self.tab_list_open;
         let tooltip = format!("{} ({})", strings.tab_list_title, count);
         Some(
-            components::icon_only_button(Icon::Layers, metrics)
+            // Its own drawing, not the stacked sheets of the task centre beside the page
+            // tools: the two controls open different things (R2).
+            components::icon_only_button(Icon::TabList, metrics)
                 .size(metrics.hit_target())
                 .rounded(px(radius::MEDIUM))
                 .when(open, |button| {

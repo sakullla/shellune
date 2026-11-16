@@ -115,11 +115,13 @@ pub enum Icon {
     Star,
     /// A filled star: a favourite.
     StarFilled,
+    /// Rows with a mark at their start: the list of every open tab.
+    TabList,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 50] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -169,6 +171,7 @@ impl Icon {
         Self::Stop,
         Self::Star,
         Self::StarFilled,
+        Self::TabList,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -223,6 +226,7 @@ impl Icon {
             Self::Stop => "icons/stop.svg",
             Self::Star => "icons/star.svg",
             Self::StarFilled => "icons/star-filled.svg",
+            Self::TabList => "icons/tab-list.svg",
         }
     }
 
@@ -341,6 +345,9 @@ impl Icon {
             }
             Self::StarFilled => {
                 r#"<path d="M12 3.4l2.66 5.39 5.94.86-4.3 4.19 1.02 5.92L12 16.97l-5.32 2.79 1.02-5.92-4.3-4.19 5.94-.86z" fill="black"/>"#
+            }
+            Self::TabList => {
+                r#"<rect x="3" y="4" width="18" height="16" rx="2.6"/><path d="M7 9h.01"/><path d="M10.5 9H17"/><path d="M7 12.5h.01"/><path d="M10.5 12.5H17"/><path d="M7 16h.01"/><path d="M10.5 16H17"/>"#
             }
         }
     }

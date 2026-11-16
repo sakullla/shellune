@@ -2634,8 +2634,11 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "a display-only shell with a long name and a saved host's tab put back into \
                   connecting, the way a reconnect starts",
         evidence: "proves a connecting tab says so with its dot and keeps its width, and a long \
-                   name is cut inside its own tab; the capture runs with reduced motion, so the \
-                   dot's breath is not in the picture, and no connection is being made",
+                   name is cut inside its own tab; at 720x480 and 200% the row is compact - \
+                   the hosts tab is its icon and the current tab is shown alone, whole and \
+                   cut with an ellipsis, the connecting one in the list of every tab; the \
+                   capture runs with reduced motion, so the dot's breath is not in the \
+                   picture, and no connection is being made",
         quick: true,
         variants: &[
             Variant::dark().chinese(),

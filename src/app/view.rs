@@ -17098,7 +17098,7 @@ impl ShelluneView {
         )
         .w(metrics.tab_max_width())
         .flex_shrink()
-        .min_w(metrics.tab_min_width() + mark_room)
+        .min_w(self.tab_min_width() + mark_room)
         .tooltip(components::tooltip(tooltip))
         .on_click(cx.listener(move |this, _event, window, cx| {
             this.activate_in(id, window, cx);
@@ -17143,15 +17143,19 @@ impl ShelluneView {
                         tab_accent_mark(accent, metrics, format!("session.tab.accent.{index}"))
                     }),
             )
-            .child(tab_icon(
-                if kind == PaneKind::Remote {
-                    Icon::Server
-                } else {
-                    Icon::Terminal
-                },
-                selected,
-                metrics,
-            ))
+            // The one tab of a compact row gives the kind's icon up to its title: the
+            // kind is in the tooltip, and the name is what tells the tab apart (R2, R9).
+            .when(!self.header_compact(), |body| {
+                body.child(tab_icon(
+                    match kind {
+                        PaneKind::Remote => Icon::Server,
+                        PaneKind::Desktop => Icon::Monitor,
+                        PaneKind::Local | PaneKind::Serial => Icon::Terminal,
+                    },
+                    selected,
+                    metrics,
+                ))
+            })
             .child(tab_title_label(
                 title,
                 selected,
@@ -17194,6 +17198,10 @@ impl ShelluneView {
     /// joins the page and needs none, so neither it nor the tab after it draws one. The
     /// first session tab sits beside the hosts tab, which counts as its neighbour.
     pub(super) fn tab_divider(&self, index: usize) -> bool {
+        // A compact row draws one session tab, right after the hosts tab.
+        if self.header_compact() {
+            return !self.tab_is_current(index) && !self.home_is_shown();
+        }
         let previous_current = match index.checked_sub(1) {
             Some(previous) => self.tab_is_current(previous),
             None => self.home_is_shown(),
@@ -17272,22 +17280,44 @@ impl ShelluneView {
     /// is left alone after that. While tabs are hidden past an end, that end fades out
     /// and carries a button that scrolls towards it; the list of every tab stays beside
     /// the strip.
+    ///
+    /// A compact row ([`Self::header_compact`]) has room for one tab only, so the strip
+    /// gathers the others away and shows the current one alone, whole; the list of
+    /// every tab beside it is how the others are reached (R2, R9).
     pub(super) fn tab_strip(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let handle = self.tab_scroll.clone();
         let layout = self.workspace.layout();
+        let compact = self.header_compact();
         let width = handle.bounds().size.width;
+        let active = layout
+            .active_tab_id()
+            .and_then(|current| layout.tabs().iter().position(|tab| tab.id() == current));
         let current = layout.active_tab_id().map(|id| (id, width));
         // The tab to bring into view in this frame, if the current tab or the strip's
-        // width changed since the last one was.
+        // width changed since the last one was. A compact strip holds only that tab,
+        // from its start.
         let mut reveal = None;
-        if current != self.tab_revealed.get() {
-            reveal = current
-                .and_then(|(current, _)| layout.tabs().iter().position(|tab| tab.id() == current));
+        if compact {
+            let mut offset = handle.offset();
+            if offset.x != px(0.0) {
+                offset.x = px(0.0);
+                handle.set_offset(offset);
+            }
+            self.tab_revealed.set(None);
+        } else if current != self.tab_revealed.get() {
+            reveal = active;
             self.tab_revealed.set(current);
         }
         let room = strip_button_room(metrics);
-        let ends = StripEnds::of(&handle, room);
+        let ends_of = move |handle: &gpui::ScrollHandle| {
+            if compact {
+                StripEnds::default()
+            } else {
+                StripEnds::of(handle, room)
+            }
+        };
+        let ends = ends_of(&handle);
         let fade = strip_fade_width(metrics);
 
         let mut scroller = div()
@@ -17299,7 +17329,8 @@ impl ShelluneView {
             .h_full()
             .min_w(px(0.0))
             .debug_selector(|| "session.tabs".to_owned());
-        for index in 0..layout.tabs().len() {
+        let shown = |index: usize| !compact || index == active.unwrap_or(0);
+        for index in (0..layout.tabs().len()).filter(|index| shown(*index)) {
             if let Some(id) = layout.anchor_of(index) {
                 scroller = scroller.child(self.session_tab(id, index, cx));
             } else {
@@ -17327,10 +17358,7 @@ impl ShelluneView {
                         moved = true;
                     }
                 }
-                if moved
-                    || StripEnds::of(&check, room) != ends
-                    || check.bounds().size.width != width
-                {
+                if moved || ends_of(&check) != ends || check.bounds().size.width != width {
                     // A view cannot be marked for drawing while it is being drawn; the
                     // request waits until this frame is done.
                     cx.defer(move |cx| cx.notify(view));
@@ -18470,7 +18498,7 @@ enum StripEnd {
 }
 
 /// Whether tabs are hidden past either end of the strip, read from its scroll state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StripEnds {
     /// Tabs run on past the left end.
     before: bool,

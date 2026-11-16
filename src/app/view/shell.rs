@@ -10,7 +10,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, FontWeight, KeyDownEvent, SharedString, Stateful, Window, div, px,
+    AnyElement, Context, Div, FontWeight, KeyDownEvent, Pixels, SharedString, Stateful, Window,
+    div, px,
 };
 
 use shellune_core::{SessionState, SnippetId};
@@ -39,6 +40,13 @@ pub enum Tool {
     /// The saved shortcut commands, with the editor for one of them (R6).
     Snippets,
 }
+
+/// The logical width the top row needs, less the window buttons it draws, for every
+/// part at its full size (R2, R9): the brand, the hosts tab with its word and a
+/// count, one session tab at [`theme::Metrics::tab_min_width`], the list of every tab,
+/// the new-tab control, a caption gap and the page tools. A narrower window draws the
+/// compact row ([`ShelluneView::header_compact`]).
+const HEADER_FULL_ROW: f32 = 460.0;
 
 /// The pieces of one centred dialog; the dialog itself is the shared
 /// [`components::modal`].
@@ -101,6 +109,7 @@ impl ShelluneView {
         let ux = copy::ux();
         let platform = Platform::current();
         let height = metrics.header_height();
+        let compact = self.header_compact();
 
         let leading_room = if platform == Platform::MacOs {
             super::titlebar::traffic_light_room(metrics)
@@ -114,14 +123,23 @@ impl ShelluneView {
             .items_center()
             .h(height)
             .pl(leading_room)
-            .pr(metrics.scale(spacing::TIGHT))
-            .when(platform != Platform::MacOs, |row| {
-                row.child(brand_mark(metrics.scale(22.0), metrics))
+            // A compact row keeps the blank lead, which still drags the window, and
+            // gives the mark's room to the current tab (R2, R9).
+            .when(platform != Platform::MacOs && !compact, |row| {
+                row.pr(metrics.scale(spacing::TIGHT))
+                    .child(brand_mark(metrics.scale(22.0), metrics))
             });
 
         // The tabs stand on the head's bottom edge, so the current one reaches down to
-        // the page it opens onto. The hosts tab is pinned; the session tabs scroll
-        // beside it once they do not fit (R2).
+        // the page it opens onto. The hosts tab is pinned and never cut: the row's
+        // narrowest is at least its width. The session tabs scroll beside it once they
+        // do not fit, and only they give up room (R2).
+        let home = div()
+            .flex()
+            .items_end()
+            .flex_none()
+            .h(height)
+            .child(self.home_tab(compact, cx));
         let tabs = div()
             .flex()
             .items_end()
@@ -129,7 +147,6 @@ impl ShelluneView {
             .min_w(px(0.0))
             .h(height)
             .overflow_hidden()
-            .child(self.home_tab(cx))
             .when(!self.workspace.layout().tabs().is_empty(), |row| {
                 row.child(self.tab_strip(cx))
             });
@@ -180,6 +197,7 @@ impl ShelluneView {
             .w_full()
             .debug_selector(|| "topbar".to_owned())
             .child(brand)
+            .child(home)
             .child(tabs)
             // Beside the strip rather than inside it: the strip clips what does not
             // fit, and the list of every tab has to stay reachable when it does (R2).
@@ -189,7 +207,13 @@ impl ShelluneView {
                 self.drag_area("header.drag")
                     .flex_1()
                     .h_full()
-                    .min_w(metrics.scale(24.0)),
+                    // A compact row keeps a pointer's width of caption, unscaled: the
+                    // pointer does not grow with the text (R9).
+                    .min_w(if compact {
+                        px(theme::HIT_TARGET)
+                    } else {
+                        metrics.scale(24.0)
+                    }),
             )
             // The task centre sits beside the page tools: its entry is always there, and
             // a run this window is driving says so in the same row, so leaving it for
@@ -476,6 +500,46 @@ impl ShelluneView {
         )
     }
 
+    /// Whether the top row is too narrow for every part at its full size, so it draws
+    /// the compact form (R2, R9).
+    ///
+    /// That is 200% text in a small window: the brand, the hosts tab's word and count,
+    /// a session tab of the strip's minimum width, the strip's controls, a caption gap,
+    /// the page tools and the window buttons need more than the window has. The
+    /// compact row drops the brand mark and the new-tab chevron (its shells are in the
+    /// palette and on the hosts home's own menu), shows the hosts tab as its icon, the
+    /// page tools at the pointer target's size, and only the current session tab; the
+    /// list of every tab beside the strip reaches the rest. It is decided from the
+    /// window's width and the text size alone, never from a measured layout, so the row
+    /// cannot flip between its two forms from one frame to the next.
+    pub(super) fn header_compact(&self) -> bool {
+        let metrics = self.metrics();
+        self.viewport_width
+            < metrics.scale(HEADER_FULL_ROW)
+                + super::titlebar::window_controls_width(Platform::current())
+    }
+
+    /// Whether the top row draws its compact form, for a test.
+    #[cfg(test)]
+    pub fn header_compact_for_test(&self) -> bool {
+        self.header_compact()
+    }
+
+    /// The narrowest a session tab becomes in the row as it is drawn now (R2).
+    pub(super) fn tab_min_width(&self) -> Pixels {
+        if self.header_compact() {
+            self.metrics().tab_compact_min_width()
+        } else {
+            self.metrics().tab_min_width()
+        }
+    }
+
+    /// The narrowest a session tab becomes in the row as it is drawn now, for a test.
+    #[cfg(test)]
+    pub fn tab_min_width_for_test(&self) -> Pixels {
+        self.tab_min_width()
+    }
+
     /// A square icon button of the top bar.
     fn bar_icon(
         &self,
@@ -485,7 +549,11 @@ impl ShelluneView {
         selected: bool,
     ) -> Stateful<Div> {
         let metrics = self.metrics();
-        let size = metrics.scale(30.0);
+        let size = if self.header_compact() {
+            metrics.hit_target()
+        } else {
+            metrics.scale(30.0)
+        };
         components::icon_only_button(icon, metrics)
             .size(size)
             .rounded(px(radius::MEDIUM))
@@ -501,8 +569,10 @@ impl ShelluneView {
     ///
     /// It has the shape of every other tab (R2) and the parts a page has: no state dot
     /// and no close button, since the home is not a session and cannot be closed. It
-    /// sits outside the scrolling strip, so it is always one click away.
-    fn home_tab(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// sits outside the scrolling strip, so it is always one click away. In a compact
+    /// row it is its icon alone, as a browser's pinned tab is; the word and the count
+    /// are then in its tooltip, so nothing of it is cut (R2, R9).
+    fn home_tab(&self, compact: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let selected = self.home_is_shown();
@@ -512,9 +582,14 @@ impl ShelluneView {
         // described as it really is (R5).
         let shortcut = crate::app::keymap::page_action(Destination::Hosts)
             .and_then(|spec| self.keymap.label(spec.id));
+        let name = if compact && count > 0 {
+            format!("{} ({count})", strings.nav_hosts)
+        } else {
+            strings.nav_hosts.to_owned()
+        };
         let tooltip = match shortcut {
-            Some(shortcut) => format!("{} · {shortcut}", strings.nav_hosts),
-            None => strings.nav_hosts.to_owned(),
+            Some(shortcut) => format!("{name} · {shortcut}"),
+            None => name,
         };
         super::browser_tab(
             "nav.hosts",
@@ -537,14 +612,16 @@ impl ShelluneView {
             super::tab_body(metrics)
                 .child(super::tab_icon(Icon::Server, selected, metrics))
                 // One short word that is never cut, with the count right after it.
-                .child(
-                    div()
-                        .flex_none()
-                        .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
-                        .debug_selector(|| "nav.hosts.title".to_owned())
-                        .child(strings.nav_hosts),
-                )
-                .when(count > 0, |body| {
+                .when(!compact, |body| {
+                    body.child(
+                        div()
+                            .flex_none()
+                            .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
+                            .debug_selector(|| "nav.hosts.title".to_owned())
+                            .child(strings.nav_hosts),
+                    )
+                })
+                .when(count > 0 && !compact, |body| {
                     body.child(
                         div()
                             .flex_none()
@@ -558,11 +635,20 @@ impl ShelluneView {
 
     /// "+" opens the default shell in a new tab; the chevron lists every shell, quick
     /// connect and the saved hosts.
+    ///
+    /// A compact row has "+" alone: the shells are in the palette and on the hosts
+    /// home's own menu, one click away on the hosts tab, and quick connect is on that
+    /// page too (R9).
     fn new_tab_control(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
+        let compact = self.header_compact();
         let open = self.shell_menu_open && !self.shell_menu_home;
-        let size = metrics.scale(28.0);
+        let size = if compact {
+            metrics.hit_target()
+        } else {
+            metrics.scale(28.0)
+        };
         let new_shell = self.keymap.label("shell.new");
         let tooltip = match new_shell {
             Some(shortcut) => format!("{} ({shortcut})", ux.new_tab),
@@ -578,7 +664,7 @@ impl ShelluneView {
                 components::icon_only_button(Icon::Plus, metrics)
                     .size(size)
                     .rounded_l(px(radius::MEDIUM))
-                    .rounded_r(px(0.0))
+                    .rounded_r(px(if compact { radius::MEDIUM } else { 0.0 }))
                     .id("header.primary")
                     .debug_selector(|| "header.primary".to_owned())
                     .tooltip(components::tooltip(SharedString::from(tooltip)))
@@ -586,28 +672,30 @@ impl ShelluneView {
                         this.new_local_shell(window, cx);
                     })),
             )
-            .child(
-                components::icon_only_button(Icon::ChevronDown, metrics)
-                    // Its own width, but never narrower than a pointer target (R4).
-                    .w(metrics.hit_target())
-                    .h(size)
-                    .rounded_r(px(radius::MEDIUM))
-                    .rounded_l(px(0.0))
-                    .when(open, |button| {
-                        button.bg(theme::swatch(palette::SURFACE_SELECTED))
-                    })
-                    .id("shell.menu")
-                    .debug_selector(|| "shell.menu".to_owned())
-                    .when(!open, |button| {
-                        button.tooltip(components::tooltip(ux.new_tab_menu))
-                    })
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        // The header's menu, wherever the home page's one was.
-                        this.shell_menu_open = !(this.shell_menu_open && !this.shell_menu_home);
-                        this.shell_menu_home = false;
-                        cx.notify();
-                    })),
-            );
+            .when(!compact, |control| {
+                control.child(
+                    components::icon_only_button(Icon::ChevronDown, metrics)
+                        // Its own width, but never narrower than a pointer target (R4).
+                        .w(metrics.hit_target())
+                        .h(size)
+                        .rounded_r(px(radius::MEDIUM))
+                        .rounded_l(px(0.0))
+                        .when(open, |button| {
+                            button.bg(theme::swatch(palette::SURFACE_SELECTED))
+                        })
+                        .id("shell.menu")
+                        .debug_selector(|| "shell.menu".to_owned())
+                        .when(!open, |button| {
+                            button.tooltip(components::tooltip(ux.new_tab_menu))
+                        })
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            // The header's menu, wherever the home page's one was.
+                            this.shell_menu_open = !(this.shell_menu_open && !this.shell_menu_home);
+                            this.shell_menu_home = false;
+                            cx.notify();
+                        })),
+                )
+            });
         // Records where the control is drawn, for the menu that hangs from it.
         let anchor = self.shell_menu_anchor.clone();
         control.child(

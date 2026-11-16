@@ -1379,6 +1379,16 @@ impl Metrics {
         self.scale(120.0)
     }
 
+    /// The narrowest the one tab a compact top row shows becomes (R2, R9).
+    ///
+    /// A compact row - 200% text in a small window - has no room for a tab of
+    /// [`Self::tab_min_width`] beside the controls that must stay on it, so it shows
+    /// only the current tab and lets it go this narrow: the state dot, a few letters
+    /// of the title and the close button still fit.
+    pub fn tab_compact_min_width(self) -> Pixels {
+        self.scale(80.0)
+    }
+
     /// The widest a tab of the strip grows when there is room (R2).
     pub fn tab_max_width(self) -> Pixels {
         self.scale(220.0)
