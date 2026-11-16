@@ -13,12 +13,12 @@
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{Context, Div, FontWeight, SharedString, div, px};
+use gpui::{Context, Div, SharedString, div};
 
 use super::ShelluneView;
 use crate::app::components;
-use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Tone, palette, radius, spacing};
+use crate::app::icons::Icon;
+use crate::app::theme::{self, Tone, palette, spacing};
 
 /// How long a success stays.
 const SHORT: Duration = Duration::from_secs(4);
@@ -163,70 +163,36 @@ impl ShelluneView {
         for (index, toast) in self.toasts.iter().enumerate() {
             let id = toast.id;
             let tone = toast.tone;
-            stack = stack.child(
-                div()
-                    .id(("toast", id as usize))
-                    .debug_selector(move || format!("toast.{index}"))
-                    .occlude()
-                    .flex()
-                    .items_start()
-                    .gap(metrics.scale(spacing::TIGHT + 2.0))
-                    .w(metrics.scale(340.0))
-                    .p(metrics.scale(spacing::SNUG))
-                    .rounded(px(radius::LARGE))
-                    .bg(theme::swatch(palette::SURFACE_RAISED))
-                    .border_1()
-                    .border_color(theme::swatch(palette::BORDER_STRONG))
-                    .shadow_lg()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(metrics.scale(22.0))
-                            .rounded_full()
-                            .bg(theme::swatch(tone.tint()))
-                            .child(icons::icon(
-                                tone_icon(tone),
-                                metrics.small_icon_size(),
-                                tone.text(),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .gap(metrics.scale(2.0))
-                            .child(
-                                div()
-                                    .text_size(metrics.label_size())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .debug_selector(move || format!("toast.{index}.title"))
-                                    .child(SharedString::from(toast.title.clone())),
-                            )
-                            .children(toast.detail.clone().map(|detail| {
-                                div()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                    .line_clamp(2)
-                                    .child(SharedString::from(detail))
-                            })),
-                    )
-                    .child(
-                        components::icon_only_button(Icon::Close, metrics)
-                            .flex_none()
-                            .size(metrics.hit_target())
-                            .id(("toast.close", id as usize))
-                            .debug_selector(move || format!("toast.close.{index}"))
-                            .on_click(cx.listener(move |view, _event, _window, cx| {
-                                view.dismiss_toast(id, cx);
-                            })),
-                    ),
+            let title = div()
+                .debug_selector(move || format!("toast.{index}.title"))
+                .child(SharedString::from(toast.title.clone()));
+            let card = components::toast(
+                tone,
+                tone_icon(tone),
+                title,
+                toast.detail.clone().map(SharedString::from),
+                metrics,
+            )
+            .id(("toast", id as usize))
+            .debug_selector(move || format!("toast.{index}"))
+            .occlude()
+            .child(
+                components::icon_only_button(Icon::Close, metrics)
+                    .flex_none()
+                    .size(metrics.hit_target())
+                    .id(("toast.close", id as usize))
+                    .debug_selector(move || format!("toast.close.{index}"))
+                    .on_click(cx.listener(move |view, _event, _window, cx| {
+                        view.dismiss_toast(id, cx);
+                    })),
             );
+            // A toast fades in where it lands; it does not travel, so the stack never
+            // shifts under the pointer.
+            stack = stack.child(theme::enter(
+                card,
+                ("toast.enter", id as usize),
+                theme::Enter::Fade,
+            ));
         }
         Some(stack)
     }

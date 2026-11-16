@@ -34,10 +34,10 @@ use super::ShelluneView;
 use super::shell::ModalContent;
 use crate::app::components::{self, Variant};
 use crate::app::copy::{self, BackupStrings};
-use crate::app::icons::{self, Icon};
+use crate::app::icons::Icon;
 use crate::app::snippets::SnippetLibrary;
 use crate::app::text_field::TextField;
-use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
+use crate::app::theme::{self, Tone, palette, spacing};
 
 /// The dialog of the backup flow that is open, when one is.
 pub(super) enum BackupDialog {
@@ -292,49 +292,8 @@ fn missing_keys(document: &ShelluneData, plan: &ApplyPlan) -> Vec<MissingKey> {
         .collect()
 }
 
-/// A checkbox with its label.
-fn checkbox(
-    id: &'static str,
-    label: &'static str,
-    checked: bool,
-    metrics: Metrics,
-) -> Stateful<Div> {
-    let accent = theme::swatch(palette::ACCENT);
-    let hover = theme::swatch(palette::TEXT_PRIMARY);
-    div()
-        .id(id)
-        .debug_selector(move || id.to_owned())
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(metrics.scale(spacing::TIGHT))
-        .cursor_pointer()
-        .text_size(metrics.label_size())
-        .text_color(theme::swatch(palette::TEXT_PRIMARY))
-        .hover(move |style| style.text_color(hover))
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(metrics.scale(16.0))
-                .rounded(px(radius::SMALL))
-                .border_1()
-                .when(checked, |mark| {
-                    mark.bg(accent).border_color(accent).child(icons::icon(
-                        Icon::Check,
-                        metrics.scale(12.0),
-                        theme::swatch(palette::ON_ACCENT),
-                    ))
-                })
-                .when(!checked, |mark| {
-                    mark.bg(theme::swatch(palette::CANVAS))
-                        .border_color(theme::swatch(palette::BORDER_STRONG))
-                }),
-        )
-        .child(label)
-}
+// A checkbox with its label is the shared component.
+use crate::app::components::checkbox;
 
 impl ShelluneView {
     /// The backup strings of the language on screen.

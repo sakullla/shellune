@@ -563,7 +563,7 @@ impl ShelluneView {
             .when(!short, |col| col.min_h(px(0.0)))
             .p(metrics.scale(spacing::HAIRLINE))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "hosts.surface".to_owned());
@@ -1671,7 +1671,7 @@ impl ShelluneView {
             .gap(metrics.scale(1.0))
             .p(metrics.scale(spacing::HAIRLINE))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "home.quick.results".to_owned());
@@ -2559,44 +2559,18 @@ fn tree_row_label(label: String, chosen: bool, metrics: Metrics) -> Div {
         .child(SharedString::from(label))
 }
 
-/// A selection box: a hollow square that fills with the accent and a tick when chosen.
-///
-/// It is drawn as what it is - a checkbox - rather than borrowing a chevron, which reads
-/// as "open this" and hid the fact that rows can be picked for a batch at all.
+/// A selection box in a pointer-sized target: the shared [`components::checkbox_box`],
+/// lit by the pointer anywhere on its target.
 fn checkbox(checked: bool, metrics: Metrics) -> Div {
-    let size = metrics.scale(16.0);
-    let hit = metrics.hit_target();
-    let border = theme::swatch(palette::ACCENT);
-    let mut boxed = div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(size)
-        .rounded(px(4.0))
-        .border_1();
-    boxed = if checked {
-        boxed
-            .bg(theme::swatch(palette::ACCENT))
-            .border_color(theme::swatch(palette::ACCENT))
-            .child(crate::app::icons::icon(
-                Icon::Check,
-                metrics.scale(12.0),
-                theme::swatch(palette::ON_ACCENT),
-            ))
-    } else {
-        boxed
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .group_hover("host-checkbox", move |style| style.border_color(border))
-    };
     div()
-        .group("host-checkbox")
+        .group(components::CHECK_GROUP)
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
-        .size(hit)
+        .size(metrics.hit_target())
         .cursor_pointer()
-        .child(boxed)
+        .child(components::checkbox_box(checked, metrics))
 }
 
 /// The frame of one dashboard card: a raised surface, a row of its contents, and the
@@ -2629,7 +2603,7 @@ fn home_card_frame(metrics: Metrics) -> Div {
         .px(metrics.scale(spacing::TIGHT + 2.0))
         .py(metrics.scale(spacing::HAIRLINE + 2.0))
         .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::SURFACE_RAISED))
+        .bg(theme::swatch(palette::SURFACE))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
         .cursor_pointer()

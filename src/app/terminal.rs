@@ -2770,7 +2770,7 @@ impl TerminalPane {
     /// The right-click menu: copy, paste and find.
     fn context_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let position = self.menu?;
-        let metrics = Metrics::default();
+        let metrics = theme::metrics();
         let strings = self.locale.strings();
         let viewport = window.viewport_size();
         let can_copy = self.core.has_selection();
@@ -2822,10 +2822,10 @@ impl TerminalPane {
             .min_w(metrics.scale(200.0))
             .p(metrics.scale(spacing::HAIRLINE))
             .rounded(px(theme::radius::LARGE))
-            .bg(theme::swatch(shell_palette::SURFACE_RAISED))
+            .bg(theme::swatch(shell_palette::RAISED))
             .border_1()
             .border_color(theme::swatch(shell_palette::BORDER_STRONG))
-            .shadow_lg()
+            .shadow(theme::Elevation::Mid.shadows())
             .debug_selector(|| "terminal.menu".to_owned())
             .child(
                 item(
@@ -3075,7 +3075,7 @@ impl TerminalPane {
                 .flex_col()
                 .flex_none()
                 .debug_selector(|| "serial.strip".to_owned())
-                .bg(theme::swatch(shell_palette::SURFACE))
+                .bg(theme::swatch(shell_palette::CHROME))
                 .border_t_1()
                 .border_color(theme::faded(theme::swatch(shell_palette::BORDER), 0.8))
                 .child(row),
@@ -3123,7 +3123,7 @@ impl TerminalPane {
             .flex_none()
             .pl(metrics.scale(spacing::BASE - 2.0))
             .pr(metrics.scale(spacing::HAIRLINE))
-            .bg(theme::swatch(shell_palette::SURFACE))
+            .bg(theme::swatch(shell_palette::CHROME))
             .border_t_1()
             .border_color(theme::faded(theme::swatch(shell_palette::BORDER), 0.8))
             .text_size(metrics.caption_size())
@@ -3653,7 +3653,7 @@ impl TerminalPane {
             .overflow_y_scroll()
             .p(metrics.scale(spacing::TIGHT))
             .gap(metrics.scale(spacing::HAIRLINE))
-            .bg(theme::swatch(shell_palette::SURFACE))
+            .bg(theme::swatch(shell_palette::CHROME))
             .border_t_1()
             .border_color(theme::swatch(shell_palette::BORDER))
             .debug_selector(|| "terminal.blocks".to_owned())
@@ -4091,10 +4091,10 @@ impl TerminalPane {
             .px(metrics.scale(spacing::SNUG))
             .py(metrics.scale(2.0))
             .rounded(px(theme::radius::LARGE))
-            .bg(theme::swatch(shell_palette::SURFACE_RAISED))
+            .bg(theme::swatch(shell_palette::RAISED))
             .border_1()
             .border_color(theme::swatch(shell_palette::BORDER_STRONG))
-            .shadow_md()
+            .shadow(theme::Elevation::Mid.shadows())
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
             .cursor_pointer()
@@ -4691,6 +4691,10 @@ fn flush_shapes(
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The frame around the grid follows the window's text size. The bar, the find
+        // bar and the block overlay still keep the regular size: they have no narrow
+        // layout yet, and at 200% they would be pushed past a 720x480 window (R4).
+        let frame = theme::metrics();
         let metrics = Metrics::default();
         // The advance width comes from the font the window actually resolved, so
         // the grid matches what is drawn even when the platform substitutes a face.
@@ -4720,9 +4724,9 @@ impl Render for TerminalPane {
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
-                    .pl(metrics.scale(spacing::SNUG))
-                    .pr(metrics.scale(spacing::HAIRLINE))
-                    .py(metrics.scale(spacing::TIGHT))
+                    .pl(frame.scale(spacing::SNUG))
+                    .pr(frame.scale(spacing::HAIRLINE))
+                    .py(frame.scale(spacing::TIGHT))
                     .bg(color_of(palette::BACKGROUND))
                     .child(self.viewport(window, cx))
                     .children(self.scrollback_thumb())

@@ -1491,7 +1491,7 @@ impl ShelluneView {
                 .bg(if selected == Some(host_id) {
                     theme::swatch(palette::SURFACE_SELECTED)
                 } else {
-                    theme::swatch(palette::SURFACE_RAISED)
+                    theme::swatch(palette::SURFACE)
                 })
                 .debug_selector(move || format!("batch.history.host.{index}"))
                 .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -2480,7 +2480,7 @@ impl ShelluneView {
                 .bg(if is_selected {
                     theme::swatch(palette::SURFACE_SELECTED)
                 } else {
-                    theme::swatch(palette::SURFACE_RAISED)
+                    theme::swatch(palette::SURFACE)
                 })
                 .cursor_pointer()
                 .debug_selector(move || format!("batch.run.host.{index}"))

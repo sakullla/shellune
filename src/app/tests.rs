@@ -2083,14 +2083,18 @@ fn the_tab_and_palette_shortcuts_reach_past_a_terminal() {
 // Palette
 // ---------------------------------------------------------------------------
 
+/// The surfaces a label or a mark is drawn on: the five layers and the chosen fill.
+const LABEL_SURFACES: [(&str, theme::Token); 6] = [
+    ("canvas", palette::CANVAS),
+    ("chrome", palette::CHROME),
+    ("surface", palette::SURFACE),
+    ("raised", palette::RAISED),
+    ("overlay", palette::OVERLAY),
+    ("selected", palette::SURFACE_SELECTED),
+];
+
 #[test]
 fn body_text_reaches_the_contrast_floor_on_every_surface() {
-    let surfaces = [
-        ("canvas", palette::CANVAS),
-        ("surface", palette::SURFACE),
-        ("raised", palette::SURFACE_RAISED),
-        ("selected", palette::SURFACE_SELECTED),
-    ];
     let text = [
         ("primary", palette::TEXT_PRIMARY),
         ("secondary", palette::TEXT_SECONDARY),
@@ -2098,12 +2102,13 @@ fn body_text_reaches_the_contrast_floor_on_every_surface() {
         ("accent", palette::ACCENT),
     ];
 
-    for (surface_name, surface) in surfaces {
+    for (surface_name, surface) in LABEL_SURFACES {
         for (text_name, token) in text {
-            let ratio = theme::contrast::ratio(token, surface);
+            let (dark, light) = theme::contrast::both(token, surface);
             assert!(
-                ratio >= BODY_CONTRAST_FLOOR,
-                "{text_name} on {surface_name} is {ratio:.2}:1, below {BODY_CONTRAST_FLOOR}"
+                dark >= BODY_CONTRAST_FLOOR && light >= BODY_CONTRAST_FLOOR,
+                "{text_name} on {surface_name} is {dark:.2}:1 dark and {light:.2}:1 light, \
+                 below {BODY_CONTRAST_FLOOR}"
             );
         }
     }
@@ -2112,10 +2117,10 @@ fn body_text_reaches_the_contrast_floor_on_every_surface() {
 #[test]
 fn host_avatar_initials_are_readable_on_their_tint() {
     for (tint, text) in palette::AVATARS {
-        let ratio = theme::contrast::ratio(text, tint);
+        let ratio = theme::contrast::worst(text, tint);
         assert!(
             ratio >= BODY_CONTRAST_FLOOR,
-            "avatar {text:#08x} on {tint:#08x} is {ratio:.2}:1"
+            "avatar {text:x} on {tint:x} is {ratio:.2}:1"
         );
     }
 }
@@ -2136,23 +2141,16 @@ fn host_initials_tell_numbered_hosts_apart() {
 
 #[test]
 fn tab_identity_colours_are_readable_distinct_and_not_status_hues() {
-    let surfaces = [
-        palette::CANVAS,
-        palette::SURFACE,
-        palette::SURFACE_RAISED,
-        palette::SURFACE_SELECTED,
-    ];
     for token in palette::TAB_ACCENTS {
-        for surface in surfaces {
-            let dark = theme::contrast::ratio(token, surface);
+        for (surface_name, surface) in LABEL_SURFACES {
+            let (dark, light) = theme::contrast::both(token, surface);
             assert!(
                 dark >= GRAPHIC_CONTRAST_FLOOR,
-                "tab colour {token:06x} on {surface:06x} is {dark:.2}:1"
+                "tab colour {token:x} on {surface_name} is {dark:.2}:1"
             );
-            let light = theme::contrast::ratio(light(token), light(surface));
             assert!(
                 light >= GRAPHIC_CONTRAST_FLOOR,
-                "light tab colour {token:06x} on {surface:06x} is {light:.2}:1"
+                "light tab colour {token:x} on {surface_name} is {light:.2}:1"
             );
         }
     }
@@ -2167,7 +2165,7 @@ fn tab_identity_colours_are_readable_distinct_and_not_status_hues() {
             assert_ne!(
                 token,
                 tone.token(),
-                "{token:06x} is also the {tone:?} status colour"
+                "{token:x} is also the {tone:?} status colour"
             );
         }
     }
@@ -2187,12 +2185,6 @@ fn tab_identity_colours_are_readable_distinct_and_not_status_hues() {
 
 #[test]
 fn status_colours_are_readable_and_distinct() {
-    let surfaces = [
-        palette::CANVAS,
-        palette::SURFACE,
-        palette::SURFACE_RAISED,
-        palette::SURFACE_SELECTED,
-    ];
     let tones = [
         Tone::Neutral,
         Tone::Accent,
@@ -2203,22 +2195,28 @@ fn status_colours_are_readable_and_distinct() {
     ];
 
     for tone in tones {
-        for surface in surfaces {
-            let ratio = theme::contrast::ratio(tone.token(), surface);
+        for (surface_name, surface) in LABEL_SURFACES {
+            let (dark, light) = theme::contrast::both(tone.token(), surface);
             assert!(
-                ratio >= BODY_CONTRAST_FLOOR,
-                "{tone:?} on {surface:#08x} is {ratio:.2}:1"
+                dark >= BODY_CONTRAST_FLOOR && light >= BODY_CONTRAST_FLOOR,
+                "{tone:?} on {surface_name} is {dark:.2}:1 dark and {light:.2}:1 light"
             );
         }
+        // A chip draws its word on its own tint.
+        let on_tint = theme::contrast::worst(tone.token(), tone.tint());
+        assert!(
+            on_tint >= BODY_CONTRAST_FLOOR,
+            "{tone:?} on its tint is {on_tint:.2}:1"
+        );
     }
 
-    let mut tokens: Vec<u32> = tones.iter().map(|tone| tone.token()).collect();
+    let mut tokens: Vec<theme::Token> = tones.iter().map(|tone| tone.token()).collect();
     let count = tokens.len();
     tokens.sort_unstable();
     tokens.dedup();
     assert_eq!(tokens.len(), count, "two tones share a colour");
 
-    let ring = theme::contrast::ratio(palette::ACCENT, palette::CANVAS);
+    let ring = theme::contrast::worst(palette::FOCUS_RING, palette::CANVAS);
     assert!(
         ring >= GRAPHIC_CONTRAST_FLOOR,
         "the focus ring is {ring:.2}:1 against the canvas"
@@ -16552,74 +16550,57 @@ async fn a_failed_host_file_does_not_block_the_rest_of_the_window(cx: &mut TestA
 // The light palette
 // ---------------------------------------------------------------------------
 
-/// The light value of a dark token.
-fn light(token: u32) -> u32 {
-    theme::light_value(token)
-}
-
 #[test]
-fn every_token_has_a_light_value() {
+fn every_token_has_a_light_value_of_its_own() {
+    // The light palette is its own table: no surface, edge or text colour is the dark
+    // value carried over, and the light text is dark on a light floor.
     let tokens = [
-        palette::CANVAS,
-        palette::SURFACE,
-        palette::SURFACE_RAISED,
-        palette::SURFACE_HOVER,
-        palette::SURFACE_SELECTED,
-        palette::BORDER,
-        palette::BORDER_STRONG,
-        palette::TEXT_PRIMARY,
-        palette::TEXT_SECONDARY,
-        palette::TEXT_MUTED,
-        palette::ACCENT,
-        palette::ACCENT_HOVER,
-        palette::ON_ACCENT,
-        palette::ACCENT_TINT,
-        palette::ACCENT_ON_TINT,
-        palette::POSITIVE_TINT,
-        palette::WARNING_TINT,
-        palette::DANGER_TINT,
-        palette::POSITIVE,
-        palette::WARNING,
-        palette::DANGER,
-        palette::PLANNED,
-        palette::BRAND_END,
+        ("canvas", palette::CANVAS),
+        ("chrome", palette::CHROME),
+        ("surface", palette::SURFACE),
+        ("raised", palette::RAISED),
+        ("overlay", palette::OVERLAY),
+        ("hover", palette::SURFACE_HOVER),
+        ("selected", palette::SURFACE_SELECTED),
+        ("border", palette::BORDER),
+        ("border strong", palette::BORDER_STRONG),
+        ("text primary", palette::TEXT_PRIMARY),
+        ("text secondary", palette::TEXT_SECONDARY),
+        ("text muted", palette::TEXT_MUTED),
+        ("accent", palette::ACCENT),
+        ("accent hover", palette::ACCENT_HOVER),
+        ("on accent", palette::ON_ACCENT),
+        ("accent tint", palette::ACCENT_TINT),
+        ("accent on tint", palette::ACCENT_ON_TINT),
+        ("positive tint", palette::POSITIVE_TINT),
+        ("warning tint", palette::WARNING_TINT),
+        ("danger tint", palette::DANGER_TINT),
+        ("positive", palette::POSITIVE),
+        ("warning", palette::WARNING),
+        ("danger", palette::DANGER),
+        ("planned", palette::PLANNED),
+        ("brand end", palette::BRAND_END),
     ];
-    for token in tokens
+    for (name, token) in tokens
         .into_iter()
         .chain(
             palette::AVATARS
                 .iter()
-                .flat_map(|(tint, text)| [*tint, *text]),
+                .flat_map(|(tint, text)| [("avatar tint", *tint), ("avatar text", *text)]),
         )
-        .chain(palette::TAB_ACCENTS)
+        .chain(palette::TAB_ACCENTS.map(|token| ("tab accent", token)))
     {
-        assert_ne!(light(token), token, "{token:06x} has no light value");
+        assert_ne!(
+            token.dark(),
+            token.light(),
+            "{name} {token:x} has no light value"
+        );
     }
-}
-
-#[test]
-fn light_body_text_reaches_the_contrast_floor_on_every_surface() {
-    let surfaces = [
-        ("canvas", palette::CANVAS),
-        ("surface", palette::SURFACE),
-        ("raised", palette::SURFACE_RAISED),
-        ("selected", palette::SURFACE_SELECTED),
-    ];
-    let text = [
-        ("primary", palette::TEXT_PRIMARY),
-        ("secondary", palette::TEXT_SECONDARY),
-        ("muted", palette::TEXT_MUTED),
-        ("accent", palette::ACCENT),
-    ];
-    for (surface_name, surface) in surfaces {
-        for (text_name, token) in text {
-            let ratio = theme::contrast::ratio(light(token), light(surface));
-            assert!(
-                ratio >= BODY_CONTRAST_FLOOR,
-                "light {text_name} on {surface_name} is {ratio:.2}:1"
-            );
-        }
-    }
+    assert!(
+        theme::contrast::relative_luminance(palette::CANVAS.light())
+            > theme::contrast::relative_luminance(palette::TEXT_PRIMARY.light()),
+        "the light palette draws dark text on a light floor"
+    );
 }
 
 #[test]
@@ -16636,15 +16617,8 @@ fn light_status_and_accent_pairs_are_readable() {
         ),
     ];
     for (name, text, background) in pairs {
-        let ratio = theme::contrast::ratio(light(text), light(background));
+        let ratio = theme::contrast::ratio(text.light(), background.light());
         assert!(ratio >= BODY_CONTRAST_FLOOR, "light {name} is {ratio:.2}:1");
-    }
-    for (tint, text) in palette::AVATARS {
-        let ratio = theme::contrast::ratio(light(text), light(tint));
-        assert!(
-            ratio >= BODY_CONTRAST_FLOOR,
-            "light avatar {text:06x} is {ratio:.2}:1"
-        );
     }
 }
 
@@ -16698,7 +16672,7 @@ async fn the_theme_control_switches_the_palette(cx: &mut TestAppContext) {
     assert_eq!(theme::appearance(), theme::Appearance::Light, "drawn light");
     assert_eq!(
         theme::swatch(palette::CANVAS),
-        gpui::rgb(light(palette::CANVAS)),
+        gpui::rgb(palette::CANVAS.light()),
         "a token resolves to its light value"
     );
     cx.update(|_window, app| view.update(app, |view, cx| view.cycle_theme(cx)));

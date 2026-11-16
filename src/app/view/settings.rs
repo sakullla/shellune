@@ -511,7 +511,7 @@ impl ShelluneView {
                 .w_full()
                 .min_w(px(0.0))
                 .rounded(px(radius::LARGE))
-                .bg(theme::swatch(palette::SURFACE_RAISED))
+                .bg(theme::swatch(palette::SURFACE))
                 .border_1()
                 .border_color(theme::swatch(palette::BORDER))
                 .debug_selector({
@@ -1427,10 +1427,10 @@ impl ShelluneView {
             .w_full()
             .min_w(px(0.0))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::SURFACE))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
-            .shadow_xs()
+            .shadow(theme::Elevation::Low.shadows())
             .debug_selector(move || format!("settings.card.{id}"));
         for (index, row) in rows.into_iter().enumerate() {
             card = card.child(row.when(index + 1 < count, |row| {

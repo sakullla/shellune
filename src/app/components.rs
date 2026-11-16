@@ -11,8 +11,6 @@
 //! drift apart. Nothing here invents a colour; every value is a token from
 //! [`crate::app::theme`], which is what keeps the two palettes in step.
 
-use std::time::Duration;
-
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Div, Pixels, Rgba, SharedString, Window,
@@ -20,7 +18,9 @@ use gpui::{
 };
 
 use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Metrics, StatusMark, Tone, palette, radius, spacing};
+use crate::app::theme::{
+    self, Elevated, Elevation, Enter, Metrics, StatusMark, Token, Tone, palette, radius, spacing,
+};
 
 /// The visual weight of a button.
 ///
@@ -87,18 +87,18 @@ impl ControlState {
 /// a disabled one loses its pointer and its text drops to the disabled token.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ControlFace {
-    fill: Option<u32>,
-    border: Option<u32>,
+    fill: Option<Token>,
+    border: Option<Token>,
     border_width: f32,
-    text: u32,
-    mark: Option<u32>,
+    text: Token,
+    mark: Option<Token>,
     busy: bool,
     pressed: bool,
 }
 
 impl ControlFace {
     /// A face with a hairline border and nothing else.
-    fn new(fill: Option<u32>, border: Option<u32>, text: u32) -> Self {
+    fn new(fill: Option<Token>, border: Option<Token>, text: Token) -> Self {
         Self {
             fill,
             border,
@@ -112,25 +112,25 @@ impl ControlFace {
 
     /// The fill behind the control, or nothing to draw one.
     #[must_use]
-    pub fn fill_token(self) -> Option<u32> {
+    pub fn fill_token(self) -> Option<Token> {
         self.fill
     }
 
     /// The border around the control, or nothing to draw one.
     #[must_use]
-    pub fn border_token(self) -> Option<u32> {
+    pub fn border_token(self) -> Option<Token> {
         self.border
     }
 
     /// The label and icon colour.
     #[must_use]
-    pub fn text_token(self) -> u32 {
+    pub fn text_token(self) -> Token {
         self.text
     }
 
     /// The leading bar that marks the chosen control, when this state has one.
     #[must_use]
-    pub fn mark_token(self) -> Option<u32> {
+    pub fn mark_token(self) -> Option<Token> {
         self.mark
     }
 
@@ -180,7 +180,7 @@ impl ControlFace {
         }
     }
 
-    fn with_mark(self, mark: u32) -> Self {
+    fn with_mark(self, mark: Token) -> Self {
         Self {
             mark: Some(mark),
             ..self
@@ -193,7 +193,7 @@ impl ControlFace {
 
     /// The same face with a secondary ring around it, which is how focus and a
     /// rejected value are drawn: the fill stays as it was, the edge doubles.
-    fn ringed(self, ring: u32) -> Self {
+    fn ringed(self, ring: Token) -> Self {
         Self {
             border: Some(ring),
             border_width: 2.0,
@@ -221,8 +221,8 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
             palette::ACCENT_ON_TINT,
         ),
         Variant::Secondary => ControlFace::new(
-            Some(palette::SURFACE_RAISED),
-            Some(palette::BORDER),
+            Some(palette::SURFACE),
+            Some(palette::BORDER_STRONG),
             palette::TEXT_PRIMARY,
         ),
         Variant::Ghost => ControlFace::new(None, None, palette::TEXT_SECONDARY),
@@ -320,7 +320,7 @@ pub fn button_face(variant: Variant, state: ControlState) -> ControlFace {
 }
 
 /// The colour that says "this is the chosen one" for a variant's own tones.
-fn accent_of(variant: Variant) -> u32 {
+fn accent_of(variant: Variant) -> Token {
     match variant {
         Variant::Danger => palette::DANGER,
         _ => palette::ACCENT,
@@ -328,21 +328,21 @@ fn accent_of(variant: Variant) -> u32 {
 }
 
 impl ControlFace {
-    fn with_fill(self, fill: u32) -> Self {
+    fn with_fill(self, fill: Token) -> Self {
         Self {
             fill: Some(fill),
             ..self
         }
     }
 
-    fn with_border(self, border: u32) -> Self {
+    fn with_border(self, border: Token) -> Self {
         Self {
             border: Some(border),
             ..self
         }
     }
 
-    fn with_text(self, text: u32) -> Self {
+    fn with_text(self, text: Token) -> Self {
         Self { text, ..self }
     }
 }
@@ -385,7 +385,7 @@ fn hover_style(face: ControlFace) -> impl FnOnce(gpui::StyleRefinement) -> gpui:
 }
 
 /// The 2px leading bar that says "this one is chosen" without relying on colour.
-fn mark_bar(token: u32, metrics: Metrics) -> Div {
+fn mark_bar(token: Token, metrics: Metrics) -> Div {
     div()
         .flex_none()
         .w(px(2.0))
@@ -491,7 +491,7 @@ pub fn keycap(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .h(metrics.scale(18.0))
         .px(metrics.scale(5.0))
         .rounded(px(radius::SMALL))
-        .bg(theme::swatch(palette::SURFACE))
+        .bg(theme::swatch(palette::CHROME))
         .border_1()
         .border_b_2()
         .border_color(theme::swatch(palette::BORDER_STRONG))
@@ -564,7 +564,16 @@ pub fn button(label: impl Into<SharedString>, variant: Variant, metrics: Metrics
             .child(label.into()),
         button_face(variant, ControlState::Resting),
     );
-    base.hover(hover_style(button_face(variant, ControlState::Hovered)))
+    lifted(base, variant).hover(hover_style(button_face(variant, ControlState::Hovered)))
+}
+
+/// A solid button rests on the page: the primary and the secondary weights carry a low
+/// shadow, the tinted and quiet ones lie flat.
+fn lifted(base: Div, variant: Variant) -> Div {
+    match variant {
+        Variant::Primary | Variant::Secondary => base.elevation(Elevation::Low),
+        Variant::Soft | Variant::Ghost | Variant::Danger => base,
+    }
 }
 
 /// [`button`] in a state the caller owns: focused, pressed, disabled or waiting.
@@ -644,7 +653,7 @@ pub fn icon_label_button(
             .child(label.into()),
         button_face(variant, ControlState::Resting),
     );
-    base.hover(hover_style(button_face(variant, ControlState::Hovered)))
+    lifted(base, variant).hover(hover_style(button_face(variant, ControlState::Hovered)))
 }
 
 /// A square button holding one icon, quiet until pointed at.
@@ -750,7 +759,7 @@ pub fn segment(label: impl Into<SharedString>, selected: bool, metrics: Metrics)
             .font_weight(gpui::FontWeight::MEDIUM)
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_xs()
+            .elevation(Elevation::Low)
     } else {
         let hover = theme::swatch(palette::TEXT_PRIMARY);
         base.text_color(theme::swatch(palette::TEXT_MUTED))
@@ -961,7 +970,7 @@ pub fn field_row(label: impl Into<SharedString>, metrics: Metrics) -> Div {
 #[must_use]
 pub fn field_face(state: ControlState) -> ControlFace {
     let resting = ControlFace::new(
-        Some(palette::SURFACE_RAISED),
+        Some(palette::SURFACE),
         Some(palette::BORDER),
         palette::TEXT_PRIMARY,
     );
@@ -1043,11 +1052,12 @@ pub fn state_card_with_icon(
         .flex_none()
         .items_center()
         .justify_center()
-        .w(metrics.scale(40.0))
-        .h(metrics.scale(40.0))
-        .rounded(px(radius::MEDIUM))
+        .w(metrics.scale(44.0))
+        .h(metrics.scale(44.0))
+        .rounded(px(radius::LARGE))
+        .bg(tone.chip_background())
         .border_1()
-        .border_color(theme::faded(tone.text(), 0.45))
+        .border_color(theme::faded(tone.text(), 0.28))
         .child(match emblem_icon {
             Some(icon) => icons::icon(icon, metrics.scale(20.0), tone.text()).into_any_element(),
             None => attention_dot(tone, metrics),
@@ -1105,9 +1115,10 @@ pub fn state_card_with_icon(
         .px(metrics.scale(spacing::LOOSE))
         .py(metrics.scale(spacing::LOOSE + 16.0))
         .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::SURFACE_RAISED))
+        .bg(theme::swatch(palette::SURFACE))
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
+        .elevation(Elevation::Low)
         .child(emblem)
         .child(text)
 }
@@ -1123,7 +1134,7 @@ fn attention_dot(tone: Tone, metrics: Metrics) -> AnyElement {
         dot.debug_selector(|| "state.motion.pulse".to_owned())
             .with_animation(
                 "state.motion",
-                Animation::new(Duration::from_millis(180)),
+                Animation::new(theme::Motion::BASE).with_easing(theme::ease_out()),
                 |dot, delta| dot.opacity(0.35 + 0.65 * delta),
             )
             .into_any_element()
@@ -1139,7 +1150,7 @@ fn attention_dot(tone: Tone, metrics: Metrics) -> AnyElement {
 #[must_use]
 pub fn row_face(state: ControlState) -> ControlFace {
     let resting = ControlFace::new(
-        Some(palette::SURFACE_RAISED),
+        Some(palette::SURFACE),
         Some(palette::BORDER),
         palette::TEXT_PRIMARY,
     );
@@ -1242,23 +1253,85 @@ pub fn menu_item_face(state: ControlState) -> ControlFace {
     }
 }
 
-/// The panel a menu is drawn in.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn menu_panel(metrics: Metrics) -> Div {
+/// The floating card a menu is drawn in: the raised layer, a strong edge and a mid
+/// shadow, so it reads as over the page and not part of it.
+///
+/// Every context and drop-down menu uses this card, so a session row's menu and a tab's
+/// menu are the same object.
+pub fn menu_card(selector: &'static str, metrics: Metrics) -> Div {
     div()
+        .debug_selector(move || selector.to_owned())
         .flex()
         .flex_col()
-        .flex_none()
+        .min_w(metrics.scale(200.0))
         .gap(metrics.scale(1.0))
-        .p(metrics.scale(spacing::HAIRLINE + 1.0))
+        .p(metrics.scale(spacing::HAIRLINE))
         .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::SURFACE_RAISED))
+        .bg(theme::swatch(palette::RAISED))
         .border_1()
         .border_color(theme::swatch(palette::BORDER_STRONG))
-        .shadow_xs()
+        .elevation(Elevation::Mid)
 }
 
-/// One entry of a [`menu_panel`].
+/// One command of a [`menu_card`]: an optional icon and a label.
+///
+/// An unavailable command stays in its place, muted and without a pointer, so the menu
+/// does not change shape with the selection; a destructive one is drawn in the danger
+/// tone before it is pressed.
+pub fn menu_entry(
+    label: impl Into<SharedString>,
+    selector: &'static str,
+    icon: Option<Icon>,
+    enabled: bool,
+    danger: bool,
+    metrics: Metrics,
+) -> gpui::Stateful<Div> {
+    let hover = theme::swatch(palette::SURFACE_HOVER);
+    let color = if !enabled {
+        theme::swatch(palette::TEXT_MUTED)
+    } else if danger {
+        theme::swatch(palette::DANGER)
+    } else {
+        theme::swatch(palette::TEXT_PRIMARY)
+    };
+    let danger_hover = theme::swatch(palette::DANGER_TINT);
+    div()
+        .id(selector)
+        .debug_selector(move || selector.to_owned())
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .h(metrics.scale(30.0))
+        .px(metrics.scale(spacing::TIGHT + 2.0))
+        .rounded(px(radius::MEDIUM - 2.0))
+        .text_size(metrics.label_size())
+        .text_color(color)
+        .when(enabled, |item| {
+            let hover = if danger { danger_hover } else { hover };
+            item.cursor_pointer().hover(move |style| style.bg(hover))
+        })
+        .children(icon.map(|icon| icons::icon(icon, metrics.small_icon_size(), color)))
+        .child(label.into())
+}
+
+/// The hairline between groups of [`menu_entry`]s.
+pub fn menu_divider(metrics: Metrics) -> Div {
+    div()
+        .flex_none()
+        .h(px(1.0))
+        .mx(metrics.scale(spacing::HAIRLINE))
+        .my(metrics.scale(spacing::HAIRLINE - 1.0))
+        .bg(theme::swatch(palette::BORDER))
+}
+
+/// The panel a choice menu is drawn in: a [`menu_card`] without a selector.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn menu_panel(metrics: Metrics) -> Div {
+    menu_card("menu.panel", metrics).flex_none().min_w(px(0.0))
+}
+
+/// One value of a [`menu_panel`], drawn from the [`menu_item_face`] table.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn menu_item(label: impl Into<SharedString>, selected: bool, metrics: Metrics) -> Div {
     let state = if selected {
@@ -1294,16 +1367,13 @@ pub fn menu_item(label: impl Into<SharedString>, selected: bool, metrics: Metric
 #[must_use]
 pub fn dialog_face() -> ControlFace {
     ControlFace::new(
-        Some(palette::SURFACE_RAISED),
+        Some(palette::OVERLAY),
         Some(palette::BORDER_STRONG),
         palette::TEXT_PRIMARY,
     )
 }
 
-/// The centred panel a dialog is drawn on.
-///
-/// The one shadow left in the shell: a dialog is the only thing that floats above the
-/// page, and even it keeps a small one.
+/// The centred panel a dialog is drawn on: the overlay layer at the highest elevation.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn dialog_panel(metrics: Metrics) -> Div {
     painted(
@@ -1314,8 +1384,8 @@ pub fn dialog_panel(metrics: Metrics) -> Div {
             .w_full()
             .gap(metrics.scale(spacing::BASE))
             .p(metrics.scale(spacing::LOOSE))
-            .rounded(px(radius::LARGE))
-            .shadow_sm(),
+            .rounded(px(radius::XLARGE))
+            .elevation(Elevation::High),
         dialog_face(),
     )
 }
@@ -1419,7 +1489,7 @@ pub fn loading_indicator(metrics: Metrics) -> AnyElement {
         bar.debug_selector(|| "state.loading.motion".to_owned())
             .with_animation(
                 "state.loading",
-                Animation::new(Duration::from_millis(180)),
+                Animation::new(theme::Motion::BASE).with_easing(theme::ease_out()),
                 |bar, delta| bar.opacity(0.4 + 0.6 * delta),
             )
             .into_any_element()
@@ -1473,15 +1543,17 @@ pub struct Tooltip {
 
 impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let metrics = Metrics::default();
+        // A tooltip is its own view, drawn outside the window's render pass; the
+        // window's text size comes from the theme so a 200% window gets a 200% tip.
+        let metrics = theme::metrics();
         div()
             .px(metrics.scale(spacing::TIGHT + 1.0))
             .py(metrics.scale(spacing::HAIRLINE + 1.0))
             .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_sm()
+            .elevation(Elevation::Mid)
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .child(self.text.clone())
@@ -1494,10 +1566,349 @@ pub fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) 
     move |_window, cx| cx.new(|_cx| Tooltip { text: text.clone() }).into()
 }
 
+/// A card: a block of content on the surface layer, resting on the page at a low
+/// elevation.
+///
+/// It is the one container a page groups its content in - a settings section, a home
+/// tile, a status panel - so the corner, edge and shadow of every card agree.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn card(metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .min_w(px(0.0))
+        .gap(metrics.scale(spacing::SNUG))
+        .p(metrics.scale(spacing::BASE))
+        .rounded(px(radius::LARGE))
+        .bg(theme::swatch(palette::SURFACE))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER))
+        .elevation(Elevation::Low)
+}
+
+/// An on/off switch for a setting that takes effect at once.
+///
+/// The knob's side says the state before its colour does: off sits left on a grey
+/// track, on sits right on the accent. The caller gives it an id and a click; the
+/// switch only draws.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn switch(on: bool, metrics: Metrics) -> Div {
+    let width = metrics.scale(34.0);
+    let height = metrics.scale(20.0);
+    let inset = metrics.scale(3.0);
+    let knob = height - inset * 2.0;
+    let track = if on {
+        palette::ACCENT
+    } else {
+        palette::TRACK_OFF
+    };
+    let hover = theme::swatch(if on {
+        palette::ACCENT_HOVER
+    } else {
+        palette::BORDER_STRONG
+    });
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .w(width)
+        .h(height)
+        .px(inset)
+        .rounded_full()
+        .bg(theme::swatch(track))
+        .cursor_pointer()
+        .when(on, |track| track.justify_end())
+        .when(!on, |track| track.justify_start())
+        .hover(move |style| style.bg(hover))
+        .child(
+            div()
+                .flex_none()
+                .size(knob)
+                .rounded_full()
+                .bg(theme::swatch(palette::KNOB))
+                .elevation(Elevation::Low),
+        )
+}
+
+/// The hover group a [`checkbox_box`] follows, so the label's row lights the box.
+pub const CHECK_GROUP: &str = "checkbox";
+
+/// The box of a checkbox alone: a hollow square that fills with the accent and a tick
+/// when checked.
+///
+/// It is drawn as what it is - a checkbox - rather than borrowing a chevron, which reads
+/// as "open this". Under the pointer of its [`CHECK_GROUP`] an empty box takes the
+/// accent edge, so the box says it can be picked before it is.
+pub fn checkbox_box(checked: bool, metrics: Metrics) -> Div {
+    let accent = theme::swatch(palette::ACCENT);
+    let boxed = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(metrics.scale(16.0))
+        .rounded(px(radius::SMALL - 2.0))
+        .border_1();
+    if checked {
+        boxed.bg(accent).border_color(accent).child(icons::icon(
+            Icon::Check,
+            metrics.scale(12.0),
+            theme::swatch(palette::ON_ACCENT),
+        ))
+    } else {
+        boxed
+            .bg(theme::swatch(palette::SURFACE))
+            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .group_hover(CHECK_GROUP, move |style| style.border_color(accent))
+    }
+}
+
+/// A checkbox with its label, for a choice inside a form.
+pub fn checkbox(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    checked: bool,
+    metrics: Metrics,
+) -> gpui::Stateful<Div> {
+    let hover = theme::swatch(palette::TEXT_PRIMARY);
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .group(CHECK_GROUP)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .cursor_pointer()
+        .text_size(metrics.label_size())
+        .text_color(theme::swatch(if checked {
+            palette::TEXT_PRIMARY
+        } else {
+            palette::TEXT_SECONDARY
+        }))
+        .hover(move |style| style.text_color(hover))
+        .child(checkbox_box(checked, metrics))
+        .child(label.into())
+}
+
+/// A finished notification: a tone's icon on its tint, a title and an optional line.
+///
+/// The caller gives it its id, its close button and its place in the stack; the toast
+/// is the raised card and its words. It floats over the page, so it is drawn on the
+/// raised layer at the mid elevation, like a menu.
+pub fn toast(
+    tone: Tone,
+    icon: Icon,
+    title: Div,
+    detail: Option<SharedString>,
+    metrics: Metrics,
+) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap(metrics.scale(spacing::TIGHT + 2.0))
+        .w(metrics.scale(340.0))
+        .p(metrics.scale(spacing::SNUG))
+        .rounded(px(radius::LARGE))
+        .bg(theme::swatch(palette::RAISED))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER_STRONG))
+        .elevation(Elevation::Mid)
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(metrics.scale(24.0))
+                .rounded_full()
+                .bg(theme::swatch(tone.tint()))
+                .child(icons::icon(icon, metrics.small_icon_size(), tone.text())),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap(metrics.scale(2.0))
+                .child(
+                    title
+                        .text_size(metrics.label_size())
+                        .font_weight(metrics.medium_weight())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY)),
+                )
+                .children(detail.map(|detail| {
+                    div()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        .line_clamp(2)
+                        .child(detail)
+                })),
+        )
+}
+
+/// An empty page or section: an icon on the accent tint, a title, one line and an
+/// optional next step.
+///
+/// "Empty" is a state of its own and says what to do next; it is not the failure card,
+/// so it carries no status tone.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn empty_state(
+    icon: Icon,
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    action: Option<AnyElement>,
+    metrics: Metrics,
+) -> Div {
+    div()
+        .debug_selector(|| "empty.state".to_owned())
+        .flex()
+        .flex_col()
+        .items_center()
+        .w_full()
+        .min_w(px(0.0))
+        .gap(metrics.scale(spacing::SNUG))
+        .px(metrics.scale(spacing::LOOSE))
+        .py(metrics.scale(spacing::LOOSE + 8.0))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(metrics.scale(48.0))
+                .rounded(px(radius::XLARGE))
+                .bg(theme::swatch(palette::ACCENT_TINT))
+                .child(icons::icon(
+                    icon,
+                    metrics.scale(22.0),
+                    theme::swatch(palette::ACCENT_ON_TINT),
+                )),
+        )
+        .child(
+            div()
+                .w_full()
+                .max_w(metrics.scale(420.0))
+                .whitespace_normal()
+                .text_center()
+                .text_size(metrics.title_size())
+                .font_weight(metrics.title_weight())
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .child(title.into()),
+        )
+        .child(
+            div()
+                .w_full()
+                .max_w(metrics.scale(420.0))
+                .whitespace_normal()
+                .text_center()
+                .text_size(metrics.body_size())
+                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                .child(body.into()),
+        )
+        .children(action.map(|action| div().mt(metrics.scale(spacing::HAIRLINE)).child(action)))
+}
+
+/// The pieces of one centred dialog.
+///
+/// The subtitle is its own piece and is drawn at the top of the scrolling body.
+/// Putting that sentence in the fixed header left the body too short to reach at 200%
+/// text (R4).
+pub struct ModalContent {
+    /// The fixed header: icon tile, title, close button.
+    pub header: Div,
+    /// The sentence under the title, scrolled with the body.
+    pub subtitle: Option<Div>,
+    /// What the dialog asks or shows.
+    pub body: AnyElement,
+    /// The fixed row of actions, primary last.
+    pub footer: Option<Div>,
+}
+
+/// A centred dialog over a dimmed page.
+///
+/// The dialog is the overlay layer at the highest elevation, with the largest panel
+/// radius; the body scrolls between a fixed header and footer. The scrim takes every
+/// press so nothing behind it can be used, but a press on it does not close the
+/// dialog: what was typed is kept until the user closes it on purpose. With motion
+/// allowed the dialog settles into place.
+pub fn modal(
+    viewport: gpui::Size<Pixels>,
+    id: &'static str,
+    width: f32,
+    content: ModalContent,
+    metrics: Metrics,
+) -> Div {
+    let ModalContent {
+        header,
+        subtitle,
+        body,
+        footer,
+    } = content;
+    // The inset stays a small edge gap. Scaling it with the text turned a 200% minimum
+    // window into a short dialog, and the failure's next line was drawn past the client
+    // edge where it could not be read (R4).
+    let margin = metrics.scale(spacing::LOOSE).min(px(16.0));
+    let width = metrics.scale(width).min(viewport.width - margin * 2.0);
+    let max_height = viewport.height - margin * 2.0;
+    let dialog = div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .w(width)
+        .max_h(max_height)
+        .flex()
+        .flex_col()
+        .rounded(px(radius::XLARGE))
+        .bg(theme::swatch(palette::OVERLAY))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER_STRONG))
+        .elevation(Elevation::High)
+        .overflow_hidden()
+        .occlude()
+        .child(header)
+        .child(
+            div()
+                .id(SharedString::from(format!("{id}.body")))
+                .debug_selector(move || format!("{id}.body"))
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .children(subtitle)
+                .child(body),
+        )
+        .children(footer.map(|footer| footer.flex_none()));
+    div()
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(viewport.width)
+        .h(viewport.height)
+        .child(
+            div()
+                .id(SharedString::from(format!("{id}.backdrop")))
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .occlude()
+                .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+                    cx.stop_propagation();
+                }),
+        )
+        .child(theme::enter(
+            dialog,
+            SharedString::from(format!("{id}.enter")),
+            Enter::Fade,
+        ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::theme::{contrast, light_value};
+    use crate::app::theme::contrast;
 
     /// Minimum contrast for a label or body line (WCAG AA).
     const BODY: f64 = 4.5;
@@ -1513,14 +1924,16 @@ mod tests {
     ];
 
     /// Where a face with no fill of its own ends up being drawn.
-    const BACKDROPS: [u32; 4] = [
+    const BACKDROPS: [Token; 6] = [
         palette::CANVAS,
+        palette::CHROME,
         palette::SURFACE,
-        palette::SURFACE_RAISED,
+        palette::RAISED,
+        palette::OVERLAY,
         palette::SURFACE_SELECTED,
     ];
 
-    fn backdrops(face: ControlFace) -> Vec<u32> {
+    fn backdrops(face: ControlFace) -> Vec<Token> {
         match face.fill_token() {
             Some(fill) => vec![fill],
             None => BACKDROPS.to_vec(),
@@ -1538,11 +1951,10 @@ mod tests {
             BODY
         };
         for background in backdrops(face) {
-            let dark = contrast::ratio(face.text_token(), background);
-            let washed = contrast::ratio(light_value(face.text_token()), light_value(background));
+            let (dark, washed) = contrast::both(face.text_token(), background);
             assert!(
                 dark >= floor,
-                "{name}: the label on {background:06x} is {dark:.2}:1, below {floor:.1}:1"
+                "{name}: the label on {background:x} is {dark:.2}:1, below {floor:.1}:1"
             );
             assert!(
                 washed >= floor,
@@ -1552,7 +1964,15 @@ mod tests {
     }
 
     /// Everything a face draws, as one comparable key.
-    type Key = (Option<u32>, Option<u32>, u32, i32, Option<u32>, bool, bool);
+    type Key = (
+        Option<Token>,
+        Option<Token>,
+        Token,
+        i32,
+        Option<Token>,
+        bool,
+        bool,
+    );
 
     fn key(face: ControlFace) -> Key {
         (
@@ -1659,11 +2079,10 @@ mod tests {
                 let face = button_face(variant, state);
                 let edge = face.border_token().expect("the state draws an edge");
                 for background in backdrops(face) {
-                    let dark = contrast::ratio(edge, background);
-                    let washed = contrast::ratio(light_value(edge), light_value(background));
+                    let (dark, washed) = contrast::both(edge, background);
                     assert!(
                         dark >= GRAPHIC,
-                        "{variant:?} {state:?}: the edge on {background:06x} is {dark:.2}:1"
+                        "{variant:?} {state:?}: the edge on {background:x} is {dark:.2}:1"
                     );
                     assert!(
                         washed >= GRAPHIC,
@@ -1723,6 +2142,57 @@ mod tests {
             metrics,
         );
         let _ = loading_indicator(metrics);
+        let _ = card(metrics).child(stacked("prod-web", "10.0.0.12", metrics));
+        for on in [false, true] {
+            let _ = switch(on, metrics);
+            let _ = checkbox("check", "Remember", on, metrics);
+            let _ = checkbox_box(on, metrics);
+        }
+        let _ = menu_card("menu", metrics)
+            .child(menu_entry(
+                "Open",
+                "menu.open",
+                Some(Icon::Terminal),
+                true,
+                false,
+                metrics,
+            ))
+            .child(menu_divider(metrics))
+            .child(menu_entry(
+                "Remove",
+                "menu.remove",
+                None,
+                true,
+                true,
+                metrics,
+            ))
+            .child(menu_entry(
+                "Close",
+                "menu.close",
+                None,
+                false,
+                false,
+                metrics,
+            ));
+        let _ = empty_state(
+            Icon::Server,
+            "No hosts yet",
+            "Add a host to connect to it with one click.",
+            Some(button("New host", Variant::Primary, metrics).into_any_element()),
+            metrics,
+        );
+        let _ = modal(
+            gpui::size(px(720.0), px(480.0)),
+            "dialog",
+            440.0,
+            ModalContent {
+                header: dialog_header("New host", "hosts.json", metrics),
+                subtitle: None,
+                body: div().into_any_element(),
+                footer: Some(div().child(button("Save", Variant::Primary, metrics))),
+            },
+            metrics,
+        );
         for tone in [
             Tone::Neutral,
             Tone::Accent,
@@ -1733,6 +2203,47 @@ mod tests {
         ] {
             let _ = chip(tone_word(tone), tone, metrics);
             let _ = status_mark(tone, metrics.scale(7.0));
+            let _ = toast(
+                tone,
+                Icon::Check,
+                div().child(tone_word(tone)),
+                None,
+                metrics,
+            );
+        }
+    }
+
+    #[test]
+    fn a_switch_and_a_checkbox_say_their_state_by_shape_as_well_as_colour() {
+        // The off track and the knob are both readable against the surface the switch
+        // sits on, and the on track is the accent the primary action uses.
+        for surface in [palette::SURFACE, palette::CHROME, palette::OVERLAY] {
+            let (dark, light) = contrast::both(palette::TRACK_OFF, surface);
+            assert!(
+                dark >= 1.3 && light >= 1.3,
+                "the off track disappears into {surface:x}"
+            );
+        }
+        let (dark, light) = contrast::both(palette::KNOB, palette::ACCENT);
+        assert!(dark >= GRAPHIC || light >= GRAPHIC);
+        // The tick on a checked box keeps the body floor on the accent fill.
+        let (dark, light) = contrast::both(palette::ON_ACCENT, palette::ACCENT);
+        assert!(dark >= BODY && light >= BODY);
+    }
+
+    #[test]
+    fn the_floating_layers_are_drawn_above_the_page() {
+        // A menu, a toast and a dialog stand on their own layer and carry a strong edge,
+        // so they read as over the page in both palettes even before their shadow.
+        let dialog = dialog_face();
+        assert_eq!(dialog.fill_token(), Some(palette::OVERLAY));
+        assert_eq!(dialog.border_token(), Some(palette::BORDER_STRONG));
+        for (name, layer) in [("raised", palette::RAISED), ("overlay", palette::OVERLAY)] {
+            let (dark, light) = contrast::both(palette::BORDER_STRONG, layer);
+            assert!(
+                dark > 1.2 && light > 1.2,
+                "the {name} edge is not seen: {dark:.2}/{light:.2}"
+            );
         }
     }
 

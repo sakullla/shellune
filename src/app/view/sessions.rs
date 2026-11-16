@@ -6,73 +6,18 @@
 //! or from its context menu, and where every closed record is cleared at once.
 
 use gpui::prelude::*;
-use gpui::{Context, Div, MouseButton, Pixels, Point, SharedString, Stateful, Window, div, px};
+use gpui::{Context, Div, MouseButton, Pixels, Point, SharedString, Window, div, px};
 use shellune_core::{Session, SessionId, SessionKind, SessionState};
 
 use super::ShelluneView;
 use super::overlays::clamp_menu;
 use crate::app::components;
-use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Metrics, palette, radius, spacing};
+use crate::app::icons::Icon;
+use crate::app::theme::{self, palette, spacing};
 
-/// One line of a context menu.
-pub(super) fn menu_entry(
-    label: &'static str,
-    selector: &'static str,
-    icon: Option<Icon>,
-    enabled: bool,
-    danger: bool,
-    metrics: Metrics,
-) -> Stateful<Div> {
-    let hover = theme::swatch(palette::SURFACE_HOVER);
-    let color = if !enabled {
-        theme::swatch(palette::TEXT_MUTED)
-    } else if danger {
-        theme::swatch(palette::DANGER)
-    } else {
-        theme::swatch(palette::TEXT_PRIMARY)
-    };
-    div()
-        .id(selector)
-        .debug_selector(move || selector.to_owned())
-        .flex()
-        .items_center()
-        .gap(metrics.scale(spacing::TIGHT))
-        .h(metrics.scale(30.0))
-        .px(metrics.scale(spacing::TIGHT + 2.0))
-        .rounded(px(radius::MEDIUM))
-        .text_size(metrics.label_size())
-        .text_color(color)
-        .when(enabled, |item| {
-            item.cursor_pointer().hover(move |style| style.bg(hover))
-        })
-        .children(icon.map(|icon| icons::icon(icon, metrics.small_icon_size(), color)))
-        .child(label)
-}
-
-/// The hairline between groups of menu entries.
-pub(super) fn menu_divider(metrics: Metrics) -> Div {
-    div()
-        .h(px(1.0))
-        .mx(metrics.scale(spacing::HAIRLINE))
-        .my(metrics.scale(2.0))
-        .bg(theme::swatch(palette::BORDER))
-}
-
-/// The floating card a context menu is drawn in.
-pub(super) fn menu_card(selector: &'static str, metrics: Metrics) -> Div {
-    div()
-        .debug_selector(move || selector.to_owned())
-        .flex()
-        .flex_col()
-        .min_w(metrics.scale(200.0))
-        .p(metrics.scale(spacing::HAIRLINE))
-        .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::SURFACE_RAISED))
-        .border_1()
-        .border_color(theme::swatch(palette::BORDER_STRONG))
-        .shadow_lg()
-}
+// The menu pieces are the shared components: a session row's menu is the same object as
+// every other context menu.
+use crate::app::components::{menu_card, menu_divider, menu_entry};
 
 impl ShelluneView {
     /// Whether the session record is closed: its tab is gone and only the record is

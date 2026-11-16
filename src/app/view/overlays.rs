@@ -796,11 +796,11 @@ impl ShelluneView {
             .w(width)
             .flex()
             .flex_col()
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(colors::SURFACE_RAISED))
+            .rounded(px(radius::XLARGE))
+            .bg(theme::swatch(colors::OVERLAY))
             .border_1()
             .border_color(theme::swatch(colors::BORDER_STRONG))
-            .shadow_lg()
+            .shadow(theme::Elevation::High.shadows())
             .overflow_hidden()
             .occlude()
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -835,7 +835,7 @@ impl ShelluneView {
                     .px(metrics.scale(spacing::SNUG))
                     .border_t_1()
                     .border_color(theme::swatch(colors::BORDER))
-                    .bg(theme::swatch(colors::SURFACE))
+                    .bg(theme::swatch(colors::CHROME))
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(colors::TEXT_MUTED))
                     .child(hint("\u{2191}\u{2193}", strings.palette_key_move))
@@ -854,7 +854,7 @@ impl ShelluneView {
                             .id("palette.backdrop")
                             .absolute()
                             .inset_0()
-                            .bg(gpui::rgba(0x0000_0080))
+                            .bg(theme::scrim())
                             .occlude()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -1113,10 +1113,10 @@ impl ShelluneView {
             .overflow_y_scroll()
             .p(metrics.scale(spacing::HAIRLINE))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(colors::SURFACE_RAISED))
+            .bg(theme::swatch(colors::RAISED))
             .border_1()
             .border_color(theme::swatch(colors::BORDER_STRONG))
-            .shadow_lg()
+            .shadow(theme::Elevation::Mid.shadows())
             .child(
                 item(strings.remote_connect, "host.menu.connect", false).on_click(cx.listener(
                     move |this, _event, window, cx| {
@@ -1375,10 +1375,10 @@ impl ShelluneView {
             .overflow_y_scroll()
             .p(metrics.scale(spacing::HAIRLINE))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(colors::SURFACE_RAISED))
+            .bg(theme::swatch(colors::RAISED))
             .border_1()
             .border_color(theme::swatch(colors::BORDER_STRONG))
-            .shadow_lg()
+            .shadow(theme::Elevation::Mid.shadows())
             .when_some(reconnect, |menu, reconnect| {
                 menu.child(reconnect).child(divider())
             })
@@ -2250,7 +2250,7 @@ impl ShelluneView {
             .px(metrics.scale(spacing::SNUG))
             .border_t_1()
             .border_color(theme::swatch(colors::BORDER))
-            .bg(theme::swatch(colors::SURFACE))
+            .bg(theme::swatch(colors::CHROME))
             .text_size(metrics.caption_size())
             .text_color(theme::swatch(colors::TEXT_MUTED))
             .child(hint("\u{2191}\u{2193}", strings.palette_key_move))

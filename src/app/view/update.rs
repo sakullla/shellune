@@ -1077,7 +1077,7 @@ impl ShelluneView {
             .px(metrics.scale(spacing::SNUG))
             .py(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "update.confirm.list".to_owned());

@@ -635,7 +635,7 @@ impl ShelluneView {
             .when(!across, |bar| {
                 bar.h(metrics.scale(12.0)).w_full().cursor_row_resize()
             })
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .hover(|bar| bar.bg(theme::swatch(palette::SURFACE_HOVER)))
             .border_color(theme::swatch(palette::BORDER))
             .when(across, |bar| bar.border_l_1().border_r_1())
@@ -906,7 +906,7 @@ impl ShelluneView {
             .px(metrics.scale(spacing::TIGHT))
             // The active pane is marked by its own fill and an accent bar, not only by
             // the weight of a word: the frame around it is the other half of the mark.
-            .when(active, |row| row.bg(theme::swatch(palette::SURFACE_RAISED)))
+            .when(active, |row| row.bg(theme::swatch(palette::SURFACE)))
             .when(active, |row| {
                 row.child(
                     div()
@@ -1207,7 +1207,7 @@ impl ShelluneView {
                 this.select_tab(index, window, cx);
             }));
         tab = if selected {
-            tab.bg(theme::swatch(palette::SURFACE_RAISED))
+            tab.bg(theme::swatch(palette::SURFACE))
                 .border_color(theme::swatch(palette::BORDER_STRONG))
         } else {
             tab.border_color(theme::clear())

@@ -988,10 +988,10 @@ impl TextField {
             .min_w(metrics.scale(180.0))
             .p(metrics.scale(spacing::HAIRLINE))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_lg()
+            .shadow(theme::Elevation::Mid.shadows())
             .debug_selector(|| "field.menu".to_owned())
             .child(
                 item(strings.field_cut, key("X"), can_copy, "field.menu.cut").when(

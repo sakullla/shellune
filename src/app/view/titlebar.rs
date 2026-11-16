@@ -33,9 +33,6 @@ pub const TRAFFIC_LIGHT_ROOM: f32 = 72.0;
 /// Where the macOS window buttons sit, centred in the 46-point header row.
 pub const TRAFFIC_LIGHT_POSITION: (f32, f32) = (18.0, 16.0);
 
-/// The background colour of the close button under the pointer, the platform's red.
-const CLOSE_HOVER: u32 = 0xc42b1c;
-
 impl ShelluneView {
     /// A blank part of the top row: it drags the window and a double click maximises.
     ///
@@ -84,13 +81,15 @@ impl ShelluneView {
                       area: WindowControlArea,
                       close: bool,
                       run: fn(&mut Window)| {
+            // The close button turns the platform's red under the pointer, from the
+            // palette's solid danger fill, so it warns before the click.
             let hover_bg = if close {
-                gpui::rgb(CLOSE_HOVER)
+                theme::swatch(palette::DANGER_SOLID)
             } else {
                 theme::swatch(palette::SURFACE_HOVER)
             };
             let hover_text = if close {
-                gpui::rgb(0xffffff)
+                theme::swatch(palette::ON_DANGER)
             } else {
                 theme::swatch(palette::TEXT_PRIMARY)
             };

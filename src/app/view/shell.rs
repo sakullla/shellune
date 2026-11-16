@@ -10,8 +10,7 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, FontWeight, KeyDownEvent, MouseButton, SharedString, Stateful,
-    Window, div, px,
+    AnyElement, Context, Div, FontWeight, KeyDownEvent, SharedString, Stateful, Window, div, px,
 };
 
 use shellune_core::{SessionState, SnippetId};
@@ -41,18 +40,9 @@ pub enum Tool {
     Snippets,
 }
 
-/// The pieces of one centred dialog, kept together so [`ShelluneView::modal`] stays
-/// within the argument limit.
-///
-/// The subtitle is its own piece and is drawn at the top of the scrolling body.
-/// Putting that sentence in the fixed header left the body too short to reach
-/// at 200% text (R4).
-pub(super) struct ModalContent {
-    pub(super) header: Div,
-    pub(super) subtitle: Option<Div>,
-    pub(super) body: AnyElement,
-    pub(super) footer: Option<Div>,
-}
+/// The pieces of one centred dialog; the dialog itself is the shared
+/// [`components::modal`].
+pub(super) use crate::app::components::ModalContent;
 
 impl ShelluneView {
     // -----------------------------------------------------------------------
@@ -82,7 +72,7 @@ impl ShelluneView {
             .flex_col()
             .flex_none()
             .w_full()
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .border_b_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "session.header".to_owned())
@@ -471,7 +461,7 @@ impl ShelluneView {
                 .min_h(metrics.hit_target().max(px(terminal::SHELL_BAR_HEIGHT)))
                 .pl(metrics.scale(spacing::BASE - 2.0))
                 .pr(metrics.scale(spacing::HAIRLINE))
-                .bg(theme::swatch(palette::SURFACE))
+                .bg(theme::swatch(palette::CHROME))
                 .border_t_1()
                 .border_color(theme::faded(theme::swatch(palette::BORDER), 0.8))
                 .debug_selector(|| "session.bar".to_owned())
@@ -534,10 +524,10 @@ impl ShelluneView {
                 this.select(Destination::Hosts, window, cx);
             }));
         tab = if selected {
-            tab.bg(theme::swatch(palette::SURFACE_RAISED))
+            tab.bg(theme::swatch(palette::SURFACE))
                 .border_1()
                 .border_color(theme::swatch(palette::BORDER_STRONG))
-                .shadow_sm()
+                .shadow(theme::Elevation::Low.shadows())
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .font_weight(FontWeight::MEDIUM)
         } else {
@@ -955,10 +945,10 @@ impl ShelluneView {
                 .gap(metrics.scale(spacing::LOOSE))
                 .p(metrics.scale(spacing::LOOSE))
                 .rounded(px(radius::XLARGE))
-                .bg(theme::swatch(palette::SURFACE_RAISED))
+                .bg(theme::swatch(palette::SURFACE))
                 .border_1()
                 .border_color(theme::swatch(palette::BORDER))
-                .shadow_xs()
+                .shadow(theme::Elevation::Low.shadows())
                 .debug_selector(|| "hosts.empty".to_owned())
                 .child(
                     div()
@@ -969,7 +959,7 @@ impl ShelluneView {
                         .size(metrics.scale(56.0))
                         .rounded(px(radius::XLARGE))
                         .bg(super::brand_gradient())
-                        .shadow_md()
+                        .shadow(theme::Elevation::Mid.shadows())
                         .child(icons::icon(
                             Icon::Server,
                             metrics.scale(26.0),
@@ -1082,10 +1072,10 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::SNUG))
             .p(metrics.scale(spacing::LOOSE))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_lg()
+            .shadow(theme::Elevation::Mid.shadows())
             .debug_selector(|| "keys.capture".to_owned())
             .child(
                 div()
@@ -1256,8 +1246,10 @@ impl ShelluneView {
     // Dialogs
     // -----------------------------------------------------------------------
 
-    /// A centred dialog over a dimmed window. A press on the dimmed part does not
-    /// close it: what was typed is kept until the user closes it on purpose.
+    /// A centred dialog over a dimmed window, laid in the window's overlay layer.
+    ///
+    /// The dialog is [`components::modal`]; a press on the dimmed part does not close
+    /// it, so what was typed is kept until the user closes it on purpose.
     pub(super) fn modal(
         &self,
         window: &Window,
@@ -1265,69 +1257,13 @@ impl ShelluneView {
         width: f32,
         content: ModalContent,
     ) -> Div {
-        let ModalContent {
-            header,
-            subtitle,
-            body,
-            footer,
-        } = content;
-        let metrics = self.metrics();
-        let viewport = window.viewport_size();
-        // The inset stays a small edge gap. Scaling it with the text turned a 200%
-        // minimum window into a short dialog, and the failure's next line was drawn
-        // past the client edge where it could not be read (R4).
-        let margin = metrics.scale(spacing::LOOSE).min(px(16.0));
-        let width = metrics.scale(width).min(viewport.width - margin * 2.0);
-        let max_height = viewport.height - margin * 2.0;
-        let dialog = div()
-            .id(id)
-            .debug_selector(move || id.to_owned())
-            .w(width)
-            .max_h(max_height)
-            .flex()
-            .flex_col()
-            .rounded(px(radius::XLARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_2xl()
-            .overflow_hidden()
-            .occlude()
-            .child(header)
-            .child(
-                div()
-                    .id(SharedString::from(format!("{id}.body")))
-                    .debug_selector(move || format!("{id}.body"))
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .children(subtitle)
-                    .child(body),
-            )
-            .children(footer.map(|footer| footer.flex_none()));
-        super::overlay_layer().child(
-            div()
-                .relative()
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(viewport.width)
-                .h(viewport.height)
-                .child(
-                    div()
-                        .id(SharedString::from(format!("{id}.backdrop")))
-                        .absolute()
-                        .inset_0()
-                        .bg(gpui::rgba(0x0508_1470))
-                        .occlude()
-                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                            cx.stop_propagation();
-                        }),
-                )
-                .child(dialog),
-        )
+        super::overlay_layer().child(components::modal(
+            window.viewport_size(),
+            id,
+            width,
+            content,
+            self.metrics(),
+        ))
     }
 
     /// The header of a dialog: an optional icon tile, a title, a subtitle and a
@@ -1500,7 +1436,7 @@ impl ShelluneView {
             .py(metrics.scale(spacing::SNUG))
             .px(metrics.scale(spacing::BASE))
             .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "remote.stage".to_owned());
@@ -1706,10 +1642,10 @@ impl ShelluneView {
                         .w_full()
                         .max_w(metrics.scale(600.0))
                         .rounded(px(radius::XLARGE))
-                        .bg(theme::swatch(palette::SURFACE_RAISED))
+                        .bg(theme::swatch(palette::SURFACE))
                         .border_1()
                         .border_color(theme::swatch(palette::BORDER))
-                        .shadow_sm()
+                        .shadow(theme::Elevation::Low.shadows())
                         .child(header)
                         .children(subtitle)
                         .child(body)

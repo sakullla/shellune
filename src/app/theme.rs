@@ -1,116 +1,136 @@
-//! Design tokens for the Shellune shell (R12, R13).
+//! Design tokens for the Shellune shell (R1, R12, R13).
 //!
-//! The values here are the single source of truth for the palette, spacing,
-//! corner radii, type scale and zoom behaviour described in
-//! `docs/design/02-shell-and-design-system.md`. Views reference tokens instead of literal
-//! colours or sizes, so a visual review only has to change this module.
+//! The values here are the single source of truth for the palette, the surface layers,
+//! elevation, motion, spacing, corner radii, the type scale and zoom behaviour described
+//! in `docs/design/02-shell-and-design-system.md`. Views name tokens instead of literal
+//! colours, shadows, durations or sizes, so a visual review only has to change this
+//! module.
+//!
+//! The two palettes are two tables, [`dark`] and [`light`], written side by side; a
+//! [`Token`] carries one value from each. Neither is derived from the other, so a light
+//! colour is chosen for a light window and not looked up from a dark one.
 //!
 //! Four properties are checked by tests rather than trusted:
 //!
-//! * every text and status colour reaches the WCAG contrast floor against the
-//!   surface it is drawn on ([`contrast`]), in both palettes;
-//! * every token has exactly one light value and no two tokens share a value, so the
-//!   dark-keyed table in [`light`] can resolve all of them;
-//! * the chrome stays neutral and the accent is the only identity hue in regular
-//!   use, which is what keeps two themes looking like one product;
-//! * layout metrics shrink and grow with [`Zoom`] instead of being hard-coded
-//!   per view.
+//! * every text and status colour reaches the WCAG contrast floor against every surface
+//!   it is drawn on ([`contrast`]), in both palettes;
+//! * the five surface layers step in one direction, so a raised object is told apart
+//!   from what it floats over even before its shadow is drawn;
+//! * the chrome stays neutral and the accent is the only identity hue in regular use,
+//!   which is what keeps two themes looking like one product;
+//! * layout metrics shrink and grow with [`Zoom`] instead of being hard-coded per view.
 
-use gpui::{FontWeight, Pixels, Rgba, px, rgb};
+use std::time::Duration;
+
+use gpui::{
+    Animation, AnimationExt, AnyElement, BoxShadow, ElementId, FontWeight, IntoElement, Pixels,
+    Rgba, Styled, point, px, rgb,
+};
 use shellune_core::{SessionFailure, SessionKind, SessionState, TabAccent, TransferState};
 
-/// Raw colour tokens as 24-bit sRGB values.
+/// One colour of the interface: its value in the dark palette and in the light one.
 ///
-/// The palette takes its colours from the logo: a blue-black graphite in the dark and
-/// a cool paper grey in the light, with exactly one chromatic identity colour - the
-/// logo's periwinkle - as the accent for the current
-/// object and the one primary action. Nothing else in the regular interface is
-/// allowed to be saturated, so a busy session list stays quiet and the only colours
-/// that shout are the four status tones.
-pub mod palette {
-    /// Application background: the content area and the terminal itself.
-    pub const CANVAS: u32 = 0x0b0c10;
-    /// Chrome surface: the navigation rail, the tab strip and the status bar.
-    pub const SURFACE: u32 = 0x111218;
-    /// Raised surface for cards, rows and inputs.
-    pub const SURFACE_RAISED: u32 = 0x16171e;
-    /// Surface under the pointer, one step above [`SURFACE_RAISED`].
-    pub const SURFACE_HOVER: u32 = 0x1d1e27;
-    /// Surface used for the selected navigation entry, tab or choice.
-    pub const SURFACE_SELECTED: u32 = 0x24252f;
-    /// Surface of a control under the pressed pointer: a step below
-    /// [`SURFACE_SELECTED`], so a press is felt and not only tinted.
-    pub const SURFACE_PRESSED: u32 = 0x2c2d38;
-    /// Hairline border between regions.
-    pub const BORDER: u32 = 0x21222b;
-    /// Border of controls and of an element under the pointer.
-    pub const BORDER_STRONG: u32 = 0x33343f;
-    /// The sunken track a segmented control's options sit in.
-    pub const SEGMENT_TRACK: u32 = 0x0d0e13;
-    /// The raised thumb under the chosen option of a segmented control.
-    pub const SEGMENT_THUMB: u32 = 0x282a35;
-    /// Primary text: titles and the current object.
-    pub const TEXT_PRIMARY: u32 = 0xedeef3;
-    /// Secondary text: body copy and list metadata.
-    pub const TEXT_SECONDARY: u32 = 0xb1b3be;
-    /// Muted text: hints, counts and the status bar.
-    ///
-    /// Light enough to keep the body floor on [`SURFACE_PRESSED`], the darkest
-    /// surface a muted label is drawn on, not just on the raised surfaces.
-    pub const TEXT_MUTED: u32 = 0x9699a4;
-    /// Accent used for the selected destination and primary actions.
-    pub const ACCENT: u32 = 0x8b9ffd;
-    /// Accent under the pointer, for a solid primary button.
-    pub const ACCENT_HOVER: u32 = 0xa3b3fe;
-    /// The accent under a pressed primary button: one step down from [`ACCENT`], so a
-    /// press sinks instead of brightening.
-    pub const ACCENT_PRESSED: u32 = 0x7489f2;
-    /// Text drawn on a solid [`ACCENT`] fill.
-    pub const ON_ACCENT: u32 = 0x0b0f2e;
-    /// Accent tint for filled accent surfaces.
-    pub const ACCENT_TINT: u32 = 0x1a1d3a;
-    /// Text and icons drawn on [`ACCENT_TINT`].
-    pub const ACCENT_ON_TINT: u32 = 0xbcc7ff;
-    /// Dark tint behind a positive chip or banner.
-    pub const POSITIVE_TINT: u32 = 0x11241d;
-    /// Dark tint behind a warning chip or banner.
-    pub const WARNING_TINT: u32 = 0x261f12;
-    /// Dark tint behind a danger chip, banner or destructive button.
-    pub const DANGER_TINT: u32 = 0x2b1618;
-    /// Live and completed status.
-    pub const POSITIVE: u32 = 0x5ed6a4;
-    /// Waiting, verifying or in-progress status.
-    pub const WARNING: u32 = 0xe8c07a;
-    /// Failed, rejected or unavailable status.
-    pub const DANGER: u32 = 0xff8f96;
-    /// Planned-but-not-shipped status; deliberately desaturated so it never
-    /// reads as an error or as success.
-    pub const PLANNED: u32 = 0x9aa0ab;
-    /// The ring drawn around the control the keyboard is on.
-    ///
-    /// It is the accent's own family but its own token: a focus ring may be tuned
-    /// for visibility without moving the colour of the primary action. The ring is
-    /// always drawn in addition to a thickness or edge change, never instead of one.
-    pub const FOCUS_RING: u32 = 0xa9b7ff;
-    /// Fill of a control that cannot be used right now.
-    pub const DISABLED_SURFACE: u32 = 0x141519;
-    /// Text and icons on [`DISABLED_SURFACE`].
-    ///
-    /// Inactive controls are exempt from WCAG AA, but they are still read, so the
-    /// pair keeps the graphic floor instead of disappearing into the fill.
-    pub const DISABLED_TEXT: u32 = 0x7a7e87;
-    /// The groove an in-flight indicator travels in.
-    pub const LOADING_TRACK: u32 = 0x22242b;
-    /// The in-flight indicator itself; it never carries meaning on its own, the
-    /// state's word does.
-    pub const LOADING_FILL: u32 = 0x95a8fd;
-    /// What a dialog lays over the page beneath it, at [`scrim`]'s alpha.
-    pub const SCRIM: u32 = 0x05060a;
-    /// Host avatar pairs (tint, initials): slate, steel, sand, sage, clay.
-    ///
-    /// The first pair is the accent tint, kept for the first host group. The rest are
-    /// low-chroma earth and metal tints: an avatar says which host this is, so it must
-    /// not compete with the accent that says which host is current.
+/// Views hold tokens, never resolved colours; [`swatch`] resolves one in the palette the
+/// window is being drawn in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Token {
+    dark: u32,
+    light: u32,
+}
+
+impl Token {
+    /// A token from its dark and its light value.
+    #[must_use]
+    pub const fn new(dark: u32, light: u32) -> Self {
+        Self { dark, light }
+    }
+
+    /// The 24-bit sRGB value in the dark palette.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const fn dark(self) -> u32 {
+        self.dark
+    }
+
+    /// The 24-bit sRGB value in the light palette.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const fn light(self) -> u32 {
+        self.light
+    }
+
+    /// The value in one palette.
+    #[must_use]
+    pub const fn value(self, appearance: Appearance) -> u32 {
+        match appearance {
+            Appearance::Dark => self.dark,
+            Appearance::Light => self.light,
+        }
+    }
+}
+
+impl std::fmt::LowerHex for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:06x}/{:06x}", self.dark, self.light)
+    }
+}
+
+/// The dark palette: a blue-black graphite.
+///
+/// The surfaces climb in five layers, each a little lighter than the one it sits on:
+/// canvas, chrome, surface, raised and overlay. A dark palette cannot lean on shadow
+/// alone - a shadow on black barely shows - so a raised object also carries a lighter
+/// fill and a brighter edge.
+// The tables hold every token, including the ones only the next screens draw with.
+#[allow(dead_code)]
+pub mod dark {
+    /// The window's floor: behind the content area and around the terminal.
+    pub const CANVAS: u32 = 0x0d0e12;
+    /// The title bar, the tab strip, the navigation rail and the status bar.
+    pub const CHROME: u32 = 0x131419;
+    /// Content: cards, list rows, inputs and the current tab.
+    pub const SURFACE: u32 = 0x18191f;
+    /// Things that float over content: menus, popovers, tooltips and toasts.
+    pub const RAISED: u32 = 0x1f2027;
+    /// Dialogs, the front-most layer.
+    pub const OVERLAY: u32 = 0x23242c;
+    pub const SURFACE_HOVER: u32 = 0x262730;
+    pub const SURFACE_SELECTED: u32 = 0x2b2c36;
+    pub const SURFACE_PRESSED: u32 = 0x31323d;
+    pub const BORDER: u32 = 0x272831;
+    pub const BORDER_STRONG: u32 = 0x373844;
+    pub const SEGMENT_TRACK: u32 = 0x101115;
+    pub const SEGMENT_THUMB: u32 = 0x2c2d37;
+    pub const TEXT_PRIMARY: u32 = 0xeeeff4;
+    pub const TEXT_SECONDARY: u32 = 0xb6b8c3;
+    pub const TEXT_MUTED: u32 = 0x9c9faa;
+    pub const ACCENT: u32 = 0x8f9dff;
+    pub const ACCENT_HOVER: u32 = 0xa6b1ff;
+    pub const ACCENT_PRESSED: u32 = 0x7887f2;
+    pub const ON_ACCENT: u32 = 0x0d1033;
+    pub const ACCENT_TINT: u32 = 0x1d2042;
+    pub const ACCENT_ON_TINT: u32 = 0xc0c8ff;
+    pub const POSITIVE: u32 = 0x5fd4a3;
+    pub const WARNING: u32 = 0xe9c27c;
+    pub const DANGER: u32 = 0xff8f97;
+    pub const INFO: u32 = 0x7cc4f2;
+    pub const PLANNED: u32 = 0x9ca1ad;
+    pub const POSITIVE_TINT: u32 = 0x13261f;
+    pub const WARNING_TINT: u32 = 0x2a2214;
+    pub const DANGER_TINT: u32 = 0x2e181b;
+    pub const INFO_TINT: u32 = 0x14232f;
+    pub const DANGER_SOLID: u32 = 0xc42b1c;
+    pub const ON_DANGER: u32 = 0xffffff;
+    pub const TRACK_OFF: u32 = 0x3b3c47;
+    pub const KNOB: u32 = 0xf4f5f8;
+    pub const FOCUS_RING: u32 = 0xadb8ff;
+    pub const DISABLED_SURFACE: u32 = 0x17181d;
+    pub const DISABLED_TEXT: u32 = 0x7b7f89;
+    pub const LOADING_TRACK: u32 = 0x262830;
+    pub const LOADING_FILL: u32 = 0x97a5ff;
+    pub const SCRIM: u32 = 0x040508;
+    pub const SHADOW: u32 = 0x000000;
+    pub const BRAND_END: u32 = 0xb29bfc;
     pub const AVATARS: [(u32, u32); 6] = [
         (ACCENT_TINT, ACCENT_ON_TINT),
         (0x1a2430, 0xbcd2e6),
@@ -119,25 +139,242 @@ pub mod palette {
         (0x1e2620, 0xb3cfb0),
         (0x2a1f1d, 0xe0bcae),
     ];
-    /// The deeper stop of the one remaining accent gradient.
+    pub const TAB_ACCENTS: [u32; 6] = [0x9cbcd8, 0xb9aecb, 0x8fc6cf, 0xaec79a, 0xd3bc9c, 0xd4a8ae];
+}
+
+/// The light palette: cool paper.
+///
+/// Content is white on a faintly grey floor, and the chrome is one step darker than the
+/// floor. In light the layers above content stay white and are told apart by their
+/// shadow, which is what a light window does well.
+#[allow(dead_code)]
+pub mod light {
+    pub const CANVAS: u32 = 0xf3f4f7;
+    pub const CHROME: u32 = 0xebecf0;
+    pub const SURFACE: u32 = 0xffffff;
+    pub const RAISED: u32 = 0xffffff;
+    pub const OVERLAY: u32 = 0xffffff;
+    pub const SURFACE_HOVER: u32 = 0xeef0f4;
+    pub const SURFACE_SELECTED: u32 = 0xe5e7ee;
+    pub const SURFACE_PRESSED: u32 = 0xdcdfe7;
+    pub const BORDER: u32 = 0xe1e3e9;
+    pub const BORDER_STRONG: u32 = 0xc9ccd5;
+    pub const SEGMENT_TRACK: u32 = 0xe9ebf0;
+    pub const SEGMENT_THUMB: u32 = 0xffffff;
+    pub const TEXT_PRIMARY: u32 = 0x16171d;
+    pub const TEXT_SECONDARY: u32 = 0x444652;
+    pub const TEXT_MUTED: u32 = 0x5a5d68;
+    pub const ACCENT: u32 = 0x4053cc;
+    pub const ACCENT_HOVER: u32 = 0x3646b4;
+    pub const ACCENT_PRESSED: u32 = 0x2e3c9b;
+    pub const ON_ACCENT: u32 = 0xffffff;
+    pub const ACCENT_TINT: u32 = 0xeceffe;
+    pub const ACCENT_ON_TINT: u32 = 0x3442a6;
+    pub const POSITIVE: u32 = 0x0f6e49;
+    pub const WARNING: u32 = 0x7a5300;
+    pub const DANGER: u32 = 0xb42b3c;
+    pub const INFO: u32 = 0x1d5f8f;
+    pub const PLANNED: u32 = 0x5b606a;
+    pub const POSITIVE_TINT: u32 = 0xdff2e8;
+    pub const WARNING_TINT: u32 = 0xfaf0d8;
+    pub const DANGER_TINT: u32 = 0xfce7e9;
+    pub const INFO_TINT: u32 = 0xe2eff9;
+    pub const DANGER_SOLID: u32 = 0xc42b1c;
+    pub const ON_DANGER: u32 = 0xffffff;
+    pub const TRACK_OFF: u32 = 0xc4c7d0;
+    pub const KNOB: u32 = 0xffffff;
+    pub const FOCUS_RING: u32 = 0x3646b4;
+    pub const DISABLED_SURFACE: u32 = 0xf0f1f4;
+    pub const DISABLED_TEXT: u32 = 0x767b84;
+    pub const LOADING_TRACK: u32 = 0xe2e4e9;
+    pub const LOADING_FILL: u32 = 0x4053cc;
+    pub const SCRIM: u32 = 0x1a1c22;
+    pub const SHADOW: u32 = 0x101828;
+    pub const BRAND_END: u32 = 0x7c5cd6;
+    pub const AVATARS: [(u32, u32); 6] = [
+        (ACCENT_TINT, ACCENT_ON_TINT),
+        (0xe4eef7, 0x1c4a6b),
+        (0xdff1ee, 0x14574f),
+        (0xf8efd9, 0x6b4a00),
+        (0xe6f1e4, 0x2d5a2a),
+        (0xf9e9e3, 0x7a3a24),
+    ];
+    pub const TAB_ACCENTS: [u32; 6] = [0x2f5f86, 0x5d4a80, 0x1a6b74, 0x51662f, 0x8a5a20, 0x8b4450];
+
+    /// The terminal's default colours and its 16 ANSI colours, light.
     ///
-    /// It is the lavender the logo's crescent fades into, so the one gradient left - the
-    /// welcome emblem - is the logo's own. No regular control is filled with it.
-    pub const BRAND_END: u32 = 0xb29bfc;
-    /// Tab identity colours, in [`TabAccent::ALL`] order.
+    /// Keyed by the dark values of `shellune_terminal::palette`; a colour a program
+    /// set itself (256-colour or true colour) is drawn as it asked.
+    pub const TERMINAL: &[(u32, u32)] = &[
+        (0xe6e9f0, 0x1f2329), // foreground
+        (0x0b0c10, 0xfcfcfd), // background
+        (0x8b9ffd, 0x3f52c8), // cursor
+        (0x2b313d, 0x3a3e48), // black
+        (0xff8d99, 0xc8334a), // red
+        (0x64d8a8, 0x2a7a3f), // green
+        (0xf3c66c, 0x8a5c00), // yellow
+        (0x9db4ff, 0x3157c9), // blue
+        (0xd7a0ff, 0x8c35a8), // magenta
+        (0x7fd8e8, 0x0b7286), // cyan
+        (0xb5bdcc, 0x80879a), // white
+        (0x828b9c, 0x646b7b), // bright black
+        (0xffb3bc, 0xb52a3f), // bright red
+        (0x8de6c0, 0x246c37), // bright green
+        (0xf8d894, 0x7a5100), // bright yellow
+        (0xbccbff, 0x2a4cb6), // bright blue
+        (0xe3c4ff, 0x7b2b95), // bright magenta
+        (0xa8e9f4, 0x0a6474), // bright cyan
+        (0xeef1f7, 0x4a4f5c), // bright white
+    ];
+}
+
+/// The colour tokens views paint with.
+///
+/// The interface takes its colours from the logo: a blue-black graphite in the dark and
+/// a cool paper grey in the light, with exactly one chromatic identity colour - the
+/// logo's periwinkle - as the accent for the current object and the one primary action.
+/// Nothing else in the regular interface is saturated, so a busy session list stays
+/// quiet and the only colours that shout are the status tones.
+pub mod palette {
+    use super::{Token, dark, light};
+
+    macro_rules! tokens {
+        ($($(#[$doc:meta])* $name:ident;)*) => {
+            $($(#[$doc])* pub const $name: Token = Token::new(dark::$name, light::$name);)*
+        };
+    }
+
+    tokens! {
+        /// Layer 0, the window's floor: the content area behind cards, and the frame
+        /// around the terminal.
+        CANVAS;
+        /// Layer 1, the chrome: the title bar, the tab strip, the rail and the status
+        /// bar.
+        CHROME;
+        /// Layer 2, content: cards, list rows, inputs and the current tab, which joins
+        /// the page under it.
+        SURFACE;
+        /// Layer 3, things that float over content: menus, popovers, tooltips, toasts.
+        RAISED;
+        /// Layer 4, dialogs: the front-most surface, drawn over the scrim.
+        OVERLAY;
+        /// A surface under the pointer.
+        SURFACE_HOVER;
+        /// The selected navigation entry, tab or choice.
+        SURFACE_SELECTED;
+        /// A control under the pressed pointer, one step past selected, so a press is
+        /// felt and not only tinted.
+        SURFACE_PRESSED;
+        /// The weak hairline between regions and around cards.
+        BORDER;
+        /// The strong edge of controls, floating layers and an element under the pointer.
+        BORDER_STRONG;
+        /// The sunken track a segmented control's options sit in.
+        SEGMENT_TRACK;
+        /// The raised thumb under the chosen option of a segmented control.
+        SEGMENT_THUMB;
+        /// Primary text: titles and the current object.
+        TEXT_PRIMARY;
+        /// Secondary text: body copy and list metadata.
+        TEXT_SECONDARY;
+        /// Muted text: hints, counts and the status bar. It keeps the body floor on the
+        /// pressed surface too, not just on the resting ones.
+        TEXT_MUTED;
+        /// The selected destination and the primary action.
+        ACCENT;
+        /// A solid primary button under the pointer.
+        ACCENT_HOVER;
+        /// A pressed primary button: one step down, so a press sinks.
+        ACCENT_PRESSED;
+        /// Text on a solid [`ACCENT`] fill.
+        ON_ACCENT;
+        /// A soft accent fill.
+        ACCENT_TINT;
+        /// Text and icons on [`ACCENT_TINT`].
+        ACCENT_ON_TINT;
+        /// Live and completed status; also its text on [`POSITIVE_TINT`].
+        POSITIVE;
+        /// Waiting, verifying or in-progress status.
+        WARNING;
+        /// Failed, rejected or unavailable status.
+        DANGER;
+        /// Neutral information that still wants attention.
+        #[cfg_attr(not(test), allow(dead_code))]
+        INFO;
+        /// Planned-but-not-shipped status; deliberately desaturated.
+        PLANNED;
+        /// The tint behind a positive chip or banner.
+        POSITIVE_TINT;
+        /// The tint behind a warning chip or banner.
+        WARNING_TINT;
+        /// The tint behind a danger chip, banner or destructive button.
+        DANGER_TINT;
+        /// The tint behind an information banner.
+        #[cfg_attr(not(test), allow(dead_code))]
+        INFO_TINT;
+        /// A solid destructive fill, such as the window's close button under the
+        /// pointer.
+        DANGER_SOLID;
+        /// Text and icons on [`DANGER_SOLID`].
+        ON_DANGER;
+        /// The track of a switch that is off.
+        #[cfg_attr(not(test), allow(dead_code))]
+        TRACK_OFF;
+        /// The knob of a switch, in either state.
+        #[cfg_attr(not(test), allow(dead_code))]
+        KNOB;
+        /// The ring around the control the keyboard is on. Always drawn together with a
+        /// thicker edge, never instead of one.
+        FOCUS_RING;
+        /// A control that cannot be used right now.
+        DISABLED_SURFACE;
+        /// Text on [`DISABLED_SURFACE`]; it keeps the graphic floor.
+        DISABLED_TEXT;
+        /// The groove an in-flight indicator travels in.
+        LOADING_TRACK;
+        /// The in-flight indicator itself.
+        LOADING_FILL;
+        /// What a dialog lays over the page beneath it, at [`super::SCRIM_ALPHA`].
+        SCRIM;
+        /// The ink of an elevation shadow.
+        SHADOW;
+        /// The deeper stop of the one accent gradient, the logo's lavender tail.
+        BRAND_END;
+    }
+
+    /// Host avatar pairs (tint, initials): accent, slate, steel, sand, sage, clay.
+    ///
+    /// The first pair is the accent tint, kept for the first host group. The rest are
+    /// low-chroma earth and metal tints: an avatar says which host this is, so it must
+    /// not compete with the accent that says which host is current.
+    pub const AVATARS: [(Token, Token); 6] = {
+        let mut pairs = [(CANVAS, CANVAS); 6];
+        let mut index = 0;
+        while index < 6 {
+            pairs[index] = (
+                Token::new(dark::AVATARS[index].0, light::AVATARS[index].0),
+                Token::new(dark::AVATARS[index].1, light::AVATARS[index].1),
+            );
+            index += 1;
+        }
+        pairs
+    };
+
+    /// Tab identity colours, in `TabAccent::ALL` order: slate, heather, steel, sage,
+    /// sand, dust.
     ///
     /// They are deliberately not the status hues: green, amber and red keep meaning
-    /// "connected", "waiting" and "failed", and a tab colour must never be read as
-    /// one of those. Each value keeps its contrast on every tab surface in both
-    /// palettes (checked by the palette tests).
-    pub const TAB_ACCENTS: [u32; 6] = [
-        0x9cbcd8, // slate
-        0xb9aecb, // heather
-        0x8fc6cf, // steel
-        0xaec79a, // sage
-        0xd3bc9c, // sand
-        0xd4a8ae, // dust
-    ];
+    /// "connected", "waiting" and "failed", and a tab colour must never be read as one
+    /// of those.
+    pub const TAB_ACCENTS: [Token; 6] = {
+        let mut accents = [CANVAS; 6];
+        let mut index = 0;
+        while index < 6 {
+            accents[index] = Token::new(dark::TAB_ACCENTS[index], light::TAB_ACCENTS[index]);
+            index += 1;
+        }
+        accents
+    };
 }
 
 /// The token a tab's distinguishing colour is drawn with.
@@ -145,7 +382,7 @@ pub mod palette {
 /// The colour is an identity aid, never a status: a tab keeps its status dot, its
 /// state word and its target whatever colour the user gives it.
 #[must_use]
-pub fn tab_accent_token(accent: TabAccent) -> u32 {
+pub fn tab_accent_token(accent: TabAccent) -> Token {
     let index = TabAccent::ALL
         .iter()
         .position(|candidate| *candidate == accent)
@@ -177,9 +414,9 @@ pub enum SwatchState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwatchFace {
     /// The fill behind the colour, when this state paints one.
-    pub fill: Option<u32>,
+    pub fill: Option<Token>,
     /// The ring around the colour, when this state draws one.
-    pub ring: Option<u32>,
+    pub ring: Option<Token>,
 }
 
 impl SwatchFace {
@@ -237,16 +474,22 @@ pub mod spacing {
     pub const LOOSE: f32 = 24.0;
 }
 
-/// Corner radii in logical pixels.
+/// Corner radii in logical pixels: 6, 8, 10, 14 and 20.
+///
+/// The radius grows with the object: the smaller a thing is, the tighter its corner, so
+/// a chip inside a card does not look rounder than the card.
 pub mod radius {
-    /// Chips, keycaps and small controls.
+    /// Chips, keycaps, checkboxes and small controls.
     pub const SMALL: f32 = 6.0;
-    /// Buttons, rows, tabs and inputs.
+    /// Buttons, rows, menu entries and inputs.
     pub const MEDIUM: f32 = 8.0;
-    /// Cards, menus and the terminal frame.
-    pub const LARGE: f32 = 12.0;
-    /// Hero tiles and the welcome emblem.
-    pub const XLARGE: f32 = 16.0;
+    /// Cards, menus, toasts, tabs and the terminal frame.
+    pub const LARGE: f32 = 10.0;
+    /// Dialogs and hero tiles.
+    pub const XLARGE: f32 = 14.0;
+    /// The welcome emblem and the splash mark.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const XXLARGE: f32 = 20.0;
 }
 
 /// Type scale in logical pixels.
@@ -259,15 +502,36 @@ pub mod type_scale {
     pub const BODY: f32 = 13.0;
     /// Panel title.
     pub const TITLE: f32 = 15.0;
-    /// Destination title in the header.
+    /// Destination title in the header and dialog titles.
     pub const HEADING: f32 = 17.0;
+    /// A page title.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const DISPLAY: f32 = 22.0;
     /// The welcome title on an empty page.
-    pub const HERO: f32 = 24.0;
+    pub const HERO: f32 = 28.0;
 }
 
-/// Colour helper so views do not call `rgb` with literals.
-pub fn swatch(hex: u32) -> Rgba {
-    rgb(resolve(hex))
+/// The three weights the interface uses.
+///
+/// Regular for reading, medium for labels and controls, semibold for titles. Bold is not
+/// used: at interface sizes it smears more than it stresses.
+pub mod weight {
+    use gpui::FontWeight;
+
+    /// Body copy.
+    pub const NORMAL: FontWeight = FontWeight::NORMAL;
+    /// Button labels, chips, list names and the current tab.
+    pub const MEDIUM: FontWeight = FontWeight::MEDIUM;
+    /// Titles and headings.
+    pub const SEMIBOLD: FontWeight = FontWeight::SEMIBOLD;
+}
+
+/// Resolves a token in the palette the window is being drawn in.
+///
+/// Views never call `rgb` with a literal; this is the one place a token turns into a
+/// colour.
+pub fn swatch(token: Token) -> Rgba {
+    rgb(resolve(token))
 }
 
 /// Which palette the window is drawn in.
@@ -307,6 +571,13 @@ pub enum Motion {
 }
 
 impl Motion {
+    /// A small state change: a dot fading in, a chip appearing. 120 ms.
+    pub const FAST: Duration = Duration::from_millis(120);
+    /// An object entering: a menu, a toast, a card. 180 ms.
+    pub const BASE: Duration = Duration::from_millis(180);
+    /// A large surface entering: a dialog, the splash. 260 ms.
+    pub const SLOW: Duration = Duration::from_millis(260);
+
     /// Whether a short animation may run.
     #[must_use]
     pub fn allows_animation(self) -> bool {
@@ -384,6 +655,8 @@ thread_local! {
     static TERMINAL_APPEARANCE: std::cell::Cell<Appearance> = const { std::cell::Cell::new(Appearance::Dark) };
     /// The motion preference of the window being drawn. Not read from the OS.
     static MOTION: std::cell::Cell<Motion> = const { std::cell::Cell::new(Motion::Full) };
+    /// The text size of the window being drawn.
+    static ZOOM: std::cell::Cell<Zoom> = const { std::cell::Cell::new(Zoom::Regular) };
 }
 
 /// The palette the window is drawn in now.
@@ -420,111 +693,155 @@ pub fn set_motion(motion: Motion) {
     MOTION.with(|current| current.set(motion));
 }
 
-/// The value a token has in the current palette.
-///
-/// The tokens are the dark palette's values; the light palette is a table keyed by
-/// them, so every view keeps naming one token and gets the value that fits.
+/// The metrics of the window being drawn, for the pieces drawn outside the window's own
+/// render pass - the terminal's frame and a tooltip - which would otherwise fall back to
+/// 100% and ignore the user's text size.
 #[must_use]
-pub fn resolve(token: u32) -> u32 {
-    match appearance() {
-        Appearance::Dark => token,
-        Appearance::Light => light_value(token),
+pub fn metrics() -> Metrics {
+    Metrics::new(ZOOM.with(std::cell::Cell::get))
+}
+
+/// Sets the zoom the next draws use; the window calls it before drawing.
+pub fn set_zoom(zoom: Zoom) {
+    ZOOM.with(|current| current.set(zoom));
+}
+
+/// How an object arrives on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Enter {
+    /// Fades in where it is: toasts, tooltips, a chip.
+    Fade,
+    /// Fades in while rising a few pixels into place: cards, menus.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Rise,
+    /// Fades in while settling from slightly above: dialogs and the splash. GPUI
+    /// cannot scale a box, so the settle stands in for the slight zoom.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Settle,
+}
+
+impl Enter {
+    /// How long this entrance takes.
+    #[must_use]
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::Fade => Motion::FAST,
+            Self::Rise => Motion::BASE,
+            Self::Settle => Motion::SLOW,
+        }
+    }
+
+    /// How far the object travels, in logical pixels; negative is from above.
+    fn travel(self) -> f32 {
+        match self {
+            Self::Fade => 0.0,
+            Self::Rise => 6.0,
+            Self::Settle => -8.0,
+        }
     }
 }
 
-/// The light value of a dark token; a value that is not a token is returned as it is.
-#[must_use]
-pub fn light_value(token: u32) -> u32 {
-    light::TABLE
-        .iter()
-        .find(|(dark, _)| *dark == token)
-        .map_or(token, |(_, light)| *light)
+/// The curve every entrance follows: quick out of the gate, settling softly.
+pub fn ease_out() -> impl Fn(f32) -> f32 {
+    gpui::ease_out_quint()
 }
 
-/// The light palette, as pairs of (dark token, light value).
-pub mod light {
-    use super::palette as dark;
+/// Plays an entrance on `element` when motion is allowed.
+///
+/// Motion is only ever an entrance: GPUI has no hover transitions, so the pointer
+/// changes a face at once, and nothing loops except an in-flight indicator. With motion
+/// reduced the element is drawn in its final place at once. The `id` keys the
+/// animation, so a re-render with the same id does not play it again.
+pub fn enter<E>(element: E, id: impl Into<ElementId>, kind: Enter) -> AnyElement
+where
+    E: IntoElement + Styled + 'static,
+{
+    if !motion_allowed() {
+        return element.into_any_element();
+    }
+    let travel = kind.travel();
+    element
+        .with_animation(
+            id,
+            Animation::new(kind.duration()).with_easing(ease_out()),
+            move |element, delta| {
+                let element = element.opacity(delta);
+                if travel == 0.0 {
+                    element
+                } else {
+                    element.relative().top(px(travel * (1.0 - delta)))
+                }
+            },
+        )
+        .into_any_element()
+}
 
-    /// Every token of [`super::palette`] and its light value.
-    pub const TABLE: &[(u32, u32)] = &[
-        (dark::CANVAS, 0xf6f7fb),
-        (dark::SURFACE, 0xeff0f6),
-        (dark::SURFACE_RAISED, 0xffffff),
-        (dark::SURFACE_HOVER, 0xe9eaf2),
-        (dark::SURFACE_SELECTED, 0xe0e2ec),
-        (dark::SURFACE_PRESSED, 0xd7d9e5),
-        (dark::BORDER, 0xdfe1ea),
-        (dark::BORDER_STRONG, 0xc5c7d2),
-        (dark::SEGMENT_TRACK, 0xebedf3),
-        (dark::SEGMENT_THUMB, 0xffffff),
-        (dark::TEXT_PRIMARY, 0x15161c),
-        (dark::TEXT_SECONDARY, 0x444652),
-        (dark::TEXT_MUTED, 0x595b67),
-        (dark::ACCENT, 0x3f52c8),
-        (dark::ACCENT_HOVER, 0x3646b0),
-        (dark::ACCENT_PRESSED, 0x2e3c98),
-        (dark::ON_ACCENT, 0xffffff),
-        (dark::ACCENT_TINT, 0xeceffe),
-        (dark::ACCENT_ON_TINT, 0x3442a6),
-        (dark::POSITIVE_TINT, 0xdff2e8),
-        (dark::WARNING_TINT, 0xfaf0d8),
-        (dark::DANGER_TINT, 0xfce7e9),
-        (dark::POSITIVE, 0x10714b),
-        (dark::WARNING, 0x7a5300),
-        (dark::DANGER, 0xb32b3c),
-        (dark::PLANNED, 0x5b606a),
-        (dark::FOCUS_RING, 0x3646b0),
-        (dark::DISABLED_SURFACE, 0xf1f2f4),
-        (dark::DISABLED_TEXT, 0x777c85),
-        (dark::LOADING_TRACK, 0xe2e4e8),
-        (dark::LOADING_FILL, 0x3f52c8),
-        (dark::SCRIM, 0x1a1c20),
-        (dark::BRAND_END, 0x7c5cd6),
-        // Host avatars after the accent pair they share their first entry with.
-        (dark::AVATARS[1].0, 0xe4eef7),
-        (dark::AVATARS[1].1, 0x1c4a6b),
-        (dark::AVATARS[2].0, 0xdff1ee),
-        (dark::AVATARS[2].1, 0x14574f),
-        (dark::AVATARS[3].0, 0xf8efd9),
-        (dark::AVATARS[3].1, 0x6b4a00),
-        (dark::AVATARS[4].0, 0xe6f1e4),
-        (dark::AVATARS[4].1, 0x2d5a2a),
-        (dark::AVATARS[5].0, 0xf9e9e3),
-        (dark::AVATARS[5].1, 0x7a3a24),
-        // Tab identity colours: the same hue, dark enough for a light surface.
-        (dark::TAB_ACCENTS[0], 0x2f5f86),
-        (dark::TAB_ACCENTS[1], 0x5d4a80),
-        (dark::TAB_ACCENTS[2], 0x1a6b74),
-        (dark::TAB_ACCENTS[3], 0x51662f),
-        (dark::TAB_ACCENTS[4], 0x8a5a20),
-        (dark::TAB_ACCENTS[5], 0x8b4450),
-    ];
+/// How far an object floats above what it sits on.
+///
+/// Each level is a pair of shadows - a tight contact shadow and a soft ambient one - so
+/// a raised object has an edge and a presence. Dark shadows are deeper: on a dark floor
+/// a light shadow does not read at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elevation {
+    /// On the page: no shadow. Rows, the chrome, inline controls.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Flat,
+    /// Resting on the page: cards, inputs, the chosen segment.
+    Low,
+    /// Over the page: menus, popovers, tooltips and toasts.
+    Mid,
+    /// Over everything: dialogs and the splash.
+    High,
+}
 
-    /// The terminal's default colours and its 16 ANSI colours, light.
-    ///
-    /// Keyed by the dark values of `shellune_terminal::palette`; a colour a program
-    /// set itself (256-colour or true colour) is drawn as it asked.
-    pub const TERMINAL: &[(u32, u32)] = &[
-        (0xe6e9f0, 0x1f2329), // foreground
-        (0x0b0c10, 0xfcfcfd), // background
-        (0x8b9ffd, 0x3f52c8), // cursor
-        (0x2b313d, 0x3a3e48), // black
-        (0xff8d99, 0xc8334a), // red
-        (0x64d8a8, 0x2a7a3f), // green
-        (0xf3c66c, 0x8a5c00), // yellow
-        (0x9db4ff, 0x3157c9), // blue
-        (0xd7a0ff, 0x8c35a8), // magenta
-        (0x7fd8e8, 0x0b7286), // cyan
-        (0xb5bdcc, 0x80879a), // white
-        (0x828b9c, 0x646b7b), // bright black
-        (0xffb3bc, 0xb52a3f), // bright red
-        (0x8de6c0, 0x246c37), // bright green
-        (0xf8d894, 0x7a5100), // bright yellow
-        (0xbccbff, 0x2a4cb6), // bright blue
-        (0xe3c4ff, 0x7b2b95), // bright magenta
-        (0xa8e9f4, 0x0a6474), // bright cyan
-        (0xeef1f7, 0x4a4f5c), // bright white
-    ];
+impl Elevation {
+    /// The shadows of this level in the palette being drawn.
+    #[must_use]
+    pub fn shadows(self) -> Vec<BoxShadow> {
+        let dark = appearance() == Appearance::Dark;
+        // (y offset, blur, spread, alpha) for the contact and the ambient shadow.
+        let layers: &[(f32, f32, f32, f32)] = match (self, dark) {
+            (Self::Flat, _) => &[],
+            (Self::Low, false) => &[(1.0, 2.0, 0.0, 0.06), (1.0, 3.0, 0.0, 0.08)],
+            (Self::Low, true) => &[(1.0, 2.0, 0.0, 0.32), (1.0, 4.0, 0.0, 0.24)],
+            (Self::Mid, false) => &[(2.0, 4.0, -1.0, 0.06), (8.0, 20.0, -4.0, 0.14)],
+            (Self::Mid, true) => &[(2.0, 4.0, -1.0, 0.40), (10.0, 24.0, -4.0, 0.50)],
+            (Self::High, false) => &[(4.0, 8.0, -2.0, 0.08), (20.0, 48.0, -8.0, 0.22)],
+            (Self::High, true) => &[(4.0, 8.0, -2.0, 0.45), (24.0, 56.0, -8.0, 0.65)],
+        };
+        let ink = swatch(palette::SHADOW);
+        layers
+            .iter()
+            .map(|&(y, blur, spread, alpha)| BoxShadow {
+                color: faded(ink, alpha).into(),
+                offset: point(px(0.0), px(y)),
+                blur_radius: px(blur),
+                spread_radius: px(spread),
+            })
+            .collect()
+    }
+}
+
+/// Lets any styled element take an [`Elevation`] instead of a GPUI shadow preset.
+pub trait Elevated: Styled + Sized {
+    /// Draws this element at `level`.
+    #[must_use]
+    fn elevation(self, level: Elevation) -> Self {
+        let shadows = level.shadows();
+        if shadows.is_empty() {
+            self
+        } else {
+            self.shadow(shadows)
+        }
+    }
+}
+
+impl<T: Styled + Sized> Elevated for T {}
+
+/// The value a token has in the palette the window is being drawn in.
+#[must_use]
+pub fn resolve(token: Token) -> u32 {
+    token.value(appearance())
 }
 
 /// A terminal colour in the current palette.
@@ -556,14 +873,12 @@ pub fn clear() -> Rgba {
 ///
 /// The page stays legible underneath: the backdrop only has to make the dialog the
 /// front-most object, not to black the window out.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const SCRIM_ALPHA: f32 = 0.62;
 
 /// The backdrop a dialog draws over the page beneath it.
 ///
 /// It is a translucent [`palette::SCRIM`] rather than a solid fill, so a dialog does
 /// not look like a second window and the page keeps its place.
-#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub fn scrim() -> Rgba {
     faded(swatch(palette::SCRIM), SCRIM_ALPHA)
@@ -629,8 +944,8 @@ impl Tone {
         swatch(self.token())
     }
 
-    /// The raw token behind [`Tone::text`], exposed for contrast tests.
-    pub fn token(self) -> u32 {
+    /// The token behind [`Tone::text`], exposed for contrast tests.
+    pub fn token(self) -> Token {
         match self {
             Self::Neutral => palette::TEXT_SECONDARY,
             Self::Accent => palette::ACCENT,
@@ -650,8 +965,8 @@ impl Tone {
         swatch(self.tint())
     }
 
-    /// The raw token behind [`Tone::chip_background`].
-    pub fn tint(self) -> u32 {
+    /// The token behind [`Tone::chip_background`].
+    pub fn tint(self) -> Token {
         match self {
             Self::Accent => palette::ACCENT_TINT,
             Self::Positive => palette::POSITIVE_TINT,
@@ -864,6 +1179,12 @@ impl Metrics {
         self.scale(type_scale::HEADING)
     }
 
+    /// Page title size.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn display_size(self) -> Pixels {
+        self.scale(type_scale::DISPLAY)
+    }
+
     /// Welcome title size.
     pub fn hero_size(self) -> Pixels {
         self.scale(type_scale::HERO)
@@ -871,12 +1192,17 @@ impl Metrics {
 
     /// Weight for body copy.
     pub fn body_weight(self) -> FontWeight {
-        FontWeight::NORMAL
+        weight::NORMAL
+    }
+
+    /// Weight for labels, controls and names in a list.
+    pub fn medium_weight(self) -> FontWeight {
+        weight::MEDIUM
     }
 
     /// Weight for titles.
     pub fn title_weight(self) -> FontWeight {
-        FontWeight::SEMIBOLD
+        weight::SEMIBOLD
     }
 }
 
@@ -939,14 +1265,29 @@ pub mod contrast {
         };
         (lighter + 0.05) / (darker + 0.05)
     }
+
+    /// The contrast of a token pair in each palette, dark first.
+    pub fn both(foreground: super::Token, background: super::Token) -> (f64, f64) {
+        (
+            ratio(foreground.dark(), background.dark()),
+            ratio(foreground.light(), background.light()),
+        )
+    }
+
+    /// The lower of the pair's two contrasts: the floor holds in both palettes only if
+    /// this reaches it.
+    pub fn worst(foreground: super::Token, background: super::Token) -> f64 {
+        let (dark, light) = both(foreground, background);
+        dark.min(light)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        StatusMark, Tone, contrast,
-        light::{TABLE, TERMINAL},
-        light_value, palette,
+        Appearance, Elevation, Enter, Motion, StatusMark, Token, Tone, contrast, dark,
+        light::{self, TERMINAL},
+        palette, radius, type_scale,
     };
 
     /// Minimum contrast for body text (WCAG AA).
@@ -954,171 +1295,155 @@ mod tests {
     /// Minimum contrast for status dots, marks, focus rings and inactive controls.
     const GRAPHIC: f64 = 3.0;
 
-    /// The light value of a dark token.
-    fn light(token: u32) -> u32 {
-        light_value(token)
-    }
+    /// The five layers, floor first.
+    const LAYERS: [(&str, Token); 5] = [
+        ("canvas", palette::CANVAS),
+        ("chrome", palette::CHROME),
+        ("surface", palette::SURFACE),
+        ("raised", palette::RAISED),
+        ("overlay", palette::OVERLAY),
+    ];
 
-    /// Every colour token the shell paints with, in one list.
-    ///
-    /// The light palette is a table keyed by the dark value, so two tokens may never
-    /// share one: a duplicate would silently resolve both of them to one light value.
-    fn tokens() -> Vec<(&'static str, u32)> {
-        let mut tokens = vec![
-            ("canvas", palette::CANVAS),
-            ("surface", palette::SURFACE),
-            ("surface raised", palette::SURFACE_RAISED),
-            ("surface hover", palette::SURFACE_HOVER),
-            ("surface selected", palette::SURFACE_SELECTED),
-            ("surface pressed", palette::SURFACE_PRESSED),
-            ("border", palette::BORDER),
-            ("border strong", palette::BORDER_STRONG),
-            ("segment track", palette::SEGMENT_TRACK),
-            ("segment thumb", palette::SEGMENT_THUMB),
-            ("text primary", palette::TEXT_PRIMARY),
-            ("text secondary", palette::TEXT_SECONDARY),
-            ("text muted", palette::TEXT_MUTED),
-            ("accent", palette::ACCENT),
-            ("accent hover", palette::ACCENT_HOVER),
-            ("accent pressed", palette::ACCENT_PRESSED),
-            ("on accent", palette::ON_ACCENT),
-            ("accent tint", palette::ACCENT_TINT),
-            ("accent on tint", palette::ACCENT_ON_TINT),
-            ("positive", palette::POSITIVE),
-            ("warning", palette::WARNING),
-            ("danger", palette::DANGER),
-            ("planned", palette::PLANNED),
-            ("positive tint", palette::POSITIVE_TINT),
-            ("warning tint", palette::WARNING_TINT),
-            ("danger tint", palette::DANGER_TINT),
-            ("focus ring", palette::FOCUS_RING),
-            ("disabled surface", palette::DISABLED_SURFACE),
-            ("disabled text", palette::DISABLED_TEXT),
-            ("loading track", palette::LOADING_TRACK),
-            ("loading fill", palette::LOADING_FILL),
-            ("scrim", palette::SCRIM),
-            ("brand end", palette::BRAND_END),
-        ];
-        // The first avatar pair is the accent tint itself, already listed above.
-        for (tint, text) in palette::AVATARS.iter().skip(1) {
-            tokens.push(("avatar tint", *tint));
-            tokens.push(("avatar text", *text));
-        }
-        for token in palette::TAB_ACCENTS {
-            tokens.push(("tab accent", token));
-        }
-        tokens
-    }
-
-    /// The surfaces a control or a label can be drawn on, in both palettes.
-    fn surfaces() -> Vec<(&'static str, u32, u32)> {
-        [
-            ("canvas", palette::CANVAS),
-            ("surface", palette::SURFACE),
-            ("raised", palette::SURFACE_RAISED),
+    /// Every surface a label can be drawn on: the layers and the interaction fills.
+    fn surfaces() -> Vec<(&'static str, Token)> {
+        let mut surfaces = LAYERS.to_vec();
+        surfaces.extend([
+            ("hover", palette::SURFACE_HOVER),
             ("selected", palette::SURFACE_SELECTED),
             ("pressed", palette::SURFACE_PRESSED),
-        ]
-        .into_iter()
-        .map(|(name, token)| (name, token, light(token)))
-        .collect()
+        ]);
+        surfaces
     }
 
-    #[test]
-    fn no_two_tokens_share_a_value() {
-        let tokens = tokens();
-        for (index, (name, token)) in tokens.iter().enumerate() {
-            for (other_name, other) in tokens.iter().skip(index + 1) {
-                assert_ne!(
-                    token, other,
-                    "{name} and {other_name} are both {token:06x}, so the light table \
-                     cannot tell them apart"
-                );
-            }
-        }
-        assert_eq!(
-            TABLE.len(),
-            tokens.len(),
-            "every token has exactly one light value"
+    fn assert_floor(name: &str, foreground: Token, background: Token, floor: f64) {
+        let (dark, light) = contrast::both(foreground, background);
+        assert!(dark >= floor, "dark {name} is {dark:.2}:1, below {floor}:1");
+        assert!(
+            light >= floor,
+            "light {name} is {light:.2}:1, below {floor}:1"
         );
     }
 
     #[test]
-    fn every_token_has_a_light_value_of_its_own() {
-        for (name, token) in tokens() {
-            assert_ne!(
-                light(token),
-                token,
-                "{name} ({token:06x}) resolves to itself in the light palette"
+    fn body_text_reaches_four_and_a_half_to_one_on_every_surface_in_both_palettes() {
+        // Muted is included: hints, counts and the status bar also sit on a pressed
+        // row, so "muted" is not an exemption from the body floor. The status tones
+        // are words too ("Connected", "Failed"), so they keep the same floor.
+        let text = [
+            ("primary", palette::TEXT_PRIMARY),
+            ("secondary", palette::TEXT_SECONDARY),
+            ("muted", palette::TEXT_MUTED),
+            ("accent", palette::ACCENT),
+            ("positive", palette::POSITIVE),
+            ("warning", palette::WARNING),
+            ("danger", palette::DANGER),
+            ("info", palette::INFO),
+            ("planned", palette::PLANNED),
+        ];
+        for (surface_name, surface) in surfaces() {
+            for (text_name, token) in text {
+                assert_floor(
+                    &format!("{text_name} on {surface_name}"),
+                    token,
+                    surface,
+                    BODY,
+                );
+            }
+            assert_floor(
+                &format!("the focus ring on {surface_name}"),
+                palette::FOCUS_RING,
+                surface,
+                GRAPHIC,
             );
         }
     }
 
     #[test]
-    fn the_new_tokens_reach_their_contrast_floor_in_both_palettes() {
-        for (surface_name, surface, light_surface) in surfaces() {
-            let ring = palette::FOCUS_RING;
-            assert!(
-                contrast::ratio(ring, surface) >= GRAPHIC,
-                "the dark focus ring on {surface_name} is {:.2}:1",
-                contrast::ratio(ring, surface)
+    fn every_status_reads_on_its_own_tint_and_every_fill_carries_its_text() {
+        for (name, text, fill) in [
+            ("positive", palette::POSITIVE, palette::POSITIVE_TINT),
+            ("warning", palette::WARNING, palette::WARNING_TINT),
+            ("danger", palette::DANGER, palette::DANGER_TINT),
+            ("info", palette::INFO, palette::INFO_TINT),
+            ("on accent", palette::ON_ACCENT, palette::ACCENT),
+            ("on accent hover", palette::ON_ACCENT, palette::ACCENT_HOVER),
+            (
+                "on accent pressed",
+                palette::ON_ACCENT,
+                palette::ACCENT_PRESSED,
+            ),
+            (
+                "accent on tint",
+                palette::ACCENT_ON_TINT,
+                palette::ACCENT_TINT,
+            ),
+            ("on danger", palette::ON_DANGER, palette::DANGER_SOLID),
+        ] {
+            assert_floor(name, text, fill, BODY);
+        }
+        for (tint, text) in palette::AVATARS {
+            assert_floor(&format!("avatar {text:x}"), text, tint, BODY);
+        }
+        // An inactive control is still read, and an indicator is a graphic.
+        assert_floor(
+            "disabled text",
+            palette::DISABLED_TEXT,
+            palette::DISABLED_SURFACE,
+            GRAPHIC,
+        );
+        assert_floor(
+            "loading indicator",
+            palette::LOADING_FILL,
+            palette::LOADING_TRACK,
+            GRAPHIC,
+        );
+    }
+
+    #[test]
+    fn the_light_palette_is_its_own_table_not_a_copy_of_the_dark_one() {
+        for (name, token) in surfaces() {
+            assert_ne!(
+                token.dark(),
+                token.light(),
+                "{name} draws one value in both palettes"
             );
+        }
+        // Light reads dark on light; dark reads light on dark.
+        let floor = palette::CANVAS;
+        assert!(
+            contrast::relative_luminance(floor.light())
+                > contrast::relative_luminance(palette::TEXT_PRIMARY.light())
+        );
+        assert!(
+            contrast::relative_luminance(floor.dark())
+                < contrast::relative_luminance(palette::TEXT_PRIMARY.dark())
+        );
+        assert_eq!(palette::CANVAS.value(Appearance::Dark), dark::CANVAS);
+        assert_eq!(palette::CANVAS.value(Appearance::Light), light::CANVAS);
+    }
+
+    #[test]
+    fn the_dark_layers_climb_from_the_floor_to_the_dialog() {
+        // In the dark each layer is lighter than the one under it, so a menu or a
+        // dialog is told apart even where its shadow does not show. In the light the
+        // content layers are white and the floor and chrome are greyer beneath them.
+        for pair in LAYERS.windows(2) {
+            let (below_name, below) = pair[0];
+            let (above_name, above) = pair[1];
             assert!(
-                contrast::ratio(light(ring), light_surface) >= GRAPHIC,
-                "the light focus ring on {surface_name} is {:.2}:1",
-                contrast::ratio(light(ring), light_surface)
+                contrast::relative_luminance(above.dark())
+                    > contrast::relative_luminance(below.dark()),
+                "dark {above_name} is not above {below_name}"
             );
-            // Muted is included: hints, counts and the status bar also sit on a
-            // pressed row, so "muted" is not an exemption from the body floor.
-            for text in [
-                palette::TEXT_PRIMARY,
-                palette::TEXT_SECONDARY,
-                palette::TEXT_MUTED,
-            ] {
+        }
+        for (name, content) in &LAYERS[2..] {
+            for (under_name, under) in &LAYERS[..2] {
                 assert!(
-                    contrast::ratio(text, surface) >= BODY,
-                    "body text on the dark {surface_name} is {:.2}:1",
-                    contrast::ratio(text, surface)
-                );
-                assert!(
-                    contrast::ratio(light(text), light_surface) >= BODY,
-                    "body text on the light {surface_name} is {:.2}:1",
-                    contrast::ratio(light(text), light_surface)
+                    contrast::relative_luminance(content.light())
+                        > contrast::relative_luminance(under.light()),
+                    "light {name} does not stand on {under_name}"
                 );
             }
-        }
-
-        // An inactive control is still read: its text keeps the graphic floor on its
-        // own fill, in both palettes.
-        for (text, surface, palette_name) in [
-            (palette::DISABLED_TEXT, palette::DISABLED_SURFACE, "dark"),
-            (
-                light(palette::DISABLED_TEXT),
-                light(palette::DISABLED_SURFACE),
-                "light",
-            ),
-        ] {
-            let ratio = contrast::ratio(text, surface);
-            assert!(
-                ratio >= GRAPHIC,
-                "{palette_name} disabled text is {ratio:.2}:1"
-            );
-        }
-
-        // The indicator is a graphic, not text: 3:1 against its own track is enough.
-        for (fill, track, palette_name) in [
-            (palette::LOADING_FILL, palette::LOADING_TRACK, "dark"),
-            (
-                light(palette::LOADING_FILL),
-                light(palette::LOADING_TRACK),
-                "light",
-            ),
-        ] {
-            let ratio = contrast::ratio(fill, track);
-            assert!(
-                ratio >= GRAPHIC,
-                "{palette_name} loading indicator is {ratio:.2}:1"
-            );
         }
     }
 
@@ -1134,10 +1459,9 @@ mod tests {
 
     #[test]
     fn the_scrim_dims_the_page_it_covers() {
-        let scrim = palette::SCRIM;
         for (name, scrim, canvas) in [
-            ("dark", scrim, palette::CANVAS),
-            ("light", light(scrim), light(palette::CANVAS)),
+            ("dark", palette::SCRIM.dark(), palette::CANVAS.dark()),
+            ("light", palette::SCRIM.light(), palette::CANVAS.light()),
         ] {
             let covered = over(scrim, f64::from(super::SCRIM_ALPHA), canvas);
             assert!(
@@ -1155,13 +1479,8 @@ mod tests {
 
     #[test]
     fn the_chrome_stays_neutral_and_only_the_accent_carries_hue() {
-        for (name, token) in [
-            ("canvas", palette::CANVAS),
-            ("surface", palette::SURFACE),
-            ("surface raised", palette::SURFACE_RAISED),
-            ("surface hover", palette::SURFACE_HOVER),
-            ("surface selected", palette::SURFACE_SELECTED),
-            ("surface pressed", palette::SURFACE_PRESSED),
+        let mut neutral = surfaces();
+        neutral.extend([
             ("border", palette::BORDER),
             ("border strong", palette::BORDER_STRONG),
             ("text primary", palette::TEXT_PRIMARY),
@@ -1170,8 +1489,9 @@ mod tests {
             ("disabled surface", palette::DISABLED_SURFACE),
             ("disabled text", palette::DISABLED_TEXT),
             ("loading track", palette::LOADING_TRACK),
-        ] {
-            for (palette_name, value) in [("dark", token), ("light", light(token))] {
+        ]);
+        for (name, token) in neutral {
+            for (palette_name, value) in [("dark", token.dark()), ("light", token.light())] {
                 let [_, r, g, b] = value.to_be_bytes();
                 let spread = u8::max(u8::max(r, g), b) - u8::min(u8::min(r, g), b);
                 assert!(
@@ -1180,16 +1500,15 @@ mod tests {
                 );
             }
         }
-
         // The one identity colour is the logo's periwinkle: blue is its strongest channel
         // and green never drops below red, so the accent cannot turn violet or magenta
-        // in a regular control (R3).
+        // in a regular control.
         for (name, token) in [
             ("accent", palette::ACCENT),
             ("accent hover", palette::ACCENT_HOVER),
             ("accent pressed", palette::ACCENT_PRESSED),
         ] {
-            for (palette_name, value) in [("dark", token), ("light", light(token))] {
+            for (palette_name, value) in [("dark", token.dark()), ("light", token.light())] {
                 let [_, r, g, b] = value.to_be_bytes();
                 assert!(
                     b > g && g >= r,
@@ -1201,18 +1520,82 @@ mod tests {
                 );
             }
         }
-        // The emblem's second stop is the logo's own lavender tail: still blue-led, and
-        // never a red-led magenta.
-        for (palette_name, value) in [
-            ("dark", palette::BRAND_END),
-            ("light", light(palette::BRAND_END)),
-        ] {
+        for value in [palette::BRAND_END.dark(), palette::BRAND_END.light()] {
             let [_, r, g, b] = value.to_be_bytes();
-            assert!(
-                b > r && b > g,
-                "{palette_name} brand end is {value:06x}, which is not blue-led"
-            );
+            assert!(b > r && b > g, "brand end {value:06x} is not blue-led");
         }
+    }
+
+    #[test]
+    fn elevation_rises_level_by_level_and_is_deeper_in_the_dark() {
+        let reach = |level: Elevation| {
+            level
+                .shadows()
+                .iter()
+                .map(|shadow| f32::from(shadow.blur_radius) + f32::from(shadow.offset.y))
+                .fold(0.0_f32, f32::max)
+        };
+        let ink = |level: Elevation| {
+            level
+                .shadows()
+                .iter()
+                .map(|shadow| shadow.color.a)
+                .fold(0.0_f32, f32::max)
+        };
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            super::set_appearance(appearance);
+            assert!(Elevation::Flat.shadows().is_empty());
+            assert!(reach(Elevation::Low) < reach(Elevation::Mid));
+            assert!(reach(Elevation::Mid) < reach(Elevation::High));
+        }
+        super::set_appearance(Appearance::Light);
+        let light_ink = ink(Elevation::High);
+        super::set_appearance(Appearance::Dark);
+        let dark_ink = ink(Elevation::High);
+        assert!(dark_ink > light_ink, "a dark shadow is not deeper");
+    }
+
+    #[test]
+    fn motion_durations_step_from_fast_to_slow() {
+        assert_eq!(Motion::FAST.as_millis(), 120);
+        assert_eq!(Motion::BASE.as_millis(), 180);
+        assert_eq!(Motion::SLOW.as_millis(), 260);
+        assert!(Enter::Fade.duration() < Enter::Rise.duration());
+        assert!(Enter::Rise.duration() < Enter::Settle.duration());
+        let ease = super::ease_out();
+        assert!(ease(0.0).abs() < f32::EPSILON && (ease(1.0) - 1.0).abs() < f32::EPSILON);
+        assert!(ease(0.5) > 0.5, "the entrance decelerates");
+    }
+
+    #[test]
+    fn reduced_motion_draws_an_entrance_in_its_final_place() {
+        super::set_motion(Motion::Reduced);
+        let _ = super::enter(gpui::div(), "still", Enter::Rise);
+        super::set_motion(Motion::Full);
+        let _ = super::enter(gpui::div(), "moving", Enter::Settle);
+        assert!(super::motion_allowed());
+    }
+
+    #[test]
+    fn radii_and_type_grow_with_the_object() {
+        let radii = [
+            radius::SMALL,
+            radius::MEDIUM,
+            radius::LARGE,
+            radius::XLARGE,
+            radius::XXLARGE,
+        ];
+        assert_eq!(radii, [6.0, 8.0, 10.0, 14.0, 20.0]);
+        let titles = [
+            type_scale::TITLE,
+            type_scale::HEADING,
+            type_scale::DISPLAY,
+            type_scale::HERO,
+        ];
+        assert_eq!(titles, [15.0, 17.0, 22.0, 28.0]);
+        let metrics = super::Metrics::new(super::Zoom::Largest);
+        assert_eq!(metrics.display_size(), gpui::px(44.0));
+        assert_eq!(metrics.medium_weight(), gpui::FontWeight::MEDIUM);
     }
 
     #[test]

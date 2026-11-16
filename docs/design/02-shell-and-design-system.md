@@ -1,6 +1,6 @@
 # 应用外壳与设计系统
 
-本文件是 `src/app/theme.rs`、`src/app/components.rs` 与 `src/app/view.rs` 的设计依据。
+本文件是 `src/app/theme.rs`、`src/app/components.rs` 与 `src/app/view.rs` 的设计依据（2026-11 重设计：令牌、组件与动效见 §2、§5）。
 tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为准并同时修正本文件。
 
 ## 1. 结构：顶栏标签 + 页面
@@ -363,82 +363,124 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 
 ## 2. 视觉 tokens
 
-配色取自 logo：logo 是偏蓝的近黑底（`#08080e`）上一弯长春花蓝（`#859bfd`）的月牙，尾端渐变到淡紫
-（`#b29bfc`）。一套语义，两种主题：深色是带一点靛蓝的石墨（画布 + 逐级抬升的表面），浅色是冷调纸灰
-（`#f6f7fb` 画布 + 纯白卡片）。两种主题里只有**一个**有彩色的身份色：logo 的长春花蓝 accent（深色
-`#8b9ffd`，浅色加深到 `#3f52c8` 以守住对比度），用于当前对象、主操作、焦点环、选中标记与终端光标。
-常规控件不用渐变、不出现第二种强调色、强调色不偏紫（绿通道不低于红通道，由测试校验）；唯一的渐变
-`brand_gradient`（accent → brand end）就是 logo 自己的蓝到淡紫，只画在空状态徽记上。本机 Shell 卡片的
-图标块用 accent tint 底 + on-tint 图标。状态色
-（绿 / 琥珀 / 红）只表达状态。表面、边框与文字在两种主题下都保持中性（各通道差值
-≤ 14，由测试校验）。
+2026-11 重设计（R1）后的设计语言：中性冷灰的五层表面，加一个克制的长春花蓝紫强调色；"质感"来自
+**表面分层 + 层级阴影 + 进入动效**，而不是渐变、描边堆叠或第二种强调色。所有值只在
+`src/app/theme.rs` 定义一次，视图只写令牌名，不写字面量颜色、阴影预设、时长或尺寸。
 
-颜色以 24 位 sRGB 常量给出，`theme::swatch` 按当前主题解析。正文对五种表面（canvas、surface、
-raised、selected、pressed）的对比度由测试校验（WCAG AA：正文 4.5:1，图形 3:1）；
-`theme::light::TABLE` 为每个 token 给出浅色值，测试同时校验「每个 token 有且只有一个浅色值」与
-「没有两个 token 共用一个值」（浅色表按深色值索引，值重复会让两个 token 解析成同一个浅色）。
+### 2.1 颜色：两张独立的表
 
-| token | 深色 | 浅色 | 用途 |
+`theme::Token` 同时携带深色值与浅色值；两张表 `theme::dark` 与 `theme::light` 并排维护，浅色**不再**
+由"深色值查表映射"得到（旧的 `light::TABLE` 已删除），因此两个令牌可以共用同一个值（例如浅色下
+surface / raised / overlay 都是白），也不再有"值不得重复"的约束。`theme::swatch(token)` 按当前外观
+解析；`theme::palette::*` 是视图唯一使用的令牌名。
+
+配色仍取自 logo：深色是带一点靛蓝的石墨，浅色是冷调纸灰。唯一的有彩身份色是 logo 的长春花蓝
+accent，用于当前对象、主操作、焦点环与选中标记；常规控件不用渐变、不出现第二种强调色，accent 不偏紫
+（蓝 > 绿 ≥ 红，蓝绿差 ≥ 0x40，由测试校验）。唯一的渐变 `brand_gradient`（accent → brand end）只画在
+品牌徽记上。表面、边框与文字在两种主题下都保持中性（各通道差值 ≤ 14，由测试校验）。
+
+**五层表面**（自下而上）：
+
+| 层 | 令牌 | 深色 | 浅色 | 放什么 |
+| --- | --- | --- | --- | --- |
+| 0 | `CANVAS` | `#0d0e12` | `#f3f4f7` | 窗口底：内容区底色、终端外围 |
+| 1 | `CHROME` | `#131419` | `#ebecf0` | 标题栏、标签条、导航、状态栏、键帽 |
+| 2 | `SURFACE` | `#18191f` | `#ffffff` | 内容：卡片、列表行、输入框、当前标签 |
+| 3 | `RAISED` | `#1f2027` | `#ffffff` | 浮在内容上的：菜单、弹出层、tooltip、toast |
+| 4 | `OVERLAY` | `#23242c` | `#ffffff` | 对话框（最前层，压在 scrim 上） |
+
+深色下每一层都比下一层亮（测试校验单调递增），因为黑底上的阴影几乎看不见，浮层必须同时靠更亮的
+填充和更亮的边；浅色下内容层都是白，靠底层更灰与阴影区分（测试校验内容层亮于 canvas/chrome）。
+
+**交互、边框、文字与状态**：
+
+| 令牌 | 深色 | 浅色 | 用途 |
 | --- | --- | --- | --- |
-| canvas | `#0b0c10` | `#f6f7fb` | 页面与终端背景（与 `shellune-terminal` 的 BACKGROUND 一致） |
-| surface | `#111218` | `#eff0f6` | chrome：顶部会话头、窗格标记、键帽 |
-| surface raised | `#16171e` | `#ffffff` | 卡片、行、输入框、菜单、对话框 |
-| surface hover | `#1d1e27` | `#e9eaf2` | 指针悬停 |
-| surface selected | `#24252f` | `#e0e2ec` | 选中项、徽标底色 |
-| surface pressed | `#2c2d38` | `#d7d9e5` | 按下的控件与行 |
-| border / border strong | `#21222b` / `#33343f` | `#dfe1ea` / `#c5c7d2` | 发丝分隔线 / 控件边框与悬停边框 |
-| segment track / thumb | `#0d0e13` / `#282a35` | `#ebedf3` / `#ffffff` | 分段控件的凹槽与选中滑块 |
-| text primary / secondary / muted | `#edeef3` / `#b1b3be` / `#9699a4` | `#15161c` / `#444652` / `#595b67` | 标题 / 正文 / 提示与计数（muted 在 pressed 上也守住 4.5:1） |
-| accent / hover / pressed / on accent | `#8b9ffd` / `#a3b3fe` / `#7489f2` / `#0b0f2e` | `#3f52c8` / `#3646b0` / `#2e3c98` / `#ffffff` | 主操作填充：静止 / 悬停 / 按下 / 其上的文字 |
-| accent tint / on tint | `#1a1d3a` / `#bcc7ff` | `#eceffe` / `#3442a6` | 次级强调（Soft 按钮、SSH 标记、徽标） |
-| focus ring | `#a9b7ff` | `#3646b0` | 键盘焦点环（2px 边） |
-| positive / warning / danger | `#5ed6a4` / `#e8c07a` / `#ff8f96` | `#10714b` / `#7a5300` / `#b32b3c` | 状态色，界面里只有它们是饱和色 |
-| positive / warning / danger tint | `#11241d` / `#261f12` / `#2b1618` | `#dff2e8` / `#faf0d8` / `#fce7e9` | 状态 chip 与提示条的底色 |
-| planned | `#9aa0ab` | `#5b606a` | 已关闭 / 本版本不提供 |
-| disabled surface / text | `#141519` / `#7a7e87` | `#f1f2f4` / `#777c85` | 不可用的控件与其文字（仍保持 3:1） |
-| loading track / fill | `#22242b` / `#95a8fd` | `#e2e4e8` / `#3f52c8` | 进行中指示条的槽与进度 |
-| scrim | `#05060a` | `#1a1c20` | 对话框背后的遮罩，按 `SCRIM_ALPHA`（0.62）叠在页面上 |
-| brand end | `#b29bfc` | `#7c5cd6` | 仅剩的渐变第二色标（欢迎徽记），与 accent 同族，不再是紫色 |
-| avatars | 6 组底色/文字 | 同 | 主机头像：accent 底色 + 5 组低彩度金属/土色，组内对比度由测试校验 |
-| tab accents | 6 个辨识色 | 同 | 标签自己的颜色（`TAB_ACCENTS`）：低彩度、与状态色不同源，两种主题下 ≥ 3:1 |
+| `SURFACE_HOVER` / `SURFACE_SELECTED` / `SURFACE_PRESSED` | `#262730` / `#2b2c36` / `#31323d` | `#eef0f4` / `#e5e7ee` / `#dcdfe7` | 悬停 / 选中 / 按下 |
+| `BORDER` / `BORDER_STRONG` | `#272831` / `#373844` | `#e1e3e9` / `#c9ccd5` | 弱边（分隔线、卡片）/ 强边（控件、浮层、悬停） |
+| `SEGMENT_TRACK` / `SEGMENT_THUMB` | `#101115` / `#2c2d37` | `#e9ebf0` / `#ffffff` | 分段控件凹槽 / 选中滑块 |
+| `TEXT_PRIMARY` / `TEXT_SECONDARY` / `TEXT_MUTED` | `#eeeff4` / `#b6b8c3` / `#9c9faa` | `#16171d` / `#444652` / `#5a5d68` | 标题 / 正文 / 提示与计数 |
+| `ACCENT` / `ACCENT_HOVER` / `ACCENT_PRESSED` / `ON_ACCENT` | `#8f9dff` / `#a6b1ff` / `#7887f2` / `#0d1033` | `#4053cc` / `#3646b4` / `#2e3c9b` / `#ffffff` | 主操作：静止 / 悬停 / 按下 / 其上文字 |
+| `ACCENT_TINT` / `ACCENT_ON_TINT` | `#1d2042` / `#c0c8ff` | `#eceffe` / `#3442a6` | Soft 按钮、徽标、空状态图标块 |
+| `POSITIVE` / `WARNING` / `DANGER` / `INFO` | `#5fd4a3` / `#e9c27c` / `#ff8f97` / `#7cc4f2` | `#0f6e49` / `#7a5300` / `#b42b3c` / `#1d5f8f` | 状态色（同时是其 tint 上的文字色） |
+| `*_TINT`（positive/warning/danger/info） | `#13261f` / `#2a2214` / `#2e181b` / `#14232f` | `#dff2e8` / `#faf0d8` / `#fce7e9` / `#e2eff9` | 状态 chip、横幅、toast 图标底 |
+| `DANGER_SOLID` / `ON_DANGER` | `#c42b1c` / `#ffffff` | 同 | 实心危险填充（Windows 关闭按钮悬停） |
+| `TRACK_OFF` / `KNOB` | `#3b3c47` / `#f4f5f8` | `#c4c7d0` / `#ffffff` | 开关关闭时的轨道 / 开关圆钮 |
+| `PLANNED` | `#9ca1ad` | `#5b606a` | 已关闭 / 本版本不提供 |
+| `FOCUS_RING` | `#adb8ff` | `#3646b4` | 键盘焦点环（2px 边） |
+| `DISABLED_SURFACE` / `DISABLED_TEXT` | `#17181d` / `#7b7f89` | `#f0f1f4` / `#767b84` | 不可用控件（仍保持 3:1） |
+| `LOADING_TRACK` / `LOADING_FILL` | `#262830` / `#97a5ff` | `#e2e4e9` / `#4053cc` | 进行中指示条 |
+| `SCRIM` | `#040508` | `#1a1c22` | 对话框遮罩，按 `SCRIM_ALPHA`（0.62）叠加；`theme::scrim()` |
+| `SHADOW` | `#000000` | `#101828` | 层级阴影的墨色 |
+| `BRAND_END` | `#b29bfc` | `#7c5cd6` | 唯一渐变的第二色标 |
+| `AVATARS` / `TAB_ACCENTS` | 6 组 / 6 色 | 各自独立的浅色值 | 主机头像与标签辨识色（不与状态色同源） |
 
-终端默认前景、背景、光标与 16 个 ANSI 色另有浅色映射（`theme::light::TERMINAL`）；光标跟随
-accent，ANSI 色保持程序要求的值——终端里程序输出的颜色不被界面主题改写。终端配色可单独选择
-（设置页"终端配色"：跟随应用 / 深色 / 浅色，`theme::TerminalScheme`），因为很多命令行程序按深色
-终端设计。无论哪种配色，绘制时都有最低对比度保护：文字与其背景的对比度低于 3:1（dim 文字 2:1）
-时，把文字往黑或白方向推到够读为止；dim 先向背景混合 40%。前景与背景完全相同（程序有意隐藏）时
-不调整。
+**对比度（测试断言）**：正文三色、accent 与五个状态色在全部八种表面（五层 + hover/selected/pressed）上
+深浅两套都 ≥ 4.5:1；焦点环 ≥ 3:1；每个状态色在自己的 tint 上、`ON_ACCENT` 在三种 accent 上、
+`ON_DANGER` 在 `DANGER_SOLID` 上 ≥ 4.5:1；禁用文字与加载条取图形下限 3:1。
 
-**字阶**：caption 11、label 12、body 13、title 15、heading 17、hero 24。层级靠字号与字重建立，
-不靠装饰块：标题 semibold，正文 normal，标签与计数用 muted 色而不是第二种底色。
+终端默认前景、背景、光标与 16 个 ANSI 色另有浅色映射（`theme::light::TERMINAL`，按终端深色值索引）；
+程序输出的颜色不被界面主题改写。终端配色可单独选择（`theme::TerminalScheme`）。绘制时有最低对比度
+保护：低于 3:1（dim 2:1）时把文字推向黑或白。
 
-**等宽端点**：地址、端口、路径、远端命令、组合键这些要逐字读的值用终端的等宽字体
-（`components::endpoint`、`terminal::monospace_family()`），周围的标签仍用界面字体。整个外壳只有
-两处用两种字族：终端网格本身，和这些端点值。
+### 2.2 层级（Elevation）
 
-**形状**：主要圆角来自 `theme::radius` 的 6 / 8 / 12 / 16 四个语义档；1px 与 0 只用于
-细状态条、拼接边与需要直角的局部，不承载组件层级。
-6（`SMALL`）给嵌在更大容器里的小块——chip、tag、键帽、计数与类型徽标、小号图标按钮、
-分段控件里的单个分段、tooltip、16 / 24px 图标方块，以及主机编辑器里的 16px 勾选框；
-8（`MEDIUM`）给常规按钮、输入框、分段轨道、提示条、会话标签、32–40px 的瓦片与头像，
-以及紧凑的文件/菜单条目；12（`LARGE`）给卡片与状态卡、主机/会话/传输列表行、菜单面板、
-命令面板、toast 与浮层对话框；16（`XLARGE`）给共享 modal 外壳、主机编辑器、48 / 56px 的
-主机与品牌瓦片，以及大号空状态面板。
-常见关系是“内层比外层低一档”：分段 6 在轨道 8 里，24px 图标 6 在紧凑行 8 里，
-瓦片 8 在卡片 12 里；通栏列表行与其容器可同为 12，英雄瓦片与空状态卡可同为 16。
-同屏圆角只取这些值，不再出现 4 / 10 / 14 的临时档位。
-控件高度 32（紧凑 26），行高 52，标签 30，头部第一行 46，第二行最小 36，窗格标记 26，指针目标不小于 24。所有长度经
-`Metrics` 按文字大小（90% / 100% / 115% / 200%）缩放；200% 是文字缩放的上限。最小窗口
-（720×480）在 200% 中文下，顶栏的主机标签、新建、搜索、设置与窗口按钮仍在窗口内，主页与设置页
-按宽度换行。
+`theme::Elevation { Flat, Low, Mid, High }`，每级是一对阴影（贴合的接触影 + 柔和的环境影）。视图写
+`.elevation(Elevation::Mid)`（`theme::Elevated` trait）或 `.shadow(Elevation::Mid.shadows())`，
+**不再调用 GPUI 的 `shadow_xs/sm/md/lg/2xl` 预设**。
 
-**边框与阴影**：边框一律 1px 发丝线（焦点与校验失败是 2px，按下时底边加粗到 2px），卡片直接压
-在 canvas 上而不加阴影；只有对话框与 tooltip 保留一层很轻的阴影（`shadow_sm`），菜单一层
-`shadow_xs`。胶囊形状从常规控件退出：chip、tag、徽标、键帽都是有圆角的矩形块，不是药丸。
+| 级 | 用于 | 浅色（y / blur / spread / α） | 深色 |
+| --- | --- | --- | --- |
+| Flat | 行、chrome、行内控件 | 无 | 无 |
+| Low | 卡片、输入、Primary/Secondary 按钮、分段滑块、开关圆钮 | 1/2/0/.06 + 1/3/0/.08 | 1/2/0/.32 + 1/4/0/.24 |
+| Mid | 菜单、弹出层、tooltip、toast | 2/4/−1/.06 + 8/20/−4/.14 | 2/4/−1/.40 + 10/24/−4/.50 |
+| High | 对话框、命令面板、启动过场 | 4/8/−2/.08 + 20/48/−8/.22 | 4/8/−2/.45 + 24/56/−8/.65 |
 
-图标是 `icons.rs` 里内嵌的 24 格线条 SVG（1.6 描边、圆角端点、不填充），由 GPUI 渲染为蒙版并取
-元素的文字颜色，因此同一个图标适用于所有色调与悬停状态。控件里 14px、行与标题里 16px、状态徽记
-20px；所有图形按同一套圆角画，一排图标因此落在同一个重量上。
+深色阴影更深、浮层边框用 `BORDER_STRONG`，测试校验"逐级更远"和"深色更深"。
+
+### 2.3 动效
+
+gpui 没有 hover 过渡、没有元素缩放，也没有系统"减少动态效果"查询，因此规则是：
+
+1. **只有进入动画**。hover、按下、选中都即时切换；除进行中指示外没有循环动画。
+2. 时长令牌：`Motion::FAST` 120ms（小状态变化、toast/tooltip 淡入）、`Motion::BASE` 180ms（菜单、卡片、
+   等待徽记）、`Motion::SLOW` 260ms（对话框、启动过场）。缓动统一 `theme::ease_out()`（ease-out-quint）。
+3. `theme::enter(element, id, Enter::{Fade, Rise, Settle})`：Fade 原地淡入；Rise 淡入并上移 6px；Settle 从
+   上方 8px 落定（替代做不到的轻微缩放）。同一 id 重绘不会重播。
+4. 设置里的 `Motion::Reduced`（以及截图）下 `enter` 直接画最终状态，状态词、颜色与操作都不变。
+
+当前使用：对话框（`components::modal`）与 toast 用 Fade；等待徽记与加载条用 BASE。
+
+### 2.4 形状与字
+
+**圆角** `theme::radius`：6 / 8 / 10 / 14 / 20 五档，物体越大圆角越大，"内层比外层低一档"。
+
+| 档 | 令牌 | 用于 |
+| --- | --- | --- |
+| 6 | `SMALL` | chip 内块、键帽、勾选框、小图标按钮、分段、tooltip |
+| 8 | `MEDIUM` | 按钮、输入框、菜单项、行内瓦片 |
+| 10 | `LARGE` | 卡片、状态卡、列表行、菜单、toast、标签、终端框 |
+| 14 | `XLARGE` | 对话框、命令面板、空状态图标块、大瓦片 |
+| 20 | `XXLARGE` | 欢迎徽记、启动过场标志 |
+
+旧的 12 / 16 档已删除。1px 与 0 只用于细状态条与拼接边。
+
+**字阶** `theme::type_scale`：caption 11、label 12、body 13、title 15、heading 17、display 22、hero 28。
+**字重** `theme::weight`：NORMAL（正文）、MEDIUM（按钮、chip、列表名、当前标签；`Metrics::medium_weight`）、
+SEMIBOLD（标题）。不用 bold。
+
+**等宽端点**：地址、端口、路径、远端命令、组合键用终端等宽字体（`components::endpoint`），周围标签
+仍用界面字体。
+
+**尺寸**：控件 32（紧凑 26），行 52，标签 30，头部 46，指针目标 ≥ 24。所有长度经 `Metrics` 按文字大小
+（90% / 100% / 115% / 200%）缩放。窗口在绘制前把缩放写入 `theme::set_zoom`，终端外框与 tooltip 这类
+在窗口渲染之外绘制的部件用 `theme::metrics()` 取得同一缩放（终端底栏、搜索条与命令块浮层暂保持常规
+尺寸，等 R3 的可收拢底栏完成后再随缩放）。
+
+**边框**：1px 发丝线；焦点与校验失败 2px；按下时底边加粗到 2px。卡片用弱边 + Low，浮层用强边 + Mid/High。
+
+图标是 `icons.rs` 内嵌的 24 格线条 SVG（1.6 描边），按元素文字颜色着色：控件 14px、行与标题 16px、
+状态徽记 20–22px。
 
 ### 终端内搜索（`crates/terminal` + `src/app/terminal.rs`）
 
@@ -825,6 +867,7 @@ X11 转发让服务器上的图形程序显示在这台电脑上。三个模式�
 | 关闭命令面板 / 菜单 / 提示条（终端外） | Esc | Esc |
 | 命令面板（终端内也有效） | Ctrl+Shift+P | ⇧⌘P |
 | 关闭当前会话（终端内也有效） | Ctrl+Shift+W | ⌘W |
+| 重新连接当前会话（已断开或失败时；终端内也有效） | Ctrl+Shift+R | ⇧⌘R |
 | 下一个 / 上一个标签（终端内也有效） | Ctrl+PgDn / Ctrl+PgUp | ⇧⌘] / ⇧⌘[ |
 | 直达第 1-8 个标签 / 最后一个标签 | Alt+1-8 / Alt+9 | ⌃1-8 / ⌃9 |
 | 上传到当前会话 / 从当前会话下载（终端内也有效） | Ctrl+Shift+U / Ctrl+Shift+D | ⇧⌘U / ⇧⌘D |
@@ -1204,7 +1247,7 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 
 ### 连接阶段与多行粘贴确认（R17）
 
-两块浮层都用共享的 `modal`（居中、圆角 `radius::XLARGE`、`shadow_2xl`、半透明遮罩），打开时接管键盘，关闭后把焦点
+两块浮层都用共享的 `components::modal`（居中、圆角 `radius::XLARGE`、`Elevation::High`、`theme::scrim()` 遮罩），打开时接管键盘，关闭后把焦点
 还给打开前的终端或字段。
 
 **连接中**（`remote.dialog`）：标题是"连接到 <主机名>"，副标题是地址，右上角状态 chip 用 `remote_status_label` 的词与色调。
@@ -1256,37 +1299,44 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 
 组件只画外观，交互（点击、焦点、动作）由调用方加。每个控件的**外观只有一张表**：`ControlFace`
 给出某个 [`Variant` / 字段 / 行 / 菜单项] 在某个 `ControlState` 下的填充、边框、边框宽度、文字色、
-前导标记与"是否等待中"。组件自己只画"静止"那一行，并把"悬停"那一行注册成指针样式；需要焦点、按下、
-选中、不可用或进行中的调用方，用它自己的状态调用同名组件（`button_with_state`、`row_with_state`、
-`field_frame`），而不是另写一组颜色。因此页面里不会再出现第三种灰或第二种蓝。
+前导标记与"是否等待中"，值全部是 `theme::Token`。组件自己只画"静止"那一行，并把"悬停"那一行注册
+成指针样式；需要焦点、按下、选中、不可用或进行中的调用方，用它自己的状态调用同名组件
+（`button_with_state`、`row_with_state`、`field_frame`），而不是另写一组颜色。页面里不再手写勾选框、
+对话框外壳或菜单卡片。
 
-| 组件 | 用途 |
+| 组件 | 规范 |
 | --- | --- |
-| `button` / `button_with_state` | Primary（实心 accent）、Soft（accent 底色）、Secondary、Ghost、Danger 五级；状态由调用方给 |
-| `button_face(variant, state)` | 五级 × 八态的外观表（测试逐格校验文字与边的对比度） |
-| `icon_label_button` / `compact_button` | 带图标的按钮（新建、连接、导入、文件、重连、关闭）；工具栏里的紧凑按钮 |
-| `icon_only_button` / `danger_icon_button` / `icon_button` | 纯图标方形按钮 / 危险操作 / 短符号（A−、A+） |
-| `field_face(state)` + `field_frame(state)` | 输入框外观：静止、悬停、焦点（2px 焦点环）、校验失败（2px 危险边）、不可用；`TextField` 放在框里 |
-| `segmented` + `segment` | 主机视图、登录方式等互斥选择（凹槽 + 滑块，不再用阴影做层次） |
-| `row` / `row_with_state` + `stacked` | 主机、会话、传输行：悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
-| `menu_panel` + `menu_item` | 菜单面板与其中的条目（悬停、选中、焦点） |
-| `dialog_face` + `dialog_panel` + `dialog_header` | 对话框表面、标题与副标题（标题块 + 关闭由调用方放在同一行） |
-| `banner` / `notice` | 提示、失败、确认问题（横幅）；完成后的通知（标题 + 一行说明） |
-| `state_card` / `state_card_with_icon` | 加载中 / 失败 / 空，居中，带徽记 |
-| `chip` / `tag` / `badge` / `kind_badge` / `keycap` / `status_dot` / `status_mark` | 状态（形状 + 词 + 色调）、分组、数量、类型、快捷键、独立状态标记 |
-| `endpoint` | 地址、端口、路径、组合键等等宽端点值 |
-| `loading_indicator` | 进行中指示条；减少动态效果时静止画出，词仍在 |
+| `button` / `button_with_state` | Primary（实心 accent + Low）、Soft（accent tint）、Secondary（surface + 强边 + Low）、Ghost、Danger；高 32，圆角 8，MEDIUM 字重 |
+| `button_face(variant, state)` | 五级 × 八态外观表（测试逐格校验文字与边在六种背景、两套主题下的对比度） |
+| `icon_label_button` / `compact_button` / `icon_only_button` / `danger_icon_button` / `icon_button` | 带图标按钮、工具栏紧凑按钮（26）、方形图标按钮（≥ 24 指针目标） |
+| `field_face` + `field_frame` | 输入框：surface 底、弱边，焦点 2px 焦点环，校验失败 2px 危险边 |
+| `segmented` + `segment` | 互斥选择：凹槽 + 选中滑块（滑块 Low） |
+| `switch(on)` | 设置开关：34×20 胶囊轨道，圆钮在左（关，`TRACK_OFF`）或右（开，accent），圆钮 Low；状态先由位置表达 |
+| `checkbox(id, label, checked)` / `checkbox_box(checked)` | 16px 方框（圆角 4）：未选为 surface + 强边，悬停（`CHECK_GROUP`）变 accent 边；选中为 accent 填充 + 勾 |
+| `card` | 内容分组：surface + 弱边 + 圆角 10 + Low，内边距 16 |
+| `row` / `row_with_state` + `stacked` | 列表行：surface 底，悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
+| `menu_card` + `menu_entry` + `menu_divider` | 所有右键/下拉菜单：raised + 强边 + 圆角 10 + Mid；条目 30 高，禁用项保留位置，危险项悬停为 danger tint |
+| `menu_panel` + `menu_item` + `menu_item_face` | 取值菜单（选中项保留选中外观） |
+| `modal(viewport, id, width, ModalContent)` | 所有对话框外壳：scrim 遮罩（按下不关闭），overlay + 强边 + 圆角 14 + High，头部固定、主体滚动、底部固定，进入时 Fade |
+| `dialog_face` / `dialog_panel` / `dialog_header` | 对话框表面令牌与内嵌标题块 |
+| `toast(tone, icon, title, detail)` | 通知：raised + 强边 + 圆角 10 + Mid，色调图标圆底；关闭按钮与位置由调用方加，进入时 Fade |
+| `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 14）+ 标题 + 一行说明 + 可选动作；不带状态色调 |
+| `banner` / `notice` | 提示、失败、确认问题（色调底 + 左侧 3px 色条）；完成后的通知 |
+| `state_card` / `state_card_with_icon` | 加载中 / 失败 / 空：surface 卡 + Low，色调 tint 徽记块 |
+| `chip` / `tag` / `badge` / `kind_badge` / `keycap` / `status_dot` / `status_mark` | 状态（形状 + 词 + 色调）、分组、数量、类型、快捷键、状态标记 |
+| `endpoint` / `copy_on_click` | 等宽端点值，点击复制 |
+| `loading_indicator` | 进行中指示条（BASE 淡入）；减少动效时静止画出 |
 | `section_label` / `field_row` / `divider_vertical` | 分组标题、表单标签行、竖线分隔 |
-| `Tooltip` / `tooltip()` | 图标按钮、导航项与标签的悬停说明 |
+| `Tooltip` / `tooltip()` | raised + 强边 + Mid，随窗口缩放（`theme::metrics()`） |
 | `icons::icon(Icon, size, color)` | 内嵌线条图标 |
 
-新增分区必须复用同一组组件、`ControlState` 与 `SectionState`，不为某个分区单独发明状态表达或私有
-配色。转发、双栏文件、传输和分屏使用同一套令牌、按钮、横幅和状态卡。状态卡里的长中英文按卡片宽度
-换行，不另做一套字号。
+新增分区必须复用同一组组件、`ControlState` 与 `SectionState`，不为某个分区单独发明状态表达、私有
+配色或阴影。
 
 组件的测试在 `components.rs` 与 `theme.rs` 各自的 `#[cfg(test)]` 模块里：八种状态逐格校验文字对比
-度（禁用态取 3:1 图形下限）、同一变体的八种状态互不相同、焦点与校验失败仍然只加宽边框、以及每个
-共享组件在每种状态下都能构造。
+度（禁用态取 3:1 图形下限）、同一变体的八种状态互不相同、焦点与校验失败只加宽边框、浮层使用 overlay /
+raised 与强边、开关与勾选框的轨道与勾可读、每个共享组件在每种状态下都能构造；`theme.rs` 校验对比度、
+层级单调、动效时长与减少动效。
 
 ## 6. 文案
 

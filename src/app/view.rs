@@ -255,7 +255,7 @@ impl Render for FileDragLabel {
             .px(px(8.0))
             .py(px(4.0))
             .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::SURFACE))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .text_size(px(12.0))
@@ -10912,7 +10912,7 @@ impl ShelluneView {
             .px(metrics.scale(spacing::SNUG))
             .py(metrics.scale(spacing::TIGHT))
             .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(move || format!("hosts.import.row.{index}"))
@@ -11497,10 +11497,10 @@ impl ShelluneView {
             .w(metrics.scale(320.0))
             .p(metrics.scale(spacing::HAIRLINE + 1.0))
             .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::RAISED))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_lg()
+            .shadow(theme::Elevation::Mid.shadows())
             .debug_selector(|| "shell.picker".to_owned())
             .child(section(ux.home_local_section));
 
@@ -12128,7 +12128,7 @@ impl ShelluneView {
                 .gap(metrics.scale(spacing::TIGHT))
                 .h(metrics.scale(40.0))
                 .px(metrics.scale(spacing::SNUG))
-                .bg(theme::swatch(palette::SURFACE))
+                .bg(theme::swatch(palette::CHROME))
                 .border_b_1()
                 .border_color(theme::swatch(palette::BORDER))
                 .child(switch)
@@ -12172,7 +12172,7 @@ impl ShelluneView {
                 // at 720×480 and 200% text (R4).
                 .pt(metrics.scale(spacing::TIGHT))
                 .pb(metrics.scale(spacing::HAIRLINE))
-                .bg(theme::swatch(palette::SURFACE))
+                .bg(theme::swatch(palette::CHROME))
                 .border_b_1()
                 .border_color(theme::swatch(palette::BORDER))
                 .debug_selector(|| "files.transfers".to_owned())
@@ -14075,7 +14075,7 @@ impl ShelluneView {
             .gap(metrics.scale(spacing::HAIRLINE))
             .rounded(px(radius::SMALL))
             .p(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .debug_selector(move || failure_id.to_string())
@@ -14504,7 +14504,7 @@ impl ShelluneView {
                     // than the box that holds them (R4).
                     .track_scroll(&list_scroll)
                     .rounded(px(radius::LARGE))
-                    .bg(theme::swatch(palette::SURFACE_RAISED))
+                    .bg(theme::swatch(palette::SURFACE))
                     .border_1()
                     .border_color(theme::swatch(palette::BORDER))
                     .debug_selector({
@@ -14757,7 +14757,7 @@ impl ShelluneView {
                     .flex_none()
                     .p(metrics.scale(spacing::HAIRLINE))
                     .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(palette::SURFACE))
+                    .bg(theme::swatch(palette::CHROME))
                     .text_size(metrics.caption_size())
                     .text_color(Tone::Danger.text())
                     .debug_selector(|| "transfers.refused".to_owned())
@@ -14775,7 +14775,7 @@ impl ShelluneView {
                     .flex_none()
                     .p(metrics.scale(spacing::HAIRLINE))
                     .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(palette::SURFACE))
+                    .bg(theme::swatch(palette::CHROME))
                     .text_size(metrics.caption_size())
                     .text_color(Tone::Warning.text())
                     .debug_selector(|| "transfers.skipped".to_owned())
@@ -15128,7 +15128,7 @@ impl ShelluneView {
             .flex_none()
             .gap(metrics.scale(2.0))
             .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::SURFACE))
             .px(metrics.scale(spacing::TIGHT))
             .py(metrics.scale(spacing::HAIRLINE + 2.0))
             .text_size(metrics.caption_size())
@@ -17039,10 +17039,10 @@ impl ShelluneView {
                 }),
             );
         tab = if selected {
-            tab.bg(theme::swatch(palette::SURFACE_RAISED))
+            tab.bg(theme::swatch(palette::SURFACE))
                 .border_color(theme::swatch(palette::BORDER_STRONG))
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .shadow_sm()
+                .shadow(theme::Elevation::Low.shadows())
         } else {
             tab.border_color(theme::clear())
                 .text_color(theme::swatch(palette::TEXT_MUTED))
@@ -17663,6 +17663,9 @@ impl Render for ShelluneView {
         theme::set_appearance(appearance);
         theme::set_terminal_appearance(self.terminal_scheme.appearance(appearance));
         theme::set_motion(self.workspace.motion());
+        // The terminal's frame and the tooltips are drawn outside this pass; they read
+        // the text size from here instead of falling back to 100%.
+        theme::set_zoom(self.workspace.zoom());
         // A field's focus is noted before a click can blur it. Opening an overlay then
         // still knows which field to restore, even when the click already moved focus.
         self.note_content_focus(window, cx);

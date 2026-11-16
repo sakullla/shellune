@@ -24,49 +24,8 @@ use crate::app::icons::{self, Icon};
 use crate::app::remote::MethodChoice;
 use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
 
-/// A checkbox with its label: a box that fills with the accent when checked.
-fn checkbox(
-    id: &'static str,
-    label: &'static str,
-    checked: bool,
-    metrics: Metrics,
-) -> Stateful<Div> {
-    let accent = theme::swatch(palette::ACCENT);
-    let hover = theme::swatch(palette::TEXT_PRIMARY);
-    div()
-        .id(id)
-        .debug_selector(move || id.to_owned())
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(metrics.scale(spacing::TIGHT))
-        .cursor_pointer()
-        .text_size(metrics.label_size())
-        .text_color(theme::swatch(palette::TEXT_SECONDARY))
-        .hover(move |style| style.text_color(hover))
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(metrics.scale(16.0))
-                .rounded(px(radius::SMALL))
-                .border_1()
-                .when(checked, |box_| {
-                    box_.bg(accent).border_color(accent).child(icons::icon(
-                        Icon::Check,
-                        metrics.scale(12.0),
-                        theme::swatch(palette::ON_ACCENT),
-                    ))
-                })
-                .when(!checked, |box_| {
-                    box_.bg(theme::swatch(palette::CANVAS))
-                        .border_color(theme::swatch(palette::BORDER_STRONG))
-                }),
-        )
-        .child(label)
-}
+// A checkbox with its label is the shared component.
+use crate::app::components::checkbox;
 
 impl ShelluneView {
     /// Chooses how the host in the dialog signs in.
@@ -149,7 +108,7 @@ impl ShelluneView {
                     .rounded(px(radius::MEDIUM))
                     .border_1()
                     .border_color(theme::swatch(palette::BORDER))
-                    .bg(theme::swatch(palette::SURFACE))
+                    .bg(theme::swatch(palette::CHROME))
                     .debug_selector({
                         let selector = format!("hosts.jump.{index}");
                         move || selector
@@ -422,7 +381,7 @@ impl ShelluneView {
             .px(metrics.scale(spacing::SNUG))
             .py(metrics.scale(spacing::TIGHT + 2.0))
             .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::CHROME))
             .border_1()
             .border_color(theme::swatch(palette::BORDER))
             .cursor_pointer()
@@ -1036,10 +995,10 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .rounded(px(radius::XLARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::OVERLAY))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_2xl()
+            .shadow(theme::Elevation::High.shadows())
             .overflow_hidden()
             .occlude()
             .child(header)
@@ -1060,7 +1019,7 @@ impl ShelluneView {
                             .id("hosts.editor.backdrop")
                             .absolute()
                             .inset_0()
-                            .bg(gpui::rgba(0x0000_0080))
+                            .bg(theme::scrim())
                             .occlude()
                             // A press on the dimmed window does not discard what
                             // was typed; the dialog closes with its buttons or Esc.
@@ -1574,10 +1533,10 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .rounded(px(radius::XLARGE))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
+            .bg(theme::swatch(palette::OVERLAY))
             .border_1()
             .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow_2xl()
+            .shadow(theme::Elevation::High.shadows())
             .overflow_hidden()
             .occlude()
             .child(header)
@@ -1598,7 +1557,7 @@ impl ShelluneView {
                             .id("connection.editor.backdrop")
                             .absolute()
                             .inset_0()
-                            .bg(gpui::rgba(0x0000_0080))
+                            .bg(theme::scrim())
                             .occlude()
                             .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                                 cx.stop_propagation();
