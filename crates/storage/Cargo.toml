@@ -8,6 +8,14 @@ description = "Versioned, atomic host storage for Shellune."
 publish = false
 
 [dependencies]
+# The portable data file (backup and sync): the saved passwords it may carry are
+# sealed with AES-256-GCM under a key derived from the user's passphrase with
+# Argon2id. Both match the versions already in the lock file.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
+base64 = "0.22.1"
+# The salt and the nonce of a sealed block come from the operating system.
+getrandom = "0.4.3"
 # The system credential store: Windows Credential Manager, the macOS keychain, and the
 # Secret Service on Linux (through zbus, pure Rust, so no system library is needed).
 keyring = "4.2"
@@ -15,3 +23,5 @@ shellune-core = { path = "../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Wipes the derived key and the decrypted passwords once they are used.
+zeroize = { workspace = true }

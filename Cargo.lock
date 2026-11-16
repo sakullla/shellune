@@ -6110,11 +6110,16 @@ dependencies = [
 name = "shellune-storage"
 version = "0.4.7"
 dependencies = [
+ "aes-gcm",
+ "argon2",
+ "base64",
+ "getrandom 0.4.3",
  "keyring",
  "serde",
  "serde_json",
  "shellune-core",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]

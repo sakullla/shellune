@@ -25,6 +25,11 @@
 //!   logging path can be tested for the absence of secrets instead of being trusted.
 //! * `ImportPreview` — what one SSH configuration file would contribute, read
 //!   without ever writing it, with every limitation named before anything is saved.
+//! * `ShelluneData` — the portable data file a backup writes and sync uploads: the
+//!   shared records, one section per platform for what differs between machines,
+//!   and optionally the saved passwords sealed under a passphrase. Applying one is
+//!   previewed as an `ApplyPlan`, snapshots the data files first and puts them back
+//!   when a write fails.
 //!
 //! Loading is strict (a damaged or newer file is reported, never guessed at) and
 //! saving is atomic (a temporary file in the same directory is flushed and then
@@ -44,6 +49,7 @@ mod credentials;
 mod error;
 mod forwarding;
 mod group;
+mod portable;
 mod preferences;
 mod snippets;
 mod ssh_config;
@@ -65,6 +71,12 @@ pub use error::{BookError, PersistError, StorageError};
 pub use forwarding::{FILE_NAME as FORWARD_FILE_NAME, ForwardStore};
 pub use group::{
     FILE_NAME as GROUP_FILE_NAME, GroupDeletion, GroupError, GroupService, GroupStore, GroupUpdate,
+};
+pub use portable::{
+    ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, ExportOutcome, HostOverlay,
+    KdfParams, LocalData, LocalState, PORTABLE_FORMAT, PORTABLE_VERSION, Platform, PlatformData,
+    PlatformFallback, PlatformField, PortableError, SNAPSHOT_DIRECTORY, SNAPSHOT_LIMIT,
+    SecretBundle, SharedData, SharedPreferences, ShelluneData, Snapshot, SnapshotStore,
 };
 pub use preferences::{
     FILE_NAME as PREFERENCES_FILE_NAME, KeymapEntry, KeymapPreferences, Preferences,
