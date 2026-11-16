@@ -6,6 +6,10 @@
 //! provides for exactly this — the Windows Credential Manager, the macOS keychain, or
 //! the Secret Service on Linux — under the host's id.
 //!
+//! A few secrets belong to the application rather than to a host — the WebDAV
+//! password and the sync passphrase ([`AppSecret`]). They live in the same store,
+//! under their own fixed names, so no configuration file ever holds them either.
+//!
 //! [`SecretStore`] is the boundary, so the window can be tested with
 //! [`MemorySecrets`] and never touches the real store of the machine running the tests.
 
@@ -34,6 +38,27 @@ impl SecretError {
     }
 }
 
+/// A secret that belongs to the application, not to one host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AppSecret {
+    /// The password of the WebDAV account sync uses.
+    WebDavPassword,
+    /// The passphrase the saved passwords are sealed under when sync carries them.
+    SyncPassphrase,
+}
+
+impl AppSecret {
+    /// The user name the entry is filed under in the system store. A host entry is
+    /// `host-<uuid>`, so these never collide with one.
+    #[must_use]
+    pub const fn user(self) -> &'static str {
+        match self {
+            Self::WebDavPassword => "webdav",
+            Self::SyncPassphrase => "sync-passphrase",
+        }
+    }
+}
+
 /// Where host secrets are kept.
 pub trait SecretStore: Send + Sync {
     /// Saves the secret of one host, replacing any earlier one.
@@ -57,6 +82,27 @@ pub trait SecretStore: Send + Sync {
     ///
     /// The store is unavailable or refused the deletion.
     fn forget(&self, host: HostId) -> Result<(), SecretError>;
+
+    /// Saves an application secret, replacing any earlier one.
+    ///
+    /// # Errors
+    ///
+    /// The store is unavailable or refused the write.
+    fn save_app(&self, which: AppSecret, secret: &SecretString) -> Result<(), SecretError>;
+
+    /// An application secret; `Ok(None)` only when the store confirms there is none.
+    ///
+    /// # Errors
+    ///
+    /// The store is unavailable or could not be read.
+    fn load_app(&self, which: AppSecret) -> Result<Option<SecretString>, SecretError>;
+
+    /// Forgets an application secret. Forgetting one that was never saved succeeds.
+    ///
+    /// # Errors
+    ///
+    /// The store is unavailable or refused the deletion.
+    fn forget_app(&self, which: AppSecret) -> Result<(), SecretError>;
 }
 
 /// The operating system's credential store.
@@ -65,20 +111,22 @@ pub struct SystemSecrets;
 
 impl SystemSecrets {
     fn entry(host: HostId) -> Result<keyring::Entry, SecretError> {
-        keyring::Entry::new(SERVICE, &format!("host-{host}"))
+        Self::named(&format!("host-{host}"))
+    }
+
+    fn named(user: &str) -> Result<keyring::Entry, SecretError> {
+        keyring::Entry::new(SERVICE, user)
             .map_err(|error| SecretError::new("is unavailable", error.to_string()))
     }
-}
 
-impl SecretStore for SystemSecrets {
-    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
-        Self::entry(host)?
+    fn save_entry(entry: &keyring::Entry, secret: &SecretString) -> Result<(), SecretError> {
+        entry
             .set_password(secret.expose())
             .map_err(|error| SecretError::new("could not save the password", error.to_string()))
     }
 
-    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
-        match Self::entry(host)?.get_password() {
+    fn load_entry(entry: &keyring::Entry) -> Result<Option<SecretString>, SecretError> {
+        match entry.get_password() {
             Ok(secret) => Ok(Some(SecretString::new(secret))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(SecretError::new(
@@ -88,8 +136,8 @@ impl SecretStore for SystemSecrets {
         }
     }
 
-    fn forget(&self, host: HostId) -> Result<(), SecretError> {
-        match Self::entry(host)?.delete_credential() {
+    fn forget_entry(entry: &keyring::Entry) -> Result<(), SecretError> {
+        match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(SecretError::new(
                 "could not delete the password",
@@ -99,10 +147,37 @@ impl SecretStore for SystemSecrets {
     }
 }
 
+impl SecretStore for SystemSecrets {
+    fn save(&self, host: HostId, secret: &SecretString) -> Result<(), SecretError> {
+        Self::save_entry(&Self::entry(host)?, secret)
+    }
+
+    fn load(&self, host: HostId) -> Result<Option<SecretString>, SecretError> {
+        Self::load_entry(&Self::entry(host)?)
+    }
+
+    fn forget(&self, host: HostId) -> Result<(), SecretError> {
+        Self::forget_entry(&Self::entry(host)?)
+    }
+
+    fn save_app(&self, which: AppSecret, secret: &SecretString) -> Result<(), SecretError> {
+        Self::save_entry(&Self::named(which.user())?, secret)
+    }
+
+    fn load_app(&self, which: AppSecret) -> Result<Option<SecretString>, SecretError> {
+        Self::load_entry(&Self::named(which.user())?)
+    }
+
+    fn forget_app(&self, which: AppSecret) -> Result<(), SecretError> {
+        Self::forget_entry(&Self::named(which.user())?)
+    }
+}
+
 /// Secrets kept in memory only, for tests.
 #[derive(Debug, Default)]
 pub struct MemorySecrets {
     secrets: Mutex<HashMap<HostId, String>>,
+    apps: Mutex<HashMap<AppSecret, String>>,
     /// When set, every call fails, as an unavailable system store does.
     unavailable: bool,
 }
@@ -123,13 +198,13 @@ impl MemorySecrets {
         }
     }
 
-    /// How many secrets are saved.
+    /// How many host secrets are saved (application secrets are not counted).
     #[must_use]
     pub fn len(&self) -> usize {
         self.secrets.lock().map_or(0, |secrets| secrets.len())
     }
 
-    /// Whether nothing is saved.
+    /// Whether no host secret is saved.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -172,6 +247,34 @@ impl SecretStore for MemorySecrets {
             .remove(&host);
         Ok(())
     }
+
+    fn save_app(&self, which: AppSecret, secret: &SecretString) -> Result<(), SecretError> {
+        self.check("could not save the password")?;
+        self.apps
+            .lock()
+            .map_err(|_| SecretError::new("could not save the password", "poisoned"))?
+            .insert(which, secret.expose().to_owned());
+        Ok(())
+    }
+
+    fn load_app(&self, which: AppSecret) -> Result<Option<SecretString>, SecretError> {
+        self.check("could not read the password")?;
+        Ok(self
+            .apps
+            .lock()
+            .map_err(|_| SecretError::new("could not read the password", "poisoned"))?
+            .get(&which)
+            .map(|secret| SecretString::new(secret.clone())))
+    }
+
+    fn forget_app(&self, which: AppSecret) -> Result<(), SecretError> {
+        self.check("could not delete the password")?;
+        self.apps
+            .lock()
+            .map_err(|_| SecretError::new("could not delete the password", "poisoned"))?
+            .remove(&which);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +307,49 @@ mod tests {
             "a failure is not \"nothing saved\""
         );
         assert!(store.save(host, &SecretString::new("x")).is_err());
+        assert!(store.load_app(AppSecret::WebDavPassword).is_err());
+    }
+
+    #[test]
+    fn application_secrets_are_kept_apart_from_host_secrets() {
+        let store = MemorySecrets::new();
+        assert_eq!(
+            store
+                .load_app(AppSecret::WebDavPassword)
+                .map(|secret| secret.is_some()),
+            Ok(false)
+        );
+        store
+            .save_app(AppSecret::WebDavPassword, &SecretString::new("dav"))
+            .expect("saved");
+        store
+            .save_app(AppSecret::SyncPassphrase, &SecretString::new("sealed"))
+            .expect("saved");
+        assert!(store.is_empty(), "no host secret was saved");
+        let loaded = store
+            .load_app(AppSecret::WebDavPassword)
+            .expect("read")
+            .expect("present");
+        assert_eq!(loaded.expose(), "dav");
+        store
+            .forget_app(AppSecret::WebDavPassword)
+            .expect("forgotten");
+        assert!(
+            store
+                .load_app(AppSecret::WebDavPassword)
+                .expect("read")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .load_app(AppSecret::SyncPassphrase)
+                .expect("read")
+                .map(|secret| secret.expose().to_owned()),
+            Some("sealed".to_owned())
+        );
+        assert_ne!(
+            AppSecret::WebDavPassword.user(),
+            AppSecret::SyncPassphrase.user()
+        );
     }
 }

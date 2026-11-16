@@ -66,7 +66,7 @@ pub use book::{
     FORMAT_VERSION, Group, HostBook, HostEdit, LegacyGroupLabel, RecentConnection, RecentHost,
     host_matches,
 };
-pub use credentials::{MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
+pub use credentials::{AppSecret, MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
 pub use error::{BookError, PersistError, StorageError};
 pub use forwarding::{FILE_NAME as FORWARD_FILE_NAME, ForwardStore};
 pub use group::{

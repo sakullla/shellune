@@ -1,0 +1,34 @@
+[package]
+name = "shellune-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WebDAV sync for Shellune: the client, the sync settings and state, and the conflict rules."
+publish = false
+
+[features]
+# The in-process WebDAV server the tests (this crate's and the window's) sync
+# against. Behind a feature so a release build carries none of it.
+test-support = []
+
+[dependencies]
+# The Basic authorization header.
+base64 = "0.22.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The fingerprint of the synced data (what decides whether a side changed).
+sha2 = { workspace = true }
+shellune-core = { path = "../core" }
+shellune-storage = { path = "../storage" }
+thiserror = { workspace = true }
+# A blocking HTTP client: rustls on ring (no CMake), the system's certificate
+# verifier so a private CA installed on the machine is trusted, and SOCKS for an
+# ALL_PROXY that names one. WebDAV methods go through `Agent::run`.
+ureq = { version = "3.4.2", default-features = false, features = [
+    "rustls",
+    "platform-verifier",
+    "socks-proxy",
+] }
+# The name of the probe file the connection test writes and removes.
+uuid = { workspace = true }
