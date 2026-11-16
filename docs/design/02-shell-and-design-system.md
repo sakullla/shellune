@@ -84,6 +84,31 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
     采用并弹提示，写失败保留原标记并在主机页写原因。列表工具栏的 ☆（`hosts.filter.favorites`）是"仅收藏"筛选，
     与分组、状态叠加，激活时出现 `仅收藏` chip，"清除筛选"一并去掉。
   - **所有主机**：宽窗口在列表上方写 `所有主机`（`home.all`）；以下列表能力不变。
+  - **视觉（新设计语言，结构与行为不变）**：
+    - **快速连接栏**：`TextField::set_prominent(true)` 画成主入口。高 40（随缩放），圆角 14（`XLARGE`），
+      `surface` 底加强边，静止 Low；聚焦时在 Low 之上加 accent 边与 3px 焦点环。正文字号用 body，图标 16。
+      其余输入框不受影响。
+    - **卡片**：最近、收藏、分组三类卡片都由 `home_card_frame` 构成，即共享的 `components::card` 横排
+      （surface、弱边、圆角 10、Low，内边距 12×8）。悬停时即时抬到 Mid 并换成强边，没有过渡。
+      分组卡片的图标块用品牌渐变（accent）配 `ON_ACCENT` 文件夹，与主机卡片的首字母头像区分。
+      快速连接的结果面板（`home.quick.results`）也是同一种 `card`。
+    - **卡片带的阴影余量**：`home.dashboard` 是滚动框，会裁掉内容的阴影。因此它左右各外扩 8（负外边距），
+      再用同样的内边距收回；底部只留 4（Low 的阴影余量），不收回。卡片与下方列表左缘仍然对齐，
+      静止阴影不会被裁；需要滚动的卡片带在裁切处与“所有主机”仍保持完整的间距。悬停的 Mid 阴影达不到的部分
+      仍会被滚动框裁掉。
+    - **进入动画**：卡片依次淡入（`components::enter_in_turn`）。第 n 张卡片的次序为
+      “所在区序号 + 区内序号”，每一次序晚 40ms（`TURN_DELAY`，第 6 次序以后不再加），淡入时长为
+      `Enter::Rise` 的 BASE 180ms。动画只改透明度，卡片从第一帧起就在最终位置，进入过程中也能按到。
+      减少动效时直接画终态。首次使用卡片（`hosts.empty`）用 `theme::enter(…, Enter::Rise)` 进入一次。
+    - **列表**：`hosts.surface` 改为同一种 `card`（surface + Low，内边距 4），不再是 chrome 底。
+      行仍是卡片里的平面行：左右内边距 12，名称与地址两行之间留 2。
+    - **空状态**：列表的“无匹配”（`hosts.nomatch`）和“暂无最近连接”（`hosts.recent.empty`）
+      改用 `components::empty_state`（accent tint 图标块 + 标题 + 可选说明 + 动作），外层保留原选择器。
+      首次使用卡片改用 `components::card`，取最大圆角 14 和内边距 24，品牌图标块为 Mid。
+    - **证据**：`home-*` 截图（宽、窄、空、中文、200%）。
+      `the_dashboard_cards_fade_in_turn_where_they_stand_and_take_a_press_at_once` 断言进入中与减少动效时
+      卡片位置一致、进入中可点；`the_quick_bar_is_the_larger_field_above_the_cards` 断言栏高于列表搜索、
+      卡片与列表左对齐。
   - **证据**：截图场景 `home-hosts`（最近 + 分组）、`home-favorites`（收藏卡片与行星标）、`home-quick`（栏的结果）、
     `home-narrow`（860 宽单列、720×480 @ 200%）、`home-empty`（首次使用）。fixture 的连接记录是写进文件的、按运行时刻
     取相对时间，不代表真的连过；收藏的标记/取消、快速连接的匹配与临时连接、分组筛选、空区隐藏由 `src/app/tests.rs`
@@ -545,7 +570,9 @@ gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动�
    `AnimationDurationFactor=0`；读不到时视为未要求。窗口首次绘制时读取，之后在窗口重新获得焦点或系统
    外观变化时重读（Linux 需要调用 `gsettings`，在后台线程读取）。截图固定为减少动效。
 
-当前使用：对话框（`components::modal`）与 toast 用 Fade；等待徽记与加载条用 BASE。
+当前使用：对话框（`components::modal`）与 toast 用 Fade；等待徽记与加载条用 BASE；会话状态卡用 Rise；
+首页卡片依次淡入（`components::enter_in_turn`，每次序晚 `TURN_DELAY` 40ms、淡入 BASE、只动透明度），
+首次使用卡片用 Rise。
 
 ### 2.4 形状与字
 
@@ -1298,7 +1325,8 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 剪切、粘贴（Windows 另有 Ctrl+Insert / Shift+Insert / Shift+Delete）；右键菜单给出同样四项。粘贴的换行
 变为空格（快捷命令正文的字段是唯一例外：它保留换行并以 `\n` 画出，Shift+Enter 换行，见"快捷命令"）。
 光标是绘制的细线，选区高亮（失焦时变淡），超长内容横向滚动并保持光标可见，获得焦点时显示
-主色外环。密码框可点眼睛图标临时显示，且拒绝复制 / 剪切；路径框（私钥、SSH 配置、自定义 Shell、上传
+主色外环。`set_prominent(true)` 把一个输入框画成页面主入口（只用于首页快速连接栏）：高 40、圆角 14、
+surface 底、静止 Low，焦点环叠在 Low 之上。密码框可点眼睛图标临时显示，且拒绝复制 / 剪切；路径框（私钥、SSH 配置、自定义 Shell、上传
 文件、下载目录）右端有"浏览…"按钮，调用系统文件选择框。私钥路径中的 `~` 展开为用户主目录。
 
 ### 快捷命令（`snippets.rs` + `view/shell.rs`）
@@ -1425,7 +1453,8 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 | `modal(viewport, id, width, ModalContent)` | 对话框外壳（尚未迁移的见上）：scrim 遮罩（按下不关闭），overlay + 强边 + 圆角 14 + High，头部固定、主体滚动、底部固定，进入时 Fade |
 | `dialog_face` / `dialog_panel` / `dialog_header` | 对话框表面令牌与内嵌标题块 |
 | `toast(tone, icon, title, detail)` | 通知：raised + 强边 + 圆角 10 + Mid，色调图标圆底；关闭按钮与位置由调用方加，进入时 Fade |
-| `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 14）+ 标题 + 一行说明 + 可选动作；不带状态色调 |
+| `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 14）+ 标题 + 可选一行说明 + 可选动作；不带状态色调；调用方在外层加自己的选择器 |
+| `enter_in_turn(element, id, turn)` + `turn_timing` / `turn_curve` | 一组物体依次淡入：第 `turn` 个晚 `TURN_DELAY`×turn（到 `LAST_TURN` 为止），淡入 BASE，只动透明度；减少动效时直接画终态 |
 | `banner` / `notice` | 提示、失败、确认问题（色调底 + 左侧 3px 色条）；完成后的通知 |
 | `state_card` / `state_card_with_icon` | 加载中 / 失败 / 空：surface 卡 + Low，色调 tint 徽记块 |
 | `chip` / `tag` / `badge` / `kind_badge` / `keycap` / `status_dot` / `status_mark` | 状态（形状 + 词 + 色调）、分组、数量、类型、快捷键、状态标记 |

@@ -27,7 +27,7 @@ use crate::app::snippets::{SnippetEditor, body_preview};
 use crate::app::terminal;
 use crate::app::terminal::SnippetOffer;
 use crate::app::text_field::TextField;
-use crate::app::theme::{self, ThemeChoice, Tone, palette, radius, spacing};
+use crate::app::theme::{self, Elevated, ThemeChoice, Tone, palette, radius, spacing};
 use crate::app::workspace::{AttentionKind, SectionState};
 
 /// A tool of a host or session that opens over the page instead of being a page.
@@ -1034,6 +1034,14 @@ impl ShelluneView {
                     .max(metrics.scale(72.0))
                     .min(metrics.scale(300.0))
             };
+            // The band scrolls, and a scrolling box clips what it holds at its edges.
+            // The cards rest on a shadow, so the box reaches a little past the column
+            // on both sides and takes the same room back as padding: the cards stay
+            // aligned with the list and their resting shadow is not cut. Below, the
+            // room is only the resting shadow's reach and is not taken back, so a band
+            // that has to scroll still ends a full gap above the list's heading.
+            let shadow_room = metrics.scale(spacing::TIGHT);
+            let shadow_below = metrics.scale(spacing::HAIRLINE);
             column = column.child(
                 div()
                     .id("home.dashboard")
@@ -1042,7 +1050,10 @@ impl ShelluneView {
                     .flex_col()
                     .flex_none()
                     .min_h(px(0.0))
-                    .max_h(cap)
+                    .max_h(cap + shadow_below)
+                    .mx(-shadow_room)
+                    .px(shadow_room)
+                    .pb(shadow_below)
                     .overflow_y_scroll()
                     .child(band),
             );
@@ -1278,111 +1289,112 @@ impl ShelluneView {
                 .child(SharedString::from(message.text().to_owned())),
             );
         }
-        column.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(metrics.scale(spacing::LOOSE))
-                .p(metrics.scale(spacing::LOOSE))
-                .rounded(px(radius::XLARGE))
-                .bg(theme::swatch(palette::SURFACE))
-                .border_1()
-                .border_color(theme::swatch(palette::BORDER))
-                .shadow(theme::Elevation::Low.shadows())
-                .debug_selector(|| "hosts.empty".to_owned())
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .size(metrics.scale(56.0))
-                        .rounded(px(radius::XLARGE))
-                        .bg(super::brand_gradient())
-                        .shadow(theme::Elevation::Mid.shadows())
-                        .child(icons::icon(
-                            Icon::Server,
-                            metrics.scale(26.0),
-                            theme::swatch(palette::ON_ACCENT),
-                        )),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap(metrics.scale(spacing::TIGHT))
-                        .child(
-                            div()
-                                .text_size(metrics.title_size())
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                .child(ux.home_welcome_title),
-                        )
-                        .child(
-                            div()
-                                .text_size(metrics.label_size())
-                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                .child(ux.home_welcome_body),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap(metrics.scale(spacing::TIGHT))
-                                .pt(metrics.scale(spacing::HAIRLINE))
-                                .child(
-                                    components::icon_label_button(
-                                        Icon::Plus,
-                                        strings.primary_hosts,
-                                        Variant::Primary,
-                                        metrics,
-                                    )
-                                    .id("hosts.empty.new")
-                                    .debug_selector(|| "hosts.empty.new".to_owned())
-                                    .on_click(cx.listener(
-                                        |this, _event, _window, cx| {
-                                            this.open_create_host(cx);
-                                        },
-                                    )),
+        // The welcome is the page's one card: the shared card at its largest corner and
+        // padding, with the brand tile lifted above it, rising into place once.
+        let welcome = components::card(metrics)
+            .flex_row()
+            .items_center()
+            .gap(metrics.scale(spacing::LOOSE))
+            .p(metrics.scale(spacing::LOOSE))
+            .rounded(px(radius::XLARGE))
+            .debug_selector(|| "hosts.empty".to_owned())
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(metrics.scale(56.0))
+                    .rounded(px(radius::XLARGE))
+                    .bg(super::brand_gradient())
+                    .elevation(theme::Elevation::Mid)
+                    .child(icons::icon(
+                        Icon::Server,
+                        metrics.scale(26.0),
+                        theme::swatch(palette::ON_ACCENT),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(
+                        div()
+                            .text_size(metrics.title_size())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(ux.home_welcome_title),
+                    )
+                    .child(
+                        div()
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .child(ux.home_welcome_body),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .pt(metrics.scale(spacing::HAIRLINE))
+                            .child(
+                                components::icon_label_button(
+                                    Icon::Plus,
+                                    strings.primary_hosts,
+                                    Variant::Primary,
+                                    metrics,
                                 )
-                                .child(
-                                    components::icon_label_button(
-                                        Icon::Import,
-                                        ux.home_import,
-                                        Variant::Ghost,
-                                        metrics,
-                                    )
-                                    .id("hosts.import.open")
-                                    .debug_selector(|| "hosts.import.open".to_owned())
-                                    .on_click(cx.listener(
-                                        |this, _event, _window, cx| {
-                                            this.open_import(cx);
-                                        },
-                                    )),
+                                .id("hosts.empty.new")
+                                .debug_selector(|| "hosts.empty.new".to_owned())
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.open_create_host(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                components::icon_label_button(
+                                    Icon::Import,
+                                    ux.home_import,
+                                    Variant::Ghost,
+                                    metrics,
                                 )
-                                // A new machine with a backup elsewhere starts here:
-                                // the file chooser, then the same preview the settings
-                                // page shows (R5, R6).
-                                .child(
-                                    components::icon_label_button(
-                                        Icon::FolderOpen,
-                                        copy::backup_for(self.workspace.locale()).home_restore,
-                                        Variant::Ghost,
-                                        metrics,
-                                    )
-                                    .id("hosts.empty.restore")
-                                    .debug_selector(|| "hosts.empty.restore".to_owned())
-                                    .on_click(cx.listener(
-                                        |this, _event, _window, cx| {
-                                            this.choose_backup_import(cx);
-                                        },
-                                    )),
-                                ),
-                        ),
-                ),
-        )
+                                .id("hosts.import.open")
+                                .debug_selector(|| "hosts.import.open".to_owned())
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.open_import(cx);
+                                    },
+                                )),
+                            )
+                            // A new machine with a backup elsewhere starts here:
+                            // the file chooser, then the same preview the settings
+                            // page shows (R5, R6).
+                            .child(
+                                components::icon_label_button(
+                                    Icon::FolderOpen,
+                                    copy::backup_for(self.workspace.locale()).home_restore,
+                                    Variant::Ghost,
+                                    metrics,
+                                )
+                                .id("hosts.empty.restore")
+                                .debug_selector(|| "hosts.empty.restore".to_owned())
+                                .on_click(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.choose_backup_import(cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            );
+        column.child(theme::enter(
+            welcome,
+            "hosts.empty.enter",
+            theme::Enter::Rise,
+        ))
     }
 
     /// The capture layer: what the next combination pressed will be bound to.

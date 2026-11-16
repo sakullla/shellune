@@ -32,7 +32,7 @@ use crate::app::hosts::{
     GroupAction, HostGroupRow, HostList, HostListRow, HostStatusFilter, SelectionScope, format_unix,
 };
 use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Metrics, Tone, palette, spacing};
+use crate::app::theme::{self, Elevated, Elevation, Metrics, Tone, palette, spacing};
 use crate::app::view::ShelluneView;
 use crate::app::{components, theme::radius};
 
@@ -553,19 +553,14 @@ impl ShelluneView {
                     .when(wide, |row| row.child(self.group_column_actions(cx))),
             );
 
-        // The rows sit on one surface, so the list reads as one object beside the
-        // column that narrows it.
-        let surface = div()
-            .flex()
-            .flex_col()
+        // The rows sit on one card, so the list reads as one object beside the column
+        // that narrows it: the same surface, edge and low elevation as the dashboard's
+        // cards above it, with the rows drawn flat inside.
+        let surface = components::card(metrics)
+            .gap(px(0.0))
             .flex_1()
-            .min_w(px(0.0))
             .when(!short, |col| col.min_h(px(0.0)))
             .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "hosts.surface".to_owned());
         if empty {
             list_column = list_column.child(
@@ -992,48 +987,25 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
-        // An empty list is a calm, centred note in the middle of the list's surface: an
-        // icon, what happened, and the one press that changes it. The button is as wide
-        // as its words, not a bar across the list.
+        // An empty list is the shared empty state in the middle of the list's surface:
+        // an icon, what happened, and the one press that changes it. The button is as
+        // wide as its words, not a bar across the list.
         let note = |selector: &'static str,
                     icon: Icon,
                     title: &'static str,
-                    hint: Option<&'static str>| {
+                    hint: Option<&'static str>,
+                    action: AnyElement| {
             div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-                .py(metrics.scale(spacing::LOOSE))
+                .w_full()
                 .debug_selector(move || selector.to_owned())
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(metrics.scale(40.0))
-                        .mb(metrics.scale(spacing::HAIRLINE))
-                        .rounded_full()
-                        .bg(theme::swatch(palette::SURFACE_SELECTED))
-                        .child(icons::icon(
-                            icon,
-                            metrics.icon_size(),
-                            theme::swatch(palette::TEXT_MUTED),
-                        )),
-                )
-                .child(
-                    div()
-                        .text_size(metrics.body_size())
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                        .child(title),
-                )
-                .children(hint.map(|hint| {
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .child(hint)
-                }))
+                .child(components::empty_state(
+                    icon,
+                    title,
+                    hint.map(SharedString::from),
+                    Some(action),
+                    metrics,
+                ))
+                .into_any_element()
         };
         if self.hosts.view() == crate::app::hosts::HostView::Recent {
             return note(
@@ -1041,17 +1013,14 @@ impl ShelluneView {
                 Icon::Layers,
                 strings.hosts_recent_empty,
                 None,
-            )
-            .child(
                 components::compact_button(strings.hosts_view_all, Variant::Secondary, metrics)
-                    .mt(metrics.scale(spacing::HAIRLINE + 2.0))
                     .id("hosts.recent.all")
                     .debug_selector(|| "hosts.recent.all".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.select_host_view(crate::app::hosts::HostView::All, cx);
-                    })),
-            )
-            .into_any_element();
+                    }))
+                    .into_any_element(),
+            );
         }
         let narrow = !self.hosts.search().trim().is_empty() || self.hosts.filter().is_narrowing();
         if !narrow {
@@ -1062,17 +1031,14 @@ impl ShelluneView {
             Icon::Search,
             strings.hosts_no_match,
             Some(ux.hosts_no_match_hint),
-        )
-        .child(
             components::compact_button(ux.hosts_filter_clear, Variant::Secondary, metrics)
-                .mt(metrics.scale(spacing::HAIRLINE + 2.0))
                 .id("hosts.nomatch.clear")
                 .debug_selector(|| "hosts.nomatch.clear".to_owned())
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.clear_host_narrowing(cx);
-                })),
+                }))
+                .into_any_element(),
         )
-        .into_any_element()
     }
 
     /// The list itself: a uniform list that is asked for the rows it shows.
@@ -1259,7 +1225,9 @@ impl ShelluneView {
             .flex_col()
             .gap(metrics.scale(spacing::SNUG))
             .debug_selector(|| "home.cards".to_owned());
-        let mut any = false;
+        // Which section this is, from the top: each one's cards start their entrance a
+        // turn after the section above started its own.
+        let mut order = 0usize;
 
         let recent = self.book.recent_hosts();
         if !recent.is_empty() {
@@ -1299,14 +1267,14 @@ impl ShelluneView {
                 ux.home_recent_section,
                 recent.len(),
                 cards,
-                wide,
-                per_section,
+                (wide, per_section),
+                order,
                 Some(Box::new(|this: &mut Self, cx: &mut Context<Self>| {
                     this.show_all_recent(cx);
                 })),
                 cx,
             ));
-            any = true;
+            order += 1;
         }
 
         let favorites = self.book.favorite_hosts();
@@ -1341,14 +1309,14 @@ impl ShelluneView {
                 ux.home_favorites_section,
                 favorites.len(),
                 cards,
-                wide,
-                per_section,
+                (wide, per_section),
+                order,
                 Some(Box::new(|this: &mut Self, cx: &mut Context<Self>| {
                     this.show_all_favorites(cx);
                 })),
                 cx,
             ));
-            any = true;
+            order += 1;
         }
 
         let groups = crate::app::hosts::group_overview(&self.book, &self.groups, &|id| {
@@ -1368,14 +1336,14 @@ impl ShelluneView {
                 ux.home_groups_section,
                 cards.len(),
                 cards,
-                wide,
-                per_section,
+                (wide, per_section),
+                order,
                 None,
                 cx,
             ));
-            any = true;
+            order += 1;
         }
-        any.then_some(band)
+        (order > 0).then_some(band)
     }
 
     /// How many cards one section shows.
@@ -1399,6 +1367,10 @@ impl ShelluneView {
 
     /// One section of the band: its title, the "view all" that opens the rest in the
     /// list, and the cards - on one line when wide, stacked when narrow.
+    ///
+    /// `shape` is whether the window is wide and how many cards a full line holds;
+    /// `order` is the section's place in the band, which sets when its cards fade in:
+    /// the band arrives card by card, top-left first, when motion is allowed (R4).
     #[allow(clippy::too_many_arguments)]
     fn home_section(
         &self,
@@ -1406,11 +1378,12 @@ impl ShelluneView {
         title: &'static str,
         total: usize,
         cards: Vec<AnyElement>,
-        wide: bool,
-        per_line: usize,
+        shape: (bool, usize),
+        order: usize,
         view_all: Option<SectionAction>,
         cx: &mut Context<Self>,
     ) -> Div {
+        let (wide, per_line) = shape;
         let metrics = self.metrics();
         let ux = copy::ux();
         let shown = cards.len();
@@ -1440,8 +1413,12 @@ impl ShelluneView {
         .gap(metrics.scale(spacing::TIGHT + 2.0))
         .debug_selector(move || format!("{selector}.cards"));
         let count = cards.len();
-        for card in cards {
-            line = line.child(div().flex().flex_1().min_w(px(0.0)).child(card));
+        for (number, card) in cards.into_iter().enumerate() {
+            line = line.child(components::enter_in_turn(
+                div().flex().flex_1().min_w(px(0.0)).child(card),
+                SharedString::from(format!("{selector}.enter.{number}")),
+                order + number,
+            ));
         }
         // A short line keeps the cards the width a full one gives them.
         if wide {
@@ -1501,7 +1478,7 @@ impl ShelluneView {
                     .flex_col()
                     .flex_1()
                     .min_w(px(0.0))
-                    .gap(metrics.scale(1.0))
+                    .gap(metrics.scale(2.0))
                     .child(
                         div()
                             .flex()
@@ -1615,6 +1592,8 @@ impl ShelluneView {
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.pick_group_card(path.clone(), cx);
             }))
+            // A group is a place rather than a machine: its tile is the accent block,
+            // where a host card shows the host's own initials.
             .child(
                 div()
                     .flex()
@@ -1623,11 +1602,11 @@ impl ShelluneView {
                     .justify_center()
                     .size(metrics.scale(30.0))
                     .rounded(px(radius::MEDIUM))
-                    .bg(theme::swatch(palette::ACCENT_TINT))
+                    .bg(super::brand_gradient())
                     .child(icons::icon(
                         Icon::Folder,
                         metrics.small_icon_size(),
-                        theme::swatch(palette::ACCENT_ON_TINT),
+                        theme::swatch(palette::ON_ACCENT),
                     )),
             )
             .child(
@@ -1636,7 +1615,7 @@ impl ShelluneView {
                     .flex_col()
                     .flex_1()
                     .min_w(px(0.0))
-                    .gap(metrics.scale(1.0))
+                    .gap(metrics.scale(2.0))
                     .child(
                         div()
                             .truncate()
@@ -1665,15 +1644,11 @@ impl ShelluneView {
         let ux = copy::ux();
         let results = self.quick_results();
         let highlight = self.quick_highlight();
-        let mut panel = div()
-            .flex()
-            .flex_col()
+        // The results take the cards' place, so they are a card of their own: the
+        // same surface, edge and low elevation, holding one row per result.
+        let mut panel = components::card(metrics)
             .gap(metrics.scale(1.0))
             .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "home.quick.results".to_owned());
         if results.is_empty() {
             return panel.child(
@@ -2074,7 +2049,7 @@ fn host_row_element(
         .gap(metrics.scale(spacing::SNUG))
         .w_full()
         .min_w(px(0.0))
-        .px(metrics.scale(spacing::TIGHT + 2.0))
+        .px(metrics.scale(spacing::SNUG))
         .rounded(px(radius::MEDIUM))
         .border_1()
         // A picked row is a soft tint: picked rows sit next to each other, and an
@@ -2158,7 +2133,7 @@ fn host_row_element(
                 .flex_col()
                 .flex_1()
                 .min_w(px(0.0))
-                .gap(metrics.scale(1.0))
+                .gap(metrics.scale(2.0))
                 .child(
                     div()
                         .flex()
@@ -2353,7 +2328,7 @@ fn connection_row_element(
         .gap(metrics.scale(spacing::SNUG))
         .w_full()
         .min_w(px(0.0))
-        .px(metrics.scale(spacing::TIGHT + 2.0))
+        .px(metrics.scale(spacing::SNUG))
         .rounded(px(radius::MEDIUM))
         .border_1()
         .when(cursor, |row| {
@@ -2387,7 +2362,7 @@ fn connection_row_element(
                 .flex_col()
                 .flex_1()
                 .min_w(px(0.0))
-                .gap(metrics.scale(1.0))
+                .gap(metrics.scale(2.0))
                 .child(
                     div()
                         .flex()
@@ -2573,8 +2548,6 @@ fn checkbox(checked: bool, metrics: Metrics) -> Div {
         .child(components::checkbox_box(checked, metrics))
 }
 
-/// The frame of one dashboard card: a raised surface, a row of its contents, and the
-/// pointer's lift.
 /// The target a card draws: the SSH default port is left out, so the address keeps
 /// the room.
 #[must_use]
@@ -2591,23 +2564,22 @@ pub(crate) fn card_tooltip(target: &str, hint: &str) -> String {
     format!("{target} · {hint}")
 }
 
+/// The frame of one dashboard card: the shared [`components::card`] laid out as a row,
+/// resting at the low elevation and lifted to the mid one under the pointer (R4).
+///
+/// GPUI has no hover transition, so the lift is immediate; the stronger edge comes with
+/// it, so the card under the pointer reads in both palettes even where a shadow is faint.
 fn home_card_frame(metrics: Metrics) -> Div {
     let hover_border = theme::swatch(palette::BORDER_STRONG);
-    let hover_bg = theme::swatch(palette::SURFACE_HOVER);
-    div()
-        .flex()
+    components::card(metrics)
+        .flex_row()
         .items_center()
         .w_full()
-        .min_w(px(0.0))
-        .gap(metrics.scale(spacing::TIGHT + 2.0))
-        .px(metrics.scale(spacing::TIGHT + 2.0))
-        .py(metrics.scale(spacing::HAIRLINE + 2.0))
-        .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::SURFACE))
-        .border_1()
-        .border_color(theme::swatch(palette::BORDER))
+        .gap(metrics.scale(spacing::SNUG - 2.0))
+        .px(metrics.scale(spacing::SNUG))
+        .py(metrics.scale(spacing::TIGHT))
         .cursor_pointer()
-        .hover(move |style| style.border_color(hover_border).bg(hover_bg))
+        .hover(move |style| style.border_color(hover_border).elevation(Elevation::Mid))
 }
 
 /// The favourite mark of a row: a filled star that stays in view on a favourite, an

@@ -29004,6 +29004,89 @@ async fn an_empty_section_is_hidden_and_an_empty_book_shows_the_welcome(cx: &mut
     );
 }
 
+/// The dashboard's cards fade in one after another (R4), but only their opacity moves:
+/// every card stands where it will stay from the first frame, a press during the
+/// entrance lands on it, and reduced motion draws the same cards in the same places.
+#[gpui::test]
+async fn the_dashboard_cards_fade_in_turn_where_they_stand_and_take_a_press_at_once(
+    cx: &mut TestAppContext,
+) {
+    theme::set_motion(Motion::Full);
+    let dir = TempDir::new("dashboard-entrance");
+    seed_dashboard(&dir);
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().motion()),
+        Motion::Full,
+        "the entrance is played"
+    );
+    let cards = [
+        "home.recent.0",
+        "home.recent.2",
+        "home.favorite.0",
+        "home.group.0",
+        "home.group.1",
+    ];
+    let entering: Vec<_> = cards.iter().map(|card| bounds_of(cx, card)).collect();
+
+    while cx.update(|_window, app| view.read(app).workspace().motion()) != Motion::Reduced {
+        cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+        cx.run_until_parked();
+    }
+    let still: Vec<_> = cards.iter().map(|card| bounds_of(cx, card)).collect();
+    assert_eq!(
+        entering, still,
+        "an entering card already stands where the still one does"
+    );
+    theme::set_motion(Motion::Full);
+
+    // A fresh window, pressed while its cards are still arriving.
+    let again = TempDir::new("dashboard-entrance-press");
+    seed_dashboard(&again);
+    let (view, cx) = hosts_view_with_trust(cx, &again);
+    click(cx, "home.group.1");
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app)
+                .hosts_state()
+                .filter()
+                .group()
+                .map(GroupPath::to_canonical),
+            Some("Staging".to_owned()),
+            "the last card to arrive already narrows the list"
+        );
+    });
+}
+
+/// The quick-connect bar is the page's main entry: a larger field than the list's own
+/// search, resting on the page above the cards (R4).
+#[gpui::test]
+async fn the_quick_bar_is_the_larger_field_above_the_cards(cx: &mut TestAppContext) {
+    let dir = TempDir::new("dashboard-quick-bar");
+    seed_dashboard(&dir);
+    let (_view, cx) = hosts_view_with_trust(cx, &dir);
+    let bar = bounds_of(cx, "home.quick");
+    let search = bounds_of(cx, "hosts.search");
+    assert!(
+        bar.size.height > search.size.height,
+        "the bar {bar:?} is taller than the list search {search:?}"
+    );
+    let first = bounds_of(cx, "home.recent.0");
+    assert!(
+        bar.bottom() <= first.top(),
+        "the bar {bar:?} sits above the first card {first:?}"
+    );
+    let surface = bounds_of(cx, "hosts.surface");
+    assert!(
+        (first.left() - bounds_of(cx, "hosts.toolbar").left()).abs() < px(0.5),
+        "the band's shadow room does not move the cards off the column"
+    );
+    assert!(
+        surface.right() <= cx.update(|window, _app| window.viewport_size().width),
+        "the list card stays inside the window"
+    );
+}
+
 #[gpui::test]
 async fn the_star_marks_a_favorite_that_survives_a_restart_and_unmarks_it(cx: &mut TestAppContext) {
     let dir = TempDir::new("dashboard-star");

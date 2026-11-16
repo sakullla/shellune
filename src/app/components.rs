@@ -12,9 +12,11 @@
 //! [`crate::app::theme`], which is what keeps the two palettes in step.
 
 use gpui::prelude::*;
+use std::time::Duration;
+
 use gpui::{
-    Animation, AnimationExt, AnyElement, AnyView, App, Div, Pixels, Rgba, SharedString, Window,
-    div, px,
+    Animation, AnimationExt, AnyElement, AnyView, App, Div, ElementId, Pixels, Rgba, SharedString,
+    Window, div, px,
 };
 
 use crate::app::icons::{self, Icon};
@@ -1635,7 +1637,6 @@ pub fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) 
 ///
 /// It is the one container a page groups its content in - a settings section, a home
 /// tile, a status panel - so the corner, edge and shadow of every card agree.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn card(metrics: Metrics) -> Div {
     div()
         .flex()
@@ -1885,16 +1886,16 @@ pub fn toast(
         )
 }
 
-/// An empty page or section: an icon on the accent tint, a title, one line and an
-/// optional next step.
+/// An empty page or section: an icon on the accent tint, a title, an optional line and
+/// an optional next step.
 ///
 /// "Empty" is a state of its own and says what to do next; it is not the failure card,
-/// so it carries no status tone.
-#[cfg_attr(not(test), allow(dead_code))]
+/// so it carries no status tone. The caller names it with its own selector when a page
+/// has more than one way to be empty.
 pub fn empty_state(
     icon: Icon,
     title: impl Into<SharedString>,
-    body: impl Into<SharedString>,
+    body: Option<SharedString>,
     action: Option<AnyElement>,
     metrics: Metrics,
 ) -> Div {
@@ -1934,7 +1935,7 @@ pub fn empty_state(
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .child(title.into()),
         )
-        .child(
+        .children(body.map(|body| {
             div()
                 .w_full()
                 .max_w(metrics.scale(420.0))
@@ -1942,9 +1943,62 @@ pub fn empty_state(
                 .text_center()
                 .text_size(metrics.body_size())
                 .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                .child(body.into()),
-        )
+                .child(body)
+        }))
         .children(action.map(|action| div().mt(metrics.scale(spacing::HAIRLINE)).child(action)))
+}
+
+/// How much later each object of a group fades in than the one before it.
+pub const TURN_DELAY: Duration = Duration::from_millis(40);
+
+/// The last turn that waits longer than the one before it: a long group does not keep
+/// its tail waiting, everything after this turn arrives with it.
+pub const LAST_TURN: usize = 6;
+
+/// When the `turn`-th object of a group starts to fade in, and when it is fully there.
+#[must_use]
+pub fn turn_timing(turn: usize) -> (Duration, Duration) {
+    let delay = TURN_DELAY * u32::try_from(turn.min(LAST_TURN)).unwrap_or(0);
+    (delay, delay + Enter::Rise.duration())
+}
+
+/// The curve of the `turn`-th object of a group, over the whole of its [`turn_timing`]:
+/// zero while it waits for its turn, then the shared entrance curve over the fade.
+pub fn turn_curve(turn: usize) -> impl Fn(f32) -> f32 {
+    let (delay, total) = turn_timing(turn);
+    let start = delay.as_secs_f32() / total.as_secs_f32();
+    let ease = theme::ease_out();
+    move |progress| {
+        if progress <= start {
+            0.0
+        } else {
+            ease(((progress - start) / (1.0 - start)).min(1.0))
+        }
+    }
+}
+
+/// Fades a group of objects in one after another - the home page's cards - when motion
+/// is allowed (R4).
+///
+/// Each object waits [`TURN_DELAY`] longer than the one before it, then fades in over
+/// the card entrance time. Only the opacity moves: the object takes its place, its
+/// size and its pointer target from the first frame, so a press during the entrance
+/// lands where the eye expects it. Under reduced motion it is drawn as it ends.
+pub fn enter_in_turn<E>(element: E, id: impl Into<ElementId>, turn: usize) -> AnyElement
+where
+    E: IntoElement + Styled + 'static,
+{
+    if !theme::motion_allowed() {
+        return element.into_any_element();
+    }
+    let (_, total) = turn_timing(turn);
+    element
+        .with_animation(
+            id,
+            Animation::new(total).with_easing(turn_curve(turn)),
+            |element, delta| element.opacity(delta),
+        )
+        .into_any_element()
 }
 
 /// The pieces of one centred dialog.
@@ -2314,10 +2368,11 @@ mod tests {
         let _ = empty_state(
             Icon::Server,
             "No hosts yet",
-            "Add a host to connect to it with one click.",
+            Some("Add a host to connect to it with one click.".into()),
             Some(button("New host", Variant::Primary, metrics).into_any_element()),
             metrics,
         );
+        let _ = empty_state(Icon::Layers, "Nothing recent", None, None, metrics);
         let _ = modal(
             gpui::size(px(720.0), px(480.0)),
             "dialog",
@@ -2438,5 +2493,38 @@ mod tests {
         assert!(!theme::motion_allowed());
         theme::set_motion(theme::Motion::Full);
         assert!(theme::motion_allowed());
+    }
+
+    #[test]
+    fn a_group_fades_in_one_after_another_and_every_turn_ends_fully_there() {
+        // The first object starts at once; each later one waits its turn, and a long
+        // group stops waiting at the last turn.
+        assert_eq!(turn_timing(0).0, Duration::ZERO);
+        for turn in 1..=LAST_TURN {
+            assert!(turn_timing(turn).0 > turn_timing(turn - 1).0, "turn {turn}");
+            assert_eq!(
+                turn_timing(turn).1 - turn_timing(turn).0,
+                Enter::Rise.duration(),
+                "every turn fades over the card entrance time"
+            );
+        }
+        assert_eq!(turn_timing(LAST_TURN + 5), turn_timing(LAST_TURN));
+        assert!(turn_timing(LAST_TURN).1 <= Duration::from_millis(500));
+
+        for turn in 0..=LAST_TURN + 1 {
+            let curve = turn_curve(turn);
+            assert!((curve(1.0) - 1.0).abs() < 1e-4, "turn {turn} ends drawn");
+            let mut last = 0.0;
+            for step in 0..=20 {
+                let value = curve(step as f32 / 20.0);
+                assert!(value >= last - 1e-6, "turn {turn} never fades back out");
+                last = value;
+            }
+        }
+        // While an earlier card is half in, a later one has not started yet.
+        let (delay, total) = turn_timing(2);
+        let waiting = delay.as_secs_f32() / total.as_secs_f32() * 0.9;
+        assert!(turn_curve(2)(waiting).abs() < f32::EPSILON);
+        assert!(turn_curve(0)(waiting) > 0.0);
     }
 }

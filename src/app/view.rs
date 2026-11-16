@@ -2177,6 +2177,8 @@ impl ShelluneView {
             let mut field = TextField::new(quick_placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
             field.set_clearable(true, cx);
+            // The bar is the page's main entry: the large, raised field (R4).
+            field.set_prominent(true, cx);
             field
         });
         let keys_search = cx.new(|cx| {
