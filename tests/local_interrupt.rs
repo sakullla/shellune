@@ -512,47 +512,76 @@ mod interrupt {
 
     /// Writes the command that starts the flood, and proves by its own output that it ran.
     ///
-    /// The command has to be running before the byte is sent, otherwise the press
-    /// interrupts the prompt instead of the program - and a console that is busy can lose
-    /// the whole line, the way it was measured to lose the control byte itself. So a write
-    /// that produces no flood output is written again, at most [LAUNCH_ATTEMPTS] times,
-    /// and what "started" means does not move: at least [support::OUTPUT_BEFORE_INTERRUPT]
-    /// new bytes and a real tick line from the program. The window is short because the
-    /// flood prints every 5 ms; it is a bound on how long a lost line is given, not a
-    /// wider wait for a slow machine.
+    /// Retry a missing launch, but once ticks arrive allow the stream to accumulate
+    /// under the same budget as the direct-program test. A slow stream is already
+    /// running: retyping its command only queues input for the shell after Ctrl+C.
     fn start_the_flood(session: &mut Session, label: &str) {
         let command = flood_command_for(&session.shell);
-        for attempt in 1..=LAUNCH_ATTEMPTS {
-            let before = session.bytes_read();
-            session.run(&command);
-            let started = Instant::now();
-            loop {
-                session.pump();
-                let text = session.core.snapshot().text().join("\n");
-                if session.bytes_read() >= before + support::OUTPUT_BEFORE_INTERRUPT
-                    && text.contains("tick ")
-                {
-                    return;
-                }
-                if started.elapsed() >= LAUNCH_OBSERVE {
-                    support::report(
-                        label,
-                        &format!(
-                            "the launch command produced no flood output in {LAUNCH_OBSERVE:?} \
-                             (attempt {attempt} of at most {LAUNCH_ATTEMPTS}); writing it again"
-                        ),
-                    );
-                    break;
-                }
-                std::thread::sleep(support::READ_INTERVAL);
+        start_flood_command(session, label, &command);
+    }
+
+    fn start_flood_command(session: &mut Session, label: &str, command: &str) -> u32 {
+        let mut before = session.bytes_read();
+        let started = Instant::now();
+        let mut last_launch = started;
+        let mut attempts = 1;
+        let mut saw_tick = false;
+        session.run(command);
+        loop {
+            session.pump();
+            let text = session.core.snapshot().text().join("\n");
+            saw_tick |= session.bytes_read() > before && text.contains("tick ");
+            if saw_tick && session.bytes_read() >= before + support::OUTPUT_BEFORE_INTERRUPT {
+                return attempts;
             }
+            if saw_tick {
+                assert!(
+                    started.elapsed() < support::FLOOD_BUDGET,
+                    "{label}: the flood started but produced only {} new bytes in {:?}; screen:\n{text}",
+                    session.bytes_read() - before,
+                    started.elapsed()
+                );
+            } else if last_launch.elapsed() >= LAUNCH_OBSERVE {
+                assert!(
+                    attempts < LAUNCH_ATTEMPTS,
+                    "{label}: the flood never started after {attempts} writes; screen:\n{text}"
+                );
+                support::report(
+                    label,
+                    &format!(
+                        "no tick arrived in {LAUNCH_OBSERVE:?} after launch {attempts}; retrying"
+                    ),
+                );
+                before = session.bytes_read();
+                session.run(command);
+                attempts += 1;
+                last_launch = Instant::now();
+            }
+            std::thread::sleep(support::READ_INTERVAL);
         }
-        let text = session.core.snapshot().text().join("\n");
-        panic!(
-            "the flood never started from a shell prompt: {} bytes came back after \
-             {LAUNCH_ATTEMPTS} writes of the command; the screen held:\n{text}",
-            session.bytes_read()
+    }
+
+    #[test]
+    fn a_slow_flood_is_started_once_and_accumulates_output_across_launch_windows() {
+        let _alone = support::exclusive();
+        let Some(mut session) = shell_for_the_flood() else {
+            support::report(
+                "local_interrupt",
+                "SKIP slow flood: no shell on this machine",
+            );
+            return;
+        };
+        wait_until_it_takes_input(&mut session);
+        wait_until_the_shell_is_quiet(&mut session);
+        let command = format!("{} --slow-output", flood_command_for(&session.shell));
+        let started = Instant::now();
+        let attempts = start_flood_command(&mut session, "slow flood", &command);
+        assert!(
+            started.elapsed() > LAUNCH_OBSERVE,
+            "the regression must span a launch window"
         );
+        assert_eq!(attempts, 1, "a running program must not be launched again");
+        session.write(&[0x03]);
     }
 
     /// The negative control: a flood that cannot be stopped must never look stopped.

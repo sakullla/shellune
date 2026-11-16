@@ -63,6 +63,12 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let ignore_interrupt = std::env::args().any(|arg| arg == "--ignore-interrupt");
+    // Reproduce a slowly scheduled CI runner without relying on machine load.
+    let interval = if std::env::args().any(|arg| arg == "--slow-output") {
+        Duration::from_millis(35)
+    } else {
+        INTERVAL
+    };
     install_handler();
 
     let stdout = std::io::stdout();
@@ -85,7 +91,7 @@ fn main() {
         if writeln!(out, "tick {tick}").is_err() || out.flush().is_err() {
             return;
         }
-        std::thread::sleep(INTERVAL);
+        std::thread::sleep(interval);
     }
 }
 
