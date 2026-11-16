@@ -61,6 +61,61 @@ pub const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(12);
 /// Height of the status line under the grid.
 pub const SHELL_BAR_HEIGHT: f32 = 28.0;
 
+/// How many of the bar's own tools a narrow bar folds into its "more" menu (R3).
+///
+/// The tools go in a fixed order - the font size first, then the grid size, then copy,
+/// then the presentation switch - so a bar that gets narrower only ever loses the next
+/// one, and a reader always finds the rest where they were. Search never folds: it is
+/// the one tool a pane of any width keeps under the pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BarFold {
+    /// Every tool is on the bar.
+    Nothing,
+    /// The font size controls are in the menu.
+    Font,
+    /// ...and the grid size.
+    Size,
+    /// ...and copy.
+    Copy,
+    /// ...and the presentation switch: only search and the menu are left.
+    Mode,
+}
+
+impl BarFold {
+    /// Every level, from nothing folded to everything that can fold.
+    const ORDER: [Self; 5] = [
+        Self::Nothing,
+        Self::Font,
+        Self::Size,
+        Self::Copy,
+        Self::Mode,
+    ];
+
+    pub fn folds_font(self) -> bool {
+        self >= Self::Font
+    }
+
+    pub fn folds_size(self) -> bool {
+        self >= Self::Size
+    }
+
+    pub fn folds_copy(self) -> bool {
+        self >= Self::Copy
+    }
+
+    pub fn folds_mode(self) -> bool {
+        self >= Self::Mode
+    }
+}
+
+/// What the bar's last layout measured: its own width and the width of the session's
+/// middle group, which does not fold and so decides how much room the tools have.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BarRoom {
+    width: Option<Pixels>,
+    middle: Pixels,
+}
+
 /// Width of the caret in logical pixels.
 const CARET_WIDTH: f32 = 2.0;
 
@@ -83,6 +138,14 @@ pub fn monospace_family() -> &'static str {
     } else {
         "DejaVu Sans Mono"
     }
+}
+
+/// How wide `text` is in the grid's monospace face at `size`.
+///
+/// The face has one advance for every character it draws, so the width is a count; it
+/// is what the bar reserves for the grid size and the font size it writes.
+fn monospace_width(text: &str, size: Pixels) -> Pixels {
+    px(text.chars().count() as f32 * f32::from(size) * shellune_terminal::MONOSPACE_ADVANCE_RATIO)
 }
 
 /// What a serial line left behind when its pane stopped driving it (R21).
@@ -468,7 +531,19 @@ pub struct TerminalPane {
     tag: EventTag,
     /// The session's own half of the bar under the grid, handed in by the window for
     /// the frame being drawn: where the session is and what can be done to it.
-    session_slot: std::cell::RefCell<Option<(gpui::AnyElement, gpui::AnyElement)>>,
+    session_slot: std::cell::RefCell<Option<(gpui::AnyElement, Vec<gpui::AnyElement>)>>,
+    /// The card the window lays over the grid for the next draw: why the session ended,
+    /// or that it is coming back (R3). Taken like the session's half of the bar.
+    status_slot: std::cell::RefCell<Option<gpui::AnyElement>>,
+    /// How wide the bar was at its last layout and how much of it the session's own
+    /// middle group took: what decides which tools fold into the bar's menu (R3).
+    bar_room: std::cell::Cell<BarRoom>,
+    /// Where the bar's "more" menu is open, when it is.
+    more_menu: Option<gpui::Point<Pixels>>,
+    /// Whether the bar carried the session's half at its last draw.
+    bar_has_slot: std::cell::Cell<bool>,
+    /// The room the session's left part needs, as the window measured it.
+    session_floor: std::cell::Cell<Pixels>,
     core: TerminalCore,
     source: Option<PaneSource>,
     /// What the pane is running: a program here, or a host over SSH.
@@ -734,6 +809,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
+            status_slot: std::cell::RefCell::new(None),
+            bar_room: std::cell::Cell::new(BarRoom::default()),
+            more_menu: None,
+            bar_has_slot: std::cell::Cell::new(false),
+            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -804,6 +884,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
+            status_slot: std::cell::RefCell::new(None),
+            bar_room: std::cell::Cell::new(BarRoom::default()),
+            more_menu: None,
+            bar_has_slot: std::cell::Cell::new(false),
+            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -873,6 +958,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
+            status_slot: std::cell::RefCell::new(None),
+            bar_room: std::cell::Cell::new(BarRoom::default()),
+            more_menu: None,
+            bar_has_slot: std::cell::Cell::new(false),
+            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -1025,6 +1115,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
+            status_slot: std::cell::RefCell::new(None),
+            bar_room: std::cell::Cell::new(BarRoom::default()),
+            more_menu: None,
+            bar_has_slot: std::cell::Cell::new(false),
+            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -1215,6 +1310,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
+            status_slot: std::cell::RefCell::new(None),
+            bar_room: std::cell::Cell::new(BarRoom::default()),
+            more_menu: None,
+            bar_has_slot: std::cell::Cell::new(false),
+            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -1720,8 +1820,9 @@ impl TerminalPane {
 
     /// Sends what a key press means, or scrolls for the view-only combinations.
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.is_some() && event.keystroke.key == "escape" {
+        if (self.menu.is_some() || self.more_menu.is_some()) && event.keystroke.key == "escape" {
             self.menu = None;
+            self.more_menu = None;
             cx.notify();
             return;
         }
@@ -2933,14 +3034,144 @@ impl TerminalPane {
         )
     }
 
-    /// The status line under the grid: the program, its state and the view controls.
-    ///
-    /// A live process needs no badge to say so - the session bar above already
-    /// states the connection - so the state is only spelled out once the program
-    /// stopped, in the tone of how it stopped.
-    /// Hands the pane the session's half of its bar for the next draw.
-    pub fn set_session_slot(&self, left: gpui::AnyElement, right: gpui::AnyElement) {
+    /// Hands the pane the session's half of its bar for the next draw, and the room
+    /// its left part needs before its target is cut further (R3).
+    pub fn set_session_slot(
+        &self,
+        left: gpui::AnyElement,
+        right: Vec<gpui::AnyElement>,
+        left_floor: Pixels,
+    ) {
         *self.session_slot.borrow_mut() = Some((left, right));
+        self.session_floor.set(left_floor);
+    }
+
+    /// Hands the pane the card the window lays over its grid for the next draw: why
+    /// the session ended and what can follow (R3).
+    ///
+    /// The card is centred over the last screen rather than stacked above it, so the
+    /// grid keeps its size and the output that led up to the end stays where it was,
+    /// dimmed behind the card and still selectable around it.
+    pub fn set_status_overlay(&self, card: gpui::AnyElement) {
+        *self.status_slot.borrow_mut() = Some(card);
+    }
+
+    /// The status card laid over the grid, when the window handed one in.
+    fn status_overlay(&self, metrics: Metrics) -> Option<gpui::Div> {
+        let card = self.status_slot.borrow_mut().take()?;
+        // A veil of the terminal's own background: the last screen stays legible, the
+        // card is plainly the thing in front. It takes no pointer, so a selection or a
+        // scroll in the grid still reaches the grid around the card.
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(metrics.scale(spacing::BASE))
+                .bg(theme::faded(color_of(palette::BACKGROUND), 0.55))
+                .debug_selector(|| "terminal.status.overlay".to_owned())
+                .child(card),
+        )
+    }
+
+    /// Which of the bar's tools fold into its menu at the width it last had (R3).
+    ///
+    /// Decided from the measured width of the bar and of the session's middle group -
+    /// neither changes with what folds, so the bar cannot flip between two forms from
+    /// one frame to the next - and from the tools' own sizes, which this pane draws.
+    pub fn bar_fold(&self, metrics: Metrics, has_slot: bool) -> BarFold {
+        let room = self.bar_room.get();
+        let Some(width) = room.width else {
+            return BarFold::Nothing;
+        };
+        let group_gap = metrics.scale(spacing::TIGHT);
+        // The left group is where the session is: its target is cut with an ellipsis, but
+        // its mark, a few letters of it and its chips stay.
+        let left_floor = if has_slot {
+            self.session_floor.get().max(metrics.scale(88.0))
+        } else {
+            metrics.scale(48.0)
+        };
+        let fixed = metrics.scale(spacing::BASE - 2.0)
+            + metrics.scale(spacing::HAIRLINE)
+            + left_floor
+            + group_gap * 2.0
+            + room.middle;
+        BarFold::ORDER
+            .into_iter()
+            .find(|fold| fixed + self.tools_width(*fold, metrics) <= width)
+            .unwrap_or(BarFold::Mode)
+    }
+
+    /// How wide the bar's own tool group is with `fold` of it in the menu.
+    fn tools_width(&self, fold: BarFold, metrics: Metrics) -> Pixels {
+        let target = metrics.hit_target();
+        let mut widths = Vec::with_capacity(9);
+        if !fold.folds_size() {
+            widths.push(self.grid_label_width(metrics));
+        }
+        if !fold.folds_mode() {
+            widths.push(target);
+        }
+        // Search never folds.
+        widths.push(target);
+        if !fold.folds_copy() {
+            widths.push(target);
+        }
+        if !fold.folds_font() {
+            widths.push(px(1.0) + metrics.scale(spacing::HAIRLINE) * 2.0);
+            widths.push(target);
+            widths.push(self.font_badge_width(metrics));
+            widths.push(target);
+        }
+        if fold != BarFold::Nothing {
+            widths.push(target);
+        }
+        let gaps = metrics.scale(1.0) * (widths.len().saturating_sub(1)) as f32;
+        widths.into_iter().fold(gaps, |sum, width| sum + width)
+    }
+
+    /// The grid size as the bar writes it.
+    fn grid_label(&self) -> String {
+        format!("{}\u{00D7}{}", self.grid.cols, self.grid.rows)
+    }
+
+    /// The room the grid size takes: its characters in the monospace face, its padding
+    /// and a pixel of slack for the face's own rounding.
+    fn grid_label_width(&self, metrics: Metrics) -> Pixels {
+        monospace_width(&self.grid_label(), metrics.caption_size())
+            + metrics.scale(spacing::HAIRLINE) * 2.0
+            + px(2.0)
+    }
+
+    /// The room the font size badge between A- and A+ takes.
+    fn font_badge_width(&self, metrics: Metrics) -> Pixels {
+        let text = monospace_width(&format!("{}px", self.font_size), metrics.caption_size())
+            + metrics.scale(2.0) * 2.0
+            + px(2.0);
+        text.max(metrics.scale(34.0))
+    }
+
+    /// Records what the bar's layout measured, and draws again when it changed.
+    fn apply_bar_room(&mut self, room: BarRoom, cx: &mut Context<Self>) {
+        let old = self.bar_room.get();
+        let close = |a: Option<Pixels>, b: Option<Pixels>| match (a, b) {
+            (Some(a), Some(b)) => (a - b).abs() < px(0.5),
+            (None, None) => true,
+            _ => false,
+        };
+        if close(old.width, room.width) && (old.middle - room.middle).abs() < px(0.5) {
+            return;
+        }
+        self.bar_room.set(room);
+        // Measured while the window draws, where a notification is not taken: the
+        // pane asks for its next draw once this one is done.
+        let pane = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = pane.update(cx, |_pane, cx| cx.notify());
+        });
     }
 
     /// The serial line own row above the bar (R21).
@@ -3081,14 +3312,29 @@ impl TerminalPane {
                 .child(row),
         )
     }
+    /// The status line under the grid, in three groups (R3).
+    ///
+    /// The left group is where the session is: its target and, once the program
+    /// stopped, how it stopped; it is cut with an ellipsis before anything else gives
+    /// way. The middle group is what the window hands in for the session - a reconnect
+    /// or a save that is waiting, the terminal/files switch, splitting and the session
+    /// menu. The right group is this pane's own tools: the grid size, the
+    /// presentation, search, copy and the font size.
+    ///
+    /// A bar too narrow for every tool folds them into its "more" menu in a fixed
+    /// order ([`BarFold`]) instead of drawing past its pane, and what is still left
+    /// over is clipped by the bar itself. A live process needs no badge: the session's
+    /// half states the connection, so the state is only spelled out once the program
+    /// stopped, in the tone of how it stopped.
     fn bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let slot = self.session_slot.borrow_mut().take();
         let (slot_left, slot_right) = match slot {
-            Some((left, right)) => (Some(left), Some(right)),
-            None => (None, None),
+            Some((left, right)) => (Some(left), right),
+            None => (None, Vec::new()),
         };
         let has_slot = slot_left.is_some();
-        let strings = self.locale.strings();
+        self.bar_has_slot.set(has_slot);
+        let fold = self.bar_fold(metrics, has_slot);
         let live = self.state.accepts_input();
         let tone = if live {
             Tone::Positive
@@ -3099,28 +3345,151 @@ impl TerminalPane {
             }
         };
         let muted = theme::swatch(shell_palette::TEXT_MUTED);
-        let bar_height = metrics.hit_target().max(px(SHELL_BAR_HEIGHT));
-        let font_changed =
-            (self.font_size - shellune_terminal::DEFAULT_FONT_SIZE).abs() >= f32::EPSILON;
-        let reset_hover = theme::swatch(shell_palette::SURFACE_HOVER);
-        let reset_tip = crate::app::copy::fill(
-            crate::app::copy::ux_for(self.locale).terminal_font_reset,
-            &[(
-                "size",
-                &format!("{:.0}", shellune_terminal::DEFAULT_FONT_SIZE),
-            )],
-        );
-        div()
-            .id("terminal.bar")
-            .debug_selector(|| "terminal.bar".to_owned())
+        let bar_height = metrics.hit_target().max(metrics.scale(SHELL_BAR_HEIGHT));
+        // The bar's children are the three groups and, last, a box of the bar's own
+        // size; the middle group's child is the session's half at its natural width.
+        // Those two widths are what the fold is decided from, and neither changes with
+        // what folds.
+        let weak = cx.entity().downgrade();
+        let measure_bar = move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
+            let Some(frame) = bounds.get(3) else {
+                return;
+            };
+            let width = frame.size.width;
+            let _ = weak.update(cx, |pane, cx| {
+                let room = BarRoom {
+                    width: Some(width),
+                    ..pane.bar_room.get()
+                };
+                pane.apply_bar_room(room, cx);
+            });
+        };
+        let weak = cx.entity().downgrade();
+        let middle_gap = metrics.scale(2.0);
+        let measure_middle =
+            move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
+                // Every control keeps its own width whether or not it fits, so their sum
+                // is the group's natural width however much of it is shown.
+                let gaps = middle_gap * bounds.len().saturating_sub(1) as f32;
+                let middle = bounds
+                    .iter()
+                    .fold(gaps, |sum, child| sum + child.size.width);
+                let _ = weak.update(cx, |pane, cx| {
+                    let room = BarRoom {
+                        middle,
+                        ..pane.bar_room.get()
+                    };
+                    pane.apply_bar_room(room, cx);
+                });
+            };
+
+        let left = div()
             .flex()
             .items_center()
-            .justify_between()
             .gap(metrics.scale(spacing::TIGHT))
-            // At least the bar's height; taller when the window's text is larger, so
-            // the session's half it carries is never cut off at its bottom.
+            // Where the session is keeps at least its mark and a letter or two: in a pane
+            // too narrow for everything, the session's controls give way before it.
+            .min_w(if has_slot {
+                metrics.scale(40.0)
+            } else {
+                px(0.0)
+            })
+            .flex_1()
+            .overflow_hidden()
+            .debug_selector(|| "terminal.bar.left".to_owned())
+            .children(slot_left)
+            // The program is named on the session's half and the tab; down here it is
+            // only repeated once it stopped, beside how it stopped.
+            .when(!live, |row| {
+                // The program that stopped is named here; its state is only spelled out
+                // when this bar is the session's only one. A pane that carries the
+                // session's half already has the session's own status beside the target,
+                // and saying it twice is what let one session read as two different
+                // states (R17).
+                let row = row.child(
+                    div()
+                        .truncate()
+                        .debug_selector(|| "terminal.shell".to_owned())
+                        .child(SharedString::from(self.origin.label().to_owned())),
+                );
+                if has_slot {
+                    row
+                } else {
+                    row.child(components::chip(
+                        self.state.label(self.locale),
+                        tone,
+                        metrics,
+                    ))
+                }
+            })
+            .when(self.input_busy, |row| {
+                row.child(components::chip(
+                    match self.locale {
+                        Locale::Chinese => "输入缓冲已满，本次输入未发送",
+                        Locale::English => "Input buffer full; this input was not sent",
+                    },
+                    Tone::Warning,
+                    metrics,
+                ))
+            })
+            .when_some(self.integration_note(), |row, note| {
+                row.child(
+                    div()
+                        .truncate()
+                        .debug_selector(|| "terminal.integration".to_owned())
+                        .child(note),
+                )
+            })
+            // Said under a running shell, not only after it stopped: a shell started
+            // without the login environment or in a replaced locale still runs, and this
+            // is the only place the user learns why a tool is missing or Chinese looks
+            // wrong (R14, R15).
+            .when_some(self.environment_note(), |row, note| {
+                // The whole sentence is in the tooltip: the bar is one line, and a note
+                // the user cannot finish reading is not a notice.
+                row.child(
+                    div()
+                        .id("terminal.environment")
+                        .truncate()
+                        .debug_selector(|| "terminal.environment".to_owned())
+                        .tooltip(components::tooltip(note.clone()))
+                        .child(note),
+                )
+            });
+
+        // The session's controls keep their natural width while there is room; in a pane
+        // too narrow even for the folded tools this is the group that gives way, so search
+        // and the menu that holds the rest are never the ones cut off. It gives way a
+        // whole control at a time: one that does not fit wraps onto a second line, which
+        // the group's one-line height hides, instead of being cut through.
+        let middle = div()
+            .on_children_prepainted(measure_middle)
+            .flex()
+            .flex_wrap()
+            .flex_shrink()
+            .min_w(px(0.0))
+            .h(metrics.hit_target())
+            .overflow_hidden()
+            .items_center()
+            .gap(middle_gap)
+            .debug_selector(|| "terminal.bar.middle".to_owned())
+            .children(slot_right);
+
+        div()
+            .on_children_prepainted(measure_bar)
+            .id("terminal.bar")
+            .debug_selector(|| "terminal.bar".to_owned())
+            .relative()
+            .flex()
+            .items_center()
+            .gap(metrics.scale(spacing::TIGHT))
+            // At least the bar's height; taller when the window's text is larger, so the
+            // session's half it carries is never cut off at its bottom.
             .min_h(bar_height)
             .flex_none()
+            .w_full()
+            .min_w(px(0.0))
+            .overflow_hidden()
             .pl(metrics.scale(spacing::BASE - 2.0))
             .pr(metrics.scale(spacing::HAIRLINE))
             .bg(theme::swatch(shell_palette::CHROME))
@@ -3128,178 +3497,375 @@ impl TerminalPane {
             .border_color(theme::faded(theme::swatch(shell_palette::BORDER), 0.8))
             .text_size(metrics.caption_size())
             .text_color(muted)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .min_w(px(0.0))
-                    .flex_1()
-                    .overflow_hidden()
-                    // The session's half leads the bar; the grid size steps aside to the
-                    // tools, where it is a detail rather than the first thing read.
-                    .children(slot_left)
-                    .when(!has_slot, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .font_family(monospace_family())
-                                .debug_selector(|| "terminal.grid.size".to_owned())
-                                .child(SharedString::from(format!(
-                                    "{}\u{00D7}{}",
-                                    self.grid.cols, self.grid.rows
-                                ))),
-                        )
-                    })
-                    // The program is named on the session bar and the tab; down here it
-                    // is only repeated once it stopped, beside how it stopped.
-                    .when(!live, |row| {
-                        // The program that stopped is named here; its state is only
-                        // spelled out when this bar is the session's only one. A pane
-                        // that hands its bar to the session already has the session's
-                        // own status beside the target, and saying it twice is what
-                        // let one session read as two different states (R17).
-                        let row = row.child(
-                            div()
-                                .truncate()
-                                .debug_selector(|| "terminal.shell".to_owned())
-                                .child(SharedString::from(self.origin.label().to_owned())),
-                        );
-                        if has_slot {
-                            row
-                        } else {
-                            row.child(components::chip(
-                                self.state.label(self.locale),
-                                tone,
-                                metrics,
-                            ))
-                        }
-                    })
-                    .when(self.input_busy, |row| {
-                        row.child(components::chip(
-                            match self.locale {
-                                Locale::Chinese => "输入缓冲已满，本次输入未发送",
-                                Locale::English => "Input buffer full; this input was not sent",
-                            },
-                            Tone::Warning,
-                            metrics,
-                        ))
-                    })
-                    .when_some(self.integration_note(), |row, note| {
-                        row.child(
-                            div()
-                                .truncate()
-                                .debug_selector(|| "terminal.integration".to_owned())
-                                .child(note),
-                        )
-                    })
-                    // Said under a running shell, not only after it stopped: a shell
-                    // started without the login environment or in a replaced locale
-                    // still runs, and this is the only place the user learns why a
-                    // tool is missing or Chinese looks wrong (R14, R15).
-                    .when_some(self.environment_note(), |row, note| {
-                        // The whole sentence is in the tooltip: this bar is 28px high,
-                        // and a note the user cannot finish reading is not a notice.
-                        row.child(
-                            div()
-                                .id("terminal.environment")
-                                .truncate()
-                                .debug_selector(|| "terminal.environment".to_owned())
-                                .tooltip(components::tooltip(note.clone()))
-                                .child(note),
-                        )
-                    }),
-            )
-            .child(
+            .child(left)
+            .child(middle)
+            .child(self.bar_tools(fold, metrics, cx))
+            .child(div().absolute().inset_0())
+    }
+
+    /// The bar's right group: this pane's own tools, less what `fold` put in the menu.
+    fn bar_tools(&self, fold: BarFold, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
+        let strings = self.locale.strings();
+        let font_changed =
+            (self.font_size - shellune_terminal::DEFAULT_FONT_SIZE).abs() >= f32::EPSILON;
+        let reset_hover = theme::swatch(shell_palette::SURFACE_HOVER);
+        let reset_tip = self.font_reset_label();
+        let target = metrics.hit_target();
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(metrics.scale(1.0))
+            .debug_selector(|| "terminal.bar.tools".to_owned())
+            .when(!fold.folds_size(), |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .px(metrics.scale(spacing::HAIRLINE))
+                        .whitespace_nowrap()
+                        .font_family(monospace_family())
+                        .debug_selector(|| "terminal.grid.size".to_owned())
+                        .child(SharedString::from(self.grid_label())),
+                )
+            })
+            .when(!fold.folds_mode(), |row| {
+                row.child(self.mode_button(metrics, strings, cx))
+            })
+            .child(self.search_button(metrics, strings, cx))
+            .when(!fold.folds_copy(), |row| {
+                row.child(
+                    components::icon_only_button(Icon::Copy, metrics)
+                        .w(target)
+                        .h(target)
+                        .id("terminal.copy")
+                        .debug_selector(|| "terminal.copy".to_owned())
+                        .tooltip(components::tooltip(SharedString::from(
+                            Self::with_shortcut(strings.terminal_copy, &self.shortcuts.copy),
+                        )))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.copy_selection(cx);
+                        })),
+                )
+            })
+            .when(!fold.folds_font(), |row| {
+                row.child(
+                    components::divider_vertical(metrics)
+                        .h(metrics.scale(12.0))
+                        .mx(metrics.scale(spacing::HAIRLINE)),
+                )
+                .child(
+                    components::icon_button("A\u{2212}", metrics)
+                        .w(target)
+                        .h(target)
+                        .id("terminal.font.decrease")
+                        .debug_selector(|| "terminal.font.decrease".to_owned())
+                        .tooltip(components::tooltip(strings.terminal_smaller))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.step_font_size(false, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id("terminal.font.reset")
+                        .debug_selector(|| "terminal.font.reset".to_owned())
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .min_w(metrics.scale(34.0))
+                        .h(target)
+                        .px(metrics.scale(2.0))
+                        .rounded(px(theme::radius::SMALL))
+                        .whitespace_nowrap()
+                        .font_family(monospace_family())
+                        .when(font_changed, |badge| {
+                            badge
+                                .cursor_pointer()
+                                .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                                .hover(move |style| style.bg(reset_hover))
+                                .tooltip(components::tooltip(reset_tip))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.set_font_size(shellune_terminal::DEFAULT_FONT_SIZE, cx);
+                                }))
+                        })
+                        .child(SharedString::from(format!("{}px", self.font_size))),
+                )
+                .child(
+                    components::icon_button("A+", metrics)
+                        .w(target)
+                        .h(target)
+                        .id("terminal.font.increase")
+                        .debug_selector(|| "terminal.font.increase".to_owned())
+                        .tooltip(components::tooltip(strings.terminal_larger))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.step_font_size(true, cx);
+                        })),
+                )
+            })
+            .when(fold != BarFold::Nothing, |row| {
+                let ux = crate::app::copy::ux_for(self.locale);
+                row.child(
+                    components::icon_only_button(Icon::More, metrics)
+                        .w(target)
+                        .h(target)
+                        .when(self.more_menu.is_some(), |button| {
+                            button.bg(theme::swatch(shell_palette::SURFACE_SELECTED))
+                        })
+                        .id("terminal.more")
+                        .debug_selector(|| "terminal.more".to_owned())
+                        .tooltip(components::tooltip(ux.terminal_more))
+                        // Opened on the press, like the session menu, so the grid keeps
+                        // the keyboard and Escape still closes it.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                this.menu = None;
+                                this.more_menu = if this.more_menu.is_some() {
+                                    None
+                                } else {
+                                    Some(event.position)
+                                };
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
+    }
+
+    /// Which tools the bar folds now, for a test: the draw keeps no record of what it
+    /// removed, so this is how a test knows which controls are really on the bar.
+    #[cfg(test)]
+    pub fn bar_fold_for_test(&self) -> BarFold {
+        self.bar_fold(theme::metrics(), self.bar_has_slot.get())
+    }
+
+    /// Whether the bar's "more" menu is open, for a test.
+    #[cfg(test)]
+    pub fn more_menu_open_for_test(&self) -> bool {
+        self.more_menu.is_some()
+    }
+
+    /// "Reset font size (14px)", in the pane's language.
+    fn font_reset_label(&self) -> String {
+        crate::app::copy::fill(
+            crate::app::copy::ux_for(self.locale).terminal_font_reset,
+            &[(
+                "size",
+                &format!("{:.0}", shellune_terminal::DEFAULT_FONT_SIZE),
+            )],
+        )
+    }
+
+    /// The bar's "more" menu: the tools a narrow bar folded, in the order they sit on a
+    /// wide bar (R3).
+    ///
+    /// Each keeps its own action and wording: the font steps leave the menu open so a
+    /// size can be stepped more than once, the grid size is stated rather than
+    /// pressed, and copy and the presentation switch close it like any other command.
+    fn more_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let position = self.more_menu?;
+        let metrics = theme::metrics();
+        let fold = self.bar_fold(metrics, self.bar_has_slot.get());
+        if fold == BarFold::Nothing {
+            return None;
+        }
+        let strings = self.locale.strings();
+        let ux = crate::app::copy::ux_for(self.locale);
+        let viewport = window.viewport_size();
+        let can_copy = self.core.has_selection();
+        let integrated = self.core.presentation() == TerminalMode::Integrated;
+        let font_changed =
+            (self.font_size - shellune_terminal::DEFAULT_FONT_SIZE).abs() >= f32::EPSILON;
+        // What a folded entry carries at its end: the value or the key it stands for.
+        let hint = |entry: gpui::Stateful<gpui::Div>, text: String| {
+            entry
+                .child(div().flex_1().min_w(metrics.scale(spacing::TIGHT)))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(shell_palette::TEXT_MUTED))
+                        .font_family(monospace_family())
+                        .child(SharedString::from(text)),
+                )
+        };
+        let mut menu = components::menu_card("terminal.more.menu", metrics)
+            .max_w(viewport.width - metrics.scale(spacing::TIGHT) * 2.0);
+        if fold.folds_size() {
+            menu = menu.child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(metrics.scale(1.0))
-                    .children(slot_right)
-                    .when(has_slot, |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .px(metrics.scale(spacing::HAIRLINE))
-                                .font_family(monospace_family())
-                                .debug_selector(|| "terminal.grid.size".to_owned())
-                                .child(SharedString::from(format!(
-                                    "{}\u{00D7}{}",
-                                    self.grid.cols, self.grid.rows
-                                ))),
-                        )
-                    })
-                    .child(self.mode_button(metrics, strings, cx))
-                    .child(self.search_button(metrics, strings, cx))
-                    .child(
-                        components::icon_only_button(Icon::Copy, metrics)
-                            .w(metrics.hit_target())
-                            .h(metrics.hit_target())
-                            .id("terminal.copy")
-                            .debug_selector(|| "terminal.copy".to_owned())
-                            .tooltip(components::tooltip(SharedString::from(
-                                Self::with_shortcut(strings.terminal_copy, &self.shortcuts.copy),
-                            )))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.copy_selection(cx);
-                            })),
-                    )
-                    .child(
-                        components::divider_vertical(metrics)
-                            .h(metrics.scale(12.0))
-                            .mx(metrics.scale(spacing::HAIRLINE)),
-                    )
-                    .child(
-                        components::icon_button("A\u{2212}", metrics)
-                            .w(metrics.hit_target())
-                            .h(metrics.hit_target())
-                            .id("terminal.font.decrease")
-                            .debug_selector(|| "terminal.font.decrease".to_owned())
-                            .tooltip(components::tooltip(strings.terminal_smaller))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.step_font_size(false, cx);
-                            })),
-                    )
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .h(metrics.scale(30.0))
+                    .px(metrics.scale(spacing::TIGHT + 2.0))
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
+                    .debug_selector(|| "terminal.more.size".to_owned())
+                    .child(crate::app::icons::icon(
+                        Icon::Maximize,
+                        metrics.small_icon_size(),
+                        theme::swatch(shell_palette::TEXT_MUTED),
+                    ))
+                    .child(ux.terminal_grid_size)
+                    .child(div().flex_1().min_w(metrics.scale(spacing::TIGHT)))
                     .child(
                         div()
-                            .id("terminal.font.reset")
-                            .debug_selector(|| "terminal.font.reset".to_owned())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .min_w(metrics.scale(34.0))
-                            .h(metrics.hit_target())
-                            .px(metrics.scale(2.0))
-                            .rounded(px(theme::radius::SMALL))
+                            .flex_none()
                             .font_family(monospace_family())
-                            .when(font_changed, |badge| {
-                                badge
-                                    .cursor_pointer()
-                                    .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
-                                    .hover(move |style| style.bg(reset_hover))
-                                    .tooltip(components::tooltip(reset_tip))
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.set_font_size(
-                                            shellune_terminal::DEFAULT_FONT_SIZE,
-                                            cx,
-                                        );
-                                    }))
-                            })
-                            .child(SharedString::from(format!("{}px", self.font_size))),
-                    )
-                    .child(
-                        components::icon_button("A+", metrics)
-                            .w(metrics.hit_target())
-                            .h(metrics.hit_target())
-                            .id("terminal.font.increase")
-                            .debug_selector(|| "terminal.font.increase".to_owned())
-                            .tooltip(components::tooltip(strings.terminal_larger))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.step_font_size(true, cx);
-                            })),
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                            .child(SharedString::from(self.grid_label())),
                     ),
+            );
+        }
+        if fold.folds_mode() {
+            menu = menu.child(
+                hint(
+                    components::menu_entry(
+                        strings.terminal_mode_blocks,
+                        "terminal.more.mode",
+                        Some(Icon::Layers),
+                        true,
+                        false,
+                        metrics,
+                    ),
+                    if integrated {
+                        "\u{2713}".to_owned()
+                    } else {
+                        String::new()
+                    },
+                )
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.more_menu = None;
+                    this.set_presentation(
+                        if integrated {
+                            TerminalMode::Classic
+                        } else {
+                            TerminalMode::Integrated
+                        },
+                        cx,
+                    );
+                    cx.notify();
+                })),
+            );
+        }
+        if fold.folds_copy() {
+            let entry = hint(
+                components::menu_entry(
+                    strings.terminal_copy,
+                    "terminal.more.copy",
+                    Some(Icon::Copy),
+                    can_copy,
+                    false,
+                    metrics,
+                ),
+                self.shortcuts.copy.clone().unwrap_or_default(),
+            );
+            menu = menu.child(if can_copy {
+                entry.on_click(cx.listener(|this, _event, _window, cx| {
+                    this.more_menu = None;
+                    this.copy_selection(cx);
+                    cx.notify();
+                }))
+            } else {
+                entry
+            });
+        }
+        if fold.folds_font() {
+            let reset = hint(
+                components::menu_entry(
+                    self.font_reset_label(),
+                    "terminal.more.font.reset",
+                    None,
+                    font_changed,
+                    false,
+                    metrics,
+                ),
+                format!("{}px", self.font_size),
+            );
+            menu = menu
+                .child(components::menu_divider(metrics))
+                .child(
+                    hint(
+                        components::menu_entry(
+                            strings.terminal_smaller,
+                            "terminal.more.font.decrease",
+                            Some(Icon::TextSize),
+                            true,
+                            false,
+                            metrics,
+                        ),
+                        "A\u{2212}".to_owned(),
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.step_font_size(false, cx);
+                    })),
+                )
+                .child(
+                    hint(
+                        components::menu_entry(
+                            strings.terminal_larger,
+                            "terminal.more.font.increase",
+                            Some(Icon::TextSize),
+                            true,
+                            false,
+                            metrics,
+                        ),
+                        "A+".to_owned(),
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.step_font_size(true, cx);
+                    })),
+                )
+                .child(if font_changed {
+                    reset.on_click(cx.listener(|this, _event, _window, cx| {
+                        this.set_font_size(shellune_terminal::DEFAULT_FONT_SIZE, cx);
+                    }))
+                } else {
+                    reset
+                });
+        }
+        Some(
+            gpui::deferred(
+                gpui::anchored().position(gpui::Point::default()).child(
+                    div()
+                        .relative()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .child(
+                            div()
+                                .id("terminal.more.backdrop")
+                                .absolute()
+                                .inset_0()
+                                .occlude()
+                                .on_any_mouse_down(cx.listener(|this, _event, _window, cx| {
+                                    this.more_menu = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            // Above the button that opened it, its right edge at the
+                            // press: the bar is the bottom edge of the pane.
+                            gpui::anchored()
+                                .position(position)
+                                .anchor(gpui::Corner::BottomRight)
+                                .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
+                                .child(theme::enter(
+                                    div()
+                                        .occlude()
+                                        .pb(metrics.scale(spacing::HAIRLINE))
+                                        .child(menu),
+                                    "terminal.more.enter",
+                                    theme::Enter::Rise,
+                                )),
+                        ),
+                ),
             )
+            .with_priority(3),
+        )
     }
 
     /// One row of the grid, drawn in three layers, every piece at its own column:
@@ -3635,10 +4201,14 @@ impl TerminalPane {
     /// The bar and the block list read one query, so a search means the same thing
     /// in both: the numbers come from the real scrollback, the rows from the blocks
     /// whose command or output matches with the same switches.
-    fn block_overlay(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn block_overlay(
+        &self,
+        metrics: Metrics,
+        bar_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let strings = self.locale.strings();
         let blocks = self.listed_blocks();
-        let bar_height = metrics.hit_target().max(px(SHELL_BAR_HEIGHT));
         let mut panel = div()
             .absolute()
             .bottom(bar_height)
@@ -4691,11 +5261,14 @@ fn flush_shapes(
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The frame around the grid follows the window's text size. The bar, the find
-        // bar and the block overlay still keep the regular size: they have no narrow
-        // layout yet, and at 200% they would be pushed past a 720x480 window (R4).
-        let frame = theme::metrics();
-        let metrics = Metrics::default();
+        // The frame around the grid and the bar under it follow the window's text size:
+        // a bar that has no room for every tool at that size folds them into its menu
+        // instead of being pushed past the pane (R3). The find bar, the block overlay and
+        // the serial strip keep the regular size; they have no narrow layout of their
+        // own, and at 200% they would be pushed past a 720x480 window (R4).
+        let metrics = theme::metrics();
+        let tools = Metrics::default();
+        let bar_height = metrics.hit_target().max(metrics.scale(SHELL_BAR_HEIGHT));
         // The advance width comes from the font the window actually resolved, so
         // the grid matches what is drawn even when the platform substitutes a face.
         let _ = self.measure_cell(window);
@@ -4724,26 +5297,30 @@ impl Render for TerminalPane {
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
-                    .pl(frame.scale(spacing::SNUG))
-                    .pr(frame.scale(spacing::HAIRLINE))
-                    .py(frame.scale(spacing::TIGHT))
+                    .pl(metrics.scale(spacing::SNUG))
+                    .pr(metrics.scale(spacing::HAIRLINE))
+                    .py(metrics.scale(spacing::TIGHT))
                     .bg(color_of(palette::BACKGROUND))
                     .child(self.viewport(window, cx))
                     .children(self.scrollback_thumb())
-                    .children(self.scroll_bottom_pill(metrics, show_blocks, cx)),
+                    .children(self.scroll_bottom_pill(tools, show_blocks, cx))
+                    // Why the session ended is laid over the grid it ended on, not
+                    // stacked above it: the grid keeps its size (R3).
+                    .children(self.status_overlay(metrics)),
             )
             // A serial line states itself above the bar: its device, its settings and
             // the two send habits are what a person changes while the session runs, and
             // a port that would not open says why here instead of drawing a terminal
             // that is not connected (R21).
-            .when_some(self.serial_strip(metrics, cx), |pane, strip| {
+            .when_some(self.serial_strip(tools, cx), |pane, strip| {
                 pane.child(strip)
             })
             .child(self.bar(metrics, cx))
             .when(show_blocks, |column| {
-                column.child(self.block_overlay(metrics, cx))
+                column.child(self.block_overlay(tools, bar_height, cx))
             })
-            .children(self.context_menu(window, cx));
+            .children(self.context_menu(window, cx))
+            .children(self.more_menu(window, cx));
         theme::set_appearance(window_appearance);
         pane
     }

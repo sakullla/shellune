@@ -310,7 +310,10 @@ impl ShelluneView {
     /// target, and the state when it is news; the right half is what it does - files,
     /// splitting, the reconnect or the save that is waiting, and the menu. The tab
     /// closes the session, so there is no second Close here.
-    pub(super) fn session_bar_parts(&self, cx: &mut Context<Self>) -> Option<(Div, Div)> {
+    pub(super) fn session_bar_parts(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<(Div, Vec<AnyElement>)> {
         let id = if self.workspace.layout().active_tab().is_some() {
             self.workspace.layout().active_session()
         } else {
@@ -343,7 +346,11 @@ impl ShelluneView {
         // "The session is over" is the projection's answer, not a second match on the
         // state here: a fresh variant must not turn into a silently different page.
         let ended = status.phase().is_over();
-        let can_reconnect = can_reconnect && !card;
+        // A session that ended states its reason and its one next step in the card over
+        // its terminal (R3, R17); the bar does not offer the same step a second time.
+        let failure_card = status.phase() == crate::app::workspace::SessionPhase::Ended;
+        let offers_reconnect = can_reconnect && !card;
+        let can_reconnect = offers_reconnect && !failure_card;
 
         let left = div()
             .flex()
@@ -469,83 +476,141 @@ impl ShelluneView {
                 }))
         });
 
-        let right = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(metrics.scale(2.0))
-            .when(can_reconnect, |row| {
-                row.child(
-                    self.icon_text_button(
-                        SharedString::from("session.reconnect"),
-                        Icon::Refresh,
-                        strings.session_reconnect,
-                        Variant::Primary,
-                        cx,
-                        move |view, cx| view.reconnect_session(id, cx),
-                    )
-                    .h(metrics.scale(22.0))
-                    .text_size(metrics.caption_size()),
+        // The right half is a list of separate controls rather than one row: the bar
+        // under a terminal lays them out itself, so in a pane too narrow for all of them a
+        // control that does not fit is left out whole instead of being cut through (R3).
+        let mut right: Vec<AnyElement> = Vec::new();
+        if can_reconnect {
+            right.push(
+                self.icon_text_button(
+                    SharedString::from("session.reconnect"),
+                    Icon::Refresh,
+                    strings.session_reconnect,
+                    Variant::Primary,
+                    cx,
+                    move |view, cx| view.reconnect_session(id, cx),
                 )
-            })
-            .when(unsaved, |row| {
-                row.child(
-                    self.icon_text_button(
-                        SharedString::from("session.save_host"),
-                        Icon::Server,
-                        strings.quick_save_host,
-                        Variant::Primary,
-                        cx,
-                        move |view, cx| view.save_quick_host(id, cx),
-                    )
-                    .h(metrics.scale(22.0))
-                    .text_size(metrics.caption_size()),
+                .h(metrics.scale(22.0))
+                .text_size(metrics.caption_size())
+                .into_any_element(),
+            );
+        }
+        if unsaved {
+            right.push(
+                self.icon_text_button(
+                    SharedString::from("session.save_host"),
+                    Icon::Server,
+                    strings.quick_save_host,
+                    Variant::Primary,
+                    cx,
+                    move |view, cx| view.save_quick_host(id, cx),
                 )
-            })
-            // A session that ended for good has one thing left to do.
-            .when(ended && !can_reconnect && !unsaved && !card, |row| {
-                row.child(
-                    self.icon_text_button(
-                        SharedString::from("session.close"),
-                        Icon::Close,
-                        strings.session_close,
-                        Variant::Secondary,
-                        cx,
-                        move |view, cx| view.request_close_session(id, cx),
-                    )
-                    .h(metrics.scale(22.0))
-                    .text_size(metrics.caption_size()),
+                .h(metrics.scale(22.0))
+                .text_size(metrics.caption_size())
+                .into_any_element(),
+            );
+        }
+        // A session that ended for good has one thing left to do.
+        if ended && !offers_reconnect && !unsaved && !card {
+            right.push(
+                self.icon_text_button(
+                    SharedString::from("session.close"),
+                    Icon::Close,
+                    strings.session_close,
+                    Variant::Secondary,
+                    cx,
+                    move |view, cx| view.request_close_session(id, cx),
                 )
-            })
-            .when_some(files_button, |row, button| row.child(button))
-            .when(has_terminal, |row| row.children(self.split_buttons(cx)))
-            .child(
-                self.bar_icon(
-                    "session.more",
-                    Icon::More,
-                    strings.session_more.to_owned(),
-                    self.session_more.is_some(),
-                )
-                .size(metrics.hit_target())
-                // Opened on the press, like the tab menu, so the terminal keeps the
-                // keyboard and Escape is still answered (R5).
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        view.open_session_more(id, event.position, window, cx);
-                    }),
-                ),
+                .h(metrics.scale(22.0))
+                .text_size(metrics.caption_size())
+                .into_any_element(),
+            );
+        }
+        if let Some(button) = files_button {
+            right.push(button.into_any_element());
+        }
+        if has_terminal {
+            right.extend(
+                self.split_buttons(cx)
+                    .into_iter()
+                    .map(IntoElement::into_any_element),
+            );
+        }
+        right.push(
+            self.bar_icon(
+                "session.more",
+                Icon::More,
+                strings.session_more.to_owned(),
+                self.session_more.is_some(),
             )
-            // The terminal's own tools follow in the same bar when there is a terminal.
-            .when(has_terminal, |row| {
-                row.child(
-                    components::divider_vertical(metrics)
-                        .h(metrics.scale(12.0))
-                        .mx(metrics.scale(spacing::HAIRLINE)),
-                )
-            });
+            .size(metrics.hit_target())
+            .flex_none()
+            // Opened on the press, like the tab menu, so the terminal keeps the
+            // keyboard and Escape is still answered (R5).
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    view.open_session_more(id, event.position, window, cx);
+                }),
+            )
+            .into_any_element(),
+        );
+        // The terminal's own tools follow in the same bar when there is a terminal.
+        if has_terminal {
+            right.push(
+                components::divider_vertical(metrics)
+                    .h(metrics.scale(12.0))
+                    .mx(metrics.scale(spacing::HAIRLINE))
+                    .into_any_element(),
+            );
+        }
         Some((left, right))
+    }
+
+    /// The room the left half of [`Self::session_bar_parts`] needs before its target is
+    /// cut further: the status mark, a few letters of the target and every chip it
+    /// draws, which do not shrink (R3).
+    ///
+    /// The terminal's bar reads it to decide how many of its own tools fold, so a state
+    /// chip or a failed display bridge is never what the tools push out of the bar.
+    pub(super) fn session_left_floor(&self) -> Pixels {
+        let metrics = self.metrics();
+        let gap = metrics.scale(spacing::TIGHT);
+        let mut floor = metrics.scale(7.0) + gap + metrics.scale(64.0);
+        let id = if self.workspace.layout().active_tab().is_some() {
+            self.workspace.layout().active_session()
+        } else {
+            self.active
+        };
+        let Some(session) = id.and_then(|id| self.workspace.session(id)) else {
+            return floor;
+        };
+        let status = crate::app::workspace::SessionStatus::of(session);
+        if !status.phase().is_live() {
+            let label = status.headline(self.workspace.locale());
+            floor += gap + components::chip_reserved_width(&label, status.tone(), metrics);
+        }
+        if let Some(x11) = self
+            .x11
+            .get(&session.id())
+            .filter(|status| !matches!(status, X11Status::Off))
+        {
+            let (label, tone) = self.x11_chip_word(x11);
+            floor += gap + components::chip_reserved_width(label, tone, metrics);
+        }
+        if self
+            .unsaved
+            .iter()
+            .any(|(unsaved, _)| *unsaved == session.id())
+        {
+            floor += gap
+                + components::reserved_text_width(
+                    self.strings().quick_unsaved_note,
+                    metrics.caption_size(),
+                );
+        }
+        floor
     }
 
     /// The session bar on its own, for when no terminal is on screen to carry it: the
@@ -560,7 +625,11 @@ impl ShelluneView {
                 .items_center()
                 .justify_between()
                 .gap(metrics.scale(spacing::TIGHT))
-                .min_h(metrics.hit_target().max(px(terminal::SHELL_BAR_HEIGHT)))
+                .min_h(
+                    metrics
+                        .hit_target()
+                        .max(metrics.scale(terminal::SHELL_BAR_HEIGHT)),
+                )
                 .pl(metrics.scale(spacing::BASE - 2.0))
                 .pr(metrics.scale(spacing::HAIRLINE))
                 .bg(theme::swatch(palette::CHROME))
@@ -568,7 +637,14 @@ impl ShelluneView {
                 .border_color(theme::faded(theme::swatch(palette::BORDER), 0.8))
                 .debug_selector(|| "session.bar".to_owned())
                 .child(left.flex_1())
-                .child(right),
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(metrics.scale(2.0))
+                        .children(right),
+                ),
         )
     }
 
@@ -1895,7 +1971,9 @@ impl ShelluneView {
                 .px(metrics.scale(spacing::LOOSE))
                 .py(metrics.scale(spacing::LOOSE * 2.0))
                 .debug_selector(|| "remote.dialog".to_owned())
-                .child(
+                // The attempt's card is the status card of a session on its way: it
+                // rises into place in the tab, like the card an ended session shows (R3).
+                .child(theme::enter(
                     div()
                         .flex()
                         .flex_col()
@@ -1906,12 +1984,15 @@ impl ShelluneView {
                         .bg(theme::swatch(palette::SURFACE))
                         .border_1()
                         .border_color(theme::swatch(palette::BORDER))
-                        .shadow(theme::Elevation::Low.shadows())
+                        .shadow(theme::Elevation::Mid.shadows())
+                        .debug_selector(|| "remote.page.card".to_owned())
                         .child(header)
                         .children(subtitle)
                         .child(body)
                         .children(footer),
-                ),
+                    "remote.page.enter",
+                    theme::Enter::Rise,
+                )),
         )
     }
 

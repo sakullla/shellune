@@ -47,7 +47,7 @@ use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
 use crate::app::serial::{DeviceChoice, PortScan, SerialLink};
 use crate::app::terminal::{
-    PaneState, SearchNote, SnippetOffer, SourceEvent, TerminalAttention, TerminalPane,
+    BarFold, PaneState, SearchNote, SnippetOffer, SourceEvent, TerminalAttention, TerminalPane,
     TerminalShortcuts,
 };
 use crate::app::theme::{
@@ -32006,4 +32006,275 @@ async fn an_update_waits_for_saves_held_by_a_sync_before_the_installer_starts(
         "the favourite was on disk when the installer started"
     );
     assert!(update_state(&view, cx).2, "then the window exits");
+}
+
+// ---------------------------------------------------------------------------
+// The terminal's bar and its status cards (R3)
+// ---------------------------------------------------------------------------
+
+/// The controls the bar draws now: the session's half when it carries it, and this
+/// pane's tools less what is folded into the menu.
+///
+/// GPUI keeps the last bounds of a selector that is no longer drawn, so the list comes
+/// from the fold the pane reports rather than from what was ever measured.
+fn drawn_bar_controls(fold: BarFold, with_session: bool) -> Vec<&'static str> {
+    let mut drawn = Vec::new();
+    if with_session {
+        drawn.extend([
+            "session.context",
+            "session.more",
+            "pane.split.right",
+            "pane.split.down",
+        ]);
+    }
+    if !fold.folds_size() {
+        drawn.push("terminal.grid.size");
+    }
+    if !fold.folds_mode() {
+        drawn.push("terminal.mode");
+    }
+    drawn.push("terminal.search");
+    if !fold.folds_copy() {
+        drawn.push("terminal.copy");
+    }
+    if !fold.folds_font() {
+        drawn.extend([
+            "terminal.font.decrease",
+            "terminal.font.reset",
+            "terminal.font.increase",
+        ]);
+    }
+    if fold != BarFold::Nothing {
+        drawn.push("terminal.more");
+    }
+    drawn
+}
+
+/// Every control the bar draws is inside the bar and the window, where a pointer
+/// reaches it.
+fn assert_bar_controls_inside(cx: &mut VisualTestContext, selectors: &[&'static str]) {
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let bar = bounds_of(cx, "terminal.bar");
+    assert_fits_inside(bar, viewport, "terminal.bar");
+    for selector in selectors {
+        let bounds = bounds_of(cx, selector);
+        assert_inside_horizontally(bounds, bar, selector);
+        assert_fits_inside(bounds, viewport, selector);
+    }
+}
+
+fn bar_fold(cx: &mut VisualTestContext, pane: &Entity<TerminalPane>) -> BarFold {
+    cx.update(|_window, app| pane.read(app).bar_fold_for_test())
+}
+
+fn more_menu_open(cx: &mut VisualTestContext, pane: &Entity<TerminalPane>) -> bool {
+    cx.update(|_window, app| pane.read(app).more_menu_open_for_test())
+}
+
+#[gpui::test]
+async fn the_terminal_bar_folds_its_tools_into_more_at_two_hundred_percent_in_the_smallest_window(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the remote terminal exists");
+
+    // With room, every tool is on the bar and there is nothing to fold.
+    assert_eq!(bar_fold(cx, &pane), BarFold::Nothing);
+    assert!(
+        cx.debug_bounds("terminal.more").is_none(),
+        "a bar with room for every tool has no menu for them"
+    );
+    assert_bar_controls_inside(cx, &drawn_bar_controls(BarFold::Nothing, true));
+
+    // 720x480 at 200%: the bar follows the text size, so its tools no longer fit and
+    // fold in their order - the font size first - instead of running past the pane.
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    let bar = bounds_of(cx, "terminal.bar");
+    assert!(
+        bar.size.height >= px(crate::app::terminal::SHELL_BAR_HEIGHT * 2.0) - px(0.5),
+        "the bar follows the text size: {bar:?}"
+    );
+    let fold = bar_fold(cx, &pane);
+    assert!(
+        fold.folds_font(),
+        "the font size is the first tool to fold: {fold:?}"
+    );
+    assert_bar_controls_inside(cx, &drawn_bar_controls(fold, true));
+    assert_pointer_target(cx, "terminal.more");
+    assert_pointer_target(cx, "terminal.search");
+
+    // What folded is in the menu, and it still works from there.
+    let before = cx.update(|_window, app| pane.read(app).font_size());
+    click(cx, "terminal.more");
+    assert!(more_menu_open(cx, &pane));
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert_fits_inside(
+        bounds_of(cx, "terminal.more.menu"),
+        viewport,
+        "terminal.more.menu",
+    );
+    click(cx, "terminal.more.font.increase");
+    let after = cx.update(|_window, app| pane.read(app).font_size());
+    assert!(after > before, "the folded control still steps the font");
+    assert!(
+        more_menu_open(cx, &pane),
+        "a font step leaves the menu open for the next one"
+    );
+    click(cx, "terminal.more.font.reset");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).font_size()),
+        before,
+        "the folded reset puts the default size back"
+    );
+    // A press beside the menu closes it.
+    cx.simulate_click(point(px(4.0), viewport.height / 2.0), Modifiers::default());
+    cx.run_until_parked();
+    assert!(!more_menu_open(cx, &pane));
+
+    // Back in the design window at the regular size, nothing is folded any more.
+    cx.simulate_resize(design_window());
+    smallest_text_size(&view, cx);
+    cx.run_until_parked();
+    assert_eq!(bar_fold(cx, &pane), BarFold::Nothing);
+    assert_bar_controls_inside(cx, &drawn_bar_controls(BarFold::Nothing, true));
+}
+
+#[gpui::test]
+async fn a_narrow_pane_folds_its_bar_tools_and_keeps_them_reachable(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello", cx);
+    let mut previous = BarFold::Nothing;
+    for width in [520.0, 300.0, 240.0, 200.0, 160.0] {
+        cx.simulate_resize(size(px(width), px(320.0)));
+        cx.run_until_parked();
+        let fold = bar_fold(cx, &pane);
+        assert!(
+            fold >= previous,
+            "a narrower pane never unfolds a tool: {fold:?} after {previous:?} at {width}"
+        );
+        previous = fold;
+        assert_bar_controls_inside(cx, &drawn_bar_controls(fold, false));
+    }
+    assert_eq!(
+        previous,
+        BarFold::Mode,
+        "the narrowest pane keeps only search and the menu"
+    );
+    // Everything that folded is in the menu.
+    click(cx, "terminal.more");
+    for selector in [
+        "terminal.more.size",
+        "terminal.more.mode",
+        "terminal.more.copy",
+        "terminal.more.font.decrease",
+        "terminal.more.font.increase",
+        "terminal.more.font.reset",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is reachable in the menu"
+        );
+    }
+    let mode = cx.update(|_window, app| pane.read(app).presentation());
+    click(cx, "terminal.more.mode");
+    assert_ne!(
+        cx.update(|_window, app| pane.read(app).presentation()),
+        mode,
+        "the folded switch still changes the presentation"
+    );
+    assert!(!more_menu_open(cx, &pane), "a command closes the menu");
+}
+
+#[gpui::test]
+async fn an_ended_session_states_itself_in_a_card_over_its_last_screen(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let grid_before = bounds_of(cx, "terminal.viewport");
+    lose_remote_session(&view, cx, id);
+
+    let card = bounds_of(cx, "terminal.failure");
+    let grid = bounds_of(cx, "terminal.viewport");
+    assert_eq!(
+        grid.size.height, grid_before.size.height,
+        "the card is laid over the grid; it does not push the terminal down"
+    );
+    assert!(
+        cx.debug_bounds("terminal.status.overlay").is_some(),
+        "the card sits on a veil over the last screen"
+    );
+    assert_inside_box(card, grid, "the status card");
+    let centre = grid.center();
+    assert!(
+        (card.center().x - centre.x).abs() <= px(16.0)
+            && (card.center().y - centre.y).abs() <= px(16.0),
+        "the card is centred over the terminal: {card:?} in {grid:?}"
+    );
+    assert!(cx.debug_bounds("terminal.failure.headline").is_some());
+    assert!(cx.debug_bounds("terminal.failure.target").is_some());
+    assert_pointer_target(cx, "terminal.failure.next");
+
+    // At 720x480 and 200% the card and its step still fit in the window, and so does
+    // the bar under it.
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    for selector in [
+        "terminal.failure",
+        "terminal.failure.headline",
+        "terminal.failure.next",
+        "terminal.failure.details",
+    ] {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+    }
+    let pane = cx
+        .update(|_window, app| view.read(app).pane_of(id).cloned())
+        .expect("the ended terminal keeps its last screen");
+    let fold = bar_fold(cx, &pane);
+    assert_bar_controls_inside(cx, &drawn_bar_controls(fold, true));
+
+    // The step on the card is the real one: the reconnect starts, and the attempt's own
+    // card takes the ended card's place.
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "terminal.failure.next");
+    assert!(
+        cx.update(|_window, app| view.read(app).pane_of(id).is_none()),
+        "the ended terminal is gone with the card over it once the reconnect starts"
+    );
+    assert!(
+        cx.debug_bounds("remote.dialog").is_some(),
+        "the attempt states itself in its own card"
+    );
+}
+
+#[gpui::test]
+async fn a_status_card_rises_into_the_place_a_still_card_takes(cx: &mut TestAppContext) {
+    theme::set_motion(Motion::Full);
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    lose_remote_session(&view, cx, id);
+    // The entrance is a short animation keyed to the session, played on the wall
+    // clock; once it has played the card is where a still card stands.
+    std::thread::sleep(crate::app::theme::Motion::SLOW * 2);
+    cx.update(|window, _app| window.refresh());
+    cx.run_until_parked();
+    let moving = bounds_of(cx, "terminal.failure");
+
+    cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().motion()),
+        Motion::Reduced
+    );
+    let still = bounds_of(cx, "terminal.failure");
+    assert!(
+        (moving.origin.y - still.origin.y).abs() <= px(0.5),
+        "the entrance ends where the reduced-motion card stands: {moving:?} vs {still:?}"
+    );
+    theme::set_motion(Motion::Full);
 }

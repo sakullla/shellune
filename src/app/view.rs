@@ -12013,7 +12013,6 @@ impl ShelluneView {
             return self.layout_terminal(window, cx);
         }
         let metrics = self.metrics();
-        let strings = self.strings();
         let mut column = div()
             .flex()
             .flex_col()
@@ -12074,14 +12073,25 @@ impl ShelluneView {
                     .and_then(|status| id.map(|id| self.failure_notice(id, &status, cx))),
                 (Some(_), None) => None,
             };
-            if let Some(notice) = notice {
-                frame = frame.child(
-                    div()
-                        .flex_none()
-                        .px(metrics.scale(spacing::SNUG))
-                        .pt(metrics.scale(spacing::SNUG))
-                        .child(notice),
-                );
+            let files_open = id.is_some_and(|id| self.files.is_open(id));
+            match (notice, id) {
+                // Over the terminal it ended on, while that terminal is on screen (R3).
+                (Some(notice), Some(id)) if !files_open || self.files_docked() => {
+                    pane.read(cx)
+                        .set_status_overlay(self.entering_status_card(id, notice));
+                }
+                (Some(notice), _) => {
+                    frame = frame.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .justify_center()
+                            .px(metrics.scale(spacing::SNUG))
+                            .pt(metrics.scale(spacing::SNUG))
+                            .child(notice),
+                    );
+                }
+                (None, _) => {}
             }
             match id.filter(|id| self.files.is_open(*id)) {
                 // A wide window keeps the terminal beside the files instead of behind
@@ -12106,19 +12116,22 @@ impl ShelluneView {
             let notice = if let (Some(status), Some(id)) = (&ended, id) {
                 self.failure_notice(id, status, cx)
             } else {
-                // Nothing failed and there is nothing to draw: the reason is still
+                // Nothing failed and there is nothing to draw: the state is still
                 // said, because an empty panel would look like a terminal that is
                 // merely blank.
-                self.notice_line(
-                    format!(
-                        "{} · {}",
-                        strings.session_no_terminal,
-                        copy::session_state_label(session.state(), self.workspace.locale())
-                    ),
-                    Tone::Warning,
-                )
+                self.session_state_card(session.id())
             };
-            frame = frame.child(div().p(metrics.scale(spacing::SNUG)).child(notice));
+            frame = frame.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .items_center()
+                    .justify_center()
+                    .p(metrics.scale(spacing::BASE))
+                    .child(self.entering_status_card(session.id(), notice)),
+            );
         }
         column.child(frame)
     }
@@ -16901,6 +16914,9 @@ impl ShelluneView {
     /// another attempt can help, close once it cannot - and the raw reason of the layer
     /// that knows sits behind a disclosure, where it can be read and copied without
     /// pushing the understandable sentence off the first screen.
+    ///
+    /// It is a status card (R3): laid over the terminal it ended on, centred, or drawn
+    /// in the session's place when there is no terminal to lay it over.
     fn failure_notice(&self, id: SessionId, status: &SessionStatus, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
@@ -16925,18 +16941,35 @@ impl ShelluneView {
         } else {
             strings.session_details_show
         };
-        let mut banner = components::banner(tone, metrics)
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .debug_selector(|| "terminal.failure".to_owned())
-            .child(
+        // A connection that dropped is a plug; a program that stopped is its terminal.
+        let emblem = if tone == Tone::Danger {
+            Icon::Plug
+        } else {
+            Icon::Terminal
+        };
+        let target = self
+            .workspace
+            .session(id)
+            .map(|session| self.target_of(session))
+            .filter(|target| !target.is_empty());
+        let mut banner = components::status_card(
+            tone,
+            icons::icon(emblem, metrics.icon_size(), tone.text()).into_any_element(),
+            div()
+                .debug_selector(|| "terminal.failure.headline".to_owned())
+                .child(SharedString::from(headline)),
+            target.map(|target| {
                 div()
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .debug_selector(|| "terminal.failure.headline".to_owned())
-                    .child(SharedString::from(headline)),
-            );
+                    .font_family(terminal::monospace_family())
+                    .debug_selector(|| "terminal.failure.target".to_owned())
+                    .child(SharedString::from(target))
+            }),
+            metrics,
+        )
+        .debug_selector(|| "terminal.failure".to_owned());
         let mut actions = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
             .min_w(px(0.0));
@@ -17601,6 +17634,17 @@ impl ShelluneView {
             .id(selector)
             .debug_selector(move || selector.to_owned())
             .tooltip(components::tooltip(detail))
+    }
+
+    /// The word and tone [`Self::x11_chip`] draws, for what measures the chip's room.
+    pub(super) fn x11_chip_word(&self, status: &X11Status) -> (&'static str, Tone) {
+        let strings = self.strings();
+        match status {
+            X11Status::Off => (strings.x11_bar_off, Tone::Neutral),
+            X11Status::Enabling => (strings.x11_bar_enabling, Tone::Warning),
+            X11Status::Ready { .. } => (strings.x11_bar_ready, Tone::Positive),
+            X11Status::Failed { .. } => (strings.x11_bar_failed, Tone::Danger),
+        }
     }
 
     /// The save result, on the session bar that holds the save button.

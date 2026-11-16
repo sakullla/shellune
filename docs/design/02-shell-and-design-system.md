@@ -211,11 +211,34 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 测试 `the_top_rows_notices_never_cut_the_current_tab` 在 720×480 @100%/200% 与 1080–1920 @200% 下逐一断言三种形态与当前
 标签完整；截图场景 `tabs-notices` 覆盖三种形态。
 
-会话的信息与工具在**终端底栏**（`session_bar_parts`，由视图交给前台窗格的 `TerminalPane::set_session_slot`）：
-左侧是状态点、目标（SSH 为 `user@host:port`，本地为 Shell 路径；点击复制）、非"已连接"时的状态 chip、
-非"关闭"的 X11 chip、未保存提示；右侧是待处理的主按钮（重新连接 / 保存主机 / 已结束时的"关闭会话"）、
-终端 | 文件 切换、分屏（仅有终端时）、`⋯`，然后才是终端自己的模式、搜索、复制与字号。文件视图或没有终端时，
-同样内容画成独立底栏（`standalone_session_bar`）。"X11 关"是默认状态，不再显示。
+会话的信息与工具在**终端底栏**（`TerminalPane::bar`）。底栏分三组，随窗口文字大小缩放（`theme::metrics()`），
+外框 `overflow_hidden`，任何宽度下都不画出窗格：
+
+- **左组：会话在哪里**（`terminal.bar.left`，`flex_1`）。状态点、目标（SSH 为 `user@host:port`，本地为 Shell 路径；
+  点击复制）、非"已连接"时的状态 chip、非"关闭"的 X11 chip、未保存提示。目标以省略号截断，空间不够时它最先让位，
+  但至少留下状态点（40，随缩放）。
+- **中组：会话自己的控件**（`terminal.bar.middle`）。待处理的主按钮（保存主机 / 无法重连时的"关闭会话"）、
+  终端 | 文件 切换、分屏（仅有终端时）、会话菜单 `⋯`。左中两组由视图交给前台窗格
+  （`session_bar_parts` → `TerminalPane::set_session_slot(left, right, left_floor)`）；`left_floor`
+  （`session_left_floor`）是左组在目标继续截断前需要的宽度：状态点、目标最少 64、以及每个 chip 的实际宽度。
+  极窄时中组被裁切，搜索与"更多"永远可点。
+- **右组：终端工具**（`terminal.bar.tools`）。尺寸（`134×36`）、模式、搜索、复制 | A− 字号 A+。
+  放不下时按固定顺序收进"⋯ 更多"菜单（`terminal.more` → `terminal.more.menu`，`BarFold`）：先收字号，再收尺寸，
+  再收复制，最后收模式；搜索从不收起。是否收起只由上一帧测得的底栏宽度与中组自然宽度决定
+  （两者都不随收起变化，所以不会在两种形态间来回跳），工具自身宽度由窗格按令牌算出。菜单中字号步进不关闭菜单，
+  尺寸只陈述，复制与模式执行后关闭；Esc 或点菜单外关闭。
+
+文件视图或没有终端时，左中两组画成独立底栏（`standalone_session_bar`）。"X11 关"是默认状态，不再显示。
+
+**会话状态卡**（`components::status_card`）。会话结束（断开、失败、程序退出）时，原因不再是终端上方的横幅，
+而是居中叠在最后一屏之上的卡片（`failure_notice` 经 `TerminalPane::set_status_overlay` 交给前台窗格，
+`terminal.status.overlay`）：raised + 强边 + 圆角 14 + Mid，左侧色调徽记块（连接断开为插头，正常退出为终端），
+标题是会话投影的状态词，下一行是等宽目标，下面是唯一的下一步（重新连接 / 关闭会话）与"显示详情"。网格尺寸不变，
+卡片下面铺一层 55% 的终端底色，最后一屏仍可读，卡片之外的网格仍可选择与滚动；卡片本身吃掉指针。下一步只在卡片上
+出现一次，底栏不再重复"重新连接"。没有终端的会话（连接中且已转到后台、或尚未打开终端）在窗格位置画同一种卡片：
+连接中用进行中指示条作徽记并说明"连接建立后，终端会在这里打开"（`session_state_card`）。远程桌面与窄窗口下
+铺满的文件视图占着终端的位置，此时卡片画在内容上方居中。所有状态卡与连接卡片（`remote.page.card`）进入时
+`Enter::Rise`（BASE），按会话 id 只播放一次；减少动效时直接画在最终位置。
 
 **连接在标签里进行。** 按"连接"后标签立即出现并切过去，连接卡片（`connection_page`，与对话框同一份内容
 `connection_content`）画在终端区域中央：四步进度、需要回答的问题、失败原因与重试都在这里，不再是盖住主页的
@@ -542,8 +565,8 @@ SEMIBOLD（标题）。不用 bold。
 
 **尺寸**：控件 32（紧凑 26），行 52，标签 30，头部 46，指针目标 ≥ 24。所有长度经 `Metrics` 按文字大小
 （90% / 100% / 115% / 200%）缩放。窗口在绘制前把缩放写入 `theme::set_zoom`，终端外框与 tooltip 这类
-在窗口渲染之外绘制的部件用 `theme::metrics()` 取得同一缩放（终端底栏、搜索条与命令块浮层暂保持常规
-尺寸，等 R3 的可收拢底栏完成后再随缩放）。
+在窗口渲染之外绘制的部件用 `theme::metrics()` 取得同一缩放；终端外框与可收拢底栏随缩放（R3），搜索条、
+命令块浮层与串口条仍保持常规尺寸，它们还没有自己的窄布局。
 
 **边框**：1px 发丝线；焦点与校验失败 2px；按下时底边加粗到 2px。卡片用弱边 + Low，浮层用强边 + Mid/High。
 
@@ -1390,6 +1413,7 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 | `switch(on)` | 设置开关：34×20 胶囊轨道，圆钮在左（关，`TRACK_OFF`）或右（开，`TRACK_ON`），悬停用对应 `*_HOVER`，圆钮 Low；状态先由位置表达，圆钮在每种轨道上 ≥ 3:1 |
 | `checkbox(id, label, checked)` / `checkbox_box(checked)` | 16px 方框（圆角 4）：未选为 surface + 强边，悬停（`CHECK_GROUP`）变 accent 边；选中为 accent 填充 + 勾 |
 | `card` | 内容分组：surface + 弱边 + 圆角 10 + Low，内边距 16 |
+| `status_card(tone, emblem, title, detail)` | 叠在终端上的会话状态卡：raised + 强边 + 圆角 14 + Mid，最宽 440，色调徽记块 36 + 标题 + 一行说明；吃掉指针，动作由调用方追加，进入时 Rise |
 | `row` / `row_with_state` + `stacked` | 列表行：surface 底，悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
 | `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单（尚未迁移的见上）：raised + 强边 + 圆角 10 + Mid；条目 30 高，禁用项保留位置，危险项悬停为 danger tint |
 | `menu_panel` + `menu_item` + `menu_item_face` | 取值菜单（选中项保留选中外观） |

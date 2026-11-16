@@ -433,16 +433,25 @@ impl ShelluneView {
             // terminal needs at 720x480 with 200% text (R4).
             column = column.child(div().flex_none().child(notice));
         }
-        if let Some(notice) = self.active_failure_notice(session_id, cx) {
+        let files = session_id.filter(|id| self.files.is_open(*id));
+        // Why the session ended is laid over its own terminal while that terminal is on
+        // screen (the pane draws it, see `leaf_view`), and over the session's place when
+        // it has no terminal at all. Only a page that shows something else in the
+        // terminal's place - a remote desktop's own surface, or the files in a window
+        // too narrow to dock them - still states it above, as a card of its own (R3).
+        let tree_shown = files.is_none() || self.files_docked();
+        let overlaid = tree_shown && session_id.is_some_and(|id| self.desktop_for(id).is_none());
+        if !overlaid && let Some(notice) = self.active_failure_notice(session_id, cx) {
             column = column.child(
                 div()
+                    .flex()
                     .flex_none()
+                    .justify_center()
                     .px(metrics.scale(spacing::SNUG))
                     .pt(metrics.scale(spacing::SNUG))
                     .child(notice),
             );
         }
-        let files = session_id.filter(|id| self.files.is_open(*id));
         if let Some(id) = files {
             // A wide window keeps the terminal on screen beside the files, and a narrow
             // one shows the files in its place: the session behind either arrangement is
@@ -503,6 +512,67 @@ impl ShelluneView {
             })?;
         let status = crate::app::workspace::SessionStatus::ended(failure);
         Some(self.failure_notice(id, &status, cx))
+    }
+
+    /// A status card with its entrance: it rises into place once each time it appears
+    /// for a session, and is simply there when motion is reduced (R3).
+    pub(super) fn entering_status_card(&self, id: SessionId, card: gpui::Div) -> gpui::AnyElement {
+        crate::app::theme::enter(
+            card,
+            SharedString::from(format!("session.status.enter.{id:?}")),
+            crate::app::theme::Enter::Rise,
+        )
+    }
+
+    /// The card of a session that has no terminal on screen and has not ended: it is
+    /// on its way, or it has nothing to show yet (R3).
+    ///
+    /// It states the session's one status, the same words the tab and the bar use
+    /// (R17); while the connection is being made the emblem is the loading mark and the
+    /// line under the headline says where the terminal will appear.
+    pub(super) fn session_state_card(&self, id: SessionId) -> gpui::Div {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let locale = self.workspace.locale();
+        let status = self.workspace.status(id);
+        let starting = status
+            .as_ref()
+            .is_some_and(|status| status.phase() == crate::app::workspace::SessionPhase::Starting);
+        let tone = status
+            .as_ref()
+            .map_or(Tone::Neutral, |status| status.tone());
+        let (emblem, headline, detail) = if starting {
+            (
+                crate::app::components::loading_indicator(metrics),
+                status
+                    .as_ref()
+                    .map(|status| status.headline(locale))
+                    .unwrap_or_default(),
+                crate::app::copy::ux()
+                    .session_connecting_card_hint
+                    .to_owned(),
+            )
+        } else {
+            (
+                crate::app::icons::icon(Icon::Terminal, metrics.icon_size(), tone.text())
+                    .into_any_element(),
+                strings.session_no_terminal.to_owned(),
+                self.workspace
+                    .session(id)
+                    .map(|session| crate::app::copy::session_state_label(session.state(), locale))
+                    .unwrap_or_default(),
+            )
+        };
+        crate::app::components::status_card(
+            tone,
+            emblem,
+            div()
+                .debug_selector(|| "session.state.headline".to_owned())
+                .child(SharedString::from(headline)),
+            (!detail.is_empty()).then(|| div().child(SharedString::from(detail))),
+            metrics,
+        )
+        .debug_selector(|| "session.state.card".to_owned())
     }
 
     fn layout_status_banners(&self) -> Vec<gpui::Div> {
@@ -785,7 +855,6 @@ impl ShelluneView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let metrics = self.metrics();
-        let strings = self.strings();
         let pane = leaf.id();
         let active = self.workspace.layout().active_pane() == Some(pane);
         let session = leaf.session();
@@ -841,30 +910,40 @@ impl ShelluneView {
             // The pane the keys are in carries the session's half of the bar under its
             // grid; the others keep their own bar alone.
             if active && let Some((left, right)) = self.session_bar_parts(cx) {
+                terminal.read(cx).set_session_slot(
+                    left.into_any_element(),
+                    right,
+                    self.session_left_floor(),
+                );
+            }
+            // The pane the keys are in carries why its session ended, centred over the
+            // grid it ended on (R3).
+            if active && let Some(card) = self.active_failure_notice(Some(id), cx) {
                 terminal
                     .read(cx)
-                    .set_session_slot(left.into_any_element(), right.into_any_element());
+                    .set_status_overlay(self.entering_status_card(id, card));
             }
             frame = frame.child(terminal.clone());
         } else if let Some(id) = session {
-            let text = self
-                .workspace
-                .session(id)
-                .map(|session| {
-                    format!(
-                        "{} · {}",
-                        strings.session_no_terminal,
-                        crate::app::copy::session_state_label(
-                            session.state(),
-                            self.workspace.locale()
-                        )
-                    )
-                })
-                .unwrap_or_else(|| strings.session_no_terminal.to_owned());
+            // No terminal to lay a card over: the card takes the pane's place, centred,
+            // on the terminal's own floor.
+            let card = active
+                .then(|| self.active_failure_notice(Some(id), cx))
+                .flatten()
+                .unwrap_or_else(|| self.session_state_card(id));
             frame = frame.child(
                 div()
-                    .p(metrics.scale(spacing::SNUG))
-                    .child(self.notice_line(text, Tone::Warning)),
+                    .id(SharedString::from(format!("pane.state.{pane}")))
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .items_center()
+                    .justify_center()
+                    .overflow_y_scroll()
+                    .p(metrics.scale(spacing::BASE))
+                    .bg(theme::swatch(palette::CANVAS))
+                    .child(self.entering_status_card(id, card)),
             );
         }
         div()
@@ -996,38 +1075,37 @@ impl ShelluneView {
     /// They sit in the head rather than in one pane's own strip: splitting is a
     /// session-level action that acts on the active pane, and a button drawn inside the
     /// pane it would split is one more copy of the pane chrome (R12).
-    pub(super) fn split_buttons(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        let pane = self.workspace.layout().active_pane()?;
+    ///
+    /// Each button is its own control, so a bar too narrow for both leaves the second
+    /// out whole instead of cutting it (R3).
+    pub(super) fn split_buttons(&self, cx: &mut Context<Self>) -> Vec<gpui::Stateful<gpui::Div>> {
+        let Some(pane) = self.workspace.layout().active_pane() else {
+            return Vec::new();
+        };
         let strings = self.strings();
         let control = self.metrics().hit_target();
-        Some(
-            div()
-                .flex()
-                .items_center()
-                .gap(self.metrics().scale(spacing::HAIRLINE))
-                .child(
-                    self.pane_icon(
-                        pane,
-                        "split.right",
-                        Icon::SplitRight,
-                        strings.pane_split_right,
-                        cx,
-                        |this, window, cx| this.split_active(SplitAxis::LeftRight, window, cx),
-                    )
-                    .size(control),
-                )
-                .child(
-                    self.pane_icon(
-                        pane,
-                        "split.down",
-                        Icon::SplitDown,
-                        strings.pane_split_down,
-                        cx,
-                        |this, window, cx| this.split_active(SplitAxis::TopBottom, window, cx),
-                    )
-                    .size(control),
-                ),
-        )
+        vec![
+            self.pane_icon(
+                pane,
+                "split.right",
+                Icon::SplitRight,
+                strings.pane_split_right,
+                cx,
+                |this, window, cx| this.split_active(SplitAxis::LeftRight, window, cx),
+            )
+            .size(control)
+            .flex_none(),
+            self.pane_icon(
+                pane,
+                "split.down",
+                Icon::SplitDown,
+                strings.pane_split_down,
+                cx,
+                |this, window, cx| this.split_active(SplitAxis::TopBottom, window, cx),
+            )
+            .size(control)
+            .flex_none(),
+        ]
     }
 
     fn pane_icon(

@@ -3148,6 +3148,12 @@ pub struct UxStrings {
     pub favorite_removed: &'static str,
     /// The list filter that keeps only favourites
     pub hosts_filter_favorites: &'static str,
+    /// Tooltip of the terminal bar's menu that holds the tools a narrow bar folded
+    pub terminal_more: &'static str,
+    /// The grid size line in that menu
+    pub terminal_grid_size: &'static str,
+    /// The line under it: the attempt's own steps are behind the tab
+    pub session_connecting_card_hint: &'static str,
 }
 
 impl UxStrings {
@@ -3555,6 +3561,9 @@ impl UxStrings {
             self.favorite_added,
             self.favorite_removed,
             self.hosts_filter_favorites,
+            self.terminal_more,
+            self.terminal_grid_size,
+            self.session_connecting_card_hint,
         ]
     }
 }
@@ -3977,6 +3986,9 @@ included",
     favorite_added: "Added to favorites",
     favorite_removed: "Removed from favorites",
     hosts_filter_favorites: "Favorites only",
+    terminal_more: "More terminal tools",
+    terminal_grid_size: "Terminal size",
+    session_connecting_card_hint: "The terminal opens here as soon as the connection is up.",
 };
 
 /// Simplified Chinese.
@@ -4394,6 +4406,9 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     favorite_added: "已加入收藏",
     favorite_removed: "已取消收藏",
     hosts_filter_favorites: "仅收藏",
+    terminal_more: "更多终端工具",
+    terminal_grid_size: "终端尺寸",
+    session_connecting_card_hint: "连接建立后，终端会在这里打开。",
 };
 
 /// The redesigned-shell strings of the current language.

@@ -2527,13 +2527,17 @@ pub const SCENARIOS: &[Scenario] = &[
         title: "本地终端 · 会话与标签",
         category: Category::Terminal,
         fixture: "one display-only session fed a fixed transcript; no PTY or shell ran",
-        evidence: "proves terminal layout, colour and text rendering; proves nothing about a \
-                   live shell, its environment or its keystrokes",
+        evidence: "proves terminal layout, colour and text rendering, and the bar's three \
+                   groups - where the session is, its own controls, the terminal's tools; at \
+                   720x480 and 200% the bar follows the text size and folds the tools it has \
+                   no room for into its menu; proves nothing about a live shell, its \
+                   environment or its keystrokes",
         quick: true,
         variants: &[
             Variant::dark().smallest(),
             Variant::dark().comfortable(),
             Variant::dark().chinese(),
+            Variant::light().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
@@ -2701,11 +2705,14 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "one session split left and right, the second pane holding a second \
                   display-only session",
         evidence: "proves a split marks its panes and its active pane without repeating the \
-                   session; the second pane has no process behind it",
+                   session, and that each pane's bar folds the tools its width has no room \
+                   for into its menu instead of running past the pane; the second pane has \
+                   no process behind it",
         quick: true,
         variants: &[
             Variant::dark().comfortable().chinese(),
             Variant::dark().smallest(),
+            Variant::dark().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
@@ -2717,10 +2724,17 @@ pub const SCENARIOS: &[Scenario] = &[
         title: "终端 · 连接断开",
         category: Category::Terminal,
         fixture: "a saved host's display-only terminal, ended the way a lost connection ends",
-        evidence: "proves the state, the reason and the next step are readable on the merged \
-                   head; no connection was ever made, so no transport behaviour is shown",
+        evidence: "proves the state, the target and the next step are a card centred over the \
+                   last screen, which keeps its size and stays legible behind it, and that \
+                   the card and the bar fit 720x480 at 200%; the capture runs with reduced \
+                   motion, so the card's entrance is not in the picture; no connection was \
+                   ever made, so no transport behaviour is shown",
         quick: true,
-        variants: &[Variant::dark().chinese()],
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().comfortable(),
+            Variant::dark().smallest().largest(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_disconnected,

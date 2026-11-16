@@ -906,6 +906,20 @@ pub(crate) fn segment_reserved_width(label: &str, metrics: Metrics) -> Pixels {
     (text + padding + border).min(cap)
 }
 
+/// Border-box width a [`chip`] with `label` in `tone` takes: its words, its padding, its
+/// hairline and, for any tone but the neutral one, its mark.
+pub(crate) fn chip_reserved_width(label: &str, tone: Tone, metrics: Metrics) -> Pixels {
+    let text = reserved_text_width(label, metrics.caption_size());
+    let padding = metrics.scale(8.0) * 2.0;
+    let border = px(2.0);
+    let mark = if tone == Tone::Neutral {
+        px(0.0)
+    } else {
+        metrics.scale(6.0) + metrics.scale(5.0)
+    };
+    text + padding + border + mark
+}
+
 /// Border-box floor for a [`compact_button`] label.
 pub(crate) fn compact_label_reserved_width(label: &str, metrics: Metrics) -> Pixels {
     let text = reserved_text_width(label, metrics.caption_size());
@@ -1634,6 +1648,78 @@ pub fn card(metrics: Metrics) -> Div {
         .border_1()
         .border_color(theme::swatch(palette::BORDER))
         .elevation(Elevation::Low)
+}
+
+/// The card a session's state is laid over its terminal in: why it ended, or that it is
+/// on its way (R3).
+///
+/// It floats over the grid, so it is the raised layer at the mid elevation, centred by
+/// its caller and no wider than a sentence needs. The emblem tile carries the tone, the
+/// title states the state and the optional line says what it means; the caller appends
+/// the actions and any disclosure. A press on the card stays on the card: it occludes
+/// the grid under it, while the grid around it keeps its pointer.
+pub fn status_card(
+    tone: Tone,
+    emblem: AnyElement,
+    title: Div,
+    detail: Option<Div>,
+    metrics: Metrics,
+) -> Div {
+    div()
+        .occlude()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .min_w(px(0.0))
+        .max_w(metrics.scale(440.0))
+        .gap(metrics.scale(spacing::SNUG))
+        .p(metrics.scale(spacing::BASE + 4.0))
+        .rounded(px(radius::XLARGE))
+        .bg(theme::swatch(palette::RAISED))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER_STRONG))
+        .elevation(Elevation::Mid)
+        .cursor_default()
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap(metrics.scale(spacing::SNUG))
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size(metrics.scale(36.0))
+                        .rounded(px(radius::LARGE))
+                        .bg(tone.chip_background())
+                        .child(emblem),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .gap(metrics.scale(2.0))
+                        .child(
+                            title
+                                .whitespace_normal()
+                                .text_size(metrics.title_size())
+                                .font_weight(metrics.title_weight())
+                                .text_color(theme::swatch(palette::TEXT_PRIMARY)),
+                        )
+                        .children(detail.map(|detail| {
+                            detail
+                                .whitespace_normal()
+                                .text_size(metrics.label_size())
+                                .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                        })),
+                ),
+        )
 }
 
 /// An on/off switch for a setting that takes effect at once.
