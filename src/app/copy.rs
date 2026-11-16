@@ -3090,6 +3090,58 @@ pub struct UxStrings {
     pub terminal_font_reset: &'static str,
     /// Context-menu action to copy a host or connection address
     pub host_copy_target: &'static str,
+    /// The placeholder of the home page's quick-connect bar
+    pub home_quick_placeholder: &'static str,
+    /// A quick-connect result that dials an unsaved address
+    pub home_quick_temporary: &'static str,
+    /// Detail of that result: nothing is saved
+    pub home_quick_temporary_hint: &'static str,
+    /// Detail of a local terminal in the quick-connect results
+    pub home_quick_shell_hint: &'static str,
+    /// What the quick-connect bar says when nothing matches
+    pub home_quick_empty: &'static str,
+    /// Keycap beside the result Enter opens
+    pub home_quick_enter: &'static str,
+    /// The home page's menu of local terminals
+    pub home_local_button: &'static str,
+    /// Heading of the serial connections in that menu
+    pub home_serial_section: &'static str,
+    /// Menu entry: a new serial connection
+    pub home_serial_new: &'static str,
+    /// Heading of the recent-connection cards
+    pub home_recent_section: &'static str,
+    /// Heading of the favourite cards
+    pub home_favorites_section: &'static str,
+    /// Heading of the group cards
+    pub home_groups_section: &'static str,
+    /// Heading of the full host list on the home page
+    pub home_all_hosts: &'static str,
+    /// Button: show the whole section in the list
+    pub home_view_all: &'static str,
+    /// A group card's count, with how many are connected
+    pub home_group_count: &'static str,
+    /// A group card's count when none is connected
+    pub home_group_count_idle: &'static str,
+    /// Tooltip of a card's menu button
+    pub home_card_more: &'static str,
+    /// Tooltip of a card: pressing it connects
+    pub home_card_connect_hint: &'static str,
+    /// Tooltip of a group card: pressing it narrows the list
+    pub home_group_card_hint: &'static str,
+    /// Action: mark a record as a favourite
+    pub favorite_add: &'static str,
+    /// Action: clear a record's favourite mark
+    pub favorite_remove: &'static str,
+    /// Palette entry: mark the named record as a favourite
+    pub favorite_add_named: &'static str,
+    /// Palette entry: clear the named record's mark
+    pub favorite_remove_named: &'static str,
+    /// Toast after a record was marked
+    pub favorite_added: &'static str,
+    /// Toast after a mark was cleared
+    pub favorite_removed: &'static str,
+    /// The list filter that keeps only favourites
+    pub hosts_filter_favorites: &'static str,
 }
 
 impl UxStrings {
@@ -3472,6 +3524,32 @@ impl UxStrings {
             self.terminal_select_all,
             self.terminal_font_reset,
             self.host_copy_target,
+            self.home_quick_placeholder,
+            self.home_quick_temporary,
+            self.home_quick_temporary_hint,
+            self.home_quick_shell_hint,
+            self.home_quick_empty,
+            self.home_quick_enter,
+            self.home_local_button,
+            self.home_serial_section,
+            self.home_serial_new,
+            self.home_recent_section,
+            self.home_favorites_section,
+            self.home_groups_section,
+            self.home_all_hosts,
+            self.home_view_all,
+            self.home_group_count,
+            self.home_group_count_idle,
+            self.home_card_more,
+            self.home_card_connect_hint,
+            self.home_group_card_hint,
+            self.favorite_add,
+            self.favorite_remove,
+            self.favorite_add_named,
+            self.favorite_remove_named,
+            self.favorite_added,
+            self.favorite_removed,
+            self.hosts_filter_favorites,
         ]
     }
 }
@@ -3869,6 +3947,32 @@ included",
     terminal_select_all: "Select all",
     terminal_font_reset: "Reset font size ({size}px)",
     host_copy_target: "Copy address",
+    home_quick_placeholder: "Search saved hosts, or type user@host:port to connect",
+    home_quick_temporary: "Connect to {target}",
+    home_quick_temporary_hint: "Not saved · opens the sign-in",
+    home_quick_shell_hint: "Local terminal · opens in a new tab",
+    home_quick_empty: "No saved host matches. Type user@host[:port] to connect without saving.",
+    home_quick_enter: "Enter",
+    home_local_button: "Local terminal",
+    home_serial_section: "Serial",
+    home_serial_new: "New serial connection",
+    home_recent_section: "Recent",
+    home_favorites_section: "Favorites",
+    home_groups_section: "Groups",
+    home_all_hosts: "All hosts",
+    home_view_all: "View all",
+    home_group_count: "{count} hosts · {online} online",
+    home_group_count_idle: "{count} hosts",
+    home_card_more: "More actions",
+    home_card_connect_hint: "Connect",
+    home_group_card_hint: "Show this group in the list",
+    favorite_add: "Add to favorites",
+    favorite_remove: "Remove from favorites",
+    favorite_add_named: "Add {name} to favorites",
+    favorite_remove_named: "Remove {name} from favorites",
+    favorite_added: "Added to favorites",
+    favorite_removed: "Removed from favorites",
+    hosts_filter_favorites: "Favorites only",
 };
 
 /// Simplified Chinese.
@@ -4261,6 +4365,32 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     terminal_select_all: "全选",
     terminal_font_reset: "恢复默认字号（{size}px）",
     host_copy_target: "复制地址",
+    home_quick_placeholder: "搜索已保存的主机，或输入 user@host:port 直接连接",
+    home_quick_temporary: "连接到 {target}",
+    home_quick_temporary_hint: "不保存 · 打开登录",
+    home_quick_shell_hint: "本地终端 · 在新标签中打开",
+    home_quick_empty: "没有匹配的已保存主机。输入 user@host[:port] 可直接连接，不会保存。",
+    home_quick_enter: "回车",
+    home_local_button: "本地终端",
+    home_serial_section: "串口",
+    home_serial_new: "新建串口连接",
+    home_recent_section: "最近连接",
+    home_favorites_section: "收藏",
+    home_groups_section: "分组",
+    home_all_hosts: "所有主机",
+    home_view_all: "查看全部",
+    home_group_count: "{count} 台 · {online} 在线",
+    home_group_count_idle: "{count} 台",
+    home_card_more: "更多操作",
+    home_card_connect_hint: "连接",
+    home_group_card_hint: "在列表中只看这个分组",
+    favorite_add: "加入收藏",
+    favorite_remove: "取消收藏",
+    favorite_add_named: "收藏 {name}",
+    favorite_remove_named: "取消收藏 {name}",
+    favorite_added: "已加入收藏",
+    favorite_removed: "已取消收藏",
+    hosts_filter_favorites: "仅收藏",
 };
 
 /// The redesigned-shell strings of the current language.

@@ -1481,6 +1481,17 @@ impl HostsPanel {
         }
     }
 
+    /// Narrows the list to the records marked as favourites, or drops that narrowing.
+    ///
+    /// It sits beside the group and the status rather than replacing either: "my
+    /// favourites in Prod" is one question, and dropping the filters drops all three.
+    pub fn set_favorites_filter(&mut self, favorites: bool) {
+        if self.filter.favorites != favorites {
+            self.filter.favorites = favorites;
+            self.pending_delete = None;
+        }
+    }
+
     /// Drops every narrowing filter, keeping the search phrase as it is.
     pub fn clear_filters(&mut self) {
         self.filter = HostFilter::default();
@@ -1648,7 +1659,7 @@ impl HostsPanel {
                     .collect();
                 book.connections()
                     .iter()
-                    .filter(|record| self.matches_connection(record, &searched, open))
+                    .filter(|record| self.matches_connection(book, record, &searched, open))
                     .map(ConnectionRecord::id)
                     .collect()
             }
@@ -1822,7 +1833,13 @@ impl HostsPanel {
                 _ => return false,
             }
         }
-        self.matches_status(book, host, open)
+        self.matches_favorite(book, host.id()) && self.matches_status(book, host, open)
+    }
+
+    /// Whether one record survives the favourites filter: every record does while it
+    /// is off, and only a marked one while it is on.
+    fn matches_favorite(&self, book: &HostBook, id: HostId) -> bool {
+        !self.filter.favorites || book.is_favorite(id)
     }
 
     /// Whether one host survives everything but the group, for the tree that chooses it.
@@ -1832,7 +1849,9 @@ impl HostsPanel {
         host: &HostConfig,
         open: &dyn Fn(HostId) -> bool,
     ) -> bool {
-        host_matches(host, &self.search) && self.matches_status(book, host, open)
+        host_matches(host, &self.search)
+            && self.matches_favorite(book, host.id())
+            && self.matches_status(book, host, open)
     }
 
     /// Whether one connection of another protocol survives the search and the filters.
@@ -1843,13 +1862,14 @@ impl HostsPanel {
     /// sign-in history yet, so it is only ever "never connected".
     fn matches_connection(
         &self,
+        book: &HostBook,
         record: &ConnectionRecord,
         searched: &BTreeSet<HostId>,
         open: &dyn Fn(HostId) -> bool,
     ) -> bool {
         // The phrase is matched by the book, which is the one matcher over names,
         // protocols and targets; this list only applies it to the records it draws.
-        if !searched.contains(&record.id()) {
+        if !searched.contains(&record.id()) || !self.matches_favorite(book, record.id()) {
             return false;
         }
         if let Some(wanted) = &self.filter.group {
@@ -2250,6 +2270,8 @@ impl HostStatusFilter {
 pub struct HostFilter {
     group: Option<GroupPath>,
     status: HostStatusFilter,
+    /// Whether only the records marked as favourites are kept.
+    favorites: bool,
 }
 
 impl HostFilter {
@@ -2265,11 +2287,168 @@ impl HostFilter {
         self.status
     }
 
-    /// Whether either filter narrows anything.
+    /// Whether only the favourite records are kept.
+    #[must_use]
+    pub fn favorites(&self) -> bool {
+        self.favorites
+    }
+
+    /// Whether any filter narrows anything.
     #[must_use]
     pub fn is_narrowing(&self) -> bool {
-        self.group.is_some() || self.status != HostStatusFilter::Any
+        self.group.is_some() || self.status != HostStatusFilter::Any || self.favorites
     }
+}
+
+// ---------------------------------------------------------------------------
+// The home dashboard (R1)
+// ---------------------------------------------------------------------------
+
+/// An address typed into the home page's quick-connect bar: `user@host[:port]`.
+///
+/// It is what the bar offers to dial when no saved record matches. Nothing here is
+/// saved: the connection it starts is the same unsaved one the quick-connection form
+/// prepares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuickTarget {
+    /// The user to sign in as.
+    pub user: String,
+    /// The host name or address.
+    pub host: String,
+    /// The port, when one was typed.
+    pub port: Option<u16>,
+}
+
+impl QuickTarget {
+    /// The target as the bar shows it back: `user@host` or `user@host:port`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self.port {
+            Some(port) => format!("{}@{}:{port}", self.user, self.host),
+            None => format!("{}@{}", self.user, self.host),
+        }
+    }
+}
+
+/// Reads `user@host[:port]` out of what was typed into the quick-connect bar.
+///
+/// The user and the host are both required, as the quick-connection form's own split
+/// requires them: a bare word is a search, not an address. A port has to be a number
+/// from 1 to 65535; anything else after a colon makes the text no address at all, so a
+/// typo is never dialled as some other port. An IPv6 literal keeps its colons and no
+/// port is read from it.
+#[must_use]
+pub fn parse_quick_target(text: &str) -> Option<QuickTarget> {
+    let text = text.trim();
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (user, rest) = text.split_once('@')?;
+    if user.is_empty() || rest.is_empty() || rest.contains('@') {
+        return None;
+    }
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && !host.starts_with('[') => {
+            if host.is_empty() || port.is_empty() || !port.chars().all(|ch| ch.is_ascii_digit()) {
+                return None;
+            }
+            let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+            (host, Some(port))
+        }
+        _ => (rest, None),
+    };
+    if host.contains('/') {
+        return None;
+    }
+    Some(QuickTarget {
+        user: user.to_owned(),
+        host: host.to_owned(),
+        port,
+    })
+}
+
+/// The saved records of any protocol that a phrase typed into the quick-connect bar
+/// finds, best first.
+///
+/// The matcher is the book's own (name, address, user, group, protocol), the one the
+/// list's search uses, so the bar and the list never disagree about what a phrase
+/// finds. A record whose name starts with the phrase comes first; the rest keep the
+/// order they were saved in. An empty phrase finds nothing: the bar is not a list.
+#[must_use]
+pub fn quick_matches(book: &HostBook, phrase: &str) -> Vec<HostId> {
+    let phrase = phrase.trim();
+    if phrase.is_empty() {
+        return Vec::new();
+    }
+    let lowered = phrase.to_lowercase();
+    let mut found: Vec<(bool, HostId)> = book
+        .search_connections(phrase)
+        .iter()
+        .map(|record| {
+            (
+                !record.name().to_lowercase().starts_with(&lowered),
+                record.id(),
+            )
+        })
+        .collect();
+    // A stable sort: within each half the saved order stays.
+    found.sort_by_key(|(later, _)| *later);
+    found.into_iter().map(|(_, id)| id).collect()
+}
+
+/// One group card of the home dashboard: a top-level group, what it holds and how
+/// much of it this window has open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupOverview {
+    /// The top-level group.
+    pub path: GroupPath,
+    /// Every saved record inside it and inside its children, of any protocol.
+    pub records: usize,
+    /// How many of those this window holds a connected session to.
+    pub online: usize,
+}
+
+/// The top-level groups that hold at least one record, in tree order, with their
+/// counts (R1).
+///
+/// The counts ignore the list's search and filters: a card says what the group is,
+/// and pressing it is what narrows the list. A group with nothing in it has no card;
+/// the tree beside the list is where an empty group is managed. [open] is the same
+/// read of this window's sessions the list uses, so nothing here dials anything.
+#[must_use]
+pub fn group_overview(
+    book: &HostBook,
+    groups: &GroupBook,
+    open: &dyn Fn(HostId) -> bool,
+) -> Vec<GroupOverview> {
+    let mut paths: BTreeSet<GroupPath> = drawn_paths(book, groups).into_iter().collect();
+    for record in book.connections() {
+        let mut current = record.group_path();
+        while let Some(path) = current {
+            current = path.parent();
+            paths.insert(path);
+        }
+    }
+    let paths: Vec<GroupPath> = paths.into_iter().collect();
+    child_paths(&paths, None)
+        .into_iter()
+        .filter_map(|path| {
+            let ids: Vec<HostId> = book
+                .hosts_under_group(&path)
+                .into_iter()
+                .chain(book.connections_under_group(&path))
+                .collect();
+            if ids.is_empty() {
+                return None;
+            }
+            let online = ids.iter().filter(|id| open(**id)).count();
+            Some(GroupOverview {
+                path,
+                records: ids.len(),
+                online,
+            })
+        })
+        .collect()
 }
 
 /// One group header of the flattened list.
@@ -4486,5 +4665,154 @@ mod tests {
         assert_eq!(cleared.host().jumps(), &[bastion.id()]);
         assert_eq!(cleared.host().proxy_command(), None);
         assert!(!HostDraft::edit(cleared.host()).proxy_conflicts());
+    }
+
+    // -- The home dashboard (R1) ------------------------------------------------
+
+    #[test]
+    fn the_quick_bar_reads_user_host_and_an_optional_port() {
+        assert_eq!(
+            parse_quick_target("deploy@10.0.0.5"),
+            Some(QuickTarget {
+                user: "deploy".to_owned(),
+                host: "10.0.0.5".to_owned(),
+                port: None,
+            })
+        );
+        assert_eq!(
+            parse_quick_target("  ops@db.internal:2222 "),
+            Some(QuickTarget {
+                user: "ops".to_owned(),
+                host: "db.internal".to_owned(),
+                port: Some(2222),
+            })
+        );
+        assert_eq!(
+            parse_quick_target("root@fe80::1").map(|target| target.port),
+            Some(None),
+            "an IPv6 literal keeps its colons and has no port read out of it"
+        );
+        assert_eq!(
+            parse_quick_target("ops@db:2222").map(|target| target.label()),
+            Some("ops@db:2222".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_search_word_or_a_broken_address_is_not_dialled() {
+        for text in [
+            "",
+            "prod",
+            "10.0.0.5",
+            "@host",
+            "user@",
+            "user@host:",
+            "user@host:ssh",
+            "user@host:0",
+            "user@host:70000",
+            "a@b@c",
+            "user@ho st",
+            "user@host/path",
+        ] {
+            assert_eq!(parse_quick_target(text), None, "{text:?} is not an address");
+        }
+    }
+
+    #[test]
+    fn the_quick_bar_finds_saved_records_with_name_prefixes_first() {
+        let mut book = HostBook::new();
+        let staging = host("staging-web", "10.0.0.9", 22, "deploy", None);
+        let web = host("web-01", "10.0.0.2", 22, "deploy", Some("Prod"));
+        let db = host("db", "10.0.0.3", 22, "postgres", None);
+        for record in [staging.clone(), web.clone(), db.clone()] {
+            book.insert(record).expect("a new host");
+        }
+        let desk = ConnectionRecord::Rdp(
+            RdpConfig::new("web desk", "10.0.0.7:3389", Some("alice")).expect("a valid record"),
+        );
+        let desk_id = desk.id();
+        book.insert_connection(desk).expect("a new connection");
+
+        assert_eq!(
+            quick_matches(&book, "web"),
+            vec![web.id(), desk_id, staging.id()],
+            "names that start with the phrase lead, the rest keep their saved order"
+        );
+        assert_eq!(quick_matches(&book, "postgres"), vec![db.id()]);
+        assert!(
+            quick_matches(&book, "   ").is_empty(),
+            "an empty bar lists nothing"
+        );
+        assert!(quick_matches(&book, "nothing-like-it").is_empty());
+    }
+
+    #[test]
+    fn the_group_cards_count_every_record_and_skip_empty_groups() {
+        let mut book = HostBook::new();
+        let mut web = host("web", "10.0.0.2", 22, "deploy", None);
+        web.set_group_path(Some(GroupPath::parse("Prod/Web").expect("a valid path")));
+        let mut db = host("db", "10.0.0.3", 22, "deploy", None);
+        db.set_group_path(Some(GroupPath::parse("Prod/DB").expect("a valid path")));
+        let lab = host("lab", "10.0.0.4", 22, "deploy", None);
+        for record in [web.clone(), db.clone(), lab] {
+            book.insert(record).expect("a new host");
+        }
+        let mut desk =
+            RdpConfig::new("desk", "10.0.0.7:3389", Some("alice")).expect("a valid record");
+        desk.set_group_path(Some(GroupPath::parse("Office").expect("a valid path")));
+        book.insert_connection(ConnectionRecord::Rdp(desk))
+            .expect("a new connection");
+        let mut groups = GroupBook::new();
+        groups
+            .insert(&GroupPath::parse("Empty").expect("a valid path"))
+            .expect("a new group");
+
+        let open = web.id();
+        let cards = group_overview(&book, &groups, &|id| id == open);
+        let named: Vec<(String, usize, usize)> = cards
+            .iter()
+            .map(|card| (card.path.to_canonical(), card.records, card.online))
+            .collect();
+        assert_eq!(
+            named,
+            vec![("Office".to_owned(), 1, 0), ("Prod".to_owned(), 2, 1)],
+            "top-level groups only, children counted in, an empty group has no card"
+        );
+    }
+
+    #[test]
+    fn the_favourites_filter_keeps_marked_records_of_any_protocol() {
+        let mut book = HostBook::new();
+        let web = host("web", "10.0.0.2", 22, "deploy", None);
+        let db = host("db", "10.0.0.3", 22, "deploy", None);
+        book.insert(web.clone()).expect("a new host");
+        book.insert(db.clone()).expect("a new host");
+        let desk = ConnectionRecord::Rdp(
+            RdpConfig::new("desk", "10.0.0.7:3389", Some("alice")).expect("a valid record"),
+        );
+        let desk_id = desk.id();
+        book.insert_connection(desk).expect("a new connection");
+        book.set_favorite(db.id(), true).expect("a saved host");
+        book.set_favorite(desk_id, true)
+            .expect("a saved connection");
+
+        let mut panel = HostsPanel::new();
+        let groups = GroupBook::new();
+        assert_eq!(panel.list(&book, &groups, &|_| false).matched_len(), 3);
+        panel.set_favorites_filter(true);
+        assert!(panel.filter().is_narrowing(), "the filter says it narrows");
+        let list = panel.list(&book, &groups, &|_| false);
+        assert_eq!(
+            list.ids_in_scope(SelectionScope::CurrentResults),
+            &[db.id()]
+        );
+        assert_eq!(
+            list.matched_len(),
+            2,
+            "the favourite connection stays listed"
+        );
+        panel.clear_filters();
+        assert!(!panel.filter().favorites(), "clearing the filters drops it");
+        assert_eq!(panel.list(&book, &groups, &|_| false).matched_len(), 3);
     }
 }

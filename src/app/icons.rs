@@ -111,11 +111,15 @@ pub enum Icon {
     ArrowUp,
     /// A square: stop.
     Stop,
+    /// An outlined star: mark as a favourite.
+    Star,
+    /// A filled star: a favourite.
+    StarFilled,
 }
 
 impl Icon {
     /// Every icon, for the asset listing and the tests.
-    pub const ALL: [Self; 47] = [
+    pub const ALL: [Self; 49] = [
         Self::Terminal,
         Self::Server,
         Self::Layers,
@@ -163,6 +167,8 @@ impl Icon {
         Self::FolderPlus,
         Self::ArrowUp,
         Self::Stop,
+        Self::Star,
+        Self::StarFilled,
     ];
 
     /// The asset path GPUI asks the source for.
@@ -215,6 +221,8 @@ impl Icon {
             Self::FolderPlus => "icons/folder-plus.svg",
             Self::ArrowUp => "icons/arrow-up.svg",
             Self::Stop => "icons/stop.svg",
+            Self::Star => "icons/star.svg",
+            Self::StarFilled => "icons/star-filled.svg",
         }
     }
 
@@ -328,6 +336,12 @@ impl Icon {
             }
             Self::ArrowUp => r#"<path d="M12 19V5"/><path d="M6 11l6-6 6 6"/>"#,
             Self::Stop => r#"<rect x="6.5" y="6.5" width="11" height="11" rx="2"/>"#,
+            Self::Star => {
+                r#"<path d="M12 3.4l2.66 5.39 5.94.86-4.3 4.19 1.02 5.92L12 16.97l-5.32 2.79 1.02-5.92-4.3-4.19 5.94-.86z"/>"#
+            }
+            Self::StarFilled => {
+                r#"<path d="M12 3.4l2.66 5.39 5.94.86-4.3 4.19 1.02 5.92L12 16.97l-5.32 2.79 1.02-5.92-4.3-4.19 5.94-.86z" fill="black"/>"#
+            }
         }
     }
 

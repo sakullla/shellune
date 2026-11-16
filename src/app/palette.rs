@@ -23,6 +23,8 @@ pub enum Command {
     Shell(usize),
     /// Opens the connection form of a saved host.
     Connect(HostId),
+    /// Marks a saved record of any protocol as a favourite, or clears the mark (R1).
+    ToggleFavorite(HostId),
     /// Goes to one page.
     GoTo(Destination),
     /// Opens the form for a new saved host.

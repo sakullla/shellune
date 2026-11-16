@@ -17,10 +17,7 @@ use gpui::{
 use shellune_core::{SessionState, SnippetId};
 use shellune_ssh::X11Status;
 
-use super::{
-    ELLIPSIS, ShelluneView, SnippetNote, brand_mark, files_focus_ring, host_avatar, may_reconnect,
-    program_label,
-};
+use super::{ShelluneView, SnippetNote, brand_mark, files_focus_ring, host_avatar, may_reconnect};
 use crate::app::components::{self, Variant};
 use crate::app::copy;
 use crate::app::files::FileSource;
@@ -568,7 +565,7 @@ impl ShelluneView {
     fn new_tab_control(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let ux = copy::ux();
-        let open = self.shell_menu_open;
+        let open = self.shell_menu_open && !self.shell_menu_home;
         let size = metrics.scale(28.0);
         let new_shell = self.keymap.label("shell.new");
         let tooltip = match new_shell {
@@ -609,7 +606,9 @@ impl ShelluneView {
                         button.tooltip(components::tooltip(ux.new_tab_menu))
                     })
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.shell_menu_open = !this.shell_menu_open;
+                        // The header's menu, wherever the home page's one was.
+                        this.shell_menu_open = !(this.shell_menu_open && !this.shell_menu_home);
+                        this.shell_menu_home = false;
                         cx.notify();
                     })),
             );
@@ -629,118 +628,29 @@ impl ShelluneView {
     // Hosts home
     // -----------------------------------------------------------------------
 
-    /// Local shells and saved servers on one page: both are ways to open a
-    /// terminal, they only connect differently.
+    /// The home page as a dashboard (R1): the quick-connect bar on top, then the cards
+    /// of what is used most - recent connections, favourites, groups - and under them
+    /// every saved record in the full list with all of its tools.
+    ///
+    /// The bar and the list's own filters are what must always be reachable, so the
+    /// cards sit in a band of their own that is capped and scrolls by itself: the list
+    /// keeps the height a virtualized list needs, at 720x480 and 200% text too. The
+    /// local shells and serial ports are behind the "Local terminal" menu of the
+    /// heading and the bar's own results, not a section of the page.
     pub(super) fn home_page(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
-        let strings = self.strings();
         let ux = copy::ux();
         let state = self.workspace.state(Destination::Hosts);
-        let record_count = self.book.hosts().len() + self.book.connections().len();
+        let wide = self.group_column_fits();
 
-        let heading = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .flex_wrap()
-            .gap(metrics.scale(spacing::SNUG))
-            // The title and how many records it holds, on one line: the page explains
-            // itself through what it shows, so the sentence under the title is gone.
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .gap(metrics.scale(spacing::TIGHT + 2.0))
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .text_size(metrics.hero_size())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .debug_selector(|| "header.title".to_owned())
-                            .child(ux.home_title),
-                    )
-                    .when(record_count > 0, |line| {
-                        line.child(
-                            div()
-                                .text_size(metrics.title_size())
-                                .text_color(theme::swatch(palette::TEXT_MUTED))
-                                .debug_selector(|| "header.count".to_owned())
-                                .child(SharedString::from(record_count.to_string())),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        components::icon_label_button(
-                            Icon::Plug,
-                            strings.quick_connect,
-                            Variant::Secondary,
-                            metrics,
-                        )
-                        .id("welcome.quick")
-                        .debug_selector(|| "welcome.quick".to_owned())
-                        .tooltip(components::tooltip(strings.quick_connect_hint))
-                        .on_click(cx.listener(
-                            |this, _event, window, cx| {
-                                this.open_quick_connect(window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        components::icon_label_button(
-                            Icon::Plus,
-                            strings.primary_hosts,
-                            Variant::Primary,
-                            metrics,
-                        )
-                        .id("hosts.new")
-                        .debug_selector(|| "hosts.new".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                if this.workspace.state(Destination::Hosts) == SectionState::Failed
-                                {
-                                    this.reload_hosts(cx);
-                                } else {
-                                    this.open_create_host(cx);
-                                }
-                            },
-                        )),
-                    ),
-            );
-
-        // What the page says about itself on top: the heading and the shells of this
-        // computer. It is capped and scrolls on its own, so the servers and their filters
-        // keep the rest of the window instead of being pushed below the fold at the
-        // minimum size (R8).
-        let cap = if self.viewport_height < metrics.scale(320.0) {
-            (self.viewport_height * 0.22).max(metrics.scale(48.0))
-        } else {
-            (self.viewport_height * 0.42)
-                .max(metrics.scale(120.0))
-                .min(metrics.scale(260.0))
-        };
-        let header = div()
-            .id("home.header")
-            .flex()
-            .flex_col()
-            .flex_none()
-            .min_h(px(0.0))
-            .max_h(cap)
-            .overflow_y_scroll()
-            .gap(metrics.scale(spacing::SNUG))
-            .child(heading)
-            .children(
-                self.local_error
-                    .as_ref()
-                    .map(|reason| self.notice_line(reason.clone(), Tone::Danger)),
-            )
-            .child(self.home_local_section(!self.group_column_fits(), cx));
+        // A first run is a book with no saved record at all. A book holding only a
+        // desktop or serial connection is not a first run: the welcome card would
+        // draw over records the list is the only way to reach (R1, R3, R18).
+        let welcome = matches!(state, SectionState::Empty | SectionState::Populated)
+            && self.book.hosts().is_empty()
+            && self.book.connections().is_empty()
+            && self.hosts.search().trim().is_empty()
+            && !self.import.is_open();
 
         let short_viewport = self.viewport_height < metrics.scale(320.0);
         let mut column = div()
@@ -760,19 +670,45 @@ impl ShelluneView {
                 col.overflow_y_scroll().overflow_x_hidden()
             })
             .debug_selector(|| "home".to_owned())
-            .child(header);
+            .child(self.home_heading(wide, cx))
+            .children(
+                self.local_error
+                    .as_ref()
+                    .map(|reason| self.notice_line(reason.clone(), Tone::Danger)),
+            );
+
+        // The band between the bar and the list: what the bar found while something is
+        // typed, the cards otherwise. A first run and a book that is still loading or
+        // could not be read have no cards to show.
+        let cards_allowed = !welcome && state == SectionState::Populated;
+        if let Some(band) = self.home_dashboard(cards_allowed, wide, cx) {
+            // A short window gives the band one line of cards and lets the page scroll;
+            // a taller one gives it a share of the height, never more than three
+            // sections need.
+            let cap = if short_viewport {
+                metrics.scale(64.0)
+            } else {
+                (self.viewport_height * 0.4)
+                    .max(metrics.scale(72.0))
+                    .min(metrics.scale(300.0))
+            };
+            column = column.child(
+                div()
+                    .id("home.dashboard")
+                    .debug_selector(|| "home.dashboard".to_owned())
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .min_h(px(0.0))
+                    .max_h(cap)
+                    .overflow_y_scroll()
+                    .child(band),
+            );
+        }
 
         // The empty first run explains itself in a card; every other state shows the
         // servers themselves, which is a virtualized list that has to be given the
         // height left over instead of being scrolled as one long column (R18).
-        // A first run is a book with no saved record at all. A book holding only a
-        // desktop or serial connection is not a first run: the welcome card would
-        // draw over records the list is the only way to reach (R1, R3, R18).
-        let welcome = matches!(state, SectionState::Empty | SectionState::Populated)
-            && self.book.hosts().is_empty()
-            && self.book.connections().is_empty()
-            && self.hosts.search().trim().is_empty()
-            && !self.import.is_open();
         let hosts = if welcome {
             self.home_welcome(cx)
         } else {
@@ -783,11 +719,17 @@ impl ShelluneView {
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_h(px(0.0))
+                // A short window scrolls the page as one column, so the list keeps the
+                // height it needs instead of being squeezed under the heading and the
+                // cards; a taller one gives it what is left.
+                .when(!short_viewport, |section| section.min_h(px(0.0)))
                 .gap(metrics.scale(spacing::SNUG))
                 // A narrow window spends its height on the list: the eyebrow goes there.
-                .when(self.group_column_fits(), |section| {
-                    section.child(components::section_label(ux.home_hosts_section, metrics))
+                .when(wide && !welcome, |section| {
+                    section.child(
+                        components::section_label(ux.home_all_hosts, metrics)
+                            .debug_selector(|| "home.all".to_owned()),
+                    )
                 })
                 .child(hosts),
         );
@@ -806,172 +748,169 @@ impl ShelluneView {
         if welcome || matches!(state, SectionState::Loading | SectionState::Failed) {
             // A card or a failure is read by scrolling the page, as before.
             page.overflow_y_scroll().child(column)
+        } else if short_viewport {
+            // A short window scrolls the column itself, heading, cards and list together,
+            // so the bar and the list's filters are both reachable (R1, R8).
+            page.child(column.flex_1().min_h(px(0.0)))
         } else {
             page.child(column.flex_1().min_h(px(0.0)).overflow_hidden())
         }
     }
 
-    /// The shells of this computer, as cards that open in one click.
+    /// The heading of the home page: the title and its count, the quick-connect bar,
+    /// and the three ways to start something else - the full quick-connection form, the
+    /// local terminals and a new host.
     ///
-    /// On a narrow window the same choices are drawn as one row of buttons: the servers
-    /// and their filters are the page's main content there, and a card per shell would
-    /// push the list below the fold (R8).
-    fn home_local_section(&self, compact: bool, cx: &mut Context<Self>) -> Div {
+    /// A wide window keeps it on one line with the bar in the middle; a narrow one puts
+    /// the bar on a line of its own under the title, full width, so it is never squeezed
+    /// below a usable size.
+    fn home_heading(&self, wide: bool, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         let strings = self.strings();
         let ux = copy::ux();
-        let mut tiles = div()
+        let record_count = self.book.hosts().len() + self.book.connections().len();
+
+        // The title and how many records it holds, on one line: the page explains
+        // itself through what it shows.
+        let title = div()
             .flex()
-            .flex_wrap()
-            .items_center()
-            .w_full()
+            .flex_none()
+            .items_baseline()
             .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .debug_selector(|| "shell.picker".to_owned());
-        for (index, shell) in self.workspace.shells().iter().enumerate() {
-            let selected = index == self.workspace.shell_choice();
-            if compact {
-                tiles = tiles.child(
-                    components::compact_button(
-                        shell.name().to_owned(),
-                        if selected {
-                            Variant::Secondary
-                        } else {
-                            Variant::Ghost
-                        },
-                        metrics,
-                    )
-                    .id(("shell.choice", index))
-                    .debug_selector(move || format!("shell.choice.{index}"))
-                    .tooltip(components::tooltip(ux.home_local_hint))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.launch_choice(index, window, cx);
-                    })),
-                );
-            } else {
-                tiles = tiles.child(
-                    self.shell_launcher(
-                        Icon::Terminal,
-                        shell.name().to_owned(),
-                        selected.then_some(strings.shell_default),
-                    )
-                    .id(("shell.choice", index))
-                    .debug_selector(move || format!("shell.choice.{index}"))
-                    .tooltip(components::tooltip(SharedString::from(format!(
-                        "{} · {}",
-                        program_label(shell.program()),
-                        ux.home_local_hint
-                    ))))
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        this.launch_choice(index, window, cx);
-                    })),
-                );
-            }
-        }
-        if compact {
-            tiles = tiles.child(
-                components::compact_button(
-                    format!("{}{ELLIPSIS}", strings.shell_custom_button),
-                    Variant::Ghost,
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .text_size(metrics.hero_size())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .debug_selector(|| "header.title".to_owned())
+                    .child(ux.home_title),
+            )
+            .when(record_count > 0, |line| {
+                line.child(
+                    div()
+                        .text_size(metrics.title_size())
+                        .text_color(theme::swatch(palette::TEXT_MUTED))
+                        .debug_selector(|| "header.count".to_owned())
+                        .child(SharedString::from(record_count.to_string())),
+                )
+            });
+
+        // The full form: a password, a key file, the method - everything the bar does
+        // not ask for. On a narrow window it is its icon, and the tooltip says its name.
+        let quick_form = if wide {
+            components::icon_label_button(
+                Icon::Plug,
+                strings.quick_connect,
+                Variant::Ghost,
+                metrics,
+            )
+        } else {
+            components::icon_only_button(Icon::Plug, metrics).size(metrics.control_height())
+        };
+        let local_open = self.shell_menu_open && self.shell_menu_home;
+        let anchor = self.home_local_anchor.clone();
+        let local = div()
+            .relative()
+            .flex()
+            .flex_none()
+            .child(
+                components::icon_label_button(
+                    Icon::Terminal,
+                    ux.home_local_button,
+                    Variant::Secondary,
                     metrics,
                 )
-                .id("shell.custom")
-                .debug_selector(|| "shell.custom".to_owned())
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.open_custom_shell(window, cx);
+                .child(icons::icon(
+                    Icon::ChevronDown,
+                    metrics.small_icon_size(),
+                    theme::swatch(palette::TEXT_MUTED),
+                ))
+                .when(local_open, |button| {
+                    button.bg(theme::swatch(palette::SURFACE_SELECTED))
+                })
+                .id("home.local")
+                .debug_selector(|| "home.local".to_owned())
+                .when(!local_open, |button| {
+                    button.tooltip(components::tooltip(ux.home_local_hint))
+                })
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.toggle_home_local_menu(cx);
                 })),
-            );
-        } else {
-            tiles = tiles.child(
-                self.shell_launcher(
-                    Icon::FolderOpen,
-                    format!("{}{ELLIPSIS}", strings.shell_custom_button),
-                    None,
+            )
+            // Records where the button is drawn, for the menu that hangs from it.
+            .child(
+                gpui::canvas(
+                    move |bounds, _window, _cx| anchor.set(bounds),
+                    |_, _, _, _| {},
                 )
-                .id("shell.custom")
-                .debug_selector(|| "shell.custom".to_owned())
-                .tooltip(components::tooltip(strings.shell_custom_hint))
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.open_custom_shell(window, cx);
-                })),
+                .absolute()
+                .inset_0(),
             );
-        }
-        // The label is what the cards need to be told apart from the servers; the row of
-        // buttons sits directly under the heading and needs no second title (R4, R8).
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::TIGHT))
-            .when(!compact, |section| {
-                section.child(components::section_label(ux.home_local_section, metrics))
-            });
-        if self.workspace.shells().is_empty() {
-            section = section.child(
-                components::banner(Tone::Warning, metrics)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(strings.shell_none_found),
-            );
-        }
-        section.child(tiles)
-    }
-
-    /// One local shell as a launcher: an icon, the name and, for the default shell, a
-    /// quiet mark - one line, as wide as its words, so the row of shells reads like the
-    /// app launcher it is and leaves the window to the servers.
-    ///
-    /// The program behind the name is the tooltip's business, not the row's.
-    fn shell_launcher(&self, icon: Icon, name: String, badge: Option<&'static str>) -> Div {
-        let metrics = self.metrics();
-        let hover_border = theme::swatch(palette::BORDER_STRONG);
-        let hover_bg = theme::swatch(palette::SURFACE_HOVER);
-        let default = badge.is_some();
-        div()
+        let actions = div()
             .flex()
             .flex_none()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
-            .h(metrics.scale(36.0))
-            .pl(metrics.scale(spacing::HAIRLINE + 2.0))
-            .pr(metrics.scale(spacing::SNUG))
-            .rounded(px(radius::MEDIUM + 2.0))
-            .bg(theme::swatch(palette::SURFACE_RAISED))
-            .border_1()
-            .border_color(theme::swatch(if default {
-                palette::BORDER_STRONG
-            } else {
-                palette::BORDER
-            }))
-            .cursor_pointer()
-            .hover(move |style| style.border_color(hover_border).bg(hover_bg))
             .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(metrics.scale(24.0))
-                    .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(palette::ACCENT_TINT))
-                    .child(icons::icon(
-                        icon,
-                        metrics.scale(13.0),
-                        theme::swatch(palette::ACCENT_ON_TINT),
-                    )),
+                quick_form
+                    .id("welcome.quick")
+                    .debug_selector(|| "welcome.quick".to_owned())
+                    .tooltip(components::tooltip(strings.quick_connect_hint))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.open_quick_connect(window, cx);
+                    })),
             )
+            .child(local)
             .child(
-                div()
-                    .flex_none()
-                    .text_size(metrics.label_size())
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(SharedString::from(name)),
-            )
-            .children(badge.map(|badge| {
-                div()
-                    .flex_none()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(badge)
-            }))
+                components::icon_label_button(
+                    Icon::Plus,
+                    strings.primary_hosts,
+                    Variant::Primary,
+                    metrics,
+                )
+                .id("hosts.new")
+                .debug_selector(|| "hosts.new".to_owned())
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    if this.workspace.state(Destination::Hosts) == SectionState::Failed {
+                        this.reload_hosts(cx);
+                    } else {
+                        this.open_create_host(cx);
+                    }
+                })),
+            );
+
+        let bar = div()
+            .flex_1()
+            .min_w(metrics.scale(220.0))
+            .debug_selector(|| "home.quick".to_owned())
+            .child(self.quick_bar.clone());
+
+        if wide {
+            div()
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::SNUG))
+                .child(title)
+                .child(bar)
+                .child(actions)
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .flex_wrap()
+                        .gap(metrics.scale(spacing::TIGHT))
+                        .child(title)
+                        .child(actions),
+                )
+                .child(bar)
+        }
     }
 
     /// The first-run card of the servers section: what a host is, and the three

@@ -333,6 +333,34 @@ impl ShelluneView {
             });
         }
 
+        // The favourite mark of the record in front of the user: the row under the hosts
+        // page's cursor, or the saved record behind the session on screen (R1). One entry
+        // for the record that is meant, rather than one per saved record, so a search for
+        // a host still finds the host and not a second line about marking it.
+        if let Some(id) = self.palette_favorite_target()
+            && let Some(record) = self.book.connection(id)
+        {
+            let favorite = self.book.is_favorite(id);
+            let template = if favorite {
+                ux.favorite_remove_named
+            } else {
+                ux.favorite_add_named
+            };
+            entries.push(Entry {
+                command: Command::ToggleFavorite(id),
+                group: Group::Actions,
+                title: copy::fill(template, &[("name", record.name())]),
+                detail: record.target(),
+                shortcut: None,
+                icon: if favorite {
+                    Icon::StarFilled
+                } else {
+                    Icon::Star
+                },
+                current: false,
+            });
+        }
+
         // The saved commands, each with the two things the palette can do with it (R6).
         // Both entries name the command, so a search for the command finds the pair and a
         // reader can tell "type it" from "run it" before choosing.
@@ -612,6 +640,7 @@ impl ShelluneView {
                     self.open_remote(&host, cx);
                 }
             }
+            Command::ToggleFavorite(id) => self.toggle_favorite(id, cx),
             Command::GoTo(destination) => {
                 if destination == Destination::Forwards {
                     self.open_global_forwards(window, cx);
@@ -1095,7 +1124,20 @@ impl ShelluneView {
         } else {
             strings.connection_delete
         };
+        let favorite_label = if self.book.is_favorite(id) {
+            ux.favorite_remove
+        } else {
+            ux.favorite_add
+        };
         menu = menu
+            .child(
+                item(favorite_label, "host.menu.favorite", false).on_click(cx.listener(
+                    move |this, _event, window, cx| {
+                        this.close_host_menu(window, cx);
+                        this.toggle_favorite(id, cx);
+                    },
+                )),
+            )
             .child(divider())
             .child(
                 item(ux.host_copy_target, "host.menu.copy_target", false).on_click(cx.listener(

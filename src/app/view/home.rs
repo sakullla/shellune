@@ -46,6 +46,34 @@ const GROUP_COLUMN_MIN_WIDTH: f32 = 900.0;
 /// How wide the group column is when it is drawn.
 const GROUP_COLUMN_WIDTH: f32 = 208.0;
 
+/// The narrowest a dashboard card is drawn on a wide window, before zoom.
+const HOME_CARD_MIN_WIDTH: f32 = 200.0;
+
+/// The most cards one dashboard section shows on a wide window.
+const HOME_CARDS_WIDE: usize = 4;
+
+/// The cards one section shows on a narrow window: half as many, stacked (R1, R8).
+const HOME_CARDS_NARROW: usize = 2;
+
+/// What a section's "view all" does.
+type SectionAction = Box<dyn Fn(&mut ShelluneView, &mut Context<ShelluneView>) + 'static>;
+
+/// One saved record as a dashboard card shows it.
+struct CardRecord {
+    /// The selector prefix of the section the card is in.
+    selector: &'static str,
+    /// The card's number in its section.
+    number: usize,
+    id: HostId,
+    name: String,
+    /// What a connection would reach.
+    target: String,
+    /// When it was last reached, or which protocol it speaks.
+    meta: Option<String>,
+    /// Whether it is marked as a favourite.
+    favorite: bool,
+}
+
 /// One row of the list, as the window draws it.
 enum SnapshotRow {
     /// A group header.
@@ -81,6 +109,8 @@ struct ConnectionRowView {
     open: bool,
     /// Whether the keyboard cursor is on this row.
     cursor: bool,
+    /// Whether the record is marked as a favourite (R1).
+    favorite: bool,
 }
 
 /// One host of the list, with what its row shows.
@@ -116,6 +146,8 @@ struct HostRowView {
     /// Whether any host is picked, which keeps every checkbox in view: once a
     /// selection has started, picking the next host must not need a hover first.
     selecting: bool,
+    /// Whether the host is marked as a favourite (R1).
+    favorite: bool,
 }
 
 impl ShelluneView {
@@ -231,6 +263,7 @@ impl ShelluneView {
                             .flex_none()
                             .items_center()
                             .gap(metrics.scale(2.0))
+                            .child(self.favorites_filter_button(cx))
                             .child(self.batch_entry_button(cx))
                             .child(self.toolbar_import_button(cx)),
                     ),
@@ -268,6 +301,12 @@ impl ShelluneView {
                 chips = chips.child(
                     components::chip(path.to_canonical(), Tone::Accent, metrics)
                         .debug_selector(|| "hosts.filter.group".to_owned()),
+                );
+            }
+            if self.hosts.filter().favorites() {
+                chips = chips.child(
+                    components::chip(ux.hosts_filter_favorites, Tone::Accent, metrics)
+                        .debug_selector(|| "hosts.filter.favorites.chip".to_owned()),
                 );
             }
             if self.hosts.filter().status() != HostStatusFilter::Any {
@@ -697,6 +736,54 @@ impl ShelluneView {
         section
     }
 
+    /// The favourites filter of the toolbar: a star that stays lit while only the
+    /// favourites are listed (R1).
+    ///
+    /// It sits with the list's other whole-list tools rather than in the side column,
+    /// so it is in view on both window shapes; a host can be a favourite and never
+    /// connected, so it combines with the status instead of being one.
+    fn favorites_filter_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let favorites = self.hosts.filter().favorites();
+        let hover = theme::swatch(palette::SURFACE_HOVER);
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(metrics.control_height())
+            .rounded(px(radius::MEDIUM))
+            .cursor_pointer()
+            .when(favorites, |button| {
+                button.bg(theme::swatch(palette::SURFACE_SELECTED))
+            })
+            .when(!favorites, |button| {
+                button.hover(move |style| style.bg(hover))
+            })
+            .child(icons::icon(
+                if favorites {
+                    Icon::StarFilled
+                } else {
+                    Icon::Star
+                },
+                metrics.small_icon_size(),
+                theme::swatch(if favorites {
+                    palette::ACCENT
+                } else {
+                    palette::TEXT_SECONDARY
+                }),
+            ))
+            .id("hosts.filter.favorites")
+            .debug_selector(|| "hosts.filter.favorites".to_owned())
+            .tooltip(components::tooltip(ux.hosts_filter_favorites))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.hosts.set_favorites_filter(!favorites);
+                this.hosts_cursor = None;
+                cx.notify();
+            }))
+    }
+
     /// The first row of the group column: every saved host, which is no narrowing.
     fn group_tree_all_row(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
@@ -1096,6 +1183,7 @@ impl ShelluneView {
                         cursor: cursor == Some(host.id),
                         show_duplicate,
                         selecting: !self.hosts.selected().is_empty(),
+                        favorite: self.book.is_favorite(host.id),
                     }));
                     hosts += 1;
                 }
@@ -1114,12 +1202,555 @@ impl ShelluneView {
                             .flatten(),
                         open: self.connection_is_open(row.id),
                         cursor: cursor == Some(row.id),
+                        favorite: self.book.is_favorite(row.id),
                     }));
                     connections += 1;
                 }
             }
         }
         Rc::new(rows)
+    }
+
+    // -----------------------------------------------------------------------
+    // The dashboard (R1)
+    // -----------------------------------------------------------------------
+
+    /// The band under the quick-connect bar: what the bar found while a phrase is
+    /// typed, otherwise the recent, favourite and group cards.
+    ///
+    /// A section with nothing to show is left out rather than drawn empty, and a band
+    /// with no section at all is no band: a first run shows its welcome card instead.
+    pub(super) fn home_dashboard(
+        &self,
+        cards_allowed: bool,
+        wide: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if !self.quick_query.trim().is_empty() {
+            return Some(self.quick_results_panel(cx));
+        }
+        if !cards_allowed {
+            return None;
+        }
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let per_section = self.home_cards_per_section(wide);
+        let mut band = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::SNUG))
+            .debug_selector(|| "home.cards".to_owned());
+        let mut any = false;
+
+        let recent = self.book.recent_hosts();
+        if !recent.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let cards: Vec<AnyElement> = recent
+                .iter()
+                .take(per_section)
+                .enumerate()
+                .map(|(number, recent)| {
+                    let host = recent.host;
+                    let id = host.id();
+                    let when = copy::relative_time(
+                        recent.last_connected_unix,
+                        now,
+                        copy::Locale::current(),
+                    );
+                    self.home_record_card(
+                        CardRecord {
+                            selector: "home.recent",
+                            number,
+                            id,
+                            name: host.name().to_owned(),
+                            target: host.target(),
+                            meta: Some(when),
+                            favorite: self.book.is_favorite(id),
+                        },
+                        cx,
+                    )
+                    .into_any_element()
+                })
+                .collect();
+            band = band.child(self.home_section(
+                "home.recent",
+                ux.home_recent_section,
+                recent.len(),
+                cards,
+                wide,
+                per_section,
+                Some(Box::new(|this: &mut Self, cx: &mut Context<Self>| {
+                    this.show_all_recent(cx);
+                })),
+                cx,
+            ));
+            any = true;
+        }
+
+        let favorites = self.book.favorite_hosts();
+        if !favorites.is_empty() {
+            let cards: Vec<AnyElement> = favorites
+                .iter()
+                .take(per_section)
+                .enumerate()
+                .map(|(number, record)| {
+                    let id = record.id();
+                    // A record of another protocol says which, as its list row does.
+                    let meta = (record.protocol() != shellune_core::ProtocolKind::Ssh)
+                        .then(|| record.protocol().label().to_owned());
+                    self.home_record_card(
+                        CardRecord {
+                            selector: "home.favorite",
+                            number,
+                            id,
+                            name: record.name().to_owned(),
+                            target: record.target(),
+                            meta,
+                            favorite: true,
+                        },
+                        cx,
+                    )
+                    .into_any_element()
+                })
+                .collect();
+            band = band.child(self.home_section(
+                "home.favorites",
+                ux.home_favorites_section,
+                favorites.len(),
+                cards,
+                wide,
+                per_section,
+                Some(Box::new(|this: &mut Self, cx: &mut Context<Self>| {
+                    this.show_all_favorites(cx);
+                })),
+                cx,
+            ));
+            any = true;
+        }
+
+        let groups = crate::app::hosts::group_overview(&self.book, &self.groups, &|id| {
+            self.host_is_open(id) || self.connection_is_open(id)
+        });
+        if !groups.is_empty() {
+            // Every group fits the band when the window has room for it; the tree beside
+            // the list is the place for the rest, so the section has no "view all".
+            let cards: Vec<AnyElement> = groups
+                .iter()
+                .take(per_section)
+                .enumerate()
+                .map(|(number, group)| self.home_group_card(group, number, cx).into_any_element())
+                .collect();
+            band = band.child(self.home_section(
+                "home.groups",
+                ux.home_groups_section,
+                cards.len(),
+                cards,
+                wide,
+                per_section,
+                None,
+                cx,
+            ));
+            any = true;
+        }
+        any.then_some(band)
+    }
+
+    /// How many cards one section shows.
+    ///
+    /// A wide window lays the cards out on one line and shows as many as fit, at most
+    /// four; a narrow one stacks them in one column and shows half as many, so the
+    /// band never pushes the list off the window (R1, R8).
+    pub(crate) fn home_cards_per_section(&self, wide: bool) -> usize {
+        if !wide {
+            return HOME_CARDS_NARROW;
+        }
+        let metrics = self.metrics();
+        let gap = metrics.scale(spacing::TIGHT + 2.0);
+        let width = self
+            .viewport_width
+            .min(metrics.scale(super::HOME_MAX_WIDTH))
+            - metrics.scale(super::HOME_SIDE_PADDING) * 2.0;
+        let fits = ((width + gap) / (metrics.scale(HOME_CARD_MIN_WIDTH) + gap)).floor();
+        (fits.max(1.0) as usize).min(HOME_CARDS_WIDE)
+    }
+
+    /// One section of the band: its title, the "view all" that opens the rest in the
+    /// list, and the cards - on one line when wide, stacked when narrow.
+    #[allow(clippy::too_many_arguments)]
+    fn home_section(
+        &self,
+        selector: &'static str,
+        title: &'static str,
+        total: usize,
+        cards: Vec<AnyElement>,
+        wide: bool,
+        per_line: usize,
+        view_all: Option<SectionAction>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let shown = cards.len();
+        let mut heading = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(metrics.scale(spacing::TIGHT))
+            .min_h(metrics.scale(20.0))
+            .child(components::section_label(title, metrics));
+        if let Some(action) = view_all.filter(|_| total > shown) {
+            heading = heading.child(
+                components::compact_button(ux.home_view_all, Variant::Ghost, metrics)
+                    .h(metrics.scale(20.0))
+                    .id(SharedString::from(format!("{selector}.all")))
+                    .debug_selector(move || format!("{selector}.all"))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        action(this, cx);
+                    })),
+            );
+        }
+        let mut line = if wide {
+            div().flex()
+        } else {
+            div().flex().flex_col()
+        }
+        .gap(metrics.scale(spacing::TIGHT + 2.0))
+        .debug_selector(move || format!("{selector}.cards"));
+        let count = cards.len();
+        for card in cards {
+            line = line.child(div().flex().flex_1().min_w(px(0.0)).child(card));
+        }
+        // A short line keeps the cards the width a full one gives them.
+        if wide {
+            for _ in count..per_line {
+                line = line.child(div().flex_1().min_w(px(0.0)));
+            }
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+            .debug_selector(move || selector.to_owned())
+            .child(heading)
+            .child(line)
+    }
+
+    /// One saved record as a card: press to connect, right press or the "⋯" for every
+    /// action the list row offers.
+    fn home_record_card(&self, card: CardRecord, cx: &mut Context<Self>) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let CardRecord {
+            selector,
+            number,
+            id,
+            name,
+            target,
+            meta,
+            favorite,
+        } = card;
+        let group = format!("{selector}-card");
+        let more_group = group.clone();
+        home_card_frame(metrics)
+            .id(SharedString::from(format!("{selector}.{number}")))
+            .debug_selector(move || format!("{selector}.{number}"))
+            .group(SharedString::from(group))
+            .tooltip(components::tooltip(ux.home_card_connect_hint))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.connect_saved_connection(id, cx);
+            }))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_host_menu(id, event, window, cx);
+                }),
+            )
+            .child(super::host_avatar(&name, false, metrics).size(metrics.scale(30.0)))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(metrics.scale(1.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(metrics.scale(spacing::HAIRLINE))
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(metrics.label_size())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .child(SharedString::from(name)),
+                            )
+                            .when(favorite, |line| {
+                                line.child(icons::icon(
+                                    Icon::StarFilled,
+                                    metrics.scale(11.0),
+                                    theme::swatch(palette::ACCENT),
+                                ))
+                            }),
+                    )
+                    // The target gives way first: the age or the protocol after it is
+                    // the short part a card is scanned for.
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(metrics.scale(spacing::HAIRLINE))
+                            .min_w(px(0.0))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .font_family(crate::app::terminal::monospace_family())
+                                    .child(SharedString::from(target)),
+                            )
+                            .children(meta.map(|meta| {
+                                div()
+                                    .flex_none()
+                                    .child(SharedString::from(format!("· {meta}")))
+                            })),
+                    ),
+            )
+            .child(
+                components::icon_only_button(Icon::More, metrics)
+                    .size(metrics.scale(24.0))
+                    .opacity(0.0)
+                    .group_hover(SharedString::from(more_group), |style| style.opacity(1.0))
+                    .id(SharedString::from(format!("{selector}.{number}.more")))
+                    .debug_selector(move || format!("{selector}.{number}.more"))
+                    .tooltip(components::tooltip(ux.home_card_more))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_host_menu(id, event, window, cx);
+                        }),
+                    ),
+            )
+    }
+
+    /// One top-level group as a card: its name, how much it holds and how much of it is
+    /// open. Pressing it narrows the list below to the group.
+    fn home_group_card(
+        &self,
+        group: &crate::app::hosts::GroupOverview,
+        number: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let count = if group.online > 0 {
+            copy::fill(
+                ux.home_group_count,
+                &[
+                    ("count", &group.records.to_string()),
+                    ("online", &group.online.to_string()),
+                ],
+            )
+        } else {
+            copy::fill(
+                ux.home_group_count_idle,
+                &[("count", &group.records.to_string())],
+            )
+        };
+        let narrowed = self.hosts.filter().group() == Some(&group.path);
+        let path = group.path.clone();
+        home_card_frame(metrics)
+            .id(SharedString::from(format!("home.group.{number}")))
+            .debug_selector(move || format!("home.group.{number}"))
+            .when(narrowed, |card| {
+                card.border_color(theme::faded(theme::swatch(palette::ACCENT), 0.6))
+            })
+            .tooltip(components::tooltip(ux.home_group_card_hint))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.pick_group_card(path.clone(), cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(metrics.scale(30.0))
+                    .rounded(px(radius::MEDIUM))
+                    .bg(theme::swatch(palette::ACCENT_TINT))
+                    .child(icons::icon(
+                        Icon::Folder,
+                        metrics.small_icon_size(),
+                        theme::swatch(palette::ACCENT_ON_TINT),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(metrics.scale(1.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(metrics.label_size())
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(group.path.to_canonical())),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .when(group.online > 0, |line| {
+                                line.text_color(Tone::Positive.text())
+                            })
+                            .child(SharedString::from(count)),
+                    ),
+            )
+    }
+
+    /// What the quick-connect bar found: saved records, the unsaved address and the
+    /// local shells, with the one Enter opens marked (R1).
+    fn quick_results_panel(&self, cx: &mut Context<Self>) -> Div {
+        let metrics = self.metrics();
+        let ux = copy::ux();
+        let results = self.quick_results();
+        let highlight = self.quick_highlight();
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(1.0))
+            .p(metrics.scale(spacing::HAIRLINE))
+            .rounded(px(radius::LARGE))
+            .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .debug_selector(|| "home.quick.results".to_owned());
+        if results.is_empty() {
+            return panel.child(
+                div()
+                    .px(metrics.scale(spacing::TIGHT + 2.0))
+                    .py(metrics.scale(spacing::TIGHT))
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .debug_selector(|| "home.quick.empty".to_owned())
+                    .child(ux.home_quick_empty),
+            );
+        }
+        let mut saved = 0usize;
+        for (number, result) in results.iter().enumerate() {
+            let (icon, title, detail, kind) = match result {
+                super::QuickResult::Saved(id) => {
+                    let Some(record) = self.book.connection(*id) else {
+                        continue;
+                    };
+                    let detail = format!("{} · {}", record.protocol().label(), record.target());
+                    let kind = format!("home.quick.saved.{saved}");
+                    saved += 1;
+                    (Icon::Plug, record.name().to_owned(), detail, kind)
+                }
+                super::QuickResult::Temporary(target) => (
+                    Icon::ArrowRight,
+                    copy::fill(ux.home_quick_temporary, &[("target", &target.label())]),
+                    ux.home_quick_temporary_hint.to_owned(),
+                    "home.quick.temporary".to_owned(),
+                ),
+                super::QuickResult::Shell(index) => {
+                    let Some(shell) = self.workspace.shells().get(*index) else {
+                        continue;
+                    };
+                    // The shell "+" opens says so, as the menus mark it.
+                    let mut detail = format!(
+                        "{} · {}",
+                        ux.home_quick_shell_hint,
+                        super::program_label(shell.program())
+                    );
+                    if *index == self.workspace.shell_choice() {
+                        detail.push_str(" · ");
+                        detail.push_str(self.strings().shell_default);
+                    }
+                    (
+                        Icon::Terminal,
+                        shell.name().to_owned(),
+                        detail,
+                        format!("home.quick.shell.{index}"),
+                    )
+                }
+            };
+            let lit = number == highlight;
+            let hover = theme::swatch(palette::SURFACE_HOVER);
+            panel = panel.child(
+                div()
+                    .id(SharedString::from(format!("home.quick.result.{number}")))
+                    .debug_selector(move || format!("home.quick.result.{number}"))
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .min_h(metrics.scale(40.0))
+                    .px(metrics.scale(spacing::TIGHT + 2.0))
+                    .rounded(px(radius::MEDIUM))
+                    .cursor_pointer()
+                    .when(lit, |row| row.bg(theme::swatch(palette::SURFACE_SELECTED)))
+                    .when(!lit, |row| row.hover(move |style| style.bg(hover)))
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        if this.run_quick_result(Some(number), window, cx) {
+                            this.clear_quick_bar(cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(metrics.scale(26.0))
+                            .rounded(px(radius::SMALL))
+                            .bg(theme::swatch(palette::ACCENT_TINT))
+                            .child(icons::icon(
+                                icon,
+                                metrics.small_icon_size(),
+                                theme::swatch(palette::ACCENT_ON_TINT),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(metrics.label_size())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .debug_selector(move || kind.clone())
+                                    .child(SharedString::from(title)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(metrics.caption_size())
+                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .child(SharedString::from(detail)),
+                            ),
+                    )
+                    .when(lit, |row| {
+                        row.child(components::keycap(ux.home_quick_enter, metrics))
+                    }),
+            );
+        }
+        panel
     }
 
     // -----------------------------------------------------------------------
@@ -1616,6 +2247,14 @@ fn host_row_element(
                     let _ = delete.update(cx, |view, cx| view.ask_delete_host(id, cx));
                 }),
         );
+    row = row.child(favorite_star(
+        host.favorite,
+        cursor,
+        format!("hosts.favorite.{number}"),
+        id,
+        weak,
+        metrics,
+    ));
     row = row.child(tools);
     row.child(
         components::icon_label_button(Icon::Plug, strings.remote_connect, Variant::Soft, metrics)
@@ -1755,6 +2394,14 @@ fn connection_row_element(
                         .map(|group| components::tag(group, metrics)),
                 ),
         )
+        .child(favorite_star(
+            connection.favorite,
+            cursor,
+            format!("hosts.connection.favorite.{number}"),
+            id,
+            weak,
+            metrics,
+        ))
         .child(
             div()
                 .flex()
@@ -1901,4 +2548,80 @@ fn checkbox(checked: bool, metrics: Metrics) -> Div {
         .size(hit)
         .cursor_pointer()
         .child(boxed)
+}
+
+/// The frame of one dashboard card: a raised surface, a row of its contents, and the
+/// pointer's lift.
+fn home_card_frame(metrics: Metrics) -> Div {
+    let hover_border = theme::swatch(palette::BORDER_STRONG);
+    let hover_bg = theme::swatch(palette::SURFACE_HOVER);
+    div()
+        .flex()
+        .items_center()
+        .w_full()
+        .min_w(px(0.0))
+        .gap(metrics.scale(spacing::TIGHT + 2.0))
+        .px(metrics.scale(spacing::TIGHT + 2.0))
+        .py(metrics.scale(spacing::HAIRLINE + 2.0))
+        .rounded(px(radius::LARGE))
+        .bg(theme::swatch(palette::SURFACE_RAISED))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER))
+        .cursor_pointer()
+        .hover(move |style| style.border_color(hover_border).bg(hover_bg))
+}
+
+/// The favourite mark of a row: a filled star that stays in view on a favourite, an
+/// outline that appears with the pointer or the keyboard cursor on any other (R1).
+///
+/// The press stops at the star, so marking a host never also points at or opens it.
+fn favorite_star(
+    favorite: bool,
+    cursor: bool,
+    selector: String,
+    id: HostId,
+    weak: &WeakEntity<ShelluneView>,
+    metrics: Metrics,
+) -> Stateful<Div> {
+    let ux = copy::ux();
+    let hover = theme::swatch(palette::SURFACE_HOVER);
+    let toggled = weak.clone();
+    let element_id = SharedString::from(selector.clone());
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(metrics.scale(26.0))
+        .rounded(px(radius::SMALL))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .when(!favorite && !cursor, |star| {
+            star.opacity(0.0)
+                .group_hover("host-row", |style| style.opacity(1.0))
+        })
+        .child(icons::icon(
+            if favorite {
+                Icon::StarFilled
+            } else {
+                Icon::Star
+            },
+            metrics.small_icon_size(),
+            theme::swatch(if favorite {
+                palette::ACCENT
+            } else {
+                palette::TEXT_SECONDARY
+            }),
+        ))
+        .id(element_id)
+        .debug_selector(move || selector.clone())
+        .tooltip(components::tooltip(if favorite {
+            ux.favorite_remove
+        } else {
+            ux.favorite_add
+        }))
+        .on_click(move |_event, _window, cx| {
+            cx.stop_propagation();
+            let _ = toggled.update(cx, |view, cx| view.toggle_favorite(id, cx));
+        })
 }

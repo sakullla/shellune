@@ -489,6 +489,19 @@ pub struct ShelluneView {
     toasts_hovered: bool,
     /// Where the header's "▾" was last drawn, so its menu can hang from it.
     shell_menu_anchor: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    /// Whether the open shell menu is the home page's "Local terminal" menu rather than
+    /// the header's (R1). The two list the same shells; the home one hangs from its own
+    /// button and lists the serial connections where the header lists the servers.
+    shell_menu_home: bool,
+    /// Where the home page's "Local terminal" button was last drawn.
+    home_local_anchor: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    /// The quick-connect bar at the top of the home page (R1).
+    quick_bar: Entity<TextField>,
+    /// What the bar holds, mirrored as it is typed, so a frame and a test read the
+    /// results without the field.
+    quick_query: String,
+    /// The result of the bar that Enter opens, by position in the results.
+    quick_cursor: usize,
     store: HostStore,
     /// What that file really held the last time it was read or written.
     book: HostBook,
@@ -2069,6 +2082,13 @@ impl ShelluneView {
             field.set_clearable(true, cx);
             field
         });
+        let quick_placeholder = copy::ux_for(workspace.locale()).home_quick_placeholder;
+        let quick_bar = cx.new(|cx| {
+            let mut field = TextField::new(quick_placeholder, cx);
+            field.set_leading_icon(Icon::Search, cx);
+            field.set_clearable(true, cx);
+            field
+        });
         let keys_search = cx.new(|cx| {
             let mut field = TextField::new(strings.keys_search_placeholder, cx);
             field.set_leading_icon(Icon::Search, cx);
@@ -2176,6 +2196,11 @@ impl ShelluneView {
             snippet_note: None,
             toasts_hovered: false,
             shell_menu_anchor: std::rc::Rc::default(),
+            shell_menu_home: false,
+            home_local_anchor: std::rc::Rc::default(),
+            quick_bar,
+            quick_query: String::new(),
+            quick_cursor: 0,
             store,
             book: HostBook::new(),
             hosts: HostsPanel::new(),
@@ -2345,6 +2370,7 @@ impl ShelluneView {
         view.bind_cleanup(cx);
         view.bind_shell_path(cx);
         view.bind_host_search(cx);
+        view.bind_quick_bar(cx);
         view.bind_keys_search(cx);
         view.bind_connection_fields(cx);
         view.bind_remote_fields(cx);
@@ -3017,6 +3043,15 @@ impl ShelluneView {
             || self.shell_menu_open
         {
             return false;
+        }
+        // The quick-connect bar walks its own results: Up and Down move the result Enter
+        // opens, and the list below keeps its cursor (R1).
+        if self.quick_bar.read(cx).focus_handle().is_focused(window) {
+            return match event.keystroke.key.as_str() {
+                "down" => self.step_quick_cursor(1, cx),
+                "up" => self.step_quick_cursor(-1, cx),
+                _ => false,
+            };
         }
         let search_focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
         let page_focused = self
@@ -3814,6 +3849,10 @@ impl ShelluneView {
         let labels = [
             (&self.shell_path, strings.shell_custom_placeholder),
             (&self.hosts_search, strings.hosts_search_placeholder),
+            (
+                &self.quick_bar,
+                copy::ux_for(self.workspace.locale()).home_quick_placeholder,
+            ),
             (&self.keys_search, strings.keys_search_placeholder),
             (&self.remote_fields.password, strings.auth_password),
             (&self.remote_fields.key_path, strings.auth_key),
@@ -5778,6 +5817,286 @@ impl ShelluneView {
             crate::app::hosts::HostListRow::Group(_)
             | crate::app::hosts::HostListRow::Connection(_) => None,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // The home dashboard (R1)
+    // -----------------------------------------------------------------------
+
+    /// Mirrors the quick-connect bar and lets Enter open the highlighted result.
+    fn bind_quick_bar(&mut self, cx: &mut Context<Self>) {
+        let bar = self.quick_bar.clone();
+        let view = cx.entity().downgrade();
+        bar.update(cx, |field, _cx| {
+            field.on_submit(move |_text, window, app| {
+                // A result that ran empties the bar, so the dashboard comes back for the
+                // next visit; Enter over no result keeps what was typed.
+                view.update(app, |view, cx| view.run_quick_result(None, window, cx))
+                    .unwrap_or(false)
+            });
+        });
+        cx.observe(&bar, |view, field, cx| {
+            let phrase = field.read(cx).text().to_owned();
+            if view.quick_query != phrase {
+                view.quick_query = phrase;
+                view.quick_cursor = 0;
+                cx.notify();
+            }
+        })
+        .detach();
+    }
+
+    /// What the quick-connect bar offers for what is typed, in the order it lists them.
+    ///
+    /// The saved records the phrase finds come first, then (when the text is an address)
+    /// the unsaved connection to it, then the local shells whose name or program the
+    /// phrase names. The order is also what Enter means: it opens the first one unless
+    /// the arrows moved the highlight.
+    pub(super) fn quick_results(&self) -> Vec<QuickResult> {
+        let phrase = self.quick_query.trim();
+        if phrase.is_empty() {
+            return Vec::new();
+        }
+        let mut results: Vec<QuickResult> = crate::app::hosts::quick_matches(&self.book, phrase)
+            .into_iter()
+            .take(QUICK_RESULT_LIMIT)
+            .map(QuickResult::Saved)
+            .collect();
+        if let Some(target) = crate::app::hosts::parse_quick_target(phrase) {
+            results.push(QuickResult::Temporary(target));
+        }
+        let lowered = phrase.to_lowercase();
+        for (index, shell) in self.workspace.shells().iter().enumerate() {
+            let named = shell.name().to_lowercase().contains(&lowered)
+                || program_label(shell.program())
+                    .to_lowercase()
+                    .contains(&lowered);
+            if named {
+                results.push(QuickResult::Shell(index));
+            }
+        }
+        results
+    }
+
+    /// The result Enter would open now, by position.
+    pub(super) fn quick_highlight(&self) -> usize {
+        let count = self.quick_results().len();
+        self.quick_cursor.min(count.saturating_sub(1))
+    }
+
+    /// Moves the bar's highlight; the list does not wrap, as the host list does not.
+    fn step_quick_cursor(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let count = self.quick_results().len();
+        if count == 0 {
+            return false;
+        }
+        let current = self.quick_highlight() as isize;
+        let next = (current + delta).clamp(0, count as isize - 1) as usize;
+        if next != self.quick_cursor {
+            self.quick_cursor = next;
+            cx.notify();
+        }
+        true
+    }
+
+    /// Opens one result of the bar, or the highlighted one when none is named.
+    ///
+    /// Returns whether something was opened, which is what lets the bar empty itself.
+    pub(super) fn run_quick_result(
+        &mut self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let results = self.quick_results();
+        let index = index.unwrap_or_else(|| self.quick_highlight());
+        let Some(result) = results.into_iter().nth(index) else {
+            return false;
+        };
+        // The bar forgets the phrase before the result runs, so the dashboard's cards
+        // come back for the next visit. The field itself is emptied by whoever holds it:
+        // Enter is handled inside the field, which clears its own text when told the
+        // press was used, and a click empties it afterwards.
+        self.quick_query.clear();
+        self.quick_cursor = 0;
+        match result {
+            QuickResult::Saved(id) => self.connect_saved_connection(id, cx),
+            QuickResult::Temporary(target) => self.connect_quick_target(&target, window, cx),
+            QuickResult::Shell(shell) => self.launch_choice(shell, window, cx),
+        }
+        cx.notify();
+        true
+    }
+
+    /// Empties the bar, which brings the dashboard's cards back.
+    pub(super) fn clear_quick_bar(&mut self, cx: &mut Context<Self>) {
+        self.quick_bar
+            .update(cx, |field, cx| field.set_text(String::new(), cx));
+        self.quick_query.clear();
+        self.quick_cursor = 0;
+        cx.notify();
+    }
+
+    /// Types into the quick-connect bar, as the user would.
+    #[cfg(any(test, feature = "ui-capture"))]
+    pub fn type_quick_bar(&mut self, phrase: &str, cx: &mut Context<Self>) {
+        self.quick_bar
+            .update(cx, |field, cx| field.set_text(phrase, cx));
+        self.quick_query = phrase.to_owned();
+        self.quick_cursor = 0;
+        cx.notify();
+    }
+
+    /// What the bar would list now, for a test or a shot.
+    #[cfg(any(test, feature = "ui-capture"))]
+    pub fn quick_results_for_test(&self) -> Vec<QuickResult> {
+        self.quick_results()
+    }
+
+    /// Starts an unsaved connection to an address typed into the bar (R1).
+    ///
+    /// It is the quick-connection form's own path: the form's fields are filled with the
+    /// address, the method is "automatic" so the agent and the usual keys are tried
+    /// before anything is asked, and no secret typed earlier for another address travels
+    /// with it. Nothing is written to the host file. A refusal opens the form with its
+    /// reason, so the address can be corrected there.
+    fn connect_quick_target(
+        &mut self,
+        target: &crate::app::hosts::QuickTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let port = target
+            .port
+            .unwrap_or_else(|| shellune_core::Port::DEFAULT.get())
+            .to_string();
+        let fields = [
+            (self.quick_address.clone(), target.host.clone()),
+            (self.quick_port.clone(), port),
+            (self.quick_user.clone(), target.user.clone()),
+            (self.quick_password.clone(), String::new()),
+            (self.quick_key.clone(), String::new()),
+            (self.quick_passphrase.clone(), String::new()),
+        ];
+        for (field, text) in fields {
+            field.update(cx, |field, cx| field.set_text(text, cx));
+        }
+        self.quick_method = MethodChoice::Auto;
+        self.quick_error = None;
+        self.shell_menu_open = false;
+        if self.prepare_quick_connection(cx) {
+            self.connect_remote(cx);
+            return;
+        }
+        // The reason is on the form; the form is where the address is corrected.
+        self.quick_open = true;
+        if !matches!(
+            self.workspace.destination(),
+            Destination::LocalShells | Destination::Sessions
+        ) {
+            self.select(Destination::LocalShells, window, cx);
+        }
+        let handle = self.quick_address.read(cx).focus_handle().clone();
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    /// Marks a saved record as a favourite, or clears the mark, and writes the book.
+    ///
+    /// The file is written first and the window adopts the change only when the write
+    /// succeeded, as every other edit of the book does; a refused write keeps the old
+    /// mark and says why on the hosts page.
+    pub(super) fn toggle_favorite(&mut self, id: HostId, cx: &mut Context<Self>) {
+        let mut next = self.book.clone();
+        let favorite = match next.toggle_favorite(id) {
+            Ok(favorite) => favorite,
+            Err(error) => {
+                self.hosts.set_message(error.to_string(), true);
+                cx.notify();
+                return;
+            }
+        };
+        match self.store.save(&next) {
+            Ok(()) => {
+                self.book = next;
+                let ux = copy::ux();
+                let said = if favorite {
+                    ux.favorite_added
+                } else {
+                    ux.favorite_removed
+                };
+                let name = self
+                    .book
+                    .connection(id)
+                    .map(|record| record.name().to_owned());
+                self.toast(Tone::Positive, said, name, cx);
+            }
+            Err(error) => self.hosts.set_message(error.to_string(), true),
+        }
+        cx.notify();
+    }
+
+    /// The record a palette entry about favourites is for: the row under the hosts
+    /// page's cursor, or the saved record behind the session on screen.
+    pub(super) fn palette_favorite_target(&self) -> Option<HostId> {
+        if self.workspace.destination() == Destination::Hosts
+            && let Some(id) = self.active_hosts_cursor()
+        {
+            return Some(id);
+        }
+        let session = self.workspace.session(self.active?)?;
+        let id = match session.kind() {
+            SessionKind::Remote { host }
+            | SessionKind::Rdp { host }
+            | SessionKind::Vnc { host }
+            | SessionKind::Serial { host } => *host,
+            SessionKind::Local { .. } => return None,
+        };
+        self.book.contains_connection(id).then_some(id)
+    }
+
+    /// A group card was pressed: the list below narrows to that group, opens it and
+    /// starts from its top (R1).
+    pub(super) fn pick_group_card(&mut self, path: GroupPath, cx: &mut Context<Self>) {
+        self.pick_group_row(Some(path), cx);
+        self.hosts_cursor = None;
+        self.hosts_scroll
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// "View all" of the recent cards: the list's own recent view.
+    pub(super) fn show_all_recent(&mut self, cx: &mut Context<Self>) {
+        self.hosts.select_view(HostView::Recent);
+        self.hosts_cursor = None;
+        self.hosts_scroll
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// "View all" of the favourite cards: the list narrowed to the favourites.
+    pub(super) fn show_all_favorites(&mut self, cx: &mut Context<Self>) {
+        self.hosts.set_favorites_filter(true);
+        self.hosts_cursor = None;
+        self.hosts_scroll
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Opens or closes the home page's "Local terminal" menu.
+    pub(super) fn toggle_home_local_menu(&mut self, cx: &mut Context<Self>) {
+        let open = !(self.shell_menu_open && self.shell_menu_home);
+        self.shell_menu_open = open;
+        self.shell_menu_home = open;
+        cx.notify();
+    }
+
+    /// Opens the form of a new serial connection, from the "Local terminal" menu.
+    fn create_serial_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shell_menu_open = false;
+        self.select(Destination::Hosts, window, cx);
+        self.open_create_host(cx);
+        self.switch_form_protocol(ProtocolKind::Serial, cx);
     }
 
     /// Redraws the settings page as the shortcut search is typed into.
@@ -9940,13 +10259,16 @@ impl ShelluneView {
         }
 
         // The list fills the rest of the page: a virtualized list has to be given the
-        // height it may use, or it cannot know which rows are the visible ones.
+        // height it may use, or it cannot know which rows are the visible ones. A short
+        // window scrolls the home page as one column instead, so there the section keeps
+        // the height its filters and two rows need rather than shrinking under them.
+        let short = self.viewport_height < metrics.scale(320.0);
         let mut column = div()
             .flex()
             .flex_col()
             .flex_1()
             .w_full()
-            .min_h(px(0.0))
+            .when(!short, |column| column.min_h(px(0.0)))
             .gap(metrics.scale(spacing::SNUG));
         // A connection in progress belongs at the top of the destination that
         // started it, beside the host it is for. Attempts that are not the form on
@@ -10850,7 +11172,13 @@ impl ShelluneView {
         let strings = self.strings();
         let ux = copy::ux();
         let viewport = window.viewport_size();
-        let anchor = self.shell_menu_anchor.get();
+        // The home page's "Local terminal" button opens the same shells from its own
+        // place, so the menu hangs from whichever control opened it.
+        let anchor = if self.shell_menu_home {
+            self.home_local_anchor.get()
+        } else {
+            self.shell_menu_anchor.get()
+        };
 
         let section = |label: &'static str| {
             div()
@@ -10921,59 +11249,105 @@ impl ShelluneView {
                 )
                 .id("shell.custom")
                 .debug_selector(|| "shell.custom".to_owned())
+                .tooltip(components::tooltip(strings.shell_custom_hint))
                 .on_click(cx.listener(|this, _event, window, cx| {
                     this.shell_menu_open = false;
                     this.open_custom_shell(window, cx);
                 })),
             )
-            .child(divider())
-            .child(section(ux.home_hosts_section))
-            .child(
-                self.menu_item(
-                    Icon::Plug,
-                    false,
-                    strings.quick_connect.to_owned(),
-                    None,
-                    false,
-                )
-                .id("menu.quick")
-                .debug_selector(|| "menu.quick".to_owned())
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.open_quick_connect(window, cx);
-                })),
-            )
-            .child(
+            .child(divider());
+        if self.shell_menu_home {
+            // The home page's menu is the terminals of this computer: the shells above,
+            // then the serial ports it has saved connections for. The servers are the
+            // page itself, so they are not repeated here (R1).
+            menu = menu.child(section(ux.home_serial_section));
+            let serials = self
+                .book
+                .connections()
+                .iter()
+                .filter(|record| record.protocol() == ProtocolKind::Serial);
+            for (index, record) in serials.enumerate() {
+                let id = record.id();
+                menu = menu.child(
+                    self.menu_item(
+                        Icon::Plug,
+                        false,
+                        record.name().to_owned(),
+                        Some(record.target()),
+                        false,
+                    )
+                    .id(("home.local.serial", index))
+                    .debug_selector(move || format!("home.local.serial.{index}"))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.shell_menu_open = false;
+                        this.open_serial_connection(id, cx);
+                    })),
+                );
+            }
+            menu = menu.child(
                 self.menu_item(
                     Icon::Plus,
                     false,
-                    strings.primary_hosts.to_owned(),
+                    format!("{}{ELLIPSIS}", ux.home_serial_new),
                     None,
                     false,
                 )
-                .id("menu.new_host")
-                .debug_selector(|| "menu.new_host".to_owned())
+                .id("home.local.serial.new")
+                .debug_selector(|| "home.local.serial.new".to_owned())
                 .on_click(cx.listener(|this, _event, window, cx| {
-                    this.shell_menu_open = false;
-                    this.select(Destination::Hosts, window, cx);
-                    this.open_create_host(cx);
-                })),
-            )
-            .child(
-                self.menu_item(
-                    Icon::Import,
-                    false,
-                    strings.import_open.to_owned(),
-                    None,
-                    false,
-                )
-                .id("menu.import")
-                .debug_selector(|| "menu.import".to_owned())
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    this.shell_menu_open = false;
-                    this.select(Destination::Hosts, window, cx);
-                    this.open_import(cx);
+                    this.create_serial_connection(window, cx);
                 })),
             );
+        } else {
+            menu = menu
+                .child(section(ux.home_hosts_section))
+                .child(
+                    self.menu_item(
+                        Icon::Plug,
+                        false,
+                        strings.quick_connect.to_owned(),
+                        None,
+                        false,
+                    )
+                    .id("menu.quick")
+                    .debug_selector(|| "menu.quick".to_owned())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.open_quick_connect(window, cx);
+                    })),
+                )
+                .child(
+                    self.menu_item(
+                        Icon::Plus,
+                        false,
+                        strings.primary_hosts.to_owned(),
+                        None,
+                        false,
+                    )
+                    .id("menu.new_host")
+                    .debug_selector(|| "menu.new_host".to_owned())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.shell_menu_open = false;
+                        this.select(Destination::Hosts, window, cx);
+                        this.open_create_host(cx);
+                    })),
+                )
+                .child(
+                    self.menu_item(
+                        Icon::Import,
+                        false,
+                        strings.import_open.to_owned(),
+                        None,
+                        false,
+                    )
+                    .id("menu.import")
+                    .debug_selector(|| "menu.import".to_owned())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.shell_menu_open = false;
+                        this.select(Destination::Hosts, window, cx);
+                        this.open_import(cx);
+                    })),
+                );
+        }
 
         Some(
             overlay_layer().child(
@@ -17852,6 +18226,21 @@ fn destination_icon(destination: Destination) -> Icon {
 pub(super) const HOME_MAX_WIDTH: f32 = 1040.0;
 /// The home column's padding on either side, before zoom.
 pub(super) const HOME_SIDE_PADDING: f32 = 32.0;
+
+/// The most saved records the quick-connect bar lists; the rest are one more letter
+/// away, as in the palette.
+pub(super) const QUICK_RESULT_LIMIT: usize = 6;
+
+/// One result of the home page's quick-connect bar (R1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuickResult {
+    /// A saved record of any protocol, opened the way its list row opens it.
+    Saved(HostId),
+    /// An unsaved `user@host[:port]`, dialled through the quick-connection path.
+    Temporary(crate::app::hosts::QuickTarget),
+    /// One of this computer's shells, by its place in the detected list.
+    Shell(usize),
+}
 
 /// The brand's accent-to-cyan gradient, for the few marks that carry the identity:
 /// the shell tiles on the home page and the emblems of empty states. Both stops are

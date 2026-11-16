@@ -325,6 +325,49 @@ fn seed_hosts(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Writes the saved hosts with a connection history, and marks `favorites` of them, so
+/// the home dashboard has recent, favourite and group cards to show (R1).
+///
+/// The history is stamped relative to the moment the fixture is written, so the cards
+/// say "2 h ago" and "yesterday" on every run instead of an age that grows with the
+/// calendar. Nothing was dialled: the stamps are written, not earned.
+fn seed_dashboard_hosts(root: &Path, favorites: usize) -> Result<(), String> {
+    let mut book = shellune_storage::HostBook::new();
+    let hosts = saved_hosts()?;
+    for host in &hosts {
+        book.apply(&HostEdit::create(host.clone()))
+            .map_err(|error| format!("the host fixture could not be built: {error}"))?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("the clock is before 1970: {error}"))?
+        .as_secs();
+    // api-02 two hours ago, build-01 yesterday, stage-01 five days ago.
+    for (index, age) in [(1usize, 2 * 3_600u64), (0, 30 * 3_600), (3, 5 * 86_400)] {
+        book.record_connection(hosts[index].id(), now.saturating_sub(age))
+            .map_err(|error| format!("the history fixture could not be built: {error}"))?;
+    }
+    // edge-03 and lab-07 are the favourites, in that order.
+    for index in [2usize, 5].into_iter().take(favorites) {
+        book.set_favorite(hosts[index].id(), true)
+            .map_err(|error| format!("the favourite fixture could not be built: {error}"))?;
+    }
+    HostStore::at(root)
+        .save(&book)
+        .map_err(|error| format!("the host fixture could not be written: {error}"))?;
+    Ok(())
+}
+
+/// The hosts with their connection history and no favourite.
+fn seed_dashboard_recent(root: &Path) -> Result<(), String> {
+    seed_dashboard_hosts(root, 0)
+}
+
+/// The hosts with their connection history and two favourites.
+fn seed_dashboard_favorites(root: &Path) -> Result<(), String> {
+    seed_dashboard_hosts(root, 2)
+}
+
 /// Writes three saved commands, so the manager has rows to show: two one-liners and one
 /// block, whose line count the row has to say out loud (R17).
 fn seed_snippets(root: &Path) -> Result<(), String> {
@@ -814,6 +857,32 @@ fn show_no_match(
     cx: &mut Context<ShelluneView>,
 ) -> Result<(), String> {
     view.search_hosts("no-such-host", cx);
+    Ok(())
+}
+
+/// Types a part of two saved names into the home page's quick-connect bar.
+fn show_quick_bar(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.type_quick_bar("stage", cx);
+    Ok(())
+}
+
+/// Where the quick-connect shot has arrived: the bar lists the two staging hosts.
+fn quick_bar_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    home_hosts_ready(view, cx)?;
+    let saved = view
+        .quick_results_for_test()
+        .into_iter()
+        .filter(|result| matches!(result, crate::app::view::QuickResult::Saved(_)))
+        .count();
+    if saved != 2 {
+        return Err(format!(
+            "the bar lists {saved} saved host(s) for \"stage\", not the two the fixture holds"
+        ));
+    }
     Ok(())
 }
 
@@ -1316,6 +1385,24 @@ fn home_hosts_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
             "the hosts page lists {listed} host(s), not the {expected} the fixture holds"
         ));
     }
+    let recent = view.book().recent_hosts().len();
+    if recent != 3 {
+        return Err(format!(
+            "the dashboard has {recent} recent connection(s), not the three the fixture wrote"
+        ));
+    }
+    Ok(())
+}
+
+/// The dashboard has its favourites as well as its history.
+fn home_favorites_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    home_hosts_ready(view, cx)?;
+    let favorites = view.book().favorite_hosts().len();
+    if favorites != 2 {
+        return Err(format!(
+            "the dashboard has {favorites} favourite(s), not the two the fixture marked"
+        ));
+    }
     Ok(())
 }
 
@@ -1805,7 +1892,8 @@ pub const SCENARIOS: &[Scenario] = &[
         title: "首页 · 没有保存的主机",
         category: Category::Home,
         fixture: "an empty data directory",
-        evidence: "shows the empty home page; says nothing about a host list with items",
+        evidence: "shows the empty home page: the quick-connect bar and the welcome card, with no \
+                   card band; says nothing about a host list with items",
         quick: false,
         variants: &[Variant::dark().smallest()],
         start: || page(Destination::Hosts),
@@ -1815,11 +1903,13 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "home-hosts",
-        title: "首页 · 已保存的主机与分组",
+        title: "首页 · 仪表盘：快速连接、最近连接与分组",
         category: Category::Home,
-        fixture: "six saved hosts in three groups, seeded on disk before the view starts",
-        evidence: "shows the list this build draws; the hosts were never connected and no \
-                   group tree exists yet",
+        fixture: "six saved hosts in two groups and one without, three of them with a connection \
+                  history stamped relative to the run, seeded on disk before the view starts",
+        evidence: "shows the quick-connect bar, the recent and group cards and the full list this \
+                   build draws; the history was written, not earned, so no host was ever \
+                   connected and the online counts are zero",
         quick: true,
         variants: &[
             Variant::dark().chinese(),
@@ -1827,9 +1917,59 @@ pub const SCENARIOS: &[Scenario] = &[
             Variant::dark().smallest(),
         ],
         start: || page(Destination::Hosts),
-        prepare: seed_hosts,
+        prepare: seed_dashboard_recent,
         install: no_state,
         ready: home_hosts_ready,
+    },
+    Scenario {
+        id: "home-favorites",
+        title: "首页 · 仪表盘：收藏卡片与行上的星标",
+        category: Category::Home,
+        fixture: "the same six hosts and history, with edge-03 and lab-07 marked as favourites in \
+                  hosts.json",
+        evidence: "shows the favourite cards beside the recent and group cards and the filled star \
+                   on the favourite rows; marking and clearing a favourite is proved by the GPUI \
+                   tests, not by this frame",
+        quick: true,
+        variants: &[Variant::dark().chinese(), Variant::light().comfortable()],
+        start: || page(Destination::Hosts),
+        prepare: seed_dashboard_favorites,
+        install: no_state,
+        ready: home_favorites_ready,
+    },
+    Scenario {
+        id: "home-quick",
+        title: "首页 · 快速连接栏的结果",
+        category: Category::Home,
+        fixture: "the same six hosts and history, with stage typed into the quick-connect bar",
+        evidence: "shows the results that take the cards' place while a phrase is typed and the \
+                   one Enter opens; nothing was opened and no host was dialled",
+        quick: false,
+        variants: &[Variant::dark().chinese().smallest()],
+        start: || page(Destination::Hosts),
+        prepare: seed_dashboard_recent,
+        install: show_quick_bar,
+        ready: quick_bar_ready,
+    },
+    Scenario {
+        id: "home-narrow",
+        title: "首页 · 窄窗口：卡片单列、数量减半",
+        category: Category::Home,
+        fixture: "the same six hosts, history and two favourites, drawn narrower than the 900 \
+                  threshold where the cards stack in one column",
+        evidence: "shows the stacked cards, their view-all entries and that the bar and the list's \
+                   filters stay in the window; the 720x480 shot at 200% shows where the page has \
+                   to scroll to reach the rest",
+        quick: false,
+        variants: &[
+            Variant::dark().sized(860.0, 640.0),
+            Variant::dark().sized(860.0, 640.0).chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: seed_dashboard_favorites,
+        install: no_state,
+        ready: home_favorites_ready,
     },
     Scenario {
         id: "hosts-5000",
