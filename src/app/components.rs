@@ -1589,8 +1589,9 @@ pub fn card(metrics: Metrics) -> Div {
 /// An on/off switch for a setting that takes effect at once.
 ///
 /// The knob's side says the state before its colour does: off sits left on a grey
-/// track, on sits right on the accent. The caller gives it an id and a click; the
-/// switch only draws.
+/// track, on sits right on the accent-hued track. The knob keeps the graphic floor on
+/// both tracks, hovered or not, in both palettes. The caller gives it an id and a click;
+/// the switch only draws.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn switch(on: bool, metrics: Metrics) -> Div {
     let width = metrics.scale(34.0);
@@ -1598,14 +1599,14 @@ pub fn switch(on: bool, metrics: Metrics) -> Div {
     let inset = metrics.scale(3.0);
     let knob = height - inset * 2.0;
     let track = if on {
-        palette::ACCENT
+        palette::TRACK_ON
     } else {
         palette::TRACK_OFF
     };
     let hover = theme::swatch(if on {
-        palette::ACCENT_HOVER
+        palette::TRACK_ON_HOVER
     } else {
-        palette::BORDER_STRONG
+        palette::TRACK_OFF_HOVER
     });
     div()
         .flex()
@@ -2215,17 +2216,39 @@ mod tests {
 
     #[test]
     fn a_switch_and_a_checkbox_say_their_state_by_shape_as_well_as_colour() {
-        // The off track and the knob are both readable against the surface the switch
-        // sits on, and the on track is the accent the primary action uses.
-        for surface in [palette::SURFACE, palette::CHROME, palette::OVERLAY] {
+        // The knob says the state by where it sits, so it must be seen on every track,
+        // hovered or not, in both palettes.
+        for track in [
+            palette::TRACK_OFF,
+            palette::TRACK_OFF_HOVER,
+            palette::TRACK_ON,
+            palette::TRACK_ON_HOVER,
+        ] {
+            let (dark, light) = contrast::both(palette::KNOB, track);
+            assert!(
+                dark >= GRAPHIC && light >= GRAPHIC,
+                "the knob fades into {track:x}: {dark:.2}/{light:.2}"
+            );
+        }
+        // The on track also says "on" by colour against whatever the switch sits on;
+        // the off track is at least told apart from it.
+        for surface in [
+            palette::SURFACE,
+            palette::CHROME,
+            palette::RAISED,
+            palette::OVERLAY,
+        ] {
+            let (dark, light) = contrast::both(palette::TRACK_ON, surface);
+            assert!(
+                dark >= GRAPHIC && light >= GRAPHIC,
+                "the on track fades into {surface:x}: {dark:.2}/{light:.2}"
+            );
             let (dark, light) = contrast::both(palette::TRACK_OFF, surface);
             assert!(
                 dark >= 1.3 && light >= 1.3,
                 "the off track disappears into {surface:x}"
             );
         }
-        let (dark, light) = contrast::both(palette::KNOB, palette::ACCENT);
-        assert!(dark >= GRAPHIC || light >= GRAPHIC);
         // The tick on a checked box keeps the body floor on the accent fill.
         let (dark, light) = contrast::both(palette::ON_ACCENT, palette::ACCENT);
         assert!(dark >= BODY && light >= BODY);

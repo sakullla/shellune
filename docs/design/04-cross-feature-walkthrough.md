@@ -12,7 +12,7 @@
 
 最小窗口仍是 720×480。带标签的侧边栏加上页头主操作放不下时，改用图标栏。这次收起不写入用户的折叠偏好，窗口变宽后标签回来。侧边栏中段可以纵向滚动。展开时，主题、语言、文字大小和动态效果留在栏底。
 
-减少动态效果是应用内的 `Motion`，默认完整。完整时，加载状态的圆点做一次约 180ms 的淡入（调试选择器 `state.motion.pulse`，元素 id `state.motion`）。设为减少后，同一个圆点直接以不透明画出（`state.motion.still`），状态卡的标题、原因和下一步仍在。不循环播放。GPUI 0.2.2 没有可读的系统减少动态效果接口，应用不读取、也不跟随系统设置。
+减少动态效果是应用内的 `Motion`（默认完整）与系统“减少动态效果”设置的合并，任一方要求减少即为减少。完整时，加载状态的圆点做一次约 180ms 的淡入（调试选择器 `state.motion.pulse`，元素 id `state.motion`）。设为减少后，同一个圆点直接以不透明画出（`state.motion.still`），状态卡的标题、原因和下一步仍在。不循环播放。GPUI 0.2.2 不报告系统设置，应用自己读取（Windows `SPI_GETCLIENTAREAANIMATION`、macOS `accessibilityDisplayShouldReduceMotion`、Linux GNOME `enable-animations` / KDE `AnimationDurationFactor`），窗口重新获得焦点时重读；系统要求减少时不改写应用内设置的值，见 `02-shell-and-design-system.md` §2.3。
 
 展开侧边栏的底部控件 id 是 `motion.control`。图标栏为了高度不放这个按钮，只保留主题、语言和文字大小。200% 文字下的最小窗口会强制使用图标栏，这时用命令面板的「减少动态效果」切换同一设置。搜索入口仍在图标栏里；快捷键仍是 Ctrl+Shift+P（macOS 为 ⇧⌘P）。没有再绑一个全局键，避免占用 Shell。
 

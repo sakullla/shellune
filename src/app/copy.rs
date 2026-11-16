@@ -2387,7 +2387,7 @@ pub struct UxStrings {
     pub settings_text_size_hint: &'static str,
     /// Motion
     pub settings_motion: &'static str,
-    /// Reduced skips short fades; nothing else changes
+    /// Reduced skips short fades; so does the system's reduce-motion setting
     pub settings_motion_hint: &'static str,
     /// Notifications about the tabs that are not on screen
     pub settings_notices: &'static str,
@@ -3575,7 +3575,7 @@ pub static ENGLISH_UX: UxStrings = UxStrings {
     settings_text_size: "Interface text size",
     settings_text_size_hint: "Scales every label, button and list",
     settings_motion: "Motion",
-    settings_motion_hint: "Reduced skips short fades; nothing else changes",
+    settings_motion_hint: "Reduced skips short fades; the system's reduce-motion setting does too",
     settings_notices: "Background notices",
     settings_bell_notice: "Bell",
     settings_bell_notice_hint: "Marks the tab of a shell that rang while you were elsewhere; the bell byte still reaches the program",
@@ -3995,7 +3995,7 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     settings_text_size: "界面文字大小",
     settings_text_size_hint: "缩放所有文字、按钮和列表",
     settings_motion: "动态效果",
-    settings_motion_hint: "“减少”会跳过短暂的淡入效果，其他不变",
+    settings_motion_hint: "“减少”会跳过短暂的淡入效果；系统开启减少动态效果时同样跳过",
     settings_notices: "后台提醒",
     settings_bell_notice: "响铃",
     settings_bell_notice_hint: "你在别处时响铃的 Shell，其标签会被标记；响铃字节仍照常送到程序",

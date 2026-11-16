@@ -1185,6 +1185,93 @@ async fn reduced_motion_drops_the_loading_fade_and_keeps_the_state(cx: &mut Test
     theme::set_motion(Motion::Full);
 }
 
+/// A shell over a loading transfers page: the page whose waiting mark fades in.
+fn loading_transfers_window(
+    cx: &mut TestAppContext,
+) -> (Entity<ShelluneView>, &mut VisualTestContext) {
+    let workspace = Workspace::with_sections(
+        Section::<Session>::ready(Vec::new()),
+        Section::<HostConfig>::ready(Vec::new()),
+        Section::<Transfer>::loading(),
+    );
+    let (view, cx) =
+        cx.add_window_view(move |_window, cx| ShelluneView::with_workspace(cx, workspace));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    go(cx, GoToTransfers);
+    (view, cx)
+}
+
+#[gpui::test]
+async fn the_systems_reduce_motion_setting_drops_the_fade_without_touching_the_preference(
+    cx: &mut TestAppContext,
+) {
+    // R1: the system asking for less motion is enough on its own, even when the user
+    // left the app's own setting on full.
+    theme::fake_system_reduces_motion(true);
+    let (view, cx) = loading_transfers_window(cx);
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().motion()),
+        Motion::Full,
+        "the user's preference is left as they chose it"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).effective_motion()),
+        Motion::Reduced
+    );
+    assert!(
+        cx.debug_bounds("state.motion.still").is_some(),
+        "the system setting draws the loading mark without the fade"
+    );
+    assert!(cx.debug_bounds("state.motion.pulse").is_none());
+    assert!(cx.debug_bounds("state.card").is_some());
+    assert!(!theme::motion_allowed());
+
+    theme::fake_system_reduces_motion(false);
+    theme::set_motion(Motion::Full);
+}
+
+#[gpui::test]
+async fn a_reduce_motion_switch_flipped_elsewhere_is_seen_when_the_window_returns(
+    cx: &mut TestAppContext,
+) {
+    theme::fake_system_reduces_motion(false);
+    let (view, cx) = loading_transfers_window(cx);
+    assert!(
+        cx.debug_bounds("state.motion.pulse").is_some(),
+        "full motion fades the loading mark in"
+    );
+
+    // The user leaves for the system settings and turns motion down there.
+    cx.deactivate_window();
+    theme::fake_system_reduces_motion(true);
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).effective_motion()),
+        Motion::Reduced,
+        "coming back to the window reads the system setting again"
+    );
+    assert!(
+        cx.debug_bounds("state.motion.still").is_some(),
+        "the redraw follows the system setting"
+    );
+    assert!(!theme::motion_allowed());
+
+    // And back: the user's own preference (full) is what applies again.
+    cx.deactivate_window();
+    theme::fake_system_reduces_motion(false);
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).effective_motion()),
+        Motion::Full
+    );
+    assert!(theme::motion_allowed());
+}
+
 #[gpui::test]
 async fn closing_the_palette_returns_focus_to_the_field_that_opened_it(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));

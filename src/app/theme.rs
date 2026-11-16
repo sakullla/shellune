@@ -122,6 +122,9 @@ pub mod dark {
     pub const DANGER_SOLID: u32 = 0xc42b1c;
     pub const ON_DANGER: u32 = 0xffffff;
     pub const TRACK_OFF: u32 = 0x3b3c47;
+    pub const TRACK_OFF_HOVER: u32 = 0x464855;
+    pub const TRACK_ON: u32 = 0x5a69e0;
+    pub const TRACK_ON_HOVER: u32 = 0x6170e4;
     pub const KNOB: u32 = 0xf4f5f8;
     pub const FOCUS_RING: u32 = 0xadb8ff;
     pub const DISABLED_SURFACE: u32 = 0x17181d;
@@ -181,7 +184,10 @@ pub mod light {
     pub const INFO_TINT: u32 = 0xe2eff9;
     pub const DANGER_SOLID: u32 = 0xc42b1c;
     pub const ON_DANGER: u32 = 0xffffff;
-    pub const TRACK_OFF: u32 = 0xc4c7d0;
+    pub const TRACK_OFF: u32 = 0x878b96;
+    pub const TRACK_OFF_HOVER: u32 = 0x7a7e89;
+    pub const TRACK_ON: u32 = 0x4053cc;
+    pub const TRACK_ON_HOVER: u32 = 0x3646b4;
     pub const KNOB: u32 = 0xffffff;
     pub const FOCUS_RING: u32 = 0x3646b4;
     pub const DISABLED_SURFACE: u32 = 0xf0f1f4;
@@ -317,9 +323,19 @@ pub mod palette {
         DANGER_SOLID;
         /// Text and icons on [`DANGER_SOLID`].
         ON_DANGER;
-        /// The track of a switch that is off.
+        /// The track of a switch that is off. The knob keeps the graphic floor on it.
         #[cfg_attr(not(test), allow(dead_code))]
         TRACK_OFF;
+        /// [`TRACK_OFF`] under the pointer.
+        #[cfg_attr(not(test), allow(dead_code))]
+        TRACK_OFF_HOVER;
+        /// The track of a switch that is on: the accent's hue, deep enough in the dark
+        /// that the light knob keeps the graphic floor on it.
+        #[cfg_attr(not(test), allow(dead_code))]
+        TRACK_ON;
+        /// [`TRACK_ON`] under the pointer.
+        #[cfg_attr(not(test), allow(dead_code))]
+        TRACK_ON_HOVER;
         /// The knob of a switch, in either state.
         #[cfg_attr(not(test), allow(dead_code))]
         KNOB;
@@ -540,7 +556,7 @@ pub enum Appearance {
     /// The dark palette: the tokens' own values.
     #[default]
     Dark,
-    /// The light palette, looked up from the dark tokens.
+    /// The light palette: the tokens' light values, chosen for a light window.
     Light,
 }
 
@@ -558,9 +574,10 @@ pub enum ThemeChoice {
 
 /// Whether short interface motion is played.
 ///
-/// This is an application setting. GPUI 0.2.2's window appearance is observed for
-/// light and dark, but this crate has no evidence of a system reduced-motion
-/// query, so the shell does not claim to follow one.
+/// The user's preference is one input; the operating system's "reduce motion"
+/// setting is the other. GPUI 0.2.2 does not report the system setting, so the shell
+/// reads it itself ([`system_reduces_motion`]) and draws with
+/// [`Motion::with_system`]: motion is reduced when either one asks for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Motion {
     /// Play short, skippable feedback such as a loading dot fading in.
@@ -577,6 +594,17 @@ impl Motion {
     pub const BASE: Duration = Duration::from_millis(180);
     /// A large surface entering: a dialog, the splash. 260 ms.
     pub const SLOW: Duration = Duration::from_millis(260);
+    /// One beat of an in-flight indicator that keeps pulsing while work runs. 900 ms.
+    pub const PULSE: Duration = Duration::from_millis(900);
+
+    /// The motion a window draws with, given whether the system asks for less.
+    ///
+    /// Reduced wins: the system setting can only take motion away, never add it back
+    /// against the user's own choice.
+    #[must_use]
+    pub fn with_system(self, system_reduces: bool) -> Self {
+        if system_reduces { Self::Reduced } else { self }
+    }
 
     /// Whether a short animation may run.
     #[must_use]
@@ -653,7 +681,8 @@ thread_local! {
     static APPEARANCE: std::cell::Cell<Appearance> = const { std::cell::Cell::new(Appearance::Dark) };
     /// The palette the terminal grid is drawn in.
     static TERMINAL_APPEARANCE: std::cell::Cell<Appearance> = const { std::cell::Cell::new(Appearance::Dark) };
-    /// The motion preference of the window being drawn. Not read from the OS.
+    /// The motion of the window being drawn: the user's preference combined with the
+    /// system's reduce-motion setting.
     static MOTION: std::cell::Cell<Motion> = const { std::cell::Cell::new(Motion::Full) };
     /// The text size of the window being drawn.
     static ZOOM: std::cell::Cell<Zoom> = const { std::cell::Cell::new(Zoom::Regular) };
@@ -688,9 +717,164 @@ pub fn motion_allowed() -> bool {
     MOTION.with(|current| current.get().allows_animation())
 }
 
-/// Sets the motion preference the next draws use. This does not consult the OS.
+/// Sets the motion the next draws use; the window passes its preference already
+/// combined with the system setting ([`Motion::with_system`]).
 pub fn set_motion(motion: Motion) {
     MOTION.with(|current| current.set(motion));
+}
+
+/// Whether reading the system's reduce-motion setting may block for a while.
+///
+/// On Linux the setting lives in the desktop's settings store, which is read through
+/// a helper program; the window asks off the main thread there. Windows and macOS
+/// answer from memory, so the window asks inline and its first frame is already right.
+pub const SYSTEM_MOTION_QUERY_BLOCKS: bool = cfg!(all(unix, not(target_os = "macos"), not(test)));
+
+/// Whether the operating system asks applications to reduce motion.
+///
+/// * Windows: "Animation effects" is off (`SPI_GETCLIENTAREAANIMATION`).
+/// * macOS: Accessibility > Display > Reduce motion
+///   (`NSWorkspace.accessibilityDisplayShouldReduceMotion`).
+/// * Linux and other Unix desktops: GNOME's `enable-animations` is false, or KDE's
+///   animation speed is set to instant (`AnimationDurationFactor=0`).
+///
+/// A setting that cannot be read counts as "not asked": the user's own preference
+/// still applies. Tests read a per-thread stand-in instead of the machine they run on,
+/// so a developer's system setting never changes what a test sees.
+#[must_use]
+pub fn system_reduces_motion() -> bool {
+    #[cfg(test)]
+    {
+        FAKE_SYSTEM_REDUCES_MOTION.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        system_motion::reduces_motion()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`system_reduces_motion`] answers in a test on this thread.
+    static FAKE_SYSTEM_REDUCES_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes [`system_reduces_motion`] answer `reduces` on this test thread.
+#[cfg(test)]
+pub fn fake_system_reduces_motion(reduces: bool) {
+    FAKE_SYSTEM_REDUCES_MOTION.with(|current| current.set(reduces));
+}
+
+/// The platform reads behind [`system_reduces_motion`].
+#[cfg(not(test))]
+mod system_motion {
+    #[cfg(windows)]
+    pub fn reduces_motion() -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW,
+        };
+        let mut animate: windows_sys::core::BOOL = 1;
+        // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL through the pointer, which
+        // points at a live BOOL for the duration of the call.
+        let read = unsafe {
+            SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut animate).cast(), 0)
+        };
+        read != 0 && animate == 0
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn reduces_motion() -> bool {
+        use std::ffi::{c_char, c_void};
+
+        #[link(name = "AppKit", kind = "framework")]
+        unsafe extern "C" {}
+        #[link(name = "objc")]
+        unsafe extern "C" {
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+
+        type SendObject = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        type SendBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u8;
+        // SAFETY: the messages are sent with the signatures AppKit declares:
+        // +[NSWorkspace sharedWorkspace] returns an object and
+        // -accessibilityDisplayShouldReduceMotion returns a BOOL (one byte). Both are
+        // plain getters that do not autorelease, and a missing class or a nil
+        // workspace is checked before the next send.
+        unsafe {
+            let class = objc_getClass(c"NSWorkspace".as_ptr());
+            if class.is_null() {
+                return false;
+            }
+            let send = objc_msgSend as unsafe extern "C" fn();
+            let send_object: SendObject = std::mem::transmute(send);
+            let send_bool: SendBool = std::mem::transmute(send);
+            let workspace = send_object(class, sel_registerName(c"sharedWorkspace".as_ptr()));
+            if workspace.is_null() {
+                return false;
+            }
+            send_bool(
+                workspace,
+                sel_registerName(c"accessibilityDisplayShouldReduceMotion".as_ptr()),
+            ) != 0
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn reduces_motion() -> bool {
+        gnome_animations_off() || kde_animations_instant()
+    }
+
+    /// GNOME, and the desktops that share its settings, turn animations off here.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn gnome_animations_off() -> bool {
+        std::process::Command::new("gsettings")
+            .args(["get", "org.gnome.desktop.interface", "enable-animations"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|output| {
+                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "false"
+            })
+    }
+
+    /// KDE's "animation speed: instant" is a zero duration factor in kdeglobals.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn kde_animations_instant() -> bool {
+        let Some(config) = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".config"))
+            })
+        else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(config.join("kdeglobals")) else {
+            return false;
+        };
+        let mut in_kde = false;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_kde = line == "[KDE]";
+            } else if in_kde
+                && let Some((key, value)) = line.split_once('=')
+                && key.trim() == "AnimationDurationFactor"
+            {
+                return value
+                    .trim()
+                    .parse::<f64>()
+                    .is_ok_and(|factor| factor <= 0.0);
+            }
+        }
+        false
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    pub fn reduces_motion() -> bool {
+        false
+    }
 }
 
 /// The metrics of the window being drawn, for the pieces drawn outside the window's own
@@ -752,6 +936,11 @@ pub fn ease_out() -> impl Fn(f32) -> f32 {
 /// changes a face at once, and nothing loops except an in-flight indicator. With motion
 /// reduced the element is drawn in its final place at once. The `id` keys the
 /// animation, so a re-render with the same id does not play it again.
+///
+/// The travel never changes how the element is positioned: an element in the flow is
+/// offset relatively (its siblings do not move), and an absolutely placed one - a menu
+/// anchored to a button, a toast stack pinned to a corner - is nudged by a margin on the
+/// edge it is anchored to, so it stays out of the flow and in its own place.
 pub fn enter<E>(element: E, id: impl Into<ElementId>, kind: Enter) -> AnyElement
 where
     E: IntoElement + Styled + 'static,
@@ -765,15 +954,42 @@ where
             id,
             Animation::new(kind.duration()).with_easing(ease_out()),
             move |element, delta| {
-                let element = element.opacity(delta);
-                if travel == 0.0 {
-                    element
-                } else {
-                    element.relative().top(px(travel * (1.0 - delta)))
+                let mut element = element.opacity(delta);
+                if travel != 0.0 {
+                    travel_by(element.style(), px(travel * (1.0 - delta)));
                 }
+                element
             },
         )
         .into_any_element()
+}
+
+/// Moves a styled element `offset` down (negative: up) without changing its position
+/// type. See [`enter`].
+fn travel_by(style: &mut gpui::StyleRefinement, offset: Pixels) {
+    if style.position == Some(gpui::Position::Absolute) {
+        let from_bottom = style.inset.top.is_none() && style.inset.bottom.is_some();
+        if from_bottom {
+            style.margin.bottom = Some(nudged(style.margin.bottom, -offset));
+        } else {
+            style.margin.top = Some(nudged(style.margin.top, offset));
+        }
+    } else {
+        style.position = Some(gpui::Position::Relative);
+        style.inset.top = Some(nudged(style.inset.top, offset));
+    }
+}
+
+/// `existing` moved by `offset` when it is a pixel length; otherwise just the offset.
+fn nudged(existing: Option<gpui::Length>, offset: Pixels) -> gpui::Length {
+    use gpui::{AbsoluteLength, DefiniteLength, Length};
+    let base = match existing {
+        Some(Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(base)))) => base,
+        _ => px(0.0),
+    };
+    Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(
+        base + offset,
+    )))
 }
 
 /// How far an object floats above what it sits on.
@@ -1289,6 +1505,8 @@ mod tests {
         light::{self, TERMINAL},
         palette, radius, type_scale,
     };
+    use gpui::prelude::*;
+    use gpui::px;
 
     /// Minimum contrast for body text (WCAG AA).
     const BODY: f64 = 4.5;
@@ -1565,6 +1783,110 @@ mod tests {
         let ease = super::ease_out();
         assert!(ease(0.0).abs() < f32::EPSILON && (ease(1.0) - 1.0).abs() < f32::EPSILON);
         assert!(ease(0.5) > 0.5, "the entrance decelerates");
+    }
+
+    #[test]
+    fn the_system_can_only_take_motion_away() {
+        assert_eq!(Motion::Full.with_system(false), Motion::Full);
+        assert_eq!(Motion::Full.with_system(true), Motion::Reduced);
+        assert_eq!(Motion::Reduced.with_system(false), Motion::Reduced);
+        assert_eq!(Motion::Reduced.with_system(true), Motion::Reduced);
+        assert!(
+            Motion::PULSE > Motion::SLOW,
+            "a pulse beats slower than an entrance"
+        );
+        // Tests never read the machine they run on.
+        assert!(!super::system_reduces_motion());
+        super::fake_system_reduces_motion(true);
+        assert!(super::system_reduces_motion());
+        super::fake_system_reduces_motion(false);
+    }
+
+    /// One object entering over a 200 px block, placed by `place`.
+    struct Entrance {
+        kind: Enter,
+        place: fn(gpui::Div) -> gpui::Div,
+    }
+
+    impl gpui::Render for Entrance {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let object =
+                (self.place)(gpui::div().size(px(50.0))).debug_selector(|| "entering".to_owned());
+            gpui::div()
+                .relative()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(gpui::div().h(px(200.0)).w_full().flex_none())
+                .child(super::enter(object, "entering", self.kind))
+                .child(
+                    gpui::div()
+                        .h(px(20.0))
+                        .w_full()
+                        .flex_none()
+                        .debug_selector(|| "after".to_owned()),
+                )
+        }
+    }
+
+    fn entering_bounds(
+        cx: &mut gpui::TestAppContext,
+        kind: Enter,
+        place: fn(gpui::Div) -> gpui::Div,
+    ) -> (gpui::Bounds<gpui::Pixels>, gpui::Bounds<gpui::Pixels>) {
+        super::set_motion(Motion::Full);
+        let (_view, cx) = cx.add_window_view(move |_window, _cx| Entrance { kind, place });
+        cx.simulate_resize(gpui::size(px(400.0), px(400.0)));
+        cx.run_until_parked();
+        (
+            cx.debug_bounds("entering").expect("the object is drawn"),
+            cx.debug_bounds("after").expect("its sibling is drawn"),
+        )
+    }
+
+    #[gpui::test]
+    fn an_entrance_keeps_an_anchored_object_out_of_the_flow(cx: &mut gpui::TestAppContext) {
+        for kind in [Enter::Rise, Enter::Settle] {
+            // Anchored by its top edge, like a menu under a button.
+            let (object, _) = entering_bounds(cx, kind, |object| {
+                object.absolute().top(px(40.0)).left(px(30.0))
+            });
+            assert_eq!(
+                object.left(),
+                px(30.0),
+                "{kind:?} moved the object sideways"
+            );
+            assert!(
+                (f32::from(object.top()) - 40.0).abs() <= kind.travel().abs(),
+                "{kind:?} dropped the anchored object back into the flow: {object:?}"
+            );
+            // Anchored by its bottom edge, like a toast stack.
+            let (object, _) = entering_bounds(cx, kind, |object| {
+                object.absolute().bottom(px(40.0)).right(px(30.0))
+            });
+            assert_eq!(object.right(), px(370.0));
+            assert!(
+                (f32::from(object.bottom()) - 360.0).abs() <= kind.travel().abs(),
+                "{kind:?} lost the bottom anchor: {object:?}"
+            );
+        }
+        super::set_motion(Motion::Full);
+    }
+
+    #[gpui::test]
+    fn an_entrance_in_the_flow_does_not_push_its_siblings(cx: &mut gpui::TestAppContext) {
+        for kind in [Enter::Rise, Enter::Settle] {
+            let (object, after) = entering_bounds(cx, kind, |object| object);
+            assert!(
+                (f32::from(object.top()) - 200.0).abs() <= kind.travel().abs(),
+                "{kind:?}: {object:?}"
+            );
+            assert_eq!(after.top(), px(250.0), "{kind:?} moved the next sibling");
+        }
     }
 
     #[test]

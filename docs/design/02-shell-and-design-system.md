@@ -405,7 +405,9 @@ accent，用于当前对象、主操作、焦点环与选中标记；常规控�
 | `POSITIVE` / `WARNING` / `DANGER` / `INFO` | `#5fd4a3` / `#e9c27c` / `#ff8f97` / `#7cc4f2` | `#0f6e49` / `#7a5300` / `#b42b3c` / `#1d5f8f` | 状态色（同时是其 tint 上的文字色） |
 | `*_TINT`（positive/warning/danger/info） | `#13261f` / `#2a2214` / `#2e181b` / `#14232f` | `#dff2e8` / `#faf0d8` / `#fce7e9` / `#e2eff9` | 状态 chip、横幅、toast 图标底 |
 | `DANGER_SOLID` / `ON_DANGER` | `#c42b1c` / `#ffffff` | 同 | 实心危险填充（Windows 关闭按钮悬停） |
-| `TRACK_OFF` / `KNOB` | `#3b3c47` / `#f4f5f8` | `#c4c7d0` / `#ffffff` | 开关关闭时的轨道 / 开关圆钮 |
+| `TRACK_OFF` / `TRACK_OFF_HOVER` | `#3b3c47` / `#464855` | `#878b96` / `#7a7e89` | 开关关闭时的轨道（静止 / 悬停） |
+| `TRACK_ON` / `TRACK_ON_HOVER` | `#5a69e0` / `#6170e4` | `#4053cc` / `#3646b4` | 开关打开时的轨道（accent 色相，深色下压暗以托住浅色圆钮） |
+| `KNOB` | `#f4f5f8` | `#ffffff` | 开关圆钮 |
 | `PLANNED` | `#9ca1ad` | `#5b606a` | 已关闭 / 本版本不提供 |
 | `FOCUS_RING` | `#adb8ff` | `#3646b4` | 键盘焦点环（2px 边） |
 | `DISABLED_SURFACE` / `DISABLED_TEXT` | `#17181d` / `#7b7f89` | `#f0f1f4` / `#767b84` | 不可用控件（仍保持 3:1） |
@@ -417,7 +419,8 @@ accent，用于当前对象、主操作、焦点环与选中标记；常规控�
 
 **对比度（测试断言）**：正文三色、accent 与五个状态色在全部八种表面（五层 + hover/selected/pressed）上
 深浅两套都 ≥ 4.5:1；焦点环 ≥ 3:1；每个状态色在自己的 tint 上、`ON_ACCENT` 在三种 accent 上、
-`ON_DANGER` 在 `DANGER_SOLID` 上 ≥ 4.5:1；禁用文字与加载条取图形下限 3:1。
+`ON_DANGER` 在 `DANGER_SOLID` 上 ≥ 4.5:1；禁用文字与加载条取图形下限 3:1；开关圆钮在四种轨道
+（关/开 × 静止/悬停）上、打开的轨道在 surface/chrome/raised/overlay 上，深浅两套都 ≥ 3:1。
 
 终端默认前景、背景、光标与 16 个 ANSI 色另有浅色映射（`theme::light::TERMINAL`，按终端深色值索引）；
 程序输出的颜色不被界面主题改写。终端配色可单独选择（`theme::TerminalScheme`）。绘制时有最低对比度
@@ -440,14 +443,24 @@ accent，用于当前对象、主操作、焦点环与选中标记；常规控�
 
 ### 2.3 动效
 
-gpui 没有 hover 过渡、没有元素缩放，也没有系统"减少动态效果"查询，因此规则是：
+gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动态效果"设置（应用自己读取，见第 5 条），因此规则是：
 
 1. **只有进入动画**。hover、按下、选中都即时切换；除进行中指示外没有循环动画。
 2. 时长令牌：`Motion::FAST` 120ms（小状态变化、toast/tooltip 淡入）、`Motion::BASE` 180ms（菜单、卡片、
-   等待徽记）、`Motion::SLOW` 260ms（对话框、启动过场）。缓动统一 `theme::ease_out()`（ease-out-quint）。
+   等待徽记）、`Motion::SLOW` 260ms（对话框、启动过场）；进行中的循环脉动一拍 `Motion::PULSE` 900ms。
+   缓动统一 `theme::ease_out()`（ease-out-quint）。
 3. `theme::enter(element, id, Enter::{Fade, Rise, Settle})`：Fade 原地淡入；Rise 淡入并上移 6px；Settle 从
-   上方 8px 落定（替代做不到的轻微缩放）。同一 id 重绘不会重播。
-4. 设置里的 `Motion::Reduced`（以及截图）下 `enter` 直接画最终状态，状态词、颜色与操作都不变。
+   上方 8px 落定（替代做不到的轻微缩放）。同一 id 重绘不会重播。位移不改变元素的定位方式：流内元素用
+   相对偏移（不推动兄弟元素），绝对定位的元素（锚定菜单、toast 栈）在其锚定边上用外边距微移，仍留在
+   原位、不回到文档流（测试覆盖）。
+4. 减少动效时 `enter` 直接画最终状态，循环脉动静止，状态词、颜色与操作都不变。
+5. **减少动效 = 用户偏好 或 系统设置**：窗口每帧用 `Motion::with_system` 把设置里的偏好与系统设置合并，
+   任一方要求减少即为减少；系统设置只会减少动效，不会改写用户的偏好值。系统设置由
+   `theme::system_reduces_motion()` 读取：Windows 为"动画效果"关闭（`SPI_GETCLIENTAREAANIMATION`），
+   macOS 为"辅助功能 › 显示 › 减弱动态效果"（`NSWorkspace.accessibilityDisplayShouldReduceMotion`），
+   Linux 为 GNOME `org.gnome.desktop.interface enable-animations` 为 false 或 KDE
+   `AnimationDurationFactor=0`；读不到时视为未要求。窗口首次绘制时读取，之后在窗口重新获得焦点或系统
+   外观变化时重读（Linux 需要调用 `gsettings`，在后台线程读取）。截图固定为减少动效。
 
 当前使用：对话框（`components::modal`）与 toast 用 Fade；等待徽记与加载条用 BASE。
 
@@ -1293,7 +1306,7 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 
 命令面板、标签菜单和会话菜单记下打开前的焦点，关闭后还回去。点开这些层时，点击可能先把焦点移到页面上；上一帧正在编辑的字段或终端不会被这次页面焦点盖掉。主机关闭或保存后，下一帧回到打开对话框之前的位置。
 
-减少动态效果是应用内设置（设置页“动态效果”、命令面板“减少动态效果”），默认是完整。加载状态的圆点会做一次约 180ms 的淡入；设为减少后圆点直接以不透明画出，标题、原因和下一步仍在。GPUI 0.2.2 没有可读的系统减少动态效果接口，因此不跟随系统。没有 AccessKit，屏幕阅读器兼容未验证，见 `04-cross-feature-walkthrough.md`。
+减少动态效果有两个来源：应用内设置（设置页“动态效果”、命令面板“减少动态效果”，默认是完整）与系统设置（见 2.3 第 5 条）；任一方要求减少即生效。加载状态的圆点会做一次约 180ms 的淡入；减少时圆点直接以不透明画出，标题、原因和下一步仍在。GPUI 0.2.2 不报告系统设置，由应用自己读取，因此跟随系统。没有 AccessKit，屏幕阅读器兼容未验证，见 `04-cross-feature-walkthrough.md`。
 
 ## 5. 组件清单（`components.rs`）
 
@@ -1301,8 +1314,16 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 给出某个 [`Variant` / 字段 / 行 / 菜单项] 在某个 `ControlState` 下的填充、边框、边框宽度、文字色、
 前导标记与"是否等待中"，值全部是 `theme::Token`。组件自己只画"静止"那一行，并把"悬停"那一行注册
 成指针样式；需要焦点、按下、选中、不可用或进行中的调用方，用它自己的状态调用同名组件
-（`button_with_state`、`row_with_state`、`field_frame`），而不是另写一组颜色。页面里不再手写勾选框、
+（`button_with_state`、`row_with_state`、`field_frame`），而不是另写一组颜色。新写的页面不得手写勾选框、
 对话框外壳或菜单卡片。
+
+**迁移进度（地基任务之后）。** 已迁到组件：三处勾选框、`view/shell.rs` 的对话框外壳、会话行菜单与 toast。
+以下仍是手写外观（已换成新令牌与层级，但未用共享组件），由后续界面任务替换，替换完成后删去对应条目：
+
+- 对话框外壳：`view/host_dialog.rs` 的 `hosts.editor` 与 `connection.editor`、`view/overlays.rs` 的命令面板外壳（设置与对话框任务）。
+- 菜单卡片：`view/overlays.rs` 的主机菜单与标签菜单、`terminal.rs` 的 `terminal.menu`、`text_field.rs` 的
+  `field.menu`、`view/files_menu.rs` 的 `files.menu`、`view.rs` 的 `shell.picker`（其余界面任务）。
+- 勾选框：文件列表的标记方框（`view.rs`，其余界面任务）。
 
 | 组件 | 规范 |
 | --- | --- |
@@ -1311,13 +1332,13 @@ Ctrl+←/→（macOS ⌥）按词移动，Ctrl+Backspace / Delete 按词删除�
 | `icon_label_button` / `compact_button` / `icon_only_button` / `danger_icon_button` / `icon_button` | 带图标按钮、工具栏紧凑按钮（26）、方形图标按钮（≥ 24 指针目标） |
 | `field_face` + `field_frame` | 输入框：surface 底、弱边，焦点 2px 焦点环，校验失败 2px 危险边 |
 | `segmented` + `segment` | 互斥选择：凹槽 + 选中滑块（滑块 Low） |
-| `switch(on)` | 设置开关：34×20 胶囊轨道，圆钮在左（关，`TRACK_OFF`）或右（开，accent），圆钮 Low；状态先由位置表达 |
+| `switch(on)` | 设置开关：34×20 胶囊轨道，圆钮在左（关，`TRACK_OFF`）或右（开，`TRACK_ON`），悬停用对应 `*_HOVER`，圆钮 Low；状态先由位置表达，圆钮在每种轨道上 ≥ 3:1 |
 | `checkbox(id, label, checked)` / `checkbox_box(checked)` | 16px 方框（圆角 4）：未选为 surface + 强边，悬停（`CHECK_GROUP`）变 accent 边；选中为 accent 填充 + 勾 |
 | `card` | 内容分组：surface + 弱边 + 圆角 10 + Low，内边距 16 |
 | `row` / `row_with_state` + `stacked` | 列表行：surface 底，悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
-| `menu_card` + `menu_entry` + `menu_divider` | 所有右键/下拉菜单：raised + 强边 + 圆角 10 + Mid；条目 30 高，禁用项保留位置，危险项悬停为 danger tint |
+| `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单（尚未迁移的见上）：raised + 强边 + 圆角 10 + Mid；条目 30 高，禁用项保留位置，危险项悬停为 danger tint |
 | `menu_panel` + `menu_item` + `menu_item_face` | 取值菜单（选中项保留选中外观） |
-| `modal(viewport, id, width, ModalContent)` | 所有对话框外壳：scrim 遮罩（按下不关闭），overlay + 强边 + 圆角 14 + High，头部固定、主体滚动、底部固定，进入时 Fade |
+| `modal(viewport, id, width, ModalContent)` | 对话框外壳（尚未迁移的见上）：scrim 遮罩（按下不关闭），overlay + 强边 + 圆角 14 + High，头部固定、主体滚动、底部固定，进入时 Fade |
 | `dialog_face` / `dialog_panel` / `dialog_header` | 对话框表面令牌与内嵌标题块 |
 | `toast(tone, icon, title, detail)` | 通知：raised + 强边 + 圆角 10 + Mid，色调图标圆底；关闭按钮与位置由调用方加，进入时 Fade |
 | `empty_state(icon, title, body, action)` | 空状态：accent tint 图标块（圆角 14）+ 标题 + 一行说明 + 可选动作；不带状态色调 |

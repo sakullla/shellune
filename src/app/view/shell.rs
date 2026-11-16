@@ -2845,7 +2845,7 @@ fn progress_pulse(metrics: theme::Metrics) -> AnyElement {
         gpui::AnimationExt::with_animation(
             dot,
             "remote.progress.pulse",
-            gpui::Animation::new(std::time::Duration::from_millis(900))
+            gpui::Animation::new(theme::Motion::PULSE)
                 .repeat()
                 .with_easing(gpui::pulsating_between(0.35, 1.0)),
             |dot, delta| dot.opacity(delta),

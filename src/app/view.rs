@@ -909,6 +909,10 @@ pub struct ShelluneView {
     keys_control: usize,
     /// Whether the window already tells this view when the system palette changes.
     watching_appearance: bool,
+    /// Whether the operating system asks for reduced motion, as last read. Combined with
+    /// the user's preference on every draw; re-read when the window comes back to the
+    /// front, which is when a setting changed elsewhere can have changed.
+    system_reduces_motion: bool,
     /// Whether the host dialog's first field takes the keyboard on the next draw.
     focus_host_dialog: bool,
     /// Focus to return to when an overlay closes. Weak, so a removed field is not kept.
@@ -2427,6 +2431,7 @@ impl ShelluneView {
             keys_selected: 0,
             keys_control: 0,
             watching_appearance: false,
+            system_reduces_motion: false,
             layout_persist: false,
             layout_error: None,
             split_drag: None,
@@ -11167,6 +11172,42 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// The motion this window draws with: the user's preference, reduced further when
+    /// the operating system asks for less motion (R1).
+    pub fn effective_motion(&self) -> theme::Motion {
+        self.workspace
+            .motion()
+            .with_system(self.system_reduces_motion)
+    }
+
+    /// Reads the system's reduce-motion setting again and redraws if it changed.
+    ///
+    /// Where the read is a call into the system it happens now, so the frame being
+    /// drawn already follows it; where it runs a helper program it happens off the
+    /// main thread and the answer arrives a moment later.
+    fn refresh_system_motion(&mut self, cx: &mut Context<Self>) {
+        if !theme::SYSTEM_MOTION_QUERY_BLOCKS {
+            self.apply_system_motion(theme::system_reduces_motion(), cx);
+            return;
+        }
+        let read = cx
+            .background_executor()
+            .spawn(async { theme::system_reduces_motion() });
+        cx.spawn(async move |this, cx| {
+            let reduces = read.await;
+            this.update(cx, |view, cx| view.apply_system_motion(reduces, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn apply_system_motion(&mut self, reduces: bool, cx: &mut Context<Self>) {
+        if self.system_reduces_motion != reduces {
+            self.system_reduces_motion = reduces;
+            cx.notify();
+        }
+    }
+
     /// The name of the current motion setting.
     fn motion_label(&self) -> &'static str {
         let strings = self.strings();
@@ -17650,10 +17691,20 @@ impl Render for ShelluneView {
         if !self.watching_appearance {
             self.watching_appearance = true;
             cx.observe_window_appearance(window, |this, _window, cx| {
+                this.refresh_system_motion(cx);
                 this.repaint_terminals(cx);
                 cx.notify();
             })
             .detach();
+            // A reduce-motion switch flipped in the system settings is seen when the
+            // user comes back to the window.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.refresh_system_motion(cx);
+                }
+            })
+            .detach();
+            self.refresh_system_motion(cx);
         }
         let system_dark = matches!(
             window.appearance(),
@@ -17662,7 +17713,7 @@ impl Render for ShelluneView {
         let appearance = self.theme_choice.appearance(system_dark);
         theme::set_appearance(appearance);
         theme::set_terminal_appearance(self.terminal_scheme.appearance(appearance));
-        theme::set_motion(self.workspace.motion());
+        theme::set_motion(self.effective_motion());
         // The terminal's frame and the tooltips are drawn outside this pass; they read
         // the text size from here instead of falling back to 100%.
         theme::set_zoom(self.workspace.zoom());
