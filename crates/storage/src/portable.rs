@@ -39,7 +39,7 @@ use shellune_core::{
     SecretString, SnippetBook,
 };
 
-use crate::book::{FORMAT_VERSION, HostBook};
+use crate::book::{FORMAT_VERSION, HostBook, RecentConnection};
 use crate::credentials::SecretStore;
 use crate::forwarding::ForwardStore;
 use crate::group::GroupStore;
@@ -769,10 +769,58 @@ impl ShelluneData {
     ///
     /// Returns [`PortableError::Encode`] when the view cannot be serialized.
     pub fn sync_view(&self, platform: Platform) -> Result<Vec<u8>, PortableError> {
+        self.view(platform, true)
+    }
+
+    /// The same view as [`Self::sync_view`] without the recent-connection log:
+    /// what the document holds apart from when each host was last reached. Sync
+    /// compares it to tell a side that only connected from one that changed
+    /// records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableError::Encode`] when the view cannot be serialized.
+    pub fn core_view(&self, platform: Platform) -> Result<Vec<u8>, PortableError> {
+        self.view(platform, false)
+    }
+
+    /// The same document with its recent-connection log replaced by `recents`.
+    /// An entry naming a record the document does not hold is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableError::Corrupt`] when the host book cannot be rebuilt,
+    /// which a document that passed [`Self::from_json`] does not cause.
+    pub fn with_recents(&self, recents: &[RecentConnection]) -> Result<Self, PortableError> {
+        let mut document = self.clone();
+        document.shared.hosts = apply::build_book(
+            &self.shared.hosts.records(),
+            recents,
+            self.shared.hosts.favorites(),
+        )?;
+        Ok(document)
+    }
+
+    /// Marks the document as made now by this build on `options.platform` (the
+    /// time and version `options` carry); nothing else changes.
+    pub fn restamp(&mut self, options: &ExportOptions) {
+        self.created_unix = options.created_unix;
+        self.source_platform = options.platform.as_str().to_owned();
+        self.source_app_version.clone_from(&options.app_version);
+    }
+
+    fn view(&self, platform: Platform, with_recents: bool) -> Result<Vec<u8>, PortableError> {
         let encode = |error: serde_json::Error| PortableError::Encode {
             reason: error.to_string(),
         };
-        let shared = serde_json::to_value(&self.shared).map_err(encode)?;
+        let mut shared = serde_json::to_value(&self.shared).map_err(encode)?;
+        if !with_recents
+            && let Some(hosts) = shared
+                .get_mut("hosts")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            hosts.remove("recents");
+        }
         let section = self
             .platforms
             .get(platform.as_str())
@@ -982,6 +1030,39 @@ impl LocalState {
             && self.snippets.is_empty()
             && self.known_hosts.is_empty()
     }
+}
+
+/// Two recent-connection logs as one: one entry per host, the later connection
+/// winning and, at the same time, the higher count. Newest first; entries of the
+/// same time are ordered by host so both machines end with the same list.
+///
+/// Entries are not checked against any host book; [`ShelluneData::with_recents`]
+/// and [`ApplyPlan::with_recents`] drop the ones whose host is gone.
+#[must_use]
+pub fn merge_recent_connections(
+    left: &[RecentConnection],
+    right: &[RecentConnection],
+) -> Vec<RecentConnection> {
+    let mut newest: BTreeMap<HostId, RecentConnection> = BTreeMap::new();
+    for recent in left.iter().chain(right) {
+        let newer = |kept: &RecentConnection| {
+            (recent.last_connected_unix(), recent.connections())
+                > (kept.last_connected_unix(), kept.connections())
+        };
+        match newest.get(&recent.host()) {
+            Some(kept) if !newer(kept) => {}
+            _ => {
+                newest.insert(recent.host(), *recent);
+            }
+        }
+    }
+    let mut merged: Vec<RecentConnection> = newest.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.last_connected_unix()
+            .cmp(&a.last_connected_unix())
+            .then_with(|| a.host().cmp(&b.host()))
+    });
+    merged
 }
 
 /// Seconds since the Unix epoch.

@@ -299,6 +299,50 @@ impl ApplyPlan {
         Ok(plan)
     }
 
+    /// Plans replacing only the recent-connection log of `local` with `recents`
+    /// (see [`super::merge_recent_connections`]); every other record, preference
+    /// and password stays as it is. An entry naming a record `local` does not hold
+    /// is dropped. Applying it takes the same snapshot and refuses the same way as
+    /// a document's plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableError::Corrupt`] when the host book cannot be rebuilt
+    /// and [`PortableError::Encode`] when a file cannot be serialized.
+    pub fn with_recents(
+        local: &LocalState,
+        platform: Platform,
+        recents: &[RecentConnection],
+    ) -> Result<Self, PortableError> {
+        let mut next = local.clone();
+        next.hosts = build_book(&local.hosts.records(), recents, local.hosts.favorites())?;
+        Ok(Self {
+            mode: ApplyMode::Merge,
+            platform,
+            source_platform: platform.as_str().to_owned(),
+            source_app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            created_unix: now_unix(),
+            has_secrets: false,
+            hosts: diff(
+                local.hosts.records().into_iter().map(|r| (r.id(), r)),
+                next.hosts.records().into_iter().map(|r| (r.id(), r)),
+            ),
+            groups: Change::default(),
+            forwards: Change::default(),
+            snippets: Change::default(),
+            known_hosts: Change::default(),
+            preferences_changed: false,
+            keymap_changed: false,
+            fallbacks: Vec::new(),
+            trust_conflicts: Vec::new(),
+            secrets: Vec::new(),
+            forgets: Vec::new(),
+            files: changed_files(local, &next)?,
+            base: local.clone(),
+            next,
+        })
+    }
+
     /// Merge or replace.
     #[must_use]
     pub fn mode(&self) -> ApplyMode {
@@ -812,7 +856,7 @@ fn merge_recents(
 
 /// Builds a host book through its stored form, so it passes the same checks a
 /// loaded file does.
-fn build_book(
+pub(super) fn build_book(
     records: &[ConnectionRecord],
     recents: &[RecentConnection],
     favorites: &[HostId],

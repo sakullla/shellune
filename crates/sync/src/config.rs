@@ -222,6 +222,14 @@ pub struct SyncState {
     /// section) after the last successful sync.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced_hash: Option<String>,
+    /// The fingerprint of the same data without the recent-connection log
+    /// ([`shellune_storage::ShelluneData::core_view`]) after the last successful
+    /// sync. With it a side that only connected to hosts is told from one that
+    /// changed records, and the two are merged instead of reported as a conflict;
+    /// a state written before it existed keeps the plain conflict rule until the
+    /// next successful sync records it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_synced_core_hash: Option<String>,
     /// A keyed fingerprint of the saved passwords as they were last synced; `None`
     /// when passwords were not synced. Changing a password, the passphrase, or the
     /// choice to sync passwords is a local change.
@@ -386,6 +394,7 @@ mod tests {
             last_remote_etag: Some("\"e1\"".to_owned()),
             last_remote_hash: Some("aa".to_owned()),
             last_synced_hash: Some("bb".to_owned()),
+            last_synced_core_hash: Some("cc".to_owned()),
             last_secrets_hash: None,
             last_result: Some(LastResult::Failed {
                 reason: "offline".to_owned(),
@@ -397,6 +406,15 @@ mod tests {
         assert_eq!(store.load(), state);
         assert!(state.knows("https://dav/x/shellune-data.json"));
         assert!(!state.knows("https://other/shellune-data.json"));
+        // A state an older build wrote has no fingerprint without recents.
+        std::fs::write(
+            store.path(),
+            br#"{"remote":"https://dav/x/shellune-data.json","last_synced_hash":"bb"}"#,
+        )
+        .expect("written");
+        let older = store.load();
+        assert_eq!(older.last_synced_hash.as_deref(), Some("bb"));
+        assert_eq!(older.last_synced_core_hash, None);
         std::fs::write(store.path(), b"garbage").expect("written");
         assert_eq!(store.load(), SyncState::default());
         let _ = std::fs::remove_dir_all(root);

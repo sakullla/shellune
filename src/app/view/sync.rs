@@ -697,7 +697,14 @@ impl ShelluneView {
             }
             Ok(SyncOutcome::Pulled(report)) => {
                 self.sync_settled();
-                self.adopt_pulled_data(&report, held.preferences, cx);
+                self.adopt_pulled_data(&report, held.preferences, strings.toast_pulled, cx);
+                adopted = true;
+            }
+            // One side only connected to hosts: the merge was written here like a
+            // pull, so it is taken in the same way, and no question is asked.
+            Ok(SyncOutcome::Merged(report)) => {
+                self.sync_settled();
+                self.adopt_pulled_data(&report, held.preferences, strings.toast_merged, cx);
                 adopted = true;
             }
             Ok(SyncOutcome::Conflict(report)) => {
@@ -1084,6 +1091,7 @@ impl ShelluneView {
         &mut self,
         report: &PullReport,
         preferences: bool,
+        title: &'static str,
         cx: &mut Context<Self>,
     ) {
         let strings = self.sync_strings();
@@ -1117,7 +1125,7 @@ impl ShelluneView {
         };
         self.toast(
             tone,
-            strings.toast_pulled,
+            title,
             (!notes.is_empty()).then(|| notes.join(" ")),
             cx,
         );

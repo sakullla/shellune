@@ -981,3 +981,395 @@ fn a_damaged_or_newer_cloud_file_is_never_applied_or_overwritten() {
     );
     assert!(!a.files().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Merging when one side only connected to hosts
+// ---------------------------------------------------------------------------
+
+#[track_caller]
+fn expect_merged(outcome: Result<SyncOutcome, SyncError>) -> crate::PullReport {
+    match outcome {
+        Ok(SyncOutcome::Merged(report)) => *report,
+        other => panic!("expected a merge, got {other:?}"),
+    }
+}
+
+fn id_of(state: &LocalState, name: &str) -> HostId {
+    state
+        .hosts
+        .records()
+        .iter()
+        .find(|record| record.name() == name)
+        .map(ConnectionRecord::id)
+        .expect("present")
+}
+
+/// Records a connection to `name` at `at`, the way the application does after a
+/// session opens.
+fn connect_to(state: &mut LocalState, name: &str, at: u64) {
+    let id = id_of(state, name);
+    state.hosts.record_connection(id, at).expect("recorded");
+}
+
+/// Changes the address of `name`: a change of the records, not of the recents.
+fn readdress(state: &mut LocalState, name: &str, address: &str) {
+    let id = id_of(state, name);
+    let ConnectionRecord::Ssh(mut host) = state.hosts.connection(id).expect("present") else {
+        panic!("an SSH host");
+    };
+    host.set_address(address).expect("address");
+    state.hosts.update(host, id).expect("updated");
+}
+
+fn address_of(machine: &Machine, name: &str) -> String {
+    let state = machine.load();
+    let id = id_of(&state, name);
+    match state.hosts.connection(id).expect("present") {
+        ConnectionRecord::Ssh(host) => host.address().to_owned(),
+        other => panic!("an SSH host, got {other:?}"),
+    }
+}
+
+/// When `name` was last reached and how often, as `book` remembers it.
+fn recent_in(book: &shellune_storage::HostBook, name: &str) -> Option<(u64, u32)> {
+    let id = book
+        .records()
+        .iter()
+        .find(|record| record.name() == name)
+        .map(ConnectionRecord::id)?;
+    book.recent_of(id)
+        .map(|recent| (recent.last_connected_unix(), recent.connections()))
+}
+
+fn recent_of(machine: &Machine, name: &str) -> Option<(u64, u32)> {
+    recent_in(&machine.load().hosts, name)
+}
+
+fn remote_recent(server: &WebDavServer, name: &str) -> Option<(u64, u32)> {
+    recent_in(remote_document(server).shared().hosts(), name)
+}
+
+fn puts_since(server: &WebDavServer, before: usize) -> usize {
+    server.requests()[before..]
+        .iter()
+        .filter(|request| request.starts_with("PUT"))
+        .count()
+}
+
+/// Two machines that synced `web` and `db`.
+fn synced_pair(name: &str, server: &WebDavServer) -> (Machine, Machine) {
+    let a = Machine::new(&format!("{name}-a"), Platform::Linux);
+    let b = Machine::new(&format!("{name}-b"), Platform::Linux);
+    a.connect(server);
+    b.connect(server);
+    a.edit(|state| {
+        add_host(state, "web");
+        add_host(state, "db");
+    });
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    (a, b)
+}
+
+#[test]
+fn connecting_here_while_the_cloud_changed_records_merges_without_a_conflict() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_pair("merge-remote", &server);
+
+    // Scenario one: A changes `web` and uploads; B only connected to `db`.
+    a.edit(|state| readdress(state, "web", "10.9.9.9"));
+    expect_uploaded(a.service.sync());
+    b.edit(|state| connect_to(state, "db", 1_700_000_500));
+    let b_hosts_before = std::fs::read(b.root.join("hosts.json")).expect("hosts");
+    let report = expect_merged(b.service.sync());
+    assert_eq!(address_of(&b, "web"), "10.9.9.9", "A's change arrived");
+    assert_eq!(recent_of(&b, "db"), Some((1_700_000_500, 1)), "B's kept");
+    assert_eq!(remote_recent(&server, "db"), Some((1_700_000_500, 1)));
+    assert_eq!(report.hosts.updated, 1);
+    assert_eq!(
+        report.state,
+        b.load(),
+        "the report holds the data as written"
+    );
+    // The data replaced here is kept.
+    let snapshot = report.snapshot.expect("a snapshot");
+    assert!(
+        snapshot.to_string_lossy().contains("sync-merge"),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        std::fs::read(snapshot.join("hosts.json")).expect("kept"),
+        b_hosts_before
+    );
+    let state = b.service.state();
+    assert!(!state.has_conflict());
+    assert_eq!(state.last_result, Some(LastResult::UpToDate));
+    expect_up_to_date(b.service.sync());
+    // A sees B's recent connection.
+    expect_pulled(a.service.sync());
+    assert_eq!(recent_of(&a, "db"), Some((1_700_000_500, 1)));
+    expect_up_to_date(a.service.sync());
+
+    // Scenario three: A only connects; B changes `db` and uploads.
+    a.edit(|state| connect_to(state, "web", 1_700_000_600));
+    b.edit(|state| readdress(state, "db", "10.8.8.8"));
+    expect_uploaded(b.service.sync());
+    expect_merged(a.service.sync());
+    assert_eq!(address_of(&a, "db"), "10.8.8.8");
+    assert_eq!(recent_of(&a, "web"), Some((1_700_000_600, 1)));
+    assert_eq!(remote_recent(&server, "web"), Some((1_700_000_600, 1)));
+    expect_pulled(b.service.sync());
+    // Both machines end with the same records and recents.
+    assert_eq!(a.load().hosts, b.load().hosts);
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
+}
+
+#[test]
+fn records_changed_here_keep_the_recents_connected_in_the_cloud() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_pair("merge-local", &server);
+
+    // B only connects and uploads; A changes a record meanwhile.
+    b.edit(|state| connect_to(state, "db", 1_700_000_700));
+    expect_uploaded(b.service.sync());
+    a.edit(|state| {
+        readdress(state, "web", "10.7.7.7");
+        connect_to(state, "web", 1_700_000_800);
+    });
+    let report = expect_merged(a.service.sync());
+    assert!(
+        report.snapshot.is_some(),
+        "the recents written here are kept"
+    );
+    assert_eq!(address_of(&a, "web"), "10.7.7.7", "A's change stays");
+    assert_eq!(recent_of(&a, "db"), Some((1_700_000_700, 1)), "B's arrived");
+    assert_eq!(recent_of(&a, "web"), Some((1_700_000_800, 1)));
+    // The cloud holds A's change and both recents.
+    let document = remote_document(&server);
+    assert_eq!(document.source_platform(), "linux");
+    assert_eq!(remote_recent(&server, "db"), Some((1_700_000_700, 1)));
+    assert_eq!(remote_recent(&server, "web"), Some((1_700_000_800, 1)));
+    expect_up_to_date(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert_eq!(address_of(&b, "web"), "10.7.7.7");
+    assert_eq!(a.load().hosts, b.load().hosts);
+    expect_up_to_date(b.service.sync());
+    expect_up_to_date(a.service.sync());
+}
+
+#[test]
+fn both_sides_only_connecting_keep_the_later_entry_per_host() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_pair("merge-recents", &server);
+
+    // Scenario two: both only connect, partly to the same host.
+    a.edit(|state| {
+        connect_to(state, "web", 100);
+        connect_to(state, "db", 300);
+    });
+    expect_uploaded(a.service.sync());
+    b.edit(|state| {
+        connect_to(state, "web", 200);
+        connect_to(state, "db", 50);
+    });
+    expect_merged(b.service.sync());
+    assert_eq!(recent_of(&b, "web"), Some((200, 1)), "B's is later");
+    assert_eq!(recent_of(&b, "db"), Some((300, 1)), "A's is later");
+    assert_eq!(remote_recent(&server, "web"), Some((200, 1)));
+    expect_pulled(a.service.sync());
+    assert_eq!(a.load().hosts, b.load().hosts);
+    expect_up_to_date(a.service.sync());
+    expect_up_to_date(b.service.sync());
+
+    // When the cloud's entries are the later ones it already holds the result:
+    // nothing is uploaded.
+    a.edit(|state| connect_to(state, "web", 400));
+    expect_uploaded(a.service.sync());
+    b.edit(|state| connect_to(state, "web", 350));
+    let before = server.requests().len();
+    expect_merged(b.service.sync());
+    assert_eq!(puts_since(&server, before), 0, "{:?}", server.requests());
+    assert_eq!(recent_of(&b, "web"), Some((400, 2)));
+    expect_up_to_date(b.service.sync());
+    expect_up_to_date(a.service.sync());
+    assert_eq!(a.load().hosts, b.load().hosts);
+}
+
+#[test]
+fn both_sides_changing_records_is_still_a_conflict() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_pair("merge-conflict", &server);
+    a.edit(|state| {
+        readdress(state, "web", "10.1.1.1");
+        connect_to(state, "web", 1_000);
+    });
+    expect_uploaded(a.service.sync());
+    b.edit(|state| {
+        readdress(state, "db", "10.2.2.2");
+        connect_to(state, "db", 2_000);
+    });
+    let files = data_files(&b.root);
+    let remote_before = server.file(REMOTE_PATH).expect("remote");
+    expect_conflict(b.service.sync());
+    assert_eq!(data_files(&b.root), files, "nothing changed here");
+    assert_eq!(server.file(REMOTE_PATH).expect("remote"), remote_before);
+    // The same host changed on both sides as well.
+    b.edit(|state| readdress(state, "web", "10.3.3.3"));
+    expect_conflict(b.service.sync());
+    // "Upload now" and "pull" never merge, even when only recents differ here.
+    let c = Machine::new("merge-conflict-c", Platform::Linux);
+    c.connect(&server);
+    expect_pulled(c.service.sync());
+    c.edit(|state| connect_to(state, "db", 3_000));
+    a.edit(|state| readdress(state, "db", "10.4.4.4"));
+    expect_uploaded(a.service.sync());
+    expect_conflict(c.service.upload());
+    expect_conflict(c.service.pull());
+}
+
+#[test]
+fn a_state_from_before_the_merge_keeps_the_conflict_rule_once() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_pair("merge-old-state", &server);
+    // The state an older build wrote has no fingerprint without recents.
+    let store = crate::SyncStateStore::at(&b.root);
+    let mut state = store.load();
+    assert!(state.last_synced_core_hash.is_some());
+    state.last_synced_core_hash = None;
+    store.save(&state).expect("saved");
+    let text = std::fs::read_to_string(store.path()).expect("state");
+    assert!(!text.contains("last_synced_core_hash"), "{text}");
+
+    a.edit(|state| readdress(state, "web", "10.5.5.5"));
+    expect_uploaded(a.service.sync());
+    b.edit(|state| connect_to(state, "db", 1_000));
+    expect_conflict(b.service.sync());
+    expect_pulled(b.service.resolve(Resolution::UseRemote));
+    assert!(b.service.state().last_synced_core_hash.is_some());
+
+    // From now on the merge applies.
+    a.edit(|state| readdress(state, "web", "10.6.6.6"));
+    expect_uploaded(a.service.sync());
+    b.edit(|state| connect_to(state, "db", 2_000));
+    expect_merged(b.service.sync());
+    assert_eq!(address_of(&b, "web"), "10.6.6.6");
+    assert_eq!(recent_of(&b, "db"), Some((2_000, 1)));
+}
+
+#[test]
+fn a_failed_or_refused_merge_upload_leaves_this_machine_as_it_was() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let (a, b) = synced_pair("merge-failure", &server);
+    a.edit(|state| readdress(state, "web", "10.9.9.1"));
+    expect_uploaded(a.service.sync());
+    b.edit(|state| connect_to(state, "db", 1_000));
+    let files = data_files(&b.root);
+
+    // The server refuses the write: nothing was written here.
+    server.set_read_only(true);
+    let error = b.service.sync().expect_err("refused");
+    assert!(
+        matches!(error, SyncError::Remote(WebDavError::NotWritable { .. })),
+        "{error:?}"
+    );
+    assert_eq!(data_files(&b.root), files);
+    server.set_read_only(false);
+
+    // A write refused because the file changed decides again and then merges.
+    let before = server.requests().len();
+    server.fail_next_put();
+    expect_merged(b.service.sync());
+    assert_eq!(puts_since(&server, before), 2);
+    assert_eq!(address_of(&b, "web"), "10.9.9.1");
+    assert_eq!(recent_of(&b, "db"), Some((1_000, 1)));
+    assert_eq!(remote_recent(&server, "db"), Some((1_000, 1)));
+    expect_up_to_date(b.service.sync());
+    expect_pulled(a.service.sync());
+    assert_eq!(a.load().hosts, b.load().hosts);
+}
+
+#[test]
+fn with_passwords_synced_a_password_changed_in_the_cloud_is_not_only_recents() {
+    let server = WebDavServer::start(USER, DAV_PASSWORD);
+    let a = Machine::new("merge-secrets-a", Platform::Linux);
+    let b = Machine::new("merge-secrets-b", Platform::Linux);
+    for machine in [&a, &b] {
+        machine.connect(&server);
+        machine.update_config(|config| config.sync_secrets = true);
+        machine
+            .service
+            .set_passphrase(Some(&SecretString::new(PASSPHRASE)))
+            .expect("saved");
+    }
+    let mut web_id = None;
+    a.edit(|state| {
+        let mut web = HostConfig::new("web", "10.0.0.5", 22, "deploy").expect("host");
+        web.set_auth(Some(AuthMethodKind::Password));
+        web.set_remember_secret(true);
+        web_id = Some(web.id());
+        state.hosts.insert(web).expect("inserted");
+        add_host(state, "db");
+    });
+    let web_id = web_id.expect("web");
+    let password_of = |machine: &Machine| {
+        machine
+            .secrets
+            .load(web_id)
+            .expect("read")
+            .map(|secret| secret.expose().to_owned())
+    };
+    a.secrets
+        .save(web_id, &SecretString::new("first"))
+        .expect("saved");
+    expect_uploaded(a.service.sync());
+    expect_pulled(b.service.sync());
+    assert_eq!(password_of(&b).as_deref(), Some("first"));
+
+    // A changes only the password (the records stay as they were). B changes a
+    // record: the cloud's change is a password, so this is a conflict, not a
+    // merge that would upload B's older password over it.
+    a.secrets
+        .save(web_id, &SecretString::new("second"))
+        .expect("saved");
+    expect_uploaded(a.service.sync());
+    b.edit(|state| {
+        readdress(state, "db", "10.1.2.3");
+        connect_to(state, "db", 1_000);
+    });
+    let remote_before = server.file(REMOTE_PATH).expect("remote");
+    expect_conflict(b.service.sync());
+    assert_eq!(server.file(REMOTE_PATH).expect("remote"), remote_before);
+    assert_eq!(password_of(&b).as_deref(), Some("first"));
+    expect_pulled(b.service.resolve(Resolution::UseRemote));
+    assert_eq!(password_of(&b).as_deref(), Some("second"));
+
+    // When B only connected, the cloud's password is taken with the merge.
+    a.secrets
+        .save(web_id, &SecretString::new("third"))
+        .expect("saved");
+    expect_uploaded(a.service.sync());
+    b.edit(|state| connect_to(state, "web", 2_000));
+    expect_merged(b.service.sync());
+    assert_eq!(password_of(&b).as_deref(), Some("third"));
+    assert_eq!(recent_of(&b, "web"), Some((2_000, 1)));
+    assert_eq!(remote_recent(&server, "web"), Some((2_000, 1)));
+    expect_up_to_date(b.service.sync());
+    expect_pulled(a.service.sync());
+    assert_eq!(password_of(&a).as_deref(), Some("third"));
+    expect_up_to_date(a.service.sync());
+
+    // A passphrase that does not open the cloud's passwords cannot tell what
+    // changed there: a conflict, nothing written.
+    a.secrets
+        .save(web_id, &SecretString::new("fourth"))
+        .expect("saved");
+    expect_uploaded(a.service.sync());
+    b.service
+        .set_passphrase(Some(&SecretString::new("another passphrase")))
+        .expect("saved");
+    b.edit(|state| connect_to(state, "web", 3_000));
+    let files = data_files(&b.root);
+    expect_conflict(b.service.sync());
+    assert_eq!(data_files(&b.root), files);
+}

@@ -4765,6 +4765,8 @@ sync_strings! {
     toast_uploaded: "Uploaded to the cloud", "已上传到云端";
     /// Toast: pulled
     toast_pulled: "Synced from the cloud", "已从云端同步";
+    /// Toast: both sides changed, one only by connecting; merged without asking
+    toast_merged: "Synced; recent connections were merged", "已同步，已自动合并最近连接";
     /// Toast: nothing to do
     toast_up_to_date: "Already up to date", "已是最新";
     /// Toast: failed

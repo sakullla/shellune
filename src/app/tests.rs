@@ -29334,6 +29334,91 @@ async fn a_conflict_asks_and_cancel_keeps_both_sides(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn only_connecting_here_merges_with_the_cloud_without_asking(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let (machine_a, machine_b) = (TempDir::new("merge-a"), TempDir::new("merge-b"));
+    seed(
+        &machine_a.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "root", None),
+            stored_host("beta", "10.0.0.2", 22, "root", None),
+        ],
+    );
+    let a = other_machine(&machine_a, &server);
+    let _ = a.sync().expect("A uploads");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&machine_b, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &machine_b, &secrets, Destination::Hosts);
+    assert_eq!(host_names(&view, cx), vec!["alpha", "beta"]);
+
+    // A adds a host and uploads; B meanwhile only connects to alpha.
+    let store_a = machine_a.store();
+    let mut book_a = store_a.load().expect("A's hosts read");
+    book_a
+        .insert(stored_host("from-a", "10.0.0.7", 22, "root", None))
+        .expect("inserted");
+    store_a.save(&book_a).expect("saved");
+    let _ = a.sync().expect("A uploads its change");
+    let alpha = first_host_id(&view, cx);
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            assert!(view.record_host_connection(alpha, 1_800_000_000, cx));
+        });
+    });
+    cx.run_until_parked();
+    after_debounce(cx);
+
+    assert!(
+        !sync_conflict_open(&view, cx),
+        "only connecting here is no conflict"
+    );
+    assert_eq!(sync_marker(&view, cx), None);
+    assert_eq!(
+        host_names(&view, cx),
+        vec!["alpha", "beta", "from-a"],
+        "A's host is listed without a restart"
+    );
+    let recent = |book: &HostBook| {
+        book.recent_of(alpha)
+            .map(shellune_storage::RecentConnection::last_connected_unix)
+    };
+    assert_eq!(
+        cx.update(|_window, app| recent(view.read(app).book())),
+        Some(1_800_000_000),
+        "B's connection is still listed"
+    );
+    assert_eq!(
+        recent(&machine_b.store().load().expect("B's hosts read")),
+        Some(1_800_000_000)
+    );
+    assert_eq!(
+        recent(cloud_document(&server).shared().hosts()),
+        Some(1_800_000_000),
+        "and it reached the cloud"
+    );
+    assert!(
+        shellune_storage::SnapshotStore::at(machine_b.path())
+            .list()
+            .iter()
+            .any(|snapshot| snapshot.reason().starts_with("sync-merge")),
+        "the data replaced here was copied aside first"
+    );
+    // A takes B's connection on its next sync, and nothing is sent back again.
+    assert!(matches!(
+        a.sync().expect("A syncs"),
+        shellune_sync::SyncOutcome::Pulled(_)
+    ));
+    assert_eq!(
+        recent(&machine_a.store().load().expect("A's hosts read")),
+        Some(1_800_000_000)
+    );
+    let puts = put_count(&server);
+    after_poll(cx);
+    assert_eq!(put_count(&server), puts);
+    assert_eq!(sync_progress(&view, cx).2, None);
+}
+
+#[gpui::test]
 async fn use_cloud_data_replaces_this_computer_and_keeps_a_snapshot(cx: &mut TestAppContext) {
     let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
     let (machine_a, machine_b) = (TempDir::new("remote-a"), TempDir::new("remote-b"));

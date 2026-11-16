@@ -12,7 +12,16 @@
 //! | local \ remote | unchanged       | changed  |
 //! |----------------|-----------------|----------|
 //! | unchanged      | nothing to do   | pull     |
-//! | changed        | upload (If-Match) | conflict |
+//! | changed        | upload (If-Match) | conflict or merge |
+//!
+//! When both sides changed but at least one of them only connected to hosts (its
+//! data apart from the recent-connection log, [`ShelluneData::core_view`], is
+//! what was last synced — passwords included), automatic sync merges instead of
+//! stopping: the records come from the side that changed them (the cloud's when
+//! neither did), the recent connections keep the later entry per host, and the
+//! result is uploaded with If-Match, then written here (after a snapshot). A
+//! refused upload or a save made here meanwhile decides again. Both sides
+//! changing records is still a conflict, and "upload now" and "pull" never merge.
 //!
 //! A first sync with a server (no state yet): no file or an empty one in the cloud
 //! uploads, an empty machine pulls, equal data is only recorded, and anything else
@@ -31,9 +40,9 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use shellune_core::{HostId, SecretString};
 use shellune_storage::{
-    AppSecret, ApplyMode, Change, ExportOptions, KdfParams, LocalData, LocalState, Platform,
-    PlatformFallback, PortableError, SecretError, SecretStore, ShelluneData, SnapshotStore,
-    TrustConflict,
+    AppSecret, ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, KdfParams, LocalData,
+    LocalState, Platform, PlatformFallback, PortableError, SecretBundle, SecretError, SecretStore,
+    ShelluneData, SnapshotStore, TrustConflict, merge_recent_connections,
 };
 
 use crate::config::{
@@ -101,6 +110,10 @@ pub enum SyncOutcome {
     Uploaded(UploadReport),
     /// The cloud's data was applied here.
     Pulled(Box<PullReport>),
+    /// Both sides changed, but at least one only connected to hosts: the two were
+    /// merged, uploaded (unless the cloud already held the result) and written
+    /// here. The report says what changed here.
+    Merged(Box<PullReport>),
     /// Both sides changed; nothing was written. Ask the user and call
     /// [`SyncService::resolve`].
     Conflict(ConflictReport),
@@ -111,7 +124,8 @@ pub enum SyncOutcome {
 impl SyncOutcome {
     fn last_result(&self) -> LastResult {
         match self {
-            Self::UpToDate => LastResult::UpToDate,
+            // After a merge both sides hold the same data.
+            Self::UpToDate | Self::Merged(_) => LastResult::UpToDate,
             Self::Uploaded(_) => LastResult::Uploaded,
             Self::Pulled(_) => LastResult::Pulled,
             Self::Conflict(_) | Self::ConflictKept => LastResult::Conflict,
@@ -210,7 +224,16 @@ enum Action {
     Nothing,
     Upload,
     Pull,
+    Merge,
     Conflict,
+}
+
+/// Whether each side changed more than its recent connections since the last
+/// sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoreChanges {
+    local: bool,
+    remote: bool,
 }
 
 /// The facts one decision is made from.
@@ -222,6 +245,9 @@ struct Facts {
     local_empty: bool,
     remote_empty: bool,
     same_view: bool,
+    /// Known only when both sides changed, the last sync recorded the data
+    /// without recents, and (with passwords synced) the cloud's passwords opened.
+    core: Option<CoreChanges>,
 }
 
 fn decide(direction: Direction, facts: Facts) -> Action {
@@ -240,6 +266,11 @@ fn decide(direction: Direction, facts: Facts) -> Action {
         (false, false, _) => Action::Nothing,
         (true, false, Direction::Auto | Direction::Upload) => Action::Upload,
         (false, true, Direction::Auto | Direction::Pull) => Action::Pull,
+        (true, true, Direction::Auto)
+            if facts.core.is_some_and(|core| !(core.local && core.remote)) =>
+        {
+            Action::Merge
+        }
         _ => Action::Conflict,
     }
 }
@@ -251,6 +282,8 @@ struct Remote {
     document: Result<ShelluneData, PortableError>,
     /// The fingerprint of the document's view for this platform.
     view_hash: Option<String>,
+    /// The fingerprint of the same view without the recent connections.
+    core_hash: Option<String>,
     /// What tells this version from the last synced one: the view, and — when
     /// this machine syncs passwords — the sealed block too (which the view
     /// leaves out).
@@ -260,6 +293,13 @@ struct Remote {
 enum Step {
     Done(SyncOutcome),
     Retry,
+}
+
+/// What a merge needs beyond the decision: which side changed records, and the
+/// cloud's opened passwords (when passwords are synced).
+struct CoreCheck {
+    changes: CoreChanges,
+    bundle: Option<SecretBundle>,
 }
 
 /// Syncs one data directory with the WebDAV folder its settings name.
@@ -548,6 +588,16 @@ impl SyncService {
         let remote_changed = !known
             || (adopting_secrets && document.has_secrets())
             || (!etag_unchanged && state.last_remote_hash.as_deref() != Some(remote.mark.as_str()));
+        let check = if direction == Direction::Auto
+            && known
+            && local_changed
+            && remote_changed
+            && !adopting_secrets
+        {
+            self.check_core(config, &state, &mine, secrets_changed, document, &remote)?
+        } else {
+            None
+        };
         let facts = Facts {
             first_sync: !known,
             local_changed,
@@ -555,6 +605,15 @@ impl SyncService {
             local_empty: local.is_empty(),
             remote_empty: document_is_empty(document),
             same_view: remote_hash == mine.view && !secrets_changed && !adopting_secrets,
+            core: check.as_ref().map(|check| check.changes),
+        };
+        let conflict = || -> Result<Step, SyncError> {
+            Ok(Step::Done(SyncOutcome::Conflict(ConflictReport {
+                first_sync: !known,
+                remote_platform: document.source_platform().to_owned(),
+                remote_app_version: document.source_app_version().to_owned(),
+                remote_created_unix: document.created_unix(),
+            })))
         };
         match decide(direction, facts) {
             Action::Nothing => {
@@ -565,13 +624,146 @@ impl SyncService {
                 self.upload_to(config, client, &remote_id, &local, &mine, Some(&remote))
             }
             Action::Pull => self.apply_remote(config, &remote_id, &local, &remote, "sync-pull"),
-            Action::Conflict => Ok(Step::Done(SyncOutcome::Conflict(ConflictReport {
-                first_sync: !known,
-                remote_platform: document.source_platform().to_owned(),
-                remote_app_version: document.source_app_version().to_owned(),
-                remote_created_unix: document.created_unix(),
-            }))),
+            Action::Merge => match check {
+                Some(check) => self.merge(config, client, &remote_id, &local, &remote, check),
+                None => conflict(),
+            },
+            Action::Conflict => conflict(),
         }
+    }
+
+    /// Tells whether each side changed more than its recent connections since the
+    /// last sync. `None` when that cannot be told: the last sync was recorded by a
+    /// build that did not keep the data without recents, or the cloud's passwords
+    /// do not open with this machine's passphrase.
+    fn check_core(
+        &self,
+        config: &SyncConfig,
+        state: &SyncState,
+        mine: &Fingerprint,
+        secrets_changed: bool,
+        document: &ShelluneData,
+        remote: &Remote,
+    ) -> Result<Option<CoreCheck>, SyncError> {
+        let Some(baseline) = state.last_synced_core_hash.as_deref() else {
+            return Ok(None);
+        };
+        let mut remote_core = remote.core_hash.as_deref() != Some(baseline);
+        let mut bundle = None;
+        if config.sync_secrets {
+            // The sealed block is sealed afresh on every upload, so whether the
+            // passwords in it changed is only known once it is opened.
+            let passphrase = self.sync_passphrase()?;
+            let Ok(opened) = document.open_secrets(&passphrase) else {
+                return Ok(None);
+            };
+            let records = document.shared().hosts().records();
+            let theirs = secrets_digest(
+                &passphrase,
+                records.iter().filter_map(|record| {
+                    opened.get(record.id()).map(|secret| (record.id(), secret))
+                }),
+            );
+            remote_core |= state.last_secrets_hash.as_deref() != Some(theirs.as_str());
+            bundle = Some(opened);
+        }
+        Ok(Some(CoreCheck {
+            changes: CoreChanges {
+                local: mine.core != baseline || secrets_changed,
+                remote: remote_core,
+            },
+            bundle,
+        }))
+    }
+
+    /// Merges both sides when at least one only connected to hosts: the records
+    /// of the side that changed them (the cloud's when neither did), the later
+    /// recent connection per host.
+    ///
+    /// The result goes to the cloud first (If-Match), then is written here (after
+    /// a snapshot), so a failed or refused upload leaves this machine untouched
+    /// and decides again. A save made here meanwhile refuses the write and
+    /// decides again too.
+    fn merge(
+        &self,
+        config: &SyncConfig,
+        client: &WebDavClient,
+        remote_id: &str,
+        local: &LocalState,
+        remote: &Remote,
+        check: CoreCheck,
+    ) -> Result<Step, SyncError> {
+        let document = remote
+            .document
+            .as_ref()
+            .map_err(|error| SyncError::RemoteDocument(error.clone()))?;
+        let recents =
+            merge_recent_connections(local.hosts.recents(), document.shared().hosts().recents());
+        let from_remote = check.changes.remote || !check.changes.local;
+        let mut options = ExportOptions::new(self.platform);
+        options.kdf = self.kdf;
+        let (plan, upload) = if from_remote {
+            // When the cloud's recents are the later ones it already holds the
+            // result, in its own order.
+            let theirs = merge_recent_connections(document.shared().hosts().recents(), &[]);
+            let mut merged = if theirs == recents {
+                None
+            } else {
+                // The cloud's document with the merged recents; its sealed
+                // passwords and the other platforms' sections travel unchanged.
+                Some(
+                    document
+                        .with_recents(&recents)
+                        .map_err(SyncError::RemoteDocument)?,
+                )
+            };
+            let plan = merged
+                .as_ref()
+                .unwrap_or(document)
+                .plan(
+                    local,
+                    self.platform,
+                    ApplyMode::Replace,
+                    check.bundle.as_ref(),
+                )
+                .map_err(SyncError::RemoteDocument)?;
+            if let Some(merged) = &mut merged {
+                merged.restamp(&options);
+            }
+            (plan, merged)
+        } else {
+            let plan = ApplyPlan::with_recents(local, self.platform, &recents)
+                .map_err(SyncError::Local)?;
+            if config.sync_secrets {
+                options = options.with_passphrase(self.sync_passphrase()?);
+            }
+            let export =
+                ShelluneData::export(plan.result(), &options, &*self.secrets, Some(document))
+                    .map_err(SyncError::Local)?;
+            (plan, Some(export.document))
+        };
+        let (etag, mark) = match upload {
+            Some(upload) => {
+                let bytes = upload.to_json().map_err(SyncError::Local)?;
+                let Some(etag) = put(client, Some(remote), &bytes)? else {
+                    return Ok(Step::Retry);
+                };
+                let view = hash(&upload.sync_view(self.platform).map_err(SyncError::Local)?);
+                (etag, remote_mark(&view, &bytes, config.sync_secrets))
+            }
+            None => (remote.etag.clone(), remote.mark.clone()),
+        };
+        let applied = match plan.apply(&self.data, &*self.secrets, "sync-merge") {
+            Err(PortableError::Changed) => return Ok(Step::Retry),
+            other => other.map_err(SyncError::Local)?,
+        };
+        let mine = self.fingerprint(config, &applied.state)?;
+        self.remember(remote_id, etag, mark, &mine)?;
+        Ok(Step::Done(SyncOutcome::Merged(Box::new(pull_report(
+            &plan,
+            applied,
+            from_remote && document.has_secrets() && !config.sync_secrets,
+        )))))
     }
 
     fn use_remote(&self, config: &SyncConfig, client: &WebDavClient) -> Result<Step, SyncError> {
@@ -630,13 +822,20 @@ impl SyncService {
             return Ok(None);
         };
         let document = ShelluneData::from_json(&download.bytes);
-        let view_hash = match &document {
-            Ok(document) => Some(hash(
-                &document
-                    .sync_view(self.platform)
-                    .map_err(SyncError::RemoteDocument)?,
-            )),
-            Err(_) => None,
+        let (view_hash, core_hash) = match &document {
+            Ok(document) => (
+                Some(hash(
+                    &document
+                        .sync_view(self.platform)
+                        .map_err(SyncError::RemoteDocument)?,
+                )),
+                Some(hash(
+                    &document
+                        .core_view(self.platform)
+                        .map_err(SyncError::RemoteDocument)?,
+                )),
+            ),
+            Err(_) => (None, None),
         };
         let mark = remote_mark(
             view_hash.as_deref().unwrap_or_default(),
@@ -648,6 +847,7 @@ impl SyncService {
             bytes: download.bytes,
             document,
             view_hash,
+            core_hash,
             mark,
         }))
     }
@@ -679,17 +879,8 @@ impl SyncService {
         let export = ShelluneData::export(local, &options, &*self.secrets, base_document)
             .map_err(SyncError::Local)?;
         let bytes = export.document.to_json().map_err(SyncError::Local)?;
-        let precondition = match base {
-            None => Precondition::IfAbsent,
-            Some(remote) => match &remote.etag {
-                Some(etag) if is_strong_etag(etag) => Precondition::IfMatch(etag.clone()),
-                // Without a usable tag the write cannot be made conditional.
-                _ => Precondition::None,
-            },
-        };
-        let etag = match client.put(&bytes, &precondition) {
-            Err(WebDavError::Conflict) => return Ok(Step::Retry),
-            other => other?,
+        let Some(etag) = put(client, base, &bytes)? else {
+            return Ok(Step::Retry);
         };
         let view_hash = hash(
             &export
@@ -739,27 +930,11 @@ impl SyncService {
         };
         let mine = self.fingerprint(config, &applied.state)?;
         self.remember(remote_id, remote.etag.clone(), remote.mark.clone(), &mine)?;
-        Ok(Step::Done(SyncOutcome::Pulled(Box::new(PullReport {
-            snapshot: applied.snapshot,
-            source_platform: plan.source_platform().to_owned(),
-            source_app_version: plan.source_app_version().to_owned(),
-            created_unix: plan.created_unix(),
-            hosts: plan.hosts(),
-            groups: plan.groups(),
-            forwards: plan.forwards(),
-            snippets: plan.snippets(),
-            known_hosts: plan.known_hosts(),
-            preferences_changed: plan.preferences_changed(),
-            keymap_changed: plan.keymap_changed(),
-            fallbacks: plan.fallbacks().to_vec(),
-            trust_conflicts: plan.trust_conflicts().to_vec(),
-            secrets_ignored: document.has_secrets() && !config.sync_secrets,
-            secrets_saved: applied.secrets_saved,
-            secrets_to_forget: plan.secrets_to_forget().to_vec(),
-            secrets_forgotten: applied.secrets_forgotten,
-            secrets_not_forgotten: applied.secrets_not_forgotten,
-            state: applied.state,
-        }))))
+        Ok(Step::Done(SyncOutcome::Pulled(Box::new(pull_report(
+            &plan,
+            applied,
+            document.has_secrets() && !config.sync_secrets,
+        )))))
     }
 
     /// Records what both sides hold after a successful sync.
@@ -776,6 +951,7 @@ impl SyncService {
         state.last_remote_etag = etag;
         state.last_remote_hash = Some(mark);
         state.last_synced_hash = Some(mine.view.clone());
+        state.last_synced_core_hash = Some(mine.core.clone());
         state.last_secrets_hash.clone_from(&mine.secrets);
         store.save(&state)?;
         Ok(())
@@ -803,34 +979,111 @@ impl SyncService {
                 .sync_view(self.platform)
                 .map_err(SyncError::Local)?,
         );
+        let core = hash(
+            &export
+                .document
+                .core_view(self.platform)
+                .map_err(SyncError::Local)?,
+        );
         let secrets = if config.sync_secrets {
             let passphrase = self.sync_passphrase()?;
-            let mut digest = Sha256::new();
-            digest.update(passphrase.expose().as_bytes());
-            digest.update([0]);
-            for record in local.hosts.records() {
-                if !record.remembers_secret() {
-                    continue;
-                }
-                if let Ok(Some(secret)) = self.secrets.load(record.id()) {
-                    digest.update(record.id().to_string().as_bytes());
-                    digest.update([0]);
-                    digest.update(secret.expose().as_bytes());
-                    digest.update([0]);
-                }
-            }
-            Some(hex(&digest.finalize()))
+            let saved: Vec<(HostId, SecretString)> = local
+                .hosts
+                .records()
+                .iter()
+                .filter(|record| record.remembers_secret())
+                .filter_map(|record| match self.secrets.load(record.id()) {
+                    Ok(Some(secret)) => Some((record.id(), secret)),
+                    _ => None,
+                })
+                .collect();
+            Some(secrets_digest(
+                &passphrase,
+                saved.iter().map(|(id, secret)| (*id, secret)),
+            ))
         } else {
             None
         };
-        Ok(Fingerprint { view, secrets })
+        Ok(Fingerprint {
+            view,
+            core,
+            secrets,
+        })
     }
+}
+
+/// Writes `bytes` over `base` (If-Match its tag), or as a new file without one.
+/// `None` when the server refused because the file changed meanwhile.
+fn put(
+    client: &WebDavClient,
+    base: Option<&Remote>,
+    bytes: &[u8],
+) -> Result<Option<Option<String>>, SyncError> {
+    let precondition = match base {
+        None => Precondition::IfAbsent,
+        Some(remote) => match &remote.etag {
+            Some(etag) if is_strong_etag(etag) => Precondition::IfMatch(etag.clone()),
+            // Without a usable tag the write cannot be made conditional.
+            _ => Precondition::None,
+        },
+    };
+    match client.put(bytes, &precondition) {
+        Err(WebDavError::Conflict) => Ok(None),
+        other => Ok(Some(other?)),
+    }
+}
+
+/// What a pull or a merge applied, for the interface.
+fn pull_report(plan: &ApplyPlan, applied: ApplyOutcome, secrets_ignored: bool) -> PullReport {
+    PullReport {
+        snapshot: applied.snapshot,
+        source_platform: plan.source_platform().to_owned(),
+        source_app_version: plan.source_app_version().to_owned(),
+        created_unix: plan.created_unix(),
+        hosts: plan.hosts(),
+        groups: plan.groups(),
+        forwards: plan.forwards(),
+        snippets: plan.snippets(),
+        known_hosts: plan.known_hosts(),
+        preferences_changed: plan.preferences_changed(),
+        keymap_changed: plan.keymap_changed(),
+        fallbacks: plan.fallbacks().to_vec(),
+        trust_conflicts: plan.trust_conflicts().to_vec(),
+        secrets_ignored,
+        secrets_saved: applied.secrets_saved,
+        secrets_to_forget: plan.secrets_to_forget().to_vec(),
+        secrets_forgotten: applied.secrets_forgotten,
+        secrets_not_forgotten: applied.secrets_not_forgotten,
+        state: applied.state,
+    }
+}
+
+/// A fingerprint of saved passwords keyed by the sync passphrase, so the state
+/// file holds nothing a password could be guessed from without it. The same
+/// for this machine's credential store and for the cloud's opened block when
+/// both hold the same passwords for the same records in the same order.
+fn secrets_digest<'a>(
+    passphrase: &SecretString,
+    saved: impl IntoIterator<Item = (HostId, &'a SecretString)>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(passphrase.expose().as_bytes());
+    digest.update([0]);
+    for (id, secret) in saved {
+        digest.update(id.to_string().as_bytes());
+        digest.update([0]);
+        digest.update(secret.expose().as_bytes());
+        digest.update([0]);
+    }
+    hex(&digest.finalize())
 }
 
 /// What this machine holds, as sync compares it.
 struct Fingerprint {
     /// The fingerprint of the document view.
     view: String,
+    /// The fingerprint of the view without the recent connections.
+    core: String,
     /// The keyed fingerprint of the saved passwords, when they are synced.
     secrets: Option<String>,
 }
@@ -895,6 +1148,7 @@ mod tests {
             local_empty: false,
             remote_empty: false,
             same_view: false,
+            core: None,
         }
     }
 
@@ -930,6 +1184,37 @@ mod tests {
             ..facts()
         };
         assert_eq!(decide(Auto, same), Nothing);
+    }
+
+    #[test]
+    fn only_connecting_on_one_side_merges_in_automatic_sync() {
+        use Action::{Conflict, Merge};
+        let both = Facts {
+            local_changed: true,
+            remote_changed: true,
+            ..facts()
+        };
+        let with = |local, remote| Facts {
+            core: Some(CoreChanges { local, remote }),
+            ..both
+        };
+        // Without the facts about recents (an older state, or passwords that do
+        // not open) both changing stays a conflict.
+        assert_eq!(decide(Direction::Auto, both), Conflict);
+        assert_eq!(decide(Direction::Auto, with(false, true)), Merge);
+        assert_eq!(decide(Direction::Auto, with(true, false)), Merge);
+        assert_eq!(decide(Direction::Auto, with(false, false)), Merge);
+        assert_eq!(decide(Direction::Auto, with(true, true)), Conflict);
+        // "Upload now" and "pull" never merge.
+        for direction in [Direction::Upload, Direction::Pull] {
+            assert_eq!(decide(direction, with(false, false)), Conflict);
+        }
+        // A first sync never merges either.
+        let first = Facts {
+            first_sync: true,
+            ..with(false, false)
+        };
+        assert_eq!(decide(Direction::Auto, first), Conflict);
     }
 
     #[test]

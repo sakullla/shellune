@@ -11,10 +11,10 @@ use shellune_core::{
     HostConfig, HostId, SecretString, SerialConfig, SnippetBook,
 };
 use shellune_storage::{
-    ApplyMode, ExportOptions, GroupStore, HostBook, HostKey, HostStore, HostTrust, KdfParams,
-    KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets, Platform, PlatformField,
-    PortableError, Preferences, PreferencesStore, SNAPSHOT_LIMIT, SecretStore, ShelluneData,
-    TrustConflict,
+    ApplyMode, ApplyPlan, ExportOptions, GroupStore, HostBook, HostKey, HostStore, HostTrust,
+    KdfParams, KeymapEntry, KeymapPreferences, LocalData, LocalState, MemorySecrets, Platform,
+    PlatformField, PortableError, Preferences, PreferencesStore, SNAPSHOT_LIMIT, SecretStore,
+    ShelluneData, TrustConflict, merge_recent_connections,
 };
 
 const PASSWORD: &str = "correct-horse-battery-staple";
@@ -1102,6 +1102,172 @@ fn the_sync_view_ignores_the_time_stamp_and_other_platforms() {
         first.sync_view(Platform::Windows).expect("view"),
         third.sync_view(Platform::Windows).expect("view")
     );
+}
+
+#[test]
+fn the_core_view_leaves_out_only_the_recent_connections() {
+    let fixture = windows_machine();
+    let export = |state: &LocalState| {
+        ShelluneData::export(
+            state,
+            &options(Platform::Windows),
+            &MemorySecrets::new(),
+            None,
+        )
+        .expect("exported")
+        .document
+    };
+    let first = export(&fixture.state);
+    // Connecting changes the sync view but not the core view.
+    let mut connected = fixture.state.clone();
+    connected
+        .hosts
+        .record_connection(fixture.key_host, 1_700_000_900)
+        .expect("recorded");
+    connected
+        .hosts
+        .record_connection(fixture.password_host, 1_700_000_950)
+        .expect("recorded");
+    let second = export(&connected);
+    assert_ne!(
+        first.sync_view(Platform::Windows).expect("view"),
+        second.sync_view(Platform::Windows).expect("view")
+    );
+    assert_eq!(
+        first.core_view(Platform::Windows).expect("view"),
+        second.core_view(Platform::Windows).expect("view")
+    );
+    let core = String::from_utf8(first.core_view(Platform::Windows).expect("view")).expect("utf-8");
+    assert!(!core.contains("recents"), "{core}");
+    assert!(core.contains("favorites"), "{core}");
+    // Any other change shows in the core view too.
+    let mut changed = fixture.state.clone();
+    changed.snippets.create("new", "ls").expect("snippet");
+    assert_ne!(
+        first.core_view(Platform::Windows).expect("view"),
+        export(&changed).core_view(Platform::Windows).expect("view")
+    );
+    let mut moved = fixture.state.clone();
+    moved.preferences.text_size = Some(140);
+    assert_ne!(
+        first.core_view(Platform::Windows).expect("view"),
+        export(&moved).core_view(Platform::Windows).expect("view")
+    );
+}
+
+#[test]
+fn recent_connections_merge_by_host_keeping_the_later_one() {
+    let fixture = windows_machine();
+    let (web, db) = (fixture.password_host, fixture.key_host);
+    let mut with_cache = fixture.state.clone();
+    let cache_host = HostConfig::new("cache", "10.0.0.7", 22, "redis").expect("host");
+    let cache = cache_host.id();
+    with_cache.hosts.insert(cache_host).expect("inserted");
+    // Here: web at 100 (once before), db at 500 twice.
+    let mut here = with_cache.hosts.clone();
+    here.record_connection(web, 100).expect("recorded");
+    here.record_connection(db, 500).expect("recorded");
+    here.record_connection(db, 500).expect("recorded");
+    // There: web at 300, db at 500 once, cache at 200.
+    let mut there = HostBook::new();
+    for record in with_cache.hosts.records() {
+        there.insert_connection(record).expect("inserted");
+    }
+    there.record_connection(web, 300).expect("recorded");
+    there.record_connection(db, 500).expect("recorded");
+    there.record_connection(cache, 200).expect("recorded");
+
+    let merged = merge_recent_connections(here.recents(), there.recents());
+    let seen: Vec<(HostId, u64, u32)> = merged
+        .iter()
+        .map(|recent| {
+            (
+                recent.host(),
+                recent.last_connected_unix(),
+                recent.connections(),
+            )
+        })
+        .collect();
+    // Newest first; db at the same time keeps the higher count.
+    assert_eq!(seen, vec![(db, 500, 2), (web, 300, 1), (cache, 200, 1)]);
+    // The order of the two sides does not matter.
+    assert_eq!(
+        merge_recent_connections(there.recents(), here.recents()),
+        merged
+    );
+
+    // A document takes the merged log; an entry whose host is gone is dropped.
+    let document = ShelluneData::export(
+        &fixture.state,
+        &options(Platform::Windows),
+        &MemorySecrets::new(),
+        None,
+    )
+    .expect("exported")
+    .document;
+    let replaced = document.with_recents(&merged).expect("replaced");
+    let hosts: Vec<HostId> = replaced
+        .shared()
+        .hosts()
+        .recents()
+        .iter()
+        .map(|recent| recent.host())
+        .collect();
+    assert_eq!(hosts, vec![db, web]);
+    assert_eq!(
+        replaced.core_view(Platform::Windows).expect("view"),
+        document.core_view(Platform::Windows).expect("view")
+    );
+    assert_eq!(
+        replaced.shared().hosts().favorites(),
+        document.shared().hosts().favorites()
+    );
+}
+
+#[test]
+fn a_recents_plan_writes_only_the_host_file_after_a_snapshot() {
+    let root = scratch("recents-plan");
+    let fixture = windows_machine();
+    save_state(&root, &fixture.state);
+    let data = LocalData::at(&root);
+    let local = data.load().expect("loads");
+    let before = tree(&root);
+    let mut other = local.hosts.clone();
+    other
+        .record_connection(fixture.key_host, 1_800_000_000)
+        .expect("recorded");
+    let merged = merge_recent_connections(local.hosts.recents(), other.recents());
+    let plan = ApplyPlan::with_recents(&local, Platform::Windows, &merged).expect("planned");
+    assert_eq!(plan.files().collect::<Vec<_>>(), vec!["hosts.json"]);
+    assert!(plan.hosts().is_empty(), "no record changes");
+    let secrets = MemorySecrets::new();
+    let applied = plan.apply(&data, &secrets, "sync-merge").expect("applied");
+    assert_eq!(applied.files_written, vec!["hosts.json"]);
+    assert!(secrets.is_empty(), "no password is touched");
+    let snapshot = applied.snapshot.expect("a snapshot");
+    for (path, bytes) in &before {
+        let name = path.file_name().expect("a name");
+        assert_eq!(&std::fs::read(snapshot.join(name)).expect("kept"), bytes);
+    }
+    let after = data.load().expect("loads");
+    assert_eq!(
+        after
+            .hosts
+            .recent_of(fixture.key_host)
+            .map(|recent| recent.last_connected_unix()),
+        Some(1_800_000_000)
+    );
+    assert_eq!(after.hosts.records(), local.hosts.records());
+    assert_eq!(after.hosts.favorites(), local.hosts.favorites());
+    assert_eq!(after.preferences, local.preferences);
+    assert_eq!(after.known_hosts, local.known_hosts);
+    // Planned against data that changed meanwhile, it writes nothing.
+    let stale = ApplyPlan::with_recents(&local, Platform::Windows, &merged).expect("planned");
+    assert_eq!(
+        stale.apply(&data, &secrets, "sync-merge").unwrap_err(),
+        PortableError::Changed
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
