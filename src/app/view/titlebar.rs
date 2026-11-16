@@ -19,7 +19,7 @@ use gpui::{Context, Div, MouseButton, Stateful, Window, WindowControlArea, div, 
 use super::ShelluneView;
 use crate::app::icons::{self, Icon};
 use crate::app::nav::Platform;
-use crate::app::theme::{self, palette};
+use crate::app::theme::{self, Metrics, palette, spacing};
 
 /// Whether the window draws its own title bar on this platform.
 #[must_use]
@@ -27,11 +27,39 @@ pub fn custom_titlebar(platform: Platform) -> bool {
     matches!(platform, Platform::Windows | Platform::MacOs)
 }
 
-/// The room the macOS window buttons need at the left of the top row.
-pub const TRAFFIC_LIGHT_ROOM: f32 = 72.0;
+/// The height of one macOS window button, in points. The system draws the buttons, so
+/// they keep this size whatever text size the window uses.
+const TRAFFIC_LIGHT_SIZE: f32 = 14.0;
 
-/// Where the macOS window buttons sit, centred in the 46-point header row.
-pub const TRAFFIC_LIGHT_POSITION: (f32, f32) = (18.0, 16.0);
+/// The width of the three macOS window buttons and the gaps between them, in points.
+const TRAFFIC_LIGHT_SPAN: f32 = 52.0;
+
+/// How far the first macOS window button sits from the window's left edge, in points.
+const TRAFFIC_LIGHT_INSET: f32 = 16.0;
+
+/// Where the macOS window buttons sit: inset from the left edge and centred on the top
+/// row at the text size `metrics` draws (R2).
+///
+/// The row grows with the text size and the buttons do not, so the vertical position is
+/// worked out from the row's height rather than written down for one size. The system
+/// places the buttons when the window opens, so the window asks with the text size it
+/// will open at.
+#[must_use]
+pub fn traffic_light_position(metrics: Metrics) -> (f32, f32) {
+    let header = metrics.header_height() / px(1.0);
+    let top = ((header - TRAFFIC_LIGHT_SIZE) / 2.0).max(0.0).round();
+    (TRAFFIC_LIGHT_INSET, top)
+}
+
+/// The room the macOS window buttons need at the left of the top row (R2).
+///
+/// The buttons are the system's and do not scale, so the room is their own span plus a
+/// scaled gap: at a small text size the first tab can no longer slide under them, and at
+/// a large one the row does not lose a scaled-up margin it has no use for.
+#[must_use]
+pub fn traffic_light_room(metrics: Metrics) -> gpui::Pixels {
+    px(TRAFFIC_LIGHT_INSET + TRAFFIC_LIGHT_SPAN) + metrics.scale(spacing::TIGHT)
+}
 
 impl ShelluneView {
     /// A blank part of the top row: it drags the window and a double click maximises.
@@ -82,11 +110,17 @@ impl ShelluneView {
                       close: bool,
                       run: fn(&mut Window)| {
             // The close button turns the platform's red under the pointer, from the
-            // palette's solid danger fill, so it warns before the click.
+            // palette's solid danger fill, so it warns before the click; a press sinks
+            // one step further on every button, so it is felt and not only tinted.
             let hover_bg = if close {
                 theme::swatch(palette::DANGER_SOLID)
             } else {
                 theme::swatch(palette::SURFACE_HOVER)
+            };
+            let pressed_bg = if close {
+                theme::faded(theme::swatch(palette::DANGER_SOLID), 0.82)
+            } else {
+                theme::swatch(palette::SURFACE_PRESSED)
             };
             let hover_text = if close {
                 theme::swatch(palette::ON_DANGER)
@@ -101,6 +135,9 @@ impl ShelluneView {
                 .flex_none()
                 .items_center()
                 .justify_center()
+                // The platform's own caption button width: the system scales it with
+                // the display, not with the window's text size, so a large text size
+                // does not push the buttons out of a small window.
                 .w(px(46.0))
                 .h(height)
                 .occlude()
@@ -112,8 +149,9 @@ impl ShelluneView {
                     run(window);
                 })
                 .hover(move |style| style.bg(hover_bg))
+                .active(move |style| style.bg(pressed_bg))
                 .child(
-                    icons::icon(icon, px(14.0), theme::swatch(palette::TEXT_SECONDARY))
+                    icons::icon(icon, px(12.0), theme::swatch(palette::TEXT_SECONDARY))
                         .group_hover(id, move |style| style.text_color(hover_text)),
                 )
         };
@@ -245,4 +283,51 @@ mod win32 {
 
     #[cfg(not(target_os = "windows"))]
     pub fn close(_window: &mut Window) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::px;
+
+    use super::{
+        TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_SIZE, TRAFFIC_LIGHT_SPAN, traffic_light_position,
+        traffic_light_room,
+    };
+    use crate::app::theme::{Metrics, Zoom};
+
+    #[test]
+    fn the_macos_window_buttons_are_centred_on_the_top_row_at_every_text_size() {
+        for zoom in Zoom::ALL {
+            let metrics = Metrics::new(zoom);
+            let header = metrics.header_height() / px(1.0);
+            let (x, y) = traffic_light_position(metrics);
+            assert_eq!(
+                x, TRAFFIC_LIGHT_INSET,
+                "the buttons keep their inset at {zoom:?}"
+            );
+            let above = y;
+            let below = header - y - TRAFFIC_LIGHT_SIZE;
+            assert!(
+                (above - below).abs() <= 1.0,
+                "the buttons sit in the middle of the {header}pt row at {zoom:?}: {above} above, {below} below"
+            );
+        }
+    }
+
+    #[test]
+    fn the_room_for_the_macos_window_buttons_never_shrinks_under_them() {
+        let span = px(TRAFFIC_LIGHT_INSET + TRAFFIC_LIGHT_SPAN);
+        for zoom in Zoom::ALL {
+            let room = traffic_light_room(Metrics::new(zoom));
+            assert!(
+                room > span,
+                "the first tab starts right of the buttons at {zoom:?}: {room:?} for {span:?}"
+            );
+            // The buttons do not grow with the text, so the room only grows by its gap.
+            assert!(
+                room <= span + Metrics::new(zoom).scale(8.0) + px(0.5),
+                "the room is the buttons and a gap at {zoom:?}, not a scaled-up margin: {room:?}"
+            );
+        }
+    }
 }

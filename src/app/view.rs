@@ -109,7 +109,7 @@ mod update;
 pub use desktop::{DesktopPhase, DesktopStage};
 #[cfg(test)]
 pub use shell::Tool;
-pub use titlebar::{TRAFFIC_LIGHT_POSITION, custom_titlebar};
+pub use titlebar::{custom_titlebar, traffic_light_position};
 
 /// Where one control of a file column was drawn (R4).
 ///
@@ -806,6 +806,12 @@ pub struct ShelluneView {
     settings_scroll: gpui::ScrollHandle,
     /// The home column, which scrolls as a whole in a short window (R1, R8).
     home_scroll: gpui::ScrollHandle,
+    /// The session tabs, which scroll sideways once they no longer fit (R2).
+    tab_scroll: gpui::ScrollHandle,
+    /// The tab the strip last brought into view and the strip's width then, so a newly
+    /// current tab - or the current tab of a strip that changed width - is scrolled to
+    /// once, and the user's own scrolling is left alone afterwards (R2).
+    tab_revealed: std::cell::Cell<Option<(shellune_core::TabId, gpui::Pixels)>>,
     /// A category the navigation scrolled to and the page has not drawn there yet.
     settings_pending_reveal: std::cell::Cell<bool>,
     /// The tab whose menu is open, and where the pointer opened it.
@@ -1466,6 +1472,36 @@ impl ShelluneView {
     pub fn capture_end_session(&mut self, id: SessionId, failure: SessionFailure) {
         self.workspace.session_failed(id, failure);
         self.workspace.clear_session_failure();
+    }
+
+    /// Puts a capture session back into connecting, the way a reconnect starts (R2).
+    ///
+    /// The session is first recorded as lost and then as dialling again; no transport
+    /// exists behind either step, so the shot shows the tab's state and nothing about a
+    /// connection.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_reconnecting(&mut self, id: SessionId) {
+        self.workspace
+            .session_failed(id, SessionFailure::ConnectionLost);
+        self.workspace.clear_session_failure();
+        self.workspace.session_reconnecting(id);
+    }
+
+    /// Gives the tab of a capture session a name of the user's own (R2).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_name_tab(&mut self, id: SessionId, name: &str) {
+        if let Some(tab) = self.workspace.tab_of_session(id) {
+            self.workspace.rename_tab(tab, Some(name.to_owned()));
+        }
+    }
+
+    /// Whether the tab strip runs on past its left and right ends, as it was last laid
+    /// out (R2).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_tab_strip_ends(&self) -> (bool, bool) {
+        let ends = StripEnds::of(&self.tab_scroll, strip_button_room(self.metrics()));
+        (ends.before, ends.after)
     }
 
     /// Marks a capture session as having rung or finished in the background (R7).
@@ -2391,6 +2427,8 @@ impl ShelluneView {
             palette_scroll: gpui::ScrollHandle::new(),
             settings_scroll: gpui::ScrollHandle::new(),
             home_scroll: gpui::ScrollHandle::new(),
+            tab_scroll: gpui::ScrollHandle::new(),
+            tab_revealed: std::cell::Cell::new(None),
             settings_pending_reveal: std::cell::Cell::new(false),
             tab_menu: None,
             tab_rename: None,
@@ -3780,6 +3818,25 @@ impl ShelluneView {
         self.tab_sessions()
     }
 
+    /// Whether tabs are hidden past the strip's left and right ends, as the strip last
+    /// laid itself out (R2).
+    ///
+    /// Read from the strip's scroll state rather than from the rendered scroll buttons,
+    /// for the same reason as [`Self::open_tabs`]: a button that went away keeps its
+    /// old debug bounds.
+    #[cfg(test)]
+    pub fn tab_strip_ends_for_test(&self) -> (bool, bool) {
+        let ends = StripEnds::of(&self.tab_scroll, strip_button_room(self.metrics()));
+        (ends.before, ends.after)
+    }
+
+    /// The workspace itself, for the tests that put a session or a tab into a state no
+    /// test-reachable control produces directly, such as a long custom name.
+    #[cfg(test)]
+    pub fn workspace_mut_for_test(&mut self) -> &mut Workspace {
+        &mut self.workspace
+    }
+
     /// Whether one session may use a capability at all (R18).
     ///
     /// The protocol decides, and the decision is one value the whole window asks: an
@@ -4604,6 +4661,9 @@ impl ShelluneView {
     /// connecting focuses that attempt's own form and leaves every other attempt
     /// running.
     pub fn activate(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        // A tab that is chosen is brought into the strip's view, even when it was the
+        // current one already and only scrolled away (R2).
+        self.tab_revealed.set(None);
         self.workspace.layout_mut().focus_session(id);
         if self.pane_for(id).is_none() && self.desktop_for(id).is_none() {
             if self.attempt_index(id).is_some() {
@@ -4653,6 +4713,7 @@ impl ShelluneView {
         if !self.workspace.layout_mut().select_index(index) {
             return;
         }
+        self.tab_revealed.set(None);
         self.show_layout_tab(window, cx);
     }
 
@@ -16979,29 +17040,25 @@ impl ShelluneView {
     ///
     /// Every part R7 asks for is here: the name, the kind and the connection state are
     /// read from the session record, so a tab cannot describe a session the domain
-    /// model does not have. The state is a coloured dot while the session is live and
-    /// is spelled out once it is anything else; the object it talks to is on the
-    /// session bar and in the tab's tooltip.
+    /// model does not have. The tab is the browser shape every tab of the strip shares
+    /// (R2): a state dot (breathing while it connects), the kind's icon, the title cut
+    /// with an ellipsis, and the close button. The state is the dot's tone and shape;
+    /// its word, the kind and the target are in the tab's tooltip, so no word can push
+    /// the tab wider than the strip gave it.
     fn session_tab(&self, id: SessionId, index: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let Some(session) = self.workspace.session(id) else {
             return div().id(("session.tab", index));
         };
-        let selected = self
-            .workspace
-            .layout()
-            .tabs()
-            .get(index)
-            .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id())
-            && self.workspace.destination() == Destination::LocalShells;
+        let selected = self.tab_is_current(index);
         let kind = PaneKind::of(session.kind());
         // The projection decides the state, its word and its tone; the tab only draws
         // them, so a tab and the bar under it cannot disagree (R17).
         let status = SessionStatus::of(session);
         let tone = status.tone();
         let state_label = status.headline(self.workspace.locale());
-        let live = status.phase().is_live();
+        let starting = status.phase() == SessionPhase::Starting;
         let kind_label = match kind {
             PaneKind::Local => strings.session_kind_local,
             PaneKind::Remote => strings.session_kind_remote,
@@ -17019,90 +17076,63 @@ impl ShelluneView {
         // What this tab is carrying from the background (R7): a bell or a command end,
         // in words, so the mark is read and not only coloured.
         let unread = self.workspace.session_unread(id);
+        let title = self.tab_title(id);
         let tooltip = format!(
-            "{} · {kind_label} · {} · {state_label}{jump}{marked}",
-            self.tab_title(id),
+            "{title} · {kind_label} · {} · {state_label}{jump}{marked}",
             self.target_of(session),
             marked = tab_attention_summary(unread, strings)
         );
-        let selector = format!("session.tab.{index}");
-        let hover = theme::swatch(palette::SURFACE_HOVER);
-        let hover_text = theme::swatch(palette::TEXT_PRIMARY);
         // The marks are words that cannot shrink, so the tab's own minimum grows by
-        // their room: a narrow strip then clips a whole tab rather than letting one
-        // tab's marks and close button slide over its neighbour (R4, R7).
+        // their room: a crowded strip then scrolls rather than letting one tab's marks
+        // and close button slide over its neighbour (R4, R7).
         let marks = tab_attention_marks(unread, strings, metrics, index);
-        // A state word ("Disconnected", "连接中") cannot shrink either: the tab grows
-        // by its room, so it is read whole instead of being cut at the tab's edge.
-        let state_room = if live {
-            px(0.0)
-        } else {
-            components::reserved_text_width(&state_label, metrics.caption_size())
-                + metrics.scale(spacing::TIGHT)
-        };
         let mark_room = attention_mark_room(unread, metrics);
 
-        let mut tab = div()
-            .id(("session.tab", index))
-            .debug_selector(move || selector.clone())
-            .relative()
-            .flex()
-            .items_center()
-            .flex_shrink()
-            .min_w(metrics.scale(84.0) + mark_room + state_room)
-            .max_w(metrics.scale(220.0) + state_room)
-            .gap(metrics.scale(spacing::TIGHT - 1.0))
-            .h(metrics.tab_height())
-            .pl(metrics.scale(spacing::SNUG - 2.0))
-            .pr(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::MEDIUM))
-            .border_1()
-            .text_size(metrics.label_size())
-            .cursor_pointer()
-            .tooltip(components::tooltip(tooltip))
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                this.activate_in(id, window, cx);
-            }))
-            // A middle click closes a tab and a right click offers the other tab
-            // actions, as in a browser or any other tabbed terminal.
-            .on_mouse_down(
-                gpui::MouseButton::Middle,
-                cx.listener(move |this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.request_close_tab_anchor(id, cx);
-                }),
-            )
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.open_tab_menu(id, event, window, cx);
-                }),
-            );
-        tab = if selected {
-            tab.bg(theme::swatch(palette::SURFACE))
-                .border_color(theme::swatch(palette::BORDER_STRONG))
-                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .shadow(theme::Elevation::Low.shadows())
-        } else {
-            tab.border_color(theme::clear())
-                .text_color(theme::swatch(palette::TEXT_MUTED))
-                .hover(move |style| style.bg(hover).text_color(hover_text))
-        };
+        let tab = browser_tab(
+            ("session.tab", index),
+            format!("session.tab.{index}"),
+            selected,
+            self.tab_divider(index),
+            self.tab_floor(),
+            metrics,
+        )
+        .w(metrics.tab_max_width())
+        .flex_shrink()
+        .min_w(metrics.tab_min_width() + mark_room)
+        .tooltip(components::tooltip(tooltip))
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            this.activate_in(id, window, cx);
+        }))
+        // A middle click closes a tab and a right click offers the other tab
+        // actions, as in a browser or any other tabbed terminal.
+        .on_mouse_down(
+            gpui::MouseButton::Middle,
+            cx.listener(move |this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.request_close_tab_anchor(id, cx);
+            }),
+        )
+        .on_mouse_down(
+            gpui::MouseButton::Right,
+            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.open_tab_menu(id, event, window, cx);
+            }),
+        );
 
         // Everything between the tab's edge and its close button sits in one row that
-        // may be clipped: a tab narrowed by a crowded strip then cuts its own title and
-        // marks at its own edge, instead of drawing them over the next tab and over that
-        // tab's close button. The close button stays outside this row, so it is always
-        // the one the pointer finds inside the tab it belongs to (R4).
-        let body = div()
-            .flex()
-            .flex_1()
-            .items_center()
-            .min_w(px(0.0))
-            .overflow_hidden()
-            .gap(metrics.scale(spacing::TIGHT - 1.0))
-            .child(components::status_dot(tone, metrics))
+        // is clipped: a tab narrowed by a crowded strip cuts its own title at its own
+        // edge, instead of drawing it over the next tab and over that tab's close
+        // button. The close button stays outside this row, so it is always the one the
+        // pointer finds inside the tab it belongs to (R4).
+        let body = tab_body(metrics)
+            .child(components::pulsing_status_dot(
+                tone,
+                metrics,
+                starting,
+                ("session.tab.pulse", index),
+                format!("session.tab.dot.{index}"),
+            ))
             .children(
                 self.workspace
                     .layout()
@@ -17113,68 +17143,83 @@ impl ShelluneView {
                         tab_accent_mark(accent, metrics, format!("session.tab.accent.{index}"))
                     }),
             )
-            .child(icons::icon(
+            .child(tab_icon(
                 if kind == PaneKind::Remote {
                     Icon::Server
                 } else {
                     Icon::Terminal
                 },
-                metrics.scale(13.0),
-                theme::swatch(if selected {
-                    palette::ACCENT
-                } else {
-                    palette::TEXT_MUTED
-                }),
+                selected,
+                metrics,
             ))
-            .child({
-                // The title asks for the room its words need (up to a cap) instead of
-                // relying on the platform's measure of a truncated line, which could
-                // leave a tab with a bare ellipsis where its name belongs.
-                let title = self.tab_title(id);
-                // Marks the tab carries take the room first; the name then truncates.
-                let floor = if mark_room > px(0.0) {
-                    px(0.0)
-                } else {
-                    (components::reserved_text_width(&title, metrics.label_size()) * 1.3)
-                        .min(metrics.scale(110.0))
-                };
-                div()
-                    .flex_shrink()
-                    .min_w(floor)
-                    .truncate()
-                    .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
-                    .child(SharedString::from(title))
-            })
-            .when(!live, |body| {
-                body.child(
-                    div()
-                        .flex_none()
-                        .text_size(metrics.caption_size())
-                        .text_color(tone.text())
-                        .child(SharedString::from(state_label)),
-                )
-            })
+            .child(tab_title_label(
+                title,
+                selected,
+                format!("session.tab.title.{index}"),
+                metrics,
+            ))
             // The background marks sit inside the tab's own target, so choosing the
             // mark is choosing the tab: it shows that tab and its pane, which is also
             // what clears the mark (R7).
             .children(marks);
 
         tab.child(body).child(
-            components::icon_only_button(Icon::Close, metrics)
-                // A pointer target, not a 20px drawing: the smallest size R4
-                // allows, so closing a tab never needs a careful aim.
-                .w(metrics.hit_target())
-                .h(metrics.hit_target())
-                .id(("session.tab.close", index))
-                .debug_selector({
-                    let selector = format!("session.tab.close.{index}");
-                    move || selector.clone()
-                })
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.request_close_tab_anchor(id, cx);
-                })),
+            tab_close_button(
+                ("session.tab.close", index),
+                format!("session.tab.close.{index}"),
+                format!("session.tab.{index}"),
+                selected,
+                metrics,
+            )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.request_close_tab_anchor(id, cx);
+            })),
         )
+    }
+
+    /// Whether the strip's tab at `index` is the one on screen.
+    pub(super) fn tab_is_current(&self, index: usize) -> bool {
+        self.workspace
+            .layout()
+            .tabs()
+            .get(index)
+            .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id())
+            && self.workspace.destination() == Destination::LocalShells
+    }
+
+    /// Whether the strip's tab at `index` draws the hairline on its left.
+    ///
+    /// Two background tabs side by side are told apart by the line; the current tab
+    /// joins the page and needs none, so neither it nor the tab after it draws one. The
+    /// first session tab sits beside the hosts tab, which counts as its neighbour.
+    pub(super) fn tab_divider(&self, index: usize) -> bool {
+        let previous_current = match index.checked_sub(1) {
+            Some(previous) => self.tab_is_current(previous),
+            None => self.home_is_shown(),
+        };
+        !self.tab_is_current(index) && !previous_current
+    }
+
+    /// The colour the current tab is painted with: the floor of the page it opens onto,
+    /// so the tab and the page read as one sheet (R2).
+    ///
+    /// A session with a terminal on screen opens onto the terminal itself, which paints
+    /// the terminal scheme's background right under the head; every other page - the
+    /// hosts home, a connection being set up - opens onto [`PAGE_FLOOR`].
+    pub(super) fn tab_floor(&self) -> gpui::Rgba {
+        let terminal = !self.home_is_shown()
+            && self
+                .workspace
+                .layout()
+                .active_session()
+                .is_some_and(|id| self.pane_for(id).is_some() && !self.files.is_open(id))
+            && !self.connection_inline();
+        if terminal {
+            terminal_floor()
+        } else {
+            theme::swatch(PAGE_FLOOR)
+        }
     }
 
     /// The label of one tab: the user's own name, or the session's title numbered
@@ -17218,25 +17263,163 @@ impl ShelluneView {
         self.tab_title(id)
     }
 
-    /// The tabs of the sessions that are still open, in the order they were opened.
-    fn tab_row(&self, cx: &mut Context<Self>) -> Div {
+    /// The tabs of the sessions that are still open, in the order they were opened, in
+    /// a strip that scrolls sideways once they no longer fit (R2).
+    ///
+    /// Every tab gives up width down to its minimum; past that the strip scrolls rather
+    /// than clipping a tab or pushing the window buttons out of the row. A tab that
+    /// becomes the current one is brought into view once, and the user's own scrolling
+    /// is left alone after that. While tabs are hidden past an end, that end fades out
+    /// and carries a button that scrolls towards it; the list of every tab stays beside
+    /// the strip.
+    pub(super) fn tab_strip(&self, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
-        let mut row = div()
+        let handle = self.tab_scroll.clone();
+        let layout = self.workspace.layout();
+        let width = handle.bounds().size.width;
+        let current = layout.active_tab_id().map(|id| (id, width));
+        // The tab to bring into view in this frame, if the current tab or the strip's
+        // width changed since the last one was.
+        let mut reveal = None;
+        if current != self.tab_revealed.get() {
+            reveal = current
+                .and_then(|(current, _)| layout.tabs().iter().position(|tab| tab.id() == current));
+            self.tab_revealed.set(current);
+        }
+        let room = strip_button_room(metrics);
+        let ends = StripEnds::of(&handle, room);
+        let fade = strip_fade_width(metrics);
+
+        let mut scroller = div()
+            .id("session.tabs.scroll")
+            .track_scroll(&handle)
+            .overflow_x_scroll()
             .flex()
-            .items_center()
-            .flex_1()
+            .items_end()
+            .h_full()
             .min_w(px(0.0))
-            .overflow_hidden()
-            .gap(metrics.scale(spacing::HAIRLINE))
             .debug_selector(|| "session.tabs".to_owned());
-        for index in 0..self.workspace.layout().tabs().len() {
-            if let Some(id) = self.workspace.layout().anchor_of(index) {
-                row = row.child(self.session_tab(id, index, cx));
+        for index in 0..layout.tabs().len() {
+            if let Some(id) = layout.anchor_of(index) {
+                scroller = scroller.child(self.session_tab(id, index, cx));
             } else {
-                row = row.child(self.pending_tab(index, cx));
+                scroller = scroller.child(self.pending_tab(index, cx));
             }
         }
-        row
+
+        // The ends were worked out from the strip's last layout. Once this frame is laid
+        // out, the tab to reveal is scrolled to from the fresh layout - clear of the
+        // fades, so its close button is not under a scroll button - and the frame is
+        // drawn once more if that scroll, the ends or the strip's width moved: a fade or
+        // a scroll button never lingers or goes missing, and a strip that narrows keeps
+        // its current tab in view.
+        let view = cx.entity_id();
+        let check = handle.clone();
+        let watch = gpui::canvas(
+            move |_bounds, _window, cx| {
+                let mut moved = false;
+                if let Some(target) = reveal.and_then(|index| revealed_offset(&check, index, fade))
+                {
+                    let mut offset = check.offset();
+                    if (offset.x - target).abs() > px(0.5) {
+                        offset.x = target;
+                        check.set_offset(offset);
+                        moved = true;
+                    }
+                }
+                if moved
+                    || StripEnds::of(&check, room) != ends
+                    || check.bounds().size.width != width
+                {
+                    // A view cannot be marked for drawing while it is being drawn; the
+                    // request waits until this frame is done.
+                    cx.defer(move |cx| cx.notify(view));
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+
+        div()
+            .relative()
+            .flex()
+            .flex_initial()
+            .min_w(px(0.0))
+            .h_full()
+            // The fades and buttons stay inside the strip, never over the hosts tab or
+            // the controls beside it.
+            .overflow_hidden()
+            .child(scroller)
+            .when(ends.before, |strip| {
+                strip.child(self.strip_end(StripEnd::Start, metrics, cx))
+            })
+            .when(ends.after, |strip| {
+                strip.child(self.strip_end(StripEnd::End, metrics, cx))
+            })
+            .child(watch)
+    }
+
+    /// One end of the tab strip while tabs are hidden past it: a fade over the tabs
+    /// that run on, and a button that scrolls the strip towards them (R2).
+    fn strip_end(&self, end: StripEnd, metrics: Metrics, cx: &mut Context<Self>) -> Div {
+        let strings = self.strings();
+        let chrome = theme::swatch(palette::CHROME);
+        let clear = theme::faded(chrome, 0.0);
+        let (selector, icon, label) = match end {
+            StripEnd::Start => (
+                "session.tabs.scroll.start",
+                Icon::ChevronLeft,
+                strings.tabs_scroll_start,
+            ),
+            StripEnd::End => (
+                "session.tabs.scroll.end",
+                Icon::ChevronRight,
+                strings.tabs_scroll_end,
+            ),
+        };
+        // Solid under the button, clear towards the tabs: the tab that runs on fades
+        // out instead of being cut by a hard edge.
+        let (from, to) = match end {
+            StripEnd::Start => (
+                gpui::linear_color_stop(chrome, 0.4),
+                gpui::linear_color_stop(clear, 1.0),
+            ),
+            StripEnd::End => (
+                gpui::linear_color_stop(clear, 0.0),
+                gpui::linear_color_stop(chrome, 0.6),
+            ),
+        };
+        // It stops one hairline short of the bottom, so the line that closes the head
+        // runs on under it.
+        let fade = div()
+            .absolute()
+            .top_0()
+            .bottom(px(1.0))
+            .w(strip_fade_width(metrics))
+            .flex()
+            .items_center()
+            .bg(gpui::linear_gradient(90.0, from, to))
+            .debug_selector(move || format!("{selector}.fade"));
+        let fade = match end {
+            StripEnd::Start => fade.left_0().justify_start(),
+            StripEnd::End => fade.right_0().justify_end(),
+        };
+        let handle = self.tab_scroll.clone();
+        fade.child(
+            components::icon_only_button(icon, metrics)
+                .size(metrics.hit_target())
+                .rounded(px(radius::MEDIUM))
+                .bg(chrome)
+                .id(selector)
+                .debug_selector(move || selector.to_owned())
+                .tooltip(components::tooltip(label))
+                .on_click(cx.listener(move |_this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    scroll_strip(&handle, end);
+                    cx.notify();
+                })),
+        )
     }
 
     /// What the session has to explain above the terminal: a bridge that failed, and
@@ -18117,11 +18300,265 @@ fn overlay_layer() -> Div {
     div().absolute().top_0().left_0()
 }
 
+/// The floor of the pages a tab opens onto that are not a terminal: the hosts home and
+/// a connection being set up.
+///
+/// The current tab is painted with it, so the tab and the page under it join without
+/// an edge (R2); the home paints its own floor from here as well, so the two cannot
+/// drift apart.
+pub(super) const PAGE_FLOOR: theme::Token = palette::CANVAS;
+
+/// The background the terminal paints right under the head, in the terminal scheme of
+/// the window being drawn: the floor a terminal's tab joins (R2).
+fn terminal_floor() -> gpui::Rgba {
+    let background = shellune_terminal::palette::BACKGROUND;
+    let value =
+        u32::from(background.r) << 16 | u32::from(background.g) << 8 | u32::from(background.b);
+    gpui::rgb(theme::terminal_color(value))
+}
+
+/// The browser-shaped frame every tab of the strip shares (R2).
+///
+/// The tabs stand on the head's bottom edge. The current tab is painted with the floor
+/// of the page it opens onto and is drawn down over the hairline that closes the head,
+/// with an edge on its top and sides and a rounded top, so it and the page read as one
+/// sheet. The other tabs are clear on the chrome and take a light fill under the
+/// pointer. `divider` draws the hairline that separates two background neighbours.
+///
+/// The frame is also a hover group named by `selector`, so the close button can show
+/// itself while the pointer is anywhere on the tab.
+fn browser_tab(
+    id: impl Into<gpui::ElementId>,
+    selector: String,
+    selected: bool,
+    divider: bool,
+    floor: gpui::Rgba,
+    metrics: Metrics,
+) -> Stateful<Div> {
+    let hover = theme::swatch(palette::SURFACE_HOVER);
+    let hover_text = theme::swatch(palette::TEXT_PRIMARY);
+    let tab = div()
+        .id(id)
+        .group(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .relative()
+        .flex()
+        .items_center()
+        .gap(metrics.scale(spacing::HAIRLINE))
+        .h(metrics.tab_height())
+        .pl(metrics.scale(spacing::SNUG - 2.0))
+        .pr(metrics.scale(spacing::HAIRLINE))
+        .rounded_t(px(radius::LARGE))
+        .text_size(metrics.label_size())
+        .cursor_pointer();
+    let tab = if selected {
+        tab.bg(floor)
+            .border_t_1()
+            .border_l_1()
+            .border_r_1()
+            .border_color(theme::swatch(palette::BORDER))
+            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+    } else {
+        tab.text_color(theme::swatch(palette::TEXT_SECONDARY))
+            .hover(move |style| style.bg(hover).text_color(hover_text))
+    };
+    tab.when(divider, |tab| {
+        tab.child(
+            div()
+                .absolute()
+                .left_0()
+                .top((metrics.tab_height() - metrics.scale(16.0)) / 2.0)
+                .w(px(1.0))
+                .h(metrics.scale(16.0))
+                .bg(theme::swatch(palette::BORDER_STRONG)),
+        )
+    })
+}
+
+/// The clipped row between a tab's edge and its close button: the state dot, the
+/// identity marks, the icon and the title (R2, R4).
+fn tab_body(metrics: Metrics) -> Div {
+    div()
+        .flex()
+        .flex_1()
+        .items_center()
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .gap(metrics.scale(spacing::TIGHT - 2.0))
+}
+
+/// The icon of a tab: accent while the tab is current, muted otherwise.
+fn tab_icon(icon: Icon, selected: bool, metrics: Metrics) -> gpui::Svg {
+    icons::icon(
+        icon,
+        metrics.scale(13.0),
+        theme::swatch(if selected {
+            palette::ACCENT
+        } else {
+            palette::TEXT_MUTED
+        }),
+    )
+}
+
+/// The title of a tab on one line, cut with an ellipsis where the tab ends (R2).
+///
+/// It takes what the tab has left after its fixed parts and nothing more, so a long
+/// name never pushes the close button or the next tab aside; the whole name is in the
+/// tooltip.
+///
+/// The words sit in a box pinned to the slot's edges rather than in the slot itself.
+/// A line is measured once per frame, and as a flex item its first measure is the
+/// whole name, which the slot would then clip without an ellipsis; pinned to the
+/// slot, the line is measured against the slot's own width and is cut where it ends.
+fn tab_title_label(
+    title: impl Into<SharedString>,
+    selected: bool,
+    selector: String,
+    metrics: Metrics,
+) -> Div {
+    let line = metrics.scale(20.0);
+    div()
+        .relative()
+        .flex_1()
+        .min_w(px(0.0))
+        .h(line)
+        .debug_selector(move || selector.clone())
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .line_height(line)
+                .truncate()
+                .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
+                .child(title.into()),
+        )
+}
+
+/// The close button of a tab: a full pointer target, shown on the current tab and on
+/// any tab under the pointer (R2, R4).
+///
+/// A background tab keeps the button's target while it is hidden, so the pointer that
+/// reaches for it shows it before the click lands.
+fn tab_close_button(
+    id: impl Into<gpui::ElementId>,
+    selector: String,
+    group: String,
+    selected: bool,
+    metrics: Metrics,
+) -> Stateful<Div> {
+    components::icon_only_button(Icon::Close, metrics)
+        // A pointer target, not a 20px drawing: the smallest size R4 allows, so
+        // closing a tab never needs a careful aim.
+        .w(metrics.hit_target())
+        .h(metrics.hit_target())
+        .when(!selected, |button| {
+            button
+                .opacity(0.0)
+                .group_hover(SharedString::from(group), |style| style.opacity(1.0))
+        })
+        .id(id)
+        .debug_selector(move || selector.clone())
+}
+
+/// One end of the tab strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripEnd {
+    /// The left end, towards the first tab.
+    Start,
+    /// The right end, towards the last tab.
+    End,
+}
+
+/// Whether tabs are hidden past either end of the strip, read from its scroll state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StripEnds {
+    /// Tabs run on past the left end.
+    before: bool,
+    /// Tabs run on past the right end.
+    after: bool,
+}
+
+impl StripEnds {
+    /// The ends of the strip `handle` scrolls, as it was last laid out.
+    ///
+    /// A strip narrower than `room` - the two scroll buttons side by side - shows no
+    /// tab whole anyway and has no place for the buttons, so it reports no hidden
+    /// end; its tabs are reached through the list of every tab beside it.
+    fn of(handle: &gpui::ScrollHandle, room: gpui::Pixels) -> Self {
+        if handle.bounds().size.width < room {
+            return Self {
+                before: false,
+                after: false,
+            };
+        }
+        let offset = handle.offset().x;
+        let max = handle.max_offset().width;
+        let slack = px(0.5);
+        Self {
+            before: offset < -slack,
+            after: max > slack && offset > -max + slack,
+        }
+    }
+}
+
+/// How far a fade reaches into the strip from an end that tabs run on past (R2).
+fn strip_fade_width(metrics: Metrics) -> gpui::Pixels {
+    metrics.scale(48.0)
+}
+
+/// The scroll offset that shows the strip's tab at `index` whole and clear of the
+/// fades at both ends, moving the strip as little as it can (R2).
+///
+/// It reads the strip's fresh layout, so it is asked once the frame has been laid out.
+/// A strip too narrow for the tab and both fades shows the tab against its edges
+/// instead; nothing is scrolled past either end.
+fn revealed_offset(
+    handle: &gpui::ScrollHandle,
+    index: usize,
+    fade: gpui::Pixels,
+) -> Option<gpui::Pixels> {
+    let item = handle.bounds_for_item(index)?;
+    let strip = handle.bounds();
+    let max = handle.max_offset().width;
+    let offset = handle.offset().x;
+    let inset = if strip.size.width >= item.size.width + fade * 2.0 {
+        fade
+    } else {
+        px(0.0)
+    };
+    let target = if item.left() + offset < strip.left() + inset {
+        strip.left() + inset - item.left()
+    } else if item.right() + offset > strip.right() - inset {
+        strip.right() - inset - item.right()
+    } else {
+        offset
+    };
+    Some(target.min(px(0.0)).max(-max))
+}
+
+/// The narrowest strip that has room for its two scroll buttons (R2).
+fn strip_button_room(metrics: Metrics) -> gpui::Pixels {
+    metrics.hit_target() * 2.0
+}
+
+/// Scrolls the strip by most of its width towards one end, stopping at that end.
+fn scroll_strip(handle: &gpui::ScrollHandle, end: StripEnd) {
+    let step = (handle.bounds().size.width * 0.75).max(px(1.0));
+    let max = handle.max_offset().width;
+    let mut offset = handle.offset();
+    offset.x = match end {
+        StripEnd::Start => (offset.x + step).min(px(0.0)),
+        StripEnd::End => (offset.x - step).max(-max),
+    };
+    handle.set_offset(offset);
+}
+
 /// The small mark that gives a tab its own colour, when it has one.
 ///
 /// It is drawn beside the status dot and never instead of it: the colour says which
-/// tab this is, while the dot and the state word say what the session is doing. A tab
-/// without a colour draws nothing here, so no state depends on colour being set (R2).
+/// tab this is, while the dot and the tooltip's state word say what the session is
+/// doing. A tab without a colour draws nothing here, so no state depends on colour
+/// being set (R2).
 fn tab_accent_mark(accent: TabAccent, metrics: Metrics, selector: String) -> Div {
     div()
         .flex_none()
@@ -18429,6 +18866,24 @@ fn session_target(book: &HostBook, session: &Session) -> String {
 #[cfg(not(test))]
 fn default_store() -> HostStore {
     HostStore::default_location()
+}
+
+/// The text size the preferences file records, read before the window exists so the
+/// macOS window buttons can be centred on the top row the window will draw (R2).
+///
+/// A file that cannot be read, or records no size, opens at the default size; the
+/// window reports the problem itself once it loads the same file.
+#[must_use]
+pub fn saved_zoom() -> theme::Zoom {
+    let (saved, _problem) = PreferencesStore::at(default_store().root()).load_reported();
+    saved
+        .text_size
+        .and_then(|percent| {
+            theme::Zoom::ALL
+                .into_iter()
+                .find(|zoom| zoom_percent(*zoom) == percent)
+        })
+        .unwrap_or_default()
 }
 
 /// A text size as the percent the preferences file records.

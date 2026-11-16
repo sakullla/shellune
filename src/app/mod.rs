@@ -286,8 +286,11 @@ fn open_main_window(cx: &mut App) -> Result<(), String> {
         titlebar: Some(TitlebarOptions {
             title: Some(product::NAME.into()),
             appears_transparent: view::custom_titlebar(Platform::current()),
+            // Centred on the top row at the text size the window opens with: the row
+            // grows with the text and the system's buttons do not (R2).
             traffic_light_position: (Platform::current() == Platform::MacOs).then(|| {
-                let (x, y) = view::TRAFFIC_LIGHT_POSITION;
+                let metrics = theme::Metrics::new(view::saved_zoom());
+                let (x, y) = view::traffic_light_position(metrics);
                 gpui::point(px(x), px(y))
             }),
         }),

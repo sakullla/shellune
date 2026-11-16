@@ -439,6 +439,43 @@ pub fn status_dot(tone: Tone, metrics: Metrics) -> Div {
     status_mark(tone, metrics.scale(7.0))
 }
 
+/// A named status dot that breathes while the state it marks is still on its way, such
+/// as a connection being made (R2); `breathing` says whether it is.
+///
+/// The breath repeats only while full motion is allowed. With reduced motion the dot
+/// is drawn still and at full strength: its silhouette and tone already say the state,
+/// and the word is in the tooltip of whatever carries the dot. `selector` names the dot,
+/// and a breathing dot also carries `<selector>.pulse` so a test can tell the two apart.
+pub fn pulsing_status_dot(
+    tone: Tone,
+    metrics: Metrics,
+    breathing: bool,
+    id: impl Into<gpui::ElementId>,
+    selector: String,
+) -> Div {
+    let dot = status_dot(tone, metrics);
+    let dot = if breathing && theme::motion_allowed() {
+        let pulse = format!("{selector}.pulse");
+        dot.debug_selector(move || pulse.clone())
+            .with_animation(
+                id,
+                Animation::new(theme::Motion::PULSE)
+                    .repeat()
+                    .with_easing(gpui::pulsating_between(0.35, 1.0)),
+                |dot, delta| dot.opacity(delta),
+            )
+            .into_any_element()
+    } else {
+        dot.into_any_element()
+    };
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .debug_selector(move || selector.clone())
+        .child(dot)
+}
+
 /// A compact label that carries a state's word, mark and tone.
 ///
 /// It is a hairline block, not a pill: the mark's shape and the word carry the state,

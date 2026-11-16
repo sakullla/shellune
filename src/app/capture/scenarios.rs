@@ -509,6 +509,61 @@ fn show_tabs(
     Ok(())
 }
 
+/// The shells of the overflowing strip: enough programs that the titles differ.
+const OVERFLOW_SHELLS: [&str; 7] = ["pwsh", "zsh", "bash", "fish", "nu", "cmd", "sh"];
+
+/// How many tabs the overflowing strip holds.
+const OVERFLOW_TABS: usize = 14;
+
+/// The tab that is current in the overflowing strip: one in the middle, so tabs run on
+/// past both ends.
+const OVERFLOW_CURRENT: usize = 7;
+
+/// The name the long-titled tab carries in the tab shots.
+const LONG_TAB_NAME: &str = "production-database-primary eu-west-1 log watcher";
+
+/// More tabs than the strip has room for, with one in the middle current (R2).
+fn show_tabs_overflow(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let mut ids = Vec::new();
+    for index in 0..OVERFLOW_TABS {
+        let program = OVERFLOW_SHELLS[index % OVERFLOW_SHELLS.len()];
+        ids.push(add_session(
+            view,
+            window,
+            cx,
+            program,
+            TRANSCRIPT.as_bytes(),
+        )?);
+    }
+    view.capture_name_tab(ids[2], LONG_TAB_NAME);
+    view.activate(ids[OVERFLOW_CURRENT], cx);
+    Ok(())
+}
+
+/// A shell with a long name beside a saved host's tab that is connecting again (R2).
+fn show_tabs_connecting(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let first = add_session(view, window, cx, SHOT_SHELL, TRANSCRIPT.as_bytes())?;
+    view.capture_name_tab(first, LONG_TAB_NAME);
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    let remote = view.attach_capture_remote_session(&host, TRANSCRIPT.as_bytes(), Some(window), cx);
+    view.capture_reconnecting(remote);
+    // The long-named tab is the current one, so its title is drawn at full weight and
+    // the connecting tab is one in the background.
+    view.activate(first, cx);
+    Ok(())
+}
+
 /// One session in a tab of its own, split left and right, with the new pane active
 /// (R5, R12).
 fn show_split(
@@ -1525,6 +1580,41 @@ fn tabs_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     Ok(())
 }
 
+fn tabs_overflow_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    let count = view.workspace().layout().tabs().len();
+    if count != OVERFLOW_TABS {
+        return Err(format!(
+            "the strip holds {count} tab(s), not the {OVERFLOW_TABS} the fixture opened"
+        ));
+    }
+    // The point of the shot is a strip that runs on past both ends; until it has been
+    // laid out that way the picture would be of something else.
+    match view.capture_tab_strip_ends() {
+        (true, true) => Ok(()),
+        ends => Err(format!(
+            "the strip does not run on past both ends yet: {ends:?}"
+        )),
+    }
+}
+
+fn tabs_connecting_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    let connecting = view
+        .workspace()
+        .sessions()
+        .items()
+        .iter()
+        .filter(|session| matches!(session.state(), SessionState::Connecting))
+        .count();
+    if connecting != 1 {
+        return Err(format!(
+            "{connecting} session(s) are connecting, not the one the fixture reconnected"
+        ));
+    }
+    Ok(())
+}
+
 fn split_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
     on_page(view, Destination::LocalShells, SectionState::Populated)?;
     let panes = view.workspace().layout().leaves().len();
@@ -2498,19 +2588,64 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "terminal-tabs",
-        title: "终端 · 多标签与后台提醒",
+        title: "终端 · 浏览器式标签与后台提醒",
         category: Category::Terminal,
         fixture: "two display-only shells and one saved host's terminal, the second tab \
                   carrying a background bell",
-        evidence: "proves the merged head names the current tab once, and that another tab's \
-                   bell is marked while it is not the one on screen; no shell, SSH session or \
-                   bell from a real program is part of it",
+        evidence: "proves the browser-style strip: the current tab joins the page under it, \
+                   each tab is a state dot, an icon, a cut title and a close button, and \
+                   another tab's bell is marked while it is not the one on screen; no shell, \
+                   SSH session or bell from a real program is part of it",
         quick: true,
-        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest(),
+            Variant::light().comfortable(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_tabs,
         ready: tabs_ready,
+    },
+    Scenario {
+        id: "tabs-overflow",
+        title: "终端 · 标签溢出横向滚动",
+        category: Category::Terminal,
+        fixture: "fourteen display-only shells in one strip, a tab in the middle current, \
+                  one of them with a long name",
+        evidence: "proves a strip with more tabs than room scrolls instead of clipping: both ends \
+                   fade and carry a scroll button, the current tab is in view, and the window \
+                   buttons keep their place; no shell is running behind any tab",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest(),
+            Variant::dark().comfortable(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_tabs_overflow,
+        ready: tabs_overflow_ready,
+    },
+    Scenario {
+        id: "tabs-connecting",
+        title: "终端 · 标签连接中与长标题",
+        category: Category::Terminal,
+        fixture: "a display-only shell with a long name and a saved host's tab put back into \
+                  connecting, the way a reconnect starts",
+        evidence: "proves a connecting tab says so with its dot and keeps its width, and a long \
+                   name is cut inside its own tab; the capture runs with reduced motion, so the \
+                   dot's breath is not in the picture, and no connection is being made",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_tabs_connecting,
+        ready: tabs_connecting_ready,
     },
     Scenario {
         id: "terminal-split",

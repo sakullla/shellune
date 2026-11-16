@@ -1365,9 +1365,23 @@ impl Metrics {
         self.compact_control_height().max(px(HIT_TARGET))
     }
 
-    /// Height of one session tab.
+    /// Height of one tab of the strip.
+    ///
+    /// The strip's tabs stand on the head's bottom edge, so this is the header height
+    /// less the gap above them: the current tab then reaches down to the page it opens
+    /// onto (R2).
     pub fn tab_height(self) -> Pixels {
-        self.scale(30.0)
+        self.scale(36.0)
+    }
+
+    /// The narrowest a tab of the strip becomes before the strip scrolls instead (R2).
+    pub fn tab_min_width(self) -> Pixels {
+        self.scale(120.0)
+    }
+
+    /// The widest a tab of the strip grows when there is room (R2).
+    pub fn tab_max_width(self) -> Pixels {
+        self.scale(220.0)
     }
 
     /// Body text size.

@@ -67,15 +67,26 @@ impl ShelluneView {
     /// session's actions. Drawing the name again under the tabs is what made the old
     /// window spend two rows on one object.
     pub(super) fn session_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        // The hairline that closes the head is drawn first and the row over it, so the
+        // current tab, which reaches the bottom edge, covers it and joins the page
+        // below; everywhere else the line shows (R2).
         div()
+            .relative()
             .flex()
             .flex_col()
             .flex_none()
             .w_full()
             .bg(theme::swatch(palette::CHROME))
-            .border_b_1()
-            .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "session.header".to_owned())
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.0))
+                    .bg(theme::swatch(palette::BORDER)),
+            )
             .child(self.top_bar(window, cx))
     }
 
@@ -92,7 +103,7 @@ impl ShelluneView {
         let height = metrics.header_height();
 
         let leading_room = if platform == Platform::MacOs {
-            metrics.scale(super::titlebar::TRAFFIC_LIGHT_ROOM)
+            super::titlebar::traffic_light_room(metrics)
         } else {
             metrics.scale(spacing::SNUG)
         };
@@ -108,25 +119,20 @@ impl ShelluneView {
                 row.child(brand_mark(metrics.scale(22.0), metrics))
             });
 
+        // The tabs stand on the head's bottom edge, so the current one reaches down to
+        // the page it opens onto. The hosts tab is pinned; the session tabs scroll
+        // beside it once they do not fit (R2).
         let tabs = div()
             .flex()
-            .items_center()
+            .items_end()
             .flex_initial()
             .min_w(px(0.0))
+            .h(height)
             .overflow_hidden()
-            .gap(metrics.scale(2.0))
             .child(self.home_tab(cx))
             .when(!self.workspace.layout().tabs().is_empty(), |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .w(px(1.0))
-                        .h(metrics.scale(18.0))
-                        .mx(metrics.scale(spacing::HAIRLINE))
-                        .bg(theme::swatch(palette::BORDER_STRONG)),
-                )
-            })
-            .child(self.tab_row(cx).flex_initial());
+                row.child(self.tab_strip(cx))
+            });
 
         let trailing = div()
             .flex()
@@ -492,11 +498,14 @@ impl ShelluneView {
     }
 
     /// The pinned first tab: the hosts home.
+    ///
+    /// It has the shape of every other tab (R2) and the parts a page has: no state dot
+    /// and no close button, since the home is not a session and cannot be closed. It
+    /// sits outside the scrolling strip, so it is always one click away.
     fn home_tab(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics();
         let strings = self.strings();
         let selected = self.home_is_shown();
-        let hover = theme::swatch(palette::SURFACE_HOVER);
         // Every saved record the page lists, desktop and serial ones too.
         let count = self.book.hosts().len() + self.book.connections().len();
         // The hint reads the binding in force, so a rebound or unbound shortcut is
@@ -507,53 +516,44 @@ impl ShelluneView {
             Some(shortcut) => format!("{} · {shortcut}", strings.nav_hosts),
             None => strings.nav_hosts.to_owned(),
         };
-        let mut tab = div()
-            .id("nav.hosts")
-            .debug_selector(|| "nav.hosts".to_owned())
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(metrics.scale(spacing::HAIRLINE + 2.0))
-            .h(metrics.tab_height())
-            .px(metrics.scale(spacing::SNUG - 2.0))
-            .rounded(px(radius::MEDIUM))
-            .text_size(metrics.label_size())
-            .cursor_pointer()
-            .tooltip(components::tooltip(SharedString::from(tooltip)))
-            .on_click(cx.listener(|this, _event, window, cx| {
-                this.select(Destination::Hosts, window, cx);
-            }));
-        tab = if selected {
-            tab.bg(theme::swatch(palette::SURFACE))
-                .border_1()
-                .border_color(theme::swatch(palette::BORDER_STRONG))
-                .shadow(theme::Elevation::Low.shadows())
-                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .font_weight(FontWeight::MEDIUM)
-        } else {
-            tab.border_1()
-                .border_color(theme::clear())
-                .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                .hover(move |style| style.bg(hover))
-        };
-        tab.child(icons::icon(
-            Icon::Server,
-            metrics.small_icon_size(),
-            theme::swatch(if selected {
-                palette::ACCENT
-            } else {
-                palette::TEXT_MUTED
-            }),
-        ))
-        .child(strings.nav_hosts)
-        .when(count > 0, |tab| {
-            tab.child(
-                div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(SharedString::from(count.to_string())),
-            )
-        })
+        super::browser_tab(
+            "nav.hosts",
+            "nav.hosts".to_owned(),
+            selected,
+            false,
+            self.tab_floor(),
+            metrics,
+        )
+        // Pinned and always there, so it is only as wide as its word and count (up to
+        // the strip's widest tab): the room it does not take is the session tabs'.
+        .flex_none()
+        .max_w(metrics.tab_max_width())
+        .pr(metrics.scale(spacing::SNUG - 2.0))
+        .tooltip(components::tooltip(SharedString::from(tooltip)))
+        .on_click(cx.listener(|this, _event, window, cx| {
+            this.select(Destination::Hosts, window, cx);
+        }))
+        .child(
+            super::tab_body(metrics)
+                .child(super::tab_icon(Icon::Server, selected, metrics))
+                // One short word that is never cut, with the count right after it.
+                .child(
+                    div()
+                        .flex_none()
+                        .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
+                        .debug_selector(|| "nav.hosts.title".to_owned())
+                        .child(strings.nav_hosts),
+                )
+                .when(count > 0, |body| {
+                    body.child(
+                        div()
+                            .flex_none()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(count.to_string())),
+                    )
+                }),
+        )
     }
 
     /// "+" opens the default shell in a new tab; the chevron lists every shell, quick
@@ -747,7 +747,8 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .bg(theme::swatch(palette::CANVAS));
+            // The hosts tab is painted with the same floor, so the two join (R2).
+            .bg(theme::swatch(super::PAGE_FLOOR));
         if welcome || matches!(state, SectionState::Loading | SectionState::Failed) {
             // A card or a failure is read by scrolling the page, as before.
             page.overflow_y_scroll().child(column)

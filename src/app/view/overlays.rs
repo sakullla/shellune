@@ -1300,45 +1300,24 @@ impl ShelluneView {
         let tab_count = self.workspace.layout().tabs().len();
         let index =
             (0..tab_count).find(|index| self.workspace.layout().anchor_of(*index) == Some(id))?;
+        // The shared menu entry, with the shortcut in force at its far end: the tab's
+        // menu is the same object as every other menu (R2).
         let item = |label: &'static str,
                     selector: &'static str,
+                    icon: Icon,
                     shortcut: Option<String>,
                     enabled: bool| {
-            let hover = theme::swatch(colors::SURFACE_HOVER);
-            div()
-                .id(selector)
-                .debug_selector(move || selector.to_owned())
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(metrics.scale(spacing::BASE))
-                .h(metrics.scale(30.0))
-                .px(metrics.scale(spacing::TIGHT + 2.0))
-                .rounded(px(radius::MEDIUM))
-                .text_size(metrics.label_size())
-                .text_color(theme::swatch(if enabled {
-                    colors::TEXT_PRIMARY
-                } else {
-                    colors::TEXT_MUTED
-                }))
-                .when(enabled, |item| {
-                    item.cursor_pointer().hover(move |style| style.bg(hover))
-                })
-                .child(label)
+            components::menu_entry(label, selector, Some(icon), enabled, false, metrics)
                 .children(shortcut.map(|shortcut| {
                     div()
+                        .ml_auto()
+                        .pl(metrics.scale(spacing::BASE))
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(colors::TEXT_MUTED))
                         .child(shortcut)
                 }))
         };
-        let divider = || {
-            div()
-                .h(px(1.0))
-                .mx(metrics.scale(spacing::HAIRLINE))
-                .my(metrics.scale(2.0))
-                .bg(theme::swatch(colors::BORDER))
-        };
+        let divider = || components::menu_divider(metrics);
 
         let has_others = tab_count > 1;
         let has_right = index + 1 < tab_count;
@@ -1349,6 +1328,7 @@ impl ShelluneView {
             item(
                 strings.session_reconnect,
                 "tab.menu.reconnect",
+                Icon::Refresh,
                 self.keymap.label("session.reconnect"),
                 true,
             )
@@ -1365,25 +1345,22 @@ impl ShelluneView {
         let max_height =
             (viewport.height - metrics.header_height() - metrics.scale(spacing::LOOSE))
                 .max(metrics.scale(120.0));
-        let menu = div()
+        let menu = components::menu_card("tab.menu", metrics)
             .id("tab.menu")
-            .debug_selector(|| "tab.menu".to_owned())
-            .flex()
-            .flex_col()
             .min_w(metrics.scale(220.0))
             .max_h(max_height)
             .overflow_y_scroll()
-            .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(colors::RAISED))
-            .border_1()
-            .border_color(theme::swatch(colors::BORDER_STRONG))
-            .shadow(theme::Elevation::Mid.shadows())
             .when_some(reconnect, |menu, reconnect| {
                 menu.child(reconnect).child(divider())
             })
             .child(
-                item(strings.tab_menu_duplicate, "tab.menu.duplicate", None, true).on_click(
+                item(
+                    strings.tab_menu_duplicate,
+                    "tab.menu.duplicate",
+                    Icon::Copy,
+                    None,
+                    true,
+                ).on_click(
                     cx.listener(move |this, _event, window, cx| {
                         this.close_tab_menu(window, cx);
                         this.duplicate_session(id, window, cx);
@@ -1394,6 +1371,7 @@ impl ShelluneView {
                 item(
                     strings.tab_menu_rename,
                     "tab.menu.rename",
+                    Icon::Pencil,
                     None,
                     tab.is_some(),
                 )
@@ -1411,6 +1389,7 @@ impl ShelluneView {
                 item(
                     strings.tab_menu_move_left,
                     "tab.menu.move_left",
+                    Icon::ChevronLeft,
                     None,
                     index > 0,
                 )
@@ -1425,6 +1404,7 @@ impl ShelluneView {
                 item(
                     strings.tab_menu_move_right,
                     "tab.menu.move_right",
+                    Icon::ChevronRight,
                     None,
                     index + 1 < tab_count,
                 )
@@ -1440,6 +1420,7 @@ impl ShelluneView {
                 item(
                     strings.tab_menu_close,
                     "tab.menu.close",
+                    Icon::Close,
                     self.keymap.label("tab.close"),
                     true,
                 )
@@ -1452,6 +1433,7 @@ impl ShelluneView {
                 item(
                     strings.tab_menu_close_others,
                     "tab.menu.close_others",
+                    Icon::Layers,
                     None,
                     has_others,
                 )
@@ -1466,6 +1448,7 @@ impl ShelluneView {
                 item(
                     strings.tab_menu_close_right,
                     "tab.menu.close_right",
+                    Icon::ArrowRight,
                     None,
                     has_right,
                 )

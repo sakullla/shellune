@@ -1014,6 +1014,10 @@ pub struct Strings {
     pub tab_accent_clay: &'static str,
     /// Title of the list of every open tab.
     pub tab_list_title: &'static str,
+    /// The button at the strip's left end while tabs are hidden past it (R2).
+    pub tabs_scroll_start: &'static str,
+    /// The button at the strip's right end while tabs are hidden past it (R2).
+    pub tabs_scroll_end: &'static str,
     /// Explains the tab list: strip order, and choosing one shows it.
     pub tab_list_hint: &'static str,
     /// Mark on a tab whose shell rang the bell in the background.
@@ -1618,6 +1622,8 @@ pub static ENGLISH: Strings = Strings {
     tab_accent_orchid: "Orchid",
     tab_accent_clay: "Clay",
     tab_list_title: "All tabs",
+    tabs_scroll_start: "Scroll tabs left",
+    tabs_scroll_end: "Scroll tabs right",
     tab_list_hint: "Every open tab, in strip order. Choosing one shows it.",
     tab_mark_bell: "Bell",
     tab_mark_finished: "Ended",
@@ -2152,6 +2158,8 @@ pub static CHINESE: Strings = Strings {
     tab_accent_orchid: "兰紫",
     tab_accent_clay: "陶土",
     tab_list_title: "全部标签",
+    tabs_scroll_start: "向左滚动标签",
+    tabs_scroll_end: "向右滚动标签",
     tab_list_hint: "按顶栏顺序列出全部标签，选择即切换。",
     tab_mark_bell: "响铃",
     tab_mark_finished: "结束",

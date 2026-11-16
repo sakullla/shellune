@@ -398,7 +398,9 @@ impl ShelluneView {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .bg(theme::swatch(palette::CANVAS))
+            // A page with no terminal on it - a connection being set up - shows this
+            // floor, which the current tab is painted with too (R2).
+            .bg(theme::swatch(super::PAGE_FLOOR))
             .relative();
         if let Some(reason) = &self.local_error {
             column = column.child(
@@ -1171,7 +1173,11 @@ impl ShelluneView {
         )
     }
 
-    /// A tab that is only waiting, drawn in the same strip as live sessions.
+    /// A tab that is only waiting, drawn in the same strip and the same shape as the
+    /// tabs of live sessions (R2).
+    ///
+    /// Its dot is the neutral "not started" mark and its word is in the tooltip, so a
+    /// restored strip of waiting tabs is as narrow as one of running ones.
     pub(super) fn pending_tab(
         &self,
         index: usize,
@@ -1184,58 +1190,53 @@ impl ShelluneView {
             .map(|tab| tab.display_title().to_owned())
             .unwrap_or_else(|| strings.pane_pending.to_owned());
         let accent = tab.and_then(|tab| tab.accent());
-        let selected = self
-            .workspace
-            .layout()
-            .tabs()
-            .get(index)
-            .is_some_and(|tab| Some(tab.id()) == self.workspace.layout().active_tab_id())
-            && self.workspace.destination() == Destination::LocalShells;
-        let selector = format!("session.tab.{index}");
-        let mut tab = div()
-            .id(("session.tab", index))
-            .debug_selector(move || selector.clone())
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .h(metrics.tab_height())
-            .px(metrics.scale(spacing::SNUG))
-            .rounded(px(radius::MEDIUM))
-            .border_1()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                this.select_tab(index, window, cx);
-            }));
-        tab = if selected {
-            tab.bg(theme::swatch(palette::SURFACE))
-                .border_color(theme::swatch(palette::BORDER_STRONG))
-        } else {
-            tab.border_color(theme::clear())
-        };
-        tab.children(accent.map(|accent| {
-            crate::app::view::tab_accent_mark(
-                accent,
+        let selected = self.tab_is_current(index);
+        let tooltip = format!("{title} · {}", strings.pane_pending);
+        let frame = super::browser_tab(
+            ("session.tab", index),
+            format!("session.tab.{index}"),
+            selected,
+            self.tab_divider(index),
+            self.tab_floor(),
+            metrics,
+        )
+        .w(metrics.tab_max_width())
+        .flex_shrink()
+        .min_w(metrics.tab_min_width())
+        .tooltip(crate::app::components::tooltip(tooltip))
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            this.select_tab(index, window, cx);
+        }));
+        let body = super::tab_body(metrics)
+            .child(crate::app::components::pulsing_status_dot(
+                Tone::Neutral,
                 metrics,
-                format!("session.tab.accent.{index}"),
+                false,
+                ("session.tab.pulse", index),
+                format!("session.tab.dot.{index}"),
+            ))
+            .children(accent.map(|accent| {
+                super::tab_accent_mark(accent, metrics, format!("session.tab.accent.{index}"))
+            }))
+            .child(super::tab_icon(Icon::Terminal, selected, metrics))
+            .child(super::tab_title_label(
+                title,
+                selected,
+                format!("session.tab.title.{index}"),
+                metrics,
+            ));
+        frame.child(body).child(
+            super::tab_close_button(
+                ("session.tab.close", index),
+                format!("session.tab.close.{index}"),
+                format!("session.tab.{index}"),
+                selected,
+                metrics,
             )
-        }))
-        .child(div().truncate().child(SharedString::from(format!(
-            "{title} · {}",
-            strings.pane_pending
-        ))))
-        .child(
-            crate::app::components::icon_only_button(Icon::Close, metrics)
-                .w(metrics.hit_target())
-                .h(metrics.hit_target())
-                .id(("session.tab.close", index))
-                .debug_selector({
-                    let selector = format!("session.tab.close.{index}");
-                    move || selector.clone()
-                })
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.close_pending_tab(index, cx);
-                })),
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.close_pending_tab(index, cx);
+            })),
         )
     }
 

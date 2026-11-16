@@ -8810,7 +8810,10 @@ async fn a_remote_reconnect_with_a_saved_password_dials_again_in_its_own_tab(
         "a failed reconnect keeps its tab"
     );
 
-    // The form's own retry dials in the same tab as well.
+    // The form's own retry dials in the same tab as well. A refused dial is a reach
+    // failure, so the sign-in fields are folded until the user asks for them; the
+    // password is typed into the field that is really on screen.
+    click(cx, "remote.edit_auth");
     type_into(cx, "remote.password", "hunter2-secret");
     click(cx, "remote.retry");
     assert_redialled_in_place(&view, cx, id, 2, "the form's retry");
@@ -19652,6 +19655,9 @@ async fn a_marked_tab_keeps_its_marks_and_close_button_inside_itself(cx: &mut Te
         unread_of(cx, &view, marked).bell && unread_of(cx, &view, marked).finished,
         "the background tab carries both marks"
     );
+    // The newest tab is the current one, so the strip has scrolled to it; the marked
+    // tab is reached the way a user reaches it, with the strip's own scroll button.
+    scroll_tab_strip_to_start(cx, &view);
 
     // The marked tab is wider than a bare one, because its two words need the room;
     // they are not squeezed into a title's width.
@@ -19685,6 +19691,233 @@ async fn a_marked_tab_keeps_its_marks_and_close_button_inside_itself(cx: &mut Te
         cx.update(|_window, app| view.read(app).open_tabs()),
         expected,
         "the close button belongs to the tab it is drawn in, not to its neighbour"
+    );
+}
+
+/// Clicks the strip's left scroll button until no tab is hidden past its left end.
+///
+/// Whether one is hidden is read from the strip's scroll state: a scroll button that
+/// went away keeps its last debug bounds, so its bounds cannot say it is gone.
+fn scroll_tab_strip_to_start(cx: &mut VisualTestContext, view: &Entity<ShelluneView>) {
+    for _ in 0..40 {
+        if !cx.update(|_window, app| view.read(app).tab_strip_ends_for_test().0) {
+            return;
+        }
+        click(cx, "session.tabs.scroll.start");
+    }
+    panic!("the strip never reached its first tab");
+}
+
+/// Asserts a tab is wholly inside the visible part of the strip.
+fn assert_tab_in_view(cx: &mut VisualTestContext, selector: &'static str) {
+    let strip = bounds_of(cx, "session.tabs");
+    assert_inside_horizontally(bounds_of(cx, selector), strip, selector);
+}
+
+/// Asserts every part of the strip's tab at `index` stays inside that tab, and that the
+/// tab keeps the strip's width range (R2, R4).
+fn assert_tab_holds_its_parts(cx: &mut VisualTestContext, index: usize, metrics: Metrics) {
+    let tab: &'static str = Box::leak(format!("session.tab.{index}").into_boxed_str());
+    let bounds = bounds_of(cx, tab);
+    for part in ["dot", "title", "close"] {
+        let selector: &'static str =
+            Box::leak(format!("session.tab.{part}.{index}").into_boxed_str());
+        assert_stays_inside_box(bounds_of(cx, selector), bounds, selector);
+    }
+    assert!(
+        bounds.size.width >= metrics.tab_min_width() - px(0.5)
+            && bounds.size.width <= metrics.tab_max_width() + px(0.5),
+        "{tab} keeps the strip's width range: {bounds:?}"
+    );
+    assert_pointer_target(
+        cx,
+        Box::leak(format!("session.tab.close.{index}").into_boxed_str()),
+    );
+}
+
+#[gpui::test]
+async fn a_tab_keeps_its_dot_title_and_close_inside_itself_at_any_width(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    let (long, connecting) = (tabs[0], tabs[1]);
+    let long_name = "production-database-primary-eu-west-1 replica and log watcher";
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let workspace = view.workspace_mut_for_test();
+            let tab = workspace
+                .tab_of_session(long)
+                .expect("the first session has a tab");
+            assert!(workspace.rename_tab(tab, Some(long_name.to_owned())));
+            // The second session is connecting again, the state whose word used to
+            // widen the tab past the strip's room.
+            assert!(workspace.session_failed(connecting, SessionFailure::ConnectionLost));
+            assert!(workspace.session_reconnecting(connecting));
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        session_state(cx, &view, connecting),
+        Some(SessionState::Connecting),
+        "the second tab is connecting"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_label_for_test(long)),
+        long_name,
+        "the whole name is the tab's title; the strip only cuts what it draws"
+    );
+
+    // At 720x480 and 200% text the row has no room left for the strip at all, so its
+    // tabs are not required to be in view there - the list of every tab is how they
+    // are reached - but each one still holds its own parts.
+    for (viewport, zoom, in_view) in [
+        (design_window(), Zoom::Regular, true),
+        (minimum_window(), Zoom::Regular, true),
+        (design_window(), Zoom::Largest, true),
+        (minimum_window(), Zoom::Largest, false),
+    ] {
+        cx.update(|_window, app| {
+            view.update(app, |view, cx| {
+                view.workspace_mut_for_test().set_zoom(zoom);
+                cx.notify();
+            });
+        });
+        cx.simulate_resize(viewport);
+        cx.run_until_parked();
+        let metrics = Metrics::new(zoom);
+        // The current tab is in view; the other one is reached with the strip's own
+        // scroll button when the window is too narrow for both.
+        if in_view {
+            assert_tab_in_view(cx, "session.tab.1");
+        }
+        assert_tab_holds_its_parts(cx, 1, metrics);
+        scroll_tab_strip_to_start(cx, &view);
+        if in_view {
+            assert_tab_in_view(cx, "session.tab.0");
+        }
+        assert_tab_holds_its_parts(cx, 0, metrics);
+        // The long name is cut inside its own tab: the title ends before the close
+        // button starts.
+        let title = bounds_of(cx, "session.tab.title.0");
+        let close = bounds_of(cx, "session.tab.close.0");
+        assert!(
+            title.origin.x + title.size.width <= close.origin.x + px(0.5),
+            "the long title stops before its close button at {zoom:?}: {title:?} then {close:?}"
+        );
+        // The connecting tab breathes when motion is allowed and is still otherwise.
+        let breathing = cx.debug_bounds("session.tab.dot.1.pulse").is_some();
+        assert_eq!(
+            breathing,
+            cx.update(|_window, _app| theme::motion_allowed()),
+            "the connecting tab's dot breathes exactly when motion is allowed"
+        );
+        assert!(
+            cx.debug_bounds("session.tab.dot.0.pulse").is_none(),
+            "a live tab's dot is still"
+        );
+    }
+}
+
+#[gpui::test]
+async fn twenty_tabs_scroll_and_leave_the_window_buttons_reachable(cx: &mut TestAppContext) {
+    let Some((view, cx)) = two_shells(cx) else {
+        return;
+    };
+    for _ in 0..18 {
+        click(cx, "header.primary");
+    }
+    let tabs = cx.update(|_window, app| view.read(app).open_tabs());
+    assert_eq!(tabs.len(), 20, "twenty tabs are open");
+
+    for viewport in [design_window(), minimum_window()] {
+        cx.simulate_resize(viewport);
+        cx.run_until_parked();
+        // The newest tab is the current one and the strip has brought it into view; the
+        // first ones are hidden past the left end, which says so.
+        assert_tab_in_view(cx, "session.tab.19");
+        assert_eq!(
+            cx.update(|_window, app| view.read(app).tab_strip_ends_for_test()),
+            (true, false),
+            "tabs run on past the left end only"
+        );
+        assert_pointer_target(cx, "session.tabs.scroll.start");
+        assert_inside_horizontally(
+            bounds_of(cx, "session.tabs.scroll.start"),
+            bounds_of(cx, "session.tabs"),
+            "the left scroll button",
+        );
+
+        // Nothing the row holds beside the strip is pushed out of the window, and the
+        // strip ends before the controls after it begin.
+        let strip = bounds_of(cx, "session.tabs");
+        for selector in [
+            "tabs.list.open",
+            "header.primary",
+            "palette.open",
+            "nav.settings",
+        ] {
+            let bounds = bounds_of(cx, selector);
+            assert_fits_inside(bounds, viewport, selector);
+            assert_pointer_target(cx, selector);
+            assert!(
+                bounds.origin.x >= strip.origin.x + strip.size.width - px(0.5),
+                "{selector} sits after the strip: {bounds:?} after {strip:?}"
+            );
+        }
+        if Platform::current() == Platform::Windows {
+            for selector in ["window.minimize", "window.maximize", "window.close"] {
+                assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+                assert_pointer_target(cx, selector);
+            }
+        }
+    }
+
+    // The strip scrolls back to its first tab with its own button, and then says that
+    // the tabs run on past the right end instead.
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    scroll_tab_strip_to_start(cx, &view);
+    assert_tab_in_view(cx, "session.tab.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).tab_strip_ends_for_test()),
+        (false, true),
+        "after scrolling back, the tabs run on past the right end only"
+    );
+
+    // Choosing a tab that is out of view - here from the list of every tab - brings it
+    // into the strip's view: another tab, and the current one after it was scrolled
+    // away.
+    click(cx, "tabs.list.open");
+    click(cx, "tabs.list.row.12");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[12]),
+        "the chosen tab is the current one"
+    );
+    assert_tab_in_view(cx, "session.tab.12");
+    scroll_tab_strip_to_start(cx, &view);
+    // The last row is below the list's fold, so it is chosen the way the list and the
+    // tab shortcuts choose a tab.
+    cx.update(|window, app| view.update(app, |view, cx| view.select_tab(19, window, cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[19]),
+        "the last tab is the current one again"
+    );
+    assert_tab_in_view(cx, "session.tab.19");
+    // The current tab scrolled away and chosen again comes back into view as well.
+    scroll_tab_strip_to_start(cx, &view);
+    cx.update(|window, app| view.update(app, |view, cx| view.select_tab(19, window, cx)));
+    cx.run_until_parked();
+    assert_tab_in_view(cx, "session.tab.19");
+    // The tabs the strip shows are still the ones a click lands on.
+    click(cx, "session.tab.19");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).active_session()),
+        Some(tabs[19])
     );
 }
 
