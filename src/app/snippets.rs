@@ -121,6 +121,12 @@ impl SnippetLibrary {
         self.hold = true;
     }
 
+    /// Whether a change is being held back and is not on disk yet.
+    #[must_use]
+    pub fn has_held_writes(&self) -> bool {
+        self.hold && self.held
+    }
+
     /// Stops holding writes back; returns whether the list changed meanwhile, so the
     /// caller writes it (merged with what is on disk now).
     pub fn release_writes(&mut self) -> bool {

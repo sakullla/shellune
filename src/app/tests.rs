@@ -29558,6 +29558,150 @@ async fn an_edit_saved_between_a_pull_and_its_adoption_keeps_what_arrived(cx: &m
     );
 }
 
+fn exit_waiting(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_window, app| view.read(app).exit_waiting_for_test())
+}
+
+/// Closing the window while a sync holds the window's saves back (R8): a save the
+/// window already showed must reach the disk before the window goes. The close waits
+/// for the job, the held edits - a new host with a remembered password among them -
+/// are written when it ends, and only then is the window removed, so the password in
+/// the credential store belongs to a host that is saved.
+#[gpui::test]
+async fn closing_while_saves_are_held_writes_them_before_the_window_goes(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("close-held");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Hosts);
+    assert_eq!(cloud_host_names(&server), vec!["alpha"]);
+    let alpha = first_host_id(&view, cx);
+
+    // A check runs; its end is held, so the window's saves are held back.
+    hold_sync_finish(&view, cx);
+    after_poll(cx);
+    assert!(sync_finish_held(&view, cx));
+    assert!(data_writes_held(&view, cx));
+    assert!(
+        request_real_close(cx, &view),
+        "with nothing held back a close does not wait"
+    );
+    assert!(!exit_waiting(&view, cx));
+
+    // The window saves a favourite and a new host with a password meanwhile.
+    toggle_favorite(&view, cx, alpha);
+    fill_new_host(cx);
+    click(cx, "hosts.auth.remote.method.password");
+    type_into(cx, "hosts.field.secret", "s3cret-pass");
+    click(cx, "hosts.save");
+    let added = cx
+        .update(|_window, app| {
+            view.read(app)
+                .book()
+                .hosts()
+                .iter()
+                .find(|host| host.name() == "box")
+                .map(shellune_core::HostConfig::id)
+        })
+        .expect("the host shows as saved");
+    assert_eq!(
+        names_on_disk(&dir),
+        vec!["alpha"],
+        "the saves are held back"
+    );
+    assert!(
+        shellune_storage::SecretStore::load(&*secrets, added)
+            .expect("reads")
+            .is_some(),
+        "the password is in the credential store already"
+    );
+
+    // The close waits for the sync instead of dropping what is held.
+    assert!(!request_real_close(cx, &view), "the close waits");
+    assert!(exit_waiting(&view, cx));
+    assert!(
+        cx.update(|_window, app| view.read(app).toast_titles())
+            .iter()
+            .any(|title| title == copy::ENGLISH_SYNC.exit_waits),
+        "the wait is explained"
+    );
+    assert!(!request_real_close(cx, &view), "asking again still waits");
+    assert_eq!(names_on_disk(&dir), vec!["alpha"]);
+    assert_eq!(cx.windows().len(), 1);
+
+    // The job ends: the held edits are written, then the window goes.
+    release_sync_finish(&view, cx);
+    cx.run_until_parked();
+    assert_eq!(names_on_disk(&dir), vec!["alpha", "box"]);
+    let on_disk = dir.store().load().expect("reads");
+    assert!(on_disk.is_favorite(alpha), "the favourite reached the disk");
+    assert!(
+        on_disk.hosts().iter().any(|host| host.id() == added),
+        "the password belongs to a saved host"
+    );
+    assert!(
+        cx.windows().is_empty(),
+        "the window closed once they were written"
+    );
+}
+
+/// When the files cannot be read after the writer, the held edits are not written
+/// whole over them (that could drop what the writer put there): the files stay as
+/// they are, the user is told which changes to make again, and a close that waited
+/// for those saves is called off so the notice can be read.
+#[gpui::test]
+async fn held_saves_are_not_written_over_files_that_cannot_be_read(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("held-unreadable");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Hosts);
+    let alpha = first_host_id(&view, cx);
+
+    hold_sync_finish(&view, cx);
+    after_poll(cx);
+    assert!(sync_finish_held(&view, cx));
+    toggle_favorite(&view, cx, alpha);
+    assert!(!request_real_close(cx, &view), "the close waits");
+
+    // Something leaves the host file unreadable before the window takes the job in.
+    let path = dir.path().join(shellune_storage::FILE_NAME);
+    std::fs::write(&path, "{ not json").expect("written");
+    release_sync_finish(&view, cx);
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("reads"),
+        "{ not json",
+        "the window's copy was not written over the file"
+    );
+    assert!(!data_writes_held(&view, cx));
+    assert!(!exit_waiting(&view, cx), "the close was called off");
+    assert_eq!(cx.windows().len(), 1, "the window stays");
+    let titles = cx.update(|_window, app| view.read(app).toast_titles());
+    for expected in [
+        copy::ENGLISH_SYNC.held_dropped,
+        copy::ENGLISH_SYNC.held_failed,
+        copy::ENGLISH_SYNC.exit_stopped,
+    ] {
+        assert!(
+            titles.iter().any(|title| title == expected),
+            "{expected:?} in {titles:?}"
+        );
+    }
+    assert!(
+        !cx.update(|_window, app| view.read(app).book().is_favorite(alpha)),
+        "the window shows what is on disk, not the edit that was not kept"
+    );
+}
+
 #[gpui::test]
 async fn an_applied_backup_waits_for_a_running_sync_and_is_uploaded(cx: &mut TestAppContext) {
     let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);

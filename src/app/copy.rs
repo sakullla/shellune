@@ -4859,6 +4859,14 @@ sync_strings! {
         "以下内容保留了同步来的数据：{list}。请重新进行这些修改。";
     /// Toast: edits made while data arrived could not be written
     held_failed: "Changes made during the sync could not be saved", "同步期间的修改未能保存";
+    /// Toast: a close waits until the edits held during a sync are written
+    exit_waits: "Saving your changes before closing", "正在保存修改，随后关闭";
+    /// Its detail
+    exit_waits_detail: "Shellune closes as soon as the sync in progress ends and your changes are on disk.",
+        "当前同步结束、修改写入本机后，Shellune 会自动关闭。";
+    /// Toast: the waiting close was called off because some edits were not kept
+    exit_stopped: "Shellune stayed open so you can redo those changes",
+        "Shellune 未关闭，以便你重新进行这些修改";
     /// Data document: hosts
     doc_hosts: "hosts", "主机";
     /// Data document: groups

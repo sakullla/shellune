@@ -25,6 +25,9 @@
 //!   writer is done the held edits are merged onto the files as they are then
 //!   (`LocalData::rebase`), written, read back, and uploaded like any other change; a
 //!   stale copy in memory never overwrites records that just arrived (R8, R10);
+//! * closing the window or quitting while such saves are held back waits for the
+//!   writer (bounded by the engine's timeouts), writes the held saves, and only then
+//!   closes, so an edit the window already showed as saved is never lost on exit;
 //! * a failure never blocks the window or loses a local change: the change is already on
 //!   disk, the reason is shown in the settings and as a marker in the top bar, and sync
 //!   tries again after [`RETRY_FIRST`], doubling the wait up to [`RETRY_MAX`], as well
@@ -42,7 +45,7 @@ use shellune_core::{ForwardBook, SecretString};
 use shellune_storage::{
     ForwardStore, GroupService, HostBook, KdfParams, LocalData, LocalState, PersistError,
     Platform as DataPlatform, PortableError, Preferences, PreferencesStore, SecretStore,
-    SnippetStore, StorageError, Touched,
+    StorageError, Touched,
 };
 use shellune_sync::{
     ConflictReport, LastResult, PullReport, Resolution, SyncConfig, SyncError, SyncOutcome,
@@ -77,9 +80,10 @@ type SlotTask = Box<dyn FnOnce(&mut ShelluneView, &mut Context<ShelluneView>)>;
 
 /// The window's saves, held back while another writer replaces the data files.
 struct DataGate {
-    /// The files as they were when the writer started; `None` when they could not be
-    /// read (the writer then fails on them too, and the held edits are written as is).
-    base: Option<Box<LocalState>>,
+    /// The data as the window held it when the writer started. The held edits are
+    /// exactly what the window changed since, so they are what is merged onto the
+    /// files the writer leaves; taken from memory, so starting a writer reads no file.
+    base: Box<LocalState>,
     /// The documents the window changed meanwhile.
     touched: Touched,
 }
@@ -97,6 +101,15 @@ pub(super) struct HeldWrites {
     dropped: Vec<&'static str>,
     /// Why the held edits could not be written at all.
     failed: Option<String>,
+}
+
+/// What waits for the held saves to be written before it happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingExit {
+    /// The window closes.
+    Window,
+    /// The application quits (macOS asks through `applicationShouldTerminate:`).
+    Quit,
 }
 
 /// A group change made while writes are held back goes through a scratch copy of the
@@ -419,43 +432,19 @@ fn touched_differ(a: &LocalState, b: &LocalState, touched: Touched) -> bool {
         || (touched.preferences && a.preferences != b.preferences)
 }
 
-/// Writes the touched documents of `state` as they are, the way each save would have.
-fn write_documents(
-    root: &std::path::Path,
-    state: &LocalState,
-    touched: Touched,
-) -> Result<(), String> {
-    if touched.hosts {
-        shellune_storage::HostStore::at(root)
-            .save(&state.hosts)
-            .map_err(|error| error.to_string())?;
-    }
-    if touched.groups {
-        shellune_storage::GroupStore::at(root)
-            .save(&state.groups)
-            .map_err(|error| error.to_string())?;
-    }
-    if touched.forwards {
-        ForwardStore::at(root)
-            .save(&state.forwards)
-            .map_err(|error| error.to_string())?;
-    }
-    if touched.snippets {
-        SnippetStore::at(root)
-            .save(&state.snippets)
-            .map_err(|error| error.to_string())?;
-    }
-    if touched.known_hosts {
-        shellune_storage::TrustStore::at(root)
-            .save(&state.known_hosts)
-            .map_err(|error| error.to_string())?;
-    }
-    if touched.preferences {
-        PreferencesStore::at(root)
-            .save(&state.preferences)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+/// The touched documents, named the way `LocalData` names them in its errors.
+fn touched_labels(touched: Touched) -> Vec<&'static str> {
+    [
+        (touched.hosts, "saved hosts"),
+        (touched.groups, "host groups"),
+        (touched.forwards, "forwarding rules"),
+        (touched.snippets, "saved commands"),
+        (touched.known_hosts, "trusted server identities"),
+        (touched.preferences, "preferences"),
+    ]
+    .into_iter()
+    .filter_map(|(changed, label)| changed.then_some(label))
+    .collect()
 }
 
 impl SyncCenter {
@@ -750,6 +739,11 @@ impl ShelluneView {
         if self.sync_slot_busy() {
             return;
         }
+        // A close that waited for the held saves happens now that they are written;
+        // nothing else is started for a window that is going away.
+        if self.finish_exit_after_held_writes(cx) {
+            return;
+        }
         if let Some(task) = self.sync.waiting_backup.take() {
             task(self, cx);
             return;
@@ -779,12 +773,81 @@ impl ShelluneView {
         self.sync.gate.is_some()
     }
 
-    /// Starts holding the window's saves back, remembering the files as they are.
+    /// Whether saves the window already showed are held back and not yet on disk.
+    pub(super) fn held_writes_pending(&self) -> bool {
+        self.sync
+            .gate
+            .as_ref()
+            .is_some_and(|gate| gate.touched.any() || self.snippets.has_held_writes())
+    }
+
+    /// Keeps a close or quit back while saves are held: it happens once the writer is
+    /// done and they are written (bounded by the engine's timeouts). Returns whether
+    /// the exit has to wait.
+    pub(super) fn defer_exit_for_held_writes(
+        &mut self,
+        exit: PendingExit,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.held_writes_pending() {
+            return false;
+        }
+        let first = self.exit_after_held_writes.is_none();
+        // A quit includes closing the window, so it is never downgraded.
+        if self.exit_after_held_writes != Some(PendingExit::Quit) {
+            self.exit_after_held_writes = Some(exit);
+        }
+        if first {
+            let strings = self.sync_strings();
+            self.toast(
+                Tone::Neutral,
+                strings.exit_waits,
+                Some(strings.exit_waits_detail.to_owned()),
+                cx,
+            );
+        }
+        cx.notify();
+        true
+    }
+
+    /// Closes the window, or quits, when that waited for the held saves and they are
+    /// written now. Returns whether the exit was carried out.
+    fn finish_exit_after_held_writes(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.sync.gate.is_some() {
+            return false;
+        }
+        let Some(exit) = self.exit_after_held_writes.take() else {
+            return false;
+        };
+        // Work that started while the close waited is asked about like any other.
+        if !self.app_close_confirmed && (self.transfers.any_active() || self.forwards.any_active())
+        {
+            self.closing_app = true;
+            self.terminate_pending = exit == PendingExit::Quit;
+            cx.notify();
+            return false;
+        }
+        self.app_close_confirmed = true;
+        match exit {
+            PendingExit::Quit => cx.quit(),
+            PendingExit::Window => {
+                if let Some(handle) = self.own_window {
+                    cx.defer(move |cx| {
+                        let _ = handle.update(cx, |_, window, _| window.remove_window());
+                    });
+                }
+            }
+        }
+        true
+    }
+
+    /// Starts holding the window's saves back, remembering the data as the window
+    /// holds it now (no file is read on the way).
     pub(super) fn hold_data_writes(&mut self) {
         if self.sync.gate.is_some() {
             return;
         }
-        let base = LocalData::at(self.store.root()).load().ok().map(Box::new);
+        let base = Box::new(self.data_in_memory());
         self.snippets.hold_writes();
         self.sync.gate = Some(DataGate {
             base,
@@ -819,29 +882,24 @@ impl ShelluneView {
         }
         let ours = self.data_in_memory();
         let data = LocalData::at(self.store.root());
-        let rebased = gate
-            .base
-            .as_deref()
-            .and_then(|base| data.rebase(base, &ours, touched).ok());
-        match rebased {
-            Some(rebased) => HeldWrites {
+        match data.rebase(&gate.base, &ours, touched) {
+            Ok(rebased) => HeldWrites {
                 written: rebased.written,
                 reload: touched_differ(&rebased.state, &ours, touched),
                 preferences: touched.preferences && rebased.state.preferences != ours.preferences,
                 dropped: rebased.dropped,
                 failed: None,
             },
-            // The files could not be read before or after: the held edits are written
-            // as they are, which is what each save would have done.
-            None => match write_documents(self.store.root(), &ours, touched) {
-                Ok(()) => HeldWrites {
-                    written: true,
-                    ..HeldWrites::default()
-                },
-                Err(reason) => HeldWrites {
-                    failed: Some(reason),
-                    ..HeldWrites::default()
-                },
+            // The files could not be read (or one could not be written). The window's
+            // copy is never written whole over them - that could drop what the writer
+            // put there - so the files stay as they are, the window reads them again,
+            // and the user is told which changes to make again.
+            Err(error) => HeldWrites {
+                written: false,
+                reload: true,
+                preferences: touched.preferences,
+                dropped: touched_labels(touched),
+                failed: Some(error.to_string()),
             },
         }
     }
@@ -877,13 +935,20 @@ impl ShelluneView {
                 cx,
             );
         }
-        if let Some(reason) = held.failed {
+        if let Some(reason) = &held.failed {
             self.toast(
                 Tone::Danger,
                 strings.held_failed,
-                Some(copy::fill(strings.error_detail, &[("reason", &reason)])),
+                Some(copy::fill(strings.error_detail, &[("reason", reason)])),
                 cx,
             );
+        }
+        // A close that waited for these saves does not hide that some were not kept:
+        // the window stays so the notices above can be read.
+        if (!held.dropped.is_empty() || held.failed.is_some())
+            && self.exit_after_held_writes.take().is_some()
+        {
+            self.toast(Tone::Warning, strings.exit_stopped, None, cx);
         }
     }
 
@@ -1725,6 +1790,13 @@ impl ShelluneView {
     #[must_use]
     pub fn data_writes_held_for_test(&self) -> bool {
         self.data_writes_held()
+    }
+
+    /// Whether a close or quit waits for held saves to be written.
+    #[cfg(test)]
+    #[must_use]
+    pub fn exit_waiting_for_test(&self) -> bool {
+        self.exit_after_held_writes.is_some()
     }
 
     /// Checks the cloud as "resolve conflict" would without one: a sync in either

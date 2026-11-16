@@ -672,6 +672,11 @@ pub struct ShelluneView {
     /// the question asks the platform to terminate again - this time allowed - instead
     /// of only removing the window.
     terminate_pending: bool,
+    /// A close or quit that waits for the saves held back while a sync or an import
+    /// writes the data files: it happens once they are written (R8).
+    exit_after_held_writes: Option<sync::PendingExit>,
+    /// This window, so a close that waited for held saves can finish it.
+    own_window: Option<gpui::AnyWindowHandle>,
     /// Whether the window-close callback has been registered.
     watching_close: bool,
     /// Whether this shell asked to hide the window and is waiting for the icon (R13).
@@ -2324,6 +2329,8 @@ impl ShelluneView {
             closing_app: false,
             app_close_confirmed: false,
             terminate_pending: false,
+            exit_after_held_writes: None,
+            own_window: None,
             watching_close: false,
             hidden_for_reopen: false,
             files_polling: false,
@@ -5360,10 +5367,13 @@ impl ShelluneView {
     ///
     /// Returning false keeps the window, and the question lists every task that would
     /// stop. Cancelling that question leaves them running.
+    ///
+    /// A close with nothing to ask about still waits while saves are held back during a
+    /// sync or an import: the window closes by itself once they are written (R8).
     fn refuse_app_close(&mut self, cx: &mut Context<Self>) -> bool {
         if self.app_close_confirmed || (!self.transfers.any_active() && !self.forwards.any_active())
         {
-            return true;
+            return !self.defer_exit_for_held_writes(sync::PendingExit::Window, cx);
         }
         self.closing_app = true;
         cx.notify();
@@ -5387,7 +5397,7 @@ impl ShelluneView {
     ) -> bool {
         if self.app_close_confirmed || (!self.transfers.any_active() && !self.forwards.any_active())
         {
-            return true;
+            return !self.defer_exit_for_held_writes(sync::PendingExit::Quit, cx);
         }
         if self.hidden_for_reopen {
             self.reveal_after_reopen(window, cx);
@@ -5410,6 +5420,14 @@ impl ShelluneView {
         self.closing_app = false;
         let terminate = std::mem::take(&mut self.terminate_pending);
         self.close_all_sessions(cx);
+        let exit = if terminate {
+            sync::PendingExit::Quit
+        } else {
+            sync::PendingExit::Window
+        };
+        if self.defer_exit_for_held_writes(exit, cx) {
+            return;
+        }
         if terminate {
             // The system cancelled its own quit so this question could be answered, and
             // only asking again ends the process. Windows and Linux never get here.
@@ -17468,6 +17486,7 @@ impl Render for ShelluneView {
         // changes.
         if !self.watching_close {
             self.watching_close = true;
+            self.own_window = Some(window.window_handle());
             let view = cx.entity().downgrade();
             window.on_window_should_close(cx, move |_window, cx| {
                 view.update(cx, |view, cx| {
