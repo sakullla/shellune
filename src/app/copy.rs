@@ -4626,6 +4626,18 @@ backup_strings! {
     error_encrypt: "The passwords could not be encrypted.", "无法加密密码。";
     /// What went wrong, in the storage layer's words
     error_detail: "Details: {reason}", "详情：{reason}";
+    /// Unlocking an import with an empty passphrase
+    import_passphrase_required: "Enter the passphrase this backup was exported with",
+        "请输入导出这个备份时设置的口令";
+    /// A host whose private key file is not on this computer (list row chip)
+    host_key_missing: "Key file not found on this computer", "本机未找到该私钥文件";
+    /// The chip's tooltip, naming the path
+    host_key_missing_tip: "{path} does not exist on this computer. Choose the key again before connecting.",
+        "本机不存在 {path}，连接前请重新选择私钥。";
+    /// Exporting is running in the background
+    export_running: "Saving the backup…", "正在保存备份…";
+    /// Unlocking or applying is running in the background
+    import_running: "Working…", "正在处理…";
 }
 
 /// The backup strings of one language.
@@ -4634,6 +4646,217 @@ pub fn backup_for(locale: Locale) -> &'static BackupStrings {
     match locale {
         Locale::English => &ENGLISH_BACKUP,
         Locale::Chinese => &CHINESE_BACKUP,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebDAV sync (R7, R8, R9, R10)
+// ---------------------------------------------------------------------------
+
+/// Declares [`SyncStrings`] and its two tables from one list, so a phrase cannot be
+/// added in one language and forgotten in the other.
+macro_rules! sync_strings {
+    ($($(#[doc = $doc:literal])* $field:ident: $en:literal, $zh:literal;)*) => {
+        /// Strings of the sync settings, the conflict dialog and the sync marker.
+        pub struct SyncStrings {
+            $($(#[doc = $doc])* pub $field: &'static str,)*
+        }
+
+        impl SyncStrings {
+            /// Every string of the table, in declaration order, for the completeness
+            /// test.
+            #[must_use]
+            #[cfg_attr(not(test), allow(dead_code))]
+            pub fn all(&self) -> Vec<&'static str> {
+                vec![$(self.$field),*]
+            }
+        }
+
+        /// The sync strings in English.
+        pub static ENGLISH_SYNC: SyncStrings = SyncStrings { $($field: $en,)* };
+        /// The sync strings in Chinese.
+        pub static CHINESE_SYNC: SyncStrings = SyncStrings { $($field: $zh,)* };
+    };
+}
+
+sync_strings! {
+    /// Settings category and its one page
+    settings_title: "Sync", "同步";
+    /// Under the page title
+    settings_hint: "Keeps hosts, groups, favourites, saved commands, forwards, trusted keys and preferences the same on every computer through one WebDAV folder.",
+        "通过一个 WebDAV 文件夹，让每台电脑上的主机、分组、收藏、常用命令、转发、已信任指纹和偏好保持一致。";
+    /// Field: the server address
+    url: "Server address", "服务器地址";
+    /// Under it
+    url_hint: "The WebDAV address of your account", "WebDAV 账户地址";
+    /// Field: the user name
+    username: "User name", "用户名";
+    /// Field: the password
+    password: "Password", "密码";
+    /// Under it
+    password_hint: "Kept in the system credential store, never in a file", "保存在系统凭据库中，不写入任何文件";
+    /// Placeholder of a secret that is already saved
+    secret_saved: "Saved, leave empty to keep it", "已保存，留空则保持不变";
+    /// Field: the remote folder
+    remote_dir: "Folder", "远端目录";
+    /// Under it
+    remote_dir_hint: "The folder on the server that holds the data file", "服务器上存放数据文件的文件夹";
+    /// Switch: automatic sync
+    auto: "Automatic sync", "自动同步";
+    /// Under it
+    auto_hint: "Pulls when Shellune starts and every 15 minutes, and uploads a few seconds after a change",
+        "启动时和每 15 分钟从云端拉取，修改后几秒内自动上传";
+    /// A switch that is on
+    on: "On", "开";
+    /// A switch that is off
+    off: "Off", "关";
+    /// Switch: sync saved passwords
+    secrets: "Sync saved passwords", "同步已保存的密码";
+    /// Under it
+    secrets_hint: "Off: the cloud holds no password. On: they are encrypted with the sync passphrase, which every computer needs.",
+        "关闭时云端不含任何密码；开启后用同步口令加密，每台电脑都需要设置同一口令。";
+    /// Field: the sync passphrase
+    passphrase: "Sync passphrase", "同步口令";
+    /// Under it
+    passphrase_hint: "Kept in this computer's credential store", "保存在本机凭据库中";
+    /// Saving refused: no passphrase
+    passphrase_required: "Enter the sync passphrase to sync passwords", "要同步密码，请输入同步口令";
+    /// Refused: no address
+    url_required: "Enter the server address first", "请先输入服务器地址";
+    /// Refused: nothing saved yet
+    not_configured: "Save the server first", "请先保存服务器设置";
+    /// Button: save the settings
+    save: "Save", "保存";
+    /// Saved
+    saved: "Sync settings saved", "同步设置已保存";
+    /// Not saved
+    save_failed: "The sync settings could not be saved", "同步设置未能保存";
+    /// Button: test the connection
+    test: "Test connection", "测试连接";
+    /// While testing
+    testing: "Testing…", "正在测试…";
+    /// The test passed
+    test_ok: "Connected. The folder can be written.", "连接成功，目录可写入。";
+    /// The test failed
+    test_failed: "Connection test failed:", "测试连接失败：";
+    /// Button: upload now
+    upload: "Upload now", "立即上传";
+    /// Button: pull from the cloud
+    pull: "Pull from cloud", "从云端拉取";
+    /// Button: open the conflict question again
+    resolve: "Resolve conflict…", "处理冲突…";
+    /// Label of the status line
+    status_label: "Last sync:", "上次同步：";
+    /// Never synced
+    status_never: "Not synced yet", "尚未同步";
+    /// Not set up
+    status_not_configured: "Not set up. Nothing is sent until a server is saved.", "未配置。保存服务器之前不会发送任何请求。";
+    /// A sync is running
+    status_running: "Syncing…", "正在同步…";
+    /// One status: nothing to do
+    result_up_to_date: "Up to date", "已是最新";
+    /// One status: uploaded
+    result_uploaded: "Uploaded", "已上传";
+    /// One status: pulled
+    result_pulled: "Pulled from the cloud", "已从云端拉取";
+    /// One status: conflict
+    result_conflict: "Conflict, waiting for your choice", "有冲突，等待选择";
+    /// One status: failed
+    result_failed: "Failed: {reason}", "失败：{reason}";
+    /// Under a failure
+    retry_note: "Your changes are saved on this computer. Sync tries again after the next change or check.",
+        "本地修改已保存，下次修改或定时检查时会自动重试。";
+    /// Toast: uploaded
+    toast_uploaded: "Uploaded to the cloud", "已上传到云端";
+    /// Toast: pulled
+    toast_pulled: "Synced from the cloud", "已从云端同步";
+    /// Toast: nothing to do
+    toast_up_to_date: "Already up to date", "已是最新";
+    /// Toast: failed
+    toast_failed: "Sync failed", "同步失败";
+    /// After a pull: trusted keys replaced
+    pull_trust: "{count} servers had a different trusted key; the cloud's is used now.",
+        "{count} 台服务器的已信任指纹与云端不同，现已使用云端的。";
+    /// After a pull: passwords in the cloud not used
+    pull_secrets_ignored: "The cloud holds encrypted passwords; turn on syncing passwords to use them.",
+        "云端含有加密的密码；开启“同步已保存的密码”后才会使用。";
+    /// After a pull: passwords that could not be removed
+    pull_not_forgotten: "{count} passwords no longer used could not be removed from the credential store.",
+        "{count} 个已不再使用的密码未能从凭据库移除。";
+    /// Top bar marker: failed
+    marker_failed: "Sync failed", "同步失败";
+    /// Top bar marker: conflict
+    marker_conflict: "Sync conflict", "同步冲突";
+    /// The marker's tooltip
+    marker_hint: "Open the sync settings", "打开同步设置";
+    /// Conflict dialog title
+    conflict_title: "Sync conflict", "同步冲突";
+    /// Both changed
+    conflict_intro: "This computer and the cloud both changed since the last sync. Nothing was overwritten. Choose which one to keep.",
+        "自上次同步以来，本机和云端都有修改。两边都还没有被覆盖，请选择保留哪一边。";
+    /// First sync, both hold data
+    conflict_first: "The cloud already holds Shellune data that differs from this computer's. Nothing was overwritten. Choose which one to keep.",
+        "云端已有与本机不同的 Shellune 数据。两边都还没有被覆盖，请选择保留哪一边。";
+    /// Where the cloud data came from
+    conflict_source: "Cloud data written on {platform} by Shellune {version}, {date}",
+        "云端数据由 {platform} 上的 Shellune {version} 于 {date} 写入";
+    /// What "use cloud" does
+    conflict_remote_hint: "Use cloud data: this computer's data is replaced; a copy is kept in its snapshots folder first.",
+        "以云端为准：本机数据会被替换，替换前先在本机快照文件夹保存一份。";
+    /// What "use local" does
+    conflict_local_hint: "Use this computer's data: the cloud file is replaced; a copy of it is kept in this computer's snapshots folder first.",
+        "以本机为准：云端文件会被替换，替换前先把云端文件保存到本机快照文件夹。";
+    /// What cancel does
+    conflict_cancel_hint: "Cancel: nothing changes, and the conflict stays until you choose.",
+        "取消：两边都不变，冲突会保留到你做出选择。";
+    /// Button: use the cloud
+    use_remote: "Use cloud data", "以云端为准";
+    /// Button: use this computer
+    use_local: "Use this computer's data", "以本机为准";
+    /// Button: cancel
+    cancel: "Cancel", "取消";
+    /// Refused sign-in
+    error_auth: "Authentication failed: the server refused the user name or password.",
+        "认证失败：服务器拒绝了用户名或密码。";
+    /// No answer
+    error_unreachable: "The server could not be reached.", "无法连接到服务器。";
+    /// Folder not writable
+    error_not_writable: "The folder \"{path}\" cannot be written.", "目录“{path}”不可写入。";
+    /// Bad address
+    error_address: "The server address cannot be used.", "服务器地址无效。";
+    /// Another HTTP failure
+    error_server: "The server answered with an error.", "服务器返回了错误。";
+    /// Not set up
+    error_not_configured: "Sync is not set up.", "尚未配置同步。";
+    /// sync.json problem
+    error_settings: "The sync settings could not be read or written.", "无法读取或写入同步设置。";
+    /// Keyring problem
+    error_credentials: "The credential store could not be read.", "无法读取系统凭据库。";
+    /// No passphrase saved
+    error_passphrase_missing: "Syncing passwords is on, but no sync passphrase is saved on this computer.",
+        "已开启同步密码，但本机没有保存同步口令。";
+    /// Another passphrase in the cloud
+    error_remote_passphrase: "The passwords in the cloud are encrypted with another sync passphrase.",
+        "云端的密码使用了不同的同步口令加密。";
+    /// Cloud file unusable
+    error_remote_document: "The data file in the cloud cannot be used.", "云端的数据文件无法使用。";
+    /// Nothing to pull
+    error_nothing_in_cloud: "There is no Shellune data in the cloud yet.", "云端还没有 Shellune 数据。";
+    /// Local data problem
+    error_local: "The data on this computer could not be read or written.", "无法读取或写入本机数据。";
+    /// Kept changing
+    error_busy: "The data kept changing during the sync; it will be tried again.",
+        "同步过程中数据一直在变化，稍后会重试。";
+    /// Detail suffix
+    error_detail: "Details: {reason}", "详情：{reason}";
+}
+
+/// The sync strings of one language.
+#[must_use]
+pub fn sync_for(locale: Locale) -> &'static SyncStrings {
+    match locale {
+        Locale::English => &ENGLISH_SYNC,
+        Locale::Chinese => &CHINESE_SYNC,
     }
 }
 
@@ -4771,6 +4994,27 @@ mod ux_tests {
             assert_ne!(en, zh, "{en} is not translated");
             // A placeholder in one language is filled in the other as well.
             for name in ["{path}", "{count}", "{platform}", "{version}", "{date}"] {
+                assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn both_sync_tables_are_complete_and_translated() {
+        let english = ENGLISH_SYNC.all();
+        let chinese = CHINESE_SYNC.all();
+        assert_eq!(english.len(), chinese.len());
+        for (en, zh) in english.iter().zip(chinese.iter()) {
+            assert!(!en.trim().is_empty() && !zh.trim().is_empty());
+            assert_ne!(en, zh, "{en} is not translated");
+            for name in [
+                "{path}",
+                "{count}",
+                "{platform}",
+                "{version}",
+                "{date}",
+                "{reason}",
+            ] {
                 assert_eq!(en.contains(name), zh.contains(name), "{en} / {zh}: {name}");
             }
         }

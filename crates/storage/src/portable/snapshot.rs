@@ -4,7 +4,10 @@
 //! the files it is about to change into `snapshots/<unix>-<reason>/` inside the data
 //! directory. The copy is the restore point when a later write fails, and it is
 //! what lets the side that lost a conflict be recovered by hand. Only the newest
-//! [`SNAPSHOT_LIMIT`] are kept.
+//! [`SNAPSHOT_LIMIT`] are kept - counted apart for the snapshots a conflict decision
+//! took (reasons starting with [`CONFLICT_REASON_PREFIX`]), so the routine pulls of an
+//! automatic sync can never push the copy of the side a user chose to overwrite out
+//! of the folder.
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +18,10 @@ pub const SNAPSHOT_DIRECTORY: &str = "snapshots";
 
 /// How many snapshots are kept; older ones are removed when a new one is made.
 pub const SNAPSHOT_LIMIT: usize = 10;
+
+/// The start of the reason of a snapshot taken when a conflict was decided. These
+/// are kept to their own [`SNAPSHOT_LIMIT`], apart from every other snapshot.
+pub const CONFLICT_REASON_PREFIX: &str = "sync-use-";
 
 /// One snapshot on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,13 +142,19 @@ impl SnapshotStore {
         snapshots
     }
 
-    /// Removes the oldest snapshots so at most `keep` remain. Best effort: a
-    /// snapshot that cannot be removed is left for the next time.
+    /// Removes the oldest snapshots so at most `keep` remain of the conflict
+    /// decisions and at most `keep` of everything else. Best effort: a snapshot that
+    /// cannot be removed is left for the next time.
     pub fn prune(&self, keep: usize) {
-        let snapshots = self.list();
-        let excess = snapshots.len().saturating_sub(keep);
-        for snapshot in snapshots.into_iter().take(excess) {
-            let _ = std::fs::remove_dir_all(snapshot.path());
+        let (conflicts, routine): (Vec<Snapshot>, Vec<Snapshot>) = self
+            .list()
+            .into_iter()
+            .partition(|snapshot| snapshot.reason.starts_with(CONFLICT_REASON_PREFIX));
+        for pool in [conflicts, routine] {
+            let excess = pool.len().saturating_sub(keep);
+            for snapshot in pool.into_iter().take(excess) {
+                let _ = std::fs::remove_dir_all(snapshot.path());
+            }
         }
     }
 
@@ -261,6 +274,40 @@ mod tests {
             std::fs::read(kept[0].path().join("hosts.json")).expect("copied"),
             b"{}"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn routine_snapshots_never_push_out_the_copy_a_conflict_decision_kept() {
+        let root = scratch("conflict-pool");
+        let store = SnapshotStore::at(&root);
+        store
+            .create("sync-use-remote", 100, &[("hosts.json", b"before")])
+            .expect("the conflict snapshot is written");
+        for second in 0..(SNAPSHOT_LIMIT as u64 * 2) {
+            store
+                .create("sync-pull", 200 + second, &[("hosts.json", b"{}")])
+                .expect("a pull snapshot is written");
+        }
+        let kept = store.list();
+        assert_eq!(kept.len(), SNAPSHOT_LIMIT + 1, "ten pulls and the decision");
+        assert_eq!(kept[0].reason(), "sync-use-remote");
+        assert_eq!(
+            std::fs::read(kept[0].path().join("hosts.json")).expect("copied"),
+            b"before"
+        );
+        // The decisions are limited among themselves too.
+        for second in 0..(SNAPSHOT_LIMIT as u64 + 2) {
+            store
+                .create("sync-use-local", 1_000 + second, &[])
+                .expect("a decision snapshot is written");
+        }
+        let decisions = store
+            .list()
+            .into_iter()
+            .filter(|snapshot| snapshot.reason().starts_with(CONFLICT_REASON_PREFIX))
+            .count();
+        assert_eq!(decisions, SNAPSHOT_LIMIT);
         let _ = std::fs::remove_dir_all(root);
     }
 

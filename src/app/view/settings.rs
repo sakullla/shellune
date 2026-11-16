@@ -45,6 +45,8 @@ pub(super) enum Category {
     Keys,
     /// Where the hosts are saved, the SSH import, and the backup export and import.
     Data,
+    /// WebDAV sync: the server, automatic sync and the status (R7, R8).
+    Sync,
     /// Name, tagline and version.
     About,
 }
@@ -67,6 +69,7 @@ pub(crate) enum Item {
     Import,
     ExportBackup,
     ImportBackup,
+    Sync,
     Version,
 }
 
@@ -82,17 +85,19 @@ const DATA: [Item; 4] = [
     Item::ExportBackup,
     Item::ImportBackup,
 ];
+const SYNC: [Item; 1] = [Item::Sync];
 const ABOUT: [Item; 1] = [Item::Version];
 
 impl Category {
     /// Every category, in the order the navigation lists them.
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::Appearance,
         Self::Terminal,
         Self::Connection,
         Self::Notices,
         Self::Keys,
         Self::Data,
+        Self::Sync,
         Self::About,
     ];
 
@@ -105,6 +110,7 @@ impl Category {
             Self::Notices => "notices",
             Self::Keys => "keys",
             Self::Data => "data",
+            Self::Sync => "sync",
             Self::About => "about",
         }
     }
@@ -126,6 +132,7 @@ impl Category {
             Self::Notices => &NOTICES,
             Self::Keys => &KEYS,
             Self::Data => &DATA,
+            Self::Sync => &SYNC,
             Self::About => &ABOUT,
         }
     }
@@ -140,6 +147,7 @@ impl Category {
             Self::Notices => ux.settings_notices,
             Self::Keys => ux.settings_keys,
             Self::Data => ux.settings_data,
+            Self::Sync => copy::sync_for(locale).settings_title,
             Self::About => ux.settings_about,
         }
     }
@@ -157,6 +165,7 @@ impl Item {
             Self::HostsFile | Self::Import | Self::ExportBackup | Self::ImportBackup => {
                 Category::Data
             }
+            Self::Sync => Category::Sync,
             Self::Version => Category::About,
         }
     }
@@ -179,6 +188,7 @@ impl Item {
             Self::Import => "import",
             Self::ExportBackup => "backup-export",
             Self::ImportBackup => "backup-import",
+            Self::Sync => "sync",
             Self::Version => "version",
         }
     }
@@ -202,6 +212,7 @@ impl Item {
             Self::Import => locale.strings().import_open,
             Self::ExportBackup => copy::backup_for(locale).settings_export,
             Self::ImportBackup => copy::backup_for(locale).settings_import,
+            Self::Sync => copy::sync_for(locale).settings_title,
             Self::Version => ux.settings_version,
         }
     }
@@ -225,6 +236,7 @@ impl Item {
             Self::Import => ux.settings_import_hint,
             Self::ExportBackup => copy::backup_for(locale).settings_export_hint,
             Self::ImportBackup => copy::backup_for(locale).settings_import_hint,
+            Self::Sync => copy::sync_for(locale).settings_hint,
             Self::Version => "",
         }
     }
@@ -238,7 +250,7 @@ impl Item {
 /// page rather than to the keymap: it narrows what is listed and changes no binding.
 pub(super) struct SettingsNav {
     category: Category,
-    item: [usize; 7],
+    item: [usize; 8],
     scope: Option<keymap::Context>,
     /// Whether the category column has the keyboard.
     ///
@@ -253,7 +265,7 @@ impl SettingsNav {
     pub(super) fn new() -> Self {
         Self {
             category: Category::Appearance,
-            item: [0; 7],
+            item: [0; 8],
             scope: None,
             nav_focus: false,
         }
@@ -476,7 +488,7 @@ impl ShelluneView {
             .items()
             .iter()
             .copied()
-            .filter(|item| !matches!(item, Item::Shortcuts | Item::Policy))
+            .filter(|item| !matches!(item, Item::Shortcuts | Item::Policy | Item::Sync))
             .collect();
         if !simple.is_empty() {
             let count = simple.len();
@@ -534,7 +546,7 @@ impl ShelluneView {
         }
         for item in category.items() {
             let item = *item;
-            if !matches!(item, Item::Shortcuts | Item::Policy) {
+            if !matches!(item, Item::Shortcuts | Item::Policy | Item::Sync) {
                 continue;
             }
             let chosen = item == shown;
@@ -542,7 +554,7 @@ impl ShelluneView {
             // A category of one page named like the category needs no second heading.
             let named = !Self::single_named_item(category, locale);
             let hint = match item {
-                Item::Shortcuts | Item::Policy => item.hint(locale),
+                Item::Shortcuts | Item::Policy | Item::Sync => item.hint(locale),
                 _ => "",
             };
             section = section.child(
@@ -873,6 +885,7 @@ impl ShelluneView {
         match item {
             Item::Shortcuts => self.settings_keys_page(cx),
             Item::Policy => self.settings_connection_page(cx),
+            Item::Sync => self.sync_settings_page(cx),
             _ => self.settings_item_row(item, cx),
         }
     }
@@ -881,7 +894,7 @@ impl ShelluneView {
     fn settings_item_row(&self, item: Item, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
         match item {
-            Item::Shortcuts | Item::Policy => self.settings_item_body(item, cx),
+            Item::Shortcuts | Item::Policy | Item::Sync => self.settings_item_body(item, cx),
             Item::HostsFile => self.settings_row(
                 "hosts-file",
                 copy::ux().settings_hosts_file,
@@ -1018,7 +1031,7 @@ impl ShelluneView {
                 })),
             ),
             // These have a page of their own, and a page is never built as one row.
-            Item::Shortcuts | Item::Policy | Item::HostsFile | Item::Version => {
+            Item::Shortcuts | Item::Policy | Item::Sync | Item::HostsFile | Item::Version => {
                 div().flex().flex_col()
             }
         }
@@ -1388,7 +1401,7 @@ impl ShelluneView {
     /// The card is the box a row and every control in it has to stay inside: the page
     /// scrolls downwards only, so a control drawn past the card's right edge is drawn
     /// past the window as well (R8, 720x480).
-    fn settings_card(&self, id: &'static str, rows: Vec<Div>) -> Div {
+    pub(super) fn settings_card(&self, id: &'static str, rows: Vec<Div>) -> Div {
         let count = rows.len();
         let mut card = div()
             .flex()
@@ -1415,7 +1428,7 @@ impl ShelluneView {
     /// The row is at most as wide as the card. Its label keeps a floor, and the control is
     /// at most the row, so a control that does not fit beside the label moves under it and
     /// a control wider than the row wraps inside itself (R8).
-    fn settings_row(
+    pub(super) fn settings_row(
         &self,
         id: &'static str,
         label: &'static str,
@@ -1868,7 +1881,7 @@ impl ShelluneView {
     }
 
     /// Opens one category, keeping the item it was last on (R16).
-    fn settings_select_category(&mut self, category: Category, cx: &mut Context<Self>) {
+    pub(super) fn settings_select_category(&mut self, category: Category, cx: &mut Context<Self>) {
         self.settings_nav.nav_focus = false;
         self.settings_nav.category = category;
         // Pressed again after scrolling away, the same category still scrolls back to it.

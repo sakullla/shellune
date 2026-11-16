@@ -150,6 +150,10 @@ struct HostRowView {
     selecting: bool,
     /// Whether the host is marked as a favourite (R1).
     favorite: bool,
+    /// The chip and its tooltip when the private key file the host names is not on this
+    /// computer: a record that came from another machine keeps its path and says so,
+    /// rather than failing only once a connection is tried (R9).
+    key_missing: Option<(SharedString, SharedString)>,
 }
 
 impl ShelluneView {
@@ -1186,6 +1190,19 @@ impl ShelluneView {
                         show_duplicate,
                         selecting: !self.hosts.selected().is_empty(),
                         favorite: self.book.is_favorite(host.id),
+                        key_missing: saved
+                            .identity_file()
+                            .filter(|path| self.key_presence.missing(path))
+                            .map(|path| {
+                                let backup = copy::backup_for(self.workspace.locale());
+                                (
+                                    SharedString::from(backup.host_key_missing),
+                                    SharedString::from(copy::fill(
+                                        backup.host_key_missing_tip,
+                                        &[("path", path)],
+                                    )),
+                                )
+                            }),
                     }));
                     hosts += 1;
                 }
@@ -2162,6 +2179,16 @@ fn host_row_element(
                                 Tone::Positive,
                                 metrics,
                             ))
+                        })
+                        .when_some(host.key_missing.clone(), |line, (label, tip)| {
+                            line.child(
+                                div()
+                                    .id(SharedString::from(format!("hosts.key-missing.{number}")))
+                                    .debug_selector(move || format!("hosts.key-missing.{number}"))
+                                    .flex_none()
+                                    .tooltip(components::tooltip(tip))
+                                    .child(components::chip(label, Tone::Warning, metrics)),
+                            )
                         }),
                 )
                 .child(

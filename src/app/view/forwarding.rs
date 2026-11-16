@@ -131,6 +131,7 @@ impl ShelluneView {
         }
         self.forwards.adopt(book);
         self.sync_forward_section();
+        self.note_data_changed(cx);
         cx.notify();
     }
 
@@ -148,6 +149,7 @@ impl ShelluneView {
         }
         self.forwards.adopt(book);
         self.sync_forward_section();
+        self.note_data_changed(cx);
         cx.notify();
     }
 
@@ -173,6 +175,7 @@ impl ShelluneView {
         }
         self.forwards.adopt(book);
         self.sync_forward_section();
+        self.note_data_changed(cx);
         cx.notify();
     }
 

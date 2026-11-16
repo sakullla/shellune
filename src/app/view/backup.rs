@@ -25,8 +25,9 @@ use gpui::prelude::*;
 use gpui::{App, Context, Div, Entity, FontWeight, SharedString, Stateful, Window, div, px};
 use shellune_core::{HostId, SecretString};
 use shellune_storage::{
-    ApplyMode, ApplyPlan, Change, ExportOptions, KdfParams, LocalData, Platform as DataPlatform,
-    PlatformField, PortableError, SecretBundle, ShelluneData, SnippetStore,
+    ApplyMode, ApplyOutcome, ApplyPlan, Change, ExportOptions, ExportOutcome, KdfParams, LocalData,
+    LocalState, Platform as DataPlatform, PlatformField, PortableError, SecretBundle, ShelluneData,
+    SnippetStore,
 };
 
 use super::ShelluneView;
@@ -54,6 +55,8 @@ pub(super) struct ExportDialog {
     confirm: Entity<TextField>,
     /// The system's save dialog is open, so a second press does not open another.
     choosing: bool,
+    /// The export is being written on the background executor.
+    running: bool,
     /// Why the last export did not write the file.
     failure: Option<String>,
     /// What the last export wrote.
@@ -86,7 +89,11 @@ enum ImportStage {
         document: Box<ShelluneData>,
         field: Entity<TextField>,
         problem: Option<String>,
+        /// The passphrase is being tried on the background executor.
+        running: bool,
     },
+    /// The preview is being applied on the background executor.
+    Applying,
     /// What applying the file would change.
     Preview(Box<BackupPreview>),
     /// The file was applied.
@@ -377,6 +384,7 @@ impl ShelluneView {
             passphrase,
             confirm,
             choosing: false,
+            running: false,
             failure: None,
             report: None,
         }));
@@ -388,6 +396,10 @@ impl ShelluneView {
         if let Some(BackupDialog::Export(dialog)) = self.backup.as_mut() {
             dialog.include_secrets = !dialog.include_secrets;
             dialog.failure = None;
+            // The first field the dialog now asks for takes the keyboard.
+            if dialog.include_secrets {
+                self.field_focus_pending = Some(dialog.passphrase.read(cx).focus_handle().clone());
+            }
             cx.notify();
         }
     }
@@ -414,7 +426,7 @@ impl ShelluneView {
     pub(super) fn choose_backup_export_path(&mut self, cx: &mut Context<Self>) {
         let refused = match self.backup.as_ref() {
             Some(BackupDialog::Export(dialog)) => {
-                dialog.choosing || self.export_refusal(dialog, cx).is_some()
+                dialog.choosing || dialog.running || self.export_refusal(dialog, cx).is_some()
             }
             _ => true,
         };
@@ -455,30 +467,59 @@ impl ShelluneView {
         let Some(BackupDialog::Export(dialog)) = self.backup.as_ref() else {
             return;
         };
-        if self.export_refusal(dialog, cx).is_some() {
+        if dialog.running || self.export_refusal(dialog, cx).is_some() {
             return;
         }
         let passphrase = dialog
             .include_secrets
             .then(|| dialog.passphrase.read(cx).text().to_owned());
-        let strings = self.backup_strings();
         let root = self.store.root().to_path_buf();
-        let result = (|| {
+        let secrets = self.secrets.clone();
+        let app_version = self.version().to_owned();
+        if let Some(BackupDialog::Export(dialog)) = self.backup.as_mut() {
+            dialog.running = true;
+            dialog.failure = None;
+        }
+        // Sealing the passwords is an Argon2 derivation that is meant to be slow, and
+        // the data files are read and written: none of it happens on the UI thread.
+        let target = path.clone();
+        let with_secrets = passphrase.is_some();
+        let work = cx.background_executor().spawn(async move {
             let local = LocalData::at(&root).load()?;
             let mut options = ExportOptions::new(DataPlatform::current());
             options.kdf = backup_kdf();
-            options.app_version = self.version().to_owned();
-            if let Some(passphrase) = passphrase.clone() {
+            options.app_version = app_version;
+            if let Some(passphrase) = passphrase {
                 options = options.with_passphrase(SecretString::new(passphrase));
             }
-            let base = ShelluneData::read(&path).ok();
-            let outcome = ShelluneData::export(&local, &options, &*self.secrets, base.as_ref())?;
-            outcome.document.write_to(&path)?;
+            let base = ShelluneData::read(&target).ok();
+            let outcome = ShelluneData::export(&local, &options, &*secrets, base.as_ref())?;
+            outcome.document.write_to(&target)?;
             Ok::<_, PortableError>((local, outcome))
-        })();
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |view, cx| {
+                view.finish_backup_export(path, with_secrets, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Shows what the export on the background executor did.
+    fn finish_backup_export(
+        &mut self,
+        path: PathBuf,
+        with_secrets: bool,
+        result: Result<(LocalState, ExportOutcome), PortableError>,
+        cx: &mut Context<Self>,
+    ) {
+        let strings = self.backup_strings();
         let Some(BackupDialog::Export(dialog)) = self.backup.as_mut() else {
             return;
         };
+        dialog.running = false;
         match result {
             Ok((local, outcome)) => {
                 let name = |id: &HostId| {
@@ -492,7 +533,7 @@ impl ShelluneView {
                 dialog.failure = None;
                 dialog.report = Some(ExportReport {
                     path: path.clone(),
-                    secrets: passphrase.map(|_| outcome.secrets_included.len()),
+                    secrets: with_secrets.then_some(outcome.secrets_included.len()),
                     unreadable,
                     missing,
                 });
@@ -561,10 +602,13 @@ impl ShelluneView {
                         .unwrap_or(false)
                     });
                 });
+                // The passphrase is the one thing this step asks for.
+                self.field_focus_pending = Some(field.read(cx).focus_handle().clone());
                 ImportStage::Locked {
                     document: Box::new(document),
                     field,
                     problem: None,
+                    running: false,
                 }
             }
             Ok(document) => self.plan_backup(document, Secrets::NotInFile, ApplyMode::Merge),
@@ -610,7 +654,8 @@ impl ShelluneView {
     }
 
     /// Opens the sealed passwords with the passphrase typed, or says it is wrong and
-    /// stays on the question.
+    /// stays on the question. The passphrase is tried on the background executor: the
+    /// key derivation is slow on purpose.
     pub(super) fn unlock_backup(&mut self, cx: &mut Context<Self>) {
         let strings = self.backup_strings();
         let Some(BackupDialog::Import(dialog)) = self.backup.as_mut() else {
@@ -620,23 +665,78 @@ impl ShelluneView {
             document,
             field,
             problem,
+            running,
         } = &mut dialog.stage
         else {
             return;
         };
-        let typed = SecretString::new(field.read(cx).text().to_owned());
-        match document.open_secrets(&typed) {
+        if *running {
+            return;
+        }
+        let typed = field.read(cx).text().to_owned();
+        if typed.trim().is_empty() {
+            *problem = Some(strings.import_passphrase_required.to_owned());
+            cx.notify();
+            return;
+        }
+        *running = true;
+        *problem = None;
+        let document = (**document).clone();
+        let work = cx.background_executor().spawn(async move {
+            let opened = document.open_secrets(&SecretString::new(typed));
+            (document, opened)
+        });
+        cx.spawn(async move |this, cx| {
+            let (document, opened) = work.await;
+            let _ = this.update(cx, |view, cx| {
+                view.finish_backup_unlock(document, opened, cx)
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Goes on to the preview with the opened passwords, or back to the question.
+    fn finish_backup_unlock(
+        &mut self,
+        document: ShelluneData,
+        opened: Result<SecretBundle, PortableError>,
+        cx: &mut Context<Self>,
+    ) {
+        let strings = self.backup_strings();
+        let still_asking = matches!(
+            self.backup.as_ref(),
+            Some(BackupDialog::Import(ImportDialog {
+                stage: ImportStage::Locked { .. },
+                ..
+            }))
+        );
+        if !still_asking {
+            return;
+        }
+        match opened {
             Ok(bundle) => {
-                let document = (**document).clone();
                 let stage = self.plan_backup(document, Secrets::Opened(bundle), ApplyMode::Merge);
-                if let Some(BackupDialog::Import(dialog)) = self.backup.as_mut() {
-                    dialog.stage = stage;
-                }
+                self.put_backup_stage(stage);
             }
             Err(error) => {
+                let Some(BackupDialog::Import(dialog)) = self.backup.as_mut() else {
+                    return;
+                };
+                let ImportStage::Locked {
+                    field,
+                    problem,
+                    running,
+                    ..
+                } = &mut dialog.stage
+                else {
+                    return;
+                };
+                *running = false;
                 *problem = Some(backup_error_text(&error, strings));
                 let field = field.clone();
                 field.update(cx, |field, cx| field.set_text(String::new(), cx));
+                self.field_focus_pending = Some(field.read(cx).focus_handle().clone());
             }
         }
         cx.notify();
@@ -699,9 +799,9 @@ impl ShelluneView {
     }
 
     /// Applies the preview. A replace asks once more first; a change on disk since the
-    /// preview plans it again instead of writing over that change.
+    /// preview plans it again instead of writing over that change. The files are
+    /// written on the background executor.
     pub(super) fn apply_backup(&mut self, cx: &mut Context<Self>) {
-        let strings = self.backup_strings();
         let Some(mut preview) = self.take_backup_preview() else {
             return;
         };
@@ -711,12 +811,52 @@ impl ShelluneView {
             cx.notify();
             return;
         }
+        self.put_backup_stage(ImportStage::Applying);
         let data = LocalData::at(self.store.root());
+        let secrets = self.secrets.clone();
         let reason = match preview.mode {
             ApplyMode::Merge => "backup-merge",
             ApplyMode::Replace => "backup-replace",
         };
-        match preview.plan.apply(&data, &*self.secrets, reason) {
+        let work = cx.background_executor().spawn(async move {
+            let outcome = preview.plan.apply(&data, &*secrets, reason);
+            (preview, outcome)
+        });
+        cx.spawn(async move |this, cx| {
+            let (preview, outcome) = work.await;
+            let _ = this.update(cx, |view, cx| {
+                view.finish_backup_apply(preview, outcome, cx)
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Shows what applying did: the result, a fresh preview of data that changed in
+    /// between, or the preview again with the reason.
+    fn finish_backup_apply(
+        &mut self,
+        mut preview: Box<BackupPreview>,
+        outcome: Result<ApplyOutcome, PortableError>,
+        cx: &mut Context<Self>,
+    ) {
+        let strings = self.backup_strings();
+        let still_open = matches!(
+            self.backup.as_ref(),
+            Some(BackupDialog::Import(ImportDialog {
+                stage: ImportStage::Applying,
+                ..
+            }))
+        );
+        if !still_open {
+            // The dialog was closed meanwhile; what was written is on disk, so the
+            // lists follow it all the same.
+            if outcome.is_ok() {
+                self.adopt_imported_data(preview.plan.preferences_changed(), cx);
+            }
+            return;
+        }
+        match outcome {
             Ok(outcome) => {
                 let changed = !preview.plan.is_empty();
                 let not_forgotten = outcome
@@ -756,8 +896,9 @@ impl ShelluneView {
     }
 
     /// Reads every store again after an import, so the lists, the trust decisions and
-    /// the preferences on screen are the ones now on disk.
-    fn adopt_imported_data(&mut self, preferences: bool, cx: &mut Context<Self>) {
+    /// the preferences on screen are the ones now on disk. A pull from the cloud is
+    /// adopted the same way (`view/sync.rs`).
+    pub(super) fn adopt_imported_data(&mut self, preferences: bool, cx: &mut Context<Self>) {
         self.reload_hosts(cx);
         self.restore_groups();
         self.restore_trust();
@@ -973,13 +1114,17 @@ impl ShelluneView {
             ))
             .child(self.backup_primary(
                 "backup.export.save",
-                strings.export_choose,
+                if dialog.running {
+                    strings.export_running
+                } else {
+                    strings.export_choose
+                },
                 if done {
                     Variant::Secondary
                 } else {
                     Variant::Primary
                 },
-                refusal.is_none() && !dialog.choosing,
+                refusal.is_none() && !dialog.choosing && !dialog.running,
                 cx,
                 |this, cx| this.choose_backup_export_path(cx),
             ));
@@ -1087,7 +1232,13 @@ impl ShelluneView {
                     |this, cx| this.close_backup(cx),
                 )),
             ),
-            ImportStage::Locked { field, problem, .. } => {
+            ImportStage::Locked {
+                field,
+                problem,
+                running,
+                ..
+            } => {
+                let running = *running;
                 let mut body = body
                     .child(self.backup_caption(strings.import_locked, "backup.import.locked"))
                     .child(self.backup_field(
@@ -1121,14 +1272,22 @@ impl ShelluneView {
                         ))
                         .child(self.backup_primary(
                             "backup.import.unlock",
-                            strings.import_unlock,
+                            if running {
+                                strings.import_running
+                            } else {
+                                strings.import_unlock
+                            },
                             Variant::Primary,
-                            true,
+                            !running,
                             cx,
                             |this, cx| this.unlock_backup(cx),
                         )),
                 )
             }
+            ImportStage::Applying => (
+                body.child(self.backup_caption(strings.import_running, "backup.import.working")),
+                footer,
+            ),
             ImportStage::Preview(preview) => self.import_preview(preview, body, footer, cx),
             ImportStage::Applied {
                 snapshot,
@@ -1517,6 +1676,7 @@ impl ShelluneView {
             BackupDialog::Import(dialog) => match dialog.stage {
                 ImportStage::Refused(_) => "import.refused",
                 ImportStage::Locked { .. } => "import.locked",
+                ImportStage::Applying => "import.applying",
                 ImportStage::Preview(_) => "import.preview",
                 ImportStage::Applied { .. } => "import.applied",
             },
@@ -1539,7 +1699,7 @@ impl ShelluneView {
                 ImportStage::Refused(reason) => Some(reason.clone()),
                 ImportStage::Locked { problem, .. } => problem.clone(),
                 ImportStage::Preview(preview) => preview.problem.clone(),
-                ImportStage::Applied { .. } => None,
+                ImportStage::Applied { .. } | ImportStage::Applying => None,
             },
         }
     }
@@ -1653,6 +1813,19 @@ impl ShelluneView {
             return None;
         };
         self.export_refusal(dialog, cx)
+    }
+
+    /// Whether the import dialog's passphrase field has the keyboard, for the tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn backup_field_focused_for_test(&self, window: &Window, cx: &App) -> bool {
+        let Some(BackupDialog::Import(dialog)) = self.backup.as_ref() else {
+            return false;
+        };
+        let ImportStage::Locked { field, .. } = &dialog.stage else {
+            return false;
+        };
+        field.read(cx).focus_handle().is_focused(window)
     }
 
     /// The credential store this window keeps passwords in, for the tests.

@@ -98,6 +98,7 @@ mod panes;
 mod sessions;
 pub(crate) mod settings;
 mod shell;
+mod sync;
 mod titlebar;
 mod toasts;
 
@@ -607,6 +608,14 @@ pub struct ShelluneView {
     /// The dialog is opened from a button or the palette, neither of which has a window to
     /// give the keyboard with, so the focus is handed over where a window exists.
     snippet_focus_pending: Option<FocusHandle>,
+    /// The first field of a dialog that just opened, which takes the keyboard on the next
+    /// draw (the backup and sync dialogs are opened without a window at hand).
+    field_focus_pending: Option<FocusHandle>,
+    /// WebDAV sync: its settings, the job running in the background, the conflict
+    /// question and the marker (R7, R8, R10).
+    sync: sync::SyncCenter,
+    /// Whether the private key files saved hosts name exist here, for the list (R9).
+    key_presence: crate::app::hosts::KeyPresence,
     /// The manager's own keyboard target, so its list answers the arrow keys while no
     /// field of the editor is open.
     snippet_focus: FocusHandle,
@@ -1175,13 +1184,27 @@ impl ShelluneView {
         workspace: Workspace,
         root: &std::path::Path,
     ) -> Self {
-        Self::with_stores(
+        Self::with_stores_online(
             cx,
             workspace,
             HostStore::at(root.to_path_buf()),
             TrustStore::at(root.to_path_buf()),
             std::sync::Arc::new(shellune_storage::MemorySecrets::new()),
+            false,
         )
+    }
+
+    /// Builds the shell over `store` with a credential store the test holds, so a sync
+    /// password saved before the window opens is the one its first sync uses.
+    #[cfg(test)]
+    pub fn with_secrets_for_test(
+        cx: &mut Context<Self>,
+        workspace: Workspace,
+        store: HostStore,
+        secrets: std::sync::Arc<dyn SecretStore>,
+    ) -> Self {
+        let trust = TrustStore::at(store.root().to_path_buf());
+        Self::with_stores(cx, workspace, store, trust, secrets)
     }
 
     /// Chooses the palette the capture draws, without touching saved preferences.
@@ -2073,6 +2096,19 @@ impl ShelluneView {
         trust: TrustStore,
         secrets: std::sync::Arc<dyn SecretStore>,
     ) -> Self {
+        Self::with_stores_online(cx, workspace, store, trust, secrets, true)
+    }
+
+    /// [`Self::with_stores`], saying whether sync may reach a server at all: a capture
+    /// draws the sync page from saved settings and must never send a request.
+    fn with_stores_online(
+        cx: &mut Context<Self>,
+        workspace: Workspace,
+        store: HostStore,
+        trust: TrustStore,
+        secrets: std::sync::Arc<dyn SecretStore>,
+        online: bool,
+    ) -> Self {
         let placeholder = workspace.strings().shell_custom_placeholder;
         let search_placeholder = workspace.strings().hosts_search_placeholder;
         let strings = workspace.strings();
@@ -2182,6 +2218,11 @@ impl ShelluneView {
         // The group tree lives in the same directory as the hosts, and one service
         // writes both so a moved branch and the hosts in it cannot part.
         let group_service = GroupService::at(store.root());
+        // Sync reads its settings and state from the same directory and keeps its
+        // password beside the hosts' in the credential store. Nothing is sent here.
+        let sync_center =
+            sync::SyncCenter::new(store.root(), secrets.clone(), workspace.locale(), cx)
+                .online(online);
 
         let mut view = Self {
             workspace,
@@ -2260,6 +2301,9 @@ impl ShelluneView {
             snippets: SnippetLibrary::load(snippet_store),
             snippet_panel: SnippetsPanel::new(),
             snippet_focus_pending: None,
+            field_focus_pending: None,
+            sync: sync_center,
+            key_presence: crate::app::hosts::KeyPresence::new(),
             snippet_focus: cx.focus_handle(),
             forward_listen_host,
             forward_listen_port,
@@ -2395,6 +2439,9 @@ impl ShelluneView {
         // replayed: the summary and the log say what it had finished, and a retry is
         // the user's own decision from the history (R13).
         view.batch.recover(crate::app::remote::now_unix());
+        // Every store is loaded: automatic sync pulls now, when a server is saved and
+        // the switch is on, and nothing is sent otherwise (R8).
+        view.start_sync(cx);
         view
     }
 
@@ -2567,16 +2614,19 @@ impl ShelluneView {
     /// every draw, so the sidebar, the palette, the shortcuts and the key bindings
     /// all persist through one path. A failed write is not worth a banner: the
     /// choice still holds for this run, and the next change tries again.
-    fn persist_preferences(&mut self) {
+    ///
+    /// Returns whether a change was written, which sync treats as a change to upload.
+    fn persist_preferences(&mut self) -> bool {
         let Some(saved) = &self.saved_preferences else {
-            return;
+            return false;
         };
         let now = self.current_preferences();
         if *saved == now {
-            return;
+            return false;
         }
-        let _ = PreferencesStore::at(self.store.root()).save(&now);
+        let written = PreferencesStore::at(self.store.root()).save(&now).is_ok();
         self.saved_preferences = Some(now);
+        written
     }
 
     // -----------------------------------------------------------------------
@@ -2726,6 +2776,7 @@ impl ShelluneView {
                 Ok(()) => {
                     self.saved_preferences = Some(now);
                     self.keymap_save_error = None;
+                    self.note_data_changed(cx);
                 }
                 Err(error) => self.keymap_save_error = Some(error.to_string()),
             }
@@ -3048,6 +3099,10 @@ impl ShelluneView {
             || self.host_menu.is_some()
             || self.tab_menu.is_some()
             || self.shell_menu_open
+            // A backup or sync dialog is a question over the page: the list behind it
+            // must not move or connect while it is answered.
+            || self.backup.is_some()
+            || self.sync_dialog_open()
         {
             return false;
         }
@@ -3086,6 +3141,12 @@ impl ShelluneView {
     #[cfg(test)]
     pub fn hosts_cursor(&self) -> Option<HostId> {
         self.active_hosts_cursor()
+    }
+
+    /// The hosts page's search field's focus, so a test can give it the keyboard.
+    #[cfg(test)]
+    pub fn hosts_search_focus_for_test(&self, cx: &gpui::App) -> FocusHandle {
+        self.hosts_search.read(cx).focus_handle().clone()
     }
 
     /// Connects a saved record with the protocol it was saved as (R2).
@@ -3409,6 +3470,7 @@ impl ShelluneView {
         match outcome {
             Ok(outcome) => {
                 self.groups = outcome.groups;
+                self.note_data_changed(cx);
                 if let Some(book) = outcome.hosts {
                     self.book = book;
                     let items = self.book.hosts().to_vec();
@@ -3874,6 +3936,7 @@ impl ShelluneView {
         for (field, label) in labels {
             field.update(cx, |field, cx| field.set_placeholder(label, cx));
         }
+        self.relabel_sync_fields(cx);
     }
 
     /// Puts the keyboard on what the page shows: the terminal on screen, or the page.
@@ -6026,6 +6089,7 @@ impl ShelluneView {
         match self.store.save(&next) {
             Ok(()) => {
                 self.book = next;
+                self.note_data_changed(cx);
                 let ux = copy::ux();
                 let said = if favorite {
                     ux.favorite_added
@@ -6800,6 +6864,7 @@ impl ShelluneView {
         match self.store.save(&next) {
             Ok(()) => {
                 self.book = next;
+                self.note_data_changed(cx);
                 self.hosts.close_editor();
                 self.host_fields = None;
                 self.protocol_fields = None;
@@ -7012,6 +7077,9 @@ impl ShelluneView {
         match self.store.save(&next) {
             Ok(()) => {
                 self.book = next;
+                // The hosts are written; the forwarding rules below are a second file,
+                // and either way what is on disk now travels.
+                self.note_data_changed(cx);
                 let items = self.book.hosts().to_vec();
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
                 self.recheck_open_hosts();
@@ -7689,6 +7757,7 @@ impl ShelluneView {
         match self.store.save(&next) {
             Ok(()) => {
                 self.book = next;
+                self.note_data_changed(cx);
                 let items = self.book.hosts().to_vec();
                 self.workspace.replace_hosts(SectionStatus::Ready, items);
                 self.unsaved.remove(index);
@@ -8423,6 +8492,7 @@ impl ShelluneView {
             self.abort_for_trust(id, error.to_string(), cx);
             return false;
         }
+        self.note_data_changed(cx);
         true
     }
 
@@ -8823,6 +8893,8 @@ impl ShelluneView {
             cx.notify();
             return;
         }
+        // The accepted identity is in the trust file and reached the connection.
+        self.note_data_changed(cx);
         if let Some(panel) = self.remote.as_mut() {
             panel.set_status(RemoteStatus::Connecting);
         }
@@ -9145,6 +9217,7 @@ impl ShelluneView {
         match self.store.save(&next) {
             Ok(()) => {
                 self.book = next;
+                self.note_data_changed(cx);
                 cx.notify();
                 true
             }
@@ -11055,6 +11128,12 @@ impl ShelluneView {
         // writes nothing (R5, R6).
         if self.backup.is_some() {
             self.close_backup(cx);
+            return true;
+        }
+        // The sync conflict question: Escape is "not now", which changes nothing and
+        // keeps the conflict until it is answered (R10).
+        if self.sync_dialog_open() {
+            self.resolve_sync_conflict(shellune_sync::Resolution::Cancel, cx);
             return true;
         }
         // A batch preview or a list is a question, so Escape is "not now". A run that
@@ -17347,7 +17426,9 @@ impl Render for ShelluneView {
         // Small views that are not handed the workspace (a text field's menu) read the
         // language from here.
         self.workspace.locale().set_current();
-        self.persist_preferences();
+        if self.persist_preferences() {
+            self.note_data_changed(cx);
+        }
         if self.focus_lost_watch.is_none() {
             self.focus_lost_watch = Some(cx.on_focus_lost(window, |view, window, cx| {
                 view.reclaim_focus(window, cx);
@@ -17426,6 +17507,14 @@ impl Render for ShelluneView {
         if let Some(handle) = self.snippet_focus_pending.take()
             && !handle.is_focused(window)
         {
+            window.focus(&handle);
+        }
+        // A backup or sync dialog that just asked for a field gives it the keyboard, and
+        // remembers where the keyboard was so closing the dialog puts it back.
+        if let Some(handle) = self.field_focus_pending.take()
+            && !handle.is_focused(window)
+        {
+            self.remember_focus(window, cx);
             window.focus(&handle);
         }
         // The paste confirmation holds the keyboard while it is up. Nothing behind it
@@ -17753,6 +17842,7 @@ impl Render for ShelluneView {
             .children(self.connection_dialog_overlay(window, cx))
             .children(self.group_dialog_overlay(window, cx))
             .children(self.backup_overlay(window, cx))
+            .children(self.sync_overlay(window, cx))
             .children(self.custom_shell_overlay(window, cx))
             .children(self.shell_menu_overlay(window, cx))
             .children(self.files_menu_overlay(window, cx))

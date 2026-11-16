@@ -1876,6 +1876,73 @@ fn backup_import_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     }
 }
 
+/// Writes the saved hosts and sync settings for a server that is never reached: the
+/// capture window is offline, so the page is drawn from these files alone (R7, R8).
+///
+/// `last` is what the state file says the last sync did; its time is fixed, so the
+/// status line reads the same on every run.
+fn seed_sync_with(root: &Path, last: shellune_sync::LastResult) -> Result<(), String> {
+    seed_hosts(root)?;
+    let mut config =
+        shellune_sync::SyncConfig::new("https://dav.example.com/remote.php/dav/files/me/", "me");
+    config.auto = true;
+    shellune_sync::SyncConfigStore::at(root)
+        .save(&config)
+        .map_err(|error| format!("the sync settings could not be written: {error}"))?;
+    let state = shellune_sync::SyncState {
+        last_result: Some(last),
+        last_time_unix: Some(1_794_816_000),
+        last_success_unix: Some(1_794_816_000),
+        ..shellune_sync::SyncState::default()
+    };
+    shellune_sync::SyncStateStore::at(root)
+        .save(&state)
+        .map_err(|error| format!("the sync state could not be written: {error}"))
+}
+
+fn seed_sync(root: &Path) -> Result<(), String> {
+    seed_sync_with(root, shellune_sync::LastResult::Uploaded)
+}
+
+fn seed_sync_conflict(root: &Path) -> Result<(), String> {
+    seed_sync_with(root, shellune_sync::LastResult::Conflict)
+}
+
+/// Opens the sync category over saved settings (R7, R8).
+fn show_sync_settings(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::Sync)?;
+    view.capture_sync_settings(cx);
+    Ok(())
+}
+
+fn sync_settings_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    settings_page_is_on(view, ("sync", "sync"))
+}
+
+/// Opens the conflict question over the sync category, with a fixed report of a Mac's
+/// cloud file; nothing is resolved (R10).
+fn show_sync_conflict(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_settings_item(view, window, cx, Item::Sync)?;
+    view.capture_sync_conflict(cx);
+    Ok(())
+}
+
+fn sync_conflict_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if view.capture_sync_conflict_open() {
+        Ok(())
+    } else {
+        Err("the sync conflict question is not open".to_owned())
+    }
+}
+
 fn settings_connection_custom_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     settings_page_is_on(view, ("connection", "policy"))?;
     let defaults = view.connection_defaults();
@@ -2694,6 +2761,45 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_backup_import,
         install: show_backup_import_preview,
         ready: backup_import_ready,
+    },
+    Scenario {
+        id: "settings-sync",
+        title: "设置 · 同步（WebDAV）",
+        category: Category::Settings,
+        fixture: "six saved hosts, sync settings for a server that is never reached and a \
+                  state file saying the last sync uploaded at a fixed time",
+        evidence: "shows the server fields, the automatic and password switches, the actions \
+                   and the status line this build draws; the window is offline, so nothing \
+                   was sent, and saving, testing, uploading and pulling are proved by the \
+                   GPUI tests against the in-process WebDAV server",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: seed_sync,
+        install: show_sync_settings,
+        ready: sync_settings_ready,
+    },
+    Scenario {
+        id: "sync-conflict",
+        title: "浮层 · 同步冲突",
+        category: Category::Overlay,
+        fixture: "the sync fixture with a state file saying a conflict waits, and a fixed \
+                  report of a cloud file written on macOS",
+        evidence: "shows the conflict question, where the cloud data came from and the \
+                   three answers, plus the conflict marker in the top bar; nothing was \
+                   resolved, and each answer is proved by the GPUI tests",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().chinese().smallest(),
+        ],
+        start: || page(Destination::Settings),
+        prepare: seed_sync_conflict,
+        install: show_sync_conflict,
+        ready: sync_conflict_ready,
     },
     Scenario {
         id: "overlay-palette",

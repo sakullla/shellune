@@ -199,6 +199,9 @@ impl ShelluneView {
             // a run this window is driving says so in the same row, so leaving it for
             // another page never loses it (R11, R13).
             .children(self.batch_topbar_control(cx))
+            // A failed sync or a conflict waiting for an answer is said here, on every
+            // page, and a press opens the sync settings (R8, R10).
+            .children(self.sync_topbar_marker(cx))
             .child(trailing)
             .children(controls)
     }
@@ -1240,8 +1243,8 @@ impl ShelluneView {
         on: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace.set_attention(kind, on) {
-            self.persist_preferences();
+        if self.workspace.set_attention(kind, on) && self.persist_preferences() {
+            self.note_data_changed(cx);
         }
         cx.notify();
     }
@@ -2211,6 +2214,7 @@ impl ShelluneView {
             Ok(()) => {
                 self.snippet_panel.end_edit();
                 self.snippet_list_focus();
+                self.note_data_changed(cx);
                 self.toast(Tone::Positive, copy::ux().snippet_saved, None, cx);
             }
             Err(error) => {
@@ -2232,6 +2236,7 @@ impl ShelluneView {
         let locale = self.workspace.locale();
         match self.snippets.remove(id) {
             Ok(true) => {
+                self.note_data_changed(cx);
                 let count = self.snippets.snippets().len();
                 self.snippet_panel
                     .select(self.snippet_panel.selected(), count);

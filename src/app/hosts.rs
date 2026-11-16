@@ -2138,6 +2138,56 @@ pub fn import_message(
     (message, true)
 }
 
+/// Whether the private key files hosts name exist on this computer (R9).
+///
+/// A host that came from another machine - through a backup or a sync - keeps the key
+/// path it was saved with, and that path may name a file this computer does not have.
+/// The record is kept as it is; the list says so on the row until the file is there or
+/// the path is changed. A list is drawn every frame, so the answers are kept for a few
+/// seconds instead of asking the file system for every row of every frame; a new path is
+/// asked about at once, and a file that appears is noticed on the next check.
+#[derive(Debug, Default)]
+pub struct KeyPresence {
+    known: std::cell::RefCell<std::collections::HashMap<String, (bool, std::time::Instant)>>,
+}
+
+impl KeyPresence {
+    /// How long one answer is trusted.
+    const FRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// An empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `path` (as a host saves it: `~` expanded, relative to the home folder)
+    /// names a file that is missing on this computer.
+    #[must_use]
+    pub fn missing(&self, path: &str) -> bool {
+        let path = path.trim();
+        if path.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if let Some((exists, at)) = self.known.borrow().get(path)
+            && now.duration_since(*at) < Self::FRESH
+        {
+            return !exists;
+        }
+        let exists = shellune_storage::resolve_path(path).exists();
+        self.known
+            .borrow_mut()
+            .insert(path.to_owned(), (exists, now));
+        !exists
+    }
+
+    /// Forgets every answer, so the next draw asks again (after data was replaced).
+    pub fn forget(&self) {
+        self.known.borrow_mut().clear();
+    }
+}
+
 /// Formats a Unix timestamp as UTC, without pulling a date library into the shell.
 ///
 /// The recent view has to say *when* a host was reached, and a stored integer is not
@@ -3571,6 +3621,24 @@ impl ConnectionEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_path_is_missing_until_the_file_is_there_and_the_answer_is_asked_again() {
+        let dir =
+            std::env::temp_dir().join(format!("shellune-key-presence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let key = dir.join("id_ed25519");
+        let path = key.display().to_string();
+        let presence = KeyPresence::new();
+        assert!(presence.missing(&path), "no file yet");
+        assert!(!presence.missing("  "), "no path is not a missing file");
+        std::fs::write(&key, "key").expect("written");
+        assert!(presence.missing(&path), "the answer is kept for a moment");
+        presence.forget();
+        assert!(!presence.missing(&path), "and asked again once forgotten");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     // -----------------------------------------------------------------------
     // Connections of another protocol (R2, R9, R18)

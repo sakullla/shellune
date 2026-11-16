@@ -557,6 +557,28 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
             ],
         ),
         (
+            "settings.category.sync",
+            &[(
+                "sync",
+                "settings.row.sync-url",
+                &[
+                    "settings.sync.url",
+                    "settings.sync.username",
+                    "settings.sync.password",
+                    "settings.sync.remote-dir",
+                    "settings.sync.auto.0",
+                    "settings.sync.auto.1",
+                    "settings.sync.secrets.0",
+                    "settings.sync.secrets.1",
+                    "settings.sync.save",
+                    "settings.sync.test",
+                    "settings.sync.upload",
+                    "settings.sync.pull",
+                    "settings.sync.status",
+                ][..],
+            )],
+        ),
+        (
             "settings.category.about",
             &[("version", "settings.row.about", &["status.version"][..])],
         ),
@@ -582,7 +604,7 @@ async fn every_settings_row_and_control_stays_inside_its_card_at_two_hundred_per
             checked += 1;
         }
     }
-    assert_eq!(checked, 15, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
+    assert_eq!(checked, 16, "not every settings item was measured"); // The font stepper keeps a pointer target a finger can hit at the largest text too.
     click(cx, "settings.category.terminal");
     click(cx, "settings.item.font-size");
     for selector in ["settings.font.less", "settings.font.more"] {
@@ -635,6 +657,8 @@ fn item_selector(item: &'static str) -> &'static str {
         "import" => "settings.item.import",
         "backup-export" => "settings.item.backup-export",
         "backup-import" => "settings.item.backup-import",
+        // The sync page is named like its category, so the category is its row.
+        "sync" => "settings.category.sync",
         _ => "settings.item.version",
     }
 }
@@ -656,6 +680,7 @@ fn card_selector(item: &'static str) -> &'static str {
         "import" => "settings.card.import",
         "backup-export" => "settings.card.backup-export",
         "backup-import" => "settings.card.backup-import",
+        "sync" => "settings.card.sync",
         "keys" => "settings.keys",
         _ => "settings.card.version",
     }
@@ -815,6 +840,7 @@ fn page_selector(item: &'static str) -> &'static str {
         "import" => "settings.page.import",
         "backup-export" => "settings.page.backup-export",
         "backup-import" => "settings.page.backup-import",
+        "sync" => "settings.page.sync",
         _ => "settings.page.version",
     }
 }
@@ -1040,6 +1066,7 @@ async fn the_minimum_window_reaches_every_settings_category_and_item_at_115_perc
         ),
         ("settings.category.keys", &["keys"][..]),
         ("settings.category.data", &["hosts-file", "import"][..]),
+        ("settings.category.sync", &["sync"][..]),
         ("settings.category.about", &["version"][..]),
     ] {
         assert_within_width(bounds_of(cx, category), viewport, category);
@@ -1055,7 +1082,7 @@ async fn the_minimum_window_reaches_every_settings_category_and_item_at_115_perc
             reached += 1;
         }
     }
-    assert_eq!(reached, 14, "not every settings item was reachable");
+    assert_eq!(reached, 15, "not every settings item was reachable");
 
     // The way out is on the page as it always was, so a person is never stranded here.
     assert_within_width(bounds_of(cx, "nav.hosts"), viewport, "the hosts entry");
@@ -28858,4 +28885,622 @@ async fn a_group_card_in_a_short_window_scrolls_the_page_to_the_narrowed_list(
         after.top() >= px(0.0) && after.top() < viewport.height / 4.0,
         "the narrowed list starts near the top of the window: {after:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// WebDAV sync (R7, R8, R9, R10)
+// ---------------------------------------------------------------------------
+
+const SYNC_USER: &str = "alice";
+const SYNC_PASSWORD: &str = "dav-password-4711";
+
+/// The cloud file's path under the test server's account.
+fn cloud_path() -> String {
+    format!(
+        "{}/{}",
+        shellune_sync::DEFAULT_REMOTE_DIR,
+        shellune_sync::REMOTE_FILE_NAME
+    )
+}
+
+/// The names of the hosts the cloud file holds, sorted; empty when there is no file.
+fn cloud_host_names(server: &shellune_sync::testing::WebDavServer) -> Vec<String> {
+    let Some(bytes) = server.file(&cloud_path()) else {
+        return Vec::new();
+    };
+    let document =
+        shellune_storage::ShelluneData::from_json(&bytes).expect("the cloud file is a document");
+    let mut names: Vec<String> = document
+        .shared()
+        .hosts()
+        .hosts()
+        .iter()
+        .map(|host| host.name().to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The cloud document.
+fn cloud_document(server: &shellune_sync::testing::WebDavServer) -> shellune_storage::ShelluneData {
+    let bytes = server.file(&cloud_path()).expect("the cloud holds a file");
+    shellune_storage::ShelluneData::from_json(&bytes).expect("the cloud file is a document")
+}
+
+/// Points a data directory at the test server and keeps the WebDAV password in the
+/// machine's own credential store, as saving the sync page does.
+fn configure_sync(
+    dir: &TempDir,
+    secrets: &shellune_storage::MemorySecrets,
+    server: &shellune_sync::testing::WebDavServer,
+    auto: bool,
+) {
+    use shellune_storage::SecretStore as _;
+    let mut config = shellune_sync::SyncConfig::new(server.url(), SYNC_USER);
+    config.auto = auto;
+    shellune_sync::SyncConfigStore::at(dir.path())
+        .save(&config)
+        .expect("the sync settings are written");
+    secrets
+        .save_app(
+            shellune_storage::AppSecret::WebDavPassword,
+            &shellune_core::SecretString::new(SYNC_PASSWORD),
+        )
+        .expect("the password is kept");
+}
+
+/// Another machine: a sync service over its own directory and credential store.
+fn other_machine(
+    dir: &TempDir,
+    server: &shellune_sync::testing::WebDavServer,
+) -> shellune_sync::SyncService {
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(dir, &secrets, server, true);
+    shellune_sync::SyncService::new(
+        shellune_storage::LocalData::at(dir.path()),
+        shellune_storage::Platform::current(),
+        secrets,
+    )
+    .with_kdf(shellune_storage::KdfParams::new(8, 1, 1).expect("cheap parameters"))
+}
+
+/// A window over `dir` whose credential store the test holds, on `destination`.
+fn sync_window<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &TempDir,
+    secrets: &Arc<shellune_storage::MemorySecrets>,
+    destination: Destination,
+) -> (Entity<ShelluneView>, &'a mut VisualTestContext) {
+    let mut workspace = Workspace::new();
+    workspace.select(destination);
+    let store = dir.store();
+    let secrets: Arc<dyn shellune_storage::SecretStore> = secrets.clone();
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        ShelluneView::with_secrets_for_test(cx, workspace, store, secrets)
+    });
+    cx.simulate_resize(tall_window());
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// Lets the debounce after a change run out, and the upload it starts finish.
+fn after_debounce(cx: &mut VisualTestContext) {
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(6));
+    cx.run_until_parked();
+}
+
+/// Lets one automatic check of the cloud come round, and finish.
+fn after_poll(cx: &mut VisualTestContext) {
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(15 * 60 + 1));
+    cx.run_until_parked();
+}
+
+/// How many sync jobs ended, whether one is running or waiting, and the last failure.
+fn sync_progress(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+) -> (usize, bool, Option<String>) {
+    cx.update(|_window, app| view.read(app).sync_progress_for_test())
+}
+
+fn sync_marker(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> Option<&'static str> {
+    cx.update(|_window, app| view.read(app).sync_marker_for_test())
+}
+
+fn sync_conflict_open(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_window, app| view.read(app).sync_conflict_open_for_test())
+}
+
+fn first_host_id(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> HostId {
+    cx.update(|_window, app| view.read(app).book().hosts()[0].id())
+}
+
+fn toggle_favorite(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: HostId) {
+    cx.update(|_window, app| view.update(app, |view, cx| view.toggle_favorite(id, cx)));
+    cx.run_until_parked();
+}
+
+fn put_count(server: &shellune_sync::testing::WebDavServer) -> usize {
+    server
+        .requests()
+        .iter()
+        .filter(|request| request.starts_with("PUT"))
+        .count()
+}
+
+#[gpui::test]
+async fn the_sync_page_tests_the_connection_and_keeps_the_password_out_of_the_file(
+    cx: &mut TestAppContext,
+) {
+    use shellune_storage::SecretStore as _;
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("sync-settings");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Settings);
+    assert_eq!(
+        sync_progress(&view, cx).0,
+        0,
+        "nothing is synced while no server is saved"
+    );
+    assert!(server.requests().is_empty(), "and nothing is sent");
+
+    click(cx, "settings.category.sync");
+    assert!(cx.debug_bounds("settings.card.sync").is_some());
+    let status = cx.update(|_window, app| view.read(app).sync_status_for_test().0);
+    assert_eq!(status, copy::ENGLISH_SYNC.status_not_configured);
+
+    type_into(cx, "settings.sync.url", &server.url());
+    type_into(cx, "settings.sync.username", SYNC_USER);
+    type_into(cx, "settings.sync.password", "not-the-password");
+    click(cx, "settings.sync.test");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).sync_test_for_test()),
+        Some((false, copy::ENGLISH_SYNC.error_auth.to_owned())),
+        "a wrong password is reported as an authentication failure"
+    );
+    assert!(cx.debug_bounds("settings.sync.test.result").is_some());
+
+    clear_field(cx, "settings.sync.password", "not-the-password".len());
+    type_into(cx, "settings.sync.password", SYNC_PASSWORD);
+    click(cx, "settings.sync.test");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).sync_test_for_test())
+            .map(|(passed, _)| passed),
+        Some(true),
+        "the right password connects and the folder is written"
+    );
+    assert_eq!(sync_progress(&view, cx).0, 0, "a test is not a sync");
+
+    click(cx, "settings.sync.save");
+    let saved = std::fs::read_to_string(dir.path().join(shellune_sync::CONFIG_FILE_NAME))
+        .expect("the settings file is written");
+    assert!(saved.contains(&server.url()));
+    assert!(
+        !saved.contains(SYNC_PASSWORD),
+        "the WebDAV password is not in the settings file"
+    );
+    assert_eq!(
+        secrets
+            .load_app(shellune_storage::AppSecret::WebDavPassword)
+            .expect("the store answers")
+            .as_ref()
+            .map(shellune_core::SecretString::expose),
+        Some(SYNC_PASSWORD),
+        "it is in the credential store"
+    );
+    // Automatic sync is on by default, so saving starts the first sync at once.
+    let (finished, busy, failure) = sync_progress(&view, cx);
+    assert!(finished >= 1 && !busy, "the first sync ran");
+    assert_eq!(failure, None);
+    let status = cx.update(|_window, app| view.read(app).sync_status_for_test().0);
+    assert!(
+        status.starts_with(copy::ENGLISH_SYNC.status_label),
+        "the page says when the last sync was: {status}"
+    );
+}
+
+#[gpui::test]
+async fn syncing_passwords_needs_a_passphrase_before_it_is_saved(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("sync-passphrase");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, false);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Settings);
+    click(cx, "settings.category.sync");
+    click(cx, "settings.sync.secrets.0");
+    assert!(cx.debug_bounds("settings.sync.passphrase").is_some());
+    click(cx, "settings.sync.save");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).sync_status_for_test().1),
+        Some(copy::ENGLISH_SYNC.passphrase_required.to_owned())
+    );
+    let config = shellune_sync::SyncConfigStore::at(dir.path())
+        .load()
+        .expect("reads")
+        .expect("configured");
+    assert!(
+        !config.sync_secrets,
+        "nothing was saved without the passphrase"
+    );
+}
+
+#[gpui::test]
+async fn with_automatic_sync_off_a_change_stays_local_until_upload_now(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("sync-manual");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, false);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Settings);
+    assert_eq!(
+        sync_progress(&view, cx).0,
+        0,
+        "no pull at start while it is off"
+    );
+    assert!(server.requests().is_empty());
+
+    let alpha = first_host_id(&view, cx);
+    toggle_favorite(&view, cx, alpha);
+    after_debounce(cx);
+    after_poll(cx);
+    assert!(
+        server.requests().is_empty(),
+        "a change is not uploaded while automatic sync is off"
+    );
+    assert!(server.file(&cloud_path()).is_none());
+
+    click(cx, "settings.category.sync");
+    click(cx, "settings.sync.upload");
+    assert_eq!(
+        cloud_host_names(&server),
+        vec!["alpha"],
+        "upload now writes the cloud"
+    );
+    assert!(cloud_document(&server).shared().hosts().is_favorite(alpha));
+    assert_eq!(sync_progress(&view, cx).2, None);
+}
+
+#[gpui::test]
+async fn a_saved_change_is_uploaded_after_the_debounce(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("sync-auto-upload");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Hosts);
+    // The first sync at start found an empty cloud and uploaded.
+    assert_eq!(cloud_host_names(&server), vec!["alpha"]);
+
+    let alpha = first_host_id(&view, cx);
+    toggle_favorite(&view, cx, alpha);
+    assert!(
+        !cloud_document(&server).shared().hosts().is_favorite(alpha),
+        "nothing is sent before the debounce runs out"
+    );
+    after_debounce(cx);
+    assert!(
+        cloud_document(&server).shared().hosts().is_favorite(alpha),
+        "the change reached the cloud"
+    );
+    assert_eq!(sync_marker(&view, cx), None);
+}
+
+#[gpui::test]
+async fn another_machine_s_host_arrives_at_start_and_on_the_next_check(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let machine_a = TempDir::new("sync-a");
+    seed(
+        &machine_a.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let a = other_machine(&machine_a, &server);
+    assert!(matches!(
+        a.sync().expect("A uploads"),
+        shellune_sync::SyncOutcome::Uploaded(_)
+    ));
+
+    // B starts with nothing and pulls what A wrote.
+    let machine_b = TempDir::new("sync-b");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&machine_b, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &machine_b, &secrets, Destination::Hosts);
+    assert_eq!(host_names(&view, cx), vec!["alpha"], "pulled at start");
+
+    // A adds a host; B's next check brings it in without a restart.
+    seed(
+        &machine_a.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "root", None),
+            stored_host("beta", "10.0.0.2", 22, "root", None),
+        ],
+    );
+    let _ = a.sync().expect("A uploads again");
+    after_poll(cx);
+    assert_eq!(host_names(&view, cx), vec!["alpha", "beta"]);
+    assert_eq!(
+        machine_b.store().load().expect("reads").hosts().len(),
+        2,
+        "and it is saved on B"
+    );
+    // Applying the pull did not send it back.
+    let puts = put_count(&server);
+    after_debounce(cx);
+    assert_eq!(put_count(&server), puts, "a pull is not uploaded again");
+}
+
+/// Sets up a conflict: A and B synced once, then both changed, and A uploaded first.
+fn conflicting_machines<'a>(
+    cx: &'a mut TestAppContext,
+    server: &shellune_sync::testing::WebDavServer,
+    machine_a: &TempDir,
+    machine_b: &TempDir,
+) -> (
+    Entity<ShelluneView>,
+    &'a mut VisualTestContext,
+    shellune_sync::SyncService,
+) {
+    seed(
+        &machine_a.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let a = other_machine(machine_a, server);
+    let _ = a.sync().expect("A uploads");
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(machine_b, &secrets, server, true);
+    let (view, cx) = sync_window(cx, machine_b, &secrets, Destination::Settings);
+    assert_eq!(host_names(&view, cx), vec!["alpha"]);
+
+    seed(
+        &machine_a.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "root", None),
+            stored_host("from-a", "10.0.0.7", 22, "root", None),
+        ],
+    );
+    let _ = a.sync().expect("A uploads its change");
+    let alpha = first_host_id(&view, cx);
+    toggle_favorite(&view, cx, alpha);
+    after_debounce(cx);
+    (view, cx, a)
+}
+
+#[gpui::test]
+async fn a_conflict_asks_and_cancel_keeps_both_sides(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let (machine_a, machine_b) = (TempDir::new("conflict-a"), TempDir::new("conflict-b"));
+    let (view, cx, _a) = conflicting_machines(cx, &server, &machine_a, &machine_b);
+    assert!(
+        sync_conflict_open(&view, cx),
+        "both sides changed, so the window asks"
+    );
+    assert!(cx.debug_bounds("sync.conflict.dialog").is_some());
+    assert_eq!(cloud_host_names(&server), vec!["alpha", "from-a"]);
+
+    click(cx, "sync.conflict.cancel");
+    assert!(!sync_conflict_open(&view, cx));
+    assert_eq!(
+        host_names(&view, cx),
+        vec!["alpha"],
+        "nothing local was replaced"
+    );
+    assert_eq!(
+        cloud_host_names(&server),
+        vec!["alpha", "from-a"],
+        "nothing in the cloud was replaced"
+    );
+    assert_eq!(sync_marker(&view, cx), Some("conflict"));
+    assert!(cx.debug_bounds("topbar.sync").is_some());
+
+    // An automatic check does not ask again while the conflict is put away...
+    after_poll(cx);
+    assert!(!sync_conflict_open(&view, cx));
+    // ...and the settings page asks again on request.
+    click(cx, "settings.category.sync");
+    click(cx, "settings.sync.conflict");
+    assert!(sync_conflict_open(&view, cx));
+    // Escape is the same as cancel.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!sync_conflict_open(&view, cx));
+    assert_eq!(host_names(&view, cx), vec!["alpha"]);
+    assert_eq!(cloud_host_names(&server), vec!["alpha", "from-a"]);
+}
+
+#[gpui::test]
+async fn use_cloud_data_replaces_this_computer_and_keeps_a_snapshot(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let (machine_a, machine_b) = (TempDir::new("remote-a"), TempDir::new("remote-b"));
+    let (view, cx, _a) = conflicting_machines(cx, &server, &machine_a, &machine_b);
+    assert!(sync_conflict_open(&view, cx));
+    click(cx, "sync.conflict.remote");
+    assert_eq!(host_names(&view, cx), vec!["alpha", "from-a"]);
+    assert_eq!(sync_marker(&view, cx), None);
+    let snapshots = shellune_storage::SnapshotStore::at(machine_b.path()).list();
+    let kept = snapshots
+        .iter()
+        .find(|snapshot| snapshot.reason().starts_with("sync-use-remote"))
+        .expect("the data replaced here was copied aside first");
+    let before = HostStore::at(kept.path()).load().expect("the copy reads");
+    assert_eq!(before.hosts().len(), 1);
+    assert!(
+        before.is_favorite(before.hosts()[0].id()),
+        "the copy is this computer's data before the choice"
+    );
+}
+
+#[gpui::test]
+async fn use_this_computer_replaces_the_cloud_and_keeps_its_file(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let (machine_a, machine_b) = (TempDir::new("local-a"), TempDir::new("local-b"));
+    let (view, cx, a) = conflicting_machines(cx, &server, &machine_a, &machine_b);
+    assert!(sync_conflict_open(&view, cx));
+    click(cx, "sync.conflict.local");
+    assert_eq!(host_names(&view, cx), vec!["alpha"]);
+    assert_eq!(
+        cloud_host_names(&server),
+        vec!["alpha"],
+        "the cloud took this computer's data"
+    );
+    let alpha = first_host_id(&view, cx);
+    assert!(cloud_document(&server).shared().hosts().is_favorite(alpha));
+    let snapshots = shellune_storage::SnapshotStore::at(machine_b.path()).list();
+    let kept = snapshots
+        .iter()
+        .find(|snapshot| snapshot.reason().starts_with("sync-use-local"))
+        .expect("the cloud file replaced was copied aside first");
+    let file = std::fs::read(kept.path().join(shellune_sync::REMOTE_FILE_NAME))
+        .expect("the cloud file is in the snapshot");
+    assert!(String::from_utf8_lossy(&file).contains("from-a"));
+    assert_eq!(sync_marker(&view, cx), None);
+    // A had nothing unsynced, so its next sync takes the choice made here.
+    assert!(matches!(
+        a.sync().expect("A checks"),
+        shellune_sync::SyncOutcome::Pulled(_)
+    ));
+    assert_eq!(
+        machine_a.store().load().expect("reads").hosts().len(),
+        1,
+        "the other machine follows the data that was kept"
+    );
+}
+
+#[gpui::test]
+async fn a_failed_sync_keeps_the_change_shows_a_marker_and_is_retried(cx: &mut TestAppContext) {
+    let server = shellune_sync::testing::WebDavServer::start(SYNC_USER, SYNC_PASSWORD);
+    let dir = TempDir::new("sync-offline");
+    seed(
+        &dir.store(),
+        vec![stored_host("alpha", "10.0.0.1", 22, "root", None)],
+    );
+    let secrets = Arc::new(shellune_storage::MemorySecrets::new());
+    configure_sync(&dir, &secrets, &server, true);
+    let (view, cx) = sync_window(cx, &dir, &secrets, Destination::Hosts);
+    assert_eq!(cloud_host_names(&server), vec!["alpha"]);
+
+    server.set_offline(true);
+    let alpha = first_host_id(&view, cx);
+    toggle_favorite(&view, cx, alpha);
+    after_debounce(cx);
+    let (_, busy, failure) = sync_progress(&view, cx);
+    assert!(!busy);
+    let failure = failure.expect("the failure is kept");
+    assert!(
+        failure.starts_with(copy::ENGLISH_SYNC.error_unreachable),
+        "{failure}"
+    );
+    assert!(
+        dir.store().load().expect("reads").is_favorite(alpha),
+        "the change is saved on this computer"
+    );
+    assert_eq!(sync_marker(&view, cx), Some("failed"));
+    assert!(cx.debug_bounds("topbar.sync").is_some());
+    let status = cx.update(|_window, app| view.read(app).sync_status_for_test().0);
+    assert!(status.contains("Failed"), "{status}");
+
+    // The network is back: the next check sends the change.
+    server.set_offline(false);
+    after_poll(cx);
+    assert_eq!(sync_progress(&view, cx).2, None);
+    assert_eq!(sync_marker(&view, cx), None);
+    assert!(cloud_document(&server).shared().hosts().is_favorite(alpha));
+
+    // The marker leads to the sync settings.
+    server.set_offline(true);
+    toggle_favorite(&view, cx, alpha);
+    after_debounce(cx);
+    assert_eq!(sync_marker(&view, cx), Some("failed"));
+    click(cx, "topbar.sync");
+    assert_eq!(destination_of(&view, cx), Destination::Settings);
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).settings_page_id().0),
+        "sync"
+    );
+}
+
+#[gpui::test]
+async fn a_host_whose_key_file_is_not_on_this_computer_says_so_in_the_list(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("key-missing");
+    let key_file = dir.path().join("id_present");
+    std::fs::write(&key_file, "not a real key").expect("the test writes the file");
+    let mut alpha = stored_host("alpha", "10.0.0.1", 22, "root", None);
+    alpha.set_auth(Some(shellune_core::AuthMethodKind::KeyFile));
+    alpha.set_identity_file(Some("/nowhere/shellune-test/id_from_linux"));
+    let mut beta = stored_host("beta", "10.0.0.2", 22, "root", None);
+    beta.set_auth(Some(shellune_core::AuthMethodKind::KeyFile));
+    beta.set_identity_file(Some(key_file.display().to_string()));
+    seed(&dir.store(), vec![alpha, beta]);
+    let (_view, cx) = hosts_view(cx, dir.store());
+    assert!(
+        cx.debug_bounds("hosts.key-missing.0").is_some(),
+        "the host naming a key this computer does not have says so"
+    );
+    assert!(
+        cx.debug_bounds("hosts.key-missing.1").is_none(),
+        "a key that is here draws no notice"
+    );
+}
+
+#[gpui::test]
+async fn the_hosts_keys_do_nothing_behind_a_backup_dialog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("hosts-keys-behind-backup");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("alpha", "10.0.0.1", 22, "deploy", None),
+            stored_host("beta", "10.0.0.2", 22, "deploy", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    let damaged = dir.path().join("damaged.json");
+    std::fs::write(&damaged, "{ not a backup").expect("the test writes the file");
+    read_backup(&view, cx, &damaged);
+    assert_eq!(backup_stage(&view, cx), Some("import.refused"));
+    let search = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+    cx.update(|window, _app| window.focus(&search));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_cursor()),
+        None,
+        "the list behind the dialog does not move"
+    );
+}
+
+#[gpui::test]
+async fn an_empty_import_passphrase_is_asked_for_in_import_words(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-empty-passphrase");
+    let backup = dir.path().join("locked.json");
+    let alpha = password_host("alpha", "10.0.0.1");
+    let alpha_id = alpha.id();
+    write_backup(
+        &backup,
+        vec![alpha],
+        Some("right horse"),
+        &[(alpha_id, "alpha-password")],
+    );
+    let (view, cx) = settings_view(cx, &dir);
+    read_backup(&view, cx, &backup);
+    assert_eq!(backup_stage(&view, cx), Some("import.locked"));
+    assert!(
+        cx.update(|window, app| view.read(app).backup_field_focused_for_test(window, app)),
+        "the passphrase field takes the keyboard"
+    );
+    click(cx, "backup.import.unlock");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).backup_message_for_test()),
+        Some(copy::ENGLISH_BACKUP.import_passphrase_required.to_owned())
+    );
+    assert_eq!(backup_stage(&view, cx), Some("import.locked"));
 }
