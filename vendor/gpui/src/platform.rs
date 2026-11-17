@@ -1609,6 +1609,13 @@ impl ClipboardItem {
         }
     }
 
+    /// Create a ClipboardItem with several entries, such as a text and an image that
+    /// are the same copied content. Platforms that hold one value per kind write the
+    /// first text and the first image.
+    pub fn new_entries(entries: Vec<ClipboardEntry>) -> Self {
+        Self { entries }
+    }
+
     /// Concatenates together all the ClipboardString entries in the item.
     /// Returns None if there were no ClipboardString entries.
     pub fn text(&self) -> Option<String> {

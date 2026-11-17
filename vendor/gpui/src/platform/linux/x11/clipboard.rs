@@ -988,10 +988,13 @@ impl Clipboard {
         self.inner.write(data, selection, wait)
     }
 
-    #[allow(unused)]
+    /// Offers an image, in its own format, and the text that came with it, if any, as
+    /// `UTF8_STRING`: a paste that wants text gets the text, one that wants an image
+    /// gets the image.
     pub(crate) fn set_image(
         &self,
         image: Image,
+        text: Option<String>,
         selection: ClipboardKind,
         wait: WaitConfig,
     ) -> Result<()> {
@@ -1004,10 +1007,16 @@ impl Clipboard {
             ImageFormat::Bmp => self.inner.atoms.BMP__MIME,
             ImageFormat::Tiff => self.inner.atoms.TIFF_MIME,
         };
-        let data = vec![ClipboardData {
+        let mut data = vec![ClipboardData {
             bytes: image.bytes,
-            format: self.inner.atoms.PNG__MIME,
+            format,
         }];
+        if let Some(text) = text {
+            data.push(ClipboardData {
+                bytes: text.into_bytes(),
+                format: self.inner.atoms.UTF8_STRING,
+            });
+        }
         self.inner.write(data, selection, wait)
     }
 

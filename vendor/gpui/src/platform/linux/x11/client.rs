@@ -1554,13 +1554,26 @@ impl LinuxClient for X11Client {
 
     fn write_to_clipboard(&self, item: crate::ClipboardItem) {
         let mut state = self.0.borrow_mut();
-        state
-            .clipboard
-            .set_text(
+        // An image is offered in its own format, with any text of the item beside it;
+        // without one the item is text, as before.
+        let image = item.entries().iter().find_map(|entry| match entry {
+            crate::ClipboardEntry::Image(image) => Some(image.clone()),
+            crate::ClipboardEntry::String(_) => None,
+        });
+        let written = match image {
+            Some(image) => state.clipboard.set_image(
+                image,
+                item.text(),
+                clipboard::ClipboardKind::Clipboard,
+                clipboard::WaitConfig::None,
+            ),
+            None => state.clipboard.set_text(
                 std::borrow::Cow::Owned(item.text().unwrap_or_default()),
                 clipboard::ClipboardKind::Clipboard,
                 clipboard::WaitConfig::None,
-            )
+            ),
+        };
+        written
             .context("X11: Failed to write to clipboard (clipboard)")
             .log_with_level(log::Level::Debug);
         state.clipboard_item.replace(item);

@@ -2,6 +2,19 @@
 
 ## `gpui` 0.2.2
 
+This copy is the released 0.2.2 crate with the patches listed below. The root
+`Cargo.toml` routes `gpui` here with `[patch.crates-io]`. On a GPUI upgrade, go
+through the list: re-apply each patch the new release does not already contain, and
+re-run the check each one names before accepting the upgrade.
+
+| patch | files | why |
+| --- | --- | --- |
+| Frame readback | `src/platform.rs`, `src/window.rs`, `src/platform/windows/{window,directx_renderer}.rs` | the capture tool reads the frame a hidden window rendered |
+| Initial window background | `src/platform.rs`, `src/platform/windows/window.rs` | a light window does not open on a black flash |
+| Clipboard images and mixed items | `src/platform.rs`, `src/platform/windows/{clipboard,dib}.rs`, `src/platform/windows.rs`, `src/platform/linux/x11/{client,clipboard}.rs` | remote-desktop clipboard: screenshots and text-plus-image copies |
+
+### Frame readback
+
 The capture tool must read the frame the hidden window actually rendered. The
 released crate has no public CPU readback, so this copy adds one small, rendering-
 neutral API:
@@ -14,9 +27,85 @@ neutral API:
   staging texture and returns tightly packed RGB.
 
 No drawing, layout, input or platform lifecycle behaviour is changed; other
-platforms keep the default `None`. The root `Cargo.toml` routes `gpui` here with
-`[patch.crates-io]`. On a GPUI upgrade, re-apply this API and re-run the hidden-window
-capture probe before accepting the upgrade.
+platforms keep the default `None`. Check after re-applying: the hidden-window capture
+probe.
+
+### Initial window background
+
+A new window is filled with its class background brush before its first frame is
+drawn, and the released crate always uses black, so a light theme opened on a black
+flash.
+
+- `src/platform.rs`: public `set_initial_window_background(Rgba)`, stored in an
+  atomic, and the crate-internal `initial_window_background()` that reads it.
+- `src/platform/windows/window.rs`: the window class's brush is that colour; a window
+  opened after the application asked for another colour (a theme switch) replaces
+  the class brush before it is shown and frees the old one.
+
+Other platforms keep their own behaviour. Check after re-applying: open the
+application with the light theme and watch for a black frame.
+
+### Clipboard images and mixed items
+
+The remote-desktop clipboard carries images and text together. The released crate
+could neither read a bitmap-only Windows clipboard nor write an image on X11, and
+wrote only the first entry of an item on Windows.
+
+- `src/platform.rs`: public `ClipboardItem::new_entries(Vec<ClipboardEntry>)`, so an
+  application can build one item holding a text and an image.
+- `src/platform/windows/clipboard.rs`, read: when no format the crate already knows
+  is on the clipboard, `CF_DIB` (else `CF_DIBV5`) is decoded to a PNG
+  `ClipboardEntry::Image`. PrintScreen, the snipping overlay and many older programs
+  offer only a bitmap. A text or encoded image offered beside the bitmap still wins,
+  as before.
+- `src/platform/windows/clipboard.rs`, write: the first text entry and the first
+  image entry are both written, instead of only the first entry; one failing does not
+  keep the other off. An image is written as before (its own format plus PNG) and
+  also as `CF_DIB`, because Paint, Office and similar programs paste only a bitmap.
+  Images whose bitmap would exceed 256 MiB get no `CF_DIB` copy.
+- `src/platform/windows/dib.rs` (new, declared in `src/platform/windows.rs`): the
+  DIB-to-PNG and image-to-DIB conversions. Decoding uses `image`'s `BmpDecoder` without
+  a file header, refuses a header that claims more than 512 MiB of pixels, and makes
+  a 32-bit bitmap opaque when its alpha is zero everywhere; writing produces a
+  `BITMAPINFOHEADER` with 32-bit `BI_RGB` rows bottom-up.
+- `src/platform/linux/x11/client.rs` and `clipboard.rs`: writing an item that holds an
+  image calls `Clipboard::set_image` (unused before), which now offers the image under
+  the atom of its own format - it used to label every image `image/png` - and the
+  item's text as `UTF8_STRING` beside it. Items without an image are written as
+  text, as before.
+
+Not changed: Wayland still writes text only, so an image cannot be put on the
+clipboard there; macOS is untouched. X11 serves the selection in one property
+change, without INCR, so an image larger than the X server's maximum request length
+(about 16 MiB with BIG-REQUESTS on Xorg) cannot be handed to a requesting program.
+
+Check after re-applying: the conversion tests in `dib.rs`. `gpui` is not a member of
+this workspace, so `cargo test -p gpui` is refused; the file depends only on `image`
+and `anyhow` and is tested through a throwaway crate outside the workspace:
+
+    # target/gpui-dib-tests/Cargo.toml
+    [package]
+    name = "gpui-dib-tests"
+    version = "0.0.0"
+    edition = "2024"
+    publish = false
+
+    [workspace]
+
+    [dependencies]
+    anyhow = "1"
+    image = "0.25"
+
+    # target/gpui-dib-tests/src/lib.rs
+    #[path = "../../../vendor/gpui/src/platform/windows/dib.rs"]
+    #[allow(dead_code)]
+    mod dib;
+
+    cargo test --manifest-path target/gpui-dib-tests/Cargo.toml
+
+The Windows read and write paths themselves need a real clipboard: copy a
+PrintScreen image and paste it in a desktop pane; copy an image in the application
+and paste it in Paint.
 
 ## `xattr` 0.2.3
 

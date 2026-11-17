@@ -12,12 +12,13 @@ use windows::Win32::{
             RegisterClipboardFormatW, SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_HDROP, CF_UNICODETEXT},
+        Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
     },
     UI::Shell::{DragQueryFileW, HDROP},
 };
 use windows_core::PCWSTR;
 
+use super::dib;
 use crate::{ClipboardEntry, ClipboardItem, ClipboardString, Image, ImageFormat, hash};
 
 // https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-dragqueryfilew
@@ -146,25 +147,26 @@ fn format_to_type(item_format: u32) -> &'static ClipboardFormatType {
     FORMATS_MAP.get(&item_format).unwrap()
 }
 
-// Currently, we only write the first item.
+// The clipboard holds one value per format, so the first text entry and the first
+// image entry are written: an item that carries both (a copy of mixed content) pastes
+// as text where text is wanted and as an image where an image is.
 fn write_to_clipboard_inner(item: ClipboardItem) -> Result<()> {
     unsafe {
         EmptyClipboard()?;
     }
-    match item.entries().first() {
-        Some(entry) => match entry {
-            ClipboardEntry::String(string) => {
-                write_string_to_clipboard(string)?;
-            }
-            ClipboardEntry::Image(image) => {
-                write_image_to_clipboard(image)?;
-            }
-        },
-        None => {
-            // Writing an empty list of entries just clears the clipboard.
-        }
-    }
-    Ok(())
+    // Writing an empty list of entries just clears the clipboard.
+    let text = item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::String(string) => Some(string),
+        ClipboardEntry::Image(_) => None,
+    });
+    let image = item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(image),
+        ClipboardEntry::String(_) => None,
+    });
+    // One failing format does not keep the other off the clipboard.
+    let text_result = text.map_or(Ok(()), write_string_to_clipboard);
+    let image_result = image.map_or(Ok(()), write_image_to_clipboard);
+    text_result.and(image_result)
 }
 
 fn write_string_to_clipboard(item: &ClipboardString) -> Result<()> {
@@ -198,39 +200,40 @@ fn set_data_to_clipboard<T>(data: &[T], format: u32) -> Result<()> {
 }
 
 // Here writing PNG to the clipboard to better support other apps. For more info, please ref to
-// the PR.
+// the PR. A bitmap (CF_DIB) is written beside it, because many programs (Paint, Office)
+// paste only that.
 fn write_image_to_clipboard(item: &Image) -> Result<()> {
     match item.format {
-        ImageFormat::Svg => set_data_to_clipboard(item.bytes(), *CLIPBOARD_SVG_FORMAT)?,
-        ImageFormat::Gif => {
-            set_data_to_clipboard(item.bytes(), *CLIPBOARD_GIF_FORMAT)?;
-            let png_bytes = convert_image_to_png_format(item.bytes(), ImageFormat::Gif)?;
-            set_data_to_clipboard(&png_bytes, *CLIPBOARD_PNG_FORMAT)?;
-        }
+        ImageFormat::Svg => return set_data_to_clipboard(item.bytes(), *CLIPBOARD_SVG_FORMAT),
+        ImageFormat::Gif => set_data_to_clipboard(item.bytes(), *CLIPBOARD_GIF_FORMAT)?,
+        ImageFormat::Jpeg => set_data_to_clipboard(item.bytes(), *CLIPBOARD_JPG_FORMAT)?,
         ImageFormat::Png => {
-            set_data_to_clipboard(item.bytes(), *CLIPBOARD_PNG_FORMAT)?;
-            let png_bytes = convert_image_to_png_format(item.bytes(), ImageFormat::Png)?;
-            set_data_to_clipboard(&png_bytes, *CLIPBOARD_PNG_FORMAT)?;
+            // Already the format other programs look for; it goes on unchanged.
+            set_data_to_clipboard(item.bytes(), *CLIPBOARD_PNG_FORMAT)?
         }
-        ImageFormat::Jpeg => {
-            set_data_to_clipboard(item.bytes(), *CLIPBOARD_JPG_FORMAT)?;
-            let png_bytes = convert_image_to_png_format(item.bytes(), ImageFormat::Jpeg)?;
-            set_data_to_clipboard(&png_bytes, *CLIPBOARD_PNG_FORMAT)?;
-        }
-        other => {
-            log::warn!(
-                "Clipboard unsupported image format: {:?}, convert to PNG instead.",
-                item.format
-            );
-            let png_bytes = convert_image_to_png_format(item.bytes(), other)?;
-            set_data_to_clipboard(&png_bytes, *CLIPBOARD_PNG_FORMAT)?;
-        }
+        other => log::warn!(
+            "Clipboard unsupported image format: {:?}, convert to PNG instead.",
+            other
+        ),
+    }
+    let decoded = image::load_from_memory_with_format(item.bytes(), item.format.into())?;
+    if item.format != ImageFormat::Png {
+        let png_bytes = encode_png(&decoded)?;
+        set_data_to_clipboard(&png_bytes, *CLIPBOARD_PNG_FORMAT)?;
+    }
+    match dib::image_to_dib(&decoded) {
+        Some(dib) => set_data_to_clipboard(&dib, CF_DIB.0 as u32)?,
+        None => log::warn!(
+            "Clipboard image is too large for a bitmap copy ({}x{}); only {:?} is written.",
+            decoded.width(),
+            decoded.height(),
+            item.format
+        ),
     }
     Ok(())
 }
 
-fn convert_image_to_png_format(bytes: &[u8], image_format: ImageFormat) -> Result<Vec<u8>> {
-    let image = image::load_from_memory_with_format(bytes, image_format.into())?;
+fn encode_png(image: &image::DynamicImage) -> Result<Vec<u8>> {
     let mut output_buf = Vec::new();
     image.write_to(
         &mut std::io::Cursor::new(&mut output_buf),
@@ -261,6 +264,12 @@ where
                 entries: vec![entry],
             });
         }
+    }
+    // Nothing above, but a bitmap: a screenshot, or a program that offers only that.
+    if let Some(entry) = read_bitmap_from_clipboard() {
+        return Some(ClipboardItem {
+            entries: vec![entry],
+        });
     }
     // log the formats that we don't support yet.
     {
@@ -343,6 +352,40 @@ fn read_image_for_type(format_number: u32, format: ImageFormat) -> Option<Clipbo
         (bytes, id)
     })?;
     Some(ClipboardEntry::Image(Image { format, bytes, id }))
+}
+
+/// A bitmap on the clipboard (`CF_DIB`, else `CF_DIBV5`) as a PNG image entry.
+///
+/// Read only when no format above matched, so an encoded image or text offered beside
+/// the bitmap still wins. Windows synthesizes either format from the other and from
+/// `CF_BITMAP`; `CF_DIB` is tried first because its layout is the one every program
+/// agrees on, and screenshots carry no alpha that `CF_DIBV5` would add.
+fn read_bitmap_from_clipboard() -> Option<ClipboardEntry> {
+    for format in [CF_DIB.0 as u32, CF_DIBV5.0 as u32] {
+        if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
+            continue;
+        }
+        let Some(dib) = with_clipboard_data(format, |data_ptr, size| {
+            if data_ptr.is_null() {
+                return Vec::new();
+            }
+            unsafe { std::slice::from_raw_parts(data_ptr as *const u8, size) }.to_vec()
+        }) else {
+            continue;
+        };
+        match dib::dib_to_png(&dib) {
+            Ok(bytes) => {
+                let id = hash(&bytes);
+                return Some(ClipboardEntry::Image(Image {
+                    format: ImageFormat::Png,
+                    bytes,
+                    id,
+                }));
+            }
+            Err(error) => log::warn!("Clipboard bitmap (format {format}) is unreadable: {error:#}"),
+        }
+    }
+    None
 }
 
 fn read_files_from_clipboard() -> Option<ClipboardEntry> {

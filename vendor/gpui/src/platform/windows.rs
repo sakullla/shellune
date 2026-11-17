@@ -1,5 +1,6 @@
 mod clipboard;
 mod destination_list;
+mod dib;
 mod direct_write;
 mod directx_atlas;
 mod directx_devices;
