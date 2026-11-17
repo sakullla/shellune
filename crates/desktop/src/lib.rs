@@ -248,6 +248,22 @@ impl ClipboardKind {
     }
 }
 
+/// The length of the longest prefix of the UTF-8 text `bytes` that fits in `bound`
+/// bytes and ends on a whole character: `bytes.len()` when it already fits. The
+/// shim cuts remote text the same way (`sd_clip_utf8_cut`).
+pub fn cut_clipboard_text(bytes: &[u8], bound: usize) -> usize {
+    if bytes.len() <= bound {
+        return bytes.len();
+    }
+    // The byte at `bound` is the first one left out; backing off over continuation
+    // bytes reaches the start of its character, which is then left out whole.
+    let mut at = bound;
+    while at > 0 && bytes[at] & 0xC0 == 0x80 {
+        at -= 1;
+    }
+    at
+}
+
 /// One format of one clipboard copy. A group holds each kind at most once.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClipboardEntry {
@@ -307,25 +323,88 @@ impl fmt::Debug for ClipboardEntry {
 /// Something the user should know that is not a state change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Notice {
-    /// The server did not open, or refused, the clipboard channel.
+    /// The server refused the clipboard: it failed this client's format list, or its
+    /// clipboard never became ready while a local copy waited. RDP only.
     ClipboardRefused,
+    /// The clipboard became ready after [`Notice::ClipboardRefused`] was reported
+    /// (the server was still logging on); that notice no longer holds.
+    ClipboardReady,
     /// The VNC server has no extended clipboard and the text had characters outside
     /// Latin-1, so it was not sent.
     ClipboardLatin1Only,
-    /// A remote clipboard entry exceeded its bound and was skipped.
-    ClipboardTooLarge,
-    /// The mapped folder is missing or unreadable; the session connected without it.
-    DriveUnavailable,
+    /// A clipboard entry of this kind exceeded its bound. Text is cut at the last
+    /// whole character within the bound and still delivered or sent; a remote image
+    /// is left out of its group.
+    ClipboardTooLarge(ClipboardKind),
+    /// The mapped folder could not be offered in this session, for this reason; the
+    /// session goes on without it.
+    DriveUnavailable(DriveProblem),
+    /// The server did not take the mapped folder; the session goes on without it.
+    DriveRefused(DriveRefusal),
     Unknown(u32),
 }
 
+/// How the server did not take the mapped folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DriveRefusal {
+    /// The server never opened device redirection, for example because its policy
+    /// turns all of it off.
+    NotOpened,
+    /// The server declined the drive with this NTSTATUS, for example because its
+    /// policy turns drive redirection off.
+    Declined(u32),
+}
+
+/// Why the mapped folder is not available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DriveProblem {
+    /// The folder does not exist.
+    Missing,
+    /// The path names a file.
+    NotAFolder,
+    /// Not a drive-letter or UNC path.
+    NotAbsolute,
+    /// Longer than the drive channel can address (MAX_PATH, counted both in UTF-16
+    /// units and in UTF-8 bytes).
+    TooLong,
+    /// The folder exists but cannot be listed.
+    NoAccess,
+    /// FreeRDP would not set the drive up.
+    NotAdded,
+    Other(i32),
+}
+
+impl DriveProblem {
+    fn from_raw(raw: i32) -> DriveProblem {
+        match raw {
+            ffi::SD_DRIVE_MISSING => DriveProblem::Missing,
+            ffi::SD_DRIVE_NOT_A_FOLDER => DriveProblem::NotAFolder,
+            ffi::SD_DRIVE_NOT_ABSOLUTE => DriveProblem::NotAbsolute,
+            ffi::SD_DRIVE_TOO_LONG => DriveProblem::TooLong,
+            ffi::SD_DRIVE_NO_ACCESS => DriveProblem::NoAccess,
+            ffi::SD_DRIVE_NOT_ADDED => DriveProblem::NotAdded,
+            other => DriveProblem::Other(other),
+        }
+    }
+}
+
 impl Notice {
-    fn from_raw(raw: u32) -> Notice {
+    fn from_raw(raw: u32, detail: i32) -> Notice {
         match raw {
             ffi::SD_NOTICE_CLIPBOARD_REFUSED => Notice::ClipboardRefused,
+            ffi::SD_NOTICE_CLIPBOARD_READY => Notice::ClipboardReady,
             ffi::SD_NOTICE_CLIPBOARD_LATIN1_ONLY => Notice::ClipboardLatin1Only,
-            ffi::SD_NOTICE_CLIPBOARD_TOO_LARGE => Notice::ClipboardTooLarge,
-            ffi::SD_NOTICE_DRIVE_UNAVAILABLE => Notice::DriveUnavailable,
+            ffi::SD_NOTICE_CLIPBOARD_TOO_LARGE => u32::try_from(detail)
+                .ok()
+                .and_then(ClipboardKind::from_raw)
+                .map_or(Notice::Unknown(raw), Notice::ClipboardTooLarge),
+            ffi::SD_NOTICE_DRIVE_UNAVAILABLE => {
+                Notice::DriveUnavailable(DriveProblem::from_raw(detail))
+            }
+            ffi::SD_NOTICE_DRIVE_REFUSED => Notice::DriveRefused(match detail {
+                0 => DriveRefusal::NotOpened,
+                status => DriveRefusal::Declined(status as u32),
+            }),
             other => Notice::Unknown(other),
         }
     }
@@ -615,9 +694,12 @@ impl DesktopClient {
     }
 
     /// A local folder the RDP server sees as the drive `name` (normally
-    /// [`DRIVE_NAME`]); `None` maps nothing. A folder that is missing or unreadable
-    /// when the attempt starts is left out and reported as
-    /// [`Notice::DriveUnavailable`]; the session still connects. VNC ignores it.
+    /// [`DRIVE_NAME`]); `None` maps nothing. A folder that cannot be offered when the
+    /// attempt starts, or that the server declines, is reported as
+    /// [`Notice::DriveUnavailable`] with the reason; the session still connects.
+    /// The server stays inside the folder: requests through a symbolic link or
+    /// junction in it, or naming a DOS device, are answered with access denied.
+    /// VNC ignores it.
     pub fn set_drive(&mut self, name: &str, path: Option<&str>) -> Result<(), Error> {
         let name = CString::new(name).map_err(|_| Error::Argument)?;
         let path = path
@@ -690,27 +772,41 @@ impl DesktopClient {
     }
 
     /// Offers the local clipboard to the remote side, replacing whatever was offered
-    /// before; the newest call wins. Each kind may appear once, text up to
-    /// [`MAX_CLIPBOARD_TEXT_BYTES`] and an image up to [`MAX_CLIPBOARD_IMAGE_BYTES`];
-    /// anything else is [`Error::Argument`]. RDP offers every entry, VNC only the
-    /// text. A connection with sharing off answers [`Error::Unavailable`].
+    /// before; the newest call wins. Each kind may appear once. Text over
+    /// [`MAX_CLIPBOARD_TEXT_BYTES`] is cut here at the last whole character within
+    /// it ([`cut_clipboard_text`]), sent, and reported as
+    /// [`Notice::ClipboardTooLarge`] on the event stream once the session takes the
+    /// group; it is never an error. An image over [`MAX_CLIPBOARD_IMAGE_BYTES`] is
+    /// [`Error::Argument`], as is text that is not UTF-8 or a repeated kind. RDP
+    /// offers every entry, VNC only the text. A connection with sharing off answers
+    /// [`Error::Unavailable`].
     pub fn push_clipboard(&self, entries: &[ClipboardEntry]) -> Result<(), Error> {
         if entries.len() > ffi::SD_MAX_CLIPBOARD_ENTRIES {
             return Err(Error::Argument);
         }
         let mut raw = Vec::with_capacity(entries.len());
+        let mut cut_kinds = 0u32;
         for entry in entries {
-            if entry.bytes.len() > entry.kind.bound() {
-                return Err(Error::Argument);
-            }
+            let len = match entry.kind {
+                ClipboardKind::Text => {
+                    let len = cut_clipboard_text(&entry.bytes, MAX_CLIPBOARD_TEXT_BYTES);
+                    if len < entry.bytes.len() {
+                        cut_kinds |= 1 << entry.kind.raw();
+                    }
+                    len
+                }
+                kind if entry.bytes.len() > kind.bound() => return Err(Error::Argument),
+                _ => entry.bytes.len(),
+            };
             raw.push(ffi::sd_clipboard_entry {
                 kind: entry.kind.raw(),
-                len: entry.bytes.len() as u32,
+                len: len as u32,
                 bytes: entry.bytes.as_ptr(),
             });
         }
-        let code =
-            unsafe { ffi::sd_client_clipboard_set(self.handle, raw.as_ptr(), raw.len() as u32) };
+        let code = unsafe {
+            ffi::sd_client_clipboard_set_cut(self.handle, raw.as_ptr(), raw.len() as u32, cut_kinds)
+        };
         clipboard_status(code)
     }
 
@@ -908,7 +1004,7 @@ unsafe fn translate(event: &ffi::sd_event) -> Option<Event> {
             clipboard_entries(event).map(|entries| Event::Clipboard { entries })
         }
         ffi::SD_EVENT_NOTICE => Some(Event::Notice {
-            notice: Notice::from_raw(event.notice),
+            notice: Notice::from_raw(event.notice, event.detail),
         }),
         ffi::SD_EVENT_CERTIFICATE => Some(Event::Certificate {
             request_id: event.request_id,
@@ -995,7 +1091,7 @@ pub fn abi_layout() -> [usize; 7] {
 /// choice, the fetch sequence and the text encodings on a machine with no server.
 #[doc(hidden)]
 pub mod probe {
-    use super::{ClipboardKind, Event, ffi, translate};
+    use super::{ClipboardKind, Error, Event, ffi, translate};
     use std::ffi::{CString, c_void};
     use std::os::raw::c_char;
 
@@ -1166,6 +1262,99 @@ pub mod probe {
     pub fn latin1_to_utf8(bytes: &[u8]) -> Option<Vec<u8>> {
         convert(ffi::SD_PROBE_LATIN1_TO_UTF8, bytes)
     }
+
+    /// One drive request as a server sends it: an IRP's major and minor function and
+    /// its body after the common header. `on_file` sends it on the file the last
+    /// successful create opened.
+    pub struct DriveRequest<'a> {
+        pub major: u32,
+        pub minor: u32,
+        pub on_file: bool,
+        pub body: &'a [u8],
+    }
+
+    /// Loads the drive for the folder `base` the way the rdpdr channel does
+    /// (FreeRDP's own drive service, as patched) and sends it the requests in order;
+    /// returns the NTSTATUS each would answer the server with. Releasing the device at
+    /// the end closes, and deletes on close, what is still open. `None` without the
+    /// RDP backend.
+    pub fn rdp_drive_requests(base: &str, requests: &[DriveRequest<'_>]) -> Option<Vec<u32>> {
+        let base = CString::new(base).ok()?;
+        let raw: Vec<ffi::sd_probe_drive_request> = requests
+            .iter()
+            .map(|request| ffi::sd_probe_drive_request {
+                major: request.major,
+                minor: request.minor,
+                use_file: i32::from(request.on_file),
+                len: request.body.len() as u32,
+                body: request.body.as_ptr(),
+            })
+            .collect();
+        let mut statuses = vec![0u32; requests.len()];
+        let code = unsafe {
+            ffi::sd_probe_rdp_drive_requests(
+                base.as_ptr(),
+                raw.as_ptr(),
+                raw.len() as u32,
+                statuses.as_mut_ptr(),
+            )
+        };
+        (code == ffi::SD_OK).then_some(statuses)
+    }
+
+    /// One step of a scripted RDP session; times are milliseconds after it connected.
+    pub enum SessionStep {
+        /// The server says the user logged on.
+        Logon(u32),
+        /// The worker's periodic check runs.
+        Tick(u32),
+        /// The UI pushes a local copy.
+        ClipboardPush(u32),
+        /// The server's clipboard says it is ready (Monitor Ready).
+        ClipboardReady,
+        /// The server fails this client's format list.
+        ClipboardFail,
+        /// The server opens device redirection (Server Announce).
+        DevicesOpened,
+        /// The server answers the drive with this result code.
+        DriveReply(u32),
+    }
+
+    /// Plays the steps against an RDP session's own handlers with this client's
+    /// clipboard and drive options; the notices arrive on the client's event stream
+    /// as a session's would.
+    pub fn rdp_session(client: &super::DesktopClient, steps: &[SessionStep]) -> Result<(), Error> {
+        let raw: Vec<ffi::sd_probe_session_step> = steps
+            .iter()
+            .map(|step| {
+                let (kind, at_ms, value) = match *step {
+                    SessionStep::Logon(at) => (ffi::SD_PROBE_SESSION_LOGON, at, 0),
+                    SessionStep::Tick(at) => (ffi::SD_PROBE_SESSION_TICK, at, 0),
+                    SessionStep::ClipboardPush(at) => (ffi::SD_PROBE_SESSION_CLIP_PUSH, at, 0),
+                    SessionStep::ClipboardReady => (ffi::SD_PROBE_SESSION_CLIP_READY, 0, 0),
+                    SessionStep::ClipboardFail => (ffi::SD_PROBE_SESSION_CLIP_FAIL, 0, 0),
+                    SessionStep::DevicesOpened => (ffi::SD_PROBE_SESSION_RDPDR_ANNOUNCE, 0, 0),
+                    SessionStep::DriveReply(result) => {
+                        (ffi::SD_PROBE_SESSION_DRIVE_REPLY, 0, result)
+                    }
+                };
+                ffi::sd_probe_session_step { kind, at_ms, value }
+            })
+            .collect();
+        super::status(unsafe {
+            ffi::sd_probe_rdp_session(client.handle, raw.as_ptr(), raw.len() as u32)
+        })
+    }
+
+    /// Checks a folder the way an RDP attempt does before offering it as a drive:
+    /// `Some(None)` when it can be offered, `Some(Some(problem))` when not, `None`
+    /// without the RDP backend.
+    pub fn rdp_drive_folder(path: &str) -> Option<Option<super::DriveProblem>> {
+        let path = CString::new(path).ok()?;
+        let mut problem = 0i32;
+        let code = unsafe { ffi::sd_probe_rdp_drive_folder(path.as_ptr(), &mut problem) };
+        (code == ffi::SD_OK).then(|| (problem != 0).then(|| super::DriveProblem::from_raw(problem)))
+    }
 }
 
 /// The shim's own name for a session state, for diagnostics only.
@@ -1216,5 +1405,84 @@ mod frame_tests {
             pixels,
             [vec![0; 4], vec![1; 4], vec![2; 4], vec![3; 4]].concat()
         );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_cut_tests {
+    use super::*;
+
+    #[test]
+    fn text_within_the_bound_is_left_whole() {
+        assert_eq!(cut_clipboard_text(b"", 4), 0);
+        assert_eq!(cut_clipboard_text(b"abcd", 4), 4);
+        assert_eq!(cut_clipboard_text("é".as_bytes(), 2), 2);
+    }
+
+    #[test]
+    fn the_cut_never_splits_a_character() {
+        assert_eq!(cut_clipboard_text(b"abcde", 4), 4);
+        // "aé": the bound falls inside the two-byte é, which is left out whole.
+        assert_eq!(cut_clipboard_text("aé".as_bytes(), 2), 1);
+        // Three- and four-byte characters.
+        assert_eq!(cut_clipboard_text("a中文".as_bytes(), 5), 4);
+        assert_eq!(cut_clipboard_text("a中文".as_bytes(), 6), 4);
+        assert_eq!(cut_clipboard_text("😀😀".as_bytes(), 7), 4);
+        assert_eq!(cut_clipboard_text("😀".as_bytes(), 3), 0);
+        let text = "x".repeat(MAX_CLIPBOARD_TEXT_BYTES - 1) + "€";
+        let len = cut_clipboard_text(text.as_bytes(), MAX_CLIPBOARD_TEXT_BYTES);
+        assert_eq!(len, MAX_CLIPBOARD_TEXT_BYTES - 1);
+        assert!(std::str::from_utf8(&text.as_bytes()[..len]).is_ok());
+    }
+
+    #[test]
+    fn every_notice_code_maps_to_its_own_notice() {
+        assert_eq!(
+            Notice::from_raw(ffi::SD_NOTICE_CLIPBOARD_REFUSED, 0),
+            Notice::ClipboardRefused
+        );
+        assert_eq!(
+            Notice::from_raw(ffi::SD_NOTICE_CLIPBOARD_LATIN1_ONLY, 0),
+            Notice::ClipboardLatin1Only
+        );
+        assert_eq!(
+            Notice::from_raw(ffi::SD_NOTICE_CLIPBOARD_TOO_LARGE, 1),
+            Notice::ClipboardTooLarge(ClipboardKind::Text)
+        );
+        assert_eq!(
+            Notice::from_raw(ffi::SD_NOTICE_CLIPBOARD_TOO_LARGE, 3),
+            Notice::ClipboardTooLarge(ClipboardKind::Dib)
+        );
+        assert_eq!(
+            Notice::from_raw(ffi::SD_NOTICE_CLIPBOARD_TOO_LARGE, 9),
+            Notice::Unknown(ffi::SD_NOTICE_CLIPBOARD_TOO_LARGE)
+        );
+        for (raw, problem) in [
+            (1, DriveProblem::Missing),
+            (2, DriveProblem::NotAFolder),
+            (3, DriveProblem::NotAbsolute),
+            (4, DriveProblem::TooLong),
+            (5, DriveProblem::NoAccess),
+            (6, DriveProblem::NotAdded),
+            (42, DriveProblem::Other(42)),
+        ] {
+            assert_eq!(
+                Notice::from_raw(ffi::SD_NOTICE_DRIVE_UNAVAILABLE, raw),
+                Notice::DriveUnavailable(problem)
+            );
+        }
+        assert_eq!(
+            Notice::from_raw(ffi::SD_NOTICE_CLIPBOARD_READY, 0),
+            Notice::ClipboardReady
+        );
+        assert_eq!(
+            Notice::from_raw(ffi::SD_NOTICE_DRIVE_REFUSED, 0),
+            Notice::DriveRefused(DriveRefusal::NotOpened)
+        );
+        assert_eq!(
+            Notice::from_raw(ffi::SD_NOTICE_DRIVE_REFUSED, 0xC000_0022u32 as i32),
+            Notice::DriveRefused(DriveRefusal::Declined(0xC000_0022))
+        );
+        assert_eq!(Notice::from_raw(77, 0), Notice::Unknown(77));
     }
 }

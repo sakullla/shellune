@@ -249,7 +249,7 @@ void sd_emit_clipboard(sd_client *client, const sd_clip_set *set) {
   sd_dispatch(client, &event);
 }
 
-void sd_emit_notice(sd_client *client, uint32_t notice) {
+void sd_emit_notice(sd_client *client, uint32_t notice, int32_t detail) {
   sd_event event;
   memset(&event, 0, sizeof(event));
   event.kind = SD_EVENT_NOTICE;
@@ -257,7 +257,16 @@ void sd_emit_notice(sd_client *client, uint32_t notice) {
   event.state = (uint32_t)client->state;
   LeaveCriticalSection(&client->lock);
   event.notice = notice;
+  event.detail = detail;
   sd_dispatch(client, &event);
+}
+
+void sd_emit_too_large(sd_client *client, uint32_t kinds) {
+  for (uint32_t kind = SD_CLIPBOARD_TEXT_UTF8; kind <= SD_CLIPBOARD_IMAGE_DIB; kind++) {
+    if ((kinds & (1u << kind)) != 0) {
+      sd_emit_notice(client, SD_NOTICE_CLIPBOARD_TOO_LARGE, (int32_t)kind);
+    }
+  }
 }
 
 int32_t sd_is_cancelled(sd_client *client) {
@@ -381,7 +390,13 @@ void sd_flush_input(sd_client *client) {
     }
   }
   sd_clip_set *set = sd_take_clipboard(client);
-  if (set != NULL) sd_backend_clipboard(client, set);
+  if (set != NULL) {
+    /* A local text cut to the bound when it was pushed is said here, on the worker,
+     * rather than from the caller's thread inside the push. */
+    uint32_t too_large = set->too_large;
+    sd_backend_clipboard(client, set);
+    sd_emit_too_large(client, too_large);
+  }
 }
 
 /* Releasing a pressed key when the picture loses focus is a UI decision, but the
@@ -629,6 +644,17 @@ sd_status sd_probe_rdp_settings(sd_client *client, char *out, size_t cap) {
 #endif
 }
 
+sd_status sd_probe_rdp_session(sd_client *client, const sd_probe_session_step *steps,
+                               uint32_t count) {
+  if (client == NULL || (steps == NULL && count > 0)) return SD_ERR_ARGUMENT;
+#if defined(SD_WITH_RDP)
+  if (client->proto != SD_PROTOCOL_RDP) return SD_ERR_ARGUMENT;
+  return sd_rdp_probe_session(client, steps, count);
+#else
+  return SD_ERR_UNAVAILABLE;
+#endif
+}
+
 sd_status sd_client_connect(sd_client *client) {
   if (client == NULL) return SD_ERR_ARGUMENT;
   char info[256];
@@ -803,7 +829,15 @@ sd_status sd_client_pointer(sd_client *client, uint16_t x, uint16_t y,
 
 sd_status sd_client_clipboard_set(sd_client *client, const sd_clipboard_entry *entries,
                                   uint32_t count) {
+  return sd_client_clipboard_set_cut(client, entries, count, 0);
+}
+
+sd_status sd_client_clipboard_set_cut(sd_client *client, const sd_clipboard_entry *entries,
+                                      uint32_t count, uint32_t cut_kinds) {
   if (client == NULL) return SD_ERR_ARGUMENT;
+  const uint32_t known = (1u << SD_CLIPBOARD_TEXT_UTF8) | (1u << SD_CLIPBOARD_IMAGE_PNG) |
+                         (1u << SD_CLIPBOARD_IMAGE_DIB);
+  if ((cut_kinds & ~known) != 0) return SD_ERR_ARGUMENT;
   sd_status valid = sd_clip_validate(entries, count);
   if (valid != SD_OK) return valid;
   /* A connection with sharing turned off neither sends nor receives. Saying so here
@@ -820,6 +854,7 @@ sd_status sd_client_clipboard_set(sd_client *client, const sd_clipboard_entry *e
   /* Copied outside both locks: an image may be tens of megabytes. */
   sd_clip_set *copy = sd_clip_set_copy(entries, count);
   if (copy == NULL) return SD_ERR_INTERNAL;
+  copy->too_large |= cut_kinds;
   EnterCriticalSection(&client->input_lock);
   sd_clip_set *stale = client->clipboard_pending;
   client->clipboard_pending = copy;
@@ -831,7 +866,7 @@ sd_status sd_client_clipboard_set(sd_client *client, const sd_clipboard_entry *e
 sd_status sd_client_clipboard(sd_client *client, const char *utf8) {
   if (client == NULL || utf8 == NULL) return SD_ERR_ARGUMENT;
   size_t len = strlen(utf8);
-  if (len > SD_MAX_CLIPBOARD_BYTES) return SD_ERR_ARGUMENT;
+  if (len > UINT32_MAX) return SD_ERR_ARGUMENT;
   sd_clipboard_entry entry;
   entry.kind = SD_CLIPBOARD_TEXT_UTF8;
   entry.len = (uint32_t)len;

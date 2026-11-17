@@ -32,9 +32,11 @@ extern "C" {
 /* Upper bound the shim enforces on a single frame notification, so a hostile or
  * broken server cannot make us allocate without limit. */
 #define SD_MAX_FRAME_BYTES (64u * 1024u * 1024u)
-/* Clipboard bounds, both directions: text (UTF-8 bytes) and one image entry. A
- * remote entry above its bound is skipped and reported with
- * SD_NOTICE_CLIPBOARD_TOO_LARGE; a local one is refused with SD_ERR_ARGUMENT. */
+/* Clipboard bounds, both directions: text (UTF-8 bytes) and one image entry.
+ * Text above its bound is cut at the last whole character within it and still
+ * delivered (remote) or sent (local); a remote image above its bound is skipped.
+ * Both are reported with SD_NOTICE_CLIPBOARD_TOO_LARGE. A local image above its
+ * bound is refused with SD_ERR_ARGUMENT, so the caller can say why. */
 #define SD_MAX_CLIPBOARD_BYTES (1024u * 1024u)
 #define SD_MAX_CLIPBOARD_IMAGE_BYTES (32u * 1024u * 1024u)
 /* One entry per kind at most, so a group never holds more than this. */
@@ -90,15 +92,38 @@ typedef enum sd_clipboard_kind {
   SD_CLIPBOARD_IMAGE_DIB = 3, /* a packed DIB: BITMAPINFOHEADER (or V5) + bits */
 } sd_clipboard_kind;
 
-/* Something the user should know that is not a state change. */
+/* Something the user should know that is not a state change. `detail` of the
+ * notice event says more where noted. */
 typedef enum sd_notice {
-  SD_NOTICE_CLIPBOARD_REFUSED = 1,     /* the server did not open the clipboard channel */
+  SD_NOTICE_CLIPBOARD_REFUSED = 1,     /* the server refused the clipboard: it failed this
+                                          client's format list, or its clipboard never
+                                          became ready although a copy was waiting */
   SD_NOTICE_CLIPBOARD_LATIN1_ONLY = 2, /* VNC server without extended clipboard; text
                                           outside Latin-1 was not sent */
-  SD_NOTICE_CLIPBOARD_TOO_LARGE = 3,   /* a remote entry exceeded its bound and was skipped */
-  SD_NOTICE_DRIVE_UNAVAILABLE = 4,     /* the mapped folder is missing or unreadable; the
-                                          session connects without it */
+  SD_NOTICE_CLIPBOARD_TOO_LARGE = 3,   /* an entry exceeded its bound; detail is the
+                                          sd_clipboard_kind: text was cut to the bound,
+                                          a remote image was skipped */
+  SD_NOTICE_DRIVE_UNAVAILABLE = 4,     /* the mapped folder could not be offered; detail
+                                          is the sd_drive_problem. The session goes on
+                                          without the drive */
+  SD_NOTICE_CLIPBOARD_READY = 5,       /* the clipboard became ready after
+                                          SD_NOTICE_CLIPBOARD_REFUSED was reported: that
+                                          notice no longer holds */
+  SD_NOTICE_DRIVE_REFUSED = 6,         /* the server did not take the drive: detail is the
+                                          NTSTATUS it declined the device with, or 0 when
+                                          it never opened device redirection at all. The
+                                          session goes on without the drive */
 } sd_notice;
+
+/* Why the mapped folder is not available (detail of SD_NOTICE_DRIVE_UNAVAILABLE). */
+typedef enum sd_drive_problem {
+  SD_DRIVE_MISSING = 1,        /* the folder does not exist */
+  SD_DRIVE_NOT_A_FOLDER = 2,   /* the path names a file */
+  SD_DRIVE_NOT_ABSOLUTE = 3,   /* not a drive-letter or UNC path */
+  SD_DRIVE_TOO_LONG = 4,       /* longer than the drive channel can address */
+  SD_DRIVE_NO_ACCESS = 5,      /* exists but cannot be listed */
+  SD_DRIVE_NOT_ADDED = 6,      /* FreeRDP would not set the drive up */
+} sd_drive_problem;
 
 typedef struct sd_clipboard_entry {
   uint32_t kind; /* sd_clipboard_kind */
@@ -138,7 +163,7 @@ typedef struct sd_event {
   uint32_t kind;
   uint32_t state;
   uint32_t failure;
-  int32_t detail;      /* protocol/library code, 0 when unknown */
+  int32_t detail;      /* protocol/library code, 0 when unknown; see sd_notice */
   uint32_t request_id; /* SD_EVENT_CERTIFICATE only */
   uint32_t cert_flags; /* VERIFY_CERT_FLAG_* as reported by FreeRDP */
   const char *text;    /* reason or clipboard text, not NUL terminated */
@@ -190,9 +215,13 @@ sd_status sd_client_set_vnc_colour_depth(sd_client *client, uint32_t bytes_per_p
  * registers no cut-text callback, and a push answers SD_ERR_UNAVAILABLE. */
 sd_status sd_client_set_clipboard(sd_client *client, int32_t enabled);
 /* A local folder the RDP server sees as a drive named `name`. NULL or empty `path`
- * clears it. The folder is checked when the attempt starts: when it is missing or
- * unreadable the session connects without it and reports
- * SD_NOTICE_DRIVE_UNAVAILABLE. VNC accepts and ignores it. */
+ * clears it. The folder is checked when the attempt starts: when it cannot be
+ * offered the session connects without it and reports SD_NOTICE_DRIVE_UNAVAILABLE
+ * with the reason; a server that declines it is reported with
+ * SD_NOTICE_DRIVE_REFUSED. The server is kept inside the folder by the patched
+ * FreeRDP drive channel (packaging/native/patches/freerdp-drive-confinement.patch):
+ * whatever resolves outside it - through a symbolic link, junction or mount point,
+ * or to a device - is answered with access denied. VNC accepts and ignores it. */
 sd_status sd_client_set_drive(sd_client *client, const char *name, const char *path);
 
 /* Starts the worker thread. Returns once the attempt is queued, not connected. */
@@ -215,11 +244,17 @@ sd_status sd_client_pointer(sd_client *client, uint16_t x, uint16_t y,
                             uint32_t buttons);
 /* Replaces the whole local clipboard group offered to the peer; the newest call
  * wins. The entries are copied before this returns. `count` may be 0 (an empty
- * clipboard). SD_ERR_ARGUMENT: a bound above is exceeded, a kind repeats or is
- * unknown, or text is not UTF-8; nothing already queued is changed then. VNC
- * forwards only the text entry. */
+ * clipboard). Text above its bound is cut and reported (see the bounds above).
+ * SD_ERR_ARGUMENT: an image exceeds its bound, a kind repeats or is unknown, or
+ * text is not UTF-8; nothing already queued is changed then. VNC forwards only
+ * the text entry. */
 sd_status sd_client_clipboard_set(sd_client *client, const sd_clipboard_entry *entries,
                                   uint32_t count);
+/* The same, for a caller that already cut entries to their bound itself:
+ * `cut_kinds` (bit 1 << sd_clipboard_kind) names them, and they are reported with
+ * SD_NOTICE_CLIPBOARD_TOO_LARGE exactly as a cut made here would be. */
+sd_status sd_client_clipboard_set_cut(sd_client *client, const sd_clipboard_entry *entries,
+                                      uint32_t count, uint32_t cut_kinds);
 /* Shorthand for a group holding one NUL-terminated UTF-8 text entry. */
 sd_status sd_client_clipboard(sd_client *client, const char *utf8);
 
@@ -273,6 +308,45 @@ sd_status sd_probe_text(int32_t conversion, const uint8_t *in, size_t len, uint8
  * and describes the clipboard and drive part as "key=value" words. Emits the drive
  * notice like a real attempt. SD_ERR_UNAVAILABLE without the RDP backend. */
 sd_status sd_probe_rdp_settings(sd_client *client, char *out, size_t cap);
+/* Checks a folder the way an attempt does before offering it; `*problem` is 0 or an
+ * sd_drive_problem. SD_ERR_UNAVAILABLE without the RDP backend. */
+sd_status sd_probe_rdp_drive_folder(const char *path, int32_t *problem);
+/* One drive request as the server sends it: an IRP's function codes and its body
+ * after the common header. `use_file` sends it on the file the last successful
+ * create opened. */
+typedef struct sd_probe_drive_request {
+  uint32_t major;
+  uint32_t minor;
+  int32_t use_file;
+  uint32_t len;
+  const uint8_t *body;
+} sd_probe_drive_request;
+/* Loads the drive for the folder `base` the way the rdpdr channel does (the
+ * settings entry an attempt adds, FreeRDP's own drive service) and sends it the
+ * requests in order. `statuses[i]` is the NTSTATUS the server would get. The device
+ * is released at the end, which closes, and deletes on close, what is still open.
+ * SD_ERR_UNAVAILABLE without the RDP backend. */
+sd_status sd_probe_rdp_drive_requests(const char *base, const sd_probe_drive_request *requests,
+                                      uint32_t count, uint32_t *statuses);
+/* One step of a scripted RDP session, for the notices it reports. Times are
+ * milliseconds after the session connected. */
+typedef struct sd_probe_session_step {
+  uint32_t kind; /* SD_PROBE_SESSION_* */
+  uint32_t at_ms;
+  uint32_t value;
+} sd_probe_session_step;
+#define SD_PROBE_SESSION_LOGON 1u          /* the server says the user logged on */
+#define SD_PROBE_SESSION_TICK 2u           /* the worker's periodic check runs */
+#define SD_PROBE_SESSION_CLIP_PUSH 3u      /* the UI pushes a local copy */
+#define SD_PROBE_SESSION_CLIP_READY 4u     /* the server's clipboard: Monitor Ready */
+#define SD_PROBE_SESSION_CLIP_FAIL 5u      /* the server fails this client's format list */
+#define SD_PROBE_SESSION_RDPDR_ANNOUNCE 6u /* the server opens device redirection */
+#define SD_PROBE_SESSION_DRIVE_REPLY 7u    /* the server answers the drive: value */
+/* Plays the steps against the RDP session's own handlers, with this client's
+ * clipboard and drive options; the notices reach the client's callback as a
+ * session's would. SD_ERR_UNAVAILABLE without the RDP backend. */
+sd_status sd_probe_rdp_session(sd_client *client, const sd_probe_session_step *steps,
+                               uint32_t count);
 
 #ifdef __cplusplus
 }

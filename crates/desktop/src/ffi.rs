@@ -51,6 +51,15 @@ pub const SD_NOTICE_CLIPBOARD_REFUSED: u32 = 1;
 pub const SD_NOTICE_CLIPBOARD_LATIN1_ONLY: u32 = 2;
 pub const SD_NOTICE_CLIPBOARD_TOO_LARGE: u32 = 3;
 pub const SD_NOTICE_DRIVE_UNAVAILABLE: u32 = 4;
+pub const SD_NOTICE_CLIPBOARD_READY: u32 = 5;
+pub const SD_NOTICE_DRIVE_REFUSED: u32 = 6;
+
+pub const SD_DRIVE_MISSING: i32 = 1;
+pub const SD_DRIVE_NOT_A_FOLDER: i32 = 2;
+pub const SD_DRIVE_NOT_ABSOLUTE: i32 = 3;
+pub const SD_DRIVE_TOO_LONG: i32 = 4;
+pub const SD_DRIVE_NO_ACCESS: i32 = 5;
+pub const SD_DRIVE_NOT_ADDED: i32 = 6;
 
 pub const SD_PROBE_UTF8_TO_CF_UNICODE: i32 = 1;
 pub const SD_PROBE_CF_UNICODE_TO_UTF8: i32 = 2;
@@ -112,6 +121,30 @@ pub struct sd_probe_step {
     pub data: *const u8,
 }
 
+#[repr(C)]
+pub struct sd_probe_drive_request {
+    pub major: u32,
+    pub minor: u32,
+    pub use_file: i32,
+    pub len: u32,
+    pub body: *const u8,
+}
+
+#[repr(C)]
+pub struct sd_probe_session_step {
+    pub kind: u32,
+    pub at_ms: u32,
+    pub value: u32,
+}
+
+pub const SD_PROBE_SESSION_LOGON: u32 = 1;
+pub const SD_PROBE_SESSION_TICK: u32 = 2;
+pub const SD_PROBE_SESSION_CLIP_PUSH: u32 = 3;
+pub const SD_PROBE_SESSION_CLIP_READY: u32 = 4;
+pub const SD_PROBE_SESSION_CLIP_FAIL: u32 = 5;
+pub const SD_PROBE_SESSION_RDPDR_ANNOUNCE: u32 = 6;
+pub const SD_PROBE_SESSION_DRIVE_REPLY: u32 = 7;
+
 /// Opaque in the header; the crate never looks inside.
 #[repr(C)]
 pub struct sd_client {
@@ -164,10 +197,11 @@ unsafe extern "C" {
         name: *const c_char,
         path: *const c_char,
     ) -> i32;
-    pub fn sd_client_clipboard_set(
+    pub fn sd_client_clipboard_set_cut(
         client: *mut sd_client,
         entries: *const sd_clipboard_entry,
         count: u32,
+        cut_kinds: u32,
     ) -> i32;
     pub fn sd_client_detach(client: *mut sd_client);
     pub fn sd_client_free(client: *mut sd_client) -> i32;
@@ -198,4 +232,16 @@ unsafe extern "C" {
         written: *mut usize,
     ) -> i32;
     pub fn sd_probe_rdp_settings(client: *mut sd_client, out: *mut c_char, cap: usize) -> i32;
+    pub fn sd_probe_rdp_drive_folder(path: *const c_char, problem: *mut i32) -> i32;
+    pub fn sd_probe_rdp_drive_requests(
+        base: *const c_char,
+        requests: *const sd_probe_drive_request,
+        count: u32,
+        statuses: *mut u32,
+    ) -> i32;
+    pub fn sd_probe_rdp_session(
+        client: *mut sd_client,
+        steps: *const sd_probe_session_step,
+        count: u32,
+    ) -> i32;
 }

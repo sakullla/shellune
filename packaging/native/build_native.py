@@ -87,6 +87,49 @@ FREERDP = {
 FREERDP_MAC_PATCH = REPO_ROOT / "packaging/native/patches/freerdp-salted-mac-negotiation.patch"
 FREERDP_CONNECTION_ORIGINAL = "9d197d202d558b782cf600981c3fb940296b43bf437d6ebba1970b063e5f2713"
 FREERDP_CONNECTION_PATCHED = "ca4d99bb0482b6a2cf6f690086b3e3f0124949ab3607d9acc822ad24f37ed219"
+FREERDP_DRIVE_PATCH = REPO_ROOT / "packaging/native/patches/freerdp-drive-confinement.patch"
+FREERDP_RDPDR_PATCH = REPO_ROOT / "packaging/native/patches/freerdp-rdpdr-device-reply.patch"
+# Every patch names each file it touches with the whole-file sha256 before and after
+# (line endings normalized), so only the pinned source is patched and a repeat build
+# of the exact patched tree is accepted. The order is the order of application.
+FREERDP_PATCHES = [
+    {
+        "label": "MAC",
+        "pin": "salted-mac-patch",
+        "patch": FREERDP_MAC_PATCH,
+        "files": {
+            "libfreerdp/core/connection.c": (
+                FREERDP_CONNECTION_ORIGINAL, FREERDP_CONNECTION_PATCHED,
+            ),
+        },
+    },
+    {
+        "label": "drive confinement",
+        "pin": "drive-confinement-patch",
+        "patch": FREERDP_DRIVE_PATCH,
+        "files": {
+            "channels/drive/client/drive_file.c": (
+                "c6495ccba9a513b6e5fee40ca7a93273f351632fa9f26c35ad3a875f07e8e4cf",
+                "84b273803870b8341a92ac4d64839d24be56914016b7b731e215d535435d1ec6",
+            ),
+        },
+    },
+    {
+        "label": "rdpdr device reply",
+        "pin": "rdpdr-device-reply-patch",
+        "patch": FREERDP_RDPDR_PATCH,
+        "files": {
+            "include/freerdp/client/rdpdr.h": (
+                "f51500716fa5afa2d49605addb87c1cf8b4b60c512c73ed311b9d3607d06fd34",
+                "4e42afc82abe8e3546567afc71595b49aec3298462d406a8be3d1303ba7f8cf3",
+            ),
+            "channels/rdpdr/client/rdpdr_main.c": (
+                "6f726d13b8bcd8e789ff6046d27dda88a2e6944f04e322c68346f0652341e259",
+                "27ca18954129ef0fadc645be1fd5f8101f3912f3b841f117ba39cfcb44aa7eb2",
+            ),
+        },
+    },
+]
 LIBVNC = {
     "name": "libvncserver",
     "version": "0.9.15",
@@ -509,7 +552,7 @@ def build_openssl(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
 def build_freerdp(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,
                   source: pathlib.Path, force: bool) -> pathlib.Path | None:
     build = work / "build" / "freerdp"
-    apply_freerdp_mac_patch(source)
+    apply_freerdp_patches(source)
     pin = step_pin("freerdp", FREERDP, [*FREERDP_OPTIONS, freerdp_patch_pin()])
     if already_built(dist, FREERDP_LIBRARIES, force, "freerdp", pin):
         log("freerdp already installed")
@@ -529,26 +572,42 @@ def build_freerdp(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.P
 
 
 def freerdp_patch_pin() -> str:
-    return "salted-mac-patch=" + sha256_of(FREERDP_MAC_PATCH)
+    """Names every patch by its sha256, so a changed patch rebuilds FreeRDP."""
+    return ",".join(spec["pin"] + "=" + sha256_of(spec["patch"]) for spec in FREERDP_PATCHES)
+
+
+def source_digest(path: pathlib.Path) -> str:
+    # Normalize checkout line endings, without accepting other source edits.
+    return hashlib.sha256(path.read_text(encoding="utf-8").encode()).hexdigest()
+
+
+def apply_freerdp_patch(source: pathlib.Path, spec: dict) -> None:
+    """Only patch the pinned source, and accept repeat builds of that exact result."""
+    label = spec["label"]
+    files = spec["files"]
+    current = {name: source_digest(source / name) for name in files}
+    if all(current[name] == patched for name, (_, patched) in files.items()):
+        return
+    for name, (original, _) in files.items():
+        if current[name] != original:
+            raise SystemExit(
+                f"FreeRDP {label} patch: unexpected {pathlib.PurePosixPath(name).name}; "
+                "refusing to patch"
+            )
+    run(["git", "apply", "--unsafe-paths", "--directory=" + source.resolve().as_posix(),
+         str(spec["patch"])], cwd=REPO_ROOT)
+    for name, (_, patched) in files.items():
+        if source_digest(source / name) != patched:
+            raise SystemExit(f"FreeRDP {label} patch: patched source checksum mismatch")
 
 
 def apply_freerdp_mac_patch(source: pathlib.Path) -> None:
-    """Only patch the pinned source, and accept repeat builds of that exact result."""
-    target = source / "libfreerdp/core/connection.c"
+    apply_freerdp_patch(source, FREERDP_PATCHES[0])
 
-    def digest() -> str:
-        # Normalize checkout line endings, without accepting other source edits.
-        return hashlib.sha256(target.read_text(encoding="utf-8").encode()).hexdigest()
 
-    current = digest()
-    if current == FREERDP_CONNECTION_PATCHED:
-        return
-    if current != FREERDP_CONNECTION_ORIGINAL:
-        raise SystemExit("FreeRDP MAC patch: unexpected connection.c; refusing to patch")
-    run(["git", "apply", "--unsafe-paths", "--directory=" + source.resolve().as_posix(),
-         str(FREERDP_MAC_PATCH)], cwd=REPO_ROOT)
-    if digest() != FREERDP_CONNECTION_PATCHED:
-        raise SystemExit("FreeRDP MAC patch: patched source checksum mismatch")
+def apply_freerdp_patches(source: pathlib.Path) -> None:
+    for spec in FREERDP_PATCHES:
+        apply_freerdp_patch(source, spec)
 
 
 def build_libvnc(work: pathlib.Path, dist: pathlib.Path, build_tools: pathlib.Path,

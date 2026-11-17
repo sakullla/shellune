@@ -87,6 +87,16 @@ int32_t sd_clip_utf8_valid(const uint8_t *utf8, size_t len) {
   return 1;
 }
 
+size_t sd_clip_utf8_cut(const uint8_t *utf8, size_t len, size_t bound) {
+  if (len <= bound) return len;
+  /* The byte at `bound` is the first one left out. Backing off over continuation
+   * bytes lands on the start of the character it belongs to, which is then left
+   * out whole. */
+  size_t at = bound;
+  while (at > 0 && (utf8[at] & 0xC0) == 0x80) at--;
+  return at;
+}
+
 /* UTF-8 to the CF_UNICODETEXT layout: UTF-16LE, CRLF line ends, NUL terminated.
  * Stops at an embedded NUL, which would end the text for every reader anyway. */
 uint8_t *sd_clip_utf8_to_cf_unicode(const uint8_t *utf8, size_t len, size_t *out_len) {
@@ -218,7 +228,7 @@ sd_status sd_clip_validate(const sd_clipboard_entry *entries, uint32_t count) {
     seen |= bit;
     if (entry->len > 0 && entry->bytes == NULL) return SD_ERR_ARGUMENT;
     if (entry->kind == SD_CLIPBOARD_TEXT_UTF8) {
-      if (entry->len > SD_MAX_CLIPBOARD_BYTES) return SD_ERR_ARGUMENT;
+      /* Over the bound is cut when copied, not refused (R1). */
       if (!sd_clip_utf8_valid(entry->bytes, entry->len)) return SD_ERR_ARGUMENT;
     } else if (entry->len == 0 || entry->len > SD_MAX_CLIPBOARD_IMAGE_BYTES) {
       return SD_ERR_ARGUMENT;
@@ -256,15 +266,20 @@ sd_clip_set *sd_clip_set_copy(const sd_clipboard_entry *entries, uint32_t count)
   sd_clip_set *set = (sd_clip_set *)calloc(1, sizeof(sd_clip_set));
   if (set == NULL) return NULL;
   for (uint32_t i = 0; i < count && i < SD_MAX_CLIPBOARD_ENTRIES; i++) {
+    size_t len = entries[i].len;
+    if (entries[i].kind == SD_CLIPBOARD_TEXT_UTF8 && len > SD_MAX_CLIPBOARD_BYTES) {
+      len = sd_clip_utf8_cut(entries[i].bytes, len, SD_MAX_CLIPBOARD_BYTES);
+      set->too_large |= 1u << SD_CLIPBOARD_TEXT_UTF8;
+    }
     /* One spare byte keeps a zero length entry a real allocation. */
-    uint8_t *copy = (uint8_t *)malloc((size_t)entries[i].len + 1);
+    uint8_t *copy = (uint8_t *)malloc(len + 1);
     if (copy == NULL) {
       sd_clip_set_free(set);
       return NULL;
     }
-    if (entries[i].len > 0) memcpy(copy, entries[i].bytes, entries[i].len);
-    copy[entries[i].len] = 0;
-    sd_clip_set_add(set, entries[i].kind, copy, entries[i].len);
+    if (len > 0) memcpy(copy, entries[i].bytes, len);
+    copy[len] = 0;
+    sd_clip_set_add(set, entries[i].kind, copy, (uint32_t)len);
   }
   return set;
 }
@@ -372,22 +387,27 @@ static void sd_clip_fetch_store(sd_clip_fetch *fetch, uint32_t kind, const uint8
                                 uint32_t len) {
   if (data == NULL || len == 0) return;
   if (kind == SD_CLIPBOARD_TEXT_UTF8) {
-    /* Each UTF-16 unit is at least one UTF-8 byte, so the unit count before the
-     * terminator already proves an oversized text without converting it. */
+    /* Each UTF-16 unit is at least one UTF-8 byte, so the first `bound` units hold
+     * at least the first `bound` bytes of the text: converting more is never
+     * needed. A high surrogate left at the cut would only become U+FFFD. */
     size_t units = 0;
     while (units < len / 2 && (data[units * 2] != 0 || data[units * 2 + 1] != 0)) units++;
+    int32_t cut = 0;
     if (units > SD_MAX_CLIPBOARD_BYTES) {
-      fetch->too_large = 1;
-      return;
+      units = SD_MAX_CLIPBOARD_BYTES;
+      uint32_t last = (uint32_t)data[units * 2 - 2] | ((uint32_t)data[units * 2 - 1] << 8);
+      if (last >= 0xD800 && last <= 0xDBFF) units--;
+      cut = 1;
     }
     size_t out_len = 0;
     uint8_t *text = sd_clip_cf_unicode_to_utf8(data, units * 2, &out_len);
     if (text == NULL) return;
     if (out_len > SD_MAX_CLIPBOARD_BYTES) {
-      free(text);
-      fetch->too_large = 1;
-      return;
+      out_len = sd_clip_utf8_cut(text, out_len, SD_MAX_CLIPBOARD_BYTES);
+      text[out_len] = 0;
+      cut = 1;
     }
+    if (cut) fetch->too_large |= 1u << SD_CLIPBOARD_TEXT_UTF8;
     if (out_len == 0) {
       free(text);
       return;
@@ -396,7 +416,7 @@ static void sd_clip_fetch_store(sd_clip_fetch *fetch, uint32_t kind, const uint8
     return;
   }
   if (len > SD_MAX_CLIPBOARD_IMAGE_BYTES) {
-    fetch->too_large = 1;
+    fetch->too_large |= 1u << kind;
     return;
   }
   uint8_t *copy = (uint8_t *)malloc(len);
@@ -407,7 +427,7 @@ static void sd_clip_fetch_store(sd_clip_fetch *fetch, uint32_t kind, const uint8
 
 uint32_t sd_clip_fetch_on_response(sd_clip_fetch *fetch, int32_t ok, const uint8_t *data,
                                    uint32_t len, sd_clip_set *finished,
-                                   int32_t *too_large, int32_t *done) {
+                                   uint32_t *too_large, int32_t *done) {
   *done = 0;
   *too_large = 0;
   if (!fetch->in_flight || fetch->next >= fetch->plan_count) return 0;
@@ -449,7 +469,7 @@ uint32_t sd_clip_entries(const sd_clip_set *set, sd_clipboard_entry out[SD_MAX_C
 
 /* ------------------------------------------------------------------ probes */
 
-static void sd_probe_deliver(const sd_clip_set *set, int32_t too_large, sd_event_fn fn,
+static void sd_probe_deliver(const sd_clip_set *set, uint32_t too_large, sd_event_fn fn,
                              void *user) {
   if (fn == NULL) return;
   sd_clipboard_entry entries[SD_MAX_CLIPBOARD_ENTRIES];
@@ -464,13 +484,15 @@ static void sd_probe_deliver(const sd_clip_set *set, int32_t too_large, sd_event
     event.entry_count = count;
     fn(user, &event);
   }
-  if (too_large) {
+  for (uint32_t kind = SD_CLIPBOARD_TEXT_UTF8; kind <= SD_CLIPBOARD_IMAGE_DIB; kind++) {
+    if ((too_large & (1u << kind)) == 0) continue;
     sd_event event;
     memset(&event, 0, sizeof(event));
     event.abi_version = SD_ABI_VERSION;
     event.kind = SD_EVENT_NOTICE;
     event.state = SD_STATE_CONNECTED;
     event.notice = SD_NOTICE_CLIPBOARD_TOO_LARGE;
+    event.detail = (int32_t)kind;
     fn(user, &event);
   }
 }
@@ -521,7 +543,7 @@ sd_status sd_probe_rdp_fetch(const sd_probe_step *steps, uint32_t step_count,
     } else {
       sd_clip_set finished;
       memset(&finished, 0, sizeof(finished));
-      int32_t too_large = 0;
+      uint32_t too_large = 0;
       int32_t done = 0;
       id = sd_clip_fetch_on_response(&fetch, step->ok, step->data, step->len, &finished,
                                      &too_large, &done);

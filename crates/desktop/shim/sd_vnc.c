@@ -115,24 +115,28 @@ static void sd_vnc_frame(rfbClient *rfb, int x, int y, int w, int h) {
                 width, height);
 }
 
-/* Hands one remote text to the consumer, taking `utf8`. Text over the bound is
- * skipped and reported rather than cut, because a cut text is a different text. */
+/* Hands one remote text to the consumer, taking `utf8` (valid UTF-8). Text over
+ * the bound is cut at the last whole character within it, delivered, and
+ * reported (R1). */
 static void sd_vnc_emit_text(sd_vnc_session *session, uint8_t *utf8, size_t len) {
   if (utf8 == NULL) return;
+  int32_t cut = 0;
+  if (len > SD_MAX_CLIPBOARD_BYTES) {
+    len = sd_clip_utf8_cut(utf8, len, SD_MAX_CLIPBOARD_BYTES);
+    cut = 1;
+  }
   if (len == 0) {
     free(utf8);
-    return;
+  } else {
+    sd_clip_set set;
+    memset(&set, 0, sizeof(set));
+    sd_clip_set_add(&set, SD_CLIPBOARD_TEXT_UTF8, utf8, (uint32_t)len);
+    sd_emit_clipboard(session->client, &set);
+    sd_clip_set_clear(&set);
   }
-  if (len > SD_MAX_CLIPBOARD_BYTES) {
-    free(utf8);
-    sd_emit_notice(session->client, SD_NOTICE_CLIPBOARD_TOO_LARGE);
-    return;
+  if (cut) {
+    sd_emit_notice(session->client, SD_NOTICE_CLIPBOARD_TOO_LARGE, SD_CLIPBOARD_TEXT_UTF8);
   }
-  sd_clip_set set;
-  memset(&set, 0, sizeof(set));
-  sd_clip_set_add(&set, SD_CLIPBOARD_TEXT_UTF8, utf8, (uint32_t)len);
-  sd_emit_clipboard(session->client, &set);
-  sd_clip_set_clear(&set);
 }
 
 /* The original RFB cut text: ISO 8859-1 by definition. */
@@ -672,7 +676,7 @@ void sd_vnc_clipboard(sd_client *client, sd_clip_set *set) {
     if (latin1 == NULL) {
       if (!session->latin1_reported) {
         session->latin1_reported = 1;
-        sd_emit_notice(client, SD_NOTICE_CLIPBOARD_LATIN1_ONLY);
+        sd_emit_notice(client, SD_NOTICE_CLIPBOARD_LATIN1_ONLY, 0);
       }
     } else {
       if (latin1_len > 0) SendClientCutText(rfb, (char *)latin1, (int)latin1_len);

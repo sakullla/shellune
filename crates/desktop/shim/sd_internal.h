@@ -1,6 +1,6 @@
 /* Internal glue between the shared handle and the protocol backends.
  *
- * Only sd_shim.c, sd_rdp.c and sd_vnc.c include this. The Rust crate sees
+ * Only the shim's own sources (sd_*.c) include this. The Rust crate sees
  * shellune_desktop_shim.h alone; nothing here is part of the ABI promise beyond
  * keeping the layout identical in every translation unit of this library.
  */
@@ -198,11 +198,14 @@ typedef struct sd_clip_item {
 typedef struct sd_clip_set {
   uint32_t count;
   sd_clip_item items[SD_MAX_CLIPBOARD_ENTRIES];
+  /* Kinds (bit 1 << kind) that were over their bound: text cut, images left out. */
+  uint32_t too_large;
 } sd_clip_set;
 
 /* Checks a caller's entries against the bounds and rules of the header. */
 sd_status sd_clip_validate(const sd_clipboard_entry *entries, uint32_t count);
-/* Deep copy of validated entries; NULL on allocation failure. */
+/* Deep copy of validated entries; NULL on allocation failure. Text over its bound
+ * is cut to it and marked in `too_large`. */
 sd_clip_set *sd_clip_set_copy(const sd_clipboard_entry *entries, uint32_t count);
 void sd_clip_set_free(sd_clip_set *set);
 /* Releases the entries, leaving an empty group. */
@@ -220,6 +223,9 @@ uint8_t *sd_clip_cf_unicode_to_utf8(const uint8_t *utf16, size_t len, size_t *ou
 uint8_t *sd_clip_utf8_to_latin1(const uint8_t *utf8, size_t len, size_t *out_len);
 uint8_t *sd_clip_latin1_to_utf8(const uint8_t *latin1, size_t len, size_t *out_len);
 int32_t sd_clip_utf8_valid(const uint8_t *utf8, size_t len);
+/* The length of the longest prefix of valid UTF-8 `utf8` that fits in `bound` bytes
+ * and ends on a whole character. */
+size_t sd_clip_utf8_cut(const uint8_t *utf8, size_t len, size_t bound);
 
 /* RDP clipboard format ids used on the wire. */
 #define SD_CF_DIB 8u
@@ -248,7 +254,7 @@ typedef struct sd_clip_fetch {
   uint32_t queued_ids[2];
   uint32_t queued_kinds[2];
   uint32_t queued_count;
-  int32_t too_large;  /* an entry of this group was skipped for its size */
+  uint32_t too_large; /* kinds of this group over their bound (bit 1 << kind) */
   sd_clip_set collected;
 } sd_clip_fetch;
 
@@ -258,11 +264,12 @@ uint32_t sd_clip_fetch_on_list(sd_clip_fetch *fetch, const uint32_t *ids,
                                const char *const *names, uint32_t count);
 /* An answer arrived. Returns the next format id to request, or 0. When the group is
  * complete `*done` is 1, the group is moved to `finished` (caller clears it) and
- * `*too_large` says whether an entry was skipped for its size. An answer while
- * nothing is in flight is ignored. */
+ * `*too_large` holds the kinds that were over their bound (bit 1 << kind): a text
+ * is cut to the bound and kept, an image is left out. An answer while nothing is
+ * in flight is ignored. */
 uint32_t sd_clip_fetch_on_response(sd_clip_fetch *fetch, int32_t ok, const uint8_t *data,
                                    uint32_t len, sd_clip_set *finished,
-                                   int32_t *too_large, int32_t *done);
+                                   uint32_t *too_large, int32_t *done);
 void sd_clip_fetch_reset(sd_clip_fetch *fetch);
 /* Fills `out` with views of the group's entries; returns how many. */
 uint32_t sd_clip_entries(const sd_clip_set *set, sd_clipboard_entry out[SD_MAX_CLIPBOARD_ENTRIES]);
@@ -363,7 +370,9 @@ int32_t sd_ask_certificate(sd_client *client, const char *host, const char *subj
                            uint32_t flags);
 /* Delivers one remote clipboard group; an empty group is not delivered. */
 void sd_emit_clipboard(sd_client *client, const sd_clip_set *set);
-void sd_emit_notice(sd_client *client, uint32_t notice);
+void sd_emit_notice(sd_client *client, uint32_t notice, int32_t detail);
+/* One SD_NOTICE_CLIPBOARD_TOO_LARGE per kind set in `kinds` (bit 1 << kind). */
+void sd_emit_too_large(sd_client *client, uint32_t kinds);
 
 /* --- backend pointer lifetime ---
  *
@@ -406,6 +415,20 @@ void sd_rdp_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t buttons)
 /* Takes ownership of `set`. */
 void sd_rdp_clipboard(sd_client *client, sd_clip_set *set);
 sd_status sd_rdp_probe_settings(sd_client *client, char *out, size_t cap);
+sd_status sd_rdp_probe_session(sd_client *client, const sd_probe_session_step *steps,
+                               uint32_t count);
+#endif
+
+/* --- RDP drive (sd_rdp_drive.c) --- */
+#if defined(SD_WITH_RDP)
+struct rdp_settings;
+/* 0 when `path` can be offered as a drive, else an sd_drive_problem. */
+int32_t sd_rdp_drive_check(const char *path);
+/* Adds `path` (already checked) as drive `name`. Returns 0 on success, else an
+ * sd_drive_problem. */
+int32_t sd_rdp_drive_add(struct rdp_settings *settings, const char *name, const char *path);
+/* The size of the context sd_rdp_run allocates, for probes that build one. */
+size_t sd_rdp_context_size(void);
 #endif
 
 #if defined(SD_WITH_VNC)

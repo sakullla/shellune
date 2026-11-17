@@ -35,6 +35,7 @@ fn main() {
         "sd_shim.c",
         "sd_clip.c",
         "sd_rdp.c",
+        "sd_rdp_drive.c",
         "sd_vnc.c",
         "sd_stub.c",
     ] {

@@ -1,0 +1,61 @@
+--- a/include/freerdp/client/rdpdr.h
++++ b/include/freerdp/client/rdpdr.h
+@@ -76,6 +76,18 @@
+ 	 */
+ 	typedef UINT (*pcRdpdrHotplugDevice)(RdpdrClientContext* context, RdpdrHotplugEventType type);
+ 
++	/** @brief Shellune: the server answered a device announce ([MS-RDPEFS] 2.2.2.1).
++	 *  A non-zero result code means the server declined the device, which is then
++	 *  unregistered. Called on the rdpdr channel thread.
++	 */
++	typedef void (*pcRdpdrDeviceReply)(RdpdrClientContext* context, UINT32 deviceId,
++	                                   UINT32 deviceType, const char* name, UINT32 resultCode);
++
++	/** @brief Shellune: the server opened device redirection (Server Announce).
++	 *  Called on the rdpdr channel thread.
++	 */
++	typedef void (*pcRdpdrServerAnnounce)(RdpdrClientContext* context);
++
+ 	/** @struct s_rdpdr_client_context
+ 	 *  @brief rdpdr channel client context
+ 	 *
+@@ -89,6 +101,10 @@
+ 		WINPR_ATTR_NODISCARD pcRdpdrRegisterDevice RdpdrRegisterDevice;
+ 		WINPR_ATTR_NODISCARD pcRdpdrUnregisterDevice RdpdrUnregisterDevice;
+ 		WINPR_ATTR_NODISCARD pcRdpdrHotplugDevice RdpdrHotplugDevice;
++
++		/* Shellune: optional, set by the client before it connects. */
++		pcRdpdrDeviceReply RdpdrDeviceReply;
++		pcRdpdrServerAnnounce RdpdrServerAnnounce;
+ 	};
+ 
+ #ifdef __cplusplus
+--- a/channels/rdpdr/client/rdpdr_main.c
++++ b/channels/rdpdr/client/rdpdr_main.c
+@@ -1828,6 +1828,9 @@
+ 				case PAKID_CORE_SERVER_ANNOUNCE:
+ 					rdpdr->haveClientId = FALSE;
+ 					rdpdr->haveServerCaps = FALSE;
++					/* Shellune: the server has device redirection open. */
++					if (rdpdr->context.RdpdrServerAnnounce)
++						rdpdr->context.RdpdrServerAnnounce(&rdpdr->context);
+ 					if ((error = rdpdr_process_server_announce_request(rdpdr, s)))
+ 					{
+ 					}
+@@ -1917,6 +1920,16 @@
+ 						Stream_Read_UINT32(s, deviceId);
+ 						Stream_Read_UINT32(s, status);
+ 
++						/* Shellune: tell the client how the server answered. */
++						if (rdpdr->context.RdpdrDeviceReply)
++						{
++							const DEVICE* device =
++							    devman_get_device_by_id(rdpdr->devman, deviceId);
++							rdpdr->context.RdpdrDeviceReply(
++							    &rdpdr->context, deviceId, device ? device->type : 0,
++							    device ? device->name : nullptr, status);
++						}
++
+ 						if (status != 0)
+ 							devman_unregister_device(rdpdr->devman, (void*)((size_t)deviceId));
+ 						error = CHANNEL_RC_OK;
