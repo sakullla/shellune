@@ -2179,6 +2179,34 @@ pub fn modal_with(
         ))
 }
 
+/// How long the dimmed page takes to clear after a dialog closes.
+pub const SCRIM_EXIT: std::time::Duration = theme::Motion::BASE;
+
+/// The dimming a [`modal`] leaves behind as it closes, fading out (R5).
+///
+/// The dialog itself is gone at once: GPUI rebuilds the tree every frame, so keeping a
+/// closed dialog drawn would mean keeping every dialog's state alive after its answer.
+/// The dimming carries no state, so it alone eases away. It takes no presses - the
+/// page is usable again the moment the dialog is answered - and `key` restarts the
+/// fade for each dialog that closes. Under reduced motion there is nothing to draw:
+/// the window does not ask for it.
+pub fn modal_scrim_exit(viewport: gpui::Size<Pixels>, key: u64) -> AnyElement {
+    div()
+        .debug_selector(|| "modal.scrim.exit".to_owned())
+        .absolute()
+        .top_0()
+        .left_0()
+        .w(viewport.width)
+        .h(viewport.height)
+        .bg(theme::scrim())
+        .with_animation(
+            SharedString::from(format!("modal.scrim.exit.{key}")),
+            Animation::new(SCRIM_EXIT).with_easing(theme::ease_out()),
+            |scrim, delta| scrim.opacity(1.0 - delta),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

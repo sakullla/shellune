@@ -844,6 +844,20 @@ pub struct ShelluneView {
     /// The preview holds the whole block, so a long paste is read by scrolling it in
     /// the dialog rather than by truncating it (R17).
     paste_scroll: gpui::ScrollHandle,
+    /// Whether this draw laid a dialog over the page. [`shell`]'s `modal` sets it, and
+    /// the end of the draw reads and clears it.
+    modal_drawn: std::cell::Cell<bool>,
+    /// Whether the last draw laid a dialog over the page.
+    modal_shown: bool,
+    /// The dimming a dialog left behind as it closed, while it fades out (R5): the
+    /// number of the fade, so a timer that belongs to an older one clears nothing.
+    scrim_exit: Option<u64>,
+    /// The number the next fade takes.
+    scrim_exit_count: u64,
+    /// The interceptor that keeps every shortcut but Escape while a delete or close
+    /// question is up, so nothing runs behind a question about something that cannot
+    /// be undone. It exists only while such a question is open.
+    question_watch: Option<gpui::Subscription>,
     /// Whether a user edit may be written. Window close turns this off first.
     layout_persist: bool,
     /// Why the saved layout could not be read. The file is left as it was.
@@ -2474,6 +2488,11 @@ impl ShelluneView {
             paste_focus: cx.focus_handle(),
             paste_watch: None,
             paste_scroll: gpui::ScrollHandle::new(),
+            modal_drawn: std::cell::Cell::new(false),
+            modal_shown: false,
+            scrim_exit: None,
+            scrim_exit_count: 0,
+            question_watch: None,
             session_menu: None,
             session_more: None,
             backup: None,
@@ -7122,6 +7141,25 @@ impl ShelluneView {
         cx.notify();
     }
 
+    /// Asks the deletion question for one host without moving the keyboard, as a test
+    /// that holds a field needs.
+    #[cfg(test)]
+    pub fn request_delete_host_for_test(&mut self, id: HostId, cx: &mut Context<Self>) {
+        self.ask_delete_host(id, cx);
+    }
+
+    /// Whether the window draws the fading dimming of a dialog that just closed.
+    #[cfg(test)]
+    pub fn scrim_exit_for_test(&self) -> bool {
+        self.scrim_exit.is_some()
+    }
+
+    /// Whether the last draw laid a dialog over the page.
+    #[cfg(test)]
+    pub fn modal_shown_for_test(&self) -> bool {
+        self.modal_shown
+    }
+
     /// Drops the deletion question without touching anything.
     fn cancel_delete_host(&mut self, cx: &mut Context<Self>) {
         self.hosts.cancel_delete();
@@ -11527,6 +11565,87 @@ impl ShelluneView {
     #[must_use]
     pub fn rail_collapsed(&self) -> bool {
         self.rail_collapsed
+    }
+
+    /// Whether a question about something that cannot be undone is on screen: deleting
+    /// a host, or closing a session or the app while work is still running (R5).
+    pub(crate) fn question_open(&self) -> bool {
+        (self.closing_app && (self.transfers.any_active() || self.forwards.any_active()))
+            || self
+                .closing
+                .is_some_and(|id| self.close_needs_confirmation(id))
+            || (self.workspace.destination() == Destination::Hosts
+                && self.hosts.pending_delete().is_some())
+    }
+
+    /// Keeps every shortcut but Escape from running while a question is up.
+    ///
+    /// A bound shortcut runs before any key listener sees the key, so without this
+    /// Ctrl+W would close a tab, or Ctrl+L switch the language, behind a question that
+    /// is waiting for an answer. Escape goes on: it is the question's way out. Only
+    /// this window's keys are kept.
+    fn watch_questions(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.question_open() {
+            self.question_watch = None;
+            return;
+        }
+        if self.question_watch.is_some() {
+            return;
+        }
+        let view = cx.entity().downgrade();
+        let own = window.window_handle().window_id();
+        let watch = cx.intercept_keystrokes(move |event, window, app| {
+            if window.window_handle().window_id() != own {
+                return;
+            }
+            let keystroke = &event.keystroke;
+            if keystroke.key == "escape" && keystroke.modifiers.number_of_modifiers() == 0 {
+                return;
+            }
+            let open = view
+                .read_with(app, |view, _app| view.question_open())
+                .unwrap_or(false);
+            if open {
+                app.stop_propagation();
+            }
+        });
+        self.question_watch = Some(watch);
+    }
+
+    /// Notes whether this draw laid a dialog over the page, and returns the fading
+    /// dimming of one that has just closed (R5).
+    ///
+    /// A dialog that was on screen at the last draw and is gone now leaves its dimming
+    /// behind for [`components::SCRIM_EXIT`], fading out; a dialog that opens meanwhile
+    /// brings its own dimming and ends the fade. Under reduced motion nothing is left
+    /// behind: the dimming goes with the dialog.
+    fn settle_scrim_exit(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let drawn = self.modal_drawn.replace(false);
+        let closed = self.modal_shown && !drawn;
+        self.modal_shown = drawn;
+        if drawn || !theme::motion_allowed() {
+            self.scrim_exit = None;
+        } else if closed {
+            self.scrim_exit_count += 1;
+            let key = self.scrim_exit_count;
+            self.scrim_exit = Some(key);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(components::SCRIM_EXIT).await;
+                let _ = this.update(cx, |view, cx| {
+                    if view.scrim_exit == Some(key) {
+                        view.scrim_exit = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        self.scrim_exit
+            .map(|key| components::modal_scrim_exit(window.viewport_size(), key))
     }
 
     /// Closes whatever floats above the page, one layer at a time, and says whether
@@ -18215,6 +18334,7 @@ impl Render for ShelluneView {
         } else {
             self.paste_watch = None;
         }
+        self.watch_questions(window, cx);
         // A file view's question takes the keyboard in its first field, and gives it back
         // to the column it asked about once it is gone, so a copy can be asked for, typed
         // and confirmed without a pointer (R4). The field is also brought into the column:
@@ -18253,7 +18373,7 @@ impl Render for ShelluneView {
             Some(self.session_header(window, cx))
         };
 
-        div()
+        let root = div()
             .id("shellune.root")
             .relative()
             .flex()
@@ -18275,6 +18395,20 @@ impl Render for ShelluneView {
                 // again here would cancel nothing and then close the panel behind the
                 // dialog, because the paste is no longer waiting (R17).
                 if std::mem::take(&mut this.paste_key_spent) {
+                    cx.stop_propagation();
+                    return;
+                }
+                // A delete or close question holds the keys while it is up, as the
+                // paste dialog does: Escape answers it with the way out, and every other
+                // key is spent on it. Enter in the field or the terminal behind the
+                // dimming would otherwise act on something the user cannot see, and
+                // typed text would go to a program behind a question (R5).
+                if this.question_open() && !this.paste_prompt_open(cx) {
+                    if event.keystroke.key == "escape"
+                        && event.keystroke.modifiers.number_of_modifiers() == 0
+                    {
+                        this.dismiss_floating(window, cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }
@@ -18532,8 +18666,11 @@ impl Render for ShelluneView {
             // A question asked before work is stopped is answered before anything
             // else: it is drawn over every other layer.
             .children(self.close_transfer_question(window, cx))
-            .children(self.close_app_question(window, cx))
-            .children(self.toast_stack(cx))
+            .children(self.close_app_question(window, cx));
+        // The dimming of a dialog that just closed fades out over the page, under the
+        // toasts like the dialog was (R5).
+        let scrim_exit = self.settle_scrim_exit(window, cx);
+        root.children(scrim_exit).children(self.toast_stack(cx))
     }
 }
 

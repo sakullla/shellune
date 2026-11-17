@@ -32775,3 +32775,177 @@ async fn the_shortcut_capture_is_the_shared_dialog_and_a_press_outside_cancels_i
         "cancelling leaves the binding as it was"
     );
 }
+
+/// Sets the window's motion preference to `motion`, by the same step the settings use.
+fn motion_to(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, motion: Motion) {
+    while cx.update(|_window, app| view.read(app).workspace().motion()) != motion {
+        cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+async fn a_closed_dialog_leaves_its_dimming_to_fade_out_and_the_page_usable(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("scrim-exit");
+    let store = dir.store();
+    seed(
+        &store,
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", None),
+            stored_host("db", "10.0.0.6", 22, "postgres", None),
+        ],
+    );
+    let (view, cx) = hosts_view(cx, store);
+    motion_to(&view, cx, Motion::Full);
+    // Whether the window draws a fading dimming now. Asked of the view: a test frame
+    // keeps the bounds of what an earlier frame drew.
+    let fading =
+        |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).scrim_exit_for_test());
+    let dialog = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).modal_shown_for_test())
+    };
+
+    // Nothing has closed yet, so nothing fades.
+    assert!(!fading(cx));
+    click(cx, "hosts.delete.0");
+    assert!(cx.debug_bounds("hosts.confirm.backdrop").is_some());
+    assert!(
+        !fading(cx),
+        "an open dialog has its own dimming, not a fading one"
+    );
+
+    // Escape answers the question: the dialog goes at once and its dimming fades out
+    // over the window (R5).
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!dialog(cx), "the card goes at once");
+    assert!(fading(cx), "the dimming stays behind to fade out");
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let scrim = bounds_of(cx, "modal.scrim.exit");
+    assert!(
+        scrim.size.width >= viewport.width - px(0.5)
+            && scrim.size.height >= viewport.height - px(0.5),
+        "the fading dimming covers the window it dimmed: {scrim:?} in {viewport:?}"
+    );
+
+    // The fading dimming takes no presses: the page is usable the moment the question
+    // is answered, and a new dialog brings its own dimming.
+    click(cx, "hosts.delete.1");
+    assert!(
+        cx.update(|_window, app| view.read(app).hosts_state().pending_delete().is_some())
+            && dialog(cx),
+        "a press through the fading dimming reaches the page"
+    );
+    assert!(!fading(cx), "a dialog that opens ends the fade");
+
+    // The fade is gone once its time is up.
+    click(cx, "hosts.confirm.cancel");
+    assert!(!dialog(cx) && fading(cx));
+    cx.executor()
+        .advance_clock(crate::app::components::SCRIM_EXIT + std::time::Duration::from_millis(20));
+    cx.run_until_parked();
+    assert!(!fading(cx), "the dimming is gone once it has faded");
+
+    // A form closes the same way.
+    click(cx, "hosts.new");
+    assert!(cx.debug_bounds("hosts.editor.backdrop").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!dialog(cx), "Escape closes the form");
+    assert!(fading(cx), "a closed form's dimming fades out too");
+    cx.executor()
+        .advance_clock(crate::app::components::SCRIM_EXIT + std::time::Duration::from_millis(20));
+    cx.run_until_parked();
+    assert!(!fading(cx));
+
+    // With reduced motion the dimming goes with the dialog.
+    motion_to(&view, cx, Motion::Reduced);
+    click(cx, "hosts.delete.0");
+    assert!(dialog(cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!dialog(cx), "Escape closes the question");
+    assert!(
+        !fading(cx),
+        "reduced motion leaves no fading dimming behind"
+    );
+    motion_to(&view, cx, Motion::Full);
+}
+
+#[gpui::test]
+async fn a_delete_question_keeps_every_key_but_escape(cx: &mut TestAppContext) {
+    let dir = TempDir::new("question-keys");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", None),
+            stored_host("db", "10.0.0.9", 22, "postgres", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    type_into(cx, "hosts.search", "db");
+    let search = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned())
+    };
+    assert_eq!(search(cx), "db");
+
+    // The question is asked while the search field still holds the keyboard.
+    cx.update(|_window, app| {
+        view.update(app, |view, cx| {
+            let id = view.book().hosts()[1].id();
+            view.request_delete_host_for_test(id, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("hosts.confirm").is_some());
+
+    // Enter behind the question would connect the match the user cannot see; typed
+    // text would change the search under it; a shortcut would act behind it. All of
+    // them are spent on the question, which stays open (R5).
+    cx.simulate_keystrokes("enter");
+    cx.simulate_keystrokes("x");
+    cx.simulate_keystrokes("ctrl-l");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).remote_state().is_none()),
+        "Enter behind the question connects nothing"
+    );
+    assert_eq!(
+        search(cx),
+        "db",
+        "typed text does not reach the field behind"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::English,
+        "no shortcut runs behind the question"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).question_open()),
+        "only an answer closes the question"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        2,
+        "no key deletes anything"
+    );
+
+    // Escape is the way out, and the keys belong to the page again after it.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).question_open()));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        2
+    );
+    cx.simulate_keystrokes("ctrl-l");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().locale()),
+        Locale::Chinese,
+        "shortcuts run again once the question is answered"
+    );
+}
