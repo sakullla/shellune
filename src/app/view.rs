@@ -12992,15 +12992,14 @@ impl ShelluneView {
                 field.set_clearable(true, cx);
                 field
             });
-            let view = cx.entity().downgrade();
-            cx.observe(&field, move |_field_owner, text_field, cx| {
+            // The observer already runs inside an update of this view: updating it again
+            // through a handle would lease it twice and abort the app, which is what any
+            // focus change away from the filter (opening a question) used to do.
+            cx.observe(&field, move |view, text_field, cx| {
                 let text = text_field.read(cx).text().to_owned();
-                view.update(cx, |view, cx| {
-                    if view.files.set_filter(id, source, text) {
-                        cx.notify();
-                    }
-                })
-                .ok();
+                if view.files.set_filter(id, source, text) {
+                    cx.notify();
+                }
             })
             .detach();
             self.files_filter_fields.insert((id, source), field);
@@ -17018,6 +17017,12 @@ impl ShelluneView {
         if self.files.set_filter(id, source, text) {
             cx.notify();
         }
+    }
+
+    /// The filter one column holds, for a test.
+    #[cfg(test)]
+    pub fn files_filter_of_for_test(&self, id: SessionId, source: FileSource) -> Option<String> {
+        self.files.filter_of(id, source).map(str::to_owned)
     }
 
     /// The entries one column has marked, for a test (R14).

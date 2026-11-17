@@ -10375,6 +10375,39 @@ fn listed_names(
     })
 }
 
+/// The filter field reports what is typed into it from inside the view's own update.
+/// It used to update the view again through a handle, which leased it twice and aborted
+/// the app on the first keystroke or focus change - opening any question did that.
+#[gpui::test]
+async fn typing_in_the_filter_and_then_opening_a_question_keeps_the_app_running(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let _answers = open_files(cx, &view, id);
+
+    type_into(cx, "files.filter", "no");
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .files_filter_of_for_test(id, FileSource::Remote)),
+        Some("no".to_owned()),
+        "what is typed into the filter is the column's filter"
+    );
+
+    click(cx, "files.new");
+    assert!(
+        cx.debug_bounds("files.question").is_some(),
+        "the question opens after the filter had the keyboard"
+    );
+    type_into(cx, "files.question.input", "x");
+    click(cx, "files.question.cancel");
+    assert!(
+        !cx.update(|_window, app| view.read(app).files_question_open()),
+        "the question is answered and the view still works"
+    );
+}
+
 #[gpui::test]
 async fn a_new_folder_is_asked_for_and_the_result_is_the_servers_next_listing(
     cx: &mut TestAppContext,
