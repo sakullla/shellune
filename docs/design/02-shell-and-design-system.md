@@ -210,7 +210,12 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 `view/shell.rs::home_tab`）。** 三种标签共用同一个外框：
 
 - 标签条是 `chrome` 层；标签立在头部底边上（高 `Metrics::tab_height` = 36，顶部留 10）。当前标签用它所通向页面的
-  底色填充（`tab_floor`：有终端时是终端配色的背景，主页与连接卡片页是 `PAGE_FLOOR` = `canvas`），顶部圆角 10、
+  底色填充（`tab_floor`：有终端时是终端配色的背景；独占标签的远程桌面画面顶到头部时，是标签正下方那一行远程
+  画面的颜色（`DesktopPane::top_edge_colour`，按标签横向覆盖的列取平均；画面上方留有 canvas 边带、标签中点不在
+  画面上方或尚无画面时仍是 canvas）；主页与连接卡片页是 `PAGE_FLOOR` = `canvas`）。当前标签的文字色取能在这块
+  底色上读清的主文字色（`text_on`：本调色板的主文字色，或在对比更高时取另一调色板的），所以浅色画面或另一调色板
+  的终端配色上标题仍可读（测试 `the_current_desktop_tab_takes_the_colour_of_the_picture_under_it`、
+  `the_current_tab_writes_in_the_ink_its_floor_needs`）。顶部圆角 10、
   上左右一条 `border` 发丝线、底边不画线，并盖住头部底边那条发丝线（发丝线先画、标签后画），与下方页面连成一张纸；
   非当前标签透明，悬停时 `surface hover` 浅底。两个相邻的非当前标签之间画 1px `border strong` 分隔线，当前标签两侧不画。
 - 内容依次为：状态点（`components::pulsing_status_dot`；连接中在允许动效时以 `Motion::PULSE` 脉动，减少动效时静止，
@@ -263,11 +268,17 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   点击复制）、非"已连接"时的状态 chip、非"关闭"的 X11 chip、未保存提示。目标以省略号截断，空间不够时它最先让位，
   但至少留下状态点（40，随缩放）。
 - **中组：会话自己的控件**（`terminal.bar.middle`）。可重连时的"重新连接"图标按钮（`session.reconnect`，↻，悬停提示
-  带快捷键；与邻居同为一个点击目标大小，分屏 @200% 也是整个按钮而非被裁成半截）、待处理的主按钮（保存主机 / 无法重连时的"关闭会话"）、
-  终端 | 文件 切换、分屏（仅有终端时）、会话菜单 `⋯`。左中两组由视图交给前台窗格
-  （`session_bar_parts` → `TerminalPane::set_session_slot(left, right, left_floor)`）；`left_floor`
+  带快捷键；与邻居同为一个点击目标大小）、待处理的主按钮（保存主机 / 无法重连时的"关闭会话"）、
+  终端 | 文件 切换、分屏（仅有终端时），最后是会话菜单 `⋯`。左中两组由视图交给前台窗格
+  （`session_bar_parts` → `TerminalPane::set_session_slot(SessionSlot { left, controls, pinned }, left_floor)`）；`left_floor`
   （`session_left_floor`）是左组在目标继续截断前需要的宽度：状态点、目标最少 64、以及每个 chip 的实际宽度。
-  极窄时中组被裁切，搜索与"更多"永远可点。
+  中组分两段（R3、R9）：`controls`（`terminal.bar.controls`，顺序即 `session_bar_controls` 的 `BarControl` 列表）
+  在窄宽时**从末尾起整个让位**——放不下的控件换到被一行高度隐藏的第二行；连第一个控件都放不下时整段不画
+  （仍参与布局，测量不变），不会被裁成半截；`pinned`（会话菜单 `⋯` 与其后的分隔线）在段外、`flex_none`，中组
+  最窄收缩到它为止，**任何宽度下 `⋯` 都在底栏这一行上**。窗格测出让位的控件数（`bar_hidden_controls`），会话菜单
+  打开时按同一列表把让位的控件放在菜单最前（`session.more.reconnect/save_host/files/terminal/split_right/split_down`，
+  动作与底栏按钮相同），其后是分隔线和菜单原有项。左右分屏 720×480 @200% 时分屏按钮、乃至重新连接都经 `⋯` 可达
+  （测试 `a_narrow_split_bar_keeps_the_session_menu_and_offers_what_it_hides_there`）。搜索与"更多"永远可点。
 - **右组：终端工具**（`terminal.bar.tools`）。尺寸（`134×36`）、模式、搜索、复制 | A− 字号 A+。
   放不下时按固定顺序收进"⋯ 更多"菜单（`terminal.more` → `terminal.more.menu`，`BarFold`）：先收字号，再收尺寸，
   再收复制，最后收模式；搜索从不收起。是否收起只由上一帧测得的底栏宽度与中组自然宽度决定
@@ -283,10 +294,14 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 不可断开的长词，按字换行曾让卡片高出窗口），下面是下一步（重新连接 / 关闭会话）与"显示详情"。网格尺寸不变，
 卡片下面铺一层 55% 的终端底色，最后一屏仍可读，卡片之外的网格仍可选择与滚动；卡片本身吃掉指针。遮罩只盖网格、
 `overflow_hidden`，卡片放在不高于遮罩的滚动盒里（`terminal.status.scroll`，从卡片顶部开始滚动）：窗格比卡片矮时
-（如上下分屏 @200%）卡片可滚动查看，不会盖住底栏或画出窗口。卡片上的"重新连接"是带文字的主按钮，底栏中组
-同时保留"重新连接"图标按钮（R8 的底栏入口），卡片放不下下一步时用它；测试
+（如上下分屏 @200%）卡片可滚动查看，不会盖住底栏或画出窗口。卡片挡住按下与悬停、但让滚轮穿过
+（`entering_status_card` 用 `block_mouse_except_scroll`），所以指针停在卡片上也能滚动它（测试
+`the_wheel_over_an_ended_card_scrolls_it_in_a_short_pane`）。卡片上的"重新连接"是带文字的主按钮，底栏中组
+同时保留"重新连接"图标按钮（R8 的底栏入口），卡片放不下下一步时用它；底栏连它也放不下时经会话菜单 `⋯` 到达。测试
 `an_ended_shell_*` 覆盖单窗格、左右与上下分屏在设计尺寸与 720×480 @200% 下的卡片尺寸与可点的重新连接。没有终端的会话（连接中且已转到后台、或尚未打开终端）在窗格位置画同一种卡片：
-连接中用进行中指示条作徽记并说明"连接建立后，终端会在这里打开"（`session_state_card`）。远程桌面与窄窗口下
+连接中用进行中指示条作徽记并说明"连接建立后，终端会在这里打开"（`session_state_card`）。这类卡片与上面同一结构
+（`status_card_floor`：外层 `overflow_hidden` 居中，内层 `pane.state.scroll` 最高为窗格高、纵向滚动），矮窗格里从
+卡片顶部开始、滚轮在卡片上可滚（测试 `a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wheel`）。远程桌面与窄窗口下
 铺满的文件视图占着终端的位置，此时卡片画在内容上方居中。所有状态卡与连接卡片（`remote.page.card`）进入时
 `Enter::Rise`（BASE），按会话 id 只播放一次；减少动效时直接画在最终位置。
 
@@ -511,15 +526,25 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 - **时长**：过场至少放完一轮进入（计时从构造时开始），读取更慢就等读取完成；不额外加长。之后进入 Ready，品牌层
   以 `Motion::BASE` 180ms 淡出、露出首页或恢复的工作区（交叉淡化）。淡出层不接收指针，页面从第一帧就可以点击（测试）。
 - **减少动效**（用户偏好或系统设置）：不画品牌、不等待、不淡出；读取期间只有 canvas 与标题行，读完立即显示页面。
+  系统设置要靠辅助程序回答的平台（Linux，`SYSTEM_MOTION_QUERY_BLOCKS`）在后台询问，过场**等回答再决定画不画品牌**：
+  等待期间只画 canvas 与标题行（与减少动效相同），最多等 `SYSTEM_MOTION_WAIT`（400ms）；回答到达后若要求减少动效
+  就不画品牌，否则品牌从此刻开始一轮完整进入。超时则按用户自己的偏好继续，迟到的回答仍会被采纳用于之后的帧
+  （测试 `a_late_system_answer_for_less_motion_never_shows_the_brand` 等三项）。Windows 与 macOS 同步读取，不等待。
 - **读取失败**：照常结束过场，页面显示原有的失败卡片（如主机文件读不了时首页的 `state.card` 与原因）。
 - **标题行**：过场期间顶部是与正式标题行等高的空白拖动区（`startup.drag`），Windows 上右端是同一组窗口按钮；
   macOS 的红绿灯由系统画在同一行，Linux 用系统标题栏。窗口在读取期间也能拖动、最小化、最大化与关闭。
 - **测试与截图**：`ShelluneView::new` / `with_workspace` / `with_store*` 仍在返回前同步读完所有存储（测试与截图用的
   “同步就绪”入口，首帧就是页面）；`launching_for_test` 走与启动相同的后台路径。截图场景 `startup-splash` 由
   `capture_hold_splash` 把窗口停在过场并画出最终位置的品牌（截图固定减少动效，进入与淡出是静帧证明不了的）。
-- **已知限制**：GPUI 0.2.2 的 `WindowOptions` 只有不透明 / 透明 / 模糊三种窗口背景，没有颜色；Windows 的窗口类
-  背景刷与 macOS 的不透明背景都是黑色。窗口背景因此不能预设为 canvas 色：浅色外观在首帧前仍可能闪过一瞬黑色。
-  缓解是首帧不再等待任何数据读取（只读偏好），以正确外观的 canvas 尽快覆盖窗口。
+- **初始窗口背景**：GPUI 0.2.2 的 `WindowOptions` 只有不透明 / 透明 / 模糊三种窗口背景，没有颜色，因此
+  `vendor/gpui` 加了一处补丁：公开函数 `gpui::set_initial_window_background(Rgba)`。Windows 注册窗口类时用这个颜色
+  创建背景画刷（原为硬编码黑色）；之后打开窗口时颜色若已改变，在窗口显示前更新窗口类画刷。`open_main_window`
+  在建窗口前按偏好里的主题与系统外观（`saved_theme_choice` + `App::window_appearance`）设为对应调色板的 `canvas`
+  （`initial_floor`，测试 `a_new_window_opens_on_the_floor_of_its_saved_theme`）。
+- **已知限制**：macOS 与 Linux 的补丁入口是空操作，窗口在首帧前仍是平台默认背景（macOS 不透明背景为黑色），浅色
+  外观可能闪过一瞬；缓解仍是首帧只读偏好、以正确外观的 canvas 尽快覆盖窗口。Windows 上 GPUI 默认使用
+  DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`），窗口类画刷只在系统用 GDI 擦除背景时可见；首帧之前 DWM 实际
+  显示什么，本机截图（读回 GPU 后备缓冲）无法证明，需要在真实启动中目视确认。
 
 ## 2. 视觉 tokens
 

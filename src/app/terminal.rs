@@ -113,7 +113,48 @@ impl BarFold {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct BarRoom {
     width: Option<Pixels>,
-    middle: Pixels,
+    /// The natural width of the session's controls that give way in a narrow bar.
+    controls: Pixels,
+    /// The width of the session's controls that always stay on the bar: its menu.
+    pinned: Pixels,
+    /// How many of the controls that give way wrapped off the bar's one line.
+    wrapped: usize,
+    /// How many controls give way.
+    count: usize,
+    /// Where the first of them ends; it never wraps, so a group narrower than it cuts
+    /// it instead.
+    first_right: Option<Pixels>,
+    /// Whether the group is narrower than its first control, so none of them is whole
+    /// on the bar and the group is not drawn.
+    clipped: bool,
+    /// How many of the controls that give way, counted from the end, were left off
+    /// the bar at its last layout (R3, R9).
+    hidden: usize,
+}
+
+impl BarRoom {
+    /// The natural width of the whole middle group, with `gap` between its parts.
+    fn middle(self, gap: Pixels) -> Pixels {
+        let between = if self.controls > px(0.0) && self.pinned > px(0.0) {
+            gap
+        } else {
+            px(0.0)
+        };
+        self.controls + between + self.pinned
+    }
+}
+
+/// The session's half of the bar under a terminal, handed in by the window for one
+/// draw (R3).
+pub struct SessionSlot {
+    /// Where the session is: its mark, its target and its chips.
+    pub left: gpui::AnyElement,
+    /// The session's controls, in their order of importance: in a bar too narrow for
+    /// all of them the last ones give way first, each one whole.
+    pub controls: Vec<gpui::AnyElement>,
+    /// The controls that never give way: the session's menu, which reaches every
+    /// control the bar had no room for.
+    pub pinned: Vec<gpui::AnyElement>,
 }
 
 /// Width of the caret in logical pixels.
@@ -531,7 +572,7 @@ pub struct TerminalPane {
     tag: EventTag,
     /// The session's own half of the bar under the grid, handed in by the window for
     /// the frame being drawn: where the session is and what can be done to it.
-    session_slot: std::cell::RefCell<Option<(gpui::AnyElement, Vec<gpui::AnyElement>)>>,
+    session_slot: std::cell::RefCell<Option<SessionSlot>>,
     /// The card the window lays over the grid for the next draw: why the session ended,
     /// or that it is coming back (R3). Taken like the session's half of the bar.
     status_slot: std::cell::RefCell<Option<gpui::AnyElement>>,
@@ -3020,14 +3061,22 @@ impl TerminalPane {
 
     /// Hands the pane the session's half of its bar for the next draw, and the room
     /// its left part needs before its target is cut further (R3).
-    pub fn set_session_slot(
-        &self,
-        left: gpui::AnyElement,
-        right: Vec<gpui::AnyElement>,
-        left_floor: Pixels,
-    ) {
-        *self.session_slot.borrow_mut() = Some((left, right));
+    pub fn set_session_slot(&self, slot: SessionSlot, left_floor: Pixels) {
+        *self.session_slot.borrow_mut() = Some(slot);
         self.session_floor.set(left_floor);
+    }
+
+    /// How many of the session's controls, counted from the end of the list the window
+    /// handed in, the bar had no room for at its last layout (R3, R9).
+    ///
+    /// The window offers those in the session's menu, which always stays on the bar.
+    #[must_use]
+    pub fn bar_hidden_controls(&self) -> usize {
+        if self.bar_has_slot.get() {
+            self.bar_room.get().hidden
+        } else {
+            0
+        }
     }
 
     /// Hands the pane the card the window lays over its grid for the next draw: why
@@ -3103,7 +3152,7 @@ impl TerminalPane {
             + metrics.scale(spacing::HAIRLINE)
             + left_floor
             + group_gap * 2.0
-            + room.middle;
+            + room.middle(metrics.scale(2.0));
         BarFold::ORDER
             .into_iter()
             .find(|fold| fixed + self.tools_width(*fold, metrics) <= width)
@@ -3167,7 +3216,15 @@ impl TerminalPane {
             (None, None) => true,
             _ => false,
         };
-        if close(old.width, room.width) && (old.middle - room.middle).abs() < px(0.5) {
+        let near = |a: Pixels, b: Pixels| (a - b).abs() < px(0.5);
+        if close(old.width, room.width)
+            && near(old.controls, room.controls)
+            && near(old.pinned, room.pinned)
+            && old.clipped == room.clipped
+        {
+            // What else was measured decides nothing in this pane's own draw; the
+            // window reads what is hidden when the session's menu opens.
+            self.bar_room.set(room);
             return;
         }
         self.bar_room.set(room);
@@ -3334,10 +3391,11 @@ impl TerminalPane {
     /// stopped, in the tone of how it stopped.
     fn bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let slot = self.session_slot.borrow_mut().take();
-        let (slot_left, slot_right) = match slot {
-            Some((left, right)) => (Some(left), right),
-            None => (None, Vec::new()),
+        let (slot_left, slot_controls, slot_pinned) = match slot {
+            Some(slot) => (Some(slot.left), slot.controls, slot.pinned),
+            None => (None, Vec::new(), Vec::new()),
         };
+        let has_controls = !slot_controls.is_empty();
         let has_slot = slot_left.is_some();
         self.bar_has_slot.set(has_slot);
         let fold = self.bar_fold(metrics, has_slot);
@@ -3353,9 +3411,9 @@ impl TerminalPane {
         let muted = theme::swatch(shell_palette::TEXT_MUTED);
         let bar_height = metrics.hit_target().max(metrics.scale(SHELL_BAR_HEIGHT));
         // The bar's children are the three groups and, last, a box of the bar's own
-        // size; the middle group's child is the session's half at its natural width.
-        // Those two widths are what the fold is decided from, and neither changes with
-        // what folds.
+        // size; the middle group holds the session's controls at their natural width
+        // and its menu. Those widths are what the fold is decided from, and none of
+        // them changes with what folds.
         let weak = cx.entity().downgrade();
         let measure_bar = move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
             let Some(frame) = bounds.get(3) else {
@@ -3372,18 +3430,83 @@ impl TerminalPane {
         };
         let weak = cx.entity().downgrade();
         let middle_gap = metrics.scale(2.0);
-        let measure_middle =
+        // Every control keeps its own width whether or not it fits, so their sum is the
+        // natural width however much of it is shown.
+        let natural = move |bounds: &[Bounds<Pixels>]| {
+            let gaps = middle_gap * bounds.len().saturating_sub(1) as f32;
+            bounds
+                .iter()
+                .fold(gaps, |sum, child| sum + child.size.width)
+        };
+        // A control that does not fit wraps onto the line under the bar's one line;
+        // the line is the pointer target's height, so half of it tells the two apart
+        // whatever the controls' own heights are.
+        let line = metrics.hit_target();
+        let measure_controls =
             move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
-                // Every control keeps its own width whether or not it fits, so their sum
-                // is the group's natural width however much of it is shown.
-                let gaps = middle_gap * bounds.len().saturating_sub(1) as f32;
-                let middle = bounds
+                let controls = natural(&bounds);
+                let top = bounds
                     .iter()
-                    .fold(gaps, |sum, child| sum + child.size.width);
+                    .map(|child| child.origin.y)
+                    .fold(None, |top: Option<Pixels>, y| {
+                        Some(top.map_or(y, |top| top.min(y)))
+                    });
+                let wrapped = top.map_or(0, |top| {
+                    bounds
+                        .iter()
+                        .filter(|child| child.origin.y > top + line / 2.0)
+                        .count()
+                });
                 let _ = weak.update(cx, |pane, cx| {
                     let room = BarRoom {
-                        middle,
+                        controls,
+                        wrapped,
+                        count: bounds.len(),
+                        first_right: bounds.first().map(|first| first.right()),
                         ..pane.bar_room.get()
+                    };
+                    pane.apply_bar_room(room, cx);
+                });
+            };
+        let weak = cx.entity().downgrade();
+        let measure_middle =
+            move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
+                let pinned = if has_controls {
+                    bounds.get(1..).unwrap_or_default()
+                } else {
+                    &bounds[..]
+                };
+                let pinned = natural(pinned);
+                let group = has_controls.then(|| bounds.first().copied()).flatten();
+                let _ = weak.update(cx, |pane, cx| {
+                    let previous = pane.bar_room.get();
+                    let room = match group {
+                        // The controls were measured in this frame, just before.
+                        Some(group) => {
+                            let clipped = previous
+                                .first_right
+                                .is_some_and(|right| right > group.right() + px(0.5));
+                            BarRoom {
+                                pinned,
+                                clipped,
+                                hidden: if clipped {
+                                    previous.count
+                                } else {
+                                    previous.wrapped
+                                },
+                                ..previous
+                            }
+                        }
+                        None => BarRoom {
+                            pinned,
+                            controls: px(0.0),
+                            wrapped: 0,
+                            count: 0,
+                            first_right: None,
+                            clipped: false,
+                            hidden: 0,
+                            ..previous
+                        },
                     };
                     pane.apply_bar_room(room, cx);
                 });
@@ -3466,20 +3589,46 @@ impl TerminalPane {
         // The session's controls keep their natural width while there is room; in a pane
         // too narrow even for the folded tools this is the group that gives way, so search
         // and the menu that holds the rest are never the ones cut off. It gives way a
-        // whole control at a time: one that does not fit wraps onto a second line, which
-        // the group's one-line height hides, instead of being cut through.
+        // whole control at a time, from its end: one that does not fit wraps onto a
+        // second line, which the group's one-line height hides, instead of being cut
+        // through. The session's menu is outside that group and never gives way: it
+        // offers every control the bar has no room for (R3, R9).
+        // A group narrower than its first control would cut it through; it is then
+        // laid out as before, so the measure stays put, but not drawn, and the menu
+        // offers all of it.
+        let clipped = self.bar_room.get().clipped;
+        let controls = has_controls.then(|| {
+            div()
+                .on_children_prepainted(measure_controls)
+                .when(clipped, |group| group.invisible())
+                .flex()
+                .flex_wrap()
+                .flex_shrink()
+                .min_w(px(0.0))
+                .h(metrics.hit_target())
+                .overflow_hidden()
+                .items_center()
+                .gap(middle_gap)
+                .debug_selector(|| "terminal.bar.controls".to_owned())
+                .children(slot_controls)
+        });
         let middle = div()
             .on_children_prepainted(measure_middle)
             .flex()
-            .flex_wrap()
             .flex_shrink()
-            .min_w(px(0.0))
+            // The group shrinks down to its menu and no further.
+            .min_w(self.bar_room.get().pinned)
             .h(metrics.hit_target())
             .overflow_hidden()
             .items_center()
             .gap(middle_gap)
             .debug_selector(|| "terminal.bar.middle".to_owned())
-            .children(slot_right);
+            .children(controls)
+            .children(
+                slot_pinned
+                    .into_iter()
+                    .map(|pinned| div().flex().flex_none().items_center().child(pinned)),
+            );
 
         div()
             .on_children_prepainted(measure_bar)

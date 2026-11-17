@@ -274,10 +274,27 @@ pub fn reopen_main_window(cx: &mut App) -> Result<(), String> {
     }
 }
 
+/// The `0xRRGGBB` floor a window opens on: the canvas of the palette `choice` gives
+/// under the system's `appearance` (R7).
+fn initial_floor(choice: theme::ThemeChoice, appearance: gpui::WindowAppearance) -> u32 {
+    let system_dark = matches!(
+        appearance,
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    );
+    theme::palette::CANVAS.value(choice.appearance(system_dark))
+}
+
 fn open_main_window(cx: &mut App) -> Result<(), String> {
     let (width, height) = DEFAULT_WINDOW_SIZE;
     let (min_width, min_height) = MIN_WINDOW_SIZE;
     let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+    // The window is filled with the floor its first frame paints, in the palette the
+    // saved theme gives, before that frame exists: a light window no longer opens on
+    // a black flash (R7). The platform applies it where it can (Windows).
+    gpui::set_initial_window_background(gpui::rgb(initial_floor(
+        view::saved_theme_choice(),
+        cx.window_appearance(),
+    )));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(min_width), px(min_height))),

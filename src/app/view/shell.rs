@@ -10,11 +10,11 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, FontWeight, KeyDownEvent, Pixels, SharedString, Stateful, Window,
-    div, px,
+    AnyElement, App, Context, Div, FontWeight, KeyDownEvent, Pixels, SharedString, Stateful,
+    Window, div, px,
 };
 
-use shellune_core::{SessionState, SnippetId};
+use shellune_core::{SessionId, SessionState, SnippetId};
 use shellune_ssh::X11Status;
 
 use super::{ShelluneView, SnippetNote, brand_mark, files_focus_ring, host_avatar, may_reconnect};
@@ -39,6 +39,34 @@ pub enum Tool {
     Transfers,
     /// The saved shortcut commands, with the editor for one of them (R6).
     Snippets,
+}
+
+/// One of the session's controls on the bar under its terminal, besides its menu (R3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarControl {
+    /// Start the ended session again.
+    Reconnect,
+    /// Save a quick connection as a host.
+    SaveHost,
+    /// Close a session that ended for good.
+    Close,
+    /// The terminal/files switch.
+    Files,
+    /// Split the active pane side by side.
+    SplitRight,
+    /// Split the active pane one above the other.
+    SplitDown,
+}
+
+/// The session's half of the bar, before it is handed to the bar that draws it.
+pub(super) struct SessionBarParts {
+    /// Where the session is.
+    pub left: Div,
+    /// One control for each [`BarControl`] of
+    /// [`ShelluneView::session_bar_controls`], in that order.
+    pub controls: Vec<AnyElement>,
+    /// The session's menu and what follows it, which always stay on the bar.
+    pub pinned: Vec<AnyElement>,
 }
 
 /// The logical width the top row needs, less the window buttons it draws, for every
@@ -310,15 +338,8 @@ impl ShelluneView {
     /// target, and the state when it is news; the right half is what it does - files,
     /// splitting, the reconnect or the save that is waiting, and the menu. The tab
     /// closes the session, so there is no second Close here.
-    pub(super) fn session_bar_parts(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<(Div, Vec<AnyElement>)> {
-        let id = if self.workspace.layout().active_tab().is_some() {
-            self.workspace.layout().active_session()
-        } else {
-            self.active
-        }?;
+    pub(super) fn session_bar_parts(&self, cx: &mut Context<Self>) -> Option<SessionBarParts> {
+        let id = self.bar_session()?;
         let session = self.workspace.session(id)?;
         let metrics = self.metrics();
         let strings = self.strings();
@@ -479,6 +500,13 @@ impl ShelluneView {
         // The right half is a list of separate controls rather than one row: the bar
         // under a terminal lays them out itself, so in a pane too narrow for all of them a
         // control that does not fit is left out whole instead of being cut through (R3).
+        // The menu is apart from them and always stays: it offers what was left out.
+        let kinds = self.session_bar_controls(id);
+        debug_assert_eq!(
+            kinds.contains(&BarControl::Reconnect),
+            can_reconnect,
+            "the bar's controls and its reconnect agree"
+        );
         let mut right: Vec<AnyElement> = Vec::new();
         if can_reconnect {
             // The card over the terminal names the step in words; the bar's entry is the
@@ -539,7 +567,13 @@ impl ShelluneView {
                     .map(IntoElement::into_any_element),
             );
         }
-        right.push(
+        debug_assert_eq!(
+            right.len(),
+            kinds.len(),
+            "one control is drawn for each the session's menu may stand in for"
+        );
+        let mut pinned: Vec<AnyElement> = Vec::new();
+        pinned.push(
             self.bar_icon(
                 "session.more",
                 Icon::More,
@@ -561,14 +595,98 @@ impl ShelluneView {
         );
         // The terminal's own tools follow in the same bar when there is a terminal.
         if has_terminal {
-            right.push(
+            pinned.push(
                 components::divider_vertical(metrics)
                     .h(metrics.scale(12.0))
                     .mx(metrics.scale(spacing::HAIRLINE))
                     .into_any_element(),
             );
         }
-        Some((left, right))
+        Some(SessionBarParts {
+            left,
+            controls: right,
+            pinned,
+        })
+    }
+
+    /// The session the bar under the terminal speaks for.
+    fn bar_session(&self) -> Option<SessionId> {
+        if self.workspace.layout().active_tab().is_some() {
+            self.workspace.layout().active_session()
+        } else {
+            self.active
+        }
+    }
+
+    /// Which controls the bar draws for session `id`, in the order it draws them,
+    /// besides its menu (R3).
+    ///
+    /// The bar and the session's menu both read this list: a control that a narrow bar
+    /// has no room for is offered in the menu instead (R9).
+    pub(super) fn session_bar_controls(&self, id: SessionId) -> Vec<BarControl> {
+        let Some(session) = self.workspace.session(id) else {
+            return Vec::new();
+        };
+        let status = crate::app::workspace::SessionStatus::of(session);
+        let card = self.connection_inline();
+        let can_reconnect = may_reconnect(session) && !card;
+        let unsaved = self.unsaved.iter().any(|(session, _)| *session == id);
+        let ended = status.phase().is_over();
+        let browsable =
+            self.allows(id, shellune_core::Capability::Files) && self.files.can_browse(id);
+        let has_terminal = self.pane_for(id).is_some() || self.desktop_for(id).is_some();
+        let mut controls = Vec::new();
+        if can_reconnect {
+            controls.push(BarControl::Reconnect);
+        }
+        if unsaved {
+            controls.push(BarControl::SaveHost);
+        }
+        if ended && !can_reconnect && !unsaved && !card {
+            controls.push(BarControl::Close);
+        }
+        if browsable {
+            controls.push(BarControl::Files);
+        }
+        if has_terminal && self.workspace.layout().active_pane().is_some() {
+            controls.extend([BarControl::SplitRight, BarControl::SplitDown]);
+        }
+        controls
+    }
+
+    /// The controls of session `id` that the bar under its terminal had no room for at
+    /// its last layout, which the session's menu offers instead (R3, R9).
+    pub(super) fn session_bar_hidden(&self, id: SessionId, cx: &App) -> Vec<BarControl> {
+        if self.bar_session() != Some(id) {
+            return Vec::new();
+        }
+        let Some(pane) = self.pane_for(id) else {
+            return Vec::new();
+        };
+        let hidden = pane.read(cx).bar_hidden_controls();
+        if hidden == 0 {
+            return Vec::new();
+        }
+        let controls = self.session_bar_controls(id);
+        let first = controls.len().saturating_sub(hidden);
+        controls[first..].to_vec()
+    }
+
+    /// The selectors of the bar controls of session `id` that its bar had no room for,
+    /// for a test.
+    #[cfg(test)]
+    pub fn session_bar_hidden_for_test(&self, id: SessionId, cx: &App) -> Vec<&'static str> {
+        self.session_bar_hidden(id, cx)
+            .into_iter()
+            .map(|control| match control {
+                BarControl::Reconnect => "session.reconnect",
+                BarControl::SaveHost => "session.save_host",
+                BarControl::Close => "session.close",
+                BarControl::Files => "session.files",
+                BarControl::SplitRight => "pane.split.right",
+                BarControl::SplitDown => "pane.split.down",
+            })
+            .collect()
     }
 
     /// The room the left half of [`Self::session_bar_parts`] needs before its target is
@@ -619,7 +737,11 @@ impl ShelluneView {
     /// The session bar on its own, for when no terminal is on screen to carry it: the
     /// file view, or a session that has no terminal (yet).
     pub(super) fn standalone_session_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let (left, right) = self.session_bar_parts(cx)?;
+        let SessionBarParts {
+            left,
+            controls,
+            pinned,
+        } = self.session_bar_parts(cx)?;
         let metrics = self.metrics();
         Some(
             div()
@@ -646,7 +768,8 @@ impl ShelluneView {
                         .flex_none()
                         .items_center()
                         .gap(metrics.scale(2.0))
-                        .children(right),
+                        .children(controls)
+                        .children(pinned),
                 ),
         )
     }
@@ -847,7 +970,7 @@ impl ShelluneView {
             "nav.hosts".to_owned(),
             selected,
             false,
-            self.tab_floor(),
+            self.tab_floor(cx),
             metrics,
         )
         // Pinned and always there, so it is only as wide as its word and count (up to

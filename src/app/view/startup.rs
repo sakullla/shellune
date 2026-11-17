@@ -16,8 +16,13 @@
 //! the minimise, maximise and close buttons answer, so a slow disk never leaves a
 //! window that cannot be moved or closed.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
+use std::time::Duration;
+
 use gpui::prelude::*;
-use gpui::{Animation, AnimationExt, AnyElement, Context, Div, SharedString, Window, div};
+use gpui::{Animation, AnimationExt, AnyElement, Context, Div, SharedString, Task, Window, div};
 
 use shellune_core::{ForwardBook, GroupBook, WorkspaceSnapshot};
 use shellune_storage::{
@@ -29,6 +34,11 @@ use crate::app::copy::Locale;
 use crate::app::product;
 use crate::app::theme::{self, Enter, Metrics, Motion, palette, spacing};
 use crate::app::workspace::Workspace;
+
+/// How long the start waits for the system's reduce-motion answer where it comes from
+/// a helper program (Linux), before it decides on its own whether to show the brand
+/// (R7). The window shows its bare floor meanwhile, as it does with reduced motion.
+pub const SYSTEM_MOTION_WAIT: Duration = Duration::from_millis(400);
 
 /// Where the window is in its start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +117,26 @@ impl ShelluneView {
         Self::launching_with(cx, workspace, store, trust, super::default_secrets())
     }
 
+    /// [`Self::launching_for_test`] on a system whose reduce-motion answer comes from a
+    /// helper program, the way Linux answers: `answer` is that program (R7).
+    #[cfg(test)]
+    pub fn launching_with_system_answer_for_test(
+        cx: &mut Context<Self>,
+        workspace: Workspace,
+        store: HostStore,
+        answer: Task<bool>,
+    ) -> Self {
+        let trust = TrustStore::at(store.root().to_path_buf());
+        Self::launching_with_answer(
+            cx,
+            workspace,
+            store,
+            trust,
+            super::default_secrets(),
+            Some(answer),
+        )
+    }
+
     fn launching_with(
         cx: &mut Context<Self>,
         workspace: Workspace,
@@ -114,14 +144,36 @@ impl ShelluneView {
         trust: TrustStore,
         secrets: std::sync::Arc<dyn shellune_storage::SecretStore>,
     ) -> Self {
+        // Where the answer comes from a helper program it is asked off the main
+        // thread, and the start waits for it before it decides on the brand.
+        let answer = theme::SYSTEM_MOTION_QUERY_BLOCKS.then(|| {
+            cx.background_executor()
+                .spawn(async { theme::system_reduces_motion() })
+        });
+        Self::launching_with_answer(cx, workspace, store, trust, secrets, answer)
+    }
+
+    fn launching_with_answer(
+        cx: &mut Context<Self>,
+        workspace: Workspace,
+        store: HostStore,
+        trust: TrustStore,
+        secrets: std::sync::Arc<dyn shellune_storage::SecretStore>,
+        answer: Option<Task<bool>>,
+    ) -> Self {
         let mut view = Self::assemble(cx, workspace, store, trust, secrets, true);
         view.restore_preferences(cx);
         view.relabel_fields(cx);
         // Whether the system asks for less motion decides whether there is a brand to
-        // show at all, so it is asked before the read can finish.
-        view.refresh_system_motion(cx);
+        // show at all, so it is known before the brand is drawn: asked inline where the
+        // system answers from memory, waited for (up to a limit) where it does not.
+        if answer.is_some() {
+            view.system_motion_pending = true;
+        } else {
+            view.refresh_system_motion(cx);
+        }
         view.startup = Startup::Splash;
-        view.read_stores_in_background(cx);
+        view.read_stores_in_background(answer, cx);
         view
     }
 
@@ -138,9 +190,18 @@ impl ShelluneView {
         self.splash_fading
     }
 
+    /// Whether the start is still waiting for the system's reduce-motion answer.
+    #[cfg(test)]
+    pub fn system_motion_pending(&self) -> bool {
+        self.system_motion_pending
+    }
+
     /// Reads every store on the background executor and adopts the result on the main
     /// thread, after the brand's entrance when there is one (R7).
-    fn read_stores_in_background(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// With a system `answer` still to come, the brand waits for it - no longer than
+    /// [`SYSTEM_MOTION_WAIT`] - and its entrance is timed from then.
+    fn read_stores_in_background(&mut self, answer: Option<Task<bool>>, cx: &mut Context<Self>) {
         let root = self.store.root().to_path_buf();
         let stores = StartupStores {
             hosts: self.store.clone(),
@@ -150,15 +211,45 @@ impl ShelluneView {
             layout: WorkspaceStore::at(root),
         };
         let read = cx.background_executor().spawn(async move { stores.read() });
-        // The entrance is timed from now, the moment before the first frame, so a read
+        // The entrance is timed from the moment the brand can first be drawn - now,
+        // before the first frame, unless the system's answer is awaited - so a read
         // that takes longer than the entrance adds nothing to it.
-        let entrance = cx.background_executor().timer(Motion::SLOW);
+        let early_entrance = answer
+            .is_none()
+            .then(|| cx.background_executor().timer(Motion::SLOW));
         cx.spawn(async move |this, cx| {
+            let mut entrance = early_entrance;
+            if let Some(mut answer) = answer {
+                let limit = cx.background_executor().timer(SYSTEM_MOTION_WAIT);
+                let reduces = Bounded {
+                    answer: &mut answer,
+                    limit,
+                }
+                .await;
+                let _ = this.update(cx, |view, cx| {
+                    view.system_motion_pending = false;
+                    if let Some(reduces) = reduces {
+                        view.apply_system_motion(reduces, cx);
+                    }
+                    cx.notify();
+                });
+                if reduces.is_none() {
+                    // An answer later than the limit still counts for every frame
+                    // after it.
+                    let late = this.clone();
+                    cx.spawn(async move |cx| {
+                        let reduces = answer.await;
+                        let _ = late.update(cx, |view, cx| view.apply_system_motion(reduces, cx));
+                    })
+                    .detach();
+                }
+                entrance = Some(cx.background_executor().timer(Motion::SLOW));
+            }
             let read = read.await;
             let animate = this
                 .read_with(cx, |view, _| view.effective_motion().allows_animation())
                 .unwrap_or(false);
-            if animate {
+            if animate && let Some(entrance) = entrance {
                 entrance.await;
             }
             let _ = this.update(cx, |view, cx| view.finish_startup(read, cx));
@@ -205,7 +296,7 @@ impl ShelluneView {
         if self.splash_held {
             return true;
         }
-        theme::motion_allowed()
+        !self.system_motion_pending && theme::motion_allowed()
     }
 
     /// Puts the window back on its start, held there for a still shot (R7).
@@ -295,6 +386,27 @@ impl ShelluneView {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+/// Waits for `answer`, but no longer than `limit`: `None` when the limit came first,
+/// and `answer` is left to finish on its own.
+struct Bounded<'a, A, L> {
+    answer: &'a mut A,
+    limit: L,
+}
+
+impl<A: Future + Unpin, L: Future + Unpin> Future for Bounded<'_, A, L> {
+    type Output = Option<A::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        if let Poll::Ready(value) = Pin::new(&mut *self.answer).poll(cx) {
+            return Poll::Ready(Some(value));
+        }
+        if Pin::new(&mut self.limit).poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
     }
 }
 

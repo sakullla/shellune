@@ -461,6 +461,29 @@ impl Tiling {
     }
 }
 
+/// The colour a new platform window is filled with before its first frame is drawn,
+/// as `0x00RRGGBB`. Black, the colour the window class always used, until it is set.
+static INITIAL_WINDOW_BACKGROUND: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x000000);
+
+/// Sets the colour new windows are filled with before their first frame is drawn.
+///
+/// Call it before opening a window, with the colour that window's first frame paints,
+/// so a light window does not open on a black flash. The alpha is ignored. On Windows
+/// it becomes the window class's background brush; other platforms keep their own
+/// behaviour.
+pub fn set_initial_window_background(color: crate::Rgba) {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let packed = (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b);
+    INITIAL_WINDOW_BACKGROUND.store(packed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The colour set with [`set_initial_window_background`], as `0x00RRGGBB`.
+#[allow(dead_code)]
+pub(crate) fn initial_window_background() -> u32 {
+    INITIAL_WINDOW_BACKGROUND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One rendered window frame read back from the GPU, top-down RGB.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameImage {

@@ -110,6 +110,8 @@ mod update;
 pub use desktop::{DesktopPhase, DesktopStage};
 #[cfg(test)]
 pub use shell::Tool;
+#[cfg(test)]
+pub use startup::SYSTEM_MOTION_WAIT;
 pub use titlebar::{custom_titlebar, traffic_light_position};
 
 /// Where one control of a file column was drawn (R4).
@@ -882,6 +884,10 @@ pub struct ShelluneView {
     startup: startup::Startup,
     /// Whether the brand is still fading out over the page that replaced it.
     splash_fading: bool,
+    /// Whether the start is still waiting for the system's reduce-motion answer, where
+    /// that answer comes from a helper program (Linux): the brand is not drawn until it
+    /// is known, so a system that asks for less motion never flashes it (R7).
+    system_motion_pending: bool,
     /// The capture's still splash: the brand drawn in its final place although a capture
     /// draws with reduced motion (R7).
     #[cfg(feature = "ui-capture")]
@@ -2679,6 +2685,7 @@ impl ShelluneView {
             desktop_fullscreen: None,
             startup: startup::Startup::Ready,
             splash_fading: false,
+            system_motion_pending: false,
             #[cfg(feature = "ui-capture")]
             splash_held: false,
             #[cfg(test)]
@@ -2730,12 +2737,7 @@ impl ShelluneView {
         self.keymap = keymap;
         self.keymap_problem = keymap_problem;
         crate::app::apply_keymap(cx, &self.keymap);
-        if let Some(choice) = saved.theme.as_deref().and_then(|value| match value {
-            "system" => Some(theme::ThemeChoice::System),
-            "light" => Some(theme::ThemeChoice::Light),
-            "dark" => Some(theme::ThemeChoice::Dark),
-            _ => None,
-        }) {
+        if let Some(choice) = saved.theme.as_deref().and_then(theme_choice_named) {
             self.theme_choice = choice;
         }
         if let Some(locale) = saved.language.as_deref().and_then(|value| match value {
@@ -12553,17 +12555,10 @@ impl ShelluneView {
                 // merely blank.
                 self.session_state_card(session.id())
             };
-            frame = frame.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .items_center()
-                    .justify_center()
-                    .p(metrics.scale(spacing::BASE))
-                    .child(self.entering_status_card(session.id(), notice)),
-            );
+            frame = frame.child(self.status_card_floor(
+                SharedString::from(format!("session.state.{:?}", session.id())),
+                self.entering_status_card(session.id(), notice),
+            ));
         }
         column.child(frame)
     }
@@ -17592,7 +17587,7 @@ impl ShelluneView {
             format!("session.tab.{index}"),
             selected,
             self.tab_divider(index),
-            self.tab_floor(),
+            self.tab_floor(cx),
             metrics,
         )
         .w(metrics.tab_max_width())
@@ -17713,8 +17708,13 @@ impl ShelluneView {
     ///
     /// A session with a terminal on screen opens onto the terminal itself, which paints
     /// the terminal scheme's background right under the head; every other page - the
-    /// hosts home, a connection being set up - opens onto [`PAGE_FLOOR`].
-    pub(super) fn tab_floor(&self) -> gpui::Rgba {
+    /// hosts home, a connection being set up - opens onto [`PAGE_FLOOR`]. A remote
+    /// desktop alone in its tab opens onto its own picture where the picture reaches the
+    /// head, so the tab takes the colour of the picture's top row under it.
+    pub(super) fn tab_floor(&self, cx: &gpui::App) -> gpui::Rgba {
+        if let Some(colour) = self.desktop_tab_floor(cx) {
+            return colour;
+        }
         let terminal = !self.home_is_shown()
             && self
                 .workspace
@@ -17727,6 +17727,37 @@ impl ShelluneView {
         } else {
             theme::swatch(PAGE_FLOOR)
         }
+    }
+
+    /// The colour of the remote picture right under the current tab, when a remote
+    /// desktop alone in its tab is what the tab opens onto (R2).
+    fn desktop_tab_floor(&self, cx: &gpui::App) -> Option<gpui::Rgba> {
+        if self.home_is_shown() || self.connection_inline() || !self.active_tab_is_solo() {
+            return None;
+        }
+        let layout = self.workspace.layout();
+        let id = layout.active_session()?;
+        if self.files.is_open(id) {
+            return None;
+        }
+        let desktop = self.desktop_for(id)?;
+        // Where the current tab stands in the strip, from the strip's last layout: a
+        // compact strip holds the current tab alone.
+        let current = layout
+            .active_tab_id()
+            .and_then(|current| layout.tabs().iter().position(|tab| tab.id() == current));
+        let item = if self.header_compact() {
+            Some(0)
+        } else {
+            current
+        };
+        let span = item
+            .and_then(|item| self.tab_scroll.bounds_for_item(item))
+            .map(|tab| {
+                let offset = self.tab_scroll.offset().x;
+                (tab.left() + offset, tab.right() + offset)
+            });
+        desktop.read(cx).top_edge_colour(span)
     }
 
     /// The label of one tab: the user's own name, or the session's title numbered
@@ -18931,7 +18962,7 @@ fn browser_tab(
             .border_l_1()
             .border_r_1()
             .border_color(theme::swatch(palette::BORDER))
-            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+            .text_color(text_on(floor))
     } else {
         tab.text_color(theme::swatch(palette::TEXT_SECONDARY))
             .hover(move |style| style.bg(hover).text_color(hover_text))
@@ -18947,6 +18978,37 @@ fn browser_tab(
                 .bg(theme::swatch(palette::BORDER_STRONG)),
         )
     })
+}
+
+/// The primary text colour that reads on `floor`, a colour that may come from outside
+/// the window's palette - a terminal scheme of the other palette, or a remote picture:
+/// the palette's own primary text where it reads better, the other palette's otherwise
+/// (R2).
+pub(super) fn text_on(floor: gpui::Rgba) -> gpui::Rgba {
+    fn luminance(color: gpui::Rgba) -> f32 {
+        let channel = |value: f32| {
+            if value <= 0.039_28 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+    }
+    let contrast = |text: gpui::Rgba| {
+        let (a, b) = (luminance(text), luminance(floor));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    };
+    let own = theme::swatch(palette::TEXT_PRIMARY);
+    let other = gpui::rgb(palette::TEXT_PRIMARY.value(match theme::appearance() {
+        theme::Appearance::Dark => theme::Appearance::Light,
+        theme::Appearance::Light => theme::Appearance::Dark,
+    }));
+    if contrast(other) > contrast(own) {
+        other
+    } else {
+        own
+    }
 }
 
 /// The clipped row between a tab's edge and its close button: the state dot, the
@@ -19458,6 +19520,29 @@ pub fn saved_zoom() -> theme::Zoom {
                 .find(|zoom| zoom_percent(*zoom) == percent)
         })
         .unwrap_or_default()
+}
+
+/// The theme the preferences file records, or the default when it records none.
+///
+/// Read before the window opens, so the window can be filled with its floor from the
+/// first moment instead of the platform's black (R7).
+pub fn saved_theme_choice() -> theme::ThemeChoice {
+    let (saved, _problem) = PreferencesStore::at(default_store().root()).load_reported();
+    saved
+        .theme
+        .as_deref()
+        .and_then(theme_choice_named)
+        .unwrap_or_default()
+}
+
+/// The theme choice the preferences file writes as `value`.
+fn theme_choice_named(value: &str) -> Option<theme::ThemeChoice> {
+    match value {
+        "system" => Some(theme::ThemeChoice::System),
+        "light" => Some(theme::ThemeChoice::Light),
+        "dark" => Some(theme::ThemeChoice::Dark),
+        _ => None,
+    }
 }
 
 /// A text size as the percent the preferences file records.

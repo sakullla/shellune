@@ -457,6 +457,8 @@ impl WindowsWindow {
         // so check the inner result first.
         let this = context.inner.take().unwrap()?;
         let hwnd = creation_result?;
+        // Before the window is shown, so its first fill is already the asked colour.
+        update_class_background(hwnd);
 
         register_drag_drop(&this)?;
         configure_dwm_dark_mode(hwnd, appearance);
@@ -1157,20 +1159,52 @@ enum WindowOpenState {
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("Zed::Window");
 
+/// The `0x00RRGGBB` colour the window class's background brush has now.
+static CLASS_BACKGROUND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A GDI colour, `0x00BBGGRR`, from `0x00RRGGBB`.
+fn colorref(rgb: u32) -> COLORREF {
+    COLORREF(((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff))
+}
+
 fn register_window_class(icon_handle: HICON) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        // The class brush is what the system fills a new window with before its first
+        // frame: the colour the application asked for, black until it asks.
+        let background = crate::platform::initial_window_background();
+        CLASS_BACKGROUND.store(background, std::sync::atomic::Ordering::Relaxed);
         let wc = WNDCLASSW {
             lpfnWndProc: Some(window_procedure),
             hIcon: icon_handle,
             lpszClassName: PCWSTR(WINDOW_CLASS_NAME.as_ptr()),
             style: CS_HREDRAW | CS_VREDRAW,
             hInstance: get_module_handle().into(),
-            hbrBackground: unsafe { CreateSolidBrush(COLORREF(0x00000000)) },
+            hbrBackground: unsafe { CreateSolidBrush(colorref(background)) },
             ..Default::default()
         };
         unsafe { RegisterClassW(&wc) };
     });
+}
+
+/// Gives the window class the background the application asks for now, when it asked
+/// for another one since the class was registered or last changed.
+///
+/// The class is registered once per process; a later window opened after the
+/// application changed its colour (a theme switch) would otherwise open on the first
+/// window's colour.
+fn update_class_background(hwnd: HWND) {
+    let wanted = crate::platform::initial_window_background();
+    let current = CLASS_BACKGROUND.swap(wanted, std::sync::atomic::Ordering::Relaxed);
+    if current == wanted {
+        return;
+    }
+    let brush = unsafe { CreateSolidBrush(colorref(wanted)) };
+    let previous = unsafe { SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush.0 as isize) };
+    if previous != 0 {
+        // The class no longer refers to the old brush; nothing else holds it.
+        let _ = unsafe { DeleteObject(HGDIOBJ(previous as *mut _)) };
+    }
 }
 
 unsafe extern "system" fn window_procedure(

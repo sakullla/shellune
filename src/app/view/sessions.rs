@@ -7,10 +7,11 @@
 
 use gpui::prelude::*;
 use gpui::{Context, Div, MouseButton, Pixels, Point, SharedString, Window, div, px};
-use shellune_core::{Session, SessionId, SessionKind, SessionState};
+use shellune_core::{Session, SessionId, SessionKind, SessionState, SplitAxis};
 
 use super::ShelluneView;
 use super::overlays::clamp_menu;
+use super::shell::BarControl;
 use crate::app::components;
 use crate::app::icons::Icon;
 use crate::app::theme::{self, palette, spacing};
@@ -401,6 +402,20 @@ impl ShelluneView {
         let more_than_one = self.workspace.layout().tabs().len() > 1;
 
         let mut menu = menu_card("session.more.menu", metrics);
+        // What a narrow bar had no room for comes first, in the bar's own order: the
+        // menu always stays on the bar, so every one of its controls is in reach (R3,
+        // R9). The bar's Close is the menu's own close further down.
+        let hidden: Vec<BarControl> = self
+            .session_bar_hidden(id, cx)
+            .into_iter()
+            .filter(|control| *control != BarControl::Close)
+            .collect();
+        for control in &hidden {
+            menu = menu.child(self.session_more_bar_entry(id, *control, cx));
+        }
+        if !hidden.is_empty() {
+            menu = menu.child(menu_divider(metrics));
+        }
         if !closed {
             menu = menu.child(
                 menu_entry(
@@ -497,6 +512,66 @@ impl ShelluneView {
             ),
         )
     }
+    /// The menu's entry for a control of the bar that the bar had no room for.
+    fn session_more_bar_entry(
+        &self,
+        id: SessionId,
+        control: BarControl,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let metrics = self.metrics();
+        let strings = self.strings();
+        let files_open = self.files.is_open(id);
+        let (label, selector, icon) = match control {
+            BarControl::Reconnect => (
+                strings.session_reconnect,
+                "session.more.reconnect",
+                Icon::Refresh,
+            ),
+            BarControl::SaveHost => (
+                strings.quick_save_host,
+                "session.more.save_host",
+                Icon::Server,
+            ),
+            BarControl::Close => (strings.session_close, "session.more.bar_close", Icon::Close),
+            BarControl::Files if files_open => (
+                crate::app::copy::ux().settings_terminal,
+                "session.more.terminal",
+                Icon::Terminal,
+            ),
+            BarControl::Files => (strings.files_open, "session.more.files", Icon::Folder),
+            BarControl::SplitRight => (
+                strings.pane_split_right,
+                "session.more.split_right",
+                Icon::SplitRight,
+            ),
+            BarControl::SplitDown => (
+                strings.pane_split_down,
+                "session.more.split_down",
+                Icon::SplitDown,
+            ),
+        };
+        menu_entry(label, selector, Some(icon), true, false, metrics).on_click(cx.listener(
+            move |this, _event, window, cx| {
+                this.close_session_more(window, cx);
+                match control {
+                    BarControl::Reconnect => this.reconnect_session(id, cx),
+                    BarControl::SaveHost => this.save_quick_host(id, cx),
+                    BarControl::Close => this.request_close_session(id, cx),
+                    BarControl::Files => {
+                        let open = this.files.is_open(id);
+                        this.toggle_files(id, cx);
+                        if open {
+                            this.reclaim_focus(window, cx);
+                        }
+                    }
+                    BarControl::SplitRight => this.split_active(SplitAxis::LeftRight, window, cx),
+                    BarControl::SplitDown => this.split_active(SplitAxis::TopBottom, window, cx),
+                }
+            },
+        ))
+    }
+
     /// The right-click handler of a session row.
     pub(super) fn session_row_menu_listener(
         &self,

@@ -530,12 +530,55 @@ impl ShelluneView {
 
     /// A status card with its entrance: it rises into place once each time it appears
     /// for a session, and is simply there when motion is reduced (R3).
+    ///
+    /// Every place a card is shown holds it in a box that scrolls once the card is
+    /// taller than the space it has, so the card keeps a press to itself but lets the
+    /// wheel through to that box: over the card is where the pointer is when the user
+    /// wants to read on (R3, R9).
     pub(super) fn entering_status_card(&self, id: SessionId, card: gpui::Div) -> gpui::AnyElement {
         crate::app::theme::enter(
-            card,
+            card.block_mouse_except_scroll(),
             SharedString::from(format!("session.status.enter.{id:?}")),
             crate::app::theme::Enter::Rise,
         )
+    }
+
+    /// A status card in the place of a terminal: centred on the terminal's floor while
+    /// it fits, and in a pane shorter than the card held in a box no taller than the
+    /// pane that scrolls from the card's headline down, so nothing of it is pushed out
+    /// above the pane where no scroll reaches it (R3, R9).
+    ///
+    /// The same structure as the card over an ended terminal
+    /// ([`crate::app::terminal::TerminalPane`]'s status overlay).
+    pub(super) fn status_card_floor(
+        &self,
+        scroll_id: SharedString,
+        card: gpui::AnyElement,
+    ) -> gpui::Div {
+        let metrics = self.metrics();
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .bg(theme::swatch(palette::CANVAS))
+            .debug_selector(|| "pane.state".to_owned())
+            .child(
+                div()
+                    .id(scroll_id)
+                    .debug_selector(|| "pane.state.scroll".to_owned())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .w_full()
+                    .min_h(px(0.0))
+                    .max_h_full()
+                    .overflow_y_scroll()
+                    .p(metrics.scale(spacing::BASE))
+                    .child(card),
+            )
     }
 
     /// The card of a session that has no terminal on screen and has not ended: it is
@@ -868,7 +911,6 @@ impl ShelluneView {
         _active_tree: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let metrics = self.metrics();
         let pane = leaf.id();
         let active = self.workspace.layout().active_pane() == Some(pane);
         let session = leaf.session();
@@ -923,10 +965,13 @@ impl ShelluneView {
         {
             // The pane the keys are in carries the session's half of the bar under its
             // grid; the others keep their own bar alone.
-            if active && let Some((left, right)) = self.session_bar_parts(cx) {
+            if active && let Some(parts) = self.session_bar_parts(cx) {
                 terminal.read(cx).set_session_slot(
-                    left.into_any_element(),
-                    right,
+                    crate::app::terminal::SessionSlot {
+                        left: parts.left.into_any_element(),
+                        controls: parts.controls,
+                        pinned: parts.pinned,
+                    },
                     self.session_left_floor(),
                 );
             }
@@ -945,20 +990,10 @@ impl ShelluneView {
                 .then(|| self.active_failure_notice(Some(id), cx))
                 .flatten()
                 .unwrap_or_else(|| self.session_state_card(id));
-            frame = frame.child(
-                div()
-                    .id(SharedString::from(format!("pane.state.{pane}")))
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .items_center()
-                    .justify_center()
-                    .overflow_y_scroll()
-                    .p(metrics.scale(spacing::BASE))
-                    .bg(theme::swatch(palette::CANVAS))
-                    .child(self.entering_status_card(id, card)),
-            );
+            frame = frame.child(self.status_card_floor(
+                SharedString::from(format!("pane.state.{pane}")),
+                self.entering_status_card(id, card),
+            ));
         }
         div()
             .flex()
@@ -1289,7 +1324,7 @@ impl ShelluneView {
             format!("session.tab.{index}"),
             selected,
             self.tab_divider(index),
-            self.tab_floor(),
+            self.tab_floor(cx),
             metrics,
         )
         .w(metrics.tab_max_width())
