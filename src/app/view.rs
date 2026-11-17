@@ -16501,9 +16501,15 @@ impl ShelluneView {
                             .child(SharedString::from(strings.files_marked_hint)),
                     ),
             );
+        // The group may shrink to the bar's width: a flex_none group keeps its one-line
+        // width and its own wrap never happens, so at 720x480 with 200% text the last
+        // actions ran past the bar and the window. Shrinking with no minimum lets the
+        // buttons wrap onto further lines inside the bar (R6, R9).
         let mut actions = div()
             .flex()
-            .flex_none()
+            .flex_shrink()
+            .min_w(px(0.0))
+            .max_w_full()
             .flex_wrap()
             .items_center()
             .gap(metrics.scale(spacing::HAIRLINE));

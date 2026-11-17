@@ -599,7 +599,7 @@ gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动�
 
 当前使用：对话框（`components::modal`）与命令面板用 Settle，关闭后遮罩淡出（`modal_scrim_exit`，命令面板与对话框
 走同一条路径）；toast 用 Fade；等待徽记与加载条用 BASE；会话状态卡用 Rise；右键与下拉菜单（标签、主机、文件、终端、
-新建标签下拉）用 Rise（`components::menu_enter`，锚定位置不变，只在锚定边上外边距微移）；
+新建标签下拉、输入框的 `field.menu`）用 Rise（`components::menu_enter`，锚定位置不变，只在锚定边上外边距微移）；
 首页卡片依次淡入（`components::enter_in_turn`，每次序晚 `TURN_DELAY` 40ms、淡入 BASE、只动透明度），
 首次使用卡片用 Rise。
 
@@ -757,7 +757,9 @@ resize 都按同一条 recount 路径重新计数，视口停在读者原处，�
 
 外观（R6）：右键菜单是共享的 `menu_card` + `menu_entry`（删除为危险项）；行首的标记方框是共享的 `checkbox_box`
 （整格 24×24 指针目标，悬停整格时方框变 accent 边）；多选横幅是一行：左边"已选 N 项"与操作说明（可换行，不再被
-省略成"…"），右边四个动作按钮并排，栏太窄时整组换到下一行，而不是每个按钮各占一整行；读取失败是共享的 `card`，
+省略成"…"），右边四个动作按钮并排，栏太窄时整组换到下一行，整组仍放不下时按钮在栏内继续逐个折行（动作组可收缩到栏宽、
+不设最小宽度；`flex_none` 的整组会保持单行宽度而冲出栏的右边，720×480 @200% 时测试断言每个动作都在栏内与窗口内），
+而不是每个按钮各占一整行；读取失败是共享的 `card`，
 头部是危险色调的图标块与一句"无法读取此目录"；SCP 问题里"递归复制"是共享的勾选框（仍是键盘停靠点，焦点环不挪位）。
 **行内问题仍留在栏内**（新建文件夹、改名、删除、上传 / 下载确认）：它是该栏键盘停靠序列的一部分（`files_question_stops`），
 只挡住自己那一栏，另一栏与终端照常可用；改成全窗口的 `modal` 会改变这两条交互语义（R6 要求不变），所以它保留
@@ -1469,13 +1471,11 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 对话框外壳或菜单卡片。
 
 **迁移进度（地基任务之后）。** 已迁到组件：三处勾选框、`view/shell.rs` 的对话框外壳、会话行菜单与 toast。
-以下仍是手写外观（已换成新令牌与层级，但未用共享组件），由后续界面任务替换，替换完成后删去对应条目：
-
-- 菜单卡片：`text_field.rs` 的 `field.menu`（输入框的剪切 / 复制 / 粘贴菜单）仍是手写卡片（已用 raised + 强边 + Mid
-  令牌）。它在 `text_field.rs`，不在其余界面任务（T7）的改动范围内，留待下一次触及输入框时迁到 `menu_card`。
+已无手写的勾选框、对话框外壳或菜单卡片。
 
 其余界面任务（T7）完成的迁移：命令面板外壳改用 `dialog_surface`（与 `modal` 同一个表面）并进入 Settle、关闭后遮罩
-淡出；主机菜单、标签菜单、`terminal.menu`、`files.menu` 与 `shell.picker` 改用 `menu_card` / `menu_entry` /
+淡出；主机菜单、标签菜单、`terminal.menu`、`files.menu`、`shell.picker` 与输入框的 `field.menu`（`text_field.rs`，
+剪切 / 复制 / 粘贴 / 全选）改用 `menu_card` / `menu_entry` /
 `menu_divider` / `menu_section` / `menu_shortcut`，进入用 Rise；分组对话框底部改用 `modal_footer`，"删除分组"为 Danger；
 文件列表的标记方框与 SCP 的"递归复制"改用共享勾选框；端口转发的空状态改用 `empty_state`，规则行与编辑表单改用 `card`；
 远程桌面的控件条、状态卡片、提示条与证书卡片见 1.4；串口条的回显 / 换行 / 刷新改为紧凑按钮，分隔用 `divider_vertical`。
@@ -1494,7 +1494,7 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 | `card` | 内容分组：surface + 弱边 + 圆角 10 + Low，内边距 16 |
 | `status_card(tone, emblem, title, detail)` | 叠在终端上的会话状态卡：raised + 强边 + 圆角 14 + Mid，最宽 440，色调徽记块 36 + 标题 + 一行说明；吃掉指针，动作由调用方追加，进入时 Rise |
 | `row` / `row_with_state` + `stacked` | 列表行：surface 底，悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
-| `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单（尚未迁移的见上）：raised + 强边 + 圆角 10 + Mid；条目 30 高，标签占满剩余宽度，禁用项保留位置，危险项悬停为 danger tint |
+| `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单：raised + 强边 + 圆角 10 + Mid；条目 30 高，标签占满剩余宽度，禁用项保留位置，危险项悬停为 danger tint |
 | `menu_shortcut` / `menu_section` / `menu_enter` | 条目尾部的当前生效快捷键（caption、muted，右对齐）；菜单内分组小标题；菜单进入动画（Rise，减少动效时直接画出） |
 | `floating_bar` | 浮在画面或页面上的控件条：raised + 强边 + 圆角 10 + Mid，吃掉指针；远程桌面的缩放与全屏 |
 | `dialog_surface` | 对话框级表面：overlay + 强边 + 圆角 14 + High，裁切到圆角；`modal` 的卡片与命令面板共用 |

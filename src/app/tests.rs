@@ -33100,3 +33100,73 @@ async fn the_selection_bar_lays_its_actions_in_a_row_inside_it(cx: &mut TestAppC
         );
     }
 }
+
+#[gpui::test]
+async fn the_selection_bar_wraps_its_actions_inside_it_at_720x480_and_200_percent(
+    cx: &mut TestAppContext,
+) {
+    // At the minimum window and the largest text the four actions are wider than the
+    // column. The group has to wrap inside the bar rather than run past its right edge
+    // and out of the window (R6, R9). The rows are marked in the design window, where
+    // they are on screen, and the bar is measured after the window shrinks.
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let _ = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[
+            ("a.txt", shellune_core::FileKind::File),
+            ("b.txt", shellune_core::FileKind::File),
+        ],
+    );
+    for mark in [
+        "files.mark.0",
+        "files.mark.1",
+        "files.local.mark.0",
+        "files.local.mark.1",
+    ] {
+        click(cx, mark);
+    }
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    let viewport = minimum_window();
+    let columns: [(&'static str, [&'static str; 4]); 2] = [
+        (
+            "files.selection",
+            [
+                "files.mark.download",
+                "files.mark.copy",
+                "files.mark.delete",
+                "files.mark.clear",
+            ],
+        ),
+        (
+            "files.local.selection",
+            [
+                "files.local.mark.upload",
+                "files.local.mark.copy",
+                "files.local.mark.delete",
+                "files.local.mark.clear",
+            ],
+        ),
+    ];
+    for (bar_selector, actions) in columns {
+        let bar = bounds_of(cx, bar_selector);
+        assert_within_width(bar, viewport, bar_selector);
+        for selector in actions {
+            let bounds = bounds_of(cx, selector);
+            assert!(
+                bounds.left() >= bar.left() - px(0.5)
+                    && bounds.right() <= bar.right() + px(0.5)
+                    && bounds.top() >= bar.top() - px(0.5)
+                    && bounds.bottom() <= bar.bottom() + px(0.5),
+                "{selector} is inside the bar: {bounds:?} in {bar:?}"
+            );
+            assert_within_width(bounds, viewport, selector);
+        }
+    }
+}
