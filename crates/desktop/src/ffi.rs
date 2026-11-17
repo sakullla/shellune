@@ -8,7 +8,11 @@
 
 use std::os::raw::{c_char, c_void};
 
-pub const SD_ABI_VERSION: u32 = 1;
+pub const SD_ABI_VERSION: u32 = 2;
+
+pub const SD_MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+pub const SD_MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+pub const SD_MAX_CLIPBOARD_ENTRIES: usize = 3;
 
 pub const SD_OK: i32 = 0;
 pub const SD_ERR_ARGUMENT: i32 = 1;
@@ -37,6 +41,23 @@ pub const SD_EVENT_STATE: u32 = 0;
 pub const SD_EVENT_FRAME: u32 = 1;
 pub const SD_EVENT_CERTIFICATE: u32 = 2;
 pub const SD_EVENT_CLIPBOARD: u32 = 3;
+pub const SD_EVENT_NOTICE: u32 = 4;
+
+pub const SD_CLIPBOARD_TEXT_UTF8: u32 = 1;
+pub const SD_CLIPBOARD_IMAGE_PNG: u32 = 2;
+pub const SD_CLIPBOARD_IMAGE_DIB: u32 = 3;
+
+pub const SD_NOTICE_CLIPBOARD_REFUSED: u32 = 1;
+pub const SD_NOTICE_CLIPBOARD_LATIN1_ONLY: u32 = 2;
+pub const SD_NOTICE_CLIPBOARD_TOO_LARGE: u32 = 3;
+pub const SD_NOTICE_DRIVE_UNAVAILABLE: u32 = 4;
+
+pub const SD_PROBE_UTF8_TO_CF_UNICODE: i32 = 1;
+pub const SD_PROBE_CF_UNICODE_TO_UTF8: i32 = 2;
+pub const SD_PROBE_UTF8_TO_LATIN1: i32 = 3;
+pub const SD_PROBE_LATIN1_TO_UTF8: i32 = 4;
+pub const SD_PROBE_STEP_FORMAT_LIST: u32 = 1;
+pub const SD_PROBE_STEP_RESPONSE: u32 = 2;
 
 pub const SD_STATE_IDLE: u32 = 0;
 pub const SD_STATE_CONNECTING: u32 = 1;
@@ -68,6 +89,27 @@ pub struct sd_event {
     pub w: i32,
     pub h: i32,
     pub pixels: *const u8,
+    pub entries: *const sd_clipboard_entry,
+    pub entry_count: u32,
+    pub notice: u32,
+}
+
+#[repr(C)]
+pub struct sd_clipboard_entry {
+    pub kind: u32,
+    pub len: u32,
+    pub bytes: *const u8,
+}
+
+#[repr(C)]
+pub struct sd_probe_step {
+    pub kind: u32,
+    pub count: u32,
+    pub ids: *const u32,
+    pub names: *const *const c_char,
+    pub ok: i32,
+    pub len: u32,
+    pub data: *const u8,
 }
 
 /// Opaque in the header; the crate never looks inside.
@@ -116,7 +158,44 @@ unsafe extern "C" {
         extended: i32,
     ) -> i32;
     pub fn sd_client_pointer(client: *mut sd_client, x: u16, y: u16, buttons: u32) -> i32;
-    pub fn sd_client_clipboard(client: *mut sd_client, utf8: *const c_char) -> i32;
+    pub fn sd_client_set_clipboard(client: *mut sd_client, enabled: i32) -> i32;
+    pub fn sd_client_set_drive(
+        client: *mut sd_client,
+        name: *const c_char,
+        path: *const c_char,
+    ) -> i32;
+    pub fn sd_client_clipboard_set(
+        client: *mut sd_client,
+        entries: *const sd_clipboard_entry,
+        count: u32,
+    ) -> i32;
     pub fn sd_client_detach(client: *mut sd_client);
     pub fn sd_client_free(client: *mut sd_client) -> i32;
+
+    pub fn sd_probe_rdp_select(
+        ids: *const u32,
+        names: *const *const c_char,
+        count: u32,
+        out_ids: *mut u32,
+        out_kinds: *mut u32,
+        out_count: *mut u32,
+    ) -> i32;
+    pub fn sd_probe_rdp_fetch(
+        steps: *const sd_probe_step,
+        step_count: u32,
+        requested: *mut u32,
+        requested_cap: u32,
+        requested_count: *mut u32,
+        callback: sd_event_fn,
+        user: *mut c_void,
+    ) -> i32;
+    pub fn sd_probe_text(
+        conversion: i32,
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        written: *mut usize,
+    ) -> i32;
+    pub fn sd_probe_rdp_settings(client: *mut sd_client, out: *mut c_char, cap: usize) -> i32;
 }

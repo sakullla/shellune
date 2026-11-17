@@ -45,6 +45,10 @@ typedef struct sd_vnc_session {
   SOCKET sock;
   int32_t connected;
   int32_t limit_hit;
+  /* Clipboard sharing for this attempt, copied from the configuration once. */
+  int32_t clipboard;
+  /* SD_NOTICE_CLIPBOARD_LATIN1_ONLY is reported once per session. */
+  int32_t latin1_reported;
   /* LibVNCClient never frees the application-owned framebuffer, even when
    * rfbInitClient frees its own rfbClient on a failed handshake. */
   uint8_t *framebuffer;
@@ -111,11 +115,47 @@ static void sd_vnc_frame(rfbClient *rfb, int x, int y, int w, int h) {
                 width, height);
 }
 
+/* Hands one remote text to the consumer, taking `utf8`. Text over the bound is
+ * skipped and reported rather than cut, because a cut text is a different text. */
+static void sd_vnc_emit_text(sd_vnc_session *session, uint8_t *utf8, size_t len) {
+  if (utf8 == NULL) return;
+  if (len == 0) {
+    free(utf8);
+    return;
+  }
+  if (len > SD_MAX_CLIPBOARD_BYTES) {
+    free(utf8);
+    sd_emit_notice(session->client, SD_NOTICE_CLIPBOARD_TOO_LARGE);
+    return;
+  }
+  sd_clip_set set;
+  memset(&set, 0, sizeof(set));
+  sd_clip_set_add(&set, SD_CLIPBOARD_TEXT_UTF8, utf8, (uint32_t)len);
+  sd_emit_clipboard(session->client, &set);
+  sd_clip_set_clear(&set);
+}
+
+/* The original RFB cut text: ISO 8859-1 by definition. */
 static void sd_vnc_cut_text(rfbClient *rfb, const char *text, int len) {
   sd_vnc_session *session = sd_vnc_of(rfb);
-  if (session == NULL || text == NULL || len <= 0) return;
-  if ((uint32_t)len > SD_MAX_CLIPBOARD_BYTES) len = (int)SD_MAX_CLIPBOARD_BYTES;
-  sd_emit_clipboard(session->client, text, (uint32_t)len);
+  if (session == NULL || !session->clipboard || text == NULL || len <= 0) return;
+  size_t out_len = 0;
+  uint8_t *utf8 = sd_clip_latin1_to_utf8((const uint8_t *)text, (size_t)len, &out_len);
+  sd_vnc_emit_text(session, utf8, out_len);
+}
+
+/* Extended clipboard text: UTF-8, normally sent with a terminating NUL. */
+static void sd_vnc_cut_text_utf8(rfbClient *rfb, const char *text, int len) {
+  sd_vnc_session *session = sd_vnc_of(rfb);
+  if (session == NULL || !session->clipboard || text == NULL || len <= 0) return;
+  size_t size = (size_t)len;
+  while (size > 0 && text[size - 1] == '\0') size--;
+  if (size == 0) return;
+  uint8_t *copy = (uint8_t *)malloc(size + 1);
+  if (copy == NULL) return;
+  memcpy(copy, text, size);
+  copy[size] = 0;
+  sd_vnc_emit_text(session, copy, size);
 }
 
 static rfbBool sd_vnc_malloc_framebuffer(rfbClient *rfb) {
@@ -351,6 +391,7 @@ void sd_vnc_run(sd_client *client) {
   port = client->port != 0 ? client->port : 5900;
   mask = client->vnc_mask;
   bytes_per_pixel = client->vnc_bytes_per_pixel;
+  session->clipboard = client->clipboard_enabled;
   LeaveCriticalSection(&client->lock);
 
   if (host == NULL) {
@@ -405,7 +446,13 @@ void sd_vnc_run(sd_client *client) {
   rfb->canHandleNewFBSize = TRUE;
   rfb->MallocFrameBuffer = sd_vnc_malloc_framebuffer;
   rfb->GotFrameBufferUpdate = sd_vnc_frame;
-  rfb->GotXCutText = sd_vnc_cut_text;
+  /* With sharing off neither callback exists: LibVNCClient then drops server cut
+   * text and does not offer the extended clipboard encoding. Setting the UTF-8 one
+   * is what makes it ask for the extended clipboard. */
+  if (session->clipboard) {
+    rfb->GotXCutText = sd_vnc_cut_text;
+    rfb->GotXCutTextUTF8 = sd_vnc_cut_text_utf8;
+  }
   rfb->GetCredential = sd_vnc_credential;
   rfb->GetPassword = sd_vnc_password;
   /* Only encodings this integration actually decodes end to end are requested. */
@@ -604,10 +651,35 @@ void sd_vnc_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t buttons)
   }
 }
 
-void sd_vnc_clipboard(sd_client *client, const char *utf8, uint32_t len) {
-  rfbClient *rfb = sd_vnc_live(client, NULL);
-  if (rfb == NULL || utf8 == NULL || len == 0) return;
-  SendClientCutText(rfb, (char *)utf8, (int)len);
+void sd_vnc_clipboard(sd_client *client, sd_clip_set *set) {
+  sd_vnc_session *session = NULL;
+  rfbClient *rfb = sd_vnc_live(client, &session);
+  /* RFB carries text only; image entries are not forwarded. */
+  const sd_clip_item *text = sd_clip_set_find(set, SD_CLIPBOARD_TEXT_UTF8);
+  if (rfb == NULL || session == NULL || !session->clipboard || text == NULL ||
+      text->len == 0) {
+    sd_clip_set_free(set);
+    return;
+  }
+  if (rfb->extendedClipboardServerCapabilities != 0) {
+    /* The server announced the extended clipboard: UTF-8 as is. */
+    SendClientCutTextUTF8(rfb, (char *)text->bytes, (int)text->len);
+  } else {
+    /* Plain RFB cut text is Latin-1. Text that does not fit is not sent at all:
+     * a server would otherwise paste mojibake. */
+    size_t latin1_len = 0;
+    uint8_t *latin1 = sd_clip_utf8_to_latin1(text->bytes, text->len, &latin1_len);
+    if (latin1 == NULL) {
+      if (!session->latin1_reported) {
+        session->latin1_reported = 1;
+        sd_emit_notice(client, SD_NOTICE_CLIPBOARD_LATIN1_ONLY);
+      }
+    } else {
+      if (latin1_len > 0) SendClientCutText(rfb, (char *)latin1, (int)latin1_len);
+      free(latin1);
+    }
+  }
+  sd_clip_set_free(set);
 }
 
 sd_status sd_vnc_available(char *out, size_t cap) {
@@ -631,7 +703,7 @@ sd_status sd_vnc_available(char *out, size_t cap) {
 #endif
   int written = snprintf(out, cap,
                          "libvncclient=%s tls=%s security=%s "
-                         "encodings=raw,copyrect,rre,hextile,zrle",
+                         "encodings=raw,copyrect,rre,hextile,zrle clipboard=text",
                          LIBVNCSERVER_VERSION, tls, security);
   if (written < 0) return SD_ERR_INTERNAL;
   if ((size_t)written >= cap) return SD_ERR_ARGUMENT;

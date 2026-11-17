@@ -22,11 +22,14 @@
 #define SD_ASSERT_LAYOUT(condition, name) \
   typedef char sd_layout_##name[(condition) ? 1 : -1]
 
-SD_ASSERT_LAYOUT(sizeof(sd_event) == 120, event_size);
+SD_ASSERT_LAYOUT(sizeof(sd_event) == 136, event_size);
 SD_ASSERT_LAYOUT(offsetof(sd_event, abi_version) == 0, event_abi_version);
 SD_ASSERT_LAYOUT(offsetof(sd_event, text) == 32, event_text);
 SD_ASSERT_LAYOUT(offsetof(sd_event, host) == 48, event_host);
 SD_ASSERT_LAYOUT(offsetof(sd_event, pixels) == 112, event_pixels);
+SD_ASSERT_LAYOUT(offsetof(sd_event, entries) == 120, event_entries);
+SD_ASSERT_LAYOUT(offsetof(sd_event, notice) == 132, event_notice);
+SD_ASSERT_LAYOUT(sizeof(sd_clipboard_entry) == 16, clipboard_entry_size);
 
 /* How long a certificate question may stay unanswered before the worker gives up
  * and rejects. The UI is expected to answer or cancel; this only bounds a leak. */
@@ -158,19 +161,20 @@ void sd_backend_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t butt
 #endif
 }
 
-void sd_backend_clipboard(sd_client *client, const char *utf8, uint32_t len) {
+void sd_backend_clipboard(sd_client *client, sd_clip_set *set) {
 #if defined(SD_WITH_RDP)
   if (client->proto == SD_PROTOCOL_RDP) {
-    sd_rdp_clipboard(client, utf8, len);
+    sd_rdp_clipboard(client, set);
     return;
   }
 #endif
 #if defined(SD_WITH_VNC)
   if (client->proto == SD_PROTOCOL_VNC) {
-    sd_vnc_clipboard(client, utf8, len);
+    sd_vnc_clipboard(client, set);
     return;
   }
 #endif
+  sd_clip_set_free(set);
 }
 #endif /* any backend */
 
@@ -230,15 +234,29 @@ void sd_emit_frame(sd_client *client, int32_t x, int32_t y, int32_t w, int32_t h
   sd_dispatch(client, &event);
 }
 
-void sd_emit_clipboard(sd_client *client, const char *text, uint32_t len) {
-  if (text == NULL) return;
-  if (len > SD_MAX_CLIPBOARD_BYTES) len = SD_MAX_CLIPBOARD_BYTES;
+void sd_emit_clipboard(sd_client *client, const sd_clip_set *set) {
+  if (set == NULL || set->count == 0) return;
+  /* The backends already skip oversized entries; sd_clip_entries is the last line. */
+  sd_clipboard_entry entries[SD_MAX_CLIPBOARD_ENTRIES];
+  uint32_t count = sd_clip_entries(set, entries);
+  if (count == 0) return;
   sd_event event;
   memset(&event, 0, sizeof(event));
   event.kind = SD_EVENT_CLIPBOARD;
   event.state = SD_STATE_CONNECTED;
-  event.text = text;
-  event.text_len = len;
+  event.entries = entries;
+  event.entry_count = count;
+  sd_dispatch(client, &event);
+}
+
+void sd_emit_notice(sd_client *client, uint32_t notice) {
+  sd_event event;
+  memset(&event, 0, sizeof(event));
+  event.kind = SD_EVENT_NOTICE;
+  EnterCriticalSection(&client->lock);
+  event.state = (uint32_t)client->state;
+  LeaveCriticalSection(&client->lock);
+  event.notice = notice;
   sd_dispatch(client, &event);
 }
 
@@ -345,15 +363,12 @@ int32_t sd_pop_input(sd_client *client, sd_input_event *out) {
   return have;
 }
 
-char *sd_take_clipboard(sd_client *client, uint32_t *len) {
-  char *text = NULL;
+sd_clip_set *sd_take_clipboard(sd_client *client) {
   EnterCriticalSection(&client->input_lock);
-  text = client->clipboard_text;
-  client->clipboard_text = NULL;
-  *len = client->clipboard_len;
-  client->clipboard_len = 0;
+  sd_clip_set *set = client->clipboard_pending;
+  client->clipboard_pending = NULL;
   LeaveCriticalSection(&client->input_lock);
-  return text;
+  return set;
 }
 
 void sd_flush_input(sd_client *client) {
@@ -365,12 +380,8 @@ void sd_flush_input(sd_client *client) {
       sd_backend_pointer(client, event.x, event.y, event.buttons);
     }
   }
-  uint32_t len = 0;
-  char *text = sd_take_clipboard(client, &len);
-  if (text != NULL) {
-    sd_backend_clipboard(client, text, len);
-    free(text);
-  }
+  sd_clip_set *set = sd_take_clipboard(client);
+  if (set != NULL) sd_backend_clipboard(client, set);
 }
 
 /* Releasing a pressed key when the picture loses focus is a UI decision, but the
@@ -390,10 +401,14 @@ static void sd_clear_config(sd_client *client) {
   free(client->username);
   free(client->password);
   free(client->domain);
+  free(client->drive_name);
+  free(client->drive_path);
   client->host = NULL;
   client->username = NULL;
   client->password = NULL;
   client->domain = NULL;
+  client->drive_name = NULL;
+  client->drive_path = NULL;
 }
 
 sd_status sd_client_new(int32_t proto, sd_event_fn fn, void *user, sd_client **out) {
@@ -410,6 +425,7 @@ sd_status sd_client_new(int32_t proto, sd_event_fn fn, void *user, sd_client **o
   client->state = SD_STATE_IDLE;
   client->vnc_mask = SD_VNC_SECURITY_DEFAULT;
   client->vnc_bytes_per_pixel = 4;
+  client->clipboard_enabled = 1;
   client->width = 1024;
   client->height = 768;
   InitializeCriticalSection(&client->lock);
@@ -545,6 +561,74 @@ sd_status sd_client_set_vnc_colour_depth(sd_client *client, uint32_t bytes_per_p
   return SD_OK;
 }
 
+sd_status sd_client_set_clipboard(sd_client *client, int32_t enabled) {
+  if (client == NULL) return SD_ERR_ARGUMENT;
+  EnterCriticalSection(&client->lock);
+  int32_t state = client->state;
+  if (state == SD_STATE_CONNECTING || state == SD_STATE_CONNECTED ||
+      state == SD_STATE_CLOSING) {
+    LeaveCriticalSection(&client->lock);
+    return SD_ERR_STATE;
+  }
+  client->clipboard_enabled = enabled ? 1 : 0;
+  LeaveCriticalSection(&client->lock);
+  return SD_OK;
+}
+
+/* Control characters have no place in a drive name or a path. */
+static int32_t sd_has_control(const char *text) {
+  for (const unsigned char *at = (const unsigned char *)text; *at != 0; at++) {
+    if (*at < 0x20 || *at == 0x7F) return 1;
+  }
+  return 0;
+}
+
+sd_status sd_client_set_drive(sd_client *client, const char *name, const char *path) {
+  if (client == NULL) return SD_ERR_ARGUMENT;
+  int32_t clear = path == NULL || path[0] == 0;
+  if (!clear) {
+    if (name == NULL || name[0] == 0 || strlen(name) > 64 || sd_has_control(name) ||
+        strlen(path) > 4096 || sd_has_control(path) ||
+        !sd_clip_utf8_valid((const uint8_t *)name, strlen(name)) ||
+        !sd_clip_utf8_valid((const uint8_t *)path, strlen(path))) {
+      return SD_ERR_ARGUMENT;
+    }
+  }
+  char *name_copy = clear ? NULL : sd_strdup(name);
+  char *path_copy = clear ? NULL : sd_strdup(path);
+  if (!clear && (name_copy == NULL || path_copy == NULL)) {
+    free(name_copy);
+    free(path_copy);
+    return SD_ERR_INTERNAL;
+  }
+  EnterCriticalSection(&client->lock);
+  int32_t state = client->state;
+  if (state == SD_STATE_CONNECTING || state == SD_STATE_CONNECTED ||
+      state == SD_STATE_CLOSING) {
+    LeaveCriticalSection(&client->lock);
+    free(name_copy);
+    free(path_copy);
+    return SD_ERR_STATE;
+  }
+  free(client->drive_name);
+  free(client->drive_path);
+  client->drive_name = name_copy;
+  client->drive_path = path_copy;
+  LeaveCriticalSection(&client->lock);
+  return SD_OK;
+}
+
+sd_status sd_probe_rdp_settings(sd_client *client, char *out, size_t cap) {
+  if (client == NULL || out == NULL || cap == 0) return SD_ERR_ARGUMENT;
+  out[0] = 0;
+#if defined(SD_WITH_RDP)
+  if (client->proto != SD_PROTOCOL_RDP) return SD_ERR_ARGUMENT;
+  return sd_rdp_probe_settings(client, out, cap);
+#else
+  return SD_ERR_UNAVAILABLE;
+#endif
+}
+
 sd_status sd_client_connect(sd_client *client) {
   if (client == NULL) return SD_ERR_ARGUMENT;
   char info[256];
@@ -574,9 +658,8 @@ sd_status sd_client_connect(sd_client *client) {
   InterlockedExchange(&client->cancel, 0);
   EnterCriticalSection(&client->input_lock);
   client->input_head = client->input_count = client->queued_buttons = 0;
-  free(client->clipboard_text);
-  client->clipboard_text = NULL;
-  client->clipboard_len = 0;
+  sd_clip_set_free(client->clipboard_pending);
+  client->clipboard_pending = NULL;
   LeaveCriticalSection(&client->input_lock);
   InterlockedExchange(&client->cert_answer, 0);
   /* `running` is raised before the CONNECTING event so a consumer that reacts to
@@ -718,33 +801,42 @@ sd_status sd_client_pointer(sd_client *client, uint16_t x, uint16_t y,
   return sd_queue(client, &event);
 }
 
-sd_status sd_client_clipboard(sd_client *client, const char *utf8) {
-  if (client == NULL || utf8 == NULL) return SD_ERR_ARGUMENT;
-  /* The RDP backend does not forward client clipboard text: FreeRDP's clipboard
-   * channel is not loaded, so sd_rdp_clipboard is a no-op. Saying so here is the
-   * only way a caller can tell "queued" from "dropped"; a silent SD_OK followed by
-   * a discarded event is not a reportable outcome. The check comes before the
-   * state check so an idle RDP handle answers the same way. */
-  if (client->proto == SD_PROTOCOL_RDP) return SD_ERR_UNAVAILABLE;
-  size_t len = strlen(utf8);
-  if (len > SD_MAX_CLIPBOARD_BYTES) return SD_ERR_ARGUMENT;
-  char *copy = (char *)malloc(len + 1);
-  if (copy == NULL) return SD_ERR_INTERNAL;
-  memcpy(copy, utf8, len + 1);
-
+sd_status sd_client_clipboard_set(sd_client *client, const sd_clipboard_entry *entries,
+                                  uint32_t count) {
+  if (client == NULL) return SD_ERR_ARGUMENT;
+  sd_status valid = sd_clip_validate(entries, count);
+  if (valid != SD_OK) return valid;
+  /* A connection with sharing turned off neither sends nor receives. Saying so here
+   * is the only way a caller can tell "queued" from "dropped"; a silent SD_OK
+   * followed by a discarded group is not a reportable outcome. It comes before the
+   * state check so an idle handle answers the same way. */
   EnterCriticalSection(&client->lock);
+  int32_t enabled = client->clipboard_enabled;
   int32_t state = client->state;
   LeaveCriticalSection(&client->lock);
-  if (state != SD_STATE_CONNECTED) {
-    free(copy);
-    return SD_ERR_STATE;
-  }
+  if (!enabled) return SD_ERR_UNAVAILABLE;
+  if (state != SD_STATE_CONNECTED) return SD_ERR_STATE;
+
+  /* Copied outside both locks: an image may be tens of megabytes. */
+  sd_clip_set *copy = sd_clip_set_copy(entries, count);
+  if (copy == NULL) return SD_ERR_INTERNAL;
   EnterCriticalSection(&client->input_lock);
-  free(client->clipboard_text);
-  client->clipboard_text = copy;
-  client->clipboard_len = (uint32_t)len;
+  sd_clip_set *stale = client->clipboard_pending;
+  client->clipboard_pending = copy;
   LeaveCriticalSection(&client->input_lock);
+  sd_clip_set_free(stale);
   return SD_OK;
+}
+
+sd_status sd_client_clipboard(sd_client *client, const char *utf8) {
+  if (client == NULL || utf8 == NULL) return SD_ERR_ARGUMENT;
+  size_t len = strlen(utf8);
+  if (len > SD_MAX_CLIPBOARD_BYTES) return SD_ERR_ARGUMENT;
+  sd_clipboard_entry entry;
+  entry.kind = SD_CLIPBOARD_TEXT_UTF8;
+  entry.len = (uint32_t)len;
+  entry.bytes = (const uint8_t *)utf8;
+  return sd_client_clipboard_set(client, &entry, 1);
 }
 
 void sd_client_detach(sd_client *client) {
@@ -788,7 +880,7 @@ sd_status sd_client_free(sd_client *client) {
   free(client->cert_subject);
   free(client->cert_issuer);
   free(client->cert_fingerprint);
-  free(client->clipboard_text);
+  sd_clip_set_free(client->clipboard_pending);
   if (client->cert_signal != NULL) CloseHandle(client->cert_signal);
   if (client->backend_idle != NULL) CloseHandle(client->backend_idle);
   DeleteCriticalSection(&client->input_lock);

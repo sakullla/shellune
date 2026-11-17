@@ -37,6 +37,14 @@ pub use ffi::SD_ABI_VERSION;
 /// Largest frame this crate accepts from the shim, matching the C header.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// Largest clipboard text, in UTF-8 bytes, either direction.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = ffi::SD_MAX_CLIPBOARD_BYTES;
+/// Largest clipboard image entry, either direction.
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = ffi::SD_MAX_CLIPBOARD_IMAGE_BYTES;
+
+/// The drive name a mapped local folder gets on the RDP server.
+pub const DRIVE_NAME: &str = "Shellune";
+
 /// How long `Drop` waits for a worker to exit before giving up.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(15_000);
 
@@ -201,6 +209,128 @@ impl State {
     }
 }
 
+/// What one clipboard entry holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClipboardKind {
+    /// UTF-8 text.
+    Text,
+    /// A complete PNG file.
+    Png,
+    /// A packed DIB: a BITMAPINFOHEADER (or a V5 header) followed by the bits, as
+    /// Windows' CF_DIB / CF_DIBV5 carry it.
+    Dib,
+}
+
+impl ClipboardKind {
+    fn raw(self) -> u32 {
+        match self {
+            ClipboardKind::Text => ffi::SD_CLIPBOARD_TEXT_UTF8,
+            ClipboardKind::Png => ffi::SD_CLIPBOARD_IMAGE_PNG,
+            ClipboardKind::Dib => ffi::SD_CLIPBOARD_IMAGE_DIB,
+        }
+    }
+
+    fn from_raw(raw: u32) -> Option<ClipboardKind> {
+        match raw {
+            ffi::SD_CLIPBOARD_TEXT_UTF8 => Some(ClipboardKind::Text),
+            ffi::SD_CLIPBOARD_IMAGE_PNG => Some(ClipboardKind::Png),
+            ffi::SD_CLIPBOARD_IMAGE_DIB => Some(ClipboardKind::Dib),
+            _ => None,
+        }
+    }
+
+    /// The largest entry of this kind the shim accepts or delivers.
+    pub fn bound(self) -> usize {
+        match self {
+            ClipboardKind::Text => MAX_CLIPBOARD_TEXT_BYTES,
+            ClipboardKind::Png | ClipboardKind::Dib => MAX_CLIPBOARD_IMAGE_BYTES,
+        }
+    }
+}
+
+/// One format of one clipboard copy. A group holds each kind at most once.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClipboardEntry {
+    pub kind: ClipboardKind,
+    pub bytes: Vec<u8>,
+}
+
+impl ClipboardEntry {
+    pub fn text(text: &str) -> ClipboardEntry {
+        ClipboardEntry {
+            kind: ClipboardKind::Text,
+            bytes: text.as_bytes().to_vec(),
+        }
+    }
+
+    pub fn png(bytes: Vec<u8>) -> ClipboardEntry {
+        ClipboardEntry {
+            kind: ClipboardKind::Png,
+            bytes,
+        }
+    }
+
+    pub fn dib(bytes: Vec<u8>) -> ClipboardEntry {
+        ClipboardEntry {
+            kind: ClipboardKind::Dib,
+            bytes,
+        }
+    }
+
+    /// The text of a text entry. Entries from a peer are already valid UTF-8.
+    pub fn as_text(&self) -> Option<&str> {
+        match self.kind {
+            ClipboardKind::Text => std::str::from_utf8(&self.bytes).ok(),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for ClipboardEntry {
+    // Images are megabytes; the bytes themselves are never useful in a log.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.as_text() {
+            Some(text) if text.len() <= 64 => f
+                .debug_struct("ClipboardEntry")
+                .field("kind", &self.kind)
+                .field("text", &text)
+                .finish(),
+            _ => f
+                .debug_struct("ClipboardEntry")
+                .field("kind", &self.kind)
+                .field("len", &self.bytes.len())
+                .finish(),
+        }
+    }
+}
+
+/// Something the user should know that is not a state change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Notice {
+    /// The server did not open, or refused, the clipboard channel.
+    ClipboardRefused,
+    /// The VNC server has no extended clipboard and the text had characters outside
+    /// Latin-1, so it was not sent.
+    ClipboardLatin1Only,
+    /// A remote clipboard entry exceeded its bound and was skipped.
+    ClipboardTooLarge,
+    /// The mapped folder is missing or unreadable; the session connected without it.
+    DriveUnavailable,
+    Unknown(u32),
+}
+
+impl Notice {
+    fn from_raw(raw: u32) -> Notice {
+        match raw {
+            ffi::SD_NOTICE_CLIPBOARD_REFUSED => Notice::ClipboardRefused,
+            ffi::SD_NOTICE_CLIPBOARD_LATIN1_ONLY => Notice::ClipboardLatin1Only,
+            ffi::SD_NOTICE_CLIPBOARD_TOO_LARGE => Notice::ClipboardTooLarge,
+            ffi::SD_NOTICE_DRIVE_UNAVAILABLE => Notice::DriveUnavailable,
+            other => Notice::Unknown(other),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// The session's main state changed. `reason` is the shim's own text: it is
@@ -232,9 +362,12 @@ pub enum Event {
         fingerprint: String,
         flags: u32,
     },
-    /// The peer put text on its clipboard. Bytes that are not UTF-8 are replaced,
+    /// The peer copied something: every format of that one copy that could be
+    /// fetched, each kind at most once. Text bytes that were not UTF-8 are replaced,
     /// so the text may differ from what the peer sent.
-    Clipboard { text: String },
+    Clipboard { entries: Vec<ClipboardEntry> },
+    /// Worth telling the user; the session state is unchanged.
+    Notice { notice: Notice },
 }
 
 #[derive(Debug)]
@@ -474,6 +607,34 @@ impl DesktopClient {
         status(unsafe { ffi::sd_client_set_vnc_colour_depth(self.handle, bytes_per_pixel) })
     }
 
+    /// Clipboard sharing for the next attempt; on unless turned off. Off means
+    /// nothing is received and nothing is sent, and [`DesktopClient::push_clipboard`]
+    /// answers [`Error::Unavailable`].
+    pub fn set_clipboard(&mut self, enabled: bool) -> Result<(), Error> {
+        status(unsafe { ffi::sd_client_set_clipboard(self.handle, i32::from(enabled)) })
+    }
+
+    /// A local folder the RDP server sees as the drive `name` (normally
+    /// [`DRIVE_NAME`]); `None` maps nothing. A folder that is missing or unreadable
+    /// when the attempt starts is left out and reported as
+    /// [`Notice::DriveUnavailable`]; the session still connects. VNC ignores it.
+    pub fn set_drive(&mut self, name: &str, path: Option<&str>) -> Result<(), Error> {
+        let name = CString::new(name).map_err(|_| Error::Argument)?;
+        let path = path
+            .filter(|path| !path.is_empty())
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| Error::Argument)?;
+        status(unsafe {
+            ffi::sd_client_set_drive(
+                self.handle,
+                name.as_ptr(),
+                path.as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+            )
+        })
+    }
+
     pub fn connect(&mut self) -> Result<(), Error> {
         let code = unsafe { ffi::sd_client_connect(self.handle) };
         if code == ffi::SD_OK {
@@ -528,20 +689,49 @@ impl DesktopClient {
         status(unsafe { ffi::sd_client_pointer(self.handle, x, y, buttons.0) })
     }
 
-    /// Submits clipboard text for the remote side.
-    ///
-    /// Only VNC forwards it: the RDP integration loads no clipboard channel, so an
-    /// RDP session reports [`Error::Unavailable`] here rather than accepting text
-    /// the shim would drop.
-    pub fn clipboard(&self, text: &str) -> Result<(), Error> {
-        let text = CString::new(text).map_err(|_| Error::Argument)?;
-        match unsafe { ffi::sd_client_clipboard(self.handle, text.as_ptr()) } {
-            ffi::SD_OK => Ok(()),
-            ffi::SD_ERR_UNAVAILABLE => Err(Error::Unavailable(
-                "this backend does not forward clipboard text".to_string(),
-            )),
-            other => status(other),
+    /// Offers the local clipboard to the remote side, replacing whatever was offered
+    /// before; the newest call wins. Each kind may appear once, text up to
+    /// [`MAX_CLIPBOARD_TEXT_BYTES`] and an image up to [`MAX_CLIPBOARD_IMAGE_BYTES`];
+    /// anything else is [`Error::Argument`]. RDP offers every entry, VNC only the
+    /// text. A connection with sharing off answers [`Error::Unavailable`].
+    pub fn push_clipboard(&self, entries: &[ClipboardEntry]) -> Result<(), Error> {
+        if entries.len() > ffi::SD_MAX_CLIPBOARD_ENTRIES {
+            return Err(Error::Argument);
         }
+        let mut raw = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.bytes.len() > entry.kind.bound() {
+                return Err(Error::Argument);
+            }
+            raw.push(ffi::sd_clipboard_entry {
+                kind: entry.kind.raw(),
+                len: entry.bytes.len() as u32,
+                bytes: entry.bytes.as_ptr(),
+            });
+        }
+        let code =
+            unsafe { ffi::sd_client_clipboard_set(self.handle, raw.as_ptr(), raw.len() as u32) };
+        clipboard_status(code)
+    }
+
+    /// Offers clipboard text alone; shorthand for [`DesktopClient::push_clipboard`]
+    /// with one text entry.
+    pub fn clipboard(&self, text: &str) -> Result<(), Error> {
+        self.push_clipboard(&[ClipboardEntry::text(text)])
+    }
+
+    /// Describes the FreeRDP settings an attempt with this configuration would use,
+    /// as `key=value` words. Diagnostic: it proves the clipboard and drive options
+    /// reach FreeRDP without a server. RDP builds only.
+    #[doc(hidden)]
+    pub fn describe_rdp_settings(&self) -> Result<String, Error> {
+        let mut buffer = [0 as c_char; 1024];
+        let code =
+            unsafe { ffi::sd_probe_rdp_settings(self.handle, buffer.as_mut_ptr(), buffer.len()) };
+        status(code)?;
+        Ok(unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
     }
 
     /// Blocks until an event arrives or `timeout` passes. Only a session created
@@ -634,6 +824,58 @@ extern "C" fn dispatch(user: *mut c_void, event: *const ffi::sd_event) {
     }
 }
 
+fn clipboard_status(code: i32) -> Result<(), Error> {
+    match code {
+        ffi::SD_ERR_UNAVAILABLE => Err(Error::Unavailable(
+            "clipboard sharing is turned off for this connection".to_string(),
+        )),
+        other => status(other),
+    }
+}
+
+/// Copies one clipboard group out of the shim. Entries over their bound, of an
+/// unknown kind or repeated are dropped here as well as in C.
+fn clipboard_entries(event: &ffi::sd_event) -> Option<Vec<ClipboardEntry>> {
+    if event.entries.is_null() || event.entry_count == 0 {
+        return None;
+    }
+    let count = (event.entry_count as usize).min(ffi::SD_MAX_CLIPBOARD_ENTRIES);
+    let raw = unsafe { std::slice::from_raw_parts(event.entries, count) };
+    let mut entries: Vec<ClipboardEntry> = Vec::with_capacity(count);
+    for entry in raw {
+        let Some(kind) = ClipboardKind::from_raw(entry.kind) else {
+            continue;
+        };
+        let len = entry.len as usize;
+        if len > kind.bound()
+            || (len > 0 && entry.bytes.is_null())
+            || entries.iter().any(|seen| seen.kind == kind)
+        {
+            continue;
+        }
+        let bytes = if len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(entry.bytes, len) }.to_vec()
+        };
+        let bytes = match kind {
+            ClipboardKind::Text => match String::from_utf8(bytes) {
+                Ok(text) => text.into_bytes(),
+                Err(error) => String::from_utf8_lossy(error.as_bytes())
+                    .into_owned()
+                    .into_bytes(),
+            },
+            _ => bytes,
+        };
+        entries.push(ClipboardEntry { kind, bytes });
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
 fn text(ptr: *const c_char, len: u32) -> String {
     if ptr.is_null() || len == 0 {
         return String::new();
@@ -662,8 +904,11 @@ unsafe fn translate(event: &ffi::sd_event) -> Option<Event> {
             detail: event.detail,
             reason: text(event.text, event.text_len),
         }),
-        ffi::SD_EVENT_CLIPBOARD => Some(Event::Clipboard {
-            text: text(event.text, event.text_len),
+        ffi::SD_EVENT_CLIPBOARD => {
+            clipboard_entries(event).map(|entries| Event::Clipboard { entries })
+        }
+        ffi::SD_EVENT_NOTICE => Some(Event::Notice {
+            notice: Notice::from_raw(event.notice),
         }),
         ffi::SD_EVENT_CERTIFICATE => Some(Event::Certificate {
             request_id: event.request_id,
@@ -729,15 +974,198 @@ pub fn status_name(code: i32) -> String {
 }
 
 /// The numbers the C header promises, so the test can prove both sides agree.
-/// Returns (size of sd_event, offset of text, offset of host, offset of pixels).
+/// Returns (size of sd_event, offset of text, offset of host, offset of pixels,
+/// offset of entries, offset of notice, size of sd_clipboard_entry).
 #[doc(hidden)]
-pub fn abi_layout() -> [usize; 4] {
+pub fn abi_layout() -> [usize; 7] {
     [
         std::mem::size_of::<ffi::sd_event>(),
         std::mem::offset_of!(ffi::sd_event, text),
         std::mem::offset_of!(ffi::sd_event, host),
         std::mem::offset_of!(ffi::sd_event, pixels),
+        std::mem::offset_of!(ffi::sd_event, entries),
+        std::mem::offset_of!(ffi::sd_event, notice),
+        std::mem::size_of::<ffi::sd_clipboard_entry>(),
     ]
+}
+
+/// Runs single pieces of the shim's clipboard handling without a session or a
+/// server, through the probes in the C header. These are the functions the
+/// backends call, not copies of them; they exist so tests can prove the RDP format
+/// choice, the fetch sequence and the text encodings on a machine with no server.
+#[doc(hidden)]
+pub mod probe {
+    use super::{ClipboardKind, Event, ffi, translate};
+    use std::ffi::{CString, c_void};
+    use std::os::raw::c_char;
+
+    /// One server-to-client message of a scripted RDP clipboard exchange.
+    pub enum Step<'a> {
+        /// A format list: (format id, registered name).
+        FormatList(&'a [(u32, Option<&'a str>)]),
+        /// The answer to the request in flight; `None` is CB_RESPONSE_FAIL.
+        Response(Option<&'a [u8]>),
+    }
+
+    struct Names {
+        _owned: Vec<Option<CString>>,
+        pointers: Vec<*const c_char>,
+        ids: Vec<u32>,
+    }
+
+    fn names(formats: &[(u32, Option<&str>)]) -> Names {
+        let owned: Vec<Option<CString>> = formats
+            .iter()
+            .map(|(_, name)| name.and_then(|name| CString::new(name).ok()))
+            .collect();
+        let pointers = owned
+            .iter()
+            .map(|name| name.as_ref().map_or(std::ptr::null(), |name| name.as_ptr()))
+            .collect();
+        Names {
+            _owned: owned,
+            pointers,
+            ids: formats.iter().map(|(id, _)| *id).collect(),
+        }
+    }
+
+    /// The formats an RDP format list is fetched as, in request order.
+    pub fn rdp_select(formats: &[(u32, Option<&str>)]) -> Vec<(u32, ClipboardKind)> {
+        let list = names(formats);
+        let mut ids = [0u32; 2];
+        let mut kinds = [0u32; 2];
+        let mut count = 0u32;
+        let code = unsafe {
+            ffi::sd_probe_rdp_select(
+                list.ids.as_ptr(),
+                list.pointers.as_ptr(),
+                list.ids.len() as u32,
+                ids.as_mut_ptr(),
+                kinds.as_mut_ptr(),
+                &mut count,
+            )
+        };
+        assert_eq!(code, ffi::SD_OK, "sd_probe_rdp_select");
+        (0..count.min(2) as usize)
+            .filter_map(|i| ClipboardKind::from_raw(kinds[i]).map(|kind| (ids[i], kind)))
+            .collect()
+    }
+
+    extern "C" fn collect(user: *mut c_void, event: *const ffi::sd_event) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if user.is_null() || event.is_null() {
+                return;
+            }
+            let events = unsafe { &mut *(user as *mut Vec<Event>) };
+            if let Some(event) = unsafe { translate(&*event) } {
+                events.push(event);
+            }
+        }));
+    }
+
+    /// Plays the steps through the RDP fetch sequence. Returns every format id the
+    /// client would request, in order, and the events a session would deliver.
+    pub fn rdp_fetch(steps: &[Step<'_>]) -> (Vec<u32>, Vec<Event>) {
+        let lists: Vec<Option<Names>> = steps
+            .iter()
+            .map(|step| match step {
+                Step::FormatList(formats) => Some(names(formats)),
+                Step::Response(_) => None,
+            })
+            .collect();
+        let raw: Vec<ffi::sd_probe_step> = steps
+            .iter()
+            .zip(&lists)
+            .map(|(step, list)| match (step, list) {
+                (Step::FormatList(_), Some(list)) => ffi::sd_probe_step {
+                    kind: ffi::SD_PROBE_STEP_FORMAT_LIST,
+                    count: list.ids.len() as u32,
+                    ids: list.ids.as_ptr(),
+                    names: list.pointers.as_ptr(),
+                    ok: 0,
+                    len: 0,
+                    data: std::ptr::null(),
+                },
+                (Step::Response(answer), _) => ffi::sd_probe_step {
+                    kind: ffi::SD_PROBE_STEP_RESPONSE,
+                    count: 0,
+                    ids: std::ptr::null(),
+                    names: std::ptr::null(),
+                    ok: i32::from(answer.is_some()),
+                    len: answer.map_or(0, |data| data.len() as u32),
+                    data: answer.map_or(std::ptr::null(), |data| data.as_ptr()),
+                },
+                (Step::FormatList(_), None) => unreachable!("every list has its names"),
+            })
+            .collect();
+        let mut requested = vec![0u32; steps.len() * 2 + 2];
+        let mut count = 0u32;
+        let mut events: Vec<Event> = Vec::new();
+        let code = unsafe {
+            ffi::sd_probe_rdp_fetch(
+                raw.as_ptr(),
+                raw.len() as u32,
+                requested.as_mut_ptr(),
+                requested.len() as u32,
+                &mut count,
+                collect,
+                &mut events as *mut Vec<Event> as *mut c_void,
+            )
+        };
+        assert_eq!(code, ffi::SD_OK, "sd_probe_rdp_fetch");
+        requested.truncate((count as usize).min(requested.len()));
+        (requested, events)
+    }
+
+    fn convert(conversion: i32, input: &[u8]) -> Option<Vec<u8>> {
+        let mut needed = 0usize;
+        let code = unsafe {
+            ffi::sd_probe_text(
+                conversion,
+                input.as_ptr(),
+                input.len(),
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        if code != ffi::SD_OK {
+            return None;
+        }
+        let mut out = vec![0u8; needed];
+        let mut written = 0usize;
+        let code = unsafe {
+            ffi::sd_probe_text(
+                conversion,
+                input.as_ptr(),
+                input.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                &mut written,
+            )
+        };
+        (code == ffi::SD_OK && written == needed).then_some(out)
+    }
+
+    /// UTF-8 as RDP's CF_UNICODETEXT: UTF-16LE, CRLF line ends, NUL terminated.
+    pub fn utf8_to_cf_unicode(text: &str) -> Vec<u8> {
+        convert(ffi::SD_PROBE_UTF8_TO_CF_UNICODE, text.as_bytes()).unwrap_or_default()
+    }
+
+    /// CF_UNICODETEXT bytes back to UTF-8, up to the first NUL.
+    pub fn cf_unicode_to_utf8(bytes: &[u8]) -> Option<Vec<u8>> {
+        convert(ffi::SD_PROBE_CF_UNICODE_TO_UTF8, bytes)
+    }
+
+    /// UTF-8 as RFB Latin-1, or `None` when a character does not fit.
+    pub fn utf8_to_latin1(text: &str) -> Option<Vec<u8>> {
+        convert(ffi::SD_PROBE_UTF8_TO_LATIN1, text.as_bytes())
+    }
+
+    /// RFB Latin-1 as UTF-8.
+    pub fn latin1_to_utf8(bytes: &[u8]) -> Option<Vec<u8>> {
+        convert(ffi::SD_PROBE_LATIN1_TO_UTF8, bytes)
+    }
 }
 
 /// The shim's own name for a session state, for diagnostics only.

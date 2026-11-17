@@ -1236,7 +1236,7 @@ impl DesktopLink for NativeLink {
         self.client
             .track_state()
             .into_iter()
-            .map(native_event)
+            .filter_map(native_event)
             .collect()
     }
 
@@ -1310,8 +1310,8 @@ fn native_error(error: shellune_desktop::Error) -> LinkError {
     }
 }
 
-fn native_event(event: shellune_desktop::Event) -> LinkEvent {
-    match event {
+fn native_event(event: shellune_desktop::Event) -> Option<LinkEvent> {
+    Some(match event {
         shellune_desktop::Event::State {
             state,
             failure,
@@ -1364,8 +1364,16 @@ fn native_event(event: shellune_desktop::Event) -> LinkEvent {
             fingerprint,
             flags,
         },
-        shellune_desktop::Event::Clipboard { text } => LinkEvent::Clipboard { text },
-    }
+        // Only the text entry reaches the pane for now; images and notices are
+        // ignored until the pane handles them.
+        shellune_desktop::Event::Clipboard { entries } => LinkEvent::Clipboard {
+            text: entries
+                .iter()
+                .find_map(|entry| entry.as_text())?
+                .to_string(),
+        },
+        shellune_desktop::Event::Notice { .. } => return None,
+    })
 }
 
 fn native_failure(failure: shellune_desktop::Failure) -> LinkFailure {

@@ -7,6 +7,11 @@
  * The client is created through FreeRDP's client entry points rather than freerdp_new
  * alone: the entry points install the client-common context, which is what creates the
  * bitmap cache gdi_init asserts on and which loads the channels this client needs.
+ *
+ * Clipboard: the cliprdr channel calls back on its own thread, not the worker. Its
+ * state (the channel interface, the local group offered to the server and the fetch
+ * of the remote one) lives behind `clip_lock`, which is never held while an event is
+ * dispatched. The worker reaches the same state when the UI pushes a local group.
  */
 #ifdef SD_WITH_RDP
 #define WIN32_LEAN_AND_MEAN
@@ -24,6 +29,11 @@
 #include <freerdp/client.h>
 #include <freerdp/codec/color.h>
 #include <freerdp/client/channels.h>
+#include <freerdp/channels/channels.h>
+#include <freerdp/client/cliprdr.h>
+#include <freerdp/client/cmdline.h>
+#include <freerdp/channels/cliprdr.h>
+#include <freerdp/event.h>
 #include <freerdp/version.h>
 #include <winpr/version.h>
 #include <winpr/wlog.h>
@@ -31,6 +41,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* How long after the session is up the clipboard channel may take to say it is ready
+ * before a waiting push is reported as refused. */
+#define SD_RDP_CLIPBOARD_GRACE_MS 10000u
 
 typedef struct sd_rdp_session {
   sd_client *client;
@@ -40,6 +54,20 @@ typedef struct sd_rdp_session {
   uint32_t buttons;
   int32_t certificate_rejected;
   int32_t limit_hit;
+  /* Clipboard sharing for this attempt, copied from the configuration once. */
+  int32_t clipboard;
+
+  /* Everything below is shared with the cliprdr channel thread, under clip_lock. */
+  CRITICAL_SECTION clip_lock;
+  CliprdrClientContext *cliprdr; /* NULL until the channel is connected */
+  int32_t clip_ready;            /* the server sent Monitor Ready */
+  int32_t clip_waiting;          /* a local group waits for the channel */
+  int32_t clip_refused;          /* SD_NOTICE_CLIPBOARD_REFUSED was reported */
+  ULONGLONG connected_at;
+  sd_clip_set *local;            /* what this client offers the server */
+  uint8_t *local_unicode;        /* its text as CF_UNICODETEXT */
+  size_t local_unicode_len;
+  sd_clip_fetch fetch;           /* the remote copy being fetched */
 } sd_rdp_session;
 
 /* The entry points let FreeRDP allocate a context of this size, so the session can be
@@ -199,6 +227,346 @@ static BOOL sd_rdp_post_connect(freerdp *instance) {
   return TRUE;
 }
 
+/* ---- clipboard channel ---------------------------------------------------- */
+
+static sd_rdp_session *sd_rdp_clip_session(CliprdrClientContext *cliprdr) {
+  return cliprdr != NULL ? (sd_rdp_session *)cliprdr->custom : NULL;
+}
+
+/* Announces the local group. Called with clip_lock held. */
+static void sd_rdp_clip_announce(sd_rdp_session *session) {
+  CliprdrClientContext *cliprdr = session->cliprdr;
+  if (cliprdr == NULL || cliprdr->ClientFormatList == NULL) return;
+  CLIPRDR_FORMAT formats[SD_MAX_CLIPBOARD_ENTRIES];
+  UINT32 count = 0;
+  memset(formats, 0, sizeof(formats));
+  if (session->local != NULL) {
+    if (session->local_unicode != NULL &&
+        sd_clip_set_find(session->local, SD_CLIPBOARD_TEXT_UTF8) != NULL) {
+      formats[count++].formatId = SD_CF_UNICODETEXT;
+    }
+    if (sd_clip_set_find(session->local, SD_CLIPBOARD_IMAGE_PNG) != NULL) {
+      formats[count].formatId = SD_CF_LOCAL_PNG;
+      formats[count++].formatName = (char *)"PNG";
+    }
+    if (sd_clip_set_find(session->local, SD_CLIPBOARD_IMAGE_DIB) != NULL) {
+      formats[count++].formatId = SD_CF_DIB;
+    }
+  }
+  CLIPRDR_FORMAT_LIST list;
+  memset(&list, 0, sizeof(list));
+  list.common.msgType = CB_FORMAT_LIST;
+  list.numFormats = count;
+  list.formats = count > 0 ? formats : NULL;
+  (void)cliprdr->ClientFormatList(cliprdr, &list);
+}
+
+/* Asks for one format of the remote copy. Called with clip_lock held. */
+static void sd_rdp_clip_request(sd_rdp_session *session, uint32_t format_id) {
+  CliprdrClientContext *cliprdr = session->cliprdr;
+  if (format_id == 0 || cliprdr == NULL || cliprdr->ClientFormatDataRequest == NULL) return;
+  CLIPRDR_FORMAT_DATA_REQUEST request;
+  memset(&request, 0, sizeof(request));
+  request.common.msgType = CB_FORMAT_DATA_REQUEST;
+  request.requestedFormatId = format_id;
+  if (cliprdr->ClientFormatDataRequest(cliprdr, &request) != CHANNEL_RC_OK) {
+    /* No answer will come for a request that was never sent. */
+    sd_clip_fetch_reset(&session->fetch);
+  }
+}
+
+static UINT sd_rdp_clip_server_capabilities(CliprdrClientContext *cliprdr,
+                                            const CLIPRDR_CAPABILITIES *capabilities) {
+  (void)cliprdr;
+  (void)capabilities;
+  return CHANNEL_RC_OK;
+}
+
+static UINT sd_rdp_clip_monitor_ready(CliprdrClientContext *cliprdr,
+                                      const CLIPRDR_MONITOR_READY *ready) {
+  (void)ready;
+  sd_rdp_session *session = sd_rdp_clip_session(cliprdr);
+  if (session == NULL) return CHANNEL_RC_OK;
+  CLIPRDR_GENERAL_CAPABILITY_SET general;
+  memset(&general, 0, sizeof(general));
+  general.capabilitySetType = CB_CAPSTYPE_GENERAL;
+  general.capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN;
+  general.version = CB_CAPS_VERSION_2;
+  general.generalFlags = CB_USE_LONG_FORMAT_NAMES;
+  CLIPRDR_CAPABILITIES capabilities;
+  memset(&capabilities, 0, sizeof(capabilities));
+  capabilities.common.msgType = CB_CLIP_CAPS;
+  capabilities.cCapabilitiesSets = 1;
+  capabilities.capabilitySets = (CLIPRDR_CAPABILITY_SET *)&general;
+
+  EnterCriticalSection(&session->clip_lock);
+  if (cliprdr->ClientCapabilities != NULL) {
+    (void)cliprdr->ClientCapabilities(cliprdr, &capabilities);
+  }
+  session->clip_ready = 1;
+  session->clip_waiting = 0;
+  /* Always announce, even an empty group: the protocol expects a format list after
+   * Monitor Ready, and an empty one tells the server this side has nothing yet. */
+  sd_rdp_clip_announce(session);
+  LeaveCriticalSection(&session->clip_lock);
+  return CHANNEL_RC_OK;
+}
+
+static UINT sd_rdp_clip_server_format_list(CliprdrClientContext *cliprdr,
+                                           const CLIPRDR_FORMAT_LIST *list) {
+  sd_rdp_session *session = sd_rdp_clip_session(cliprdr);
+  if (session == NULL || list == NULL) return CHANNEL_RC_OK;
+  uint32_t count = list->formats != NULL ? list->numFormats : 0;
+  uint32_t *ids = NULL;
+  const char **names = NULL;
+  if (count > 0) {
+    ids = (uint32_t *)calloc(count, sizeof(uint32_t));
+    names = (const char **)calloc(count, sizeof(const char *));
+    if (ids == NULL || names == NULL) count = 0;
+    for (uint32_t i = 0; i < count; i++) {
+      ids[i] = list->formats[i].formatId;
+      names[i] = list->formats[i].formatName;
+    }
+  }
+  EnterCriticalSection(&session->clip_lock);
+  if (cliprdr->ClientFormatListResponse != NULL) {
+    CLIPRDR_FORMAT_LIST_RESPONSE response;
+    memset(&response, 0, sizeof(response));
+    response.common.msgType = CB_FORMAT_LIST_RESPONSE;
+    response.common.msgFlags = CB_RESPONSE_OK;
+    (void)cliprdr->ClientFormatListResponse(cliprdr, &response);
+  }
+  uint32_t first = sd_clip_fetch_on_list(&session->fetch, ids, names, count);
+  sd_rdp_clip_request(session, first);
+  LeaveCriticalSection(&session->clip_lock);
+  free(ids);
+  free(names);
+  return CHANNEL_RC_OK;
+}
+
+static UINT sd_rdp_clip_server_format_list_response(
+    CliprdrClientContext *cliprdr, const CLIPRDR_FORMAT_LIST_RESPONSE *response) {
+  sd_rdp_session *session = sd_rdp_clip_session(cliprdr);
+  if (session == NULL || response == NULL) return CHANNEL_RC_OK;
+  if ((response->common.msgFlags & CB_RESPONSE_FAIL) == 0) return CHANNEL_RC_OK;
+  int32_t notify = 0;
+  EnterCriticalSection(&session->clip_lock);
+  if (!session->clip_refused) {
+    session->clip_refused = 1;
+    notify = 1;
+  }
+  LeaveCriticalSection(&session->clip_lock);
+  if (notify) sd_emit_notice(session->client, SD_NOTICE_CLIPBOARD_REFUSED);
+  return CHANNEL_RC_OK;
+}
+
+static UINT sd_rdp_clip_server_data_request(CliprdrClientContext *cliprdr,
+                                            const CLIPRDR_FORMAT_DATA_REQUEST *request) {
+  sd_rdp_session *session = sd_rdp_clip_session(cliprdr);
+  if (session == NULL || request == NULL) return CHANNEL_RC_OK;
+  EnterCriticalSection(&session->clip_lock);
+  const uint8_t *data = NULL;
+  size_t len = 0;
+  const sd_clip_item *item = NULL;
+  switch (request->requestedFormatId) {
+    case SD_CF_UNICODETEXT:
+      if (session->local_unicode != NULL) {
+        data = session->local_unicode;
+        len = session->local_unicode_len;
+      }
+      break;
+    case SD_CF_LOCAL_PNG:
+      item = sd_clip_set_find(session->local, SD_CLIPBOARD_IMAGE_PNG);
+      break;
+    case SD_CF_DIB:
+      item = sd_clip_set_find(session->local, SD_CLIPBOARD_IMAGE_DIB);
+      break;
+    default:
+      break;
+  }
+  if (item != NULL) {
+    data = item->bytes;
+    len = item->len;
+  }
+  CLIPRDR_FORMAT_DATA_RESPONSE response;
+  memset(&response, 0, sizeof(response));
+  response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+  if (data != NULL && len > 0 && len <= UINT32_MAX) {
+    response.common.msgFlags = CB_RESPONSE_OK;
+    response.common.dataLen = (UINT32)len;
+    response.requestedFormatData = data;
+  } else {
+    /* A format this client does not hold, or no longer holds. */
+    response.common.msgFlags = CB_RESPONSE_FAIL;
+  }
+  /* Sent under the lock: the bytes belong to the local group, which a push on the
+   * worker could otherwise replace while the channel copies them. */
+  if (cliprdr->ClientFormatDataResponse != NULL) {
+    (void)cliprdr->ClientFormatDataResponse(cliprdr, &response);
+  }
+  LeaveCriticalSection(&session->clip_lock);
+  return CHANNEL_RC_OK;
+}
+
+static UINT sd_rdp_clip_server_data_response(CliprdrClientContext *cliprdr,
+                                             const CLIPRDR_FORMAT_DATA_RESPONSE *response) {
+  sd_rdp_session *session = sd_rdp_clip_session(cliprdr);
+  if (session == NULL || response == NULL) return CHANNEL_RC_OK;
+  sd_clip_set finished;
+  memset(&finished, 0, sizeof(finished));
+  int32_t too_large = 0;
+  int32_t done = 0;
+  EnterCriticalSection(&session->clip_lock);
+  int32_t ok = (response->common.msgFlags & CB_RESPONSE_FAIL) == 0 ? 1 : 0;
+  uint32_t next = sd_clip_fetch_on_response(&session->fetch, ok, response->requestedFormatData,
+                                            response->common.dataLen, &finished,
+                                            &too_large, &done);
+  sd_rdp_clip_request(session, next);
+  LeaveCriticalSection(&session->clip_lock);
+  /* Dispatched without clip_lock: the consumer's callback must never sit between the
+   * channel thread and a worker push. */
+  if (done) {
+    sd_emit_clipboard(session->client, &finished);
+    if (too_large) sd_emit_notice(session->client, SD_NOTICE_CLIPBOARD_TOO_LARGE);
+  }
+  sd_clip_set_clear(&finished);
+  return CHANNEL_RC_OK;
+}
+
+static void sd_rdp_channel_connected(void *context, const ChannelConnectedEventArgs *e) {
+  sd_rdp_session *session = sd_session_of((rdpContext *)context);
+  if (session == NULL || e == NULL || e->name == NULL) return;
+  if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) != 0 || e->pInterface == NULL) return;
+  CliprdrClientContext *cliprdr = (CliprdrClientContext *)e->pInterface;
+  EnterCriticalSection(&session->clip_lock);
+  cliprdr->custom = session;
+  cliprdr->ServerCapabilities = sd_rdp_clip_server_capabilities;
+  cliprdr->MonitorReady = sd_rdp_clip_monitor_ready;
+  cliprdr->ServerFormatList = sd_rdp_clip_server_format_list;
+  cliprdr->ServerFormatListResponse = sd_rdp_clip_server_format_list_response;
+  cliprdr->ServerFormatDataRequest = sd_rdp_clip_server_data_request;
+  cliprdr->ServerFormatDataResponse = sd_rdp_clip_server_data_response;
+  session->cliprdr = cliprdr;
+  LeaveCriticalSection(&session->clip_lock);
+}
+
+static void sd_rdp_channel_disconnected(void *context, const ChannelDisconnectedEventArgs *e) {
+  sd_rdp_session *session = sd_session_of((rdpContext *)context);
+  if (session == NULL || e == NULL || e->name == NULL) return;
+  if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) != 0) return;
+  EnterCriticalSection(&session->clip_lock);
+  if (session->cliprdr == (CliprdrClientContext *)e->pInterface) {
+    session->cliprdr->custom = NULL;
+    session->cliprdr = NULL;
+    session->clip_ready = 0;
+    sd_clip_fetch_reset(&session->fetch);
+  }
+  LeaveCriticalSection(&session->clip_lock);
+}
+
+/* Reports a push that has waited past the grace period for a channel the server
+ * never made ready. Worker thread. */
+static void sd_rdp_clip_tick(sd_rdp_session *session) {
+  if (!session->clipboard) return;
+  int32_t notify = 0;
+  EnterCriticalSection(&session->clip_lock);
+  if (session->clip_waiting && !session->clip_ready && !session->clip_refused &&
+      GetTickCount64() - session->connected_at > SD_RDP_CLIPBOARD_GRACE_MS) {
+    session->clip_refused = 1;
+    notify = 1;
+  }
+  LeaveCriticalSection(&session->clip_lock);
+  if (notify) sd_emit_notice(session->client, SD_NOTICE_CLIPBOARD_REFUSED);
+}
+
+/* ---- connection options ---------------------------------------------------- */
+
+/* Whether a folder can be offered as a drive: an absolute, existing, listable
+ * directory short enough for the drive channel, which measures its base path with
+ * a MAX_PATH bound. FreeRDP's own special values ("*" all drives, "%" home) are
+ * never accepted from here. */
+static int32_t sd_rdp_folder_usable(const char *path) {
+  if (path == NULL || path[0] == '\0' || path[0] == '*' || path[0] == '%') return 0;
+  WCHAR wide[MAX_PATH];
+  int units = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, MAX_PATH - 3);
+  if (units <= 1) return 0;
+  size_t length = (size_t)units - 1;
+  int32_t drive_absolute = length >= 3 &&
+                           ((wide[0] >= L'A' && wide[0] <= L'Z') ||
+                            (wide[0] >= L'a' && wide[0] <= L'z')) &&
+                           wide[1] == L':' && (wide[2] == L'\\' || wide[2] == L'/');
+  int32_t unc = length >= 3 && (wide[0] == L'\\' || wide[0] == L'/') &&
+                (wide[1] == L'\\' || wide[1] == L'/');
+  if (!drive_absolute && !unc) return 0;
+  DWORD attributes = GetFileAttributesW(wide);
+  if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    return 0;
+  }
+  /* Listing proves read access; a folder the user cannot open would only fail later,
+   * inside the remote session, with no explanation. */
+  WCHAR pattern[MAX_PATH];
+  memcpy(pattern, wide, length * sizeof(WCHAR));
+  size_t at = length;
+  if (wide[length - 1] != L'\\' && wide[length - 1] != L'/') pattern[at++] = L'\\';
+  pattern[at++] = L'*';
+  pattern[at] = 0;
+  WIN32_FIND_DATAW found;
+  HANDLE listing = FindFirstFileW(pattern, &found);
+  if (listing == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND ? 1 : 0;
+  FindClose(listing);
+  return 1;
+}
+
+typedef struct sd_rdp_options {
+  int32_t clipboard;
+  char *drive_name;
+  char *drive_path;
+} sd_rdp_options;
+
+static void sd_rdp_options_read(sd_client *client, sd_rdp_options *options) {
+  memset(options, 0, sizeof(*options));
+  EnterCriticalSection(&client->lock);
+  options->clipboard = client->clipboard_enabled;
+  options->drive_name = sd_strdup(client->drive_name);
+  options->drive_path = sd_strdup(client->drive_path);
+  LeaveCriticalSection(&client->lock);
+}
+
+static void sd_rdp_options_free(sd_rdp_options *options) {
+  free(options->drive_name);
+  free(options->drive_path);
+  memset(options, 0, sizeof(*options));
+}
+
+/* Writes the clipboard and drive choices into FreeRDP's settings. Returns FALSE only
+ * when FreeRDP refuses a setting; an unusable folder sets `*drive_unavailable` and the
+ * session goes ahead without it. */
+static BOOL sd_rdp_apply_options(rdpSettings *settings, const sd_rdp_options *options,
+                                 int32_t *drive_unavailable) {
+  *drive_unavailable = 0;
+  /* Explicit both ways: FreeRDP's default is on, and off must mean the channel is
+   * never loaded, not merely ignored. */
+  if (!freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard,
+                                 options->clipboard ? TRUE : FALSE)) {
+    return FALSE;
+  }
+  if (options->drive_path != NULL && options->drive_path[0] != '\0') {
+    const char *name = options->drive_name != NULL && options->drive_name[0] != '\0'
+                           ? options->drive_name
+                           : "Shellune";
+    if (!sd_rdp_folder_usable(options->drive_path)) {
+      *drive_unavailable = 1;
+    } else {
+      const char *const params[3] = {"drive", name, options->drive_path};
+      if (!freerdp_client_add_device_channel(settings, 3, params) ||
+          freerdp_device_collection_find(settings, name) == NULL) {
+        *drive_unavailable = 1;
+      }
+    }
+  }
+  return TRUE;
+}
+
 /* ---- error classification ------------------------------------------------- */
 
 static int32_t sd_rdp_failure_of(rdpContext *context, int32_t *detail) {
@@ -238,11 +606,13 @@ void sd_rdp_run(sd_client *client) {
     return;
   }
   session->client = client;
+  InitializeCriticalSection(&session->clip_lock);
   /* An RDP-only process may never have opened a Rust/VNC socket. FreeRDP's
    * embedded client entry points leave Winsock initialization to the host. */
   WSADATA sockets;
   int socket_error = WSAStartup(MAKEWORD(2, 2), &sockets);
   if (socket_error != 0) {
+    DeleteCriticalSection(&session->clip_lock);
     free(session);
     sd_emit_state(client, SD_STATE_FAILED, SD_FAILURE_IO, socket_error,
                   "could not initialize Windows sockets");
@@ -271,6 +641,9 @@ void sd_rdp_run(sd_client *client) {
   width = client->width;
   height = client->height;
   LeaveCriticalSection(&client->lock);
+  sd_rdp_options options;
+  sd_rdp_options_read(client, &options);
+  session->clipboard = options.clipboard;
 
   int32_t status = SD_FAILURE_INTERNAL;
   const char *reason = NULL;
@@ -328,6 +701,20 @@ void sd_rdp_run(sd_client *client) {
     if (password != NULL) freerdp_settings_set_string(settings, FreeRDP_Password, password);
     if (domain != NULL) freerdp_settings_set_string(settings, FreeRDP_Domain, domain);
 
+    int32_t drive_unavailable = 0;
+    if (!sd_rdp_apply_options(settings, &options, &drive_unavailable)) {
+      reason = "could not apply the clipboard and drive settings";
+      goto teardown;
+    }
+    if (drive_unavailable) sd_emit_notice(client, SD_NOTICE_DRIVE_UNAVAILABLE);
+    if (options.clipboard &&
+        (PubSub_SubscribeChannelConnected(context->pubSub, sd_rdp_channel_connected) < 0 ||
+         PubSub_SubscribeChannelDisconnected(context->pubSub, sd_rdp_channel_disconnected) <
+             0)) {
+      reason = "could not watch the clipboard channel";
+      goto teardown;
+    }
+
     instance->VerifyCertificateEx = sd_rdp_verify_certificate;
     instance->AuthenticateEx = sd_rdp_authenticate;
     instance->VerifyChangedCertificateEx = sd_rdp_verify_changed_certificate;
@@ -361,6 +748,9 @@ void sd_rdp_run(sd_client *client) {
 
     session->connected = 1;
     status = SD_FAILURE_NONE;
+    EnterCriticalSection(&session->clip_lock);
+    session->connected_at = GetTickCount64();
+    LeaveCriticalSection(&session->clip_lock);
     sd_emit_state(client, SD_STATE_CONNECTED, SD_FAILURE_NONE, 0, NULL);
 
     {
@@ -390,6 +780,7 @@ void sd_rdp_run(sd_client *client) {
           break;
         }
         sd_flush_input(client);
+        sd_rdp_clip_tick(session);
       }
       if (sd_is_cancelled(client)) {
         status = SD_FAILURE_CANCELLED;
@@ -418,6 +809,13 @@ teardown:
     session->context = NULL;
     session->instance = NULL;
   }
+
+  /* The channels are gone with the context, so no callback can reach these now. */
+  sd_clip_set_free(session->local);
+  free(session->local_unicode);
+  sd_clip_fetch_reset(&session->fetch);
+  DeleteCriticalSection(&session->clip_lock);
+  sd_rdp_options_free(&options);
 
   free(host);
   free(username);
@@ -497,17 +895,116 @@ void sd_rdp_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t buttons)
   freerdp_input_send_mouse_event(input, PTR_FLAGS_MOVE, x, y);
 }
 
-void sd_rdp_clipboard(sd_client *client, const char *utf8, uint32_t len) {
-  /* Text clipboard needs the cliprdr channel wired to this session, which this task
-   * does not do: the call is accepted and dropped rather than pretending the peer
-   * received it. */
-  (void)client;
-  (void)utf8;
-  (void)len;
+void sd_rdp_clipboard(sd_client *client, sd_clip_set *set) {
+  sd_rdp_session *session = NULL;
+  sd_rdp_input(client, &session);
+  if (session == NULL || !session->clipboard || set == NULL) {
+    sd_clip_set_free(set);
+    return;
+  }
+  /* Converted here, on the worker, so the channel thread only copies bytes. */
+  uint8_t *unicode = NULL;
+  size_t unicode_len = 0;
+  const sd_clip_item *text = sd_clip_set_find(set, SD_CLIPBOARD_TEXT_UTF8);
+  if (text != NULL) {
+    unicode = sd_clip_utf8_to_cf_unicode(text->bytes, text->len, &unicode_len);
+    if (unicode == NULL) {
+      sd_clip_set_free(set);
+      return;
+    }
+  }
+  int32_t notify = 0;
+  EnterCriticalSection(&session->clip_lock);
+  sd_clip_set *stale = session->local;
+  uint8_t *stale_unicode = session->local_unicode;
+  session->local = set;
+  session->local_unicode = unicode;
+  session->local_unicode_len = unicode_len;
+  if (session->cliprdr != NULL && session->clip_ready) {
+    sd_rdp_clip_announce(session);
+  } else {
+    /* Announced on Monitor Ready. A channel that never got there within the grace
+     * period was refused by the server: said once, then silent. */
+    session->clip_waiting = 1;
+    if (!session->clip_refused &&
+        (session->cliprdr == NULL ||
+         GetTickCount64() - session->connected_at > SD_RDP_CLIPBOARD_GRACE_MS)) {
+      session->clip_refused = 1;
+      notify = 1;
+    }
+  }
+  LeaveCriticalSection(&session->clip_lock);
+  sd_clip_set_free(stale);
+  free(stale_unicode);
+  if (notify) sd_emit_notice(client, SD_NOTICE_CLIPBOARD_REFUSED);
+}
+
+/* Whether FreeRDP actually initialised a static channel of this name. */
+static int32_t sd_rdp_channel_loaded(rdpChannels *channels, const char *name) {
+  StaticClientChannelStats *stats = freerdp_channels_client_stats(channels);
+  if (stats == NULL) return 0;
+  int32_t found = 0;
+  for (size_t i = 0; i < stats->count; i++) {
+    if (strcmp(stats->stats[i].channelName, name) == 0) found = 1;
+  }
+  freerdp_channel_client_stats_free(stats);
+  return found;
+}
+
+sd_status sd_rdp_probe_settings(sd_client *client, char *out, size_t cap) {
+  WSADATA sockets;
+  if (WSAStartup(MAKEWORD(2, 2), &sockets) != 0) return SD_ERR_INTERNAL;
+  WLog_SetLogLevel(WLog_GetRoot(), WLOG_ERROR);
+  sd_rdp_options options;
+  sd_rdp_options_read(client, &options);
+  sd_status result = SD_ERR_INTERNAL;
+  int32_t drive_unavailable = 0;
+  RDP_CLIENT_ENTRY_POINTS entry = {0};
+  entry.Size = sizeof(entry);
+  entry.Version = RDP_CLIENT_INTERFACE_VERSION;
+  entry.ContextSize = sizeof(sd_rdp_context);
+  rdpContext *context = freerdp_client_context_new(&entry);
+  if (context != NULL && context->settings != NULL) {
+    rdpSettings *settings = context->settings;
+    /* The same calls, in the same order, as sd_rdp_run before it connects. */
+    if (sd_rdp_apply_options(settings, &options, &drive_unavailable) &&
+        freerdp_client_load_addins(context->channels, settings)) {
+      const char *name = options.drive_name != NULL && options.drive_name[0] != '\0'
+                             ? options.drive_name
+                             : "Shellune";
+      RDPDR_DEVICE *device = freerdp_device_collection_find(settings, name);
+      const char *drive_path = "";
+      if (device != NULL && device->Type == RDPDR_DTYP_FILESYSTEM &&
+          ((RDPDR_DRIVE *)device)->Path != NULL) {
+        drive_path = ((RDPDR_DRIVE *)device)->Path;
+      }
+      int written = snprintf(
+          out, cap,
+          "redirect_clipboard=%d cliprdr=%d device_redirection=%d rdpdr=%d drive=%s "
+          "drive_path=%s",
+          freerdp_settings_get_bool(settings, FreeRDP_RedirectClipboard) ? 1 : 0,
+          sd_rdp_channel_loaded(context->channels, CLIPRDR_SVC_CHANNEL_NAME),
+          freerdp_settings_get_bool(settings, FreeRDP_DeviceRedirection) ? 1 : 0,
+          sd_rdp_channel_loaded(context->channels, "rdpdr"),
+          device != NULL ? name : "", drive_path);
+      if (written < 0) {
+        result = SD_ERR_INTERNAL;
+      } else if ((size_t)written >= cap) {
+        result = SD_ERR_ARGUMENT;
+      } else {
+        result = SD_OK;
+      }
+    }
+  }
+  if (context != NULL) freerdp_client_context_free(context);
+  sd_rdp_options_free(&options);
+  WSACleanup();
+  if (drive_unavailable) sd_emit_notice(client, SD_NOTICE_DRIVE_UNAVAILABLE);
+  return result;
 }
 
 sd_status sd_rdp_available(char *out, size_t cap) {
-  int written = snprintf(out, cap, "freerdp=%s winpr=%s tls=openssl clipboard=unavailable",
+  int written = snprintf(out, cap, "freerdp=%s winpr=%s tls=openssl clipboard=text,image",
                          FREERDP_VERSION_FULL, WINPR_VERSION_FULL);
   if (written < 0) return SD_ERR_INTERNAL;
   if ((size_t)written >= cap) return SD_ERR_ARGUMENT;

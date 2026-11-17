@@ -31,7 +31,13 @@ fn main() {
     println!("cargo:rerun-if-changed={}", config_path.display());
 
     let mut build = cc::Build::new();
-    for file in ["sd_shim.c", "sd_rdp.c", "sd_vnc.c", "sd_stub.c"] {
+    for file in [
+        "sd_shim.c",
+        "sd_clip.c",
+        "sd_rdp.c",
+        "sd_vnc.c",
+        "sd_stub.c",
+    ] {
         let path = manifest_dir.join("shim").join(file);
         println!("cargo:rerun-if-changed={}", path.display());
         build.file(path);

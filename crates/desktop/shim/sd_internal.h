@@ -183,6 +183,90 @@ static __inline DWORD GetLastError(void) { return (DWORD)errno; }
 
 #define SD_INPUT_QUEUE 256u
 
+/* ---- clipboard groups (sd_clip.c) ----------------------------------------
+ *
+ * One group is what one copy put on a clipboard: each kind at most once, every
+ * entry owned by the group. The helpers are pure and protocol free so the probes in
+ * the public header can test them without a server. */
+
+typedef struct sd_clip_item {
+  uint32_t kind;
+  uint32_t len;
+  uint8_t *bytes;
+} sd_clip_item;
+
+typedef struct sd_clip_set {
+  uint32_t count;
+  sd_clip_item items[SD_MAX_CLIPBOARD_ENTRIES];
+} sd_clip_set;
+
+/* Checks a caller's entries against the bounds and rules of the header. */
+sd_status sd_clip_validate(const sd_clipboard_entry *entries, uint32_t count);
+/* Deep copy of validated entries; NULL on allocation failure. */
+sd_clip_set *sd_clip_set_copy(const sd_clipboard_entry *entries, uint32_t count);
+void sd_clip_set_free(sd_clip_set *set);
+/* Releases the entries, leaving an empty group. */
+void sd_clip_set_clear(sd_clip_set *set);
+const sd_clip_item *sd_clip_set_find(const sd_clip_set *set, uint32_t kind);
+/* Adds an entry, taking `bytes`; frees it and returns 0 when the group is full or
+ * already has that kind. */
+int32_t sd_clip_set_add(sd_clip_set *set, uint32_t kind, uint8_t *bytes, uint32_t len);
+
+/* Text conversions. Each returns a malloc'd buffer (NUL terminated for UTF-8 and
+ * Latin-1 results, so a zero length result is never NULL) or NULL on failure. */
+uint8_t *sd_clip_utf8_to_cf_unicode(const uint8_t *utf8, size_t len, size_t *out_len);
+uint8_t *sd_clip_cf_unicode_to_utf8(const uint8_t *utf16, size_t len, size_t *out_len);
+/* NULL when a character is outside Latin-1 or the input is not UTF-8. */
+uint8_t *sd_clip_utf8_to_latin1(const uint8_t *utf8, size_t len, size_t *out_len);
+uint8_t *sd_clip_latin1_to_utf8(const uint8_t *latin1, size_t len, size_t *out_len);
+int32_t sd_clip_utf8_valid(const uint8_t *utf8, size_t len);
+
+/* RDP clipboard format ids used on the wire. */
+#define SD_CF_DIB 8u
+#define SD_CF_UNICODETEXT 13u
+#define SD_CF_DIBV5 17u
+/* The id this client gives its registered "PNG" format in its own format lists. */
+#define SD_CF_LOCAL_PNG 0xC0F0u
+
+/* Picks the formats one remote copy is fetched as (see sd_probe_rdp_select). */
+uint32_t sd_clip_select(const uint32_t *ids, const char *const *names, uint32_t count,
+                        uint32_t out_ids[2], uint32_t out_kinds[2]);
+
+/* The fetch of one remote copy: one request in flight at a time, text before image,
+ * and the whole group delivered once. A format list that arrives while a request is
+ * in flight voids the unfinished group; its own fetch starts once the outstanding
+ * answer has arrived (and been dropped), so an answer is never credited to the
+ * wrong request. */
+typedef struct sd_clip_fetch {
+  uint32_t plan_ids[2];
+  uint32_t plan_kinds[2];
+  uint32_t plan_count;
+  uint32_t next;      /* index of the request in flight */
+  int32_t in_flight;
+  int32_t abandoned;  /* the answer in flight belongs to a voided group */
+  int32_t queued;     /* a newer plan waits for that answer */
+  uint32_t queued_ids[2];
+  uint32_t queued_kinds[2];
+  uint32_t queued_count;
+  int32_t too_large;  /* an entry of this group was skipped for its size */
+  sd_clip_set collected;
+} sd_clip_fetch;
+
+/* A format list arrived. Returns the format id to request now, or 0 when there is
+ * nothing to request yet (nothing wanted, or an answer is still outstanding). */
+uint32_t sd_clip_fetch_on_list(sd_clip_fetch *fetch, const uint32_t *ids,
+                               const char *const *names, uint32_t count);
+/* An answer arrived. Returns the next format id to request, or 0. When the group is
+ * complete `*done` is 1, the group is moved to `finished` (caller clears it) and
+ * `*too_large` says whether an entry was skipped for its size. An answer while
+ * nothing is in flight is ignored. */
+uint32_t sd_clip_fetch_on_response(sd_clip_fetch *fetch, int32_t ok, const uint8_t *data,
+                                   uint32_t len, sd_clip_set *finished,
+                                   int32_t *too_large, int32_t *done);
+void sd_clip_fetch_reset(sd_clip_fetch *fetch);
+/* Fills `out` with views of the group's entries; returns how many. */
+uint32_t sd_clip_entries(const sd_clip_set *set, sd_clipboard_entry out[SD_MAX_CLIPBOARD_ENTRIES]);
+
 typedef struct sd_input_event {
   uint32_t kind; /* 0 keyboard, 1 pointer transition, 2 pointer motion */
   uint32_t scancode;
@@ -221,6 +305,9 @@ struct sd_client {
   uint32_t height;
   uint32_t vnc_mask;
   uint32_t vnc_bytes_per_pixel;
+  int32_t clipboard_enabled;
+  char *drive_name;
+  char *drive_path;
 
   /* Worker lifetime. `cancel` is set by any thread; the backend polls it. */
   HANDLE thread;
@@ -256,8 +343,8 @@ struct sd_client {
   uint32_t input_head;
   uint32_t input_count;
   uint32_t queued_buttons;
-  char *clipboard_text;
-  uint32_t clipboard_len;
+  /* The newest local clipboard group not yet handed to the backend, or NULL. */
+  sd_clip_set *clipboard_pending;
 };
 
 /* --- helpers implemented in sd_shim.c, used by the backends --- */
@@ -274,7 +361,9 @@ void sd_emit_frame(sd_client *client, int32_t x, int32_t y, int32_t w, int32_t h
 int32_t sd_ask_certificate(sd_client *client, const char *host, const char *subject,
                            const char *issuer, const char *fingerprint,
                            uint32_t flags);
-void sd_emit_clipboard(sd_client *client, const char *text, uint32_t len);
+/* Delivers one remote clipboard group; an empty group is not delivered. */
+void sd_emit_clipboard(sd_client *client, const sd_clip_set *set);
+void sd_emit_notice(sd_client *client, uint32_t notice);
 
 /* --- backend pointer lifetime ---
  *
@@ -296,8 +385,8 @@ void sd_backend_retire(sd_client *client);
 int32_t sd_is_cancelled(sd_client *client);
 /* Pops one queued input event. Returns 0 when the queue is empty. */
 int32_t sd_pop_input(sd_client *client, sd_input_event *out);
-/* Pops the queued clipboard text, transferring ownership to the caller. */
-char *sd_take_clipboard(sd_client *client, uint32_t *len);
+/* Pops the queued clipboard group, transferring ownership to the caller. */
+sd_clip_set *sd_take_clipboard(sd_client *client);
 /* Drains the queue into the backend. Called from the worker loop only. */
 void sd_flush_input(sd_client *client);
 
@@ -314,7 +403,9 @@ void sd_rdp_abort(sd_client *client);
 void sd_rdp_key(sd_client *client, uint32_t scancode, uint32_t keysym, int32_t down,
                 int32_t extended);
 void sd_rdp_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t buttons);
-void sd_rdp_clipboard(sd_client *client, const char *utf8, uint32_t len);
+/* Takes ownership of `set`. */
+void sd_rdp_clipboard(sd_client *client, sd_clip_set *set);
+sd_status sd_rdp_probe_settings(sd_client *client, char *out, size_t cap);
 #endif
 
 #if defined(SD_WITH_VNC)
@@ -324,7 +415,7 @@ void sd_vnc_abort(sd_client *client);
 void sd_vnc_key(sd_client *client, uint32_t scancode, uint32_t keysym, int32_t down,
                 int32_t extended);
 void sd_vnc_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t buttons);
-void sd_vnc_clipboard(sd_client *client, const char *utf8, uint32_t len);
+void sd_vnc_clipboard(sd_client *client, sd_clip_set *set);
 #endif
 
 /* Implemented in sd_stub.c when no protocol library is linked. */
@@ -335,7 +426,7 @@ void sd_backend_abort(sd_client *client);
 void sd_backend_key(sd_client *client, uint32_t scancode, uint32_t keysym, int32_t down,
                     int32_t extended);
 void sd_backend_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t buttons);
-void sd_backend_clipboard(sd_client *client, const char *utf8, uint32_t len);
+void sd_backend_clipboard(sd_client *client, sd_clip_set *set);
 #endif
 
 #if defined(SD_WITH_RDP) || defined(SD_WITH_VNC)
@@ -346,7 +437,7 @@ void sd_backend_abort(sd_client *client);
 void sd_backend_key(sd_client *client, uint32_t scancode, uint32_t keysym, int32_t down,
                     int32_t extended);
 void sd_backend_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t buttons);
-void sd_backend_clipboard(sd_client *client, const char *utf8, uint32_t len);
+void sd_backend_clipboard(sd_client *client, sd_clip_set *set);
 #endif
 
 

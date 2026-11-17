@@ -290,7 +290,7 @@ fn verify(endpoint: &Endpoint) -> Outcome {
                     }
                     _ => {}
                 },
-                Event::Clipboard { .. } => {}
+                Event::Clipboard { .. } | Event::Notice { .. } => {}
             },
             Err(_) => continue,
         }
@@ -333,10 +333,10 @@ fn verify(endpoint: &Endpoint) -> Outcome {
             "input",
             key.is_ok() && release.is_ok() && pointer.is_ok() && moved.is_ok(),
         ));
-        if endpoint.kind.protocol() == Protocol::Vnc {
-            let shared = client.clipboard("shellune endpoint matrix");
-            steps.push(("clipboard", shared.is_ok()));
-        }
+        // Both backends share the clipboard now: RDP through cliprdr, VNC through
+        // the (extended) cut text.
+        let shared = client.clipboard("shellune endpoint matrix");
+        steps.push(("clipboard", shared.is_ok()));
         let cancelled = client.cancel().is_ok();
         let stopped = client.wait_for_worker(PATIENCE).is_ok();
         steps.push(("cancel", cancelled && stopped));

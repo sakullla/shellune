@@ -63,7 +63,14 @@ impl Mailbox {
                     }
                 ) {
                     pending.events.retain(|event| {
-                        matches!(event, Some(Event::State { .. } | Event::Clipboard { .. }))
+                        matches!(
+                            event,
+                            Some(
+                                Event::State { .. }
+                                    | Event::Clipboard { .. }
+                                    | Event::Notice { .. }
+                            )
+                        )
                     });
                     pending.pixels.clear();
                     pending.width = 0;
@@ -87,10 +94,12 @@ impl Mailbox {
         // State churn must not grow metadata forever either. Never evict a live
         // certificate question or the frame marker; replace the oldest notice.
         if pending.events.len() > MAX_NOTIFICATIONS
-            && let Some(index) = pending
-                .events
-                .iter()
-                .position(|e| matches!(e, Some(Event::State { .. } | Event::Clipboard { .. })))
+            && let Some(index) = pending.events.iter().position(|e| {
+                matches!(
+                    e,
+                    Some(Event::State { .. } | Event::Clipboard { .. } | Event::Notice { .. })
+                )
+            })
         {
             pending.events.remove(index);
         }
@@ -265,7 +274,7 @@ mod tests {
         queue.try_recv().unwrap();
         queue.deliver(pixel(0, 2));
         queue.deliver(Event::Clipboard {
-            text: "last".into(),
+            entries: vec![crate::ClipboardEntry::text("last")],
         });
         queue.deliver(pixel(3, 7));
         assert!(matches!(queue.try_recv(), Ok(Event::Clipboard { .. })));

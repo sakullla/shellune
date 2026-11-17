@@ -43,10 +43,9 @@ void sd_backend_pointer(sd_client *client, uint16_t x, uint16_t y, uint32_t butt
   (void)buttons;
 }
 
-void sd_backend_clipboard(sd_client *client, const char *utf8, uint32_t len) {
+void sd_backend_clipboard(sd_client *client, sd_clip_set *set) {
   (void)client;
-  (void)utf8;
-  (void)len;
+  sd_clip_set_free(set);
 }
 
 #endif /* no native backend */

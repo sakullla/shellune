@@ -19,9 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use shellune_desktop::probe::{self, Step};
 use shellune_desktop::{
-    DesktopClient, Error, Event, Failure, PointerButtons, Protocol, State, VncSecurity,
-    backend_info, callback_panics, leaked_handles,
+    ClipboardEntry, ClipboardKind, DesktopClient, Error, Event, Failure, Notice, PointerButtons,
+    Protocol, State, VncSecurity, backend_info, callback_panics, leaked_handles,
 };
 
 /// How long a scripted peer or a worker may take before the test calls it a hang.
@@ -97,11 +98,45 @@ fn never_connected(events: &[Event]) {
 enum ClientMessage {
     PixelFormat,
     Encodings(Vec<i32>),
-    UpdateRequest { incremental: bool },
-    Key { keysym: u32, down: bool },
-    Pointer { x: u16, y: u16, mask: u8 },
-    CutText,
+    UpdateRequest {
+        incremental: bool,
+    },
+    Key {
+        keysym: u32,
+        down: bool,
+    },
+    Pointer {
+        x: u16,
+        y: u16,
+        mask: u8,
+    },
+    /// Classic RFB cut text: Latin-1 bytes.
+    CutText(Vec<u8>),
+    /// Extended clipboard: the action/format flags and, for Provide, the text.
+    ExtendedCutText {
+        flags: u32,
+        text: Option<String>,
+    },
     Other(u8),
+}
+
+/// The ExtendedClipboard pseudo-encoding, as the client lists it.
+const EXTENDED_CLIPBOARD: i32 = 0xC0A1_E5CEu32 as i32;
+const EXT_TEXT: u32 = 1;
+const EXT_CAPS: u32 = 1 << 24;
+const EXT_REQUEST: u32 = 1 << 25;
+const EXT_PEEK: u32 = 1 << 26;
+const EXT_NOTIFY: u32 = 1 << 27;
+const EXT_PROVIDE: u32 = 1 << 28;
+
+/// What the scripted peer puts on its clipboard.
+#[derive(Clone, Copy)]
+enum Cut {
+    /// Sent as classic cut text right after ServerInit.
+    Latin1(&'static [u8]),
+    /// Sent as an extended clipboard Provide once the client asked for the
+    /// extension (and the peer offers it).
+    Utf8(&'static str),
 }
 
 /// What the scripted peer does once a socket is accepted.
@@ -112,11 +147,14 @@ enum Script {
     /// Announce only these security types, then wait for the client's choice.
     SecurityTypes(Vec<u8>),
     /// Complete a 3.8 handshake and serve one raw frame, then keep reading input.
+    /// With `extended`, the peer answers a client that lists the ExtendedClipboard
+    /// encoding with its capabilities, like a server that supports it.
     Session {
         width: u16,
         height: u16,
         pixel: [u8; 4],
-        clipboard: Option<&'static str>,
+        clipboard: Option<Cut>,
+        extended: bool,
     },
 }
 
@@ -174,10 +212,18 @@ impl Scripted {
                         height,
                         pixel,
                         clipboard,
+                        extended,
                     } => {
                         // One session per test: after it ends there is nothing left to
                         // serve, and a second accept would only hide client bugs.
-                        serve_session(stream, width, height, pixel, clipboard, Arc::clone(&log));
+                        let peer = Peer {
+                            width,
+                            height,
+                            pixel,
+                            clipboard,
+                            extended,
+                        };
+                        serve_session(stream, peer, Arc::clone(&log));
                         return;
                     }
                 }
@@ -267,23 +313,61 @@ fn read_message(stream: &mut TcpStream, message_type: u8) -> Option<ClientMessag
         6 => {
             let mut header = [0u8; 7];
             stream.read_exact(&mut header).ok()?;
-            let length = u32::from_be_bytes([header[3], header[4], header[5], header[6]]) as usize;
-            let mut text = vec![0u8; length.min(4096)];
-            stream.read_exact(&mut text).ok()?;
-            Some(ClientMessage::CutText)
+            let length = i32::from_be_bytes([header[3], header[4], header[5], header[6]]);
+            let size = length.unsigned_abs() as usize;
+            if size > 1 << 21 {
+                return None;
+            }
+            let mut payload = vec![0u8; size];
+            stream.read_exact(&mut payload).ok()?;
+            if length >= 0 {
+                return Some(ClientMessage::CutText(payload));
+            }
+            // Extended clipboard: flags, then for Provide a zlib stream holding a
+            // big-endian size and the NUL-terminated text.
+            let flags = u32::from_be_bytes(payload.get(..4)?.try_into().ok()?);
+            let mut text = None;
+            if flags & EXT_PROVIDE != 0 {
+                let plain = zlib_inflate(&payload[4..])?;
+                let declared = u32::from_be_bytes(plain.get(..4)?.try_into().ok()?) as usize;
+                let mut body = plain.get(4..4 + declared)?.to_vec();
+                while body.last() == Some(&0) {
+                    body.pop();
+                }
+                text = Some(String::from_utf8(body).ok()?);
+            }
+            Some(ClientMessage::ExtendedCutText { flags, text })
         }
         other => Some(ClientMessage::Other(other)),
     }
 }
 
-fn serve_session(
-    mut stream: TcpStream,
+struct Peer {
     width: u16,
     height: u16,
     pixel: [u8; 4],
-    clipboard: Option<&'static str>,
-    log: Arc<Mutex<Vec<ClientMessage>>>,
-) {
+    clipboard: Option<Cut>,
+    extended: bool,
+}
+
+/// A server cut text message with a negative length: the extended clipboard form.
+fn extended_message(flags: u32, body: &[u8]) -> Vec<u8> {
+    let mut payload = flags.to_be_bytes().to_vec();
+    payload.extend_from_slice(body);
+    let mut message = vec![3u8, 0, 0, 0];
+    message.extend_from_slice(&(-(payload.len() as i32)).to_be_bytes());
+    message.extend_from_slice(&payload);
+    message
+}
+
+fn serve_session(mut stream: TcpStream, peer: Peer, log: Arc<Mutex<Vec<ClientMessage>>>) {
+    let Peer {
+        width,
+        height,
+        pixel,
+        clipboard,
+        extended,
+    } = peer;
     let _ = stream.set_read_timeout(Some(PATIENCE));
     if stream.write_all(b"RFB 003.008\n").is_err() {
         return;
@@ -328,10 +412,10 @@ fn serve_session(
         return;
     }
 
-    if let Some(text) = clipboard {
+    if let Some(Cut::Latin1(bytes)) = clipboard {
         let mut cut = vec![3u8, 0, 0, 0];
-        cut.extend_from_slice(&(text.len() as u32).to_be_bytes());
-        cut.extend_from_slice(text.as_bytes());
+        cut.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        cut.extend_from_slice(bytes);
         let _ = stream.write_all(&cut);
     }
 
@@ -345,7 +429,28 @@ fn serve_session(
             return;
         };
         let served_frame = matches!(message, ClientMessage::UpdateRequest { incremental: false });
+        let wants_extended = extended
+            && matches!(&message, ClientMessage::Encodings(list) if list.contains(&EXTENDED_CLIPBOARD));
         log.lock().expect("message log").push(message);
+        if wants_extended {
+            // Capabilities: text, every action, and the largest text accepted.
+            let caps = extended_message(
+                EXT_CAPS | EXT_TEXT | EXT_REQUEST | EXT_PEEK | EXT_NOTIFY | EXT_PROVIDE,
+                &(1u32 << 20).to_be_bytes(),
+            );
+            if stream.write_all(&caps).is_err() {
+                return;
+            }
+            if let Some(Cut::Utf8(text)) = clipboard {
+                let mut plain = ((text.len() + 1) as u32).to_be_bytes().to_vec();
+                plain.extend_from_slice(text.as_bytes());
+                plain.push(0);
+                let provide = extended_message(EXT_PROVIDE | EXT_TEXT, &zlib_stored(&plain));
+                if stream.write_all(&provide).is_err() {
+                    return;
+                }
+            }
+        }
         if served_frame {
             let mut update = vec![0u8, 0];
             update.extend_from_slice(&1u16.to_be_bytes());
@@ -366,13 +471,250 @@ fn serve_session(
     }
 }
 
+// ------------------------------------------------------------------- zlib
+
+/// A zlib stream holding `data` in one stored block, which every inflater reads.
+fn zlib_stored(data: &[u8]) -> Vec<u8> {
+    assert!(data.len() <= 0xFFFF, "one stored block");
+    let mut out = vec![0x78, 0x01, 0x01];
+    let len = data.len() as u16;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(data);
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in data {
+        a = (a + u32::from(*byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    out
+}
+
+struct Bits<'a> {
+    data: &'a [u8],
+    pos: usize,
+    buffer: u32,
+    count: u32,
+}
+
+impl Bits<'_> {
+    fn take(&mut self, n: u32) -> Option<u32> {
+        while self.count < n {
+            let byte = *self.data.get(self.pos)?;
+            self.pos += 1;
+            self.buffer |= u32::from(byte) << self.count;
+            self.count += 8;
+        }
+        let value = self.buffer & ((1u32 << n) - 1);
+        self.buffer = self.buffer.checked_shr(n).unwrap_or(0);
+        self.count -= n;
+        Some(value)
+    }
+}
+
+struct Huffman {
+    count: [u16; 16],
+    symbol: Vec<u16>,
+}
+
+impl Huffman {
+    fn new(lengths: &[u8]) -> Huffman {
+        let mut count = [0u16; 16];
+        for &len in lengths {
+            count[len as usize] += 1;
+        }
+        count[0] = 0;
+        let mut offsets = [0u16; 16];
+        for len in 1..15 {
+            offsets[len + 1] = offsets[len] + count[len];
+        }
+        let mut symbol = vec![0u16; lengths.len()];
+        for (sym, &len) in lengths.iter().enumerate() {
+            if len != 0 {
+                symbol[offsets[len as usize] as usize] = sym as u16;
+                offsets[len as usize] += 1;
+            }
+        }
+        Huffman { count, symbol }
+    }
+
+    fn decode(&self, bits: &mut Bits<'_>) -> Option<u16> {
+        let (mut code, mut first, mut index) = (0i32, 0i32, 0i32);
+        for len in 1..16 {
+            code |= bits.take(1)? as i32;
+            let count = i32::from(self.count[len]);
+            if code - count < first {
+                return self.symbol.get((index + code - first) as usize).copied();
+            }
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        None
+    }
+}
+
+/// Enough of RFC 1950/1951 to read what LibVNCClient's deflate writes: stored,
+/// fixed and dynamic blocks, ending at a final block or at the end of a stream that
+/// was only sync-flushed.
+fn zlib_inflate(data: &[u8]) -> Option<Vec<u8>> {
+    const LBASE: [u16; 29] = [
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
+        131, 163, 195, 227, 258,
+    ];
+    const LEXT: [u8; 29] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+    ];
+    const DBASE: [u16; 30] = [
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+    ];
+    const DEXT: [u8; 30] = [
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
+        13, 13,
+    ];
+    const ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+
+    let mut bits = Bits {
+        data: data.get(2..)?,
+        pos: 0,
+        buffer: 0,
+        count: 0,
+    };
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(last) = bits.take(1) {
+        match bits.take(2)? {
+            0 => {
+                bits.buffer = 0;
+                bits.count = 0;
+                let header = bits.data.get(bits.pos..bits.pos + 4)?;
+                let len = u16::from_le_bytes([header[0], header[1]]) as usize;
+                bits.pos += 4;
+                out.extend_from_slice(bits.data.get(bits.pos..bits.pos + len)?);
+                bits.pos += len;
+            }
+            kind @ (1 | 2) => {
+                let (lit, dist) =
+                    if kind == 1 {
+                        let mut lengths = [0u8; 288];
+                        lengths[..144].fill(8);
+                        lengths[144..256].fill(9);
+                        lengths[256..280].fill(7);
+                        lengths[280..].fill(8);
+                        (Huffman::new(&lengths), Huffman::new(&[5u8; 30]))
+                    } else {
+                        let nlen = bits.take(5)? as usize + 257;
+                        let ndist = bits.take(5)? as usize + 1;
+                        let ncode = bits.take(4)? as usize + 4;
+                        let mut code_lengths = [0u8; 19];
+                        for &index in ORDER.iter().take(ncode) {
+                            code_lengths[index] = bits.take(3)? as u8;
+                        }
+                        let codes = Huffman::new(&code_lengths);
+                        let mut lengths = Vec::with_capacity(nlen + ndist);
+                        while lengths.len() < nlen + ndist {
+                            match codes.decode(&mut bits)? {
+                                sym @ 0..=15 => lengths.push(sym as u8),
+                                16 => {
+                                    let previous = *lengths.last()?;
+                                    for _ in 0..3 + bits.take(2)? {
+                                        lengths.push(previous);
+                                    }
+                                }
+                                17 => lengths
+                                    .extend(std::iter::repeat_n(0, 3 + bits.take(3)? as usize)),
+                                _ => lengths
+                                    .extend(std::iter::repeat_n(0, 11 + bits.take(7)? as usize)),
+                            }
+                        }
+                        (
+                            Huffman::new(&lengths[..nlen]),
+                            Huffman::new(&lengths[nlen..nlen + ndist]),
+                        )
+                    };
+                loop {
+                    let sym = lit.decode(&mut bits)? as usize;
+                    if sym < 256 {
+                        out.push(sym as u8);
+                    } else if sym == 256 {
+                        break;
+                    } else {
+                        let index = sym - 257;
+                        let len = *LBASE.get(index)? as usize
+                            + bits.take(u32::from(*LEXT.get(index)?))? as usize;
+                        let code = dist.decode(&mut bits)? as usize;
+                        let back = *DBASE.get(code)? as usize
+                            + bits.take(u32::from(*DEXT.get(code)?))? as usize;
+                        let start = out.len().checked_sub(back)?;
+                        for i in 0..len {
+                            out.push(out[start + i]);
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+        if last == 1 {
+            break;
+        }
+    }
+    Some(out)
+}
+
+fn texts(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Clipboard { entries } => entries
+                .iter()
+                .find_map(|entry| entry.as_text())
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+fn notices(events: &[Event]) -> Vec<Notice> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Notice { notice } => Some(*notice),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Retries a call that needs the Connected state the shim only reports through
+/// the queue (which the caller has already drained).
+fn when_connected(
+    client: &mut DesktopClient,
+    mut call: impl FnMut(&DesktopClient) -> Result<(), Error>,
+) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match call(client) {
+            Ok(()) => return,
+            Err(Error::State) if Instant::now() < deadline => {
+                client.track_state();
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("the call never became valid: {error}"),
+        }
+    }
+}
+
 // ------------------------------------------------------------------------ tests
 
 #[test]
 fn the_event_struct_is_the_one_the_header_declares() {
-    assert_eq!(shellune_desktop::SD_ABI_VERSION, 1);
-    // Same numbers as the _Static_assert block in shim/sd_shim.c.
-    assert_eq!(shellune_desktop::abi_layout(), [120, 32, 48, 112]);
+    assert_eq!(shellune_desktop::SD_ABI_VERSION, 2);
+    // Same numbers as the layout assertions in shim/sd_shim.c.
+    assert_eq!(
+        shellune_desktop::abi_layout(),
+        [136, 32, 48, 112, 120, 132, 16]
+    );
 }
 
 #[test]
@@ -395,8 +737,10 @@ fn both_backends_report_the_libraries_they_link() {
     let rdp = backend_info(Protocol::Rdp).expect("rdp info");
     assert!(rdp.contains("freerdp="), "{rdp}");
     assert!(rdp.contains("tls=openssl"), "{rdp}");
+    assert!(rdp.contains("clipboard=text,image"), "{rdp}");
     let vnc = backend_info(Protocol::Vnc).expect("vnc info");
     assert!(vnc.contains("libvncclient="), "{vnc}");
+    assert!(vnc.contains("clipboard=text"), "{vnc}");
     // The build must say which security types it can negotiate, not imply more, and
     // the names must be the RFB ones: "vencrypt" is a security type,
     // "vencrypt-auth" is not.
@@ -426,6 +770,7 @@ fn a_vnc_banner_delayed_three_seconds_still_connects() {
             height: 3,
             pixel: [1, 2, 3, 0],
             clipboard: None,
+            extended: false,
         },
         Duration::from_secs(3),
     );
@@ -597,31 +942,538 @@ fn the_vnc_pixel_depth_is_fixed_at_four_bytes() {
     assert!(matches!(client.set_vnc_colour_depth(4), Ok(())));
 }
 
-/// Clipboard text is only forwarded by the VNC backend. An RDP session says so
-/// instead of accepting text the shim would drop, and the VNC answer is still the
-/// state check, so the two are not conflated.
+/// A push is answered by the switch first and by the state second, for both
+/// protocols: RDP forwards the clipboard now, so an idle RDP handle reports the
+/// state like VNC does, and a connection with sharing off says so instead of
+/// queueing a group it would drop.
 #[test]
-fn an_rdp_session_reports_that_it_cannot_forward_clipboard_text() {
+fn clipboard_pushes_answer_by_switch_then_state_and_check_the_group() {
     if !backends_built() {
         return;
     }
-    let mut rdp = DesktopClient::new(Protocol::Rdp).expect("rdp client");
-    rdp.set_server("127.0.0.1", a_closed_port())
-        .expect("server");
-    match rdp.clipboard("hello") {
-        Err(Error::Unavailable(reason)) => {
-            assert!(reason.contains("clipboard"), "{reason}");
-        }
-        other => panic!("an RDP session must report the missing channel, not {other:?}"),
-    }
+    for protocol in [Protocol::Rdp, Protocol::Vnc] {
+        let mut client = DesktopClient::new(protocol).expect("client");
+        client
+            .set_server("127.0.0.1", a_closed_port())
+            .expect("server");
+        assert!(
+            matches!(client.clipboard("hello"), Err(Error::State)),
+            "{protocol:?}: a handle that is not connected reports the state"
+        );
+        // Group rules come before the state: a bad group is never queued.
+        let twice = [ClipboardEntry::text("a"), ClipboardEntry::text("b")];
+        assert!(matches!(
+            client.push_clipboard(&twice),
+            Err(Error::Argument)
+        ));
+        let empty_image = [ClipboardEntry::png(Vec::new())];
+        assert!(matches!(
+            client.push_clipboard(&empty_image),
+            Err(Error::Argument)
+        ));
+        let long = "x".repeat(shellune_desktop::MAX_CLIPBOARD_TEXT_BYTES + 1);
+        assert!(matches!(client.clipboard(&long), Err(Error::Argument)));
+        let invalid = [ClipboardEntry {
+            kind: ClipboardKind::Text,
+            bytes: vec![0xFF, 0xFE],
+        }];
+        assert!(matches!(
+            client.push_clipboard(&invalid),
+            Err(Error::Argument)
+        ));
 
-    let mut vnc = DesktopClient::new(Protocol::Vnc).expect("vnc client");
-    vnc.set_server("127.0.0.1", a_closed_port())
-        .expect("server");
+        client.set_clipboard(false).expect("switch off");
+        match client.clipboard("hello") {
+            Err(Error::Unavailable(reason)) => assert!(reason.contains("clipboard"), "{reason}"),
+            other => panic!("{protocol:?}: sharing off must be reported, not {other:?}"),
+        }
+    }
+}
+
+/// The clipboard and drive options are written into the FreeRDP settings the
+/// attempt would connect with: the clipboard channel is loaded only when sharing
+/// is on, and a mapped folder becomes the "Shellune" drive on the device channel.
+#[test]
+fn rdp_clipboard_and_drive_options_reach_the_freerdp_settings() {
+    if !backends_built() {
+        return;
+    }
+    let folder = std::env::temp_dir().join(format!("shellune-drive-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).expect("a folder to map");
+    let folder_text = folder.to_str().expect("utf-8 temp path").to_owned();
+
+    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
+    let defaults = client.describe_rdp_settings().expect("settings");
     assert!(
-        matches!(vnc.clipboard("hello"), Err(Error::State)),
-        "a VNC session that is not connected reports the state, not the capability"
+        defaults.contains("redirect_clipboard=1 cliprdr=1"),
+        "sharing is on by default and loads the channel: {defaults}"
     );
+    assert!(defaults.contains("drive= "), "nothing mapped: {defaults}");
+
+    client.set_clipboard(false).expect("switch off");
+    let off = client.describe_rdp_settings().expect("settings");
+    assert!(
+        off.contains("redirect_clipboard=0 cliprdr=0"),
+        "off means the channel is not loaded at all: {off}"
+    );
+
+    client
+        .set_drive(shellune_desktop::DRIVE_NAME, Some(&folder_text))
+        .expect("drive");
+    let mapped = client.describe_rdp_settings().expect("settings");
+    assert!(
+        mapped.contains("device_redirection=1 rdpdr=1 drive=Shellune"),
+        "{mapped}"
+    );
+    assert!(
+        mapped.ends_with(&format!("drive_path={folder_text}")),
+        "{mapped}"
+    );
+    assert!(
+        notices(&client.track_state()).is_empty(),
+        "a usable folder raises no notice"
+    );
+
+    // Bad arguments are refused at the ABI; None clears the mapping.
+    assert!(matches!(
+        client.set_drive("", Some(&folder_text)),
+        Err(Error::Argument)
+    ));
+    assert!(matches!(
+        client.set_drive("Shellune", Some("C:\\tab\there")),
+        Err(Error::Argument)
+    ));
+    client.set_drive("Shellune", None).expect("clear");
+    let cleared = client.describe_rdp_settings().expect("settings");
+    assert!(cleared.contains("drive= "), "{cleared}");
+
+    // A folder that is gone is left out and reported, and the settings still build.
+    let missing = folder.join("missing");
+    client
+        .set_drive("Shellune", Some(missing.to_str().expect("utf-8")))
+        .expect("drive");
+    let without = client.describe_rdp_settings().expect("settings");
+    assert!(without.contains("drive= "), "{without}");
+    assert_eq!(
+        notices(&client.track_state()),
+        [Notice::DriveUnavailable],
+        "the missing folder is reported once"
+    );
+    // FreeRDP's own special values never come through this path.
+    client.set_drive("Shellune", Some("*")).expect("drive");
+    let special = client.describe_rdp_settings().expect("settings");
+    assert!(special.contains("drive= "), "{special}");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A mapped folder that does not exist does not stop the connection: the attempt
+/// reports the notice and still dials the server.
+#[test]
+fn an_rdp_attempt_with_a_missing_folder_reports_it_and_still_dials() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Silent);
+    let mut client = DesktopClient::new(Protocol::Rdp).expect("client");
+    client.set_server("127.0.0.1", peer.port).expect("server");
+    let missing = std::env::temp_dir().join("shellune-no-such-folder-for-this-test");
+    client
+        .set_drive("Shellune", Some(missing.to_str().expect("utf-8")))
+        .expect("drive");
+    client.connect().expect("connect starts");
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(
+            event,
+            Event::Notice {
+                notice: Notice::DriveUnavailable
+            }
+        )
+    });
+    assert_eq!(notices(&events), [Notice::DriveUnavailable], "{events:?}");
+    let deadline = Instant::now() + PATIENCE;
+    while !peer.accepted.load(Ordering::SeqCst) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        peer.accepted.load(Ordering::SeqCst),
+        "the attempt went ahead"
+    );
+    client.cancel().expect("cancel");
+    client.wait_for_worker(PATIENCE).expect("the worker stops");
+}
+
+// ------------------------------------------------------- RDP clipboard probes
+
+const CF_DIB: u32 = 8;
+const CF_UNICODETEXT: u32 = 13;
+const CF_DIBV5: u32 = 17;
+
+fn utf16(text: &str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.extend_from_slice(&[0, 0]);
+    bytes
+}
+
+/// Text first, then one image: a registered PNG wins over the DIBs, CF_DIBV5 over
+/// CF_DIB, and formats this client cannot use are never requested.
+#[test]
+fn rdp_format_choice_is_text_then_png_then_dibv5_then_dib() {
+    assert_eq!(
+        probe::rdp_select(&[
+            (CF_DIB, None),
+            (0xC123, Some("PNG")),
+            (CF_UNICODETEXT, None),
+            (CF_DIBV5, None),
+        ]),
+        [
+            (CF_UNICODETEXT, ClipboardKind::Text),
+            (0xC123, ClipboardKind::Png)
+        ]
+    );
+    assert_eq!(
+        probe::rdp_select(&[(0xC0AB, Some("image/png")), (1, None)]),
+        [(0xC0AB, ClipboardKind::Png)]
+    );
+    assert_eq!(
+        probe::rdp_select(&[(CF_DIB, None), (CF_DIBV5, None)]),
+        [(CF_DIBV5, ClipboardKind::Dib)]
+    );
+    assert_eq!(
+        probe::rdp_select(&[(CF_DIB, None)]),
+        [(CF_DIB, ClipboardKind::Dib)]
+    );
+    // Plain ANSI text, HTML and file lists are not formats this client fetches.
+    assert!(
+        probe::rdp_select(&[
+            (1, None),
+            (0xC010, Some("HTML Format")),
+            (0xC011, Some("FileGroupDescriptorW"))
+        ])
+        .is_empty()
+    );
+}
+
+/// One remote copy is fetched one request at a time, text before image, and
+/// delivered as one group.
+#[test]
+fn rdp_fetch_delivers_text_and_image_as_one_group() {
+    let text = utf16("remote\r\ntext ✓");
+    let png = b"\x89PNG fake".to_vec();
+    let list = [
+        (CF_UNICODETEXT, None),
+        (0xC0F7, Some("PNG")),
+        (CF_DIB, None),
+    ];
+    let (requested, events) = probe::rdp_fetch(&[
+        Step::FormatList(&list),
+        Step::Response(Some(&text)),
+        Step::Response(Some(&png)),
+    ]);
+    assert_eq!(requested, [CF_UNICODETEXT, 0xC0F7]);
+    assert_eq!(
+        events,
+        [Event::Clipboard {
+            entries: vec![
+                ClipboardEntry::text("remote\r\ntext ✓"),
+                ClipboardEntry::png(png.clone()),
+            ]
+        }]
+    );
+
+    // A failed answer drops that format only; the rest of the group still arrives.
+    let (requested, events) = probe::rdp_fetch(&[
+        Step::FormatList(&list),
+        Step::Response(None),
+        Step::Response(Some(&png)),
+    ]);
+    assert_eq!(requested, [CF_UNICODETEXT, 0xC0F7]);
+    assert_eq!(
+        events,
+        [Event::Clipboard {
+            entries: vec![ClipboardEntry::png(png.clone())]
+        }]
+    );
+
+    // Nothing usable is no event at all, not an empty group.
+    let (requested, events) = probe::rdp_fetch(&[
+        Step::FormatList(&[(CF_UNICODETEXT, None)]),
+        Step::Response(None),
+    ]);
+    assert_eq!(requested, [CF_UNICODETEXT]);
+    assert!(events.is_empty(), "{events:?}");
+}
+
+/// A newer copy voids the unfinished one. The answer still outstanding is dropped
+/// instead of being credited to the new copy's request, and only then does the new
+/// fetch start.
+#[test]
+fn a_newer_rdp_format_list_voids_the_unfinished_group() {
+    let old_text = utf16("old");
+    let new_dib = vec![40u8, 0, 0, 0, 1, 2, 3];
+    let (requested, events) = probe::rdp_fetch(&[
+        Step::FormatList(&[(CF_UNICODETEXT, None), (CF_DIB, None)]),
+        Step::FormatList(&[(CF_DIB, None)]),
+        Step::Response(Some(&old_text)),
+        Step::Response(Some(&new_dib)),
+    ]);
+    assert_eq!(
+        requested,
+        [CF_UNICODETEXT, CF_DIB],
+        "one request in flight at a time"
+    );
+    assert_eq!(
+        events,
+        [Event::Clipboard {
+            entries: vec![ClipboardEntry::dib(new_dib.clone())]
+        }]
+    );
+}
+
+/// An entry over its bound is skipped and reported, and the rest of the group is
+/// still delivered.
+#[test]
+fn an_oversized_remote_rdp_entry_is_skipped_and_reported() {
+    let image = vec![7u8; shellune_desktop::MAX_CLIPBOARD_IMAGE_BYTES + 1];
+    let text = utf16("small");
+    let (_, events) = probe::rdp_fetch(&[
+        Step::FormatList(&[(CF_UNICODETEXT, None), (CF_DIB, None)]),
+        Step::Response(Some(&text)),
+        Step::Response(Some(&image)),
+    ]);
+    assert_eq!(
+        events,
+        [
+            Event::Clipboard {
+                entries: vec![ClipboardEntry::text("small")]
+            },
+            Event::Notice {
+                notice: Notice::ClipboardTooLarge
+            },
+        ]
+    );
+    let long = utf16(&"a".repeat(shellune_desktop::MAX_CLIPBOARD_TEXT_BYTES + 1));
+    let (_, events) = probe::rdp_fetch(&[
+        Step::FormatList(&[(CF_UNICODETEXT, None)]),
+        Step::Response(Some(&long)),
+    ]);
+    assert_eq!(
+        events,
+        [Event::Notice {
+            notice: Notice::ClipboardTooLarge
+        }]
+    );
+}
+
+/// The text encodings the backends use: CF_UNICODETEXT is UTF-16LE with CRLF line
+/// ends and a terminating NUL; RFB cut text is Latin-1.
+#[test]
+fn clipboard_text_encodings_round_trip() {
+    assert_eq!(
+        probe::utf8_to_cf_unicode("a\nb\r\nc😀"),
+        utf16("a\r\nb\r\nc😀")
+    );
+    assert_eq!(probe::utf8_to_cf_unicode(""), [0, 0]);
+    assert_eq!(
+        probe::cf_unicode_to_utf8(&utf16("héllo\r\n世界😀")).as_deref(),
+        Some("héllo\r\n世界😀".as_bytes())
+    );
+    // Up to the first NUL; an odd trailing byte and a lone surrogate do no harm.
+    let mut raw = utf16("ab");
+    raw.extend_from_slice(&utf16("ignored"));
+    assert_eq!(probe::cf_unicode_to_utf8(&raw).as_deref(), Some(&b"ab"[..]));
+    assert_eq!(
+        probe::cf_unicode_to_utf8(&[0x00, 0xD8, 0x41, 0x00, 0x42]).as_deref(),
+        Some("\u{FFFD}A".as_bytes())
+    );
+
+    assert_eq!(
+        probe::utf8_to_latin1("café ÿ").as_deref(),
+        Some(&b"caf\xe9 \xff"[..])
+    );
+    assert_eq!(probe::utf8_to_latin1("日本"), None);
+    assert_eq!(
+        probe::utf8_to_latin1("€"),
+        None,
+        "the euro sign is not Latin-1"
+    );
+    assert_eq!(
+        probe::latin1_to_utf8(b"caf\xe9").as_deref(),
+        Some("café".as_bytes())
+    );
+}
+
+// ---------------------------------------------------------- VNC clipboard
+
+fn connect_vnc(peer: &Scripted, clipboard: bool) -> DesktopClient {
+    let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
+    client.set_server("127.0.0.1", peer.port).expect("server");
+    client.set_size(2, 2).expect("size");
+    client.set_clipboard(clipboard).expect("clipboard switch");
+    client.connect().expect("connect starts");
+    client
+}
+
+fn cut_texts(peer: &Scripted) -> Vec<ClientMessage> {
+    peer.messages()
+        .into_iter()
+        .filter(|message| {
+            matches!(
+                message,
+                ClientMessage::CutText(_) | ClientMessage::ExtendedCutText { .. }
+            )
+        })
+        .collect()
+}
+
+/// A server with the extended clipboard gets and gives UTF-8: the client asks for
+/// the extension, receives the peer's text without its terminating NUL, and sends
+/// its own as Notify + Provide. Images are not RFB's to carry.
+#[test]
+fn a_vnc_peer_with_extended_clipboard_exchanges_utf8_both_ways() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [9, 9, 9, 0],
+        clipboard: Some(Cut::Utf8("远端 ✓ text")),
+        extended: true,
+    });
+    let mut client = connect_vnc(&peer, true);
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Clipboard { .. })
+    });
+    assert_eq!(texts(&events), ["远端 ✓ text"], "{events:?}");
+    assert!(
+        peer.messages().iter().any(
+            |message| matches!(message, ClientMessage::Encodings(list) if list.contains(&EXTENDED_CLIPBOARD))
+        ),
+        "the client asked for the extension: {:?}",
+        peer.messages()
+    );
+
+    when_connected(&mut client, |client| {
+        client.push_clipboard(&[
+            ClipboardEntry::text("本机 ✓ naïve"),
+            ClipboardEntry::png(b"\x89PNG".to_vec()),
+        ])
+    });
+    let provided = ClientMessage::ExtendedCutText {
+        flags: EXT_PROVIDE | EXT_TEXT,
+        text: Some("本机 ✓ naïve".to_owned()),
+    };
+    assert!(peer.wait_for(provided.clone()), "{:?}", peer.messages());
+    assert_eq!(
+        cut_texts(&peer),
+        [
+            ClientMessage::ExtendedCutText {
+                flags: EXT_NOTIFY | EXT_TEXT,
+                text: None
+            },
+            provided
+        ],
+        "exactly one text went out, and no classic cut text"
+    );
+    drop(client);
+    assert_eq!(leaked_handles(), 0);
+}
+
+/// A server without the extended clipboard speaks Latin-1: its cut text is decoded
+/// as such, text that fits is sent as Latin-1, and text that does not is not sent at
+/// all and reported once.
+#[test]
+fn a_vnc_peer_without_extended_clipboard_gets_latin1_or_a_notice() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [9, 9, 9, 0],
+        clipboard: Some(Cut::Latin1(b"caf\xe9 cr\xe8me")),
+        extended: false,
+    });
+    let mut client = connect_vnc(&peer, true);
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Clipboard { .. })
+    });
+    assert_eq!(texts(&events), ["café crème"], "{events:?}");
+
+    when_connected(&mut client, |client| client.clipboard("naïve"));
+    assert!(
+        peer.wait_for(ClientMessage::CutText(b"na\xefve".to_vec())),
+        "{:?}",
+        peer.messages()
+    );
+
+    client.clipboard("日本語").expect("queued");
+    let events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Notice { .. })
+    });
+    assert_eq!(
+        notices(&events),
+        [Notice::ClipboardLatin1Only],
+        "{events:?}"
+    );
+    client.clipboard("Grüße").expect("queued");
+    assert!(
+        peer.wait_for(ClientMessage::CutText(b"Gr\xfc\xdfe".to_vec())),
+        "{:?}",
+        peer.messages()
+    );
+    client.clipboard("中文").expect("queued");
+    client.clipboard("ok").expect("queued");
+    assert!(peer.wait_for(ClientMessage::CutText(b"ok".to_vec())));
+    assert_eq!(
+        cut_texts(&peer),
+        [
+            ClientMessage::CutText(b"na\xefve".to_vec()),
+            ClientMessage::CutText(b"Gr\xfc\xdfe".to_vec()),
+            ClientMessage::CutText(b"ok".to_vec()),
+        ],
+        "text outside Latin-1 never reached the server"
+    );
+    let later = pump(&client, Duration::from_millis(300), |_| false);
+    assert!(
+        notices(&later).is_empty(),
+        "the notice is said once per session: {later:?}"
+    );
+}
+
+/// Sharing off: the client does not ask for the extension, drops the server's cut
+/// text, and refuses to send.
+#[test]
+fn a_vnc_session_with_clipboard_off_neither_sends_nor_receives() {
+    if !backends_built() {
+        return;
+    }
+    let peer = Scripted::start(Script::Session {
+        width: 2,
+        height: 2,
+        pixel: [9, 9, 9, 0],
+        clipboard: Some(Cut::Latin1(b"secret")),
+        extended: true,
+    });
+    let client = connect_vnc(&peer, false);
+    let mut events = pump(&client, PATIENCE, |event| {
+        matches!(event, Event::Frame { .. })
+    });
+    events.extend(pump(&client, Duration::from_millis(500), |_| false));
+    assert!(states(&events).contains(&State::Connected), "{events:?}");
+    assert!(texts(&events).is_empty(), "nothing received: {events:?}");
+    assert!(matches!(
+        client.clipboard("local"),
+        Err(Error::Unavailable(_))
+    ));
+    assert!(
+        !peer.messages().iter().any(
+            |message| matches!(message, ClientMessage::Encodings(list) if list.contains(&EXTENDED_CLIPBOARD))
+        ),
+        "the extension was not requested: {:?}",
+        peer.messages()
+    );
+    assert!(cut_texts(&peer).is_empty(), "{:?}", peer.messages());
 }
 
 /// Covers a clipboard and first frame buffered together. The worker must consume
@@ -636,7 +1488,8 @@ fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
         width: 4,
         height: 3,
         pixel,
-        clipboard: Some("from the peer"),
+        clipboard: Some(Cut::Latin1(b"from the peer")),
+        extended: false,
     });
 
     let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
@@ -683,7 +1536,7 @@ fn a_scripted_vnc_peer_delivers_a_frame_clipboard_and_accepts_input() {
     assert!(
         clipboard
             .iter()
-            .any(|event| matches!(event, Event::Clipboard { text } if text == "from the peer")),
+            .any(|event| texts(std::slice::from_ref(event)) == ["from the peer"]),
         "clipboard text: {clipboard:?}"
     );
 
@@ -749,6 +1602,7 @@ fn a_panicking_consumer_callback_cannot_unwind_into_the_library() {
         height: 2,
         pixel: [0x40, 0x50, 0x60, 0x00],
         clipboard: None,
+        extended: false,
     });
 
     let before = callback_panics();
@@ -803,6 +1657,7 @@ fn dropping_a_session_detaches_before_it_frees() {
         height: 2,
         pixel: [0x01, 0x02, 0x03, 0x00],
         clipboard: None,
+        extended: false,
     });
     let mut client = DesktopClient::new(Protocol::Vnc).expect("client");
     client.set_server("127.0.0.1", peer.port).expect("server");
