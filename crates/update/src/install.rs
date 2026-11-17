@@ -126,10 +126,9 @@ pub fn route_for(
     };
     match (os, arch) {
         ("windows", "x86_64") => {
-            let installed = executable
-                .parent()
+            let installed = windows_parent(executable)
                 .zip(install_dir)
-                .is_some_and(|(folder, installed)| same_folder(folder, installed, true));
+                .is_some_and(|(folder, installed)| same_folder(&folder, installed, true));
             let executable = executable.to_path_buf();
             if installed {
                 InstallRoute::WindowsInstaller { executable }
@@ -474,6 +473,14 @@ fn app_bundle_of(executable: &Path) -> Option<PathBuf> {
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
     (named(macos, "MacOS") && named(contents, "Contents") && is_app).then(|| bundle.to_path_buf())
+}
+
+/// The folder of a Windows executable path, split on either separator. `Path::parent`
+/// only knows `\` on Windows, and the route is also decided (and tested) elsewhere.
+fn windows_parent(executable: &Path) -> Option<PathBuf> {
+    let text = executable.to_string_lossy();
+    let cut = text.rfind(['\\', '/'])?;
+    Some(PathBuf::from(&text[..cut]))
 }
 
 /// Whether two folders are the same: by their resolved paths when both exist,
