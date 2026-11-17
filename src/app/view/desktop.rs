@@ -26,7 +26,7 @@ use crate::app::desktop::{
     clamp_pan, content_rect, encryption_note, key_codes, to_remote_in,
 };
 use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Metrics, Tone, palette, radius, spacing};
+use crate::app::theme::{self, Elevated, Metrics, Tone, palette, spacing};
 
 /// The size a session asks for before the window has measured anything.
 ///
@@ -961,44 +961,33 @@ impl DesktopPane {
                 },
             ),
         };
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::TIGHT))
-            .p(metrics.scale(spacing::SNUG))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .debug_selector(|| "desktop.status".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(icons::icon(Icon::Monitor, metrics.scale(14.0), tone.text()))
-                    .child(
-                        div()
-                            .text_size(metrics.scale(13.0))
-                            .text_color(tone.text())
-                            .child(SharedString::from(headline)),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(metrics.scale(12.0))
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(SharedString::from(detail)),
-            );
+        // The shared state card: the place the picture will be is a section that is
+        // waiting, live or ended, so it is drawn like every other such section (R6).
+        let mut card = components::state_card_with_icon(
+            tone,
+            Some(Icon::Monitor),
+            headline,
+            detail,
+            None,
+            metrics,
+        )
+        .debug_selector(|| "desktop.status".to_owned());
         if let Some(problem) = &self.send_problem {
             card = card.child(
                 div()
-                    .text_size(metrics.scale(12.0))
+                    .max_w(metrics.scale(480.0))
+                    .whitespace_normal()
+                    .text_center()
+                    .text_size(metrics.label_size())
                     .text_color(Tone::Warning.text())
                     .child(SharedString::from(problem.clone())),
             );
         }
-        card
+        div()
+            .w_full()
+            .max_w(metrics.scale(560.0))
+            .px(metrics.scale(spacing::LOOSE))
+            .child(card)
     }
 
     /// The strip that says a send did not reach the remote side (R18).
@@ -1011,31 +1000,35 @@ impl DesktopPane {
     /// so a lost paste stays on screen long enough to be read.
     fn notice_strip(&self, metrics: Metrics) -> Option<gpui::Div> {
         let problem = self.send_problem.as_ref()?;
+        // The warning banner, lifted onto the picture: it floats over a remote
+        // screen whose colours are not ours, so it carries the floating layer's
+        // shadow to stay apart from it (R6).
         Some(
-            div()
+            components::banner(Tone::Warning, metrics)
                 .absolute()
                 .top_0()
                 .left_0()
+                .w(gpui::Length::Auto)
                 .m(metrics.scale(spacing::TIGHT))
                 .max_w(px(420.0))
-                .flex()
+                .flex_row()
                 .items_center()
                 .gap(metrics.scale(spacing::TIGHT))
-                .p(metrics.scale(spacing::TIGHT))
-                .rounded(px(radius::MEDIUM))
-                .bg(theme::swatch(palette::CHROME))
-                .border_1()
-                .border_color(Tone::Warning.text())
+                .elevation(theme::Elevation::Mid)
+                .occlude()
                 .debug_selector(|| "desktop.notice".to_owned())
                 .child(icons::icon(
                     Icon::Monitor,
-                    metrics.scale(12.0),
+                    metrics.small_icon_size(),
                     Tone::Warning.text(),
                 ))
                 .child(
                     div()
-                        .text_size(metrics.scale(11.0))
-                        .text_color(Tone::Warning.text())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .whitespace_normal()
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
                         .child(SharedString::from(problem.clone())),
                 ),
         )
@@ -1057,19 +1050,13 @@ impl DesktopPane {
         } else {
             strings.desktop_fullscreen_enter
         };
-        div()
+        // The shared floating bar with the toolbar's compact buttons: the controls float
+        // over a picture that is not ours, like a menu floats over the page (R6).
+        components::floating_bar(metrics)
             .absolute()
             .top_0()
             .right_0()
             .m(metrics.scale(spacing::TIGHT))
-            .flex()
-            .items_center()
-            .gap(metrics.scale(spacing::TIGHT))
-            .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "desktop.controls".to_owned())
             // A press on a control belongs to the control: the picture underneath
             // is not clicked at the same time.
@@ -1078,32 +1065,49 @@ impl DesktopPane {
                 cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
             )
             .child(
-                components::button(strings.desktop_zoom_out, Variant::Ghost, metrics)
+                components::compact_button(strings.desktop_zoom_out, Variant::Ghost, metrics)
                     .id(SharedString::from("desktop.zoom.out"))
                     .debug_selector(|| "desktop.zoom.out".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| this.zoom_out(cx))),
             )
             .child(
                 div()
-                    .px(metrics.scale(spacing::TIGHT))
-                    .text_size(metrics.scale(11.0))
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                    .flex_none()
+                    .min_w(metrics.scale(44.0))
+                    .px(metrics.scale(spacing::HAIRLINE))
+                    .text_center()
+                    .text_size(metrics.caption_size())
+                    .font_weight(metrics.medium_weight())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .debug_selector(|| "desktop.zoom.label".to_owned())
                     .child(SharedString::from(zoom)),
             )
             .child(
-                components::button(strings.desktop_zoom_in, Variant::Ghost, metrics)
+                components::compact_button(strings.desktop_zoom_in, Variant::Ghost, metrics)
                     .id(SharedString::from("desktop.zoom.in"))
                     .debug_selector(|| "desktop.zoom.in".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| this.zoom_in(cx))),
             )
+            .child(components::divider_vertical(metrics).mx(metrics.scale(spacing::HAIRLINE)))
             .child(
-                components::button(fullscreen, Variant::Ghost, metrics)
-                    .id(SharedString::from("desktop.fullscreen"))
-                    .debug_selector(|| "desktop.fullscreen".to_owned())
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.toggle_fullscreen(window, cx);
-                    })),
+                components::icon_label_button(
+                    if self.fullscreen {
+                        Icon::Restore
+                    } else {
+                        Icon::Maximize
+                    },
+                    fullscreen,
+                    Variant::Ghost,
+                    metrics,
+                )
+                .h(metrics.compact_control_height())
+                .px(metrics.scale(spacing::TIGHT))
+                .text_size(metrics.label_size())
+                .id(SharedString::from("desktop.fullscreen"))
+                .debug_selector(|| "desktop.fullscreen".to_owned())
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.toggle_fullscreen(window, cx);
+                })),
             )
     }
 
@@ -1113,47 +1117,57 @@ impl DesktopPane {
             return div();
         };
         let fingerprint = question.fingerprint.clone();
-        div()
-            .flex()
-            .flex_col()
-            .gap(metrics.scale(spacing::TIGHT))
-            .p(metrics.scale(spacing::SNUG))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
-            .border_color(Tone::Warning.text())
+        // A question about the server's identity: the shared card on the floating layer,
+        // with the warning tile a dialog's question carries and the answers at its foot
+        // (R6).
+        components::card(metrics)
+            .occlude()
+            .w_full()
+            .max_w(metrics.scale(480.0))
+            .bg(theme::swatch(palette::RAISED))
+            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .elevation(theme::Elevation::Mid)
             .debug_selector(|| "desktop.certificate".to_owned())
             .child(
                 div()
-                    .text_size(metrics.scale(13.0))
-                    .child(SharedString::from(question.summary())),
-            )
-            .child(
-                div()
-                    .text_size(metrics.scale(11.0))
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .child(SharedString::from(fingerprint)),
+                    .flex()
+                    .items_start()
+                    .gap(metrics.scale(spacing::SNUG))
+                    .child(components::modal_icon(
+                        Icon::Lock,
+                        Some(Tone::Warning),
+                        metrics,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap(metrics.scale(spacing::HAIRLINE))
+                            .child(
+                                div()
+                                    .whitespace_normal()
+                                    .text_size(metrics.body_size())
+                                    .font_weight(metrics.medium_weight())
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .child(SharedString::from(question.summary())),
+                            )
+                            .child(
+                                components::endpoint(fingerprint, metrics)
+                                    .whitespace_normal()
+                                    .text_size(metrics.caption_size()),
+                            ),
+                    ),
             )
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .justify_end()
                     .gap(metrics.scale(spacing::TIGHT))
                     .child(
-                        components::button(
-                            strings.desktop_certificate_trust,
-                            Variant::Primary,
-                            metrics,
-                        )
-                        .id(SharedString::from("desktop.certificate.trust"))
-                        .debug_selector(|| "desktop.certificate.trust".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.answer_certificate(true, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        components::button(
+                        components::compact_button(
                             strings.desktop_certificate_reject,
                             Variant::Danger,
                             metrics,
@@ -1163,6 +1177,20 @@ impl DesktopPane {
                         .on_click(cx.listener(
                             |this, _event, _window, cx| {
                                 this.answer_certificate(false, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        components::compact_button(
+                            strings.desktop_certificate_trust,
+                            Variant::Primary,
+                            metrics,
+                        )
+                        .id(SharedString::from("desktop.certificate.trust"))
+                        .debug_selector(|| "desktop.certificate.trust".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.answer_certificate(true, cx);
                             },
                         )),
                     ),

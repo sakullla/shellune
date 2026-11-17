@@ -733,6 +733,8 @@ impl ShelluneView {
     /// The palette over a dimmed window.
     pub(super) fn palette_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let field = self.palette.clone()?;
+        // Its dimming fades out when it closes, like a dialog's does (R5, R6).
+        self.modal_drawn.set(true);
         let metrics = self.metrics();
         let strings = self.strings();
         let viewport = window.viewport_size();
@@ -787,22 +789,15 @@ impl ShelluneView {
                 .child(components::keycap(keys, metrics))
                 .child(label)
         };
-        let panel = div()
+        // The palette is a dialog-level layer: the same surface as every dialog, and it
+        // settles into place like one (R6).
+        let panel = components::dialog_surface()
             .id("palette")
             .debug_selector(|| "palette".to_owned())
             .absolute()
             .top(viewport.height * 0.12)
             .left((viewport.width - width) / 2.0)
             .w(width)
-            .flex()
-            .flex_col()
-            .rounded(px(radius::XLARGE))
-            .bg(theme::swatch(colors::OVERLAY))
-            .border_1()
-            .border_color(theme::swatch(colors::BORDER_STRONG))
-            .shadow(theme::Elevation::High.shadows())
-            .overflow_hidden()
-            .occlude()
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.palette_key(event, window, cx);
             }))
@@ -863,7 +858,7 @@ impl ShelluneView {
                                 }),
                             ),
                     )
-                    .child(panel),
+                    .child(theme::enter(panel, "palette.enter", theme::Enter::Settle)),
             ),
         )
     }
@@ -1067,56 +1062,19 @@ impl ShelluneView {
         let strings = self.strings();
         let ux = copy::ux();
         let viewport = window.viewport_size();
+        // The shared menu entry and card: a host's menu is the same object as a tab's
+        // or a file's (R6).
         let item = |label: &'static str, selector: &'static str, danger: bool| {
-            let hover = if danger {
-                theme::swatch(Tone::Danger.tint())
-            } else {
-                theme::swatch(colors::SURFACE_HOVER)
-            };
-            div()
-                .id(selector)
-                .debug_selector(move || selector.to_owned())
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(metrics.scale(spacing::BASE))
-                .h(metrics.scale(30.0))
-                .px(metrics.scale(spacing::TIGHT + 2.0))
-                .rounded(px(radius::MEDIUM))
-                .text_size(metrics.label_size())
-                .text_color(if danger {
-                    Tone::Danger.text()
-                } else {
-                    theme::swatch(colors::TEXT_PRIMARY)
-                })
-                .cursor_pointer()
-                .hover(move |style| style.bg(hover))
-                .child(label)
+            components::menu_entry(label, selector, None, true, danger, metrics)
         };
-        let divider = || {
-            div()
-                .h(px(1.0))
-                .mx(metrics.scale(spacing::HAIRLINE))
-                .my(metrics.scale(2.0))
-                .bg(theme::swatch(colors::BORDER))
-        };
+        let divider = || components::menu_divider(metrics);
         let max_height =
             (viewport.height - metrics.header_height() - metrics.scale(spacing::LOOSE))
                 .max(metrics.scale(120.0));
-        let mut menu = div()
+        let mut menu = components::menu_card("host.menu", metrics)
             .id("host.menu")
-            .debug_selector(|| "host.menu".to_owned())
-            .flex()
-            .flex_col()
-            .min_w(metrics.scale(200.0))
             .max_h(max_height)
             .overflow_y_scroll()
-            .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(colors::RAISED))
-            .border_1()
-            .border_color(theme::swatch(colors::BORDER_STRONG))
-            .shadow(theme::Elevation::Mid.shadows())
             .child(
                 item(strings.remote_connect, "host.menu.connect", false).on_click(cx.listener(
                     move |this, _event, window, cx| {
@@ -1216,7 +1174,11 @@ impl ShelluneView {
                                 metrics.header_height() + metrics.scale(2.0),
                             ))
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                            .child(div().occlude().child(menu)),
+                            .child(
+                                div()
+                                    .occlude()
+                                    .child(components::menu_enter(menu, "host.menu.enter")),
+                            ),
                     ),
             ),
         )
@@ -1307,16 +1269,8 @@ impl ShelluneView {
                     icon: Icon,
                     shortcut: Option<String>,
                     enabled: bool| {
-            components::menu_entry(label, selector, Some(icon), enabled, false, metrics).children(
-                shortcut.map(|shortcut| {
-                    div()
-                        .ml_auto()
-                        .pl(metrics.scale(spacing::BASE))
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(colors::TEXT_MUTED))
-                        .child(shortcut)
-                }),
-            )
+            components::menu_entry(label, selector, Some(icon), enabled, false, metrics)
+                .children(shortcut.map(|shortcut| components::menu_shortcut(shortcut, metrics)))
         };
         let divider = || components::menu_divider(metrics);
 
@@ -1485,7 +1439,11 @@ impl ShelluneView {
                                 metrics.header_height() + metrics.scale(2.0),
                             ))
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                            .child(div().occlude().child(menu)),
+                            .child(
+                                div()
+                                    .occlude()
+                                    .child(components::menu_enter(menu, "tab.menu.enter")),
+                            ),
                     ),
             ),
         )

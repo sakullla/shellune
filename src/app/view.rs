@@ -1735,6 +1735,93 @@ impl ShelluneView {
         self.toggle_tab_list(window, cx);
     }
 
+    /// Opens the right-click menu of the tab on screen at `position`, the way a right
+    /// click on the tab does, for a capture (R6). Nothing in it is run.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_open_tab_menu(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let layout = self.workspace.layout();
+        let anchor = (0..layout.tabs().len())
+            .filter_map(|index| layout.anchor_of(index))
+            .find(|anchor| Some(*anchor) == layout.active_session())
+            .ok_or_else(|| "the tab on screen has no session to open a menu for".to_owned())?;
+        self.shell_menu_open = false;
+        self.tab_menu = Some((anchor, position));
+        cx.notify();
+        Ok(())
+    }
+
+    /// Opens the right-click menu of the first saved host at `position`, for a capture
+    /// (R6). Nothing in it is run.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_open_host_menu(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let id = self
+            .book
+            .hosts()
+            .first()
+            .map(HostConfig::id)
+            .ok_or_else(|| "no saved host to open a menu for".to_owned())?;
+        self.hosts_cursor = Some(id);
+        self.host_menu = Some((id, position));
+        cx.notify();
+        Ok(())
+    }
+
+    /// Opens the right-click menu of one server file at `position`, for a capture (R6).
+    /// The entry is named, not read from a listing; nothing in the menu is run.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_open_files_menu(
+        &mut self,
+        id: SessionId,
+        name: &str,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_files_menu(
+            id,
+            FileSource::Remote,
+            Some(files_menu::MenuEntry {
+                name: name.to_owned(),
+                kind: shellune_core::FileKind::File,
+                folder: false,
+            }),
+            position,
+            cx,
+        );
+    }
+
+    /// Opens the menu of the header's shell control, for a capture (R6).
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_open_shell_menu(&mut self, cx: &mut Context<Self>) {
+        self.shell_menu_home = false;
+        self.shell_menu_open = true;
+        cx.notify();
+    }
+
+    /// Which menu is open over the page, for a capture (R6).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_menu(&self) -> Option<&'static str> {
+        if self.tab_menu.is_some() {
+            Some("tab.menu")
+        } else if self.host_menu.is_some() {
+            Some("host.menu")
+        } else if self.files_menu.is_some() {
+            Some("files.menu")
+        } else if self.shell_menu_open {
+            Some("shell.picker")
+        } else {
+            None
+        }
+    }
+
     /// A file source a capture scripts: fixed listings, no disk and no server (R2).
     ///
     /// Every request is answered from the fixture, so a shot of a directory really is the
@@ -11850,35 +11937,14 @@ impl ShelluneView {
             self.shell_menu_anchor.get()
         };
 
-        let section = |label: &'static str| {
-            div()
-                .px(metrics.scale(spacing::TIGHT))
-                .pt(metrics.scale(spacing::HAIRLINE + 2.0))
-                .pb(metrics.scale(2.0))
-                .text_size(metrics.caption_size())
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::swatch(palette::TEXT_MUTED))
-                .child(label)
-        };
-        let divider = || {
-            div()
-                .h(px(1.0))
-                .mx(metrics.scale(spacing::HAIRLINE))
-                .my(metrics.scale(spacing::HAIRLINE))
-                .bg(theme::swatch(palette::BORDER))
-        };
+        // The shared menu card, headings and dividers: the picker is the same object as
+        // every other menu (R6). Its entries are richer than a command - a shell's program
+        // and the current choice - so they keep their own line, on the menu's faces.
+        let section = |label: &'static str| components::menu_section(label, metrics);
+        let divider = || components::menu_divider(metrics);
 
-        let mut menu = div()
-            .flex()
-            .flex_col()
+        let mut menu = components::menu_card("shell.picker", metrics)
             .w(metrics.scale(320.0))
-            .p(metrics.scale(spacing::HAIRLINE + 1.0))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow(theme::Elevation::Mid.shadows())
-            .debug_selector(|| "shell.picker".to_owned())
             .child(section(ux.home_local_section));
 
         if self.workspace.shells().is_empty() {
@@ -12042,7 +12108,11 @@ impl ShelluneView {
                                 anchor.bottom() + metrics.scale(spacing::HAIRLINE + 2.0),
                             ))
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                            .child(div().occlude().child(menu)),
+                            .child(
+                                div()
+                                    .occlude()
+                                    .child(components::menu_enter(menu, "shell.picker.enter")),
+                            ),
                     ),
             ),
         )
@@ -12059,18 +12129,22 @@ impl ShelluneView {
         selected: bool,
     ) -> Div {
         let metrics = self.metrics();
-        let hover = theme::swatch(palette::SURFACE_HOVER);
+        // The hover is the menu entry's own, so this richer line answers the pointer
+        // the way every other menu entry does.
+        let hover = components::menu_item_face(components::ControlState::Hovered);
+        let (hover_fill, hover_text) = (hover.fill_color(), hover.text_color());
         div()
             .flex()
+            .flex_none()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT + 2.0))
             .h(metrics.scale(34.0))
             .px(metrics.scale(spacing::TIGHT))
-            .rounded(px(radius::MEDIUM))
+            .rounded(px(radius::MEDIUM - 2.0))
             .text_size(metrics.label_size())
             .text_color(theme::swatch(palette::TEXT_PRIMARY))
             .cursor_pointer()
-            .hover(move |style| style.bg(hover))
+            .hover(move |style| style.bg(hover_fill).text_color(hover_text))
             .child(
                 div()
                     .flex()
@@ -14458,22 +14532,33 @@ impl ShelluneView {
                 move |view, cx| view.reconnect_session(id, cx),
             ));
         }
-        let mut card = div()
-            .flex()
-            .flex_col()
+        // The shared card, headed like a failed state: the tone's tile and the plain
+        // sentence, the reason and the ways on under it (R6).
+        let mut card = components::card(metrics)
             .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::SMALL))
-            .p(metrics.scale(spacing::TIGHT))
-            .bg(theme::swatch(palette::CHROME))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
+            .gap(metrics.scale(spacing::TIGHT))
+            .p(metrics.scale(spacing::SNUG))
             .debug_selector(move || failure_id.to_string())
             .child(
                 div()
-                    .text_size(metrics.label_size())
-                    .text_color(Tone::Danger.text())
-                    .child(SharedString::from(strings.files_failed)),
+                    .flex()
+                    .items_center()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .child(components::modal_icon(
+                        Icon::FolderOpen,
+                        Some(Tone::Danger),
+                        metrics,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
+                            .text_size(metrics.body_size())
+                            .font_weight(metrics.medium_weight())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(strings.files_failed)),
+                    ),
             )
             .child(
                 div()
@@ -15664,19 +15749,34 @@ impl ShelluneView {
         // control the keyboard just reached into its slice (R4).
         let mut rows: Vec<(Vec<FilesStop>, Div)> = Vec::new();
 
-        let heading = match dialog {
-            FilesDialog::NewDirectory { .. } => strings.files_new,
-            FilesDialog::Rename { .. } => strings.files_rename,
-            FilesDialog::Delete { .. } => strings.files_delete,
-            FilesDialog::Upload { .. } => strings.transfers_upload,
-            FilesDialog::Download { .. } => strings.transfers_download,
+        let (heading, icon) = match dialog {
+            FilesDialog::NewDirectory { .. } => (strings.files_new, Icon::FolderPlus),
+            FilesDialog::Rename { .. } => (strings.files_rename, Icon::Pencil),
+            FilesDialog::Delete { .. } => (strings.files_delete, Icon::Trash),
+            FilesDialog::Upload { .. } => (strings.transfers_upload, Icon::Upload),
+            FilesDialog::Download { .. } => (strings.transfers_download, Icon::Download),
         };
+        // The question stays in its column, where the keyboard already is, and is headed
+        // the way a dialog is: the action's icon in its tone and the plain words (R6).
         rows.push((
             Vec::new(),
             div()
-                .text_size(metrics.label_size())
+                .flex()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .text_size(metrics.body_size())
+                .font_weight(metrics.medium_weight())
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
                 .debug_selector(|| "files.question.heading".to_owned())
+                .child(icons::icon(
+                    icon,
+                    metrics.icon_size(),
+                    if danger {
+                        Tone::Danger.text()
+                    } else {
+                        theme::swatch(palette::ACCENT)
+                    },
+                ))
                 .child(SharedString::from(heading)),
         ));
 
@@ -15768,17 +15868,19 @@ impl ShelluneView {
                         rows.push((
                             vec![FilesStop::QuestionRecursive],
                             div().flex_none().child(
-                                components::segment(
-                                    format!(
-                                        "{} {}",
-                                        if dialog.recursive() { "[x]" } else { "[ ]" },
-                                        strings.transfers_recursive
-                                    ),
+                                components::checkbox(
+                                    "files.question.recursive",
+                                    strings.transfers_recursive,
                                     dialog.recursive(),
                                     metrics,
                                 )
-                                .flex_1()
-                                .id("files.question.recursive")
+                                .min_h(metrics.hit_target())
+                                .px(metrics.scale(spacing::HAIRLINE))
+                                .rounded(px(radius::SMALL))
+                                // The ring's edge is there unlit, so focus does not
+                                // move the box by a pixel.
+                                .border_1()
+                                .border_color(gpui::transparent_black())
                                 .debug_selector(|| "files.question.recursive".to_owned())
                                 .track_focus(&self.files_question_recursive_focus)
                                 .focus(files_focus_ring)
@@ -16362,36 +16464,53 @@ impl ShelluneView {
         };
         let marked = self.files.marked(id, source);
         let count = marked.len().to_string();
-        let mut bar = components::banner(Tone::Accent, metrics)
+        // The banner is a row here: what the marks cover on the left, the actions on
+        // the right, and the actions wrap under it when the column is narrow (R6).
+        let bar = components::banner(Tone::Accent, metrics)
+            .flex_row()
+            .items_center()
             .flex_wrap()
-            .gap(metrics.scale(spacing::HAIRLINE))
+            .gap(metrics.scale(spacing::TIGHT))
             .debug_selector(move || format!("{prefix}.selection"))
             .child(
                 div()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .debug_selector(move || format!("{prefix}.selection.count"))
-                    .child(SharedString::from(copy::fill(
-                        strings.files_marked_count,
-                        &[("count", &count)],
-                    ))),
-            )
-            // How the marks are made, said once where they are used: a batch that can
-            // only be built by guessing is a batch nobody finds (R14).
-            .child(
-                div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(metrics.caption_size())
-                    .text_color(theme::swatch(palette::TEXT_MUTED))
-                    .id(SharedString::from(format!("{prefix}.selection.hint")))
-                    .child(SharedString::from(strings.files_marked_hint)),
+                    .min_w(metrics.scale(180.0))
+                    .gap(metrics.scale(2.0))
+                    .child(
+                        div()
+                            .text_size(metrics.label_size())
+                            .font_weight(metrics.medium_weight())
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .debug_selector(move || format!("{prefix}.selection.count"))
+                            .child(SharedString::from(copy::fill(
+                                strings.files_marked_count,
+                                &[("count", &count)],
+                            ))),
+                    )
+                    // How the marks are made, said once where they are used: a batch
+                    // that can only be built by guessing is a batch nobody finds (R14).
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                            .id(SharedString::from(format!("{prefix}.selection.hint")))
+                            .child(SharedString::from(strings.files_marked_hint)),
+                    ),
             );
+        let mut actions = div()
+            .flex()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .gap(metrics.scale(spacing::HAIRLINE));
         let is_remote = source == FileSource::Remote;
         let action_id = |name: &str| SharedString::from(format!("{prefix}.mark.{name}"));
         if is_remote {
-            bar = bar.child(self.text_button(
+            actions = actions.child(self.text_button(
                 action_id("download"),
                 copy::fill(strings.files_download_selected, &[("count", &count)]),
                 Variant::Soft,
@@ -16399,7 +16518,7 @@ impl ShelluneView {
                 move |view, cx| view.files_download_marked(id, cx),
             ));
         } else {
-            bar = bar.child(self.text_button(
+            actions = actions.child(self.text_button(
                 action_id("upload"),
                 copy::fill(strings.files_upload_selected, &[("count", &count)]),
                 Variant::Soft,
@@ -16407,7 +16526,7 @@ impl ShelluneView {
                 move |view, cx| view.files_upload_marked(id, cx),
             ));
         }
-        bar = bar
+        actions = actions
             .child(self.text_button(
                 action_id("copy"),
                 copy::fill(strings.files_copy_selected, &[("count", &count)]),
@@ -16433,7 +16552,7 @@ impl ShelluneView {
                     }
                 },
             ));
-        bar
+        bar.child(actions)
     }
     fn files_row(
         &self,
@@ -16612,40 +16731,12 @@ impl ShelluneView {
             ux.files_mark_row
         };
         let mark_name = name.to_owned();
-        let mark_group = SharedString::from(format!("{prefix}.mark.group.{index}"));
-        let mark_accent = theme::swatch(palette::ACCENT);
-        let mark_square = if marked {
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(metrics.scale(15.0))
-                .rounded(px(4.0))
-                .border_1()
-                .bg(mark_accent)
-                .border_color(mark_accent)
-                .child(icons::icon(
-                    Icon::Check,
-                    metrics.scale(11.0),
-                    theme::swatch(palette::ON_ACCENT),
-                ))
-        } else {
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(metrics.scale(15.0))
-                .rounded(px(4.0))
-                .border_1()
-                .border_color(theme::swatch(palette::BORDER_STRONG))
-                .group_hover(mark_group.clone(), move |style| {
-                    style.border_color(mark_accent)
-                })
-        };
+        // The shared checkbox: the mark is a choice like any other box, and its hit
+        // target is the whole square around it (R6, R14).
         let mark_box = div()
             .id(SharedString::from(mark_id.clone()))
             .debug_selector(move || mark_id.clone())
-            .group(mark_group)
+            .group(components::CHECK_GROUP)
             .flex()
             .flex_none()
             .items_center()
@@ -16653,7 +16744,7 @@ impl ShelluneView {
             .size(metrics.hit_target())
             .cursor_pointer()
             .tooltip(components::tooltip(SharedString::from(mark_label)))
-            .child(mark_square)
+            .child(components::checkbox_box(marked, metrics))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |view, _event: &gpui::MouseDownEvent, _window, cx| {
@@ -18635,42 +18726,49 @@ impl Render for ShelluneView {
                     .children(header)
                     .children(notice)
                     .child(self.destination_panel(window, cx)),
-            )
-            // Floating layers, drawn after the page and so above it, the later the
-            // higher. They are plain layers rather than deferred draws, so a field
-            // inside one can still defer its own right-click menu: gpui refuses a
-            // deferred draw inside another.
-            .children(self.connection_overlay(window, cx))
-            .children(self.import_overlay(window, cx))
-            .children(self.tool_overlay(window, cx))
-            .children(self.batch_overlay(window, cx))
-            .children(self.host_dialog_overlay(window, cx))
-            .children(self.connection_dialog_overlay(window, cx))
-            .children(self.group_dialog_overlay(window, cx))
-            .children(self.host_delete_overlay(window, cx))
-            .children(self.backup_overlay(window, cx))
-            .children(self.sync_overlay(window, cx))
-            .children(self.update_overlay(window, cx))
-            .children(self.custom_shell_overlay(window, cx))
-            .children(self.shell_menu_overlay(window, cx))
-            .children(self.files_menu_overlay(window, cx))
-            .children(self.host_menu_overlay(window, cx))
-            .children(self.tab_menu_overlay(window, cx))
-            .children(self.tab_rename_overlay(window, cx))
-            .children(self.tab_list_overlay(window, cx))
-            .children(self.session_menu_overlay(window, cx))
-            .children(self.session_more_overlay(window, cx))
-            .children(self.palette_overlay(window, cx))
-            .children(self.key_capture_overlay(window, cx))
-            .children(self.paste_overlay(window, cx))
+            );
+        // Floating layers, drawn after the page and so above it, the later the
+        // higher. They are plain layers rather than deferred draws, so a field
+        // inside one can still defer its own right-click menu: gpui refuses a
+        // deferred draw inside another. They are built before they are laid down,
+        // so the window knows whether a dialog was drawn in this frame.
+        let layers: Vec<Option<Div>> = vec![
+            self.connection_overlay(window, cx),
+            self.import_overlay(window, cx),
+            self.tool_overlay(window, cx),
+            self.batch_overlay(window, cx),
+            self.host_dialog_overlay(window, cx),
+            self.connection_dialog_overlay(window, cx),
+            self.group_dialog_overlay(window, cx),
+            self.host_delete_overlay(window, cx),
+            self.backup_overlay(window, cx),
+            self.sync_overlay(window, cx),
+            self.update_overlay(window, cx),
+            self.custom_shell_overlay(window, cx),
+            self.shell_menu_overlay(window, cx),
+            self.files_menu_overlay(window, cx),
+            self.host_menu_overlay(window, cx),
+            self.tab_menu_overlay(window, cx),
+            self.tab_rename_overlay(window, cx),
+            self.tab_list_overlay(window, cx),
+            self.session_menu_overlay(window, cx),
+            self.session_more_overlay(window, cx),
+            self.palette_overlay(window, cx),
+            self.key_capture_overlay(window, cx),
+            self.paste_overlay(window, cx),
             // A question asked before work is stopped is answered before anything
             // else: it is drawn over every other layer.
-            .children(self.close_transfer_question(window, cx))
-            .children(self.close_app_question(window, cx));
-        // The dimming of a dialog that just closed fades out over the page, under the
-        // toasts like the dialog was (R5).
+            self.close_transfer_question(window, cx),
+            self.close_app_question(window, cx),
+        ];
+        // The dimming of a dialog that just closed fades out over the page and under
+        // every floating layer: a menu or the palette opened while it fades is drawn
+        // above it, at full strength, rather than dimmed by a dialog that is gone
+        // (R5, R6). The toasts stay above everything, as they were.
         let scrim_exit = self.settle_scrim_exit(window, cx);
-        root.children(scrim_exit).children(self.toast_stack(cx))
+        root.children(scrim_exit)
+            .children(layers.into_iter().flatten())
+            .children(self.toast_stack(cx))
     }
 }
 

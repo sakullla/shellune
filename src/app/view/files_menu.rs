@@ -7,13 +7,14 @@
 //! menu adds a way to reach them, not a second behaviour.
 
 use gpui::prelude::*;
-use gpui::{Context, Div, Pixels, Point, SharedString, Window, div, px};
+use gpui::{Context, Div, Pixels, Point, Window, div};
 
 use super::{ShelluneView, overlay_layer};
+use crate::app::components;
 use crate::app::copy;
 use crate::app::files::FileSource;
-use crate::app::icons::{self, Icon};
-use crate::app::theme::{self, Tone, palette, radius, spacing};
+use crate::app::icons::Icon;
+use crate::app::theme::{Tone, spacing};
 use shellune_core::{FileKind, SessionId};
 
 /// What the menu was opened on.
@@ -262,62 +263,16 @@ impl ShelluneView {
             }
         }
 
-        let mut list = div()
-            .flex()
-            .flex_col()
-            .min_w(metrics.scale(200.0))
-            .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow(theme::Elevation::Mid.shadows())
-            .debug_selector(|| "files.menu".to_owned());
+        // The shared menu card and entries: the file view's menu is the same object as
+        // the tab's and the terminal's (R6).
+        let mut list = components::menu_card("files.menu", metrics);
         for line in lines {
             let Some((label, icon, danger, selector, action)) = line else {
-                list = list.child(
-                    div()
-                        .h(px(1.0))
-                        .mx(metrics.scale(spacing::HAIRLINE))
-                        .my(metrics.scale(2.0))
-                        .bg(theme::swatch(palette::BORDER)),
-                );
+                list = list.child(components::menu_divider(metrics));
                 continue;
             };
-            let hover = theme::swatch(if danger {
-                Tone::Danger.tint()
-            } else {
-                palette::SURFACE_HOVER
-            });
-            let color = if danger {
-                theme::swatch(palette::DANGER)
-            } else {
-                theme::swatch(palette::TEXT_PRIMARY)
-            };
             list = list.child(
-                div()
-                    .id(selector)
-                    .debug_selector(move || selector.to_owned())
-                    .flex()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT + 2.0))
-                    .h(metrics.scale(30.0))
-                    .px(metrics.scale(spacing::TIGHT + 2.0))
-                    .rounded(px(radius::MEDIUM))
-                    .text_size(metrics.label_size())
-                    .text_color(color)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
-                    .child(icons::icon(
-                        icon,
-                        metrics.small_icon_size(),
-                        if danger {
-                            color
-                        } else {
-                            theme::swatch(palette::TEXT_SECONDARY)
-                        },
-                    ))
-                    .child(SharedString::from(label))
+                components::menu_entry(label, selector, Some(icon), true, danger, metrics)
                     .on_click(cx.listener(move |view, _event, _window, cx| {
                         view.files_menu = None;
                         action(view, cx);
@@ -346,7 +301,11 @@ impl ShelluneView {
                         gpui::anchored()
                             .position(menu.position)
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                            .child(div().occlude().child(list)),
+                            .child(
+                                div()
+                                    .occlude()
+                                    .child(components::menu_enter(list, "files.menu.enter")),
+                            ),
                     ),
             ),
         )

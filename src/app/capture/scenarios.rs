@@ -2257,6 +2257,124 @@ fn import_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Menus (R6)
+// ---------------------------------------------------------------------------
+
+/// Where a menu shot asks its menu to open, in the window's logical pixels. The menu
+/// itself is kept inside the window by the same rules a right click uses, so the
+/// smallest window moves it rather than cutting it.
+const MENU_AT: (f32, f32) = (260.0, 120.0);
+
+fn menu_point() -> gpui::Point<gpui::Pixels> {
+    gpui::point(gpui::px(MENU_AT.0), gpui::px(MENU_AT.1))
+}
+
+/// A saved host's terminal ended the way a lost connection ends, with its tab's menu
+/// open, so the menu carries the reconnect entry (R6, R8).
+fn show_tab_menu(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_disconnected(view, window, cx)?;
+    view.capture_open_tab_menu(gpui::point(gpui::px(220.0), gpui::px(40.0)), cx)
+}
+
+fn tab_menu_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    disconnected_ready(view, cx)?;
+    menu_is(view, "tab.menu")
+}
+
+/// The hosts page with the first saved host's right-click menu open (R6).
+fn show_host_menu(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_open_host_menu(gpui::point(gpui::px(560.0), gpui::px(330.0)), cx)
+}
+
+fn host_menu_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    on_page(view, Destination::Hosts, SectionState::Populated)?;
+    menu_is(view, "host.menu")
+}
+
+/// The file view with the right-click menu of one server file open (R6).
+fn show_files_menu(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_files(view, window, cx)?;
+    let id = view
+        .workspace()
+        .layout()
+        .active_session()
+        .ok_or_else(|| "the file view has no session on screen".to_owned())?;
+    view.capture_open_files_menu(
+        id,
+        "构建 产物.tar.zst",
+        gpui::point(gpui::px(900.0), gpui::px(330.0)),
+        cx,
+    );
+    Ok(())
+}
+
+fn files_menu_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    files_ready(view, cx)?;
+    menu_is(view, "files.menu")
+}
+
+/// The terminal with its right-click menu open over the grid (R6).
+fn show_terminal_menu(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_terminal(view, window, cx)?;
+    let pane = view
+        .pane()
+        .cloned()
+        .ok_or_else(|| "the terminal destination has no pane on screen".to_owned())?;
+    pane.update(cx, |pane, cx| pane.capture_open_menu(menu_point(), cx));
+    Ok(())
+}
+
+fn terminal_menu_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    let open = view
+        .pane()
+        .is_some_and(|pane| pane.read(cx).capture_menu_open());
+    if !open {
+        return Err("the terminal's menu is not open".to_owned());
+    }
+    Ok(())
+}
+
+/// The hosts page with the header's shell menu open under its control (R6).
+fn show_shell_menu(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_terminal(view, window, cx)?;
+    view.capture_open_shell_menu(cx);
+    Ok(())
+}
+
+fn shell_menu_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    terminal_ready(view, cx)?;
+    menu_is(view, "shell.picker")
+}
+
+fn menu_is(view: &ShelluneView, wanted: &str) -> Result<(), String> {
+    match view.capture_menu() {
+        Some(open) if open == wanted => Ok(()),
+        other => Err(format!("the open menu is {other:?}, not {wanted}")),
+    }
+}
+
 /// Every scenario, in the order the gallery lists them.
 ///
 /// A later task adds its own entry here (the merged header, the host list, the batch
@@ -3385,6 +3503,87 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_hosts,
         install: show_batch_cancelling,
         ready: batch_cancelling_ready,
+    },
+    Scenario {
+        id: "menu-tab",
+        title: "菜单 · 标签右键菜单",
+        category: Category::Overlay,
+        fixture: "a saved host's display-only terminal ended the way a lost connection ends, \
+                  with its tab's right-click menu opened by the build",
+        evidence: "shows the shared menu card: the reconnect entry first, the commands with \
+                   their icons and shortcuts, the colour row and the disabled moves; no entry \
+                   was pressed and no connection was made",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_tab_menu,
+        ready: tab_menu_ready,
+    },
+    Scenario {
+        id: "menu-host",
+        title: "菜单 · 主机右键菜单",
+        category: Category::Overlay,
+        fixture: "six saved hosts, with the first one's right-click menu opened by the build",
+        evidence: "shows the shared menu card over the hosts page and its danger entry; \
+                   nothing was connected, copied or deleted",
+        quick: false,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::Hosts),
+        prepare: seed_hosts,
+        install: show_host_menu,
+        ready: host_menu_ready,
+    },
+    Scenario {
+        id: "menu-files",
+        title: "菜单 · 文件右键菜单",
+        category: Category::Overlay,
+        fixture: "both file columns answered from fixture listings, with the menu of one \
+                  server file opened by the build",
+        evidence: "shows the shared menu card over the file view and its danger entry; \
+                   nothing was transferred, renamed or deleted",
+        quick: false,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_files_menu,
+        ready: files_menu_ready,
+    },
+    Scenario {
+        id: "menu-terminal",
+        title: "菜单 · 终端右键菜单",
+        category: Category::Overlay,
+        fixture: "the local terminal fed with the transcript fixture, with its right-click \
+                  menu opened by the build",
+        evidence: "shows the shared menu card over the grid with the shortcuts in force and \
+                   copy unavailable while nothing is selected; nothing was copied or pasted",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_terminal_menu,
+        ready: terminal_menu_ready,
+    },
+    Scenario {
+        id: "menu-shell",
+        title: "菜单 · 新建标签下拉菜单",
+        category: Category::Overlay,
+        fixture: "the local terminal with the header's shell menu opened by the build; the \
+                  shells listed are the ones this machine reports",
+        evidence: "shows the shared menu card hanging from its control, its headings and the \
+                   current shell's check; no shell was started",
+        quick: false,
+        variants: &[Variant::dark().chinese(), Variant::dark().smallest()],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_shell_menu,
+        ready: shell_menu_ready,
     },
 ];
 

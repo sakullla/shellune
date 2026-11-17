@@ -1378,7 +1378,69 @@ pub fn menu_entry(
             item.cursor_pointer().hover(move |style| style.bg(hover))
         })
         .children(icon.map(|icon| icons::icon(icon, metrics.small_icon_size(), color)))
+        // The label takes the room, so a shortcut appended after it sits at the far end
+        // without pushing on the gap between the icon and the word.
+        .child(div().flex_1().min_w(px(0.0)).truncate().child(label.into()))
+}
+
+/// The shortcut at the far end of a [`menu_entry`]: the binding in force, quiet, so
+/// the command's own word is what the eye reads first.
+///
+/// The caller names it when a test reads it; an action with no binding draws none.
+pub fn menu_shortcut(label: impl Into<SharedString>, metrics: Metrics) -> Div {
+    div()
+        .flex_none()
+        .pl(metrics.scale(spacing::BASE))
+        .text_size(metrics.caption_size())
+        .text_color(theme::swatch(palette::TEXT_MUTED))
         .child(label.into())
+}
+
+/// The small heading over one group of a [`menu_card`]'s entries.
+pub fn menu_section(label: impl Into<SharedString>, metrics: Metrics) -> Div {
+    div()
+        .flex_none()
+        .px(metrics.scale(spacing::TIGHT + 2.0))
+        .pt(metrics.scale(spacing::HAIRLINE + 2.0))
+        .pb(metrics.scale(2.0))
+        .text_size(metrics.caption_size())
+        .font_weight(metrics.medium_weight())
+        .text_color(theme::swatch(palette::TEXT_MUTED))
+        .child(label.into())
+}
+
+/// A [`menu_card`] with its entrance: it fades in and rises the few pixels into the
+/// place it is anchored at, once per opening (`id` names the opening), and is simply
+/// there under reduced motion.
+///
+/// The rise is a margin on the anchored card, not a move of the anchor, so the menu
+/// still opens where it was asked to and its entries are pressable from the first
+/// frame.
+pub fn menu_enter(
+    menu: impl IntoElement + Styled + 'static,
+    id: impl Into<ElementId>,
+) -> AnyElement {
+    theme::enter(menu, id, Enter::Rise)
+}
+
+/// A bar of controls that floats over a picture or a page: the raised layer with a
+/// strong edge and a mid shadow, like a menu, so it reads as above what it controls.
+///
+/// The remote desktop's zoom and full-screen controls are drawn on it. The caller
+/// places it and adds the controls; a press on the bar stays on the bar.
+pub fn floating_bar(metrics: Metrics) -> Div {
+    div()
+        .occlude()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(metrics.scale(2.0))
+        .p(metrics.scale(spacing::HAIRLINE))
+        .rounded(px(radius::LARGE))
+        .bg(theme::swatch(palette::RAISED))
+        .border_1()
+        .border_color(theme::swatch(palette::BORDER_STRONG))
+        .elevation(Elevation::Mid)
 }
 
 /// The hairline between groups of [`menu_entry`]s.
@@ -1436,6 +1498,24 @@ pub fn dialog_face() -> ControlFace {
         Some(palette::OVERLAY),
         Some(palette::BORDER_STRONG),
         palette::TEXT_PRIMARY,
+    )
+}
+
+/// The surface every dialog-level layer is drawn on - a [`modal`]'s card and the
+/// command palette: the overlay layer with a strong edge, the dialog radius and the
+/// highest elevation, its content clipped to its corners.
+///
+/// It takes no presses through it: what is under a dialog is not reached through it.
+pub fn dialog_surface() -> Div {
+    painted(
+        div()
+            .flex()
+            .flex_col()
+            .rounded(px(radius::XLARGE))
+            .elevation(Elevation::High)
+            .overflow_hidden()
+            .occlude(),
+        dialog_face(),
     )
 }
 
@@ -2119,20 +2199,11 @@ pub fn modal_with(
     let margin = metrics.scale(spacing::LOOSE).min(px(16.0));
     let width = metrics.scale(width).min(viewport.width - margin * 2.0);
     let max_height = viewport.height - margin * 2.0;
-    let dialog = div()
+    let dialog = dialog_surface()
         .id(id)
         .debug_selector(move || id.to_owned())
         .w(width)
         .max_h(max_height)
-        .flex()
-        .flex_col()
-        .rounded(px(radius::XLARGE))
-        .bg(theme::swatch(palette::OVERLAY))
-        .border_1()
-        .border_color(theme::swatch(palette::BORDER_STRONG))
-        .elevation(Elevation::High)
-        .overflow_hidden()
-        .occlude()
         .child(header)
         .child(
             div()
@@ -2476,6 +2547,17 @@ mod tests {
                 false,
                 metrics,
             ));
+        let _ = menu_enter(
+            menu_card("menu", metrics)
+                .child(menu_section("Local", metrics))
+                .child(
+                    menu_entry("Copy", "menu.copy", None, true, false, metrics)
+                        .child(menu_shortcut("Ctrl+Shift+C", metrics)),
+                ),
+            "menu.enter",
+        );
+        let _ = floating_bar(metrics).child(compact_button("Fit", Variant::Ghost, metrics));
+        let _ = dialog_surface().child(div());
         let _ = empty_state(
             Icon::Server,
             "No hosts yet",

@@ -400,62 +400,34 @@ impl ShelluneView {
         let rows = self.forwards.rows();
         let no_hosts = self.book.hosts().is_empty();
         if rows.is_empty() && self.pending_exposure.is_none() {
+            // The shared empty state: what a tunnel is and the one way to make one
+            // (R6). With no host there is nothing to tunnel through, so it says that
+            // and offers nothing.
+            let action = (!no_hosts).then(|| {
+                self.icon_text_button(
+                    SharedString::from("forwards.new"),
+                    Icon::Plus,
+                    ux.fwd_new,
+                    Variant::Primary,
+                    cx,
+                    |view, cx| view.open_forward_editor(cx),
+                )
+                .h(metrics.control_height())
+                .into_any_element()
+            });
             return list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .py(metrics.scale(spacing::LOOSE))
-                    .debug_selector(|| "forwards.empty".to_owned())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(metrics.scale(48.0))
-                            .rounded(px(radius::XLARGE))
-                            .bg(theme::swatch(palette::ACCENT_TINT))
-                            .child(icons::icon(
-                                Icon::Forward,
-                                metrics.scale(22.0),
-                                theme::swatch(palette::ACCENT),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(metrics.title_size())
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                            .child(ux.fwd_empty_title),
-                    )
-                    .child(
-                        div()
-                            .max_w(metrics.scale(440.0))
-                            .text_center()
-                            .text_size(metrics.label_size())
-                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                            .child(if no_hosts {
-                                ux.fwd_no_hosts
-                            } else {
-                                ux.fwd_empty_body
-                            }),
-                    )
-                    .when(!no_hosts, |column| {
-                        column.child(
-                            div().pt(metrics.scale(spacing::HAIRLINE)).child(
-                                self.icon_text_button(
-                                    SharedString::from("forwards.new"),
-                                    Icon::Plus,
-                                    ux.fwd_new,
-                                    Variant::Primary,
-                                    cx,
-                                    |view, cx| view.open_forward_editor(cx),
-                                )
-                                .h(metrics.control_height()),
-                            ),
-                        )
-                    }),
+                components::empty_state(
+                    Icon::Forward,
+                    ux.fwd_empty_title,
+                    Some(SharedString::from(if no_hosts {
+                        ux.fwd_no_hosts
+                    } else {
+                        ux.fwd_empty_body
+                    })),
+                    action,
+                    metrics,
+                )
+                .debug_selector(|| "forwards.empty".to_owned()),
             );
         }
 
@@ -1024,15 +996,8 @@ impl ShelluneView {
             ],
         );
 
-        let mut form = div()
-            .flex()
-            .flex_col()
+        let mut form = components::card(metrics)
             .gap(metrics.scale(spacing::BASE))
-            .p(metrics.scale(spacing::BASE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::CANVAS))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
             .debug_selector(|| "forwards.form".to_owned())
             .child(
                 div()
@@ -1145,15 +1110,13 @@ impl ShelluneView {
 
 fn components_row(view: &ShelluneView, index: usize, _cx: &mut Context<ShelluneView>) -> gpui::Div {
     let metrics = view.metrics();
-    div()
-        .flex()
+    // A tunnel is one card of the shared kind, so the list reads like every other list
+    // of saved things (R6).
+    components::card(metrics)
+        .flex_row()
         .items_center()
         .gap(metrics.scale(spacing::SNUG))
         .p(metrics.scale(spacing::SNUG))
-        .rounded(px(radius::LARGE))
-        .bg(theme::swatch(palette::CANVAS))
-        .border_1()
-        .border_color(theme::swatch(palette::BORDER))
         .debug_selector(move || format!("forwards.row.{index}"))
 }
 

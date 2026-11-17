@@ -1388,6 +1388,21 @@ impl TerminalPane {
         self.grid
     }
 
+    /// Opens the right-click menu at `position`, the way a right click on the grid
+    /// does, for a capture (R6). Nothing in it is run.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_open_menu(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        self.menu = Some(position);
+        cx.notify();
+    }
+
+    /// Whether the right-click menu is open, for a capture (R6).
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_menu_open(&self) -> bool {
+        self.menu.is_some()
+    }
+
     /// The visible grid as text, row by row.
     #[cfg(any(test, feature = "ui-capture"))]
     pub fn visible_text(&self) -> Vec<String> {
@@ -2882,52 +2897,23 @@ impl TerminalPane {
         // The hint names the binding in force, like the tooltips do: a rebound key, or
         // an unbinding that handed the combination back to the program, is described as
         // it really is (R5).
+        // The entries are the shared menu entry, so this menu is the same object as the
+        // tab's and the file view's (R6).
         let item =
             |label: &'static str, shortcut: &Option<String>, enabled: bool, id: &'static str| {
-                let hover = theme::swatch(shell_palette::SURFACE_HOVER);
-                div()
-                    .id(id)
-                    .debug_selector(move || id.to_owned())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(metrics.scale(spacing::LOOSE))
-                    .h(metrics.scale(28.0))
-                    .px(metrics.scale(spacing::TIGHT + 2.0))
-                    .rounded(px(theme::radius::MEDIUM))
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(if enabled {
-                        shell_palette::TEXT_PRIMARY
-                    } else {
-                        shell_palette::TEXT_MUTED
-                    }))
-                    .when(enabled, |item| {
-                        item.cursor_pointer().hover(move |style| style.bg(hover))
-                    })
-                    .child(label)
-                    .when_some(shortcut.clone(), |item, shortcut| {
+                components::menu_entry(label, id, None, enabled, false, metrics).when_some(
+                    shortcut.clone(),
+                    |item, shortcut| {
                         item.child(
-                            div()
-                                .debug_selector(move || format!("{id}.shortcut"))
-                                .text_size(metrics.caption_size())
-                                .text_color(theme::swatch(shell_palette::TEXT_MUTED))
-                                .child(SharedString::from(shortcut)),
+                            components::menu_shortcut(SharedString::from(shortcut), metrics)
+                                .debug_selector(move || format!("{id}.shortcut")),
                         )
-                    })
+                    },
+                )
             };
         let ux = crate::app::copy::ux_for(self.locale);
         let scrolled_back = !self.alternate_screen() && self.core.display_offset() > 0;
-        let menu = div()
-            .flex()
-            .flex_col()
-            .min_w(metrics.scale(200.0))
-            .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(theme::radius::LARGE))
-            .bg(theme::swatch(shell_palette::RAISED))
-            .border_1()
-            .border_color(theme::swatch(shell_palette::BORDER_STRONG))
-            .shadow(theme::Elevation::Mid.shadows())
-            .debug_selector(|| "terminal.menu".to_owned())
+        let menu = components::menu_card("terminal.menu", metrics)
             .child(
                 item(
                     strings.field_copy,
@@ -2971,13 +2957,7 @@ impl TerminalPane {
                     cx.notify();
                 })),
             )
-            .child(
-                div()
-                    .h(px(1.0))
-                    .mx(metrics.scale(spacing::HAIRLINE))
-                    .my(metrics.scale(2.0))
-                    .bg(theme::swatch(shell_palette::BORDER)),
-            )
+            .child(components::menu_divider(metrics))
             .child(
                 item(
                     strings.terminal_search,
@@ -3026,7 +3006,11 @@ impl TerminalPane {
                             gpui::anchored()
                                 .position(position)
                                 .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                                .child(div().occlude().child(menu)),
+                                .child(
+                                    div()
+                                        .occlude()
+                                        .child(components::menu_enter(menu, "terminal.menu.enter")),
+                                ),
                         ),
                 ),
             )
@@ -3233,72 +3217,73 @@ impl TerminalPane {
                         serial.settings()
                     ))),
             )
-            .child(div().flex_none().child(SharedString::from("|")))
+            .child(components::divider_vertical(metrics))
+            // The two send habits and the refresh are the toolbar's own quiet buttons,
+            // so they answer the pointer like every other control of the bar (R6).
             .child(
-                div()
-                    .id("serial.echo")
-                    .flex_none()
-                    .px(metrics.scale(spacing::HAIRLINE))
-                    .rounded(px(radius::SMALL))
-                    .debug_selector(|| "serial.echo".to_owned())
-                    .tooltip(components::tooltip(SharedString::from(format!(
-                        "{}: {echo}",
-                        strings.serial_echo
-                    ))))
-                    .child(SharedString::from(format!(
-                        "{} {echo}",
-                        strings.serial_echo
-                    )))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        let next = this.serial.as_ref().is_none_or(|serial| !serial.echo());
-                        this.set_serial_echo(next, cx);
-                    })),
+                components::compact_button(
+                    format!("{} {echo}", strings.serial_echo),
+                    components::Variant::Ghost,
+                    metrics,
+                )
+                .h(metrics.hit_target())
+                .px(metrics.scale(spacing::TIGHT))
+                .id("serial.echo")
+                .debug_selector(|| "serial.echo".to_owned())
+                .tooltip(components::tooltip(SharedString::from(format!(
+                    "{}: {echo}",
+                    strings.serial_echo
+                ))))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    let next = this.serial.as_ref().is_none_or(|serial| !serial.echo());
+                    this.set_serial_echo(next, cx);
+                })),
             )
             .child(
-                div()
-                    .id("serial.newline")
-                    .flex_none()
-                    .px(metrics.scale(spacing::HAIRLINE))
-                    .rounded(px(radius::SMALL))
-                    .debug_selector(|| "serial.newline".to_owned())
-                    .tooltip(components::tooltip(SharedString::from(
-                        strings.serial_newline,
-                    )))
-                    .child(SharedString::from(format!(
-                        "{} {}",
-                        strings.serial_newline,
-                        serial.format().label()
-                    )))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        let Some(current) = this.serial.as_ref().map(SerialPane::format) else {
-                            return;
-                        };
-                        // The ladder is the whole catalogue in one order, so pressing the
-                        // control always reaches every choice and ends where it started.
-                        let all = NewlineFormat::ALL;
-                        let index = all
-                            .iter()
-                            .position(|format| *format == current)
-                            .unwrap_or(0);
-                        let next = all[(index + 1) % all.len()];
-                        this.set_serial_format(next, cx);
-                    })),
+                components::compact_button(
+                    format!("{} {}", strings.serial_newline, serial.format().label()),
+                    components::Variant::Ghost,
+                    metrics,
+                )
+                .h(metrics.hit_target())
+                .px(metrics.scale(spacing::TIGHT))
+                .id("serial.newline")
+                .debug_selector(|| "serial.newline".to_owned())
+                .tooltip(components::tooltip(SharedString::from(
+                    strings.serial_newline,
+                )))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    let Some(current) = this.serial.as_ref().map(SerialPane::format) else {
+                        return;
+                    };
+                    // The ladder is the whole catalogue in one order, so pressing the
+                    // control always reaches every choice and ends where it started.
+                    let all = NewlineFormat::ALL;
+                    let index = all
+                        .iter()
+                        .position(|format| *format == current)
+                        .unwrap_or(0);
+                    let next = all[(index + 1) % all.len()];
+                    this.set_serial_format(next, cx);
+                })),
             )
             .when(!live, |row| {
                 row.child(
-                    div()
-                        .id("serial.ports.refresh")
-                        .flex_none()
-                        .px(metrics.scale(spacing::HAIRLINE))
-                        .rounded(px(radius::SMALL))
-                        .debug_selector(|| "serial.ports.refresh".to_owned())
-                        .tooltip(components::tooltip(SharedString::from(
-                            strings.serial_ports_refresh,
-                        )))
-                        .child(SharedString::from(strings.serial_ports_refresh))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.refresh_serial_ports(cx);
-                        })),
+                    components::compact_button(
+                        strings.serial_ports_refresh,
+                        components::Variant::Soft,
+                        metrics,
+                    )
+                    .h(metrics.hit_target())
+                    .px(metrics.scale(spacing::TIGHT))
+                    .id("serial.ports.refresh")
+                    .debug_selector(|| "serial.ports.refresh".to_owned())
+                    .tooltip(components::tooltip(SharedString::from(
+                        strings.serial_ports_refresh,
+                    )))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.refresh_serial_ports(cx);
+                    })),
                 )
             })
             .when_some(serial.note().map(str::to_owned), |row, note| {

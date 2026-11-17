@@ -477,6 +477,11 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 **桌面画面上的浮层。** 桌面窗格把画面、控件条（缩放 -/百分比/+、全屏）和状态卡片叠在同一块画布上。发送失败时的提示条
 （`desktop.notice`）只画在**有画面**的时候；没有画面时同一句话由状态卡片（`desktop.status`）说一次，两处不会同时出现
 同一句警告。证书确认是独立的卡片（`desktop.certificate`），不会被提示条替代。
+全部用共享组件画（R6）：控件条是 `components::floating_bar`（raised + 强边 + Mid，紧凑 Ghost 按钮，全屏带图标，
+百分比与按钮之间一条竖线），浮在别人的画面上所以带浮层阴影；状态卡片是 `state_card_with_icon`（显示器图标，色调随阶段）；
+提示条是 Warning 色调的 `banner` 抬到画面上（Mid 阴影，正文主色）；证书确认是 raised 的 `card`，头部是警告色调的
+`modal_icon`，指纹用等宽 `endpoint`，底部"拒绝"（Danger）在前、"信任"（Primary）在后。窗口在桌面标签上方画的失败卡片
+下面留 24px，给卡片的浮层阴影落脚，不再被下面的画布切成一条硬边。
 
 **全屏的作用域（R18）。** 全屏不是窗口进入的一种模式，而是「这块画面此刻是不是屏幕上唯一的那块」：它只在
 会话页（`Destination::LocalShells` 的画面上）、该会话是活动窗格、窗格仍在、而且它的标签里只有它这一个叶子时成立。
@@ -592,7 +597,9 @@ gpui 没有 hover 过渡、没有元素缩放，也不报告系统的"减少动�
    `AnimationDurationFactor=0`；读不到时视为未要求。窗口首次绘制时读取，之后在窗口重新获得焦点或系统
    外观变化时重读（Linux 需要调用 `gsettings`，在后台线程读取）。截图固定为减少动效。
 
-当前使用：对话框（`components::modal`）用 Settle，关闭后遮罩淡出（`modal_scrim_exit`）；toast 用 Fade；等待徽记与加载条用 BASE；会话状态卡用 Rise；
+当前使用：对话框（`components::modal`）与命令面板用 Settle，关闭后遮罩淡出（`modal_scrim_exit`，命令面板与对话框
+走同一条路径）；toast 用 Fade；等待徽记与加载条用 BASE；会话状态卡用 Rise；右键与下拉菜单（标签、主机、文件、终端、
+新建标签下拉）用 Rise（`components::menu_enter`，锚定位置不变，只在锚定边上外边距微移）；
 首页卡片依次淡入（`components::enter_in_turn`，每次序晚 `TURN_DELAY` 40ms、淡入 BASE、只动透明度），
 首次使用卡片用 Rise。
 
@@ -747,6 +754,14 @@ resize 都按同一条 recount 路径重新计数，视口停在读者原处，�
 新建文件夹 / 上传文件…（服务器侧）/ 刷新 / 复制当前路径；复制的本机路径为系统写法（`C:\…`）。条目的图标
 按钮只在悬停与选中时显示。从系统文件管理器把文件拖到服务器一侧即上传到当前目录。窄窗口才显示
 "本机 | 服务器"切换条；传输条只在本会话有传输或有无法开始的传输时出现。
+
+外观（R6）：右键菜单是共享的 `menu_card` + `menu_entry`（删除为危险项）；行首的标记方框是共享的 `checkbox_box`
+（整格 24×24 指针目标，悬停整格时方框变 accent 边）；多选横幅是一行：左边"已选 N 项"与操作说明（可换行，不再被
+省略成"…"），右边四个动作按钮并排，栏太窄时整组换到下一行，而不是每个按钮各占一整行；读取失败是共享的 `card`，
+头部是危险色调的图标块与一句"无法读取此目录"；SCP 问题里"递归复制"是共享的勾选框（仍是键盘停靠点，焦点环不挪位）。
+**行内问题仍留在栏内**（新建文件夹、改名、删除、上传 / 下载确认）：它是该栏键盘停靠序列的一部分（`files_question_stops`），
+只挡住自己那一栏，另一栏与终端照常可用；改成全窗口的 `modal` 会改变这两条交互语义（R6 要求不变），所以它保留
+`banner` 外形（色调底 + 3px 色条，组件清单里"确认问题"的那一种），头部加上动作图标（危险问题为危险色调），按钮层级不变。
 
 ### SCP 文件复制（`crates/ssh/src/scp.rs`、`transfers.rs`）
 
@@ -1433,6 +1448,9 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 遮罩关闭，关闭后键盘回到打开前的字段、终端或页面。无匹配时显示"没有匹配的结果"，Enter 不做任何事。
 720×480、200% 文字下面板留在窗口内，列表本身滚动到最后一行（每条 76 px 高，一个屏只放得下两条），
 搜索到某条快捷命令时"插入/执行"两行完整落在列表框内而不会被裁掉。
+外观（R6）：面板画在与对话框相同的 `components::dialog_surface` 上（overlay + 强边 + 圆角 14 + High），进入时 Settle；
+它和对话框一样记作"本帧画了对话框"，关闭后遮罩由窗口用 `modal_scrim_exit` 淡出（减少动效时随面板立即消失），
+由 `the_palette_settles_like_a_dialog_and_its_dimming_fades_on_close` 锁定。
 
 
 终端内 Esc、Ctrl+C、Ctrl+L、Alt+C 与 Alt+R 属于终端程序；例外只有终端搜索条持有键盘时，Esc 关闭搜索条并交还键盘、Alt+C / Alt+R 切换条上的两个开关（见上）。语言在设置页切换（Ctrl+, 在终端内也有效，除非该绑定被解除）。
@@ -1453,15 +1471,16 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 **迁移进度（地基任务之后）。** 已迁到组件：三处勾选框、`view/shell.rs` 的对话框外壳、会话行菜单与 toast。
 以下仍是手写外观（已换成新令牌与层级，但未用共享组件），由后续界面任务替换，替换完成后删去对应条目：
 
-- 对话框外壳：`view/overlays.rs` 的命令面板外壳（其余界面任务）。主机与连接编辑器、删除确认、关闭询问与快捷键录制已迁到 `modal`。
-- 对话框底部：`view/home.rs` 的分组对话框（`hosts.group.dialog`，`group_dialog_overlay`）已用 `modal` 外壳，
-  但底部仍是自绘的一行（无分隔线、不换行、只有下内边距、紧凑按钮），“删除分组”还是 Primary；应改用
-  `modal_footer`，删除改为 Danger（其余界面任务）。
-- 页内问题：文件视图的行内问题（新建文件夹、改名、删除、上传 / 下载确认；`view.rs` 的 `files_dialog`）仍是页内面板而非 `modal`，键盘语义见
-  文件管理器一节（其余界面任务）。
-- 菜单卡片：`view/overlays.rs` 的主机菜单与标签菜单、`terminal.rs` 的 `terminal.menu`、`text_field.rs` 的
-  `field.menu`、`view/files_menu.rs` 的 `files.menu`、`view.rs` 的 `shell.picker`（其余界面任务）。
-- 勾选框：文件列表的标记方框（`view.rs`，其余界面任务）。
+- 菜单卡片：`text_field.rs` 的 `field.menu`（输入框的剪切 / 复制 / 粘贴菜单）仍是手写卡片（已用 raised + 强边 + Mid
+  令牌）。它在 `text_field.rs`，不在其余界面任务（T7）的改动范围内，留待下一次触及输入框时迁到 `menu_card`。
+
+其余界面任务（T7）完成的迁移：命令面板外壳改用 `dialog_surface`（与 `modal` 同一个表面）并进入 Settle、关闭后遮罩
+淡出；主机菜单、标签菜单、`terminal.menu`、`files.menu` 与 `shell.picker` 改用 `menu_card` / `menu_entry` /
+`menu_divider` / `menu_section` / `menu_shortcut`，进入用 Rise；分组对话框底部改用 `modal_footer`，"删除分组"为 Danger；
+文件列表的标记方框与 SCP 的"递归复制"改用共享勾选框；端口转发的空状态改用 `empty_state`，规则行与编辑表单改用 `card`；
+远程桌面的控件条、状态卡片、提示条与证书卡片见 1.4；串口条的回显 / 换行 / 刷新改为紧凑按钮，分隔用 `divider_vertical`。
+文件视图的行内问题有意留在栏内（理由见"文件视图"一节）。菜单截图场景：`menu-tab`（断开会话的标签菜单，
+含"重新连接"）、`menu-host`、`menu-files`、`menu-terminal`、`menu-shell`。
 
 | 组件 | 规范 |
 | --- | --- |
@@ -1475,7 +1494,10 @@ surface 底、静止 Low，焦点环叠在 Low 之上；尺寸不随窗口缩放
 | `card` | 内容分组：surface + 弱边 + 圆角 10 + Low，内边距 16 |
 | `status_card(tone, emblem, title, detail)` | 叠在终端上的会话状态卡：raised + 强边 + 圆角 14 + Mid，最宽 440，色调徽记块 36 + 标题 + 一行说明；吃掉指针，动作由调用方追加，进入时 Rise |
 | `row` / `row_with_state` + `stacked` | 列表行：surface 底，悬停、选中（底色 + 前导竖条）、焦点、失败、进行中 |
-| `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单（尚未迁移的见上）：raised + 强边 + 圆角 10 + Mid；条目 30 高，禁用项保留位置，危险项悬停为 danger tint |
+| `menu_card` + `menu_entry` + `menu_divider` | 右键/下拉菜单（尚未迁移的见上）：raised + 强边 + 圆角 10 + Mid；条目 30 高，标签占满剩余宽度，禁用项保留位置，危险项悬停为 danger tint |
+| `menu_shortcut` / `menu_section` / `menu_enter` | 条目尾部的当前生效快捷键（caption、muted，右对齐）；菜单内分组小标题；菜单进入动画（Rise，减少动效时直接画出） |
+| `floating_bar` | 浮在画面或页面上的控件条：raised + 强边 + 圆角 10 + Mid，吃掉指针；远程桌面的缩放与全屏 |
+| `dialog_surface` | 对话框级表面：overlay + 强边 + 圆角 14 + High，裁切到圆角；`modal` 的卡片与命令面板共用 |
 | `menu_panel` + `menu_item` + `menu_item_face` | 取值菜单（选中项保留选中外观） |
 | `modal(viewport, id, width, ModalContent)` / `modal_with(..., ModalBehaviour)` | 对话框外壳（尚未迁移的见上）：scrim 遮罩（按下不关闭；`ModalBehaviour::dismiss` 仅给无内容可丢的对话框），overlay + 强边 + 圆角 14 + High，头部固定、主体滚动（`{id}.body`，可交给调用方的 `ScrollHandle`）、底部固定，遮罩为 `{id}.backdrop`，进入时 Settle；关闭后遮罩由窗口用 `modal_scrim_exit` 淡出 |
 | `modal_footer` / `modal_icon(icon, tone)` | 对话框底部动作行（顶部分隔线、右对齐、可换行，主操作最后）；头部图标块（默认 accent tint，危险问题用色调 tint） |

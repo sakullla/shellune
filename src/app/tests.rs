@@ -32949,3 +32949,154 @@ async fn a_delete_question_keeps_every_key_but_escape(cx: &mut TestAppContext) {
         "shortcuts run again once the question is answered"
     );
 }
+
+#[gpui::test]
+async fn the_palette_settles_like_a_dialog_and_its_dimming_fades_on_close(cx: &mut TestAppContext) {
+    // The palette is a dialog-level layer: it is drawn on the dialog surface and,
+    // closed, leaves its dimming to fade out like every dialog's does (R5, R6).
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    motion_to(&view, cx, Motion::Full);
+    let fading =
+        |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).scrim_exit_for_test());
+
+    go(cx, crate::app::actions::OpenPalette);
+    assert!(cx.update(|_window, app| view.read(app).palette_open()));
+    assert!(cx.debug_bounds("palette").is_some());
+    assert!(!fading(cx), "an open palette has its own dimming");
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).palette_open()));
+    assert!(fading(cx), "the palette's dimming stays behind to fade out");
+    cx.executor()
+        .advance_clock(crate::app::components::SCRIM_EXIT + std::time::Duration::from_millis(20));
+    cx.run_until_parked();
+    assert!(!fading(cx), "and is gone once it has faded");
+
+    // Reduced motion leaves nothing behind.
+    motion_to(&view, cx, Motion::Reduced);
+    go(cx, crate::app::actions::OpenPalette);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !fading(cx),
+        "reduced motion takes the dimming with the palette"
+    );
+    motion_to(&view, cx, Motion::Full);
+}
+
+#[gpui::test]
+async fn a_host_menu_is_the_shared_menu_card_with_every_entry_inside_it(cx: &mut TestAppContext) {
+    // The host row's menu is drawn from the shared card and entries: every command is
+    // inside the card, one under the other in reading order, and the card stays in the
+    // window (R6).
+    let dir = TempDir::new("host-menu-card");
+    let store = dir.store();
+    seed(
+        &store,
+        vec![
+            stored_host("web", "10.0.0.5", 22, "deploy", None),
+            stored_host("db", "10.0.0.6", 22, "postgres", None),
+        ],
+    );
+    let (view, cx) = hosts_view(cx, store);
+    right_click(cx, "hosts.row.0");
+    assert!(cx.update(|_window, app| view.read(app).host_menu_open()));
+    let menu = bounds_of(cx, "host.menu");
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    assert!(
+        menu.right() <= viewport.width && menu.bottom() <= viewport.height,
+        "the menu stays inside the window: {menu:?} in {viewport:?}"
+    );
+    let mut above: Option<gpui::Bounds<Pixels>> = None;
+    for entry in [
+        "host.menu.connect",
+        "host.menu.forwards",
+        "host.menu.favorite",
+        "host.menu.copy_target",
+        "host.menu.edit",
+        "host.menu.duplicate",
+        "host.menu.delete",
+    ] {
+        let bounds = bounds_of(cx, entry);
+        assert!(
+            bounds.left() >= menu.left()
+                && bounds.right() <= menu.right()
+                && bounds.top() >= menu.top()
+                && bounds.bottom() <= menu.bottom(),
+            "{entry} is inside the card: {bounds:?} in {menu:?}"
+        );
+        assert!(
+            bounds.size.height >= px(24.0),
+            "{entry} keeps the pointer target"
+        );
+        if let Some(above) = above {
+            assert!(
+                bounds.top() >= above.bottom() - px(0.5),
+                "{entry} is under the entry before it"
+            );
+        }
+        above = Some(bounds);
+    }
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).host_menu_open()));
+}
+
+#[gpui::test]
+async fn the_selection_bar_lays_its_actions_in_a_row_inside_it(cx: &mut TestAppContext) {
+    // The marks' banner is a row: what the marks cover, then the actions side by side.
+    // It used to stack every action under the other across the whole column, with the
+    // hint cut to an ellipsis (R6, R14).
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let _ = open_both_sources(
+        cx,
+        &view,
+        id,
+        "/C:/work",
+        &[("a.txt", shellune_core::FileKind::File)],
+    );
+    click(cx, "files.mark.0");
+    click(cx, "files.mark.1");
+    let bar = bounds_of(cx, "files.selection");
+    let count = bounds_of(cx, "files.selection.count");
+    let actions = [
+        "files.mark.download",
+        "files.mark.copy",
+        "files.mark.delete",
+        "files.mark.clear",
+    ]
+    .map(|selector| (selector, bounds_of(cx, selector)));
+    let first = actions[0].1;
+    for (selector, bounds) in actions {
+        assert!(
+            bounds.left() >= bar.left()
+                && bounds.right() <= bar.right()
+                && bounds.bottom() <= bar.bottom(),
+            "{selector} is inside the bar: {bounds:?} in {bar:?}"
+        );
+        assert!(
+            (bounds.top() - first.top()).abs() < px(1.0),
+            "{selector} sits in the actions' one row"
+        );
+        assert!(
+            bounds.size.width < bar.size.width / 2.0,
+            "{selector} is a button, not a full-width row"
+        );
+        assert!(
+            bounds.top() >= count.bottom(),
+            "{selector} follows the count"
+        );
+    }
+    for pair in actions.windows(2) {
+        assert!(
+            pair[1].1.left() >= pair[0].1.right(),
+            "{} is beside {}, not under it",
+            pair[1].0,
+            pair[0].0
+        );
+    }
+}

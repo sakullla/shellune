@@ -28,6 +28,7 @@ use gpui::{
     relative, size,
 };
 
+use crate::app::components;
 use crate::app::copy::Locale;
 use crate::app::icons::{self, Icon};
 use crate::app::nav::Platform;
@@ -969,46 +970,15 @@ impl TextField {
             Platform::Windows | Platform::Linux => format!("Ctrl+{letter}"),
         };
 
+        // The shared menu card and entries: a field's menu is the same object as the
+        // terminal's and the tab's (R6).
         let item = |label: &'static str, shortcut: String, enabled: bool, id: &'static str| {
-            let hover = theme::swatch(palette::SURFACE_HOVER);
-            div()
-                .id(id)
-                .debug_selector(move || id.to_owned())
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(metrics.scale(spacing::LOOSE))
-                .h(metrics.scale(28.0))
-                .px(metrics.scale(spacing::TIGHT + 2.0))
-                .rounded(px(radius::MEDIUM))
-                .text_size(metrics.label_size())
-                .text_color(theme::swatch(if enabled {
-                    palette::TEXT_PRIMARY
-                } else {
-                    palette::TEXT_MUTED
-                }))
-                .when(enabled, |item| {
-                    item.cursor_pointer().hover(move |style| style.bg(hover))
-                })
-                .child(label)
-                .child(
-                    div()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_MUTED))
-                        .child(SharedString::from(shortcut)),
-                )
+            components::menu_entry(label, id, None, enabled, false, metrics).child(
+                components::menu_shortcut(SharedString::from(shortcut), metrics),
+            )
         };
-        let menu = div()
-            .flex()
-            .flex_col()
+        let menu = components::menu_card("field.menu", metrics)
             .min_w(metrics.scale(180.0))
-            .p(metrics.scale(spacing::HAIRLINE))
-            .rounded(px(radius::LARGE))
-            .bg(theme::swatch(palette::RAISED))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .shadow(theme::Elevation::Mid.shadows())
-            .debug_selector(|| "field.menu".to_owned())
             .child(
                 item(strings.field_cut, key("X"), can_copy, "field.menu.cut").when(
                     can_copy,
@@ -1042,13 +1012,7 @@ impl TextField {
                     },
                 ),
             )
-            .child(
-                div()
-                    .h(px(1.0))
-                    .mx(metrics.scale(spacing::HAIRLINE))
-                    .my(metrics.scale(2.0))
-                    .bg(theme::swatch(palette::BORDER)),
-            )
+            .child(components::menu_divider(metrics))
             .child(
                 item(
                     strings.field_select_all,
@@ -1085,7 +1049,11 @@ impl TextField {
                             gpui::anchored()
                                 .position(position)
                                 .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                                .child(div().occlude().child(menu)),
+                                .child(
+                                    div()
+                                        .occlude()
+                                        .child(components::menu_enter(menu, "field.menu.enter")),
+                                ),
                         ),
                 ),
             )

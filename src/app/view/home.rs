@@ -1870,14 +1870,18 @@ impl ShelluneView {
             GroupAction::Move => ux.hosts_group_move_action,
             GroupAction::Delete(_) => ux.hosts_group_delete_action,
         };
-        let footer = div()
-            .flex()
-            .justify_end()
-            .gap(metrics.scale(spacing::TIGHT))
-            .px(metrics.scale(spacing::LOOSE))
-            .pb(metrics.scale(spacing::LOOSE))
+        // The shared dialog foot: a hairline over it, the actions on the right and the
+        // answer last. Deleting a group cannot be taken back, so that answer is the
+        // danger button rather than the primary one (R5, R6).
+        let confirm_variant = if matches!(action, GroupAction::Delete(_)) {
+            Variant::Danger
+        } else {
+            Variant::Primary
+        };
+        let footer = components::modal_footer(metrics)
             .child(
                 components::compact_button(strings.host_cancel, Variant::Ghost, metrics)
+                    .h(metrics.control_height())
                     .id("hosts.group.cancel")
                     .debug_selector(|| "hosts.group.cancel".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {
@@ -1885,7 +1889,8 @@ impl ShelluneView {
                     })),
             )
             .child(
-                components::compact_button(confirm, Variant::Primary, metrics)
+                components::compact_button(confirm, confirm_variant, metrics)
+                    .h(metrics.control_height())
                     .id("hosts.group.confirm")
                     .debug_selector(|| "hosts.group.confirm".to_owned())
                     .on_click(cx.listener(|this, _event, _window, cx| {

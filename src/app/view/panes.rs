@@ -449,6 +449,9 @@ impl ShelluneView {
                     .justify_center()
                     .px(metrics.scale(spacing::SNUG))
                     .pt(metrics.scale(spacing::SNUG))
+                    // Room for the card's floating shadow: the page under it is painted
+                    // after it and would cut the shadow off in a hard line (R6).
+                    .pb(px(spacing::LOOSE))
                     .child(notice),
             );
         }
