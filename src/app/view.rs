@@ -98,6 +98,7 @@ mod panes;
 mod sessions;
 pub(crate) mod settings;
 mod shell;
+mod startup;
 mod sync;
 mod titlebar;
 mod toasts;
@@ -876,6 +877,15 @@ pub struct ShelluneView {
     /// desktop that fills the screen is what full screen means, and the pane's own
     /// controls are what leave it again.
     desktop_fullscreen: Option<SessionId>,
+    /// Where the window is in its start: the brand while the stores are read, then the
+    /// page (R7).
+    startup: startup::Startup,
+    /// Whether the brand is still fading out over the page that replaced it.
+    splash_fading: bool,
+    /// The capture's still splash: the brand drawn in its final place although a capture
+    /// draws with reduced motion (R7).
+    #[cfg(feature = "ui-capture")]
+    splash_held: bool,
     /// Whether the sidebar is collapsed to its icons.
     rail_collapsed: bool,
     /// What the user chose for the palette.
@@ -1176,12 +1186,18 @@ impl HostConnectionFields {
 }
 impl ShelluneView {
     /// Builds the shell in its initial state, reading the saved hosts.
+    ///
+    /// This and the constructors below read every store before they return, so the
+    /// first frame is already the page: the tests' synchronous start. A launch shows
+    /// the brand while it reads them instead ([`Self::launching`], R7).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self::with_workspace(cx, Workspace::new())
     }
 
     /// Builds the shell around an existing workspace, used by tests and by later
     /// tasks that restore state before the first frame.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_workspace(cx: &mut Context<Self>, workspace: Workspace) -> Self {
         Self::with_store(cx, workspace, default_store())
     }
@@ -1191,11 +1207,13 @@ impl ShelluneView {
     /// The hosts section the caller passed decides where the records come from: a
     /// loading section means "read the store", anything else means the caller has
     /// already established the state and the store is only where saves will go.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_store(cx: &mut Context<Self>, workspace: Workspace, store: HostStore) -> Self {
         Self::with_store_and_trust(cx, workspace, store, default_trust())
     }
 
     /// Builds the shell around an existing workspace, host store and trust file.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_store_and_trust(
         cx: &mut Context<Self>,
         workspace: Workspace,
@@ -2272,6 +2290,7 @@ impl ShelluneView {
     /// Every other store is derived from `store.root()`, so one directory decides
     /// where this shell reads and writes. The capture probe uses it to keep a run off
     /// the developer's real hosts, trust file and system credentials (R1, R2).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn with_stores(
         cx: &mut Context<Self>,
         workspace: Workspace,
@@ -2284,7 +2303,49 @@ impl ShelluneView {
 
     /// [`Self::with_stores`], saying whether sync may reach a server at all: a capture
     /// draws the sync page from saved settings and must never send a request.
+    ///
+    /// Every store is read before this returns, so the first frame is already the page:
+    /// the tests and the capture build the shell this way. A launch goes through
+    /// [`Self::launching`] instead, which reads them behind the brand (R7).
+    #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
     fn with_stores_online(
+        cx: &mut Context<Self>,
+        workspace: Workspace,
+        store: HostStore,
+        trust: TrustStore,
+        secrets: std::sync::Arc<dyn SecretStore>,
+        online: bool,
+    ) -> Self {
+        let mut view = Self::assemble(cx, workspace, store, trust, secrets, online);
+        view.restore_hosts(cx);
+        view.restore_groups();
+        view.restore_trust();
+        view.reload_forwards();
+        view.restore_workspace_layout();
+        view.restore_preferences(cx);
+        view.relabel_fields(cx);
+        view.begin_work(cx);
+        view
+    }
+
+    /// The work a window starts once every store is loaded, whichever way it was read.
+    fn begin_work(&mut self, cx: &mut Context<Self>) {
+        self.attach_batch_store();
+        // A run the last exit cut off is marked interrupted once, here, and nothing is
+        // replayed: the summary and the log say what it had finished, and a retry is
+        // the user's own decision from the history (R13).
+        self.batch.recover(crate::app::remote::now_unix());
+        // Every store is loaded: automatic sync pulls now, when a server is saved and
+        // the switch is on, and nothing is sent otherwise (R8).
+        self.start_sync(cx);
+        // Old update files are removed, and one check runs a while after the window
+        // opened when the automatic switch is on (R2).
+        self.start_updates(cx);
+    }
+
+    /// The shell's fields, its text fields and their bindings, with nothing read from
+    /// the stores yet and no work started.
+    fn assemble(
         cx: &mut Context<Self>,
         workspace: Workspace,
         store: HostStore,
@@ -2616,6 +2677,10 @@ impl ShelluneView {
             split_drag: None,
             session_terminal: false,
             desktop_fullscreen: None,
+            startup: startup::Startup::Ready,
+            splash_fading: false,
+            #[cfg(feature = "ui-capture")]
+            splash_held: false,
             #[cfg(test)]
             scripted: Vec::new(),
         };
@@ -2628,24 +2693,6 @@ impl ShelluneView {
         view.bind_remote_fields(cx);
         view.bind_quick_fields(cx);
         view.bind_forward_fields(cx);
-        view.restore_hosts(cx);
-        view.restore_groups();
-        view.restore_trust();
-        view.reload_forwards();
-        view.restore_workspace_layout();
-        view.restore_preferences(cx);
-        view.relabel_fields(cx);
-        view.attach_batch_store();
-        // A run the last exit cut off is marked interrupted once, here, and nothing is
-        // replayed: the summary and the log say what it had finished, and a retry is
-        // the user's own decision from the history (R13).
-        view.batch.recover(crate::app::remote::now_unix());
-        // Every store is loaded: automatic sync pulls now, when a server is saved and
-        // the switch is on, and nothing is sent otherwise (R8).
-        view.start_sync(cx);
-        // Old update files are removed, and one check runs a while after the window
-        // opened when the automatic switch is on (R2).
-        view.start_updates(cx);
         view
     }
 
@@ -3119,14 +3166,20 @@ impl ShelluneView {
     /// records and says why, so an unreadable file can never silently turn into
     /// "ask the user again" for a host they already accepted.
     fn restore_trust(&mut self) {
-        match self.trust.load() {
+        let read = self.trust.load().map_err(|error| error.to_string());
+        self.adopt_trust(read);
+    }
+
+    /// Takes the trust file as it was read, here or behind the splash (R7).
+    fn adopt_trust(&mut self, read: Result<HostTrust, String>) {
+        match read {
             Ok(trust) => {
                 self.trust_book = trust;
                 self.trust_error = None;
             }
             Err(error) => {
                 self.trust_book = HostTrust::new();
-                self.trust_error = Some(error.to_string());
+                self.trust_error = Some(error);
             }
         }
     }
@@ -3136,9 +3189,23 @@ impl ShelluneView {
     /// A `Loading` section is one nobody has filled in yet - that is how a fresh
     /// workspace starts - so it means "this shell has to read the store". Anything else
     /// is a result a caller already established.
+    #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
     fn restore_hosts(&mut self, cx: &mut Context<Self>) {
+        self.restore_hosts_from(None, cx);
+    }
+
+    /// [`Self::restore_hosts`] with the file already read, when it was read behind the
+    /// splash (R7); `None` reads it now.
+    fn restore_hosts_from(
+        &mut self,
+        read: Option<Result<HostBook, String>>,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(self.workspace.hosts().status(), SectionStatus::Loading) {
-            self.reload_hosts(cx);
+            match read {
+                Some(read) => self.adopt_hosts(read, cx),
+                None => self.reload_hosts(cx),
+            }
             return;
         }
         // A restored section is a real result from the caller; seeding the book with
@@ -3154,14 +3221,24 @@ impl ShelluneView {
     /// A tree that cannot be read leaves the hosts listed and says why: the groups are a
     /// way to arrange saved records, not a condition for holding them.
     fn restore_groups(&mut self) {
-        match self.group_service.groups().load() {
+        let read = self
+            .group_service
+            .groups()
+            .load()
+            .map_err(|error| error.to_string());
+        self.adopt_groups(read);
+    }
+
+    /// Takes the group tree as it was read, here or behind the splash (R7).
+    fn adopt_groups(&mut self, read: Result<GroupBook, String>) {
+        match read {
             Ok(book) => {
                 self.groups = book;
                 self.group_problem = None;
             }
             Err(error) => {
                 self.groups = GroupBook::new();
-                self.group_problem = Some(error.to_string());
+                self.group_problem = Some(error);
             }
         }
     }
@@ -6699,7 +6776,13 @@ impl ShelluneView {
 
     /// Reads the host file again and reports what it really holds.
     fn reload_hosts(&mut self, cx: &mut Context<Self>) {
-        match self.store.load() {
+        let read = self.store.load().map_err(|error| error.to_string());
+        self.adopt_hosts(read, cx);
+    }
+
+    /// Takes the host file as it was read: now, or behind the splash (R7).
+    fn adopt_hosts(&mut self, read: Result<HostBook, String>, cx: &mut Context<Self>) {
+        match read {
             Ok(book) => {
                 self.book = book;
                 self.hosts.clear_message();
@@ -6714,7 +6797,7 @@ impl ShelluneView {
                 self.book = HostBook::new();
                 self.host_fields = None;
                 self.workspace
-                    .fail_hosts(Failure::new(error.to_string(), Recovery::Retry));
+                    .fail_hosts(Failure::new(error, Recovery::Retry));
                 self.recheck_open_hosts();
             }
         }
@@ -18355,6 +18438,11 @@ impl Render for ShelluneView {
         // The terminal's frame and the tooltips are drawn outside this pass; they read
         // the text size from here instead of falling back to 100%.
         theme::set_zoom(self.workspace.zoom());
+        // While the stores are read the window is its start: the caption and the brand,
+        // in the palette and at the text size the page will have (R7).
+        if self.startup == startup::Startup::Splash {
+            return self.startup_splash(window, cx);
+        }
         // A field's focus is noted before a click can blur it. Opening an overlay then
         // still knows which field to restore, even when the click already moved focus.
         self.note_content_focus(window, cx);
@@ -18775,6 +18863,9 @@ impl Render for ShelluneView {
         root.children(scrim_exit)
             .children(layers.into_iter().flatten())
             .children(self.toast_stack(cx))
+            // The brand fading out over the page it became, above everything (R7).
+            .children(self.startup_crossfade())
+            .into_any_element()
     }
 }
 

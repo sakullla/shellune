@@ -33170,3 +33170,340 @@ async fn the_selection_bar_wraps_its_actions_inside_it_at_720x480_and_200_percen
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The window's start: the brand while the stores are read (R7)
+// ---------------------------------------------------------------------------
+
+/// A window built the way a launch builds it, over `store`, at the design size.
+fn launching_view(
+    cx: &mut TestAppContext,
+    workspace: Workspace,
+    store: HostStore,
+) -> (Entity<ShelluneView>, &mut VisualTestContext) {
+    let (view, cx) = cx
+        .add_window_view(move |_window, cx| ShelluneView::launching_for_test(cx, workspace, store));
+    cx.simulate_resize(design_window());
+    (view, cx)
+}
+
+fn starting(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_window, app| view.read(app).starting())
+}
+
+fn splash_fading(view: &Entity<ShelluneView>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_window, app| view.read(app).splash_fading())
+}
+
+#[gpui::test]
+async fn a_launch_shows_the_brand_while_the_stores_are_read_then_fades_into_the_page(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("startup-splash");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let (view, cx) = launching_view(cx, workspace, dir.store());
+    cx.run_until_parked();
+
+    // The read has finished, but the brand has not had its entrance yet: the window
+    // stays on its start, with nothing of the page drawn.
+    assert!(starting(&view, cx), "the brand is shown for its entrance");
+    assert!(cx.debug_bounds("startup.splash").is_some());
+    assert!(
+        cx.debug_bounds("startup.splash.brand").is_some(),
+        "with full motion the brand is drawn"
+    );
+    assert!(
+        cx.debug_bounds("startup.splash.name").is_some()
+            && cx.debug_bounds("startup.splash.tagline").is_some()
+    );
+    assert!(
+        cx.debug_bounds("home.quick").is_none() && cx.debug_bounds("topbar").is_none(),
+        "the page is not drawn behind the brand"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().state(Destination::Hosts)),
+        SectionState::Loading,
+        "nothing read is adopted before the start ends"
+    );
+
+    cx.executor().advance_clock(Motion::SLOW);
+    cx.run_until_parked();
+    assert!(!starting(&view, cx), "the entrance over, the page is shown");
+    assert!(
+        splash_fading(&view, cx),
+        "the brand fades out over the page"
+    );
+    assert!(cx.debug_bounds("startup.crossfade").is_some());
+    assert!(
+        cx.debug_bounds("home.quick").is_some() && cx.debug_bounds("topbar").is_some(),
+        "the page is drawn under the fading brand"
+    );
+    cx.update(|_window, app| {
+        let workspace = view.read(app).workspace();
+        assert_eq!(workspace.state(Destination::Hosts), SectionState::Populated);
+        assert_eq!(workspace.item_count(Destination::Hosts), 1);
+    });
+
+    cx.executor().advance_clock(Motion::BASE);
+    cx.run_until_parked();
+    // The window keeps the bounds of everything it once drew, so the end of the fade
+    // is read from the state the render draws the layer from.
+    assert!(
+        !splash_fading(&view, cx),
+        "the fade ends and nothing of the brand is left over the page"
+    );
+}
+
+#[gpui::test]
+async fn the_page_answers_the_pointer_while_the_brand_fades_out(cx: &mut TestAppContext) {
+    let dir = TempDir::new("startup-fade-pointer");
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let (view, cx) = launching_view(cx, workspace, dir.store());
+    cx.run_until_parked();
+    cx.executor().advance_clock(Motion::SLOW);
+    cx.run_until_parked();
+    assert!(splash_fading(&view, cx));
+
+    // The settings button is under the fading layer; the press reaches it.
+    let settings = bounds_of(cx, "nav.settings").center();
+    cx.simulate_click(settings, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().destination()),
+        Destination::Settings,
+        "the fading brand takes no pointer"
+    );
+}
+
+#[gpui::test]
+async fn the_caption_drags_and_the_window_buttons_answer_during_the_start(cx: &mut TestAppContext) {
+    let dir = TempDir::new("startup-caption");
+    let (view, cx) = launching_view(cx, Workspace::new(), dir.store());
+    cx.simulate_resize(minimum_window());
+    cx.run_until_parked();
+    assert!(starting(&view, cx));
+
+    let caption = bounds_of(cx, "startup.caption");
+    let drag = bounds_of(cx, "startup.drag");
+    assert_fits_inside(caption, minimum_window(), "the caption of the start");
+    assert!(
+        drag.size.width > px(0.0) && drag.size.height >= caption.size.height - px(0.5),
+        "the blank caption drags the window: {drag:?} in {caption:?}"
+    );
+    let header = Metrics::new(Zoom::Regular).header_height();
+    assert!(
+        (caption.size.height - header).abs() < px(0.5),
+        "the caption is the top row's height: {caption:?}"
+    );
+    if Platform::current() == Platform::Windows {
+        for button in ["window.minimize", "window.maximize", "window.close"] {
+            let bounds = bounds_of(cx, button);
+            assert_fits_inside(bounds, minimum_window(), button);
+            assert!(
+                bounds.left() >= drag.right() - px(0.5),
+                "{button} sits beside the caption, not under it"
+            );
+        }
+    }
+}
+
+#[gpui::test]
+async fn a_launch_that_cannot_read_the_hosts_still_reaches_the_page_and_says_why(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("startup-unreadable");
+    let root = dir.path().join("data");
+    std::fs::write(&root, "not a directory").expect("the sentinel file is written");
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    let (view, cx) = launching_view(cx, workspace, HostStore::at(&root));
+    cx.run_until_parked();
+    assert!(starting(&view, cx));
+
+    cx.executor().advance_clock(Motion::SLOW);
+    cx.run_until_parked();
+    assert!(!starting(&view, cx), "a failed read ends the start as well");
+    cx.executor().advance_clock(Motion::BASE);
+    cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        let workspace = view.read(app).workspace();
+        assert_eq!(workspace.state(Destination::Hosts), SectionState::Failed);
+        assert_eq!(workspace.item_count(Destination::Hosts), 0);
+        let reason = workspace
+            .failure(Destination::Hosts)
+            .map(Failure::reason)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            reason.contains("hosts.json"),
+            "the reason names the file it could not read: {reason}"
+        );
+    });
+    assert!(
+        cx.debug_bounds("state.card").is_some(),
+        "the failure card is where the hosts would be"
+    );
+}
+
+#[gpui::test]
+async fn reduced_motion_skips_the_brand_and_shows_the_page_once_it_is_read(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("startup-reduced");
+    seed(
+        &dir.store(),
+        vec![stored_host("web", "10.0.0.5", 22, "deploy", None)],
+    );
+    let mut workspace = Workspace::new();
+    workspace.select(Destination::Hosts);
+    workspace.set_motion(Motion::Reduced);
+    let store = dir.store();
+    let (view, cx) = cx
+        .add_window_view(move |_window, cx| ShelluneView::launching_for_test(cx, workspace, store));
+    cx.simulate_resize(design_window());
+
+    // No clock is advanced: the page is shown as soon as the read is in.
+    cx.run_until_parked();
+    assert!(!starting(&view, cx), "nothing waits for an entrance");
+    assert!(!splash_fading(&view, cx), "and nothing fades");
+    // The window keeps the bounds of everything it ever drew, so these say that no
+    // frame of this start had the brand or the fading layer in it.
+    assert!(
+        cx.debug_bounds("startup.splash.brand").is_none(),
+        "reduced motion draws no brand"
+    );
+    assert!(cx.debug_bounds("startup.crossfade").is_none());
+    assert!(cx.debug_bounds("home.quick").is_some());
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).workspace().item_count(Destination::Hosts)),
+        1
+    );
+}
+
+#[gpui::test]
+async fn the_system_reduce_motion_setting_also_skips_the_brand(cx: &mut TestAppContext) {
+    theme::fake_system_reduces_motion(true);
+    let dir = TempDir::new("startup-system-reduced");
+    let (view, cx) = launching_view(cx, Workspace::new(), dir.store());
+    cx.run_until_parked();
+    // Never drawn in any frame: the window keeps the bounds of all it drew.
+    let brand = cx.debug_bounds("startup.splash.brand").is_some();
+    let ready = !starting(&view, cx);
+    let fading = splash_fading(&view, cx);
+    theme::fake_system_reduces_motion(false);
+    assert!(!brand, "the system's setting draws no brand either");
+    assert!(ready, "the page is shown once it is read");
+    assert!(!fading, "and nothing fades");
+}
+
+#[gpui::test]
+async fn a_launch_restores_the_saved_layout_behind_the_brand_and_starts_nothing(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("startup-layout");
+    let saved = stored_host("web", "10.0.0.5", 22, "deploy", None);
+    seed(&dir.store(), vec![saved.clone()]);
+    let gone = shellune_core::HostId::new();
+    let root = PaneNode::split(
+        SplitAxis::LeftRight,
+        5000,
+        PaneNode::leaf(PaneTarget::remote(saved.id()), TerminalMode::Integrated),
+        PaneNode::leaf(PaneTarget::remote(gone), TerminalMode::Classic),
+    )
+    .expect("split");
+    let tab = WorkspaceTab::new("Work", root).expect("title");
+    let snapshot = WorkspaceSnapshot::new(vec![tab], PanelConfig::new(false, PanelSection::None))
+        .expect("snapshot");
+    WorkspaceStore::at(dir.path())
+        .save(&snapshot)
+        .expect("snapshot saves");
+    let before = std::fs::read(dir.path().join(WORKSPACE_FILE_NAME)).expect("file");
+
+    let (view, cx) = launching_view(cx, Workspace::new(), dir.store());
+    cx.run_until_parked();
+    assert!(starting(&view, cx));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        0,
+        "the layout is not restored before the start ends"
+    );
+
+    cx.executor().advance_clock(Motion::SLOW);
+    cx.run_until_parked();
+    cx.executor().advance_clock(Motion::BASE);
+    cx.run_until_parked();
+    assert!(!starting(&view, cx));
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_pane_count_for_test()),
+        2,
+        "both panes are restored, pending"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).missing_host_panes_for_test()),
+        vec![gone],
+        "the hosts were adopted first, so only the missing host is marked"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).open_sessions().is_empty()),
+        "no terminal process was started"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "no connection was started"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(WORKSPACE_FILE_NAME)).expect("file"),
+        before,
+        "neither the start nor the restore rewrites the layout"
+    );
+}
+
+#[gpui::test]
+async fn the_synchronous_start_the_tests_use_never_shows_the_brand(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    assert!(!starting(&view, cx));
+    assert!(!splash_fading(&view, cx));
+    assert!(cx.debug_bounds("startup.splash").is_none());
+    assert!(cx.debug_bounds("topbar").is_some());
+}
+
+#[gpui::test]
+async fn the_brand_fits_the_smallest_window_at_the_largest_text(cx: &mut TestAppContext) {
+    let dir = TempDir::new("startup-fit");
+    for locale in Locale::ALL {
+        let mut workspace = Workspace::new();
+        workspace.set_zoom(Zoom::Largest);
+        workspace.set_locale(locale);
+        let store = dir.store();
+        let (view, cx) = cx.add_window_view(move |_window, cx| {
+            ShelluneView::launching_for_test(cx, workspace, store)
+        });
+        cx.simulate_resize(minimum_window());
+        cx.run_until_parked();
+        assert!(starting(&view, cx));
+        for selector in [
+            "startup.caption",
+            "startup.splash.brand",
+            "startup.splash.name",
+            "startup.splash.tagline",
+        ] {
+            assert_fits_inside(bounds_of(cx, selector), minimum_window(), selector);
+        }
+        let caption = bounds_of(cx, "startup.caption");
+        let brand = bounds_of(cx, "startup.splash.brand");
+        assert!(
+            brand.top() >= caption.bottom() - px(0.5),
+            "the brand stays clear of the caption: {brand:?} under {caption:?}"
+        );
+    }
+}

@@ -21,13 +21,19 @@ use crate::app::theme::{self, Tone, palette, radius, spacing};
 impl ShelluneView {
     pub(super) fn reload_forwards(&mut self) {
         let store = ForwardStore::at(self.store.root());
-        match store.load() {
+        let read = store.load().map_err(|error| error.to_string());
+        self.adopt_forwards(read);
+    }
+
+    /// Takes the saved tunnels as they were read: now, or behind the splash (R7).
+    pub(super) fn adopt_forwards(&mut self, read: Result<shellune_core::ForwardBook, String>) {
+        match read {
             Ok(book) => {
                 self.forwards.replace_book(book);
                 self.forwards.clear_load_error();
                 self.sync_forward_section();
             }
-            Err(error) => self.forwards.note_load_error(error.to_string()),
+            Err(error) => self.forwards.note_load_error(error),
         }
     }
 

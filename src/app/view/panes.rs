@@ -29,12 +29,23 @@ impl ShelluneView {
     /// A missing file is a first run and leaves the page the caller selected.
     /// A damaged file is reported and left unchanged. Nothing in the snapshot is
     /// started.
+    #[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
     pub(super) fn restore_workspace_layout(&mut self) {
         let store = WorkspaceStore::at(self.store.root());
-        match store.load() {
+        let read = store.load().map_err(|error| error.to_string());
+        self.adopt_workspace_layout(read);
+    }
+
+    /// Takes `workspace.json` as it was read: now, or behind the splash (R7). The
+    /// hosts are adopted first, so a pane that names a deleted record is marked.
+    pub(super) fn adopt_workspace_layout(
+        &mut self,
+        read: Result<shellune_core::WorkspaceSnapshot, String>,
+    ) {
+        match read {
             Err(error) => {
                 self.layout_persist = false;
-                self.layout_error = Some(error.to_string());
+                self.layout_error = Some(error);
             }
             Ok(snapshot) => {
                 self.layout_persist = true;

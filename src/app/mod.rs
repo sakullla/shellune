@@ -300,7 +300,9 @@ fn open_main_window(cx: &mut App) -> Result<(), String> {
 
     let handle = cx
         .open_window(options, |window, cx| {
-            let view = cx.new(ShelluneView::new);
+            // The window opens on its start: the brand is the first frame and the
+            // stores are read behind it (R7).
+            let view = cx.new(ShelluneView::launching);
             // Give the shell the keyboard before the user clicks anything, so the
             // navigation shortcuts work in the first frame.
             window.focus(view.read(cx).root_focus());

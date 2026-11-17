@@ -58,6 +58,8 @@ pub enum Category {
     Settings,
     /// A tool or palette open over a page.
     Overlay,
+    /// The window's start, before its first page (R7).
+    Startup,
 }
 
 impl Category {
@@ -70,6 +72,7 @@ impl Category {
             Self::Desktop => "desktop",
             Self::Settings => "settings",
             Self::Overlay => "overlay",
+            Self::Startup => "startup",
         }
     }
 }
@@ -1593,6 +1596,22 @@ fn settings_keys_conflict_ready(view: &ShelluneView, cx: &App) -> Result<(), Str
             "the shortcut page reports {other:?} instead of a conflict"
         )),
     }
+}
+
+fn hold_splash(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    view.capture_hold_splash(cx);
+    Ok(())
+}
+
+fn splash_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if !view.starting() {
+        return Err("the window is not on its start".to_owned());
+    }
+    Ok(())
 }
 
 fn palette_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
@@ -3584,6 +3603,23 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: nothing,
         install: show_shell_menu,
         ready: shell_menu_ready,
+    },
+    Scenario {
+        id: "startup-splash",
+        title: "启动 · 品牌过场",
+        category: Category::Startup,
+        fixture: "an empty data directory; the window built and then held on its start,                   the brand drawn in its final place",
+        evidence: "shows the frame a launch draws while the stores are read: the live caption                    and the logo, name and tagline on the floor; the entrance, the fade into the                    page and how long a real read takes are motion and timing a still frame                    cannot show",
+        quick: true,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::Hosts),
+        prepare: nothing,
+        install: hold_splash,
+        ready: splash_ready,
     },
 ];
 
