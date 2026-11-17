@@ -998,6 +998,9 @@ pub enum ConnectionValidationError {
     /// The device name contains a control character.
     #[error("device name cannot contain control characters")]
     DeviceContainsControlCharacter,
+    /// The folder shared with a remote desktop contains a control character.
+    #[error("folder path cannot contain control characters")]
+    DriveFolderContainsControlCharacter,
     /// The line speed is outside the range this build accepts.
     #[error("baud rate {value} is outside the range {MIN_SERIAL_BAUD}-{MAX_SERIAL_BAUD}")]
     BaudOutOfRange {
@@ -1085,6 +1088,36 @@ fn security_is_default(security: &VncSecurity) -> bool {
     *security == VncSecurity::Automatic
 }
 
+/// The clipboard of a desktop connection is shared unless the user turned it off.
+const fn clipboard_default() -> bool {
+    true
+}
+
+/// Whether the clipboard choice is the default one, so a file can leave it out.
+///
+/// Only a connection that turned the clipboard off carries the key, which keeps
+/// every other record in the shape an older build reads.
+fn clipboard_is_default(clipboard: &bool) -> bool {
+    *clipboard
+}
+
+/// Trims a folder path, turns a blank one into `None` and refuses a control
+/// character, which no folder a person can choose contains.
+fn connection_drive_folder(
+    folder: Option<String>,
+) -> Result<Option<String>, ConnectionValidationError> {
+    let folder = folder
+        .map(|folder| folder.trim().to_owned())
+        .filter(|folder| !folder.is_empty());
+    if folder
+        .as_deref()
+        .is_some_and(|folder| folder.chars().any(char::is_control))
+    {
+        return Err(ConnectionValidationError::DriveFolderContainsControlCharacter);
+    }
+    Ok(folder)
+}
+
 /// A saved RDP connection (R18).
 ///
 /// The record holds what the next connection needs to find and sign in to a
@@ -1112,6 +1145,19 @@ pub struct RdpConfig {
     certificate: RdpCertificatePolicy,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     remember_secret: bool,
+    /// Whether text and pictures copied on either side can be pasted on the other.
+    #[serde(
+        default = "clipboard_default",
+        skip_serializing_if = "clipboard_is_default"
+    )]
+    clipboard: bool,
+    /// A folder on this machine the remote desktop sees as a drive, when one was
+    /// chosen.
+    ///
+    /// The path only means something on this machine: a portable document keeps it
+    /// in the section of the platform that chose it, never in the shared record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drive_folder: Option<String>,
 }
 
 /// The stored shape of an RDP connection.
@@ -1134,6 +1180,10 @@ struct RdpConfigWire {
     certificate: RdpCertificatePolicy,
     #[serde(default)]
     remember_secret: bool,
+    #[serde(default = "clipboard_default")]
+    clipboard: bool,
+    #[serde(default)]
+    drive_folder: Option<String>,
 }
 
 impl TryFrom<RdpConfigWire> for RdpConfig {
@@ -1154,6 +1204,8 @@ impl TryFrom<RdpConfigWire> for RdpConfig {
             domain: normalize_optional_text(wire.domain),
             certificate: wire.certificate,
             remember_secret: wire.remember_secret,
+            clipboard: wire.clipboard,
+            drive_folder: connection_drive_folder(wire.drive_folder)?,
         })
     }
 }
@@ -1181,6 +1233,8 @@ impl RdpConfig {
             domain: None,
             certificate: RdpCertificatePolicy::default(),
             remember_secret: false,
+            clipboard: true,
+            drive_folder: None,
         })
     }
 
@@ -1236,6 +1290,18 @@ impl RdpConfig {
     #[must_use]
     pub fn certificate(&self) -> RdpCertificatePolicy {
         self.certificate
+    }
+
+    /// Whether the clipboard is shared with the remote desktop.
+    #[must_use]
+    pub fn clipboard(&self) -> bool {
+        self.clipboard
+    }
+
+    /// The folder on this machine the remote desktop sees as a drive, if any.
+    #[must_use]
+    pub fn drive_folder(&self) -> Option<&str> {
+        self.drive_folder.as_deref()
     }
 
     /// Whether a credential for this identifier may be in the system store.
@@ -1311,6 +1377,26 @@ impl RdpConfig {
         self.certificate = policy;
     }
 
+    /// Turns clipboard sharing with the remote desktop on or off.
+    pub fn set_clipboard(&mut self, clipboard: bool) {
+        self.clipboard = clipboard;
+    }
+
+    /// Chooses the folder the remote desktop sees as a drive; a blank path turns
+    /// the mapping off.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionValidationError::DriveFolderContainsControlCharacter`
+    /// for a path with a control character, leaving the previous folder in place.
+    pub fn set_drive_folder(
+        &mut self,
+        folder: Option<impl Into<String>>,
+    ) -> Result<(), ConnectionValidationError> {
+        self.drive_folder = connection_drive_folder(folder.map(Into::into))?;
+        Ok(())
+    }
+
     /// Sets or clears the grouping label.
     pub fn set_group(&mut self, group: Option<impl Into<String>>) {
         self.group = normalize_optional_text(group.map(Into::into));
@@ -1353,6 +1439,12 @@ pub struct VncConfig {
     security: VncSecurity,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     remember_secret: bool,
+    /// Whether text copied on either side can be pasted on the other.
+    #[serde(
+        default = "clipboard_default",
+        skip_serializing_if = "clipboard_is_default"
+    )]
+    clipboard: bool,
 }
 
 /// The stored shape of a VNC connection.
@@ -1371,6 +1463,8 @@ struct VncConfigWire {
     security: VncSecurity,
     #[serde(default)]
     remember_secret: bool,
+    #[serde(default = "clipboard_default")]
+    clipboard: bool,
 }
 
 impl TryFrom<VncConfigWire> for VncConfig {
@@ -1387,6 +1481,7 @@ impl TryFrom<VncConfigWire> for VncConfig {
             port: connection_port(u32::from(wire.port.get()))?,
             security: wire.security,
             remember_secret: wire.remember_secret,
+            clipboard: wire.clipboard,
         })
     }
 }
@@ -1411,6 +1506,7 @@ impl VncConfig {
             port: Port(DEFAULT_VNC_PORT),
             security: VncSecurity::default(),
             remember_secret: false,
+            clipboard: true,
         })
     }
 
@@ -1454,6 +1550,17 @@ impl VncConfig {
     #[must_use]
     pub fn security(&self) -> VncSecurity {
         self.security
+    }
+
+    /// Whether the clipboard is shared with the remote desktop.
+    #[must_use]
+    pub fn clipboard(&self) -> bool {
+        self.clipboard
+    }
+
+    /// Turns clipboard sharing with the remote desktop on or off.
+    pub fn set_clipboard(&mut self, clipboard: bool) {
+        self.clipboard = clipboard;
     }
 
     /// Whether a credential for this identifier may be in the system store.
@@ -1961,7 +2068,9 @@ impl ConnectionRecord {
     /// original's history does not follow it, and no credential reference is
     /// carried because the copy has an identifier the store has never seen.
     /// An SSH copy also drops any jump that named the copy itself, so a duplicate
-    /// can never be built as a cycle.
+    /// can never be built as a cycle. Everything else is kept, including a desktop
+    /// connection's clipboard choice and mapped folder: the copy is made on this
+    /// machine, where that folder means the same thing.
     #[must_use]
     pub fn duplicated(&self) -> Self {
         match self {
@@ -3104,6 +3213,151 @@ mod connection_tests {
         let read: ConnectionRecord = serde_json::from_value(written).expect("reads back");
         assert_eq!(read, ConnectionRecord::Serial(console));
     }
+    #[test]
+    fn the_clipboard_is_shared_by_default_and_only_turning_it_off_is_written() {
+        let rdp = RdpConfig::new("office", "10.0.0.9", None::<String>).expect("valid");
+        assert!(rdp.clipboard(), "a new RDP connection shares the clipboard");
+        assert_eq!(rdp.drive_folder(), None, "and maps no folder");
+        let vnc = VncConfig::new("wall", "10.0.0.7").expect("valid");
+        assert!(vnc.clipboard(), "a new VNC connection shares the clipboard");
+
+        // The default stays out of the file, so the record keeps the shape an older
+        // build reads.
+        for record in [
+            ConnectionRecord::Rdp(rdp.clone()),
+            ConnectionRecord::Vnc(vnc.clone()),
+        ] {
+            let written = serde_json::to_value(&record).expect("serializes");
+            assert!(written.get("clipboard").is_none(), "{written}");
+            assert!(written.get("drive_folder").is_none(), "{written}");
+        }
+
+        let mut rdp = rdp;
+        rdp.set_clipboard(false);
+        rdp.set_drive_folder(Some("  C:/Users/alice/Shared  "))
+            .expect("a usable folder");
+        assert_eq!(rdp.drive_folder(), Some("C:/Users/alice/Shared"));
+        let written = serde_json::to_value(ConnectionRecord::Rdp(rdp.clone())).expect("serializes");
+        assert_eq!(written["clipboard"], Value::Bool(false));
+        assert_eq!(written["drive_folder"], json!("C:/Users/alice/Shared"));
+        let read: ConnectionRecord = serde_json::from_value(written).expect("reads back");
+        assert_eq!(read, ConnectionRecord::Rdp(rdp));
+
+        let mut vnc = vnc;
+        vnc.set_clipboard(false);
+        let written = serde_json::to_value(ConnectionRecord::Vnc(vnc.clone())).expect("serializes");
+        assert_eq!(written["clipboard"], Value::Bool(false));
+        let read: ConnectionRecord = serde_json::from_value(written).expect("reads back");
+        assert_eq!(read, ConnectionRecord::Vnc(vnc));
+    }
+
+    #[test]
+    fn a_record_written_before_the_clipboard_choice_reads_as_sharing_it() {
+        let rdp: ConnectionRecord = serde_json::from_value(json!({
+            "protocol": "rdp",
+            "id": HostId::new(),
+            "name": "office",
+            "address": "10.0.0.9",
+            "port": 3389
+        }))
+        .expect("an older record still reads");
+        let ConnectionRecord::Rdp(rdp) = rdp else {
+            panic!("an RDP record");
+        };
+        assert!(rdp.clipboard());
+        assert_eq!(rdp.drive_folder(), None);
+
+        let vnc: ConnectionRecord = serde_json::from_value(json!({
+            "protocol": "vnc",
+            "id": HostId::new(),
+            "name": "wall",
+            "address": "10.0.0.7",
+            "port": 5900
+        }))
+        .expect("an older record still reads");
+        let ConnectionRecord::Vnc(vnc) = vnc else {
+            panic!("a VNC record");
+        };
+        assert!(vnc.clipboard());
+    }
+
+    #[test]
+    fn a_mapped_folder_is_trimmed_and_a_control_character_is_refused() {
+        let mut rdp = RdpConfig::new("office", "10.0.0.9", None::<String>).expect("valid");
+        rdp.set_drive_folder(Some("/home/alice/shared"))
+            .expect("a usable folder");
+        assert_eq!(
+            rdp.set_drive_folder(Some("/home/alice/\u{7}bell")),
+            Err(ConnectionValidationError::DriveFolderContainsControlCharacter)
+        );
+        assert_eq!(
+            rdp.drive_folder(),
+            Some("/home/alice/shared"),
+            "a refused folder leaves the previous one in place"
+        );
+        rdp.set_drive_folder(Some("   "))
+            .expect("blank turns it off");
+        assert_eq!(rdp.drive_folder(), None);
+        rdp.set_drive_folder(Some("/srv")).expect("usable");
+        rdp.set_drive_folder(None::<String>)
+            .expect("none turns it off");
+        assert_eq!(rdp.drive_folder(), None);
+
+        // A stored blank folder is no folder; a stored control character is not a
+        // record this build wrote.
+        let base = json!({
+            "protocol": "rdp",
+            "id": HostId::new(),
+            "name": "office",
+            "address": "10.0.0.9",
+            "port": 3389
+        });
+        let mut blank = base.clone();
+        blank["drive_folder"] = json!("  ");
+        let read: ConnectionRecord = serde_json::from_value(blank).expect("reads");
+        let ConnectionRecord::Rdp(read) = read else {
+            panic!("an RDP record");
+        };
+        assert_eq!(read.drive_folder(), None);
+        let mut broken = base;
+        broken["drive_folder"] = json!("C:/a\nb");
+        assert!(serde_json::from_value::<ConnectionRecord>(broken).is_err());
+
+        // VNC has no folder to map.
+        let vnc = json!({
+            "protocol": "vnc",
+            "id": HostId::new(),
+            "name": "wall",
+            "address": "10.0.0.7",
+            "port": 5900,
+            "drive_folder": "/srv"
+        });
+        assert!(serde_json::from_value::<ConnectionRecord>(vnc).is_err());
+    }
+
+    #[test]
+    fn a_copy_keeps_the_clipboard_choice_and_the_mapped_folder() {
+        let mut rdp = RdpConfig::new("office", "10.0.0.9", None::<String>).expect("valid");
+        rdp.set_clipboard(false);
+        rdp.set_drive_folder(Some("D:/exchange")).expect("usable");
+        rdp.set_remember_secret(true);
+        let original = ConnectionRecord::Rdp(rdp);
+        let ConnectionRecord::Rdp(copy) = original.duplicated() else {
+            panic!("still RDP");
+        };
+        assert_ne!(copy.id(), original.id());
+        assert!(!copy.clipboard());
+        assert_eq!(copy.drive_folder(), Some("D:/exchange"));
+        assert!(!copy.remembers_secret());
+
+        let mut vnc = VncConfig::new("wall", "10.0.0.7").expect("valid");
+        vnc.set_clipboard(false);
+        let ConnectionRecord::Vnc(copy) = ConnectionRecord::Vnc(vnc).duplicated() else {
+            panic!("still VNC");
+        };
+        assert!(!copy.clipboard());
+    }
+
     #[test]
     fn a_serial_record_checks_the_device_and_the_frame() {
         let mut config = SerialConfig::new("console", "COM3").expect("a valid device");

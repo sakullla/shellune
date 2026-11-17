@@ -10,7 +10,7 @@
 //!   preferences that are not about the machine.
 //! * `platforms.<os>` — what only makes sense on one kind of machine: that
 //!   platform's key bindings, its text size and sidebar choice, and for each host
-//!   the private-key path and serial device it uses there. A machine writes only
+//!   the private-key path, serial device and RDP mapped folder it uses there. A machine writes only
 //!   its own section; the sections of the other platforms are carried over from
 //!   the document it started from, so a Windows key path survives a round trip
 //!   through a Linux machine.
@@ -398,6 +398,12 @@ pub struct HostOverlay {
     /// The device of a serial connection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial_device: Option<String>,
+    /// The local folder an RDP connection shows the remote desktop as a drive.
+    ///
+    /// Unlike the other two fields this one is never in the shared record: a folder
+    /// chosen on one machine is only ever used on a machine of the same platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drive_folder: Option<String>,
 }
 
 /// One portable data document (see the module documentation).
@@ -508,8 +514,10 @@ impl ShelluneData {
                 source_app_version: options.app_version.clone(),
                 shared: SharedData {
                     // Which passwords this machine's credential store holds is
-                    // not shared; the sealed block says which ones travel.
-                    hosts: apply::without_remembered_secrets(&local.hosts)?,
+                    // not shared; the sealed block says which ones travel. A
+                    // mapped folder is not shared either: it is in this
+                    // platform's section above.
+                    hosts: apply::shared_book(&local.hosts)?,
                     groups: local.groups.clone(),
                     forwards: local.forwards.clone(),
                     snippets: local.snippets.clone(),
@@ -797,6 +805,7 @@ impl ShelluneData {
             &self.shared.hosts.records(),
             recents,
             self.shared.hosts.favorites(),
+            self.shared.hosts.unreadable_connections(),
         )?;
         Ok(document)
     }
@@ -880,9 +889,13 @@ impl ShelluneData {
                 let data: PlatformData = serde_json::from_value(section.clone())
                     .map_err(|error| format!("the section of the platform {name}: {error}"))?;
                 for (id, overlay) in &data.hosts {
-                    for value in [&overlay.identity_file, &overlay.serial_device]
-                        .into_iter()
-                        .flatten()
+                    for value in [
+                        &overlay.identity_file,
+                        &overlay.serial_device,
+                        &overlay.drive_folder,
+                    ]
+                    .into_iter()
+                    .flatten()
                     {
                         if value.trim().is_empty() || value.chars().any(char::is_control) {
                             return Err(format!(
@@ -915,13 +928,19 @@ impl PlatformData {
             let overlay = match &record {
                 ConnectionRecord::Ssh(host) => HostOverlay {
                     identity_file: host.identity_file().map(str::to_owned),
-                    serial_device: None,
+                    ..HostOverlay::default()
                 },
                 ConnectionRecord::Serial(serial) => HostOverlay {
-                    identity_file: None,
                     serial_device: Some(serial.device().to_owned()),
+                    ..HostOverlay::default()
                 },
-                ConnectionRecord::Rdp(_) | ConnectionRecord::Vnc(_) => continue,
+                // Listed even without a folder: an entry with none says this
+                // platform maps nothing, so clearing the folder travels too.
+                ConnectionRecord::Rdp(rdp) => HostOverlay {
+                    drive_folder: rdp.drive_folder().map(str::to_owned),
+                    ..HostOverlay::default()
+                },
+                ConnectionRecord::Vnc(_) => continue,
             };
             hosts.insert(record.id(), overlay);
         }
@@ -1072,7 +1091,7 @@ pub(crate) fn now_unix() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-fn find_secret_key(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn find_secret_key(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::Object(map) => map.iter().find_map(|(key, child)| {
             if SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str()) {

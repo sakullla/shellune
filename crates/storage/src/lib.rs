@@ -64,7 +64,7 @@ pub use batch::{
 };
 pub use book::{
     FORMAT_VERSION, Group, HostBook, HostEdit, LegacyGroupLabel, RecentConnection, RecentHost,
-    host_matches,
+    UnreadableConnection, host_matches,
 };
 pub use credentials::{AppSecret, MemorySecrets, SERVICE, SecretError, SecretStore, SystemSecrets};
 pub use error::{BookError, PersistError, StorageError};

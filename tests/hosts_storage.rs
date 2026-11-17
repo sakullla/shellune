@@ -17,7 +17,9 @@ use shellune_core::{
     VncSecurity,
 };
 use shellune_storage::{
-    BookError, CONFIG_KEYS, FORMAT_VERSION, HostBook, HostEdit, HostStore, LOG_FIELDS, StorageError,
+    ApplyMode, BookError, CONFIG_KEYS, ExportOptions, FORMAT_VERSION, HostBook, HostEdit,
+    HostStore, LOG_FIELDS, LocalState, Platform, PortableError, ShelluneData, StorageError,
+    Touched, rebase_state,
 };
 
 // ---------------------------------------------------------------------------
@@ -1711,10 +1713,15 @@ fn a_document_with_desktop_and_serial_connections_passes_the_persisted_key_audit
     // The one key whose name says "secret": it is a flag, and the audit has to accept it
     // without accepting any value beside it.
     office.set_remember_secret(true);
+    office.set_clipboard(false);
+    office
+        .set_drive_folder(Some("C:/Users/alice/Exchange"))
+        .expect("a usable folder");
     book.insert_connection(ConnectionRecord::Rdp(office))
         .expect("inserted");
     let mut wall = VncConfig::new("Wall", "10.0.0.7").expect("valid");
     wall.set_security(VncSecurity::EncryptedOnly);
+    wall.set_clipboard(false);
     book.insert_connection(ConnectionRecord::Vnc(wall))
         .expect("inserted");
     let mut console = SerialConfig::new("Console", "COM3").expect("valid");
@@ -1772,6 +1779,8 @@ fn a_document_with_desktop_and_serial_connections_passes_the_persisted_key_audit
         "stop_bits",
         "flow",
         "local_echo",
+        "clipboard",
+        "drive_folder",
     ] {
         assert!(
             keys.iter().any(|key| key == expected),
@@ -1899,26 +1908,100 @@ fn an_unknown_protocol_is_reported_instead_of_becoming_an_empty_book() {
     let dir = TempDir::new("unknown-protocol");
     let store = dir.store();
     let id = HostId::new();
+    let wall = VncConfig::new("wall", "10.0.0.7").expect("valid");
+    let wall_id = wall.id();
     let text = format!(
-        r#"{{"version":{FORMAT_VERSION},"hosts":[],"connections":[{{"protocol":"telnet","id":"{id}","name":"old switch","address":"10.0.0.2","port":23}}],"recents":[]}}"#
+        r#"{{"version":{FORMAT_VERSION},"hosts":[],"connections":[{{"protocol":"telnet","id":"{id}","name":"old switch","address":"10.0.0.2","port":23}},{{"protocol":"vnc","id":"{wall_id}","name":"wall","address":"10.0.0.7","port":5900}}],"recents":[],"favorites":["{id}"]}}"#
     );
     dir.write_file(&text);
 
-    let error = store
+    let book = store
         .load()
-        .expect_err("a protocol this build cannot run is a failure");
-    let reason = match &error {
-        StorageError::Corrupt { reason, .. } => reason.clone(),
-        other => panic!("the file is reported as damaged, not as {other:?}"),
-    };
-    assert!(
-        reason.contains("telnet"),
-        "the refusal names the protocol it found: {reason}"
-    );
+        .expect("one record this build cannot run does not take the others with it");
     assert_eq!(
-        dir.read_file(),
-        text,
-        "the file that could not be understood is left exactly as it was"
+        book.records()
+            .iter()
+            .map(ConnectionRecord::id)
+            .collect::<Vec<_>>(),
+        vec![wall_id],
+        "only the record this build understands can be listed and dialled"
+    );
+    let [unreadable] = book.unreadable_connections() else {
+        panic!(
+            "the record is reported: {:?}",
+            book.unreadable_connections()
+        );
+    };
+    assert_eq!(unreadable.id(), Some(id));
+    assert_eq!(unreadable.name(), Some("old switch"));
+    assert_eq!(unreadable.protocol(), Some("telnet"));
+    assert!(
+        unreadable.reason().contains("telnet"),
+        "the report names the protocol it found: {}",
+        unreadable.reason()
+    );
+    assert_eq!(dir.read_file(), text, "reading the file does not change it");
+
+    // Saving keeps the record exactly as it was written, so the build that wrote it
+    // still finds it; its favourite mark stays with it.
+    store.save(&book).expect("the book saves");
+    let written: serde_json::Value =
+        serde_json::from_str(&dir.read_file()).expect("the file is JSON");
+    let original: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert!(
+        written["connections"]
+            .as_array()
+            .expect("a list")
+            .contains(&original["connections"][0]),
+        "the record is written back unchanged: {written}"
+    );
+    assert_eq!(written["favorites"], original["favorites"]);
+    let reread = store.load().expect("the saved file loads again");
+    assert_eq!(reread, book);
+
+    // A new record cannot take the identifier the set-aside record uses.
+    let mut book = reread;
+    let clash = serial("console", "COM3").reidentified(id);
+    assert_eq!(
+        book.insert_connection(clash),
+        Err(BookError::DuplicateHost { id })
+    );
+}
+
+#[test]
+fn a_record_from_a_newer_build_with_an_unknown_field_is_set_aside_on_its_own() {
+    // A later build adds a field to an RDP record. This build reports that one
+    // record and keeps every other one usable, instead of refusing the whole file.
+    let dir = TempDir::new("newer-field");
+    let store = dir.store();
+    let web = host("web", "10.0.0.5", 22, "deploy", None);
+    let web_id = web.id();
+    let id = HostId::new();
+    let text = format!(
+        r#"{{"version":{FORMAT_VERSION},"hosts":[{{"id":"{web_id}","name":"web","address":"10.0.0.5","port":22,"user":"deploy","group":null}}],"connections":[{{"protocol":"rdp","id":"{id}","name":"office","address":"10.0.0.9","port":3389,"clipboard":false,"a_later_option":3}}],"recents":[{{"host":"{id}","last_connected_unix":1700000000,"connections":2}}]}}"#
+    );
+    dir.write_file(&text);
+
+    let book = store.load().expect("the file loads");
+    assert_eq!(book.host(web_id).map(HostConfig::name), Some("web"));
+    assert!(book.connections().is_empty());
+    let [unreadable] = book.unreadable_connections() else {
+        panic!("one record is reported");
+    };
+    assert_eq!(unreadable.id(), Some(id));
+    assert_eq!(unreadable.protocol(), Some("rdp"));
+    assert!(
+        unreadable.reason().contains("a_later_option"),
+        "the report names the field it did not know: {}",
+        unreadable.reason()
+    );
+    assert_eq!(book.recents().len(), 1, "its history stays with it");
+
+    store.save(&book).expect("saves");
+    let reread = store.load().expect("loads again");
+    assert_eq!(
+        reread.unreadable_connections(),
+        book.unreadable_connections()
     );
 }
 
@@ -1947,9 +2030,21 @@ fn a_record_with_a_field_its_protocol_does_not_have_is_refused() {
     dir.write_file(&format!(
         r#"{{"version":{FORMAT_VERSION},"hosts":[],"connections":[{{"protocol":"vnc","id":"{id}","name":"wall","address":"10.0.0.7","port":5900,"user":"alice"}}],"recents":[]}}"#
     ));
+    let book = store
+        .load()
+        .expect("one record this build cannot read does not fail the file");
     assert!(
-        store.load().is_err(),
-        "a VNC record with an SSH-only field is not a file this build wrote"
+        book.connections().is_empty(),
+        "a VNC record with an SSH-only field is not a connection this build can dial"
+    );
+    let [unreadable] = book.unreadable_connections() else {
+        panic!("the record is reported");
+    };
+    assert_eq!(unreadable.id(), Some(id));
+    assert!(
+        unreadable.reason().contains("user"),
+        "{}",
+        unreadable.reason()
     );
 }
 
@@ -2453,4 +2548,410 @@ fn an_older_host_file_reads_with_no_favourites() {
     assert!(book.favorites().is_empty());
     assert!(!book.is_favorite(id));
     assert!(book.favorite_hosts().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Desktop clipboard and mapped folder in backups and sync
+// ---------------------------------------------------------------------------
+
+/// An RDP connection that turned the clipboard off and maps `folder`.
+fn mapped_rdp(folder: Option<&str>) -> RdpConfig {
+    let mut config = RdpConfig::new("Office", "10.0.0.9", Some("alice")).expect("valid");
+    config.set_clipboard(false);
+    config.set_drive_folder(folder).expect("a usable folder");
+    config
+}
+
+/// A machine holding exactly `records`.
+fn machine(records: impl IntoIterator<Item = ConnectionRecord>) -> LocalState {
+    let mut state = LocalState::default();
+    for record in records {
+        state.hosts.insert_connection(record).expect("inserted");
+    }
+    state
+}
+
+/// The document `state` exports on `platform`, carrying the other platforms'
+/// sections of `base`.
+fn export_from(
+    state: &LocalState,
+    platform: Platform,
+    base: Option<&ShelluneData>,
+) -> ShelluneData {
+    let mut options = ExportOptions::new(platform);
+    options.created_unix = 1_800_000_000;
+    ShelluneData::export(state, &options, &MemorySecrets::new(), base)
+        .expect("exported")
+        .document
+}
+
+/// The document as JSON.
+fn document_json(document: &ShelluneData) -> serde_json::Value {
+    serde_json::from_slice(&document.to_json().expect("encodes")).expect("JSON")
+}
+
+/// The RDP record with `id` in a local state.
+fn rdp_in(state: &LocalState, id: HostId) -> RdpConfig {
+    match state.hosts.connection(id) {
+        Some(ConnectionRecord::Rdp(config)) => config,
+        other => panic!("an RDP record, not {other:?}"),
+    }
+}
+
+/// The RDP record with `id` after applying `document` to `local` on `platform`.
+fn applied_rdp(
+    document: &ShelluneData,
+    local: &LocalState,
+    platform: Platform,
+    mode: ApplyMode,
+    id: HostId,
+) -> RdpConfig {
+    let plan = document.plan(local, platform, mode, None).expect("planned");
+    assert!(
+        plan.fallbacks().iter().all(|fallback| fallback.id != id),
+        "a mapped folder is never reported as taken from another machine: {:?}",
+        plan.fallbacks()
+    );
+    rdp_in(plan.result(), id)
+}
+
+/// The document read back after `edit` changed its JSON.
+fn edited(document: &ShelluneData, edit: impl FnOnce(&mut serde_json::Value)) -> ShelluneData {
+    let mut value = document_json(document);
+    edit(&mut value);
+    ShelluneData::from_json(&serde_json::to_vec(&value).expect("encodes")).expect("reads")
+}
+
+#[test]
+fn a_mapped_folder_is_kept_in_the_platform_section_and_never_in_the_shared_record() {
+    let path = r"C:\Users\alice\Exchange";
+    let office = mapped_rdp(Some(path));
+    let id = office.id();
+    let state = machine([ConnectionRecord::Rdp(office)]);
+    let document = export_from(&state, Platform::Windows, None);
+
+    let json = document_json(&document);
+    let shared = &json["shared"]["hosts"]["connections"][0];
+    assert!(
+        shared.get("drive_folder").is_none(),
+        "the shared record carries no local path: {shared}"
+    );
+    assert_eq!(
+        shared["clipboard"],
+        serde_json::Value::Bool(false),
+        "the clipboard choice is shared"
+    );
+    assert_eq!(
+        json["platforms"]["windows"]["hosts"][id.to_string()]["drive_folder"],
+        serde_json::json!(path)
+    );
+    let section = document.platform(Platform::Windows).expect("a section");
+    assert_eq!(
+        section
+            .hosts
+            .get(&id)
+            .and_then(|overlay| overlay.drive_folder.as_deref()),
+        Some(path)
+    );
+    assert_eq!(
+        rdp_in(&state, id).drive_folder(),
+        Some(path),
+        "exporting leaves the local record as it was"
+    );
+
+    // A connection without a folder is still listed, saying this platform maps
+    // nothing; VNC has nothing machine-specific and is not listed.
+    let plain = RdpConfig::new("Lab", "10.0.0.10", None::<String>).expect("valid");
+    let plain_id = plain.id();
+    let wall = VncConfig::new("Wall", "10.0.0.7").expect("valid");
+    let wall_id = wall.id();
+    let document = export_from(
+        &machine([ConnectionRecord::Rdp(plain), ConnectionRecord::Vnc(wall)]),
+        Platform::Linux,
+        None,
+    );
+    let section = document.platform(Platform::Linux).expect("a section");
+    assert_eq!(
+        section
+            .hosts
+            .get(&plain_id)
+            .map(|overlay| overlay.drive_folder.clone()),
+        Some(None)
+    );
+    assert!(!section.hosts.contains_key(&wall_id));
+}
+
+#[test]
+fn an_imported_folder_comes_from_this_platform_then_this_machine_and_never_another_platform() {
+    let windows_path = r"C:\Users\alice\Exchange";
+    let linux_path = "/home/alice/exchange";
+    let office = mapped_rdp(Some(windows_path));
+    let id = office.id();
+    let windows = machine([ConnectionRecord::Rdp(office.clone())]);
+    let document = export_from(&windows, Platform::Windows, None);
+    let empty = LocalState::default();
+
+    // Another Windows machine takes the folder from the Windows section, and the
+    // clipboard choice arrives with the record.
+    let arrived = applied_rdp(&document, &empty, Platform::Windows, ApplyMode::Merge, id);
+    assert_eq!(arrived.drive_folder(), Some(windows_path));
+    assert!(!arrived.clipboard());
+
+    // A Linux machine without the record maps nothing.
+    let arrived = applied_rdp(&document, &empty, Platform::Linux, ApplyMode::Replace, id);
+    assert_eq!(arrived.drive_folder(), None);
+    assert!(!arrived.clipboard());
+
+    // A Linux machine with its own folder for the record keeps it.
+    let mut mine = office.clone();
+    mine.set_drive_folder(Some(linux_path)).expect("usable");
+    let linux = machine([ConnectionRecord::Rdp(mine)]);
+    for mode in [ApplyMode::Merge, ApplyMode::Replace] {
+        let arrived = applied_rdp(&document, &linux, Platform::Linux, mode, id);
+        assert_eq!(arrived.drive_folder(), Some(linux_path));
+    }
+
+    // Once Linux has written its own section, each platform finds its own path in
+    // the same document.
+    let both = export_from(&linux, Platform::Linux, Some(&document));
+    for (platform, path) in [
+        (Platform::Windows, windows_path),
+        (Platform::Linux, linux_path),
+    ] {
+        let arrived = applied_rdp(&both, &empty, platform, ApplyMode::Replace, id);
+        assert_eq!(arrived.drive_folder(), Some(path));
+    }
+
+    // The platform section wins over this machine's own value, including when it
+    // says the folder was turned off.
+    let mut cleared = office;
+    cleared.set_drive_folder(None::<String>).expect("cleared");
+    let turned_off = export_from(
+        &machine([ConnectionRecord::Rdp(cleared)]),
+        Platform::Windows,
+        None,
+    );
+    let arrived = applied_rdp(
+        &turned_off,
+        &windows,
+        Platform::Windows,
+        ApplyMode::Merge,
+        id,
+    );
+    assert_eq!(arrived.drive_folder(), None);
+
+    // A folder written into the shared record by hand is never used.
+    let forged = edited(&document, |value| {
+        value["shared"]["hosts"]["connections"][0]["drive_folder"] =
+            serde_json::json!(windows_path);
+        value["platforms"] = serde_json::json!({});
+    });
+    for platform in [Platform::Windows, Platform::Linux] {
+        let arrived = applied_rdp(&forged, &empty, platform, ApplyMode::Replace, id);
+        assert_eq!(arrived.drive_folder(), None);
+    }
+}
+
+#[test]
+fn the_sync_view_of_a_platform_changes_with_its_own_folder_only() {
+    let office = mapped_rdp(Some("/home/alice/exchange"));
+    let id = office.id();
+    let before = export_from(
+        &machine([ConnectionRecord::Rdp(office.clone())]),
+        Platform::Linux,
+        None,
+    );
+    let mut moved = office.clone();
+    moved
+        .set_drive_folder(Some("/srv/exchange"))
+        .expect("usable");
+    let after = export_from(
+        &machine([ConnectionRecord::Rdp(moved)]),
+        Platform::Linux,
+        Some(&before),
+    );
+    assert_ne!(
+        before.sync_view(Platform::Linux).expect("view"),
+        after.sync_view(Platform::Linux).expect("view"),
+        "a new folder is a change on this platform"
+    );
+    assert_ne!(
+        before.core_view(Platform::Linux).expect("view"),
+        after.core_view(Platform::Linux).expect("view")
+    );
+    assert_eq!(
+        before.sync_view(Platform::Windows).expect("view"),
+        after.sync_view(Platform::Windows).expect("view"),
+        "another platform sees no change"
+    );
+
+    // The clipboard choice is shared, so every platform sees it change.
+    let mut shared = office;
+    shared.set_clipboard(true);
+    let toggled = export_from(
+        &machine([ConnectionRecord::Rdp(shared)]),
+        Platform::Linux,
+        None,
+    );
+    assert_ne!(
+        before.sync_view(Platform::Windows).expect("view"),
+        toggled.sync_view(Platform::Windows).expect("view")
+    );
+    let arrived = applied_rdp(
+        &toggled,
+        &LocalState::default(),
+        Platform::Windows,
+        ApplyMode::Replace,
+        id,
+    );
+    assert!(arrived.clipboard());
+}
+
+#[test]
+fn an_edit_to_the_folder_survives_a_rebase_over_another_writer() {
+    let office = mapped_rdp(None);
+    let id = office.id();
+    let base = machine([ConnectionRecord::Rdp(office.clone())]);
+    let mut ours = base.clone();
+    let mut mapped = office.clone();
+    mapped
+        .set_drive_folder(Some("D:/exchange"))
+        .expect("usable");
+    ours.hosts
+        .update_connection(ConnectionRecord::Rdp(mapped), id)
+        .expect("updated");
+    let mut theirs = base.clone();
+    let mut renamed = office;
+    renamed.set_name("Office 2").expect("valid");
+    renamed.set_clipboard(true);
+    theirs
+        .hosts
+        .update_connection(ConnectionRecord::Rdp(renamed), id)
+        .expect("updated");
+
+    let touched = Touched {
+        hosts: true,
+        ..Touched::default()
+    };
+    let (merged, dropped) = rebase_state(&base, &ours, &theirs, touched);
+    assert!(dropped.is_empty(), "{dropped:?}");
+    let merged = rdp_in(&merged, id);
+    assert_eq!(
+        merged.drive_folder(),
+        Some("D:/exchange"),
+        "our edit is kept"
+    );
+    assert_eq!(merged.name(), "Office 2", "and so is theirs");
+    assert!(merged.clipboard());
+}
+
+#[test]
+fn a_platform_section_with_an_unusable_folder_is_refused() {
+    let office = mapped_rdp(Some("/home/alice/exchange"));
+    let id = office.id();
+    let document = export_from(
+        &machine([ConnectionRecord::Rdp(office)]),
+        Platform::Linux,
+        None,
+    );
+    let mut value = document_json(&document);
+    value["platforms"]["linux"]["hosts"][id.to_string()]["drive_folder"] =
+        serde_json::json!("/home/alice/\u{7}");
+    let error = ShelluneData::from_json(&serde_json::to_vec(&value).expect("encodes"))
+        .expect_err("a control character is not a folder");
+    assert!(
+        matches!(&error, PortableError::Corrupt { reason } if reason.contains(&id.to_string())),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_document_with_a_record_this_build_cannot_read_still_applies_and_keeps_it() {
+    let lab = RdpConfig::new("Lab", "10.0.0.10", None::<String>).expect("valid");
+    let lab_id = lab.id();
+    let future_id = HostId::new();
+    let document = export_from(
+        &machine([ConnectionRecord::Rdp(lab)]),
+        Platform::Windows,
+        None,
+    );
+    let future = serde_json::json!({
+        "protocol": "rdp",
+        "id": future_id,
+        "name": "Office",
+        "address": "10.0.0.9",
+        "port": 3389,
+        "a_later_option": true
+    });
+    let document = edited(&document, |value| {
+        value["shared"]["hosts"]["connections"]
+            .as_array_mut()
+            .expect("a list")
+            .push(future.clone());
+        value["shared"]["hosts"]["favorites"] = serde_json::json!([future_id]);
+    });
+    let [unreadable] = document.shared().hosts().unreadable_connections() else {
+        panic!("the record is reported");
+    };
+    assert_eq!(unreadable.id(), Some(future_id));
+
+    // A replacement carries the record, and exporting again writes it unchanged.
+    let plan = document
+        .plan(
+            &LocalState::default(),
+            Platform::Windows,
+            ApplyMode::Replace,
+            None,
+        )
+        .expect("one unreadable record does not stop the import");
+    let result = plan.result().clone();
+    assert!(result.hosts.connection(lab_id).is_some());
+    assert_eq!(result.hosts.unreadable_connections().len(), 1);
+    assert!(
+        result.hosts.is_favorite(future_id),
+        "its mark stays with it"
+    );
+    let again = document_json(&export_from(&result, Platform::Windows, None));
+    assert!(
+        again["shared"]["hosts"]["connections"]
+            .as_array()
+            .expect("a list")
+            .contains(&future)
+    );
+
+    // A merge keeps a record set aside here when the document does not carry it.
+    let other = export_from(&LocalState::default(), Platform::Windows, None);
+    let plan = other
+        .plan(&result, Platform::Windows, ApplyMode::Merge, None)
+        .expect("planned");
+    assert_eq!(plan.result().hosts.unreadable_connections().len(), 1);
+
+    // A readable record with the same identifier replaces the one set aside.
+    let readable =
+        ConnectionRecord::Rdp(RdpConfig::new("Office", "10.0.0.9", None::<String>).expect("valid"))
+            .reidentified(future_id);
+    let upgraded = export_from(&machine([readable]), Platform::Windows, None);
+    let plan = upgraded
+        .plan(&result, Platform::Windows, ApplyMode::Merge, None)
+        .expect("planned");
+    assert!(plan.result().hosts.unreadable_connections().is_empty());
+    assert!(plan.result().hosts.connection(future_id).is_some());
+}
+
+#[test]
+fn a_record_that_names_a_credential_still_fails_the_whole_document() {
+    let document = export_from(&LocalState::default(), Platform::Windows, None);
+    let mut value = document_json(&document);
+    value["shared"]["hosts"]["connections"] = serde_json::json!([{
+        "protocol": "telnet",
+        "id": HostId::new(),
+        "name": "switch",
+        "password": "hunter2"
+    }]);
+    let error = ShelluneData::from_json(&serde_json::to_vec(&value).expect("encodes"))
+        .expect_err("a credential is never kept");
+    assert!(
+        matches!(&error, PortableError::Corrupt { reason } if reason.contains("password") && !reason.contains("hunter2")),
+        "{error}"
+    );
 }

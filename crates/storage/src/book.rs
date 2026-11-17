@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use shellune_core::{ConnectionRecord, GroupPath, HostConfig, HostId, JumpFault, jump_faults};
 
 use crate::error::BookError;
@@ -143,9 +143,77 @@ impl HostEdit {
     }
 }
 
+/// A saved connection this build could not read, kept exactly as it was written.
+///
+/// A newer build may add a field or a protocol to a connection record. Refusing the
+/// whole file for that would leave every other record unusable, so the record is set
+/// aside instead: it is not listed, cannot be dialled, and is written back unchanged
+/// so the build that understands it still finds it. A record that names a
+/// credential is not set aside; such a file is refused as a whole, because keeping
+/// the record would mean writing that value again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnreadableConnection {
+    id: Option<HostId>,
+    name: Option<String>,
+    protocol: Option<String>,
+    reason: String,
+    stored: serde_json::Value,
+}
+
+impl UnreadableConnection {
+    fn new(stored: serde_json::Value, reason: String) -> Self {
+        let text = |key: &str| {
+            stored
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        Self {
+            id: stored
+                .get("id")
+                .and_then(|id| serde_json::from_value(id.clone()).ok()),
+            name: text("name"),
+            protocol: text("protocol"),
+            reason,
+            stored,
+        }
+    }
+
+    /// The identifier the record carries, when it has a readable one.
+    #[must_use]
+    pub fn id(&self) -> Option<HostId> {
+        self.id
+    }
+
+    /// The name the record carries, when it has one.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The protocol tag as written, when there is one.
+    #[must_use]
+    pub fn protocol(&self) -> Option<&str> {
+        self.protocol.as_deref()
+    }
+
+    /// Why this build could not read the record, as the reader reported it.
+    ///
+    /// Never a credential: a record that names one fails the whole file instead.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// The record exactly as it was written.
+    pub(crate) fn stored(&self) -> &serde_json::Value {
+        &self.stored
+    }
+}
+
 /// Everything the user saved.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "HostBookWire")]
 pub struct HostBook {
     version: u32,
     hosts: Vec<HostConfig>,
@@ -170,6 +238,100 @@ pub struct HostBook {
     /// byte as before and an older file reads as having none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     favorites: Vec<HostId>,
+    /// Connection records this build could not read, written back after the
+    /// readable ones (see [`UnreadableConnection`]).
+    #[serde(skip)]
+    unreadable: Vec<UnreadableConnection>,
+}
+
+/// The stored shape of a host book.
+///
+/// Connection records are read one at a time, so one record this build cannot
+/// understand is set aside rather than failing the file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostBookWire {
+    version: u32,
+    hosts: Vec<HostConfig>,
+    #[serde(default)]
+    connections: Vec<serde_json::Value>,
+    recents: Vec<RecentConnection>,
+    #[serde(default)]
+    favorites: Vec<HostId>,
+}
+
+impl TryFrom<HostBookWire> for HostBook {
+    type Error = String;
+
+    fn try_from(wire: HostBookWire) -> Result<Self, Self::Error> {
+        let mut connections = Vec::with_capacity(wire.connections.len());
+        let mut unreadable = Vec::new();
+        for stored in wire.connections {
+            if let Some(key) = crate::portable::find_secret_key(&stored) {
+                let id = stored
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("without an id");
+                return Err(format!(
+                    "the connection {id} contains the field \"{key}\", which cannot be stored. Its value was not kept"
+                ));
+            }
+            match serde_json::from_value::<ConnectionRecord>(stored.clone()) {
+                Ok(record) => connections.push(record),
+                Err(error) => unreadable.push(UnreadableConnection::new(stored, error.to_string())),
+            }
+        }
+        Ok(Self {
+            version: wire.version,
+            hosts: wire.hosts,
+            connections,
+            recents: wire.recents,
+            favorites: wire.favorites,
+            unreadable,
+        })
+    }
+}
+
+impl Serialize for HostBook {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        /// One entry of the connection list: a record, or one kept as written.
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Stored<'a> {
+            Record(&'a ConnectionRecord),
+            Kept(&'a serde_json::Value),
+        }
+
+        /// The document in the order this build has always written it.
+        #[derive(Serialize)]
+        struct Document<'a> {
+            version: u32,
+            hosts: &'a [HostConfig],
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            connections: Vec<Stored<'a>>,
+            recents: &'a [RecentConnection],
+            #[serde(skip_serializing_if = "<[HostId]>::is_empty")]
+            favorites: &'a [HostId],
+        }
+
+        Document {
+            version: self.version,
+            hosts: &self.hosts,
+            connections: self
+                .connections
+                .iter()
+                .map(Stored::Record)
+                .chain(
+                    self.unreadable
+                        .iter()
+                        .map(|kept| Stored::Kept(kept.stored())),
+                )
+                .collect(),
+            recents: &self.recents,
+            favorites: &self.favorites,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl Default for HostBook {
@@ -180,6 +342,7 @@ impl Default for HostBook {
             connections: Vec::new(),
             recents: Vec::new(),
             favorites: Vec::new(),
+            unreadable: Vec::new(),
         }
     }
 }
@@ -387,6 +550,20 @@ impl HostBook {
         &self.connections
     }
 
+    /// The connection records this build could not read, in saved order.
+    ///
+    /// None of them is in [`Self::records`]; each is written back unchanged when
+    /// the book is saved, so a newer build that wrote it still finds it.
+    #[must_use]
+    pub fn unreadable_connections(&self) -> &[UnreadableConnection] {
+        &self.unreadable
+    }
+
+    /// The identifiers of the records set aside.
+    pub(crate) fn unreadable_ids(&self) -> impl Iterator<Item = HostId> + '_ {
+        self.unreadable.iter().filter_map(UnreadableConnection::id)
+    }
+
     /// One saved connection of any protocol.
     ///
     /// An SSH host answers as [`ConnectionRecord::Ssh`], so a caller that lists
@@ -443,7 +620,9 @@ impl HostBook {
     ///
     /// Returns [`BookError::DuplicateHost`] when the identifier is already saved.
     pub fn insert_connection(&mut self, connection: ConnectionRecord) -> Result<(), BookError> {
-        if self.contains_connection(connection.id()) {
+        if self.contains_connection(connection.id())
+            || self.unreadable_ids().any(|id| id == connection.id())
+        {
             return Err(BookError::DuplicateHost {
                 id: connection.id(),
             });
@@ -863,6 +1042,15 @@ impl HostBook {
                 return Err(format!(
                     "two records share the id {}, so the file is not a valid host book",
                     connection.id()
+                ));
+            }
+        }
+        // A record set aside is still a record: its identifier is taken, and its
+        // recent connection and favourite mark stay with it.
+        for id in self.unreadable_ids() {
+            if !ids.insert(id) {
+                return Err(format!(
+                    "two records share the id {id}, so the file is not a valid host book"
                 ));
             }
         }

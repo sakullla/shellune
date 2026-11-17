@@ -86,6 +86,11 @@ pub const CONFIG_KEYS: &[&str] = &[
     "stop_bits",
     "flow",
     "local_echo",
+    // Desktop connections: whether the clipboard is shared (written only when it is
+    // turned off) and the local folder an RDP session maps as a drive. A folder
+    // path, never file contents or a credential.
+    "clipboard",
+    "drive_folder",
 ];
 
 /// Every field a log line may contain.

@@ -3479,6 +3479,9 @@ fn problem_of(error: shellune_core::ConnectionValidationError) -> ConnectionProb
         Refusal::EmptyDevice | Refusal::DeviceContainsControlCharacter => {
             ConnectionFormField::Device
         }
+        // The form has no folder field yet, so no edit can produce this refusal;
+        // the address is the closest field until the folder field exists.
+        Refusal::DriveFolderContainsControlCharacter => ConnectionFormField::Address,
         Refusal::BaudOutOfRange { .. } => ConnectionFormField::Baud,
         Refusal::DataBitsOutOfRange { .. } => ConnectionFormField::DataBits,
     };

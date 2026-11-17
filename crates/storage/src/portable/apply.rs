@@ -22,7 +22,7 @@ use super::{
     HostOverlay, LocalData, LocalState, Platform, PlatformData, PortableError, SecretBundle,
     ShelluneData, now_unix,
 };
-use crate::book::{FORMAT_VERSION, HostBook, RecentConnection};
+use crate::book::{FORMAT_VERSION, HostBook, RecentConnection, UnreadableConnection};
 use crate::credentials::SecretStore;
 use crate::preferences::Preferences;
 use crate::store::write_atomic_file;
@@ -315,7 +315,12 @@ impl ApplyPlan {
         recents: &[RecentConnection],
     ) -> Result<Self, PortableError> {
         let mut next = local.clone();
-        next.hosts = build_book(&local.hosts.records(), recents, local.hosts.favorites())?;
+        next.hosts = build_book(
+            &local.hosts.records(),
+            recents,
+            local.hosts.favorites(),
+            local.hosts.unreadable_connections(),
+        )?;
         Ok(Self {
             mode: ApplyMode::Merge,
             platform,
@@ -651,16 +656,18 @@ fn set_remembers(record: &mut ConnectionRecord, remember: bool) {
     }
 }
 
-/// The same book with no record marked as remembering a password.
+/// The same book as a document shares it: no record marked as remembering a
+/// password, and no RDP connection carrying its mapped folder.
 ///
-/// Whether a record remembers is a fact about one machine's credential store, so
-/// it is left out of what a document shares.
-pub(super) fn without_remembered_secrets(book: &HostBook) -> Result<HostBook, PortableError> {
-    if !book
-        .records()
-        .iter()
-        .any(ConnectionRecord::remembers_secret)
-    {
+/// Whether a record remembers is a fact about one machine's credential store, and
+/// a folder is a path on one machine, so both are left out of the shared records;
+/// the folder travels in the platform's own section instead.
+pub(super) fn shared_book(book: &HostBook) -> Result<HostBook, PortableError> {
+    let local_only = |record: &ConnectionRecord| {
+        record.remembers_secret()
+            || matches!(record, ConnectionRecord::Rdp(rdp) if rdp.drive_folder().is_some())
+    };
+    if !book.records().iter().any(local_only) {
         return Ok(book.clone());
     }
     let records: Vec<ConnectionRecord> = book
@@ -668,10 +675,21 @@ pub(super) fn without_remembered_secrets(book: &HostBook) -> Result<HostBook, Po
         .into_iter()
         .map(|mut record| {
             set_remembers(&mut record, false);
-            record
+            if let ConnectionRecord::Rdp(rdp) = &mut record {
+                rdp.set_drive_folder(None::<String>)
+                    .map_err(|error| PortableError::Corrupt {
+                        reason: error.to_string(),
+                    })?;
+            }
+            Ok(record)
         })
-        .collect();
-    build_book(&records, book.recents(), book.favorites())
+        .collect::<Result<_, PortableError>>()?;
+    build_book(
+        &records,
+        book.recents(),
+        book.favorites(),
+        book.unreadable_connections(),
+    )
 }
 
 fn plan_book(
@@ -693,6 +711,27 @@ fn plan_book(
         let mine = local_records.get(&record.id());
         arriving.push(resolve_platform(record, overlay, mine, fallbacks)?);
     }
+
+    // Records this build could not read are carried, not dropped: the build that
+    // wrote them still needs them. A merge keeps the ones only this machine has.
+    let unreadable: Vec<UnreadableConnection> = match mode {
+        ApplyMode::Replace => incoming.unreadable_connections().to_vec(),
+        ApplyMode::Merge => {
+            let incoming_ids: HashSet<HostId> = incoming
+                .records()
+                .iter()
+                .map(ConnectionRecord::id)
+                .chain(incoming.unreadable_ids())
+                .collect();
+            local
+                .unreadable_connections()
+                .iter()
+                .filter(|kept| kept.id().is_none_or(|id| !incoming_ids.contains(&id)))
+                .chain(incoming.unreadable_connections())
+                .cloned()
+                .collect()
+        }
+    };
 
     let (mut records, recents, favorites) = match mode {
         ApplyMode::Replace => (
@@ -769,16 +808,19 @@ fn plan_book(
         .collect();
 
     Ok(BookPlan {
-        book: build_book(&records, &recents, &favorites)?,
+        book: build_book(&records, &recents, &favorites, &unreadable)?,
         to_save,
         to_forget,
     })
 }
 
-/// Puts this machine's private-key path or serial device into a record.
+/// Puts this machine's private-key path, serial device or mapped folder into a
+/// record.
 ///
 /// The platform's own section wins; a record this machine already has keeps its
-/// own value; otherwise the shared value stays and is reported.
+/// own value; otherwise the shared value stays and is reported. A mapped folder is
+/// never taken from the shared record: without a value from this platform the
+/// connection maps nothing, and nothing is reported.
 fn resolve_platform(
     record: ConnectionRecord,
     overlay: Option<&HostOverlay>,
@@ -828,6 +870,21 @@ fn resolve_platform(
             }
             Ok(ConnectionRecord::Serial(serial))
         }
+        ConnectionRecord::Rdp(mut rdp) => {
+            let folder = match (overlay, mine) {
+                (Some(overlay), _) => overlay.drive_folder.clone(),
+                (None, Some(ConnectionRecord::Rdp(mine))) => mine.drive_folder().map(str::to_owned),
+                (None, _) => None,
+            };
+            rdp.set_drive_folder(folder)
+                .map_err(|error| PortableError::Corrupt {
+                    reason: format!(
+                        "the mapped folder of the RDP connection {} is unusable: {error}",
+                        rdp.name()
+                    ),
+                })?;
+            Ok(ConnectionRecord::Rdp(rdp))
+        }
         other => Ok(other),
     }
 }
@@ -856,21 +913,37 @@ fn merge_recents(
 
 /// Builds a host book through its stored form, so it passes the same checks a
 /// loaded file does.
+///
+/// `unreadable` are records set aside as written (see [`UnreadableConnection`]);
+/// one whose identifier a readable record already uses is dropped, because the
+/// readable record is the one this machine can keep.
 pub(super) fn build_book(
     records: &[ConnectionRecord],
     recents: &[RecentConnection],
     favorites: &[HostId],
+    unreadable: &[UnreadableConnection],
 ) -> Result<HostBook, PortableError> {
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum Entry<'a> {
+        Record(&'a ConnectionRecord),
+        Kept(&'a serde_json::Value),
+    }
+
     #[derive(Serialize)]
     struct BookWire<'a> {
         version: u32,
         hosts: Vec<&'a HostConfig>,
-        connections: Vec<&'a ConnectionRecord>,
+        connections: Vec<Entry<'a>>,
         recents: Vec<&'a RecentConnection>,
         favorites: Vec<HostId>,
     }
 
-    let ids: HashSet<HostId> = records.iter().map(ConnectionRecord::id).collect();
+    let mut ids: HashSet<HostId> = records.iter().map(ConnectionRecord::id).collect();
+    let kept: Vec<&UnreadableConnection> = unreadable
+        .iter()
+        .filter(|kept| kept.id().is_none_or(|id| ids.insert(id)))
+        .collect();
     let mut marked = HashSet::new();
     let wire = BookWire {
         version: FORMAT_VERSION,
@@ -878,7 +951,12 @@ pub(super) fn build_book(
             .iter()
             .filter_map(ConnectionRecord::as_ssh)
             .collect(),
-        connections: records.iter().filter(|record| !record.is_ssh()).collect(),
+        connections: records
+            .iter()
+            .filter(|record| !record.is_ssh())
+            .map(Entry::Record)
+            .chain(kept.iter().map(|kept| Entry::Kept(kept.stored())))
+            .collect(),
         recents: recents
             .iter()
             .filter(|recent| ids.contains(&recent.host()))
