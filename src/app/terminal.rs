@@ -4408,7 +4408,11 @@ impl TerminalPane {
                 .left(px(cursor.column as f32 * cell.width))
                 .top(px(cursor.row as f32 * cell.height))
                 .px(px(2.0))
-                .bg(theme::swatch(shell_palette::SURFACE_SELECTED))
+                // Opaque, so the cells under the composition do not show through it.
+                .bg(theme::swatch_over(
+                    shell_palette::SURFACE_SELECTED,
+                    shell_palette::SURFACE,
+                ))
                 .border_1()
                 .border_color(theme::swatch(shell_palette::ACCENT))
                 .text_size(px(self.font_size))

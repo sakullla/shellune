@@ -1417,10 +1417,20 @@ impl Element for LineElement {
             _ => vec![run],
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line =
-            window
-                .text_system()
-                .shape_line(SharedString::from(shown), font_size, &runs, None);
+        let mut runs = runs;
+        let shown = SharedString::from(shown);
+        // A placeholder wider than the field ends in an ellipsis rather than a cut
+        // letter (R1); typed text scrolls instead, so the caret can reach all of it.
+        let shown = if empty {
+            cx.text_system()
+                .line_wrapper(style.font(), font_size)
+                .truncate_line(shown, bounds.size.width, "…", &mut runs)
+        } else {
+            shown
+        };
+        let line = window
+            .text_system()
+            .shape_line(shown, font_size, &runs, None);
 
         let caret_x = if empty {
             px(0.0)
@@ -1815,6 +1825,52 @@ mod tests {
         );
         model.select_word_at(0);
         assert_eq!(model.selected_text(), Some("你好界"));
+    }
+
+    /// A field of a fixed width, for the placeholder tests.
+    struct Holder {
+        width: f32,
+        field: Entity<TextField>,
+    }
+
+    impl Render for Holder {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().flex().w(px(self.width)).child(self.field.clone())
+        }
+    }
+
+    /// The placeholder as it was shaped in a field `width` wide.
+    fn drawn_placeholder(cx: &mut gpui::TestAppContext, width: f32, words: &'static str) -> String {
+        let (view, cx) = cx.add_window_view(move |_window, cx| Holder {
+            width,
+            field: cx.new(|cx| TextField::new(words, cx)),
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            view.read(cx)
+                .field
+                .read(cx)
+                .last_layout
+                .as_ref()
+                .map(|line| line.text.to_string())
+                .expect("the field is drawn")
+        })
+    }
+
+    #[gpui::test]
+    fn a_placeholder_wider_than_its_field_ends_in_an_ellipsis(cx: &mut gpui::TestAppContext) {
+        // A search box narrower than its hint drew "Search hosts or u" (R1).
+        let words = "Search hosts or user@host:port";
+        let shown = drawn_placeholder(cx, 140.0, words);
+        let kept = shown
+            .strip_suffix('…')
+            .unwrap_or_else(|| panic!("{shown:?} has no ellipsis"));
+        assert!(!kept.is_empty() && words.starts_with(kept), "{shown:?}");
+    }
+
+    #[gpui::test]
+    fn a_placeholder_that_fits_is_drawn_whole(cx: &mut gpui::TestAppContext) {
+        assert_eq!(drawn_placeholder(cx, 600.0, "Search"), "Search");
     }
 
     #[test]

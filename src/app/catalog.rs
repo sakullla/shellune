@@ -23,8 +23,7 @@ const COLUMNS: usize = 4;
 /// them. The lists take the widest column, so a row shows its words, its metadata and
 /// its command side by side.
 ///
-/// The widths are fractions of a definite width rather than flex weights: a text that
-/// ends in an ellipsis is shaped at the first width it is measured at, and a zero flex
+/// The widths are fractions of a definite width rather than flex weights: a zero flex
 /// basis measured every line of a column at nothing.
 const COLUMN_SHARES: [f32; COLUMNS] = [0.21, 0.21, 0.31, 0.21];
 
@@ -56,7 +55,7 @@ fn placeholder(text: &'static str, metrics: Metrics) -> AnyElement {
         .truncate()
         .text_size(metrics.label_size())
         .text_color(theme::swatch(palette::TEXT_MUTED))
-        .child(text)
+        .child(components::line_text(text))
         .into_any_element()
 }
 
@@ -230,7 +229,7 @@ fn feedback(metrics: Metrics) -> Div {
 
 /// The sidebar entries, the list rows and a toolbar.
 fn lists(metrics: Metrics) -> Div {
-    let avatar = |initials: &'static str, pair: (Token, Token)| {
+    let avatar = |name: &'static str, pair: (Token, Token)| {
         div()
             .flex()
             .flex_none()
@@ -242,14 +241,14 @@ fn lists(metrics: Metrics) -> Div {
             .text_size(metrics.caption_size())
             .font_weight(metrics.title_weight())
             .text_color(theme::swatch(pair.1))
-            .child(initials)
+            .child(crate::app::view::host_initials(name))
             .into_any_element()
     };
     let row = |name: &'static str, address: &'static str, state: ControlState, index: usize| {
         components::list_row(
             ListRow {
                 leading: Some(avatar(
-                    "B1",
+                    name,
                     palette::AVATARS[index % palette::AVATARS.len()],
                 )),
                 title: SharedString::from(name),
@@ -417,27 +416,32 @@ fn swatches(metrics: Metrics) -> Div {
             .text_size(size)
             .child(words)
     };
-    section("Tokens", metrics)
-        .child(strip)
-        .child(type_line(metrics.hero_size(), "Shellune 28"))
-        .child(type_line(metrics.heading_size(), "Page title 20"))
-        .child(type_line(metrics.title_size(), "Small heading 16"))
-        .child(type_line(metrics.emphasis_size(), "Emphasis 14"))
-        .child(type_line(metrics.body_size(), "Body and controls 13"))
-        .child(
-            type_line(metrics.caption_size(), "Caption 12")
-                .text_color(theme::swatch(palette::TEXT_SECONDARY)),
-        )
+    // The type scale runs on as one wrapping line, largest first, so the whole page
+    // fits the design window.
+    section("Tokens", metrics).child(strip).child(
+        samples(metrics)
+            .items_baseline()
+            .gap(metrics.scale(spacing::SNUG))
+            .child(type_line(metrics.hero_size(), "Shellune 28"))
+            .child(type_line(metrics.heading_size(), "Page title 20"))
+            .child(type_line(metrics.title_size(), "Heading 16"))
+            .child(type_line(metrics.emphasis_size(), "Emphasis 14"))
+            .child(type_line(metrics.body_size(), "Body 13"))
+            .child(
+                type_line(metrics.caption_size(), "Caption 12")
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY)),
+            ),
+    )
 }
 
 /// The whole catalogue: four columns of sections on the window's floor, scrolling when
 /// the window is shorter than the page.
 pub fn design_catalog(metrics: Metrics) -> gpui::Stateful<Div> {
     let columns: [Vec<Div>; COLUMNS] = [
-        vec![buttons(metrics)],
-        vec![inputs(metrics), labels(metrics)],
-        vec![lists(metrics), feedback(metrics)],
-        vec![surfaces(metrics), swatches(metrics)],
+        vec![buttons(metrics), labels(metrics)],
+        vec![inputs(metrics), feedback(metrics)],
+        vec![lists(metrics), swatches(metrics)],
+        vec![surfaces(metrics)],
     ];
     let mut grid = div()
         .flex()
@@ -552,11 +556,14 @@ mod tests {
                     "the row's name is cut short at {zoom:?}: {title:?}"
                 );
             }
-            // The capture shoots the page at the design window: at 100% every section
-            // starts on the first screen.
+            // The capture shoots the page at the design window: at 100% the whole page,
+            // every section to its last line, is on the one screen.
             if zoom == theme::Zoom::Regular {
-                for column in &columns {
-                    assert!(column.top() < px(720.0));
+                for (index, column) in columns.iter().enumerate() {
+                    assert!(
+                        column.bottom() <= px(720.0),
+                        "column {index} runs past the design window: {column:?}"
+                    );
                 }
             }
         }

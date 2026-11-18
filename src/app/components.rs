@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Div, ElementId, Pixels, Rgba, SharedString,
-    Window, div, px,
+    StyledText, Window, div, px,
 };
 
 use crate::app::icons::{self, Icon};
@@ -429,13 +429,20 @@ fn hover_style(face: ControlFace) -> impl FnOnce(gpui::StyleRefinement) -> gpui:
     }
 }
 
+/// The width of the leading bar that marks the chosen item.
+const MARK_BAR_WIDTH: f32 = 2.0;
+/// The stroke of a hollow status mark and the height of the dash.
+const MARK_STROKE: f32 = 1.5;
+/// The rounding of the small marks: the bar, the squares and the dash.
+const MARK_CORNER: f32 = 1.0;
+
 /// The 2px leading bar that says "this one is chosen" without relying on colour.
 fn mark_bar(token: Token, metrics: Metrics) -> Div {
     div()
         .flex_none()
-        .w(px(2.0))
+        .w(px(MARK_BAR_WIDTH))
         .h(metrics.scale(14.0))
-        .rounded(px(1.0))
+        .rounded(px(MARK_CORNER))
         .bg(theme::swatch(token))
 }
 
@@ -453,21 +460,29 @@ pub fn status_mark(tone: Tone, size: Pixels) -> Div {
             .w(size)
             .h(size)
             .rounded_full()
-            .border(px(1.5))
+            .border(px(MARK_STROKE))
             .border_color(color),
         StatusMark::Square => div()
             .w(size * 0.86)
             .h(size * 0.86)
-            .rounded(px(1.0))
+            .rounded(px(MARK_CORNER))
             .bg(color),
         StatusMark::Box => div()
             .w(size * 0.86)
             .h(size * 0.86)
-            .rounded(px(1.0))
-            .border(px(1.5))
+            .rounded(px(MARK_CORNER))
+            .border(px(MARK_STROKE))
             .border_color(color),
-        StatusMark::Bar => div().w(size * 0.34).h(size).rounded(px(1.0)).bg(color),
-        StatusMark::Dash => div().w(size).h(px(1.5)).rounded(px(1.0)).bg(color),
+        StatusMark::Bar => div()
+            .w(size * 0.34)
+            .h(size)
+            .rounded(px(MARK_CORNER))
+            .bg(color),
+        StatusMark::Dash => div()
+            .w(size)
+            .h(px(MARK_STROKE))
+            .rounded(px(MARK_CORNER))
+            .bg(color),
         StatusMark::Target => div()
             .flex()
             .items_center()
@@ -475,7 +490,7 @@ pub fn status_mark(tone: Tone, size: Pixels) -> Div {
             .w(size)
             .h(size)
             .rounded_full()
-            .border(px(1.5))
+            .border(px(MARK_STROKE))
             .border_color(color)
             .child(div().size(size * 0.3).rounded_full().bg(color)),
     };
@@ -2067,6 +2082,54 @@ pub fn capped_text(max_width: Pixels, text: Div) -> Div {
     capped(max_width, text)
 }
 
+/// Words for a line that ends in an ellipsis where it does not fit: the child of an
+/// element with `.truncate()` (and `.min_w_0()` in a row).
+///
+/// It is the text element itself rather than the bare words so the tests can read back
+/// the line as it was shaped and see the "…" that was drawn (R1); in the application it
+/// is the same text a string child would give.
+pub fn line_text(text: impl Into<SharedString>) -> StyledText {
+    let text: SharedString = text.into();
+    let element = StyledText::new(text.clone());
+    #[cfg(test)]
+    drawn::keep(text, element.layout().clone());
+    element
+}
+
+/// The lines [`line_text`] shaped, as the tests read them back.
+#[cfg(test)]
+pub mod drawn {
+    use std::cell::RefCell;
+
+    use gpui::{SharedString, TextLayout};
+
+    thread_local! {
+        static LINES: RefCell<Vec<(SharedString, TextLayout)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn keep(text: SharedString, layout: TextLayout) {
+        LINES.with(|lines| lines.borrow_mut().push((text, layout)));
+    }
+
+    /// Forgets the lines of earlier tests on this thread.
+    pub fn clear() {
+        LINES.with(|lines| lines.borrow_mut().clear());
+    }
+
+    /// The line `text` was last shaped into: the words that were drawn, with the "…"
+    /// where they were cut.
+    pub fn shown(text: &str) -> Option<String> {
+        LINES.with(|lines| {
+            lines
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(words, _)| words.as_ref() == text)
+                .map(|(_, layout)| layout.text())
+        })
+    }
+}
+
 /// Any block - a card, a column of words - centred with a width cap and laid out at the
 /// width it is painted at, by the rule of [`capped_text`].
 pub fn capped(max_width: Pixels, block: Div) -> Div {
@@ -2511,8 +2574,8 @@ pub fn list_row_frame(state: ControlState, metrics: Metrics) -> Div {
                 .left(px(0.0))
                 .top(metrics.scale(spacing::TIGHT + spacing::HALF))
                 .bottom(metrics.scale(spacing::TIGHT + spacing::HALF))
-                .w(px(2.0))
-                .rounded(px(1.0))
+                .w(px(MARK_BAR_WIDTH))
+                .rounded(px(MARK_CORNER))
                 .bg(theme::swatch(token)),
         ),
         None => base,
@@ -2575,7 +2638,7 @@ pub fn list_row(row: ListRow, state: ControlState, metrics: Metrics) -> Div {
                     .truncate()
                     .text_size(metrics.body_size())
                     .font_weight(metrics.medium_weight())
-                    .child(title),
+                    .child(line_text(title)),
             ),
         )
         .children(subtitle.map(|subtitle| {
@@ -2588,7 +2651,7 @@ pub fn list_row(row: ListRow, state: ControlState, metrics: Metrics) -> Div {
                     })
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                    .child(subtitle),
+                    .child(line_text(subtitle)),
             )
         }));
     list_row_frame(state, metrics)
@@ -2679,7 +2742,7 @@ pub fn sidebar_item(
             icons::icon(icon, metrics.icon_size(), ink_color)
                 .group_hover(ICON_GROUP, move |style| style.text_color(hover_ink)),
         )
-        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+        .child(div().flex_1().min_w_0().truncate().child(line_text(label)))
         .children(count.map(|count| {
             div()
                 .flex_none()
@@ -2772,7 +2835,7 @@ pub fn inline_banner(
                 .min_w_0()
                 .truncate()
                 .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .child(message.into()),
+                .child(line_text(message)),
         )
 }
 
@@ -2948,20 +3011,30 @@ mod tests {
 
     const VARIANTS: [Variant; 5] = Variant::ALL;
 
-    /// Where a face with no fill of its own ends up being drawn.
-    const BACKDROPS: [Token; 6] = [
+    /// The layers a control can be drawn on.
+    const LAYERS: [Token; 5] = [
         palette::CANVAS,
         palette::CHROME,
         palette::SURFACE,
         palette::RAISED,
         palette::OVERLAY,
-        palette::SURFACE_SELECTED,
     ];
 
+    /// What a face's label is read against: its own opaque fill; its veil over every
+    /// layer; or, with no fill, every layer and a chosen row on every layer.
     fn backdrops(face: ControlFace) -> Vec<Token> {
         match face.fill_token() {
-            Some(fill) => vec![fill],
-            None => BACKDROPS.to_vec(),
+            Some(fill) if fill.is_opaque() => vec![fill],
+            Some(veil) => LAYERS.iter().map(|layer| veil.over(*layer)).collect(),
+            None => LAYERS
+                .iter()
+                .copied()
+                .chain(
+                    LAYERS
+                        .iter()
+                        .map(|layer| palette::SURFACE_SELECTED.over(*layer)),
+                )
+                .collect(),
         }
     }
 
@@ -3479,8 +3552,97 @@ mod tests {
         theme::set_motion(theme::Motion::Full);
     }
 
+    /// Asserts `words` were drawn cut, ending in "…", and not cut down to nothing.
+    fn assert_cut(words: &str) {
+        let shown = drawn::shown(words).unwrap_or_else(|| panic!("{words:?} is not drawn"));
+        let kept = shown
+            .strip_suffix('…')
+            .unwrap_or_else(|| panic!("{words:?} is drawn as {shown:?}, with no ellipsis"));
+        assert!(
+            !kept.is_empty() && words.starts_with(kept),
+            "{words:?} is drawn as {shown:?}"
+        );
+    }
+
     #[gpui::test]
-    fn a_list_row_and_a_banner_end_long_words_in_an_ellipsis(cx: &mut gpui::TestAppContext) {
+    fn cut_words_in_rows_banners_and_sidebars_end_in_a_drawn_ellipsis(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A cut line ends in "…", never in a cut letter (R1); a line that fits is drawn
+        // whole. The words are read back from the shaped line, not from the box around
+        // it, which kept its width while the letters ran under the next element.
+        drawn::clear();
+        let _cx = lay_out(cx, 280.0, |metrics| {
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(list_row(
+                    ListRow {
+                        leading: Some(
+                            leading_icon(Icon::Server, Tone::Accent, metrics).into_any_element(),
+                        ),
+                        title: "a-host-name-that-is-much-longer-than-the-row".into(),
+                        subtitle: Some("deploy@a-very-long-address.internal.example:2222".into()),
+                        monospace_subtitle: true,
+                        meta: Some(tag("Prod", metrics).into_any_element()),
+                        actions: None,
+                        reveal_actions: false,
+                    },
+                    ControlState::Selected,
+                    metrics,
+                ))
+                .child(list_row(
+                    ListRow {
+                        leading: None,
+                        title: "api-02".into(),
+                        subtitle: Some("ops@192.0.2.12".into()),
+                        monospace_subtitle: true,
+                        meta: None,
+                        actions: None,
+                        reveal_actions: false,
+                    },
+                    ControlState::Resting,
+                    metrics,
+                ))
+                .child(
+                    inline_banner(
+                        Tone::Danger,
+                        Icon::Plug,
+                        "Connection lost · the server stopped answering keepalives",
+                        metrics,
+                    )
+                    .child(compact_button(
+                        "Reconnect",
+                        Variant::Primary,
+                        metrics,
+                    )),
+                )
+                .child(sidebar_item(
+                    Icon::Folder,
+                    "Production servers in the Frankfurt data centre",
+                    Some(24),
+                    true,
+                    metrics,
+                ))
+                .into_any_element()
+        });
+        for words in [
+            "a-host-name-that-is-much-longer-than-the-row",
+            "deploy@a-very-long-address.internal.example:2222",
+            "Connection lost · the server stopped answering keepalives",
+            "Production servers in the Frankfurt data centre",
+        ] {
+            assert_cut(words);
+        }
+        for words in ["api-02", "ops@192.0.2.12"] {
+            assert_eq!(drawn::shown(words).as_deref(), Some(words), "{words} fits");
+        }
+        theme::set_motion(theme::Motion::Full);
+    }
+
+    #[gpui::test]
+    fn a_list_row_and_a_banner_keep_long_words_on_one_line(cx: &mut gpui::TestAppContext) {
         let cx = lay_out(cx, 280.0, |metrics| {
             div()
                 .flex()

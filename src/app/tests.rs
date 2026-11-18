@@ -2511,15 +2511,27 @@ fn the_tab_and_palette_shortcuts_reach_past_a_terminal() {
 // Palette
 // ---------------------------------------------------------------------------
 
-/// The surfaces a label or a mark is drawn on: the five layers and the chosen fill.
-const LABEL_SURFACES: [(&str, theme::Token); 6] = [
-    ("canvas", palette::CANVAS),
-    ("chrome", palette::CHROME),
-    ("surface", palette::SURFACE),
-    ("raised", palette::RAISED),
-    ("overlay", palette::OVERLAY),
-    ("selected", palette::SURFACE_SELECTED),
-];
+/// The surfaces a label or a mark is drawn on: the five layers, and the chosen fill (a
+/// veil) on each of them.
+fn label_surfaces() -> Vec<(String, theme::Token)> {
+    let layers = [
+        ("canvas", palette::CANVAS),
+        ("chrome", palette::CHROME),
+        ("surface", palette::SURFACE),
+        ("raised", palette::RAISED),
+        ("overlay", palette::OVERLAY),
+    ];
+    layers
+        .iter()
+        .map(|(name, token)| ((*name).to_owned(), *token))
+        .chain(layers.iter().map(|(name, token)| {
+            (
+                format!("selected on {name}"),
+                palette::SURFACE_SELECTED.over(*token),
+            )
+        }))
+        .collect()
+}
 
 #[test]
 fn body_text_reaches_the_contrast_floor_on_every_surface() {
@@ -2530,7 +2542,7 @@ fn body_text_reaches_the_contrast_floor_on_every_surface() {
         ("accent", palette::ACCENT),
     ];
 
-    for (surface_name, surface) in LABEL_SURFACES {
+    for (surface_name, surface) in label_surfaces() {
         for (text_name, token) in text {
             let (dark, light) = theme::contrast::both(token, surface);
             assert!(
@@ -2570,7 +2582,7 @@ fn host_initials_tell_numbered_hosts_apart() {
 #[test]
 fn tab_identity_colours_are_readable_distinct_and_not_status_hues() {
     for token in palette::TAB_ACCENTS {
-        for (surface_name, surface) in LABEL_SURFACES {
+        for (surface_name, surface) in label_surfaces() {
             let (dark, light) = theme::contrast::both(token, surface);
             assert!(
                 dark >= GRAPHIC_CONTRAST_FLOOR,
@@ -2623,19 +2635,27 @@ fn status_colours_are_readable_and_distinct() {
     ];
 
     for tone in tones {
-        for (surface_name, surface) in LABEL_SURFACES {
+        for (surface_name, surface) in label_surfaces() {
             let (dark, light) = theme::contrast::both(tone.token(), surface);
             assert!(
                 dark >= BODY_CONTRAST_FLOOR && light >= BODY_CONTRAST_FLOOR,
                 "{tone:?} on {surface_name} is {dark:.2}:1 dark and {light:.2}:1 light"
             );
         }
-        // A chip draws its word on its own tint.
-        let on_tint = theme::contrast::worst(tone.token(), tone.tint());
-        assert!(
-            on_tint >= BODY_CONTRAST_FLOOR,
-            "{tone:?} on its tint is {on_tint:.2}:1"
-        );
+        // A chip draws its word on its own tint; the neutral tint is a veil, read on
+        // every layer it can lie on.
+        for layer in [
+            palette::CANVAS,
+            palette::SURFACE,
+            palette::RAISED,
+            palette::OVERLAY,
+        ] {
+            let on_tint = theme::contrast::worst(tone.token(), tone.tint().over(layer));
+            assert!(
+                on_tint >= BODY_CONTRAST_FLOOR,
+                "{tone:?} on its tint over {layer:x} is {on_tint:.2}:1"
+            );
+        }
     }
 
     let mut tokens: Vec<theme::Token> = tones.iter().map(|tone| tone.token()).collect();

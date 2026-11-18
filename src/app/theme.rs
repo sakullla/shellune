@@ -32,34 +32,59 @@ use shellune_core::{SessionFailure, SessionKind, SessionState, TabAccent, Transf
 ///
 /// Views hold tokens, never resolved colours; [`swatch`] resolves one in the palette the
 /// window is being drawn in.
+///
+/// Most tokens are opaque. The interaction fills ([`palette::SURFACE_HOVER`],
+/// [`palette::SURFACE_SELECTED`], [`palette::SURFACE_PRESSED`]) are a veil: white or
+/// black at a few percent, laid over whatever layer the element is on, so a hovered
+/// row lifts off a panel, a menu and a dialog alike, and a tag on a chosen row is one
+/// step lighter again instead of vanishing into it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Token {
     dark: u32,
     light: u32,
+    /// The opacity in each palette, in percent; 100 for an opaque token.
+    dark_alpha: u8,
+    light_alpha: u8,
 }
 
 impl Token {
     /// A token from its dark and its light value.
     #[must_use]
     pub const fn new(dark: u32, light: u32) -> Self {
-        Self { dark, light }
+        Self {
+            dark,
+            light,
+            dark_alpha: 100,
+            light_alpha: 100,
+        }
     }
 
-    /// The 24-bit sRGB value in the dark palette.
+    /// A see-through token: an ink and its opacity in percent, in each palette.
+    #[must_use]
+    pub const fn veil(dark: (u32, u8), light: (u32, u8)) -> Self {
+        Self {
+            dark: dark.0,
+            light: light.0,
+            dark_alpha: dark.1,
+            light_alpha: light.1,
+        }
+    }
+
+    /// The 24-bit sRGB value in the dark palette (a veil's ink, without its opacity).
     #[must_use]
     #[cfg_attr(not(test), allow(dead_code))]
     pub const fn dark(self) -> u32 {
         self.dark
     }
 
-    /// The 24-bit sRGB value in the light palette.
+    /// The 24-bit sRGB value in the light palette (a veil's ink, without its opacity).
     #[must_use]
     #[cfg_attr(not(test), allow(dead_code))]
     pub const fn light(self) -> u32 {
         self.light
     }
 
-    /// The value in one palette.
+    /// The value in one palette (a veil's ink, without its opacity).
     #[must_use]
     pub const fn value(self, appearance: Appearance) -> u32 {
         match appearance {
@@ -67,21 +92,72 @@ impl Token {
             Appearance::Light => self.light,
         }
     }
+
+    /// The opacity in one palette, from 0 to 1.
+    #[must_use]
+    pub fn alpha(self, appearance: Appearance) -> f32 {
+        f32::from(match appearance {
+            Appearance::Dark => self.dark_alpha,
+            Appearance::Light => self.light_alpha,
+        }) / 100.0
+    }
+
+    /// Whether the token hides what is under it in both palettes.
+    #[must_use]
+    pub const fn is_opaque(self) -> bool {
+        self.dark_alpha == 100 && self.light_alpha == 100
+    }
+
+    /// The opaque colour this token gives laid over `under`, in each palette: what a
+    /// veil looks like on a given layer. An opaque token is itself; a veil under it is
+    /// first laid on the window's floor.
+    #[must_use]
+    pub fn over(self, under: Token) -> Token {
+        fn blend(top: u32, alpha: u8, under: u32) -> u32 {
+            let alpha = f64::from(alpha) / 100.0;
+            let channel = |shift: u32| {
+                let top = f64::from((top >> shift) & 0xff);
+                let under = f64::from((under >> shift) & 0xff);
+                // A rounded blend of two bytes is a byte.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let mixed = (top * alpha + under * (1.0 - alpha)).round() as u32;
+                mixed
+            };
+            (channel(16) << 16) | (channel(8) << 8) | channel(0)
+        }
+        let under = if under.is_opaque() {
+            under
+        } else {
+            under.over(palette::CANVAS)
+        };
+        Token::new(
+            blend(self.dark, self.dark_alpha, under.dark),
+            blend(self.light, self.light_alpha, under.light),
+        )
+    }
 }
 
 impl std::fmt::LowerHex for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:06x}/{:06x}", self.dark, self.light)
+        if self.is_opaque() {
+            write!(f, "{:06x}/{:06x}", self.dark, self.light)
+        } else {
+            write!(
+                f,
+                "{:06x}@{}%/{:06x}@{}%",
+                self.dark, self.dark_alpha, self.light, self.light_alpha
+            )
+        }
     }
 }
 
 /// The dark palette: neutral graphite with one periwinkle accent (token v2).
 ///
-/// The surfaces are a short neutral grey ramp - canvas, panel, raised, dialog - and the
-/// interaction fills and hairlines are white laid over the panel at a few percent
-/// (hover 5%, selected 8%, pressed 10%, border 7%, strong border 12%), written here as
-/// the opaque colour that blend gives. A dark palette tells its layers apart by
-/// lightness and edge; the shadows are faint.
+/// The surfaces are a short neutral grey ramp - canvas, panel, raised, dialog. The
+/// interaction fills are white veils (hover 5%, selected 8%, pressed 10%) that lie over
+/// whichever layer they are drawn on; the hairlines are white over the panel (border
+/// 7%, strong border 12%), written here as the opaque colour that blend gives. A dark
+/// palette tells its layers apart by lightness and edge; the shadows are faint.
 pub mod dark {
     /// The window's floor: behind the content area and around the terminal.
     pub const CANVAS: u32 = 0x0f0f11;
@@ -93,12 +169,12 @@ pub mod dark {
     pub const RAISED: u32 = 0x1c1c20;
     /// Dialogs, the front-most layer.
     pub const OVERLAY: u32 = 0x202024;
-    /// White 5% over the panel.
-    pub const SURFACE_HOVER: u32 = 0x212124;
-    /// White 8% over the panel.
-    pub const SURFACE_SELECTED: u32 = 0x28282a;
-    /// White 10% over the panel.
-    pub const SURFACE_PRESSED: u32 = 0x2c2c2f;
+    /// White at 5%, over whatever layer it is on.
+    pub const SURFACE_HOVER: (u32, u8) = (0xffffff, 5);
+    /// White at 8%.
+    pub const SURFACE_SELECTED: (u32, u8) = (0xffffff, 8);
+    /// White at 10%.
+    pub const SURFACE_PRESSED: (u32, u8) = (0xffffff, 10);
     /// White 7% over the panel.
     pub const BORDER: u32 = 0x252528;
     /// White 12% over the panel.
@@ -106,20 +182,20 @@ pub mod dark {
     pub const SEGMENT_TRACK: u32 = 0x0c0c0e;
     pub const SEGMENT_THUMB: u32 = 0x232327;
     pub const TEXT_PRIMARY: u32 = 0xededef;
-    pub const TEXT_SECONDARY: u32 = 0xa1a1aa;
-    pub const TEXT_MUTED: u32 = 0x92929b;
-    pub const ACCENT: u32 = 0x8689f3;
-    pub const ACCENT_HOVER: u32 = 0x9598f5;
-    pub const ACCENT_PRESSED: u32 = 0x7a7de8;
+    pub const TEXT_SECONDARY: u32 = 0xb0b0b8;
+    pub const TEXT_MUTED: u32 = 0x9e9ea6;
+    pub const ACCENT: u32 = 0x9396f4;
+    pub const ACCENT_HOVER: u32 = 0xa0a3f6;
+    pub const ACCENT_PRESSED: u32 = 0x8689f3;
     pub const ON_ACCENT: u32 = 0x0f0f11;
     /// The accent 14% over the panel.
-    pub const ACCENT_TINT: u32 = 0x252537;
+    pub const ACCENT_TINT: u32 = 0x272737;
     pub const ACCENT_ON_TINT: u32 = 0xc5c7fa;
     pub const POSITIVE: u32 = 0x5bc490;
     pub const WARNING: u32 = 0xd9ae5f;
     pub const DANGER: u32 = 0xee8a8a;
     pub const INFO: u32 = 0x78aeeb;
-    pub const PLANNED: u32 = 0x9a9aa6;
+    pub const PLANNED: u32 = 0x9e9ea9;
     /// Each status colour 14% over the panel.
     pub const POSITIVE_TINT: u32 = 0x1f2e29;
     pub const WARNING_TINT: u32 = 0x302a22;
@@ -132,16 +208,16 @@ pub mod dark {
     pub const TRACK_ON: u32 = 0x6d71e6;
     pub const TRACK_ON_HOVER: u32 = 0x7377ea;
     pub const KNOB: u32 = 0xf4f4f5;
-    pub const FOCUS_RING: u32 = 0x9598f5;
+    pub const FOCUS_RING: u32 = 0xa0a3f6;
     pub const DISABLED_SURFACE: u32 = 0x18181b;
-    pub const DISABLED_TEXT: u32 = 0x75757e;
+    pub const DISABLED_TEXT: u32 = 0x7c7c84;
     pub const LOADING_TRACK: u32 = 0x28282a;
-    pub const LOADING_FILL: u32 = 0x8689f3;
+    pub const LOADING_FILL: u32 = 0x9396f4;
     pub const SCRIM: u32 = 0x000000;
     pub const SHADOW: u32 = 0x000000;
     pub const BRAND_END: u32 = 0xa78bfa;
     /// The terminal's selection: the accent 32% over the terminal's background.
-    pub const SELECTION: u32 = 0x323459;
+    pub const SELECTION: u32 = 0x373859;
     /// Eight low-chroma avatar pairs (tint, initials): indigo, steel, teal, sage, moss,
     /// sand, clay and heather, each hue 18% over the panel.
     pub const AVATARS: [(u32, u32); 8] = [
@@ -160,17 +236,18 @@ pub mod dark {
 /// The light palette: neutral paper with the same accent, a step deeper.
 ///
 /// The floor is near-white, the panels one step greyer and anything that floats is
-/// white; the interaction fills and hairlines are black over the panel at a few
-/// percent (hover 4%, selected 6%, pressed 8%, border 8%, strong border 14%).
+/// white; the interaction fills are black veils (hover 4%, selected 6%, pressed 8%)
+/// over whichever layer they are on, and the hairlines are black over the panel
+/// (border 8%, strong border 14%).
 pub mod light {
     pub const CANVAS: u32 = 0xfafafa;
     pub const CHROME: u32 = 0xf4f4f5;
     pub const SURFACE: u32 = 0xf4f4f5;
     pub const RAISED: u32 = 0xffffff;
     pub const OVERLAY: u32 = 0xffffff;
-    pub const SURFACE_HOVER: u32 = 0xeaeaeb;
-    pub const SURFACE_SELECTED: u32 = 0xe5e5e6;
-    pub const SURFACE_PRESSED: u32 = 0xe0e0e1;
+    pub const SURFACE_HOVER: (u32, u8) = (0x000000, 4);
+    pub const SURFACE_SELECTED: (u32, u8) = (0x000000, 6);
+    pub const SURFACE_PRESSED: (u32, u8) = (0x000000, 8);
     pub const BORDER: u32 = 0xe0e0e1;
     pub const BORDER_STRONG: u32 = 0xd2d2d3;
     pub const SEGMENT_TRACK: u32 = 0xeaeaeb;
@@ -278,12 +355,6 @@ pub mod palette {
         RAISED;
         /// Dialogs: the front-most surface, drawn over the scrim.
         OVERLAY;
-        /// A surface under the pointer.
-        SURFACE_HOVER;
-        /// The selected navigation entry, tab or choice.
-        SURFACE_SELECTED;
-        /// A control under the pressed pointer, one step past selected.
-        SURFACE_PRESSED;
         /// The weak hairline between regions and around cards.
         BORDER;
         /// The strong edge of controls, floating layers and an element under the pointer.
@@ -366,6 +437,15 @@ pub mod palette {
         /// terminal's own palette, which may differ from the window's.
         SELECTION;
     }
+
+    /// A surface under the pointer: a veil over whatever layer it is on.
+    pub const SURFACE_HOVER: Token = Token::veil(dark::SURFACE_HOVER, light::SURFACE_HOVER);
+    /// The selected navigation entry, tab, row or choice; also the quiet fill of a tag
+    /// or a neutral chip. A veil, so a tag on a chosen row still stands out.
+    pub const SURFACE_SELECTED: Token =
+        Token::veil(dark::SURFACE_SELECTED, light::SURFACE_SELECTED);
+    /// A control under the pressed pointer, one step past selected. A veil.
+    pub const SURFACE_PRESSED: Token = Token::veil(dark::SURFACE_PRESSED, light::SURFACE_PRESSED);
 
     /// Host avatar pairs (tint, initials): eight low-chroma hues.
     ///
@@ -560,7 +640,18 @@ pub mod weight {
 /// Views never call `rgb` with a literal; this is the one place a token turns into a
 /// colour.
 pub fn swatch(token: Token) -> Rgba {
-    rgb(resolve(token))
+    let appearance = appearance();
+    Rgba {
+        a: token.alpha(appearance),
+        ..rgb(token.value(appearance))
+    }
+}
+
+/// Resolves a veil laid over `under` as one opaque colour, for an element that must
+/// hide what is beneath it (an input method's composition over terminal text) and
+/// still wear an interaction fill.
+pub fn swatch_over(token: Token, under: Token) -> Rgba {
+    swatch(token.over(under))
 }
 
 /// Which palette the window is drawn in.
@@ -1069,12 +1160,6 @@ pub trait Elevated: Styled + Sized {
 
 impl<T: Styled + Sized> Elevated for T {}
 
-/// The value a token has in the palette the window is being drawn in.
-#[must_use]
-pub fn resolve(token: Token) -> u32 {
-    token.value(appearance())
-}
-
 /// A terminal colour in the current palette.
 #[must_use]
 pub fn terminal_color(color: u32) -> u32 {
@@ -1543,7 +1628,14 @@ pub mod contrast {
     }
 
     /// The contrast of a token pair in each palette, dark first.
+    ///
+    /// A veil has no contrast of its own: lay it over its layer first
+    /// ([`super::Token::over`]).
     pub fn both(foreground: super::Token, background: super::Token) -> (f64, f64) {
+        assert!(
+            foreground.is_opaque() && background.is_opaque(),
+            "{foreground:x} on {background:x}: lay a veil over its layer before measuring it"
+        );
         (
             ratio(foreground.dark(), background.dark()),
             ratio(foreground.light(), background.light()),
@@ -1568,15 +1660,18 @@ pub mod contrast {
 /// * the bare lengths - `scale(<number>)` and `px(<number>)` - do not grow. The
 ///   baselines below only ever go down as screens move onto named metrics; the count
 ///   before the migration and each lowered baseline are in
-///   `docs/design/02-shell-and-design-system.md` (section 2.5).
+///   `docs/design/02-shell-and-design-system.md` (section 2.5). `px(0)` is not
+///   counted: a zero is not a size to name, and renaming `min_w(px(0.0))` to
+///   `min_w_0()` must not pass for moving a screen onto the metrics.
 #[cfg(test)]
 mod guard {
     use std::path::{Path, PathBuf};
 
     /// Bare `scale(<number>)` calls in the non-test source of `src/app`.
     const SCALE_BASELINE: usize = 267;
-    /// Bare `px(<number>)` calls in the non-test source of `src/app`.
-    const PX_BASELINE: usize = 154;
+    /// Bare `px(<number>)` calls with a number other than zero in the non-test source
+    /// of `src/app`.
+    const PX_BASELINE: usize = 82;
 
     /// The files a colour literal is allowed in, and why.
     const COLOUR_HOMES: [&str; 2] = [
@@ -1696,6 +1791,17 @@ mod guard {
     /// Whether a bare number - `-?digits[_digits][.digits]` - and the closing
     /// parenthesis follow `from`.
     fn bare_number(code: &[u8], from: usize) -> bool {
+        bare_value(code, from).is_some()
+    }
+
+    /// Whether a bare number other than zero and the closing parenthesis follow `from`.
+    fn bare_length(code: &[u8], from: usize) -> bool {
+        bare_value(code, from).is_some_and(|zero| !zero)
+    }
+
+    /// The bare number that follows `from` up to the closing parenthesis, if there is
+    /// one: whether it is zero.
+    fn bare_value(code: &[u8], from: usize) -> Option<bool> {
         let mut at = from;
         while code.get(at) == Some(&b' ') {
             at += 1;
@@ -1711,8 +1817,11 @@ mod guard {
             at += 1;
         }
         if at == digits || !code[digits].is_ascii_digit() {
-            return false;
+            return None;
         }
+        let mut zero = code[digits..at]
+            .iter()
+            .all(|byte| matches!(byte, b'0' | b'_'));
         if code.get(at) == Some(&b'.') {
             at += 1;
             let fraction = at;
@@ -1720,13 +1829,14 @@ mod guard {
                 at += 1;
             }
             if at == fraction {
-                return false;
+                return None;
             }
+            zero &= code[fraction..at].iter().all(|byte| *byte == b'0');
         }
         while code.get(at) == Some(&b' ') {
             at += 1;
         }
-        code.get(at) == Some(&b')')
+        (code.get(at) == Some(&b')')).then_some(zero)
     }
 
     /// What one file holds: bare `scale`s, bare `px`es and colour literals.
@@ -1741,7 +1851,7 @@ mod guard {
                 scale += 1;
             }
             if let Some(open) = call_at(bytes, at, "px")
-                && bare_number(bytes, open)
+                && bare_length(bytes, open)
             {
                 px += 1;
             }
@@ -1817,6 +1927,7 @@ mod guard {
     #[test]
     fn bare_lengths_only_ever_go_down() {
         let (scale, px, _) = survey();
+        eprintln!("bare lengths: {scale} scale(<number>), {px} px(<number other than 0>)");
         assert!(
             scale <= SCALE_BASELINE,
             "{scale} bare scale(<number>) calls, above the baseline of {SCALE_BASELINE}: \
@@ -1839,10 +1950,11 @@ mod guard {
             mod tests {\n\
                 fn t() { px(1.0); scale(2.0); }\n\
             }\n\
-            fn after() { metrics.scale(-1.5); my_px(2.0); }\n";
+            fn after() { metrics.scale(-1.5); my_px(2.0); }\n\
+            fn zero() { div().min_w(px(0.0)).top(px(0.)).left(px(0)).w(px(0.5)) }\n";
         let (scale, px, colours) = tally(&non_test_code(source));
         assert_eq!(scale, 2, "scale(12.0) and scale(-1.5)");
-        assert_eq!(px, 1, "px(4.0) only");
+        assert_eq!(px, 2, "px(4.0) and px(0.5); a zero is not a length");
         assert_eq!(colours.len(), 2, "rgb(0x…) and its hex value: {colours:?}");
     }
 }
@@ -1871,14 +1983,25 @@ mod tests {
         ("overlay", palette::OVERLAY),
     ];
 
-    /// Every surface a label can be drawn on: the layers and the interaction fills.
-    fn surfaces() -> Vec<(&'static str, Token)> {
-        let mut surfaces = LAYERS.to_vec();
-        surfaces.extend([
-            ("hover", palette::SURFACE_HOVER),
-            ("selected", palette::SURFACE_SELECTED),
-            ("pressed", palette::SURFACE_PRESSED),
-        ]);
+    /// The interaction fills: veils over whatever layer they are on.
+    const VEILS: [(&str, Token); 3] = [
+        ("hover", palette::SURFACE_HOVER),
+        ("selected", palette::SURFACE_SELECTED),
+        ("pressed", palette::SURFACE_PRESSED),
+    ];
+
+    /// Every surface a label can be drawn on: the layers, and each interaction fill
+    /// laid over each layer - a hovered menu item, a chosen row in a dialog.
+    fn surfaces() -> Vec<(String, Token)> {
+        let mut surfaces: Vec<(String, Token)> = LAYERS
+            .iter()
+            .map(|(name, token)| ((*name).to_owned(), *token))
+            .collect();
+        for (veil, token) in VEILS {
+            for (layer, under) in LAYERS {
+                surfaces.push((format!("{veil} on {layer}"), token.over(under)));
+            }
+        }
         surfaces
     }
 
@@ -1968,7 +2091,7 @@ mod tests {
 
     #[test]
     fn the_light_palette_is_its_own_table_not_a_copy_of_the_dark_one() {
-        for (name, token) in surfaces() {
+        for (name, token) in LAYERS.into_iter().chain(VEILS) {
             assert_ne!(
                 token.dark(),
                 token.light(),
@@ -2031,15 +2154,35 @@ mod tests {
 
     #[test]
     fn the_interaction_fills_and_hairlines_are_the_documented_blends() {
-        // Token v2 writes hover, selected, pressed and the two hairlines as white
-        // (dark) or black (light) laid over the panel; the tables hold the opaque
-        // result, and this keeps the two in step.
-        let surface_dark = palette::SURFACE.dark();
-        let surface_light = palette::SURFACE.light();
+        // Token v2 (ADR-1): hover, selected and pressed are white (dark) or black
+        // (light) veils at a few percent, drawn see-through over whatever layer they
+        // are on; the two hairlines are the same inks laid over the panel, held as the
+        // opaque result. This keeps the tables and the design document in step.
         for (name, token, dark_alpha, light_alpha) in [
             ("hover", palette::SURFACE_HOVER, 0.05, 0.04),
             ("selected", palette::SURFACE_SELECTED, 0.08, 0.06),
             ("pressed", palette::SURFACE_PRESSED, 0.10, 0.08),
+        ] {
+            assert!(!token.is_opaque(), "{name} is a veil");
+            assert_eq!(token.dark(), 0xffffff, "dark {name} is white");
+            assert_eq!(token.light(), 0x000000, "light {name} is black");
+            assert!((f64::from(token.alpha(Appearance::Dark)) - dark_alpha).abs() < 1e-6);
+            assert!((f64::from(token.alpha(Appearance::Light)) - light_alpha).abs() < 1e-6);
+            // Over the panel the veil is the documented blend.
+            assert_eq!(
+                token.over(palette::SURFACE).dark(),
+                over(0xffffff, dark_alpha, palette::SURFACE.dark()),
+                "dark {name}"
+            );
+            assert_eq!(
+                token.over(palette::SURFACE).light(),
+                over(0x000000, light_alpha, palette::SURFACE.light()),
+                "light {name}"
+            );
+        }
+        let surface_dark = palette::SURFACE.dark();
+        let surface_light = palette::SURFACE.light();
+        for (name, token, dark_alpha, light_alpha) in [
             ("border", palette::BORDER, 0.07, 0.08),
             ("border strong", palette::BORDER_STRONG, 0.12, 0.14),
         ] {
@@ -2063,6 +2206,49 @@ mod tests {
             palette::SELECTION.light(),
             over(light::ACCENT, 0.22, 0xfcfcfd)
         );
+    }
+
+    /// The least lightness step, as a contrast ratio, that reads as "this changed":
+    /// a hovered item against its layer, a tag against the row it is on.
+    const FILL_STEP: f64 = 1.08;
+
+    #[test]
+    fn every_interaction_fill_stands_off_every_layer_it_is_drawn_on() {
+        // The fills were once opaque blends over the panel. On a menu or a dialog the
+        // dark hover came out at 1.01:1 against the layer, so a hovered menu item or
+        // a dialog's ghost button did not change, and a tag (the selected fill) on a
+        // chosen row (the same fill) vanished. As veils each one steps off whatever
+        // it is on.
+        for (layer_name, layer) in LAYERS {
+            for (veil_name, veil) in VEILS {
+                let (dark, light) = contrast::both(veil.over(layer), layer);
+                assert!(
+                    dark >= FILL_STEP && light >= FILL_STEP,
+                    "{veil_name} on {layer_name} is {dark:.3}:1 dark and {light:.3}:1 \
+                     light against the layer"
+                );
+            }
+            // A tag on a chosen row: the selected fill over the selected fill.
+            let row = palette::SURFACE_SELECTED.over(layer);
+            let tag = palette::SURFACE_SELECTED.over(row);
+            let (dark, light) = contrast::both(tag, row);
+            assert!(
+                dark >= FILL_STEP && light >= FILL_STEP,
+                "a tag on a chosen row on {layer_name} is {dark:.3}:1 / {light:.3}:1"
+            );
+        }
+    }
+
+    #[test]
+    fn a_veil_is_drawn_see_through_and_composites_to_an_opaque_colour() {
+        super::set_appearance(Appearance::Dark);
+        let hover = super::swatch(palette::SURFACE_HOVER);
+        assert!((hover.a - 0.05).abs() < 1e-6, "{hover:?}");
+        assert!((super::swatch(palette::CANVAS).a - 1.0).abs() < f32::EPSILON);
+        let laid = super::swatch_over(palette::SURFACE_SELECTED, palette::SURFACE);
+        assert!((laid.a - 1.0).abs() < f32::EPSILON);
+        assert!(palette::SURFACE_SELECTED.over(palette::OVERLAY).is_opaque());
+        assert_eq!(palette::CANVAS.over(palette::OVERLAY), palette::CANVAS);
     }
 
     /// What one colour looks like laid over another, per sRGB channel.
@@ -2098,16 +2284,19 @@ mod tests {
     #[test]
     fn the_chrome_stays_neutral_and_only_the_accent_carries_hue() {
         let mut neutral = surfaces();
-        neutral.extend([
-            ("border", palette::BORDER),
-            ("border strong", palette::BORDER_STRONG),
-            ("text primary", palette::TEXT_PRIMARY),
-            ("text secondary", palette::TEXT_SECONDARY),
-            ("text muted", palette::TEXT_MUTED),
-            ("disabled surface", palette::DISABLED_SURFACE),
-            ("disabled text", palette::DISABLED_TEXT),
-            ("loading track", palette::LOADING_TRACK),
-        ]);
+        neutral.extend(
+            [
+                ("border", palette::BORDER),
+                ("border strong", palette::BORDER_STRONG),
+                ("text primary", palette::TEXT_PRIMARY),
+                ("text secondary", palette::TEXT_SECONDARY),
+                ("text muted", palette::TEXT_MUTED),
+                ("disabled surface", palette::DISABLED_SURFACE),
+                ("disabled text", palette::DISABLED_TEXT),
+                ("loading track", palette::LOADING_TRACK),
+            ]
+            .map(|(name, token)| (name.to_owned(), token)),
+        );
         for (name, token) in neutral {
             for (palette_name, value) in [("dark", token.dark()), ("light", token.light())] {
                 let [_, r, g, b] = value.to_be_bytes();

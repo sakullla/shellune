@@ -12,6 +12,7 @@ re-run the check each one names before accepting the upgrade.
 | Frame readback | `src/platform.rs`, `src/window.rs`, `src/platform/windows/{window,directx_renderer}.rs` | the capture tool reads the frame a hidden window rendered |
 | Initial window background | `src/platform.rs`, `src/platform/windows/window.rs` | a light window does not open on a black flash |
 | Clipboard images and mixed items | `src/platform.rs`, `src/platform/windows/{clipboard,dib}.rs`, `src/platform/windows.rs`, `src/platform/linux/x11/{client,clipboard}.rs`, `src/platform/linux/wayland/clipboard.rs`, `src/platform/mac/platform.rs` | remote-desktop clipboard: screenshots and text-plus-image copies |
+| Truncated text measure cache | `src/elements/text.rs` | a truncated line draws its "…" instead of a cut letter |
 
 ### Frame readback
 
@@ -44,6 +45,34 @@ flash.
 
 Other platforms keep their own behaviour. Check after re-applying: open the
 application with the light theme and watch for a black frame.
+
+### Truncated text measure cache
+
+A text element measures itself once per width the layout asks about and paints the
+lines of the last measure it kept. In the released crate a one-line text
+(`white-space: nowrap`) reused its first measure whenever it was asked again, because
+the cache compared only the wrap width, which is `None` for every one-line measure.
+The first ask is usually for the text's natural width, with no definite width and so
+no truncation; the later ask at the width the row gives it returned that first,
+uncut layout, `truncate_line` never ran, and the line was clipped at the element's
+edge without its "…" ("roo", "1 connec" on the home page, a host address cut in
+the middle of a number).
+
+- `src/elements/text.rs`: `TextLayoutInner` keeps the `truncate_width` its lines were
+  shaped at, and the measure cache is used only when that width is the same as the
+  one being asked about, as well as the wrap width.
+- `src/elements/text.rs`: each measure truncates a copy of the element's runs. The
+  released closure truncated the runs it captured in place, so once a line could be
+  measured at a second width, the whole text was cut with the runs of the first cut:
+  on Windows a run then ended inside a character and DirectWrite's layout panicked
+  ("end byte index 3 is not a char boundary; it is inside '台'" on the Chinese home
+  page at 860x640). The test platform's text system ignores runs, so this half is
+  checked by the capture: `shellune --ui-capture --only home-narrow` must finish.
+
+Wrapping text and text without `text_overflow` are measured as before (their
+truncate width is always `None`). Check after re-applying:
+`cargo test -p shellune --bin shellune cut_words_in_rows_banners_and_sidebars_end_in_a_drawn_ellipsis`,
+which reads the shaped line back and fails without the patch.
 
 ### Clipboard images and mixed items
 
