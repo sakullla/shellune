@@ -355,7 +355,9 @@ fn home_hosts() -> Result<Vec<HostConfig>, String> {
             "address": address,
             "port": if number % 5 == 3 { 2222 } else { 22 },
             "user": user,
-            "group": group,
+            // A path, not a label: `group` would read "Prod/Web" as one segment and
+            // the sidebar would show it beside Prod instead of inside it.
+            "group_path": group,
         });
         let host: HostConfig = serde_json::from_value(record)
             .map_err(|error| format!("the host fixture {name} is not a valid record: {error}"))?;
@@ -1725,6 +1727,20 @@ fn home_hosts_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
             "the book has {recent} recent connection(s), not the five the fixture wrote"
         ));
     }
+    let nested = view
+        .book()
+        .hosts()
+        .iter()
+        .filter(|host| {
+            host.group_path()
+                .is_some_and(|path| path.segments().len() > 1)
+        })
+        .count();
+    if nested != 5 {
+        return Err(format!(
+            "the book has {nested} host(s) in a nested group, not the five the fixture wrote"
+        ));
+    }
     Ok(())
 }
 
@@ -2673,10 +2689,14 @@ pub const SCENARIOS: &[Scenario] = &[
                    address, group tag, time and state; the history was written, not earned, so \
                    no host was ever connected",
         quick: true,
+        // 200% text in a window wide enough for the tag and time columns, so the shot
+        // shows they stay aligned at the largest text in both palettes.
         variants: &[
             Variant::dark().chinese(),
             Variant::light().comfortable(),
             Variant::dark().smallest(),
+            Variant::dark().largest().sized(1600.0, 900.0),
+            Variant::light().largest().sized(1600.0, 900.0),
         ],
         start: || page(Destination::Hosts),
         prepare: seed_home,

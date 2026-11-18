@@ -31346,6 +31346,85 @@ async fn an_address_in_the_search_puts_connect_to_on_top_and_a_press_dials_it(
 }
 
 #[gpui::test]
+async fn the_arrows_go_back_up_to_connect_to_and_enter_dials_the_address_again(
+    cx: &mut TestAppContext,
+) {
+    // The "connect to …" row is row 0: Down leaves it for the saved rows, Up comes back
+    // to it, and Enter then dials what was typed instead of the saved host (ADR-3).
+    let dir = TempDir::new("home-direct-arrows");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("saved-local", "127.0.0.1", 1, "ops", None),
+            stored_host("other", "10.0.0.2", 22, "deploy", None),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    let saved = cx.update(|_window, app| view.read(app).book().hosts()[0].id());
+    let cursor =
+        |cx: &mut VisualTestContext| cx.update(|_window, app| view.read(app).hosts_cursor());
+
+    type_into(cx, "hosts.search", "ops@127.0.0.1:1");
+    assert!(cx.debug_bounds("hosts.direct").is_some());
+    assert_eq!(
+        cursor(cx),
+        None,
+        "the direct row is where the keyboard starts"
+    );
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(cursor(cx), None, "there is nothing above the direct row");
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(cursor(cx), Some(saved), "Down moves onto the saved host");
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(cursor(cx), Some(saved), "the saved host is the last row");
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(
+        cursor(cx),
+        None,
+        "Up from the first saved row is the direct row again"
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).remote_state().is_some()),
+        "Enter dials"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "",
+        "the direct row was the one dialled: it empties the search, a saved row does not"
+    );
+    cx.update(|_window, app| view.update(app, |view, cx| view.hide_connection_for_test(cx)));
+    cx.run_until_parked();
+
+    // From the page (after a press on a row), Up and Enter reach the same row.
+    type_into(cx, "hosts.search", "ops@127.0.0.1:1");
+    click(cx, "hosts.row.0");
+    assert_eq!(
+        cursor(cx),
+        Some(saved),
+        "a press on a row puts the cursor there"
+    );
+    cx.simulate_keystrokes("up enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().search().to_owned()),
+        "",
+        "Enter on the page dials the direct row once it is chosen again"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        2,
+        "nothing was saved"
+    );
+}
+
+#[gpui::test]
 async fn an_address_nobody_saved_is_offered_by_the_empty_list_and_enter_dials_it(
     cx: &mut TestAppContext,
 ) {
@@ -31529,6 +31608,273 @@ async fn the_more_menu_imports_and_starts_a_batch(cx: &mut TestAppContext) {
         cx.update(|_window, app| view.read(app).batch_panel().view().is_open()),
         "the batch preview opens from the menu"
     );
+}
+
+#[gpui::test]
+async fn a_group_only_a_desktop_names_is_in_the_sidebar_and_renamed_from_the_more_menu(
+    cx: &mut TestAppContext,
+) {
+    // A desktop record names its group as text, without adding it to the saved tree.
+    // The sidebar still offers that group, counts it like the list and the delete
+    // dialog do, and the ⋯ menu renames it without a right press (R2, R7).
+    let dir = TempDir::new("home-desktop-group");
+    let mut book = HostBook::new();
+    book.apply(&HostEdit::create(stored_host(
+        "web",
+        "10.0.0.2",
+        22,
+        "deploy",
+        Some("Prod"),
+    )))
+    .expect("the host is inserted");
+    let office = GroupPath::parse("Office").expect("a valid path");
+    let mut desk = shellune_core::RdpConfig::new("desk", "rdp.example.com", Some("desk"))
+        .expect("a valid RDP record");
+    desk.set_group_path(Some(office.clone()));
+    let desk = shellune_core::ConnectionRecord::Rdp(desk);
+    let desk_id = desk.id();
+    book.insert_connection(desk)
+        .expect("the desktop is inserted");
+    dir.store().save(&book).expect("the book saves");
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    let tree = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            let view = view.read(app);
+            view.hosts_state()
+                .group_tree(view.book(), view.groups(), &|_| false)
+                .iter()
+                .filter_map(|group| {
+                    group
+                        .path
+                        .as_ref()
+                        .map(|path| (path.to_canonical(), group.hosts))
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    assert_eq!(
+        tree(cx),
+        vec![("Office".to_owned(), 1), ("Prod".to_owned(), 1)],
+        "the desktop's group is in the tree with its record counted"
+    );
+    assert!(
+        cx.debug_bounds("hosts.tree.1").is_some(),
+        "both groups are drawn"
+    );
+    // Outside a group, the ⋯ menu has no group entries.
+    click(cx, "hosts.more");
+    assert!(cx.debug_bounds("hosts.more.menu").is_some());
+    assert!(cx.debug_bounds("hosts.more.group.rename").is_none());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).home_menu_open()));
+    click(cx, "hosts.tree.0");
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).hosts_state().section()),
+        HomeSection::Group(office.clone())
+    );
+    assert!(
+        cx.debug_bounds("hosts.list.1").is_some(),
+        "the list the group opens holds the one record the sidebar counted"
+    );
+    assert!(cx.debug_bounds("hosts.connection.0").is_some());
+
+    click(cx, "hosts.more");
+    assert!(cx.debug_bounds("hosts.more.group.delete").is_some());
+    click(cx, "hosts.more.group.rename");
+    clear_field(cx, "hosts.group.name", "Office".len());
+    type_into(cx, "hosts.group.name", "Branch");
+    click(cx, "hosts.group.confirm");
+    let branch = GroupPath::parse("Branch").expect("a valid path");
+    assert_eq!(
+        cx.update(|_window, app| view
+            .read(app)
+            .book()
+            .connection(desk_id)
+            .and_then(|record| record.group_path())),
+        Some(branch),
+        "the rename moved the desktop record"
+    );
+    assert_eq!(
+        tree(cx),
+        vec![("Branch".to_owned(), 1), ("Prod".to_owned(), 1)]
+    );
+}
+
+#[gpui::test]
+async fn a_focused_sidebar_group_renames_with_f2_deletes_with_delete_and_offers_more(
+    cx: &mut TestAppContext,
+) {
+    // The group actions have a keyboard path and a visible button, not only a right
+    // press (ADR-3): Shift+Tab from the search reaches the groups, the arrows walk them,
+    // F2 renames and Delete deletes the one with the keys, and the pointer reveals "⋯".
+    let dir = TempDir::new("home-group-keys");
+    seed(
+        &dir.store(),
+        vec![
+            stored_host("web", "10.0.0.2", 22, "deploy", Some("Prod")),
+            stored_host("stage", "10.0.0.3", 22, "deploy", Some("Staging")),
+        ],
+    );
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
+    let prod = GroupPath::parse("Prod").expect("a valid path");
+    let staging = GroupPath::parse("Staging").expect("a valid path");
+    let editor = |cx: &mut VisualTestContext| {
+        cx.update(|_window, app| {
+            view.read(app)
+                .hosts_state()
+                .group_editor()
+                .map(|editor| editor.action().clone())
+        })
+    };
+    let search_focused = |cx: &mut VisualTestContext| {
+        let handle = cx.update(|_window, app| view.read(app).hosts_search_focus_for_test(app));
+        cx.update(|window, _app| handle.is_focused(window))
+    };
+
+    click(cx, "hosts.search");
+    cx.simulate_keystrokes("shift-tab");
+    cx.run_until_parked();
+    assert!(
+        !search_focused(cx),
+        "Shift+Tab leaves the search for the groups"
+    );
+    cx.simulate_keystrokes("f2");
+    cx.run_until_parked();
+    assert_eq!(
+        editor(cx),
+        Some(crate::app::hosts::GroupAction::Rename(prod.clone())),
+        "F2 renames the first group, which has the keys"
+    );
+    assert!(cx.debug_bounds("hosts.group.name").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(editor(cx), None);
+
+    // Back from the search, Down walks to the next group and Delete asks about it.
+    click(cx, "hosts.search");
+    cx.simulate_keystrokes("shift-tab down delete");
+    cx.run_until_parked();
+    assert_eq!(
+        editor(cx),
+        Some(crate::app::hosts::GroupAction::Delete(staging.clone())),
+        "Delete asks to delete the group with the keys"
+    );
+    assert!(cx.debug_bounds("hosts.group.delete").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).book().hosts().len()),
+        2,
+        "nothing was deleted by the key"
+    );
+
+    // A press on a group gives it the keys as well; Tab goes back to the search.
+    click(cx, "hosts.tree.0");
+    cx.simulate_keystrokes("f2");
+    cx.run_until_parked();
+    assert_eq!(
+        editor(cx),
+        Some(crate::app::hosts::GroupAction::Rename(prod.clone()))
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    click(cx, "hosts.tree.1");
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert!(
+        search_focused(cx),
+        "Tab from a group goes back to the search"
+    );
+
+    // The pointer reveals the row's "⋯", which opens the same menu as a right press.
+    hover(cx, "hosts.tree.1");
+    click(cx, "hosts.tree.1.more");
+    assert!(cx.debug_bounds("hosts.group.menu").is_some());
+    click(cx, "hosts.group.rename.open");
+    assert_eq!(
+        editor(cx),
+        Some(crate::app::hosts::GroupAction::Rename(staging))
+    );
+}
+
+#[gpui::test]
+async fn the_row_facts_stand_in_columns_whether_or_not_a_row_has_them(cx: &mut TestAppContext) {
+    // The group tag column is left-aligned and the time column right-aligned, both of a
+    // fixed width: a row without one leaves it empty, so the tag of every row starts and
+    // the time of every row ends at the same x, and the star column never moves (ADR-3).
+    let dir = TempDir::new("home-row-columns");
+    let tagged_recent = stored_host("alpha", "10.0.0.1", 22, "deploy", Some("Production"));
+    let tagged = stored_host("beta", "10.0.0.2", 22, "deploy", Some("Lab"));
+    let recent = stored_host("gamma", "10.0.0.3", 22, "deploy", None);
+    let bare = stored_host("delta", "10.0.0.4", 22, "deploy", None);
+    let mut book = HostBook::new();
+    for host in [&tagged_recent, &tagged, &recent, &bare] {
+        book.apply(&HostEdit::create((*host).clone()))
+            .expect("the host is inserted");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    book.record_connection(tagged_recent.id(), now - 600)
+        .expect("a saved host");
+    book.record_connection(recent.id(), now - 5 * 86_400)
+        .expect("a saved host");
+    let mut desk = shellune_core::RdpConfig::new("desk", "rdp.example.com", Some("desk"))
+        .expect("a valid RDP record");
+    desk.set_group_path(Some(GroupPath::parse("Office").expect("a valid path")));
+    book.insert_connection(shellune_core::ConnectionRecord::Rdp(desk))
+        .expect("the desktop is inserted");
+    dir.store().save(&book).expect("the book saves");
+    let (view, cx) = hosts_view_with_trust(cx, &dir);
+
+    let check = |cx: &mut VisualTestContext, what: &str| {
+        // Saved order: alpha (tag, time), beta (tag), gamma (time), delta (neither).
+        let tag0 = bounds_of(cx, "hosts.tag.0");
+        let tag1 = bounds_of(cx, "hosts.tag.1");
+        let office = bounds_of(cx, "hosts.connection.tag.0");
+        assert!(
+            (tag0.left() - tag1.left()).abs() < px(0.5)
+                && (tag0.left() - office.left()).abs() < px(0.5),
+            "{what}: every tag starts at one x: {tag0:?} {tag1:?} {office:?}"
+        );
+        assert!(cx.debug_bounds("hosts.tag.2").is_none());
+        let last0 = bounds_of(cx, "hosts.last.0");
+        let last2 = bounds_of(cx, "hosts.last.2");
+        assert!(
+            (last0.right() - last2.right()).abs() < px(0.5),
+            "{what}: every time ends at one x, with or without a tag: {last0:?} {last2:?}"
+        );
+        assert!(cx.debug_bounds("hosts.last.1").is_none());
+        assert!(
+            last0.left() > tag0.right(),
+            "{what}: the time column is right of the tag column"
+        );
+        let stars: Vec<Pixels> = [
+            "hosts.favorite.0",
+            "hosts.favorite.1",
+            "hosts.favorite.2",
+            "hosts.favorite.3",
+            "hosts.connection.favorite.0",
+        ]
+        .into_iter()
+        .map(|star| bounds_of(cx, star).left())
+        .collect();
+        assert!(
+            stars.iter().all(|left| (*left - stars[0]).abs() < px(0.5)),
+            "{what}: the star column is one column: {stars:?}"
+        );
+    };
+    check(cx, "100%");
+
+    // The same at 200% text, in a window wide enough for the columns.
+    cx.simulate_resize(size(px(1600.0), px(900.0)));
+    cx.run_until_parked();
+    largest_text_size(&view, cx);
+    check(cx, "200%");
 }
 
 #[gpui::test]

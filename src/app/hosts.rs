@@ -1810,12 +1810,29 @@ impl HostsPanel {
         // a tree that shows only the branch already chosen would leave no way to choose
         // another. The search and the status still count, because they say how much a
         // branch holds of what the rest of the page is looking at.
-        let kept: BTreeSet<HostId> = book
+        //
+        // A group holds every saved record that names it, of any protocol: a group that
+        // only a desktop or serial connection names is still a place the sidebar has to
+        // reach, and its count has to agree with the list it opens (R2, R7).
+        let mut kept: BTreeSet<HostId> = book
             .hosts()
             .iter()
             .filter(|host| self.matches_without_group(book, host, open))
             .map(HostConfig::id)
             .collect();
+        let searched: BTreeSet<HostId> = book
+            .search_connections(&self.search)
+            .iter()
+            .map(ConnectionRecord::id)
+            .collect();
+        kept.extend(
+            book.connections()
+                .iter()
+                .filter(|record| {
+                    self.matches_connection_without_group(book, record, &searched, open)
+                })
+                .map(ConnectionRecord::id),
+        );
         let narrow_search = !self.search.trim().is_empty();
         let mut rows = Vec::new();
         self.push_tree(&mut rows, book, groups, &kept, narrow_search);
@@ -1865,14 +1882,15 @@ impl HostsPanel {
         narrow_search: bool,
     ) {
         let hosts = hosts_under(book, kept, &path);
-        if narrow_search && hosts.is_empty() {
+        let connections = connections_under(book, kept, &path);
+        if narrow_search && hosts.is_empty() && connections.is_empty() {
             return;
         }
         let expanded = self.is_expanded(&path);
         rows.push(HostListRow::Group(HostGroupRow {
             path: Some(path.clone()),
             depth,
-            hosts: hosts.len(),
+            hosts: hosts.len() + connections.len(),
             expanded,
         }));
         if !expanded {
@@ -1883,6 +1901,9 @@ impl HostsPanel {
         }
         for id in hosts {
             rows.push(HostListRow::Host(HostRow { id }));
+        }
+        for id in connections {
+            rows.push(HostListRow::Connection(ConnectionRow { id }));
         }
     }
 
@@ -2017,16 +2038,28 @@ impl HostsPanel {
         searched: &BTreeSet<HostId>,
         open: &dyn Fn(HostId) -> bool,
     ) -> bool {
-        // The phrase is matched by the book, which is the one matcher over names,
-        // protocols and targets; this list only applies it to the records it draws.
-        if !searched.contains(&record.id()) || !self.matches_favorite(book, record.id()) {
-            return false;
-        }
         if let Some(wanted) = &self.filter.group {
             match record.group_path() {
                 Some(path) if path.starts_with(wanted) => {}
                 _ => return false,
             }
+        }
+        self.matches_connection_without_group(book, record, searched, open)
+    }
+
+    /// Whether one connection of another protocol survives everything but the group,
+    /// for the tree that chooses it.
+    fn matches_connection_without_group(
+        &self,
+        book: &HostBook,
+        record: &ConnectionRecord,
+        searched: &BTreeSet<HostId>,
+        open: &dyn Fn(HostId) -> bool,
+    ) -> bool {
+        // The phrase is matched by the book, which is the one matcher over names,
+        // protocols and targets; this list only applies it to the records it draws.
+        if !searched.contains(&record.id()) || !self.matches_favorite(book, record.id()) {
+            return false;
         }
         match self.filter.status {
             HostStatusFilter::Any | HostStatusFilter::NeverConnected => true,
@@ -2576,7 +2609,8 @@ pub struct HostGroupRow {
     pub path: Option<GroupPath>,
     /// How deep in the tree the header sits, counted from zero.
     pub depth: usize,
-    /// How many hosts the current filters keep inside it and its children.
+    /// How many records, of any protocol, the current filters keep inside it and its
+    /// children.
     pub hosts: usize,
     /// Whether its rows are drawn under it.
     pub expanded: bool,
@@ -2906,16 +2940,22 @@ pub fn group_path_from_text(text: &str) -> Result<Option<GroupPath>, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Every group path worth drawing: the saved tree, plus the parents of any path a host
-/// names.
+/// Every group path worth drawing: the saved tree, plus the parents of any path a
+/// record of any protocol names.
 ///
 /// A host can carry a path whose parents were never saved by an older build or a hand
-/// edit; drawing it under a parent that does not exist would hide it, so the parents are
-/// added here instead of being invented again by the renderer.
+/// edit, and the form of a desktop or serial connection names its group as text without
+/// adding it to the tree; drawing either under a parent that does not exist, or not at
+/// all, would hide it, so the paths are added here instead of being invented again by
+/// the renderer (R2, R7).
 fn drawn_paths(book: &HostBook, groups: &GroupBook) -> Vec<GroupPath> {
     let mut paths: BTreeSet<GroupPath> = groups.paths().iter().cloned().collect();
-    for host in book.hosts() {
-        let mut current = host.group_path();
+    let named = book
+        .hosts()
+        .iter()
+        .map(HostConfig::group_path)
+        .chain(book.connections().iter().map(ConnectionRecord::group_path));
+    for mut current in named {
         while let Some(path) = current {
             current = path.parent();
             paths.insert(path);
@@ -2940,6 +2980,21 @@ fn hosts_under(book: &HostBook, kept: &BTreeSet<HostId>, path: &GroupPath) -> Ve
         .filter(|host| kept.contains(&host.id()))
         .filter(|host| host.group_path().is_some_and(|host| host.starts_with(path)))
         .map(HostConfig::id)
+        .collect()
+}
+
+/// The kept connections of another protocol in one group and everything inside it, in
+/// saved order.
+fn connections_under(book: &HostBook, kept: &BTreeSet<HostId>, path: &GroupPath) -> Vec<HostId> {
+    book.connections()
+        .iter()
+        .filter(|record| kept.contains(&record.id()))
+        .filter(|record| {
+            record
+                .group_path()
+                .is_some_and(|record| record.starts_with(path))
+        })
+        .map(ConnectionRecord::id)
         .collect()
 }
 
@@ -4890,6 +4945,92 @@ mod tests {
         // A host that is edited away leaves the list with it.
         book.remove(lab.id()).expect("the host is saved");
         assert_eq!(panel.list(&book, &groups, &no_sessions).matched_len(), 2);
+    }
+
+    #[test]
+    fn the_group_tree_reaches_and_counts_groups_named_only_by_other_protocols() {
+        // A desktop or serial connection names its group as text, without adding it to
+        // the saved tree. The sidebar still has to offer that group, and count it the
+        // way the list it opens and the delete dialog do (R2, R7).
+        let web = host("web", "10.0.0.2", 22, "deploy", Some("Prod"));
+        let mut db = host("db", "10.0.0.3", 22, "deploy", None);
+        db.set_group_path(Some(GroupPath::parse("Prod/DB").expect("a valid path")));
+        let mut book = HostBook::from_hosts(vec![web.clone(), db.clone()]).expect("distinct hosts");
+        let office = GroupPath::parse("Office").expect("a valid path");
+        let mut desk =
+            RdpConfig::new("desk", "10.0.0.7:3389", Some("alice")).expect("a valid record");
+        desk.set_group_path(Some(office.clone()));
+        let desk = ConnectionRecord::Rdp(desk);
+        let desk_id = desk.id();
+        book.insert_connection(desk).expect("a new connection");
+        let mut console =
+            RdpConfig::new("console", "10.0.0.8:3389", Some("admin")).expect("a valid record");
+        console.set_group_path(Some(GroupPath::parse("Prod/DB").expect("a valid path")));
+        book.insert_connection(ConnectionRecord::Rdp(console))
+            .expect("a new connection");
+        let groups = GroupBook::new();
+
+        let no_sessions = |_: HostId| false;
+        let mut panel = HostsPanel::new();
+        let named: Vec<(String, usize)> = panel
+            .group_tree(&book, &groups, &no_sessions)
+            .iter()
+            .filter_map(|group| {
+                group
+                    .path
+                    .as_ref()
+                    .map(|path| (path.to_canonical(), group.hosts))
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("Office".to_owned(), 1),
+                ("Prod".to_owned(), 3),
+                ("Prod/DB".to_owned(), 2),
+            ],
+            "a group only a desktop record names is in the tree, and every protocol counts"
+        );
+        // The sidebar count agrees with the list it opens and with the delete dialog.
+        for (path, count) in [
+            (office.clone(), 1),
+            (GroupPath::parse("Prod").expect("a valid path"), 3),
+        ] {
+            panel.set_group_filter(Some(path.clone()));
+            let list = panel.list(&book, &groups, &no_sessions);
+            assert_eq!(list.rows().len(), count, "{path:?}");
+            assert_eq!(
+                book.hosts_under_group(&path).len() + book.connections_under_group(&path).len(),
+                count,
+                "{path:?}"
+            );
+        }
+        panel.set_group_filter(None);
+
+        // A search that only the desktop record answers keeps its group alone.
+        panel.set_search("desk");
+        let searched: Vec<(String, usize)> = panel
+            .group_tree(&book, &groups, &no_sessions)
+            .iter()
+            .filter_map(|group| {
+                group
+                    .path
+                    .as_ref()
+                    .map(|path| (path.to_canonical(), group.hosts))
+            })
+            .collect();
+        assert_eq!(searched, vec![("Office".to_owned(), 1)]);
+
+        // Once the record leaves, its group leaves the tree with it.
+        panel.set_search("");
+        book.remove_connection(desk_id)
+            .expect("the connection is saved");
+        assert!(
+            panel
+                .group_tree(&book, &groups, &no_sessions)
+                .iter()
+                .all(|group| group.path.as_ref() != Some(&office))
+        );
     }
 
     #[test]

@@ -599,7 +599,10 @@ pub fn tag(label: impl Into<SharedString>, metrics: Metrics) -> Div {
         .bg(theme::swatch(palette::SURFACE_SELECTED))
         .text_size(metrics.caption_size())
         .text_color(theme::swatch(palette::TEXT_SECONDARY))
-        .child(label.into())
+        .min_w_0()
+        // At rest a tag is as wide as its words; capped by its parent (a list row's tag
+        // column), it ends in an ellipsis instead of spilling over.
+        .child(div().min_w_0().truncate().child(line_text(label)))
 }
 
 /// The caption size a keycap's label is set in: a step under the caption, so a

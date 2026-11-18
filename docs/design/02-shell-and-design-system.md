@@ -19,7 +19,8 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 | ◷ 最近连接  5 | B1 build-01  deploy@192.0.2.11      Prod  昨天  ●  (☆ ✎ ⧉ 🗑 [连接]) |  一行一台（uniform_list）
 | ─────────── | A2 api-02    deploy@192.0.2.24      Prod  2 小时前                  |  工具悬停 / 键盘行才出现
 | 分组       + | …                                                                  |
-| ▾ ▣ Prod   12 |                                                                    |
+| ▾ ▣ Prod   10 |                                                                    |
+|    ▣ DB     2 |                                                                    |
 |    ▣ Web    3 |                                                                    |
 |   ▣ Staging 4 |                                                                    |
 |              |                                                                    |
@@ -52,8 +53,15 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
     最近连接（`hosts.view.recent`，计数 = 有连接记录的主机数），用 `components::sidebar_item`（选中为 `SURFACE_SELECTED`
     底 + 主文字色 + 500 字重）；分隔线；"分组"标题与右侧 `+`（`hosts.group.new`，打开创建分组对话框）；分组树
     （`hosts.groups` 内每项 `hosts.tree.<n>`，按层级缩进 12，有子分组的项前面有展开箭头 `hosts.tree.<n>.toggle`，叶子
-    保留箭头位置以对齐；项本身是 `sidebar_item`：文件夹图标、最后一段名字、命中数）。**右键分组项**打开分组菜单
-    （`hosts.group.menu`：`hosts.group.rename.open` 重命名、`hosts.group.delete.open` 删除，删除仍先选去向）。树太长时
+    保留箭头位置以对齐；项本身是 `sidebar_item`：文件夹图标、最后一段名字、命中数）。树里的分组 = 已保存的分组树
+    ∪ 任一记录（SSH 主机，以及远程桌面 / 串口记录）写着的路径及其父路径（`hosts.rs::drawn_paths`），所以只被 RDP/VNC/串口
+    记录引用的分组也能在侧栏选到；命中数统计所有协议的记录（与该分组的列表条数、删除对话框的数量一致）。**右键分组项**
+    打开分组菜单（`hosts.group.menu`：`hosts.group.rename.open` 重命名、`hosts.group.delete.open` 删除，删除仍先选去向）；
+    悬停分组项时右端出现 `⋯`（`hosts.tree.<n>.more`，静止时隐藏但保留位置），点它打开同一菜单；当前位置是某个分组时，
+    工具条 `⋯` 菜单里也有同样两项（`hosts.more.group.rename`、`hosts.more.group.delete`）。**分组项是键盘停靠点**：
+    在搜索框或列表上按 Shift+Tab 进入侧栏（落在当前分组，否则第一个分组），点击分组项也会把焦点给它；获得焦点的项
+    画焦点环，↑↓ 在分组间移动，Enter/空格显示该分组，**F2 重命名、Delete（macOS Backspace）删除**（与菜单同一对话框），
+    Tab 回到搜索框，Esc 回到列表。树太长时
     在自己的区域里滚动。侧栏底部是**本地终端**（`home.local`），打开与顶栏 ▾ 相同的 Shell 菜单，菜单在条目右侧、
     底边对齐、向上展开（检测到的 Shell、自定义路径、串口一节与新建串口连接）。
   - **位置 = 视图 + 筛选**（`hosts::HomeSection`，`HostsPanel::section/set_section`）：全部 = `HostView::All` 无筛选；
@@ -68,14 +76,15 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
     未聚焦时显示 `/` 键帽；聚焦时整框是 Focused 面 + 焦点环）；筛选按钮（`hosts.filter`，图标 `Filter`，有筛选或排序
     生效时为 accent tint 常亮）打开**筛选菜单**（`hosts.filter.menu`：状态 `hosts.status.any/connected/recent/never` 与排序
     `hosts.sort.saved/name/recent`，当前项打勾，选中即关闭）；`⋯`（`hosts.more`）打开**更多菜单**（`hosts.more.menu`：
-    `hosts.import` 导入 SSH 配置、`hosts.batch.open.list` 批量任务）；最后是唯一的主按钮"新建主机"（`hosts.new`，紧凑高 28）。
+    `hosts.import` 导入 SSH 配置、`hosts.batch.open.list` 批量任务；当前位置是分组时另有重命名 / 删除该分组）；最后是唯一的主按钮"新建主机"（`hosts.new`，紧凑高 28）。
     状态或排序不是默认值时，列表上方一行写出（`hosts.filters`：`hosts.filter.status`、`hosts.filter.sort` chip 与
     `hosts.filter.clear`，清除只还原状态与排序，不动当前位置）。
   - **列表**（`hosts.list.<条数>` 内的 `uniform_list` `hosts.rows`，行高 `list_row_height` 52）：每行是
     `components::list_row_frame`（平面行；键盘光标所在行为 Selected 面 + 左侧 accent 竖条；批量选中行为 `ACCENT_TINT` 底）：
     头像（与复选框共用位置，悬停 / 光标 / 已开始多选时换成复选框 `hosts.select.<n>`）、两行文字（名称 + 等宽的
-    `user@host:port`，放不下以省略号收尾；缺私钥的主机名称旁有警示 chip）、右侧元信息（分组标签 `hosts.tag.<n>`、相对时间
-    `hosts.last.<n>`，悬停显示 UTC 时间与连接次数；窗口 < 600 时两者省略）、状态点（本窗口有已连接会话时才画绿色点
+    `user@host:port`，放不下以省略号收尾；缺私钥的主机名称旁有警示 chip）、右侧元信息按列对齐（分组标签列定宽 128、左对齐，
+    标签过长以省略号收尾 `hosts.tag.<n>`；相对时间列定宽 88、右对齐 `hosts.last.<n>`，悬停显示 UTC 时间与连接次数；某行
+    没有标签或时间时该列留空，其他内容不左移；窗口 < 600（随缩放）时两列在所有行一起省略）、状态点（本窗口有已连接会话时才画绿色点
     `hosts.state.<n>`，没有会话不写"离线"，位置保留以对齐），然后是收藏星（已收藏常显）与悬停 / 光标行才出现的工具：
     编辑、复制（窗口 ≥ 760）、删除、主按钮"连接"（`hosts.connect.<n>`）。端口转发从行上移到右键菜单
     （`host.menu.forwards`）。**单击选中、双击或 Enter 连接、右键打开记录菜单**。其它协议的记录同一种行
@@ -92,7 +101,8 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
     读成地址时另给主按钮"连接到 …"（`hosts.nomatch.connect`）。最近为空（`hosts.recent.empty`）、收藏为空
     （`hosts.favorites.empty`，说明"在主机上点星标"）、分组为空（`hosts.group.empty`）各有一句和回到全部主机的按钮。
   - **键盘**（`ShelluneView::hosts_key`，页面或搜索框有焦点、没有对话框或菜单时）：`/`（页面焦点时）与 Ctrl/Cmd+F
-    聚焦搜索；↑↓ 移动键盘光标（列表跟随滚动，"连接到 …"行算第 0 行）；Enter 连接；Ctrl/Cmd+N 新建主机；
+    聚焦搜索；↑↓ 移动键盘光标（列表跟随滚动，"连接到 …"行算第 0 行：没有光标即选中它，从第一条记录按 ↑ 回到它，
+    此时 Enter——搜索框或页面焦点——直连所输入的地址）；Enter 连接；Ctrl/Cmd+N 新建主机；
     Delete（macOS 的 Backspace）对光标行先问删除确认。Esc 关闭首页菜单。
   - **矮窗口**（高 < 320，随缩放）整页一列滚动，列表保留两行最小高度；720×480 @ 200% 时侧栏为图标栏、工具条换行，
     搜索、新建主机与本地终端都在窗口宽度内。
@@ -118,7 +128,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   | 最近连接 | 最近连接卡片 `home.recent.*` + 分段"最近连接" | 侧栏"最近连接" `hosts.view.recent` |
   | 收藏 | 收藏卡片 `home.favorite.*` + 工具栏 ☆ 仅收藏 `hosts.filter.favorites` | 侧栏"收藏" `hosts.view.favorites`；行上星标不变 |
   | 分组 | 分组卡片 `home.group.*` + 分段"按分组" + 左侧分组列 / 窄窗口选择条 | 侧栏分组树 `hosts.tree.<n>`；行上分组标签 `hosts.tag.<n>` |
-  | 新建 / 重命名 / 删除分组 | 分组列 `+`；列表上方 `hosts.group.rename.open` / `delete.open` 按钮 | 侧栏 `+`；分组项右键菜单 `hosts.group.menu` |
+  | 新建 / 重命名 / 删除分组 | 分组列 `+`；列表上方 `hosts.group.rename.open` / `delete.open` 按钮 | 侧栏 `+`；分组项右键菜单或悬停 `⋯`（`hosts.tree.<n>.more`）打开 `hosts.group.menu`；分组项有焦点时 F2 / Delete；分组位置下工具条 `⋯` 菜单 `hosts.more.group.rename` / `.delete` |
   | 状态筛选 | 分组列"状态"一节 / 窄窗口分段控件 | 工具条筛选菜单 `hosts.filter.menu`（另加排序） |
   | 导入 SSH 配置 | 工具栏按钮 `hosts.import` | 工具条 `⋯` 菜单 `hosts.import`；空状态 `hosts.import.open` |
   | 批量任务 | 工具栏按钮 `hosts.batch.open.list` | 工具条 `⋯` 菜单 `hosts.batch.open.list`；选择条 `hosts.batch.open` 不变 |
@@ -132,7 +142,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   `hosts.surface`、`hosts.statuses`、`hosts.tree.all`、`hosts.group.chooser`、`hosts.group.option.<名>`、`hosts.group.actions`、
   `hosts.filter.favorites(.chip)`、`hosts.filter.group`、`hosts.group.<n>`（列表分组头）、`hosts.forwards.<n>`；改名
   `hosts.group.tag.<n>` → `hosts.tag.<n>`、`hosts.connection.open.<n>` → `hosts.connection.state.<n>`；新增 `home.sidebar(.folded/.toggle/.groups)`、
-  `hosts.view.favorites`、`hosts.filter(.menu/.status/.sort)`、`hosts.sort.*`、`hosts.more(.menu)`、`hosts.group.menu`、
+  `hosts.view.favorites`、`hosts.filter(.menu/.status/.sort)`、`hosts.sort.*`、`hosts.more(.menu)`、`hosts.more.group.rename/.delete`、`hosts.tree.<n>.more`、`hosts.group.menu`、
   `hosts.direct`、`hosts.nomatch.connect`、`hosts.empty.local`、`hosts.favorites.empty`、`hosts.group.empty`、`hosts.state.<n>`、
   `hosts.last.<n>`（原有，现仅宽窗口）。`hosts.status.*` 只在筛选菜单打开时存在。
   以下"仪表盘"各版说明为历史记录，与上文冲突处以上文为准。

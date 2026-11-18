@@ -21,8 +21,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, IntoElement, Pixels, Point, SharedString, Stateful, WeakEntity,
-    Window, div, px, uniform_list,
+    AnyElement, App, Context, Div, FocusHandle, IntoElement, Pixels, Point, SharedString, Stateful,
+    WeakEntity, Window, div, px, uniform_list,
 };
 use shellune_core::{GroupPath, HostId, SessionKind, SessionState};
 
@@ -57,6 +57,9 @@ const GROUP_INDENT: f32 = 12.0;
 /// The edge of a group's open/close chevron, before zoom.
 const CHEVRON_SIZE: f32 = 18.0;
 
+/// The hover group of a sidebar group row, which reveals the row's "⋯".
+const GROUP_ROW: &str = "hosts-tree-row";
+
 /// The window height below which the page scrolls as one column, before zoom.
 const SHORT_HEIGHT: f32 = 320.0;
 
@@ -65,6 +68,14 @@ const ROW_DUPLICATE_MIN_WIDTH: f32 = 760.0;
 
 /// Below this width a row leaves out its group tag and its time, before zoom.
 const ROW_META_MIN_WIDTH: f32 = 600.0;
+
+/// The width of a row's group-tag column, before zoom. A longer tag ends in an ellipsis
+/// inside it, so every row's tag starts and its time ends at the same x.
+const ROW_TAG_WIDTH: f32 = 128.0;
+
+/// The width of a row's last-connected column, before zoom: room for the longest
+/// relative time ("59 min ago", "29 days ago") in either language.
+const ROW_TIME_WIDTH: f32 = 88.0;
 
 /// The least room a row keeps for its name and address before its tools give way.
 const ROW_TEXT_MIN_WIDTH: f32 = 96.0;
@@ -128,6 +139,11 @@ struct ConnectionRowView {
     cursor: bool,
     /// Whether the record is marked as a favourite (R1).
     favorite: bool,
+    /// Whether the window is wide enough for the copy tool, as for a host row, so both
+    /// kinds of row keep their columns at the same x.
+    show_duplicate: bool,
+    /// Whether the window is wide enough for the tag and time columns.
+    show_meta: bool,
 }
 
 /// One host of the list, with what its row shows.
@@ -159,6 +175,8 @@ struct HostRowView {
     cursor: bool,
     /// Whether the row has room for the duplicate tool beside edit and delete.
     show_duplicate: bool,
+    /// Whether the window is wide enough for the tag and time columns.
+    show_meta: bool,
     /// Whether any host is picked, which keeps every checkbox in view: once a
     /// selection has started, picking the next host must not need a hover first.
     selecting: bool,
@@ -241,6 +259,15 @@ impl ShelluneView {
     /// the empty state offers the same connection as its action instead.
     pub(super) fn home_direct_row(&self, list: &HostList) -> Option<QuickTarget> {
         self.home_direct_target().filter(|_| !list.is_empty())
+    }
+
+    /// Whether the "connect to …" row is on screen now, for a key that has no list.
+    pub(super) fn home_direct_row_shown(&self) -> bool {
+        self.home_direct_target().is_some()
+            && !self
+                .hosts
+                .list(&self.book, &self.groups, &|id| self.host_is_open(id))
+                .is_empty()
     }
 
     /// Dials the address the search reads as, without saving it (ADR-3).
@@ -637,8 +664,126 @@ impl ShelluneView {
             .group_tree(&self.book, &self.groups, &|id| self.host_is_open(id))
     }
 
+    /// The keyboard stop of one sidebar group row, made the first time it is asked for.
+    pub(super) fn group_focus_handle(&self, path: &GroupPath, cx: &mut App) -> FocusHandle {
+        self.group_focus
+            .borrow_mut()
+            .entry(path.clone())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
+            .clone()
+    }
+
+    /// The sidebar group whose row holds the keys, if one does.
+    pub(super) fn focused_group(&self, window: &Window) -> Option<GroupPath> {
+        self.group_focus
+            .borrow()
+            .iter()
+            .find(|(_, handle)| handle.is_focused(window))
+            .map(|(path, _)| path.clone())
+    }
+
+    /// The groups the sidebar draws, top to bottom: the rows the keyboard walks.
+    fn drawn_group_paths(&self) -> Vec<GroupPath> {
+        self.group_tree_rows()
+            .into_iter()
+            .filter_map(|group| group.path)
+            .collect()
+    }
+
+    /// Gives the keys to one sidebar group row.
+    pub(super) fn focus_group_row(
+        &mut self,
+        path: &GroupPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = self.group_focus_handle(path, cx);
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    /// Shift+Tab from the search or the list: the keys go to the sidebar, on the group
+    /// shown or else the first one. Returns whether there was a group to go to.
+    pub(super) fn focus_sidebar_groups(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let drawn = self.drawn_group_paths();
+        let target = match self.hosts.section() {
+            HomeSection::Group(shown) if drawn.contains(&shown) => Some(shown),
+            _ => drawn.first().cloned(),
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.focus_group_row(&target, window, cx);
+        true
+    }
+
+    /// The keys of a sidebar group row that holds the keyboard (ADR-3): F2 renames it,
+    /// Delete asks to delete it, ↑↓ walk the groups, Enter shows it, Tab goes back to
+    /// the search and Escape to the list. Returns whether the key was the row's.
+    pub(super) fn home_group_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(path) = self.focused_group(window) else {
+            return false;
+        };
+        if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
+            return false;
+        }
+        let modifiers = &event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        if key == "tab" && modifiers.number_of_modifiers() == 0 {
+            self.focus_hosts_search(window, cx);
+            return true;
+        }
+        if modifiers.number_of_modifiers() != 0 {
+            return false;
+        }
+        match key {
+            "f2" => {
+                self.open_group_dialog(GroupAction::Rename(path), window, cx);
+                true
+            }
+            "delete" | "backspace" => {
+                self.open_group_dialog(GroupAction::Delete(path), window, cx);
+                true
+            }
+            "enter" | "space" => {
+                self.show_home_section(HomeSection::Group(path), cx);
+                true
+            }
+            "up" | "down" => {
+                let drawn = self.drawn_group_paths();
+                if let Some(here) = drawn.iter().position(|shown| *shown == path) {
+                    let next = if key == "up" {
+                        here.saturating_sub(1)
+                    } else {
+                        (here + 1).min(drawn.len() - 1)
+                    };
+                    self.focus_group_row(&drawn[next], window, cx);
+                }
+                true
+            }
+            "escape" => {
+                let handle = self.destination_focus(Destination::Hosts).clone();
+                window.focus(&handle);
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// One group of the sidebar: its chevron, its name and how many records it holds. A
-    /// press shows it; a right press offers to rename or delete it.
+    /// press shows it; a right press, or the "⋯" the pointer reveals, offers to rename
+    /// or delete it. The row is a keyboard stop: with the keys on it, F2 renames and
+    /// Delete deletes (ADR-3).
     ///
     /// Only a branch has a chevron; a leaf keeps the chevron's room so names still line
     /// up, but offers nothing to open.
@@ -662,7 +807,27 @@ impl ShelluneView {
         };
         let toggle_path = path.clone();
         let pick_path = path.clone();
+        let more_path = path.clone();
+        let focus = self.group_focus_handle(&path, cx);
+        let focus_on_press = focus.clone();
         let menu_path = path;
+        let ring = theme::swatch(palette::FOCUS_RING);
+        let more = components::icon_only_button(Icon::More, metrics)
+            .size(metrics.scale(CHEVRON_SIZE))
+            .invisible()
+            .group_hover(GROUP_ROW, |style| style.visible())
+            .id(SharedString::from(format!("hosts.tree.{number}.more")))
+            .debug_selector(move || format!("hosts.tree.{number}.more"))
+            .tooltip(components::tooltip(copy::ux().home_card_more))
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.shell_menu_open = false;
+                    this.host_menu = None;
+                    this.home_menu = Some(HomeMenu::Group(more_path.clone(), event.position()));
+                    cx.notify();
+                }),
+            );
         let toggle = if branch {
             components::icon_only_button(chevron, metrics)
                 .size(metrics.scale(CHEVRON_SIZE))
@@ -682,6 +847,8 @@ impl ShelluneView {
         div()
             .id(SharedString::from(format!("hosts.tree.{number}")))
             .debug_selector(move || format!("hosts.tree.{number}"))
+            .group(GROUP_ROW)
+            .track_focus(&focus)
             .flex()
             .flex_none()
             .items_center()
@@ -689,12 +856,20 @@ impl ShelluneView {
             .w_full()
             .min_w_0()
             .pl(metrics.scale(GROUP_INDENT * group.depth as f32))
+            // The ring says which group the keys are on; its room is kept at rest so
+            // focusing a row moves nothing.
+            .border_1()
+            .border_color(theme::clear())
+            .rounded(px(radius::MEDIUM))
+            .focus(move |style| style.border_color(ring))
             .child(toggle)
             .child(
                 components::sidebar_item(Icon::Folder, label, Some(group.hosts), chosen, metrics)
                     .flex_1(),
             )
-            .on_click(cx.listener(move |this, _event, _window, cx| {
+            .child(more)
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                window.focus(&focus_on_press);
                 this.show_home_section(HomeSection::Group(pick_path.clone()), cx);
             }))
             .on_mouse_down(
@@ -1023,7 +1198,7 @@ impl ShelluneView {
                 (card, below(self.home_filter_anchor.get()))
             }
             HomeMenu::More => {
-                let card = components::menu_card("hosts.more.menu", metrics)
+                let mut card = components::menu_card("hosts.more.menu", metrics)
                     .w(metrics.scale(MENU_WIDTH))
                     .child(
                         components::menu_entry(
@@ -1058,6 +1233,55 @@ impl ShelluneView {
                             },
                         )),
                     );
+                // While a group is the place on screen, the same rename and delete the
+                // group's right-click menu offers are here too, so they have a visible
+                // button and not only a right press.
+                if let HomeSection::Group(path) = self.hosts.section() {
+                    let rename = path.clone();
+                    let delete = path;
+                    card = card
+                        .child(components::menu_divider(metrics))
+                        .child(
+                            components::menu_entry(
+                                ux.hosts_group_rename,
+                                "hosts.more.group.rename",
+                                Some(Icon::Pencil),
+                                true,
+                                false,
+                                metrics,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _event, window, cx| {
+                                    this.close_home_menu(cx);
+                                    this.open_group_dialog(
+                                        GroupAction::Rename(rename.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
+                        .child(
+                            components::menu_entry(
+                                ux.hosts_group_delete,
+                                "hosts.more.group.delete",
+                                Some(Icon::Trash),
+                                true,
+                                true,
+                                metrics,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _event, window, cx| {
+                                    this.close_home_menu(cx);
+                                    this.open_group_dialog(
+                                        GroupAction::Delete(delete.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        );
+                }
                 (card, below(self.home_more_anchor.get()))
             }
             HomeMenu::Group(path, position) => {
@@ -1567,6 +1791,7 @@ impl ShelluneView {
                         selected: self.hosts.selected().contains(host.id),
                         cursor: cursor == Some(host.id),
                         show_duplicate,
+                        show_meta,
                         selecting: !self.hosts.selected().is_empty(),
                         favorite: self.book.is_favorite(host.id),
                         key_missing: saved
@@ -1601,6 +1826,8 @@ impl ShelluneView {
                         open: self.connection_is_open(row.id),
                         cursor: cursor == Some(row.id),
                         favorite: self.book.is_favorite(row.id),
+                        show_duplicate,
+                        show_meta,
                     }));
                     connections += 1;
                 }
@@ -1853,12 +2080,19 @@ fn row_text(
 /// The quiet facts at a row's right end: the group tag, when it was last reached and
 /// the state dot.
 ///
+/// They stand in columns of their own: the tag column is left-aligned and the time
+/// column right-aligned, both of a fixed width, and a row without a tag or a time leaves
+/// its column empty rather than letting the rest slide left (ADR-3). In a window too
+/// narrow for them both columns are left out of every row alike.
+///
 /// The dot is drawn only while this window holds a running session to the record: a
 /// record that was only saved has no state to show, and an "offline" it never had would
 /// be a guess (R2). Its place is kept either way, so the columns line up.
+#[allow(clippy::too_many_arguments)]
 fn row_meta(
     number: usize,
     prefix: &'static str,
+    show_meta: bool,
     group: Option<SharedString>,
     last: Option<(SharedString, SharedString)>,
     open: bool,
@@ -1871,24 +2105,42 @@ fn row_meta(
         .items_center()
         .justify_center()
         .size(metrics.small_icon_size());
+    let tag_column = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_start()
+        .w(metrics.scale(ROW_TAG_WIDTH))
+        .min_w_0()
+        .children(group.map(|group| {
+            components::tag(group, metrics)
+                .max_w_full()
+                .debug_selector(move || format!("{prefix}.tag.{number}"))
+        }));
+    let time_column = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_end()
+        .w(metrics.scale(ROW_TIME_WIDTH))
+        .min_w_0()
+        .children(last.map(|(last, exact)| {
+            div()
+                .id(SharedString::from(format!("{prefix}.last.{number}")))
+                .debug_selector(move || format!("{prefix}.last.{number}"))
+                .min_w_0()
+                .truncate()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_MUTED))
+                .tooltip(components::tooltip(exact))
+                .child(components::line_text(last))
+        }));
     div()
         .flex()
         .flex_none()
         .items_center()
         .gap(metrics.scale(spacing::TIGHT))
-        .children(group.map(|group| {
-            components::tag(group, metrics).debug_selector(move || format!("{prefix}.tag.{number}"))
-        }))
-        .children(last.map(|(last, exact)| {
-            div()
-                .id(SharedString::from(format!("{prefix}.last.{number}")))
-                .debug_selector(move || format!("{prefix}.last.{number}"))
-                .flex_none()
-                .text_size(metrics.caption_size())
-                .text_color(theme::swatch(palette::TEXT_MUTED))
-                .tooltip(components::tooltip(exact))
-                .child(last)
-        }))
+        .when(show_meta, |meta| meta.child(tag_column).child(time_column))
         .child(if open {
             dot.id(SharedString::from(format!("{prefix}.state.{number}")))
                 .debug_selector(move || format!("{prefix}.state.{number}"))
@@ -2084,6 +2336,7 @@ fn host_row_element(
         .child(row_meta(
             number,
             "hosts",
+            host.show_meta,
             host.group.clone(),
             last,
             host.open,
@@ -2144,18 +2397,22 @@ fn connection_row_element(
                     let _ = edit.update(cx, |view, cx| view.edit_saved_connection(id, cx));
                 }),
         )
-        .child(
-            components::icon_only_button(Icon::Copy, metrics)
-                .id(SharedString::from(format!(
-                    "hosts.connection.copy.{number}"
-                )))
-                .debug_selector(move || format!("hosts.connection.copy.{number}"))
-                .tooltip(components::tooltip(strings.connection_duplicate))
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    let _ = copy.update(cx, |view, cx| view.duplicate_saved_connection(id, cx));
-                }),
-        )
+        // Like a host row's duplicate, the copy gives way in a narrow window (it stays on
+        // the right-press menu), so both kinds of row keep the same tools and columns.
+        .when(connection.show_duplicate, |tools| {
+            tools.child(
+                components::icon_only_button(Icon::Copy, metrics)
+                    .id(SharedString::from(format!(
+                        "hosts.connection.copy.{number}"
+                    )))
+                    .debug_selector(move || format!("hosts.connection.copy.{number}"))
+                    .tooltip(components::tooltip(strings.connection_duplicate))
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        let _ = copy.update(cx, |view, cx| view.duplicate_saved_connection(id, cx));
+                    }),
+            )
+        })
         .child(
             components::danger_icon_button(Icon::Trash, metrics)
                 .id(SharedString::from(format!(
@@ -2215,6 +2472,7 @@ fn connection_row_element(
         .child(row_meta(
             number,
             "hosts.connection",
+            connection.show_meta,
             connection.group.clone(),
             None,
             connection.open,

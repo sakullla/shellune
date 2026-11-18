@@ -558,6 +558,11 @@ pub struct ShelluneView {
     hosts_rows_drawn: std::rc::Rc<std::cell::Cell<usize>>,
     /// The host or connection row currently highlighted by keyboard navigation or a single click.
     hosts_cursor: Option<HostId>,
+    /// The keyboard stop of each sidebar group row, made the first time the row is drawn.
+    ///
+    /// A group is renamed with F2 and deleted with Delete while its row holds the keys
+    /// (ADR-3), so every row needs a focus of its own that survives redraws.
+    group_focus: RefCell<HashMap<GroupPath, FocusHandle>>,
     /// The host or connection row whose right-click menu is open, and where the pointer opened it.
     host_menu: Option<(HostId, gpui::Point<gpui::Pixels>)>,
     /// The connection form on screen. Other attempts keep theirs on [`Attempt::panel`].
@@ -2577,6 +2582,7 @@ impl ShelluneView {
             hosts_scroll: UniformListScrollHandle::new(),
             hosts_rows_drawn: std::rc::Rc::new(std::cell::Cell::new(0)),
             hosts_cursor: None,
+            group_focus: RefCell::new(HashMap::new()),
             host_menu: None,
             remote: None,
             chain: None,
@@ -3402,18 +3408,37 @@ impl ShelluneView {
     }
 
     /// Moves the host-list keyboard cursor up (`-1`) or down (`+1`) and scrolls to it.
+    ///
+    /// While the search reads as an address, the "connect to …" row is row 0 and is
+    /// what "no cursor" means: Up from the first saved row goes back to it, so Enter
+    /// dials the typed address again without retyping (ADR-3).
     pub(super) fn step_hosts_cursor(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
         let rows = self.connectable_host_rows();
         if rows.is_empty() {
             return false;
         }
-        let target_pos = match self
+        let current = self
             .hosts_cursor
-            .and_then(|current| rows.iter().position(|(_, id)| *id == current))
-        {
-            Some(pos) => (pos as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
-            None if delta >= 0 => 0,
-            None => rows.len() - 1,
+            .and_then(|current| rows.iter().position(|(_, id)| *id == current));
+        // A non-empty list always draws the direct row when there is an address.
+        let direct = self.home_direct_target().is_some();
+        let target_pos = if direct {
+            let here = current.map_or(0, |pos| pos as isize + 1);
+            let next = (here + delta).clamp(0, rows.len() as isize) as usize;
+            if next == 0 {
+                self.hosts_cursor = None;
+                self.hosts_scroll
+                    .scroll_to_item(0, gpui::ScrollStrategy::Top);
+                cx.notify();
+                return true;
+            }
+            next - 1
+        } else {
+            match current {
+                Some(pos) => (pos as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
+                None if delta >= 0 => 0,
+                None => rows.len() - 1,
+            }
         };
         let (row_index, target_id) = rows[target_pos];
         self.hosts_cursor = Some(target_id);
@@ -3435,9 +3460,31 @@ impl ShelluneView {
         // Windows and Linux, Cmd on macOS. Every other combination is left to the
         // field or the action it is bound to.
         let secondary = modifiers.number_of_modifiers() == 1 && modifiers.secondary();
-        if self.workspace.destination() != Destination::Hosts
-            || (modifiers.number_of_modifiers() != 0 && !secondary)
-            || self.palette.is_some()
+        if self.workspace.destination() != Destination::Hosts || self.hosts_keys_blocked() {
+            return false;
+        }
+        let search_focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
+        let page_focused = self
+            .destination_focus(Destination::Hosts)
+            .is_focused(window);
+        if !search_focused && !page_focused {
+            return false;
+        }
+        // Shift+Tab from the search or the list goes to the sidebar's groups, where F2
+        // and Delete rename and delete one (ADR-3).
+        if event.keystroke.key == "tab" && modifiers.shift && modifiers.number_of_modifiers() == 1 {
+            return self.focus_sidebar_groups(window, cx);
+        }
+        if modifiers.number_of_modifiers() != 0 && !secondary {
+            return false;
+        }
+        self.hosts_page_key(event, secondary, page_focused, window, cx)
+    }
+
+    /// Whether something over the hosts page holds the keys instead of it: a dialog, a
+    /// menu, the palette or a question.
+    pub(super) fn hosts_keys_blocked(&self) -> bool {
+        self.palette.is_some()
             || self.batch.view().is_open()
             || self.custom_shell_open
             || self.host_fields.is_some()
@@ -3454,16 +3501,17 @@ impl ShelluneView {
             // must not move or connect while it is answered.
             || self.backup.is_some()
             || self.sync_dialog_open()
-        {
-            return false;
-        }
-        let search_focused = self.hosts_search.read(cx).focus_handle().is_focused(window);
-        let page_focused = self
-            .destination_focus(Destination::Hosts)
-            .is_focused(window);
-        if !search_focused && !page_focused {
-            return false;
-        }
+    }
+
+    /// The hosts page's own keys, once the search or the list holds the keyboard.
+    fn hosts_page_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        secondary: bool,
+        page_focused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Ctrl/Cmd+F finds and Ctrl/Cmd+N makes a new host, from the page or the search
         // (ADR-3). The terminal's own search is bound in the terminal, so the two never
         // meet.
@@ -3493,7 +3541,8 @@ impl ShelluneView {
                     self.connect_saved_connection(id, cx);
                     true
                 } else {
-                    false
+                    // With no row chosen, the "connect to …" row is the one Enter means.
+                    self.home_direct_row_shown() && self.connect_home_direct(false, window, cx)
                 }
             }
             // Delete asks first: the question is the same one the row's bin opens.
@@ -3734,11 +3783,16 @@ impl ShelluneView {
         if !tree.contains(path) {
             tree.insert(path).map_err(|error| error.to_string())?;
         }
-        for host in self.book.hosts() {
-            if let Some(saved) = host.group_path()
-                && saved.starts_with(path)
-                && !tree.contains(&saved)
-            {
+        // A desktop or serial connection names its group the same way a host does, and
+        // the sidebar draws that group too, so its branch is part of the change.
+        let named = self.book.hosts().iter().map(HostConfig::group_path).chain(
+            self.book
+                .connections()
+                .iter()
+                .map(ConnectionRecord::group_path),
+        );
+        for saved in named.flatten() {
+            if saved.starts_with(path) && !tree.contains(&saved) {
                 tree.insert(&saved).map_err(|error| error.to_string())?;
             }
         }
@@ -18535,7 +18589,7 @@ impl Render for ShelluneView {
                     cx.stop_propagation();
                     return;
                 }
-                if this.hosts_key(event, window, cx) {
+                if this.home_group_key(event, window, cx) || this.hosts_key(event, window, cx) {
                     cx.stop_propagation();
                 }
             }))
