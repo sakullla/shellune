@@ -695,8 +695,9 @@ impl DesktopClient {
 
     /// A local folder the RDP server sees as the drive `name` (normally
     /// [`DRIVE_NAME`]); `None` maps nothing. A folder that cannot be offered when the
-    /// attempt starts, or that the server declines, is reported as
-    /// [`Notice::DriveUnavailable`] with the reason; the session still connects.
+    /// attempt starts is reported as [`Notice::DriveUnavailable`] with the reason; one
+    /// the server does not take is reported as [`Notice::DriveRefused`] with how it was
+    /// refused. Either way the session still connects.
     /// The server stays inside the folder: requests through a symbolic link or
     /// junction in it, or naming a DOS device, are answered with access denied.
     /// VNC ignores it.

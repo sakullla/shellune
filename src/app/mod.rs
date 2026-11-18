@@ -24,6 +24,8 @@ pub mod components;
 pub mod copy;
 /// The RDP and VNC surfaces a desktop session draws (R18-R20, R23).
 pub mod desktop;
+/// The clipboard a remote desktop shares with this computer (R1-R4).
+pub mod desktop_clipboard;
 pub mod files;
 pub mod forwarding;
 pub mod glyphs;

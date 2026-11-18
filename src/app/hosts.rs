@@ -2924,6 +2924,10 @@ pub enum ConnectionFormField {
     Certificate,
     /// How much a VNC connection insists on encryption.
     Security,
+    /// Whether a desktop connection shares the clipboard with this computer.
+    Clipboard,
+    /// The local folder a RDP connection offers the remote desktop as a drive.
+    DriveFolder,
     /// The device a serial connection opens.
     Device,
     /// The line speed.
@@ -2947,7 +2951,7 @@ impl ConnectionFormField {
     /// shows only the fields it has; the forms are built from
     /// [`Self::of_protocol`], which is why nothing outside a test asks for this list.
     #[cfg(test)]
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::Name,
         Self::Group,
         Self::Address,
@@ -2956,6 +2960,8 @@ impl ConnectionFormField {
         Self::Domain,
         Self::Certificate,
         Self::Security,
+        Self::Clipboard,
+        Self::DriveFolder,
         Self::Device,
         Self::Baud,
         Self::DataBits,
@@ -2977,6 +2983,8 @@ impl ConnectionFormField {
                 Self::User,
                 Self::Domain,
                 Self::Certificate,
+                Self::Clipboard,
+                Self::DriveFolder,
                 Self::Name,
                 Self::Group,
             ],
@@ -2984,6 +2992,7 @@ impl ConnectionFormField {
                 Self::Address,
                 Self::Port,
                 Self::Security,
+                Self::Clipboard,
                 Self::Name,
                 Self::Group,
             ],
@@ -3013,6 +3022,8 @@ impl ConnectionFormField {
             Self::Domain => strings.connection_field_domain,
             Self::Certificate => strings.connection_field_certificate,
             Self::Security => strings.connection_field_security,
+            Self::Clipboard => strings.connection_field_clipboard,
+            Self::DriveFolder => strings.connection_field_drive_folder,
             Self::Device => strings.connection_field_device,
             Self::Baud => strings.connection_field_baud,
             Self::DataBits => strings.connection_field_data_bits,
@@ -3035,6 +3046,8 @@ impl ConnectionFormField {
             Self::Domain => "connection.field.domain",
             Self::Certificate => "connection.field.certificate",
             Self::Security => "connection.field.security",
+            Self::Clipboard => "connection.field.clipboard",
+            Self::DriveFolder => "connection.field.drive_folder",
             Self::Device => "connection.field.device",
             Self::Baud => "connection.field.baud",
             Self::DataBits => "connection.field.data_bits",
@@ -3056,6 +3069,7 @@ impl ConnectionFormField {
                 | Self::Port
                 | Self::User
                 | Self::Domain
+                | Self::DriveFolder
                 | Self::Device
                 | Self::Baud
                 | Self::DataBits
@@ -3079,6 +3093,10 @@ pub struct ProtocolDraft {
     domain: String,
     certificate: RdpCertificatePolicy,
     security: VncSecurity,
+    /// Whether the clipboard is shared; on unless the record turned it off.
+    clipboard: bool,
+    /// The local folder offered to a RDP desktop; blank maps nothing.
+    drive_folder: String,
     device: String,
     baud: String,
     data_bits: String,
@@ -3108,6 +3126,8 @@ impl ProtocolDraft {
             domain: String::new(),
             certificate: RdpCertificatePolicy::default(),
             security: VncSecurity::default(),
+            clipboard: true,
+            drive_folder: String::new(),
             device: String::new(),
             baud: shellune_core::DEFAULT_SERIAL_BAUD.to_string(),
             data_bits: shellune_core::MAX_SERIAL_DATA_BITS.to_string(),
@@ -3144,6 +3164,8 @@ impl ProtocolDraft {
                 draft.user = config.user().unwrap_or_default().to_owned();
                 draft.domain = config.domain().unwrap_or_default().to_owned();
                 draft.certificate = config.certificate();
+                draft.clipboard = config.clipboard();
+                draft.drive_folder = config.drive_folder().unwrap_or_default().to_owned();
                 draft.remember = config.remembers_secret();
                 draft
             }
@@ -3159,6 +3181,7 @@ impl ProtocolDraft {
                 draft.address = config.address().to_owned();
                 draft.port = config.port().to_string();
                 draft.security = config.security();
+                draft.clipboard = config.clipboard();
                 draft.remember = config.remembers_secret();
                 draft
             }
@@ -3217,11 +3240,13 @@ impl ProtocolDraft {
             ConnectionFormField::Port => &self.port,
             ConnectionFormField::User => &self.user,
             ConnectionFormField::Domain => &self.domain,
+            ConnectionFormField::DriveFolder => &self.drive_folder,
             ConnectionFormField::Device => &self.device,
             ConnectionFormField::Baud => &self.baud,
             ConnectionFormField::DataBits => &self.data_bits,
             ConnectionFormField::Certificate
             | ConnectionFormField::Security
+            | ConnectionFormField::Clipboard
             | ConnectionFormField::Parity
             | ConnectionFormField::StopBits
             | ConnectionFormField::Flow
@@ -3239,11 +3264,13 @@ impl ProtocolDraft {
             ConnectionFormField::Port => &mut self.port,
             ConnectionFormField::User => &mut self.user,
             ConnectionFormField::Domain => &mut self.domain,
+            ConnectionFormField::DriveFolder => &mut self.drive_folder,
             ConnectionFormField::Device => &mut self.device,
             ConnectionFormField::Baud => &mut self.baud,
             ConnectionFormField::DataBits => &mut self.data_bits,
             ConnectionFormField::Certificate
             | ConnectionFormField::Security
+            | ConnectionFormField::Clipboard
             | ConnectionFormField::Parity
             | ConnectionFormField::StopBits
             | ConnectionFormField::Flow
@@ -3283,6 +3310,21 @@ impl ProtocolDraft {
             return false;
         }
         self.security = security;
+        true
+    }
+
+    /// Whether the form shares the clipboard with the remote desktop.
+    #[must_use]
+    pub fn clipboard(&self) -> bool {
+        self.clipboard
+    }
+
+    /// Chooses whether the clipboard is shared with the remote desktop.
+    pub fn set_clipboard(&mut self, clipboard: bool) -> bool {
+        if self.clipboard == clipboard {
+            return false;
+        }
+        self.clipboard = clipboard;
         true
     }
 
@@ -3377,6 +3419,12 @@ impl ProtocolDraft {
                 let domain = self.domain.trim();
                 config.set_domain((!domain.is_empty()).then_some(domain.to_owned()));
                 config.set_certificate(self.certificate);
+                config.set_clipboard(self.clipboard);
+                // A blank folder turns the mapping off; the domain trims it and
+                // refuses a control character on the folder field.
+                config
+                    .set_drive_folder(Some(self.drive_folder.as_str()))
+                    .map_err(problem_of)?;
                 config.set_remember_secret(self.remember);
                 ConnectionRecord::Rdp(config)
             }
@@ -3387,6 +3435,7 @@ impl ProtocolDraft {
                 let mut config = VncConfig::new(name, address).map_err(problem_of)?;
                 config.set_port(port.get().into()).map_err(problem_of)?;
                 config.set_security(self.security);
+                config.set_clipboard(self.clipboard);
                 config.set_remember_secret(self.remember);
                 ConnectionRecord::Vnc(config)
             }
@@ -3501,9 +3550,7 @@ fn problem_of(error: shellune_core::ConnectionValidationError) -> ConnectionProb
         Refusal::EmptyDevice | Refusal::DeviceContainsControlCharacter => {
             ConnectionFormField::Device
         }
-        // The form has no folder field yet, so no edit can produce this refusal;
-        // the address is the closest field until the folder field exists.
-        Refusal::DriveFolderContainsControlCharacter => ConnectionFormField::Address,
+        Refusal::DriveFolderContainsControlCharacter => ConnectionFormField::DriveFolder,
         Refusal::BaudOutOfRange { .. } => ConnectionFormField::Baud,
         Refusal::DataBitsOutOfRange { .. } => ConnectionFormField::DataBits,
     };
@@ -3776,6 +3823,86 @@ mod tests {
             Some("Prod/East".to_owned())
         );
         assert!(edit.record().as_ssh().is_none(), "it is not an SSH host");
+    }
+
+    #[test]
+    fn a_desktop_form_carries_the_clipboard_switch_and_the_mapped_folder() {
+        let rdp = ConnectionFormField::of_protocol(ProtocolKind::Rdp);
+        assert!(rdp.contains(&ConnectionFormField::Clipboard));
+        assert!(rdp.contains(&ConnectionFormField::DriveFolder));
+        let vnc = ConnectionFormField::of_protocol(ProtocolKind::Vnc);
+        assert!(vnc.contains(&ConnectionFormField::Clipboard));
+        assert!(
+            !vnc.contains(&ConnectionFormField::DriveFolder),
+            "VNC has no drive to map a folder to"
+        );
+        assert!(ConnectionFormField::DriveFolder.is_text());
+        assert!(!ConnectionFormField::Clipboard.is_text());
+
+        // A new RDP form shares the clipboard and maps nothing.
+        let mut draft = ProtocolDraft::create(ProtocolKind::Rdp);
+        assert!(
+            draft.clipboard(),
+            "the clipboard is shared unless turned off"
+        );
+        assert_eq!(draft.text(ConnectionFormField::DriveFolder), "");
+        draft.set_text(ConnectionFormField::Address, "10.0.0.9");
+        let edit = draft.build().expect("a valid RDP connection");
+        let ConnectionRecord::Rdp(config) = edit.record() else {
+            panic!("an RDP form builds an RDP record");
+        };
+        assert!(config.clipboard());
+        assert_eq!(config.drive_folder(), None, "a blank folder maps nothing");
+
+        // Both choices survive a save and come back when the form is opened again.
+        assert!(draft.set_clipboard(false));
+        assert!(
+            !draft.set_clipboard(false),
+            "the same choice is not a change"
+        );
+        draft.set_text(ConnectionFormField::DriveFolder, r"  D:\Shared  ");
+        let edit = draft.build().expect("a valid RDP connection");
+        let ConnectionRecord::Rdp(config) = edit.record() else {
+            panic!("an RDP form builds an RDP record");
+        };
+        assert!(!config.clipboard());
+        assert_eq!(
+            config.drive_folder(),
+            Some(r"D:\Shared"),
+            "the path is trimmed"
+        );
+        let again = ProtocolDraft::edit(edit.record());
+        assert!(!again.clipboard());
+        assert_eq!(again.text(ConnectionFormField::DriveFolder), r"D:\Shared");
+
+        // Clearing the folder turns the mapping off again.
+        let mut cleared = again.clone();
+        cleared.set_text(ConnectionFormField::DriveFolder, "   ");
+        let edit = cleared.build().expect("a valid RDP connection");
+        let ConnectionRecord::Rdp(config) = edit.record() else {
+            panic!("an RDP form builds an RDP record");
+        };
+        assert_eq!(config.drive_folder(), None);
+
+        // A folder no person can choose is refused on the folder field itself.
+        let mut broken = ProtocolDraft::create(ProtocolKind::Rdp);
+        broken.set_text(ConnectionFormField::Address, "10.0.0.9");
+        broken.set_text(ConnectionFormField::DriveFolder, "D:\\a\u{7}b");
+        let problem = broken
+            .build()
+            .expect_err("a control character is not a path");
+        assert_eq!(problem.field(), ConnectionFormField::DriveFolder);
+
+        // A VNC form has the switch and nothing else new.
+        let mut vnc = ProtocolDraft::create(ProtocolKind::Vnc);
+        vnc.set_text(ConnectionFormField::Address, "10.0.0.41");
+        assert!(vnc.set_clipboard(false));
+        let edit = vnc.build().expect("a valid VNC connection");
+        let ConnectionRecord::Vnc(config) = edit.record() else {
+            panic!("a VNC form builds a VNC record");
+        };
+        assert!(!config.clipboard());
+        assert!(!ProtocolDraft::edit(edit.record()).clipboard());
     }
 
     #[test]

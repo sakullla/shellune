@@ -34,9 +34,9 @@ use shellune_storage::{
 use crate::app::ShelluneView;
 use crate::app::copy::Locale;
 use crate::app::desktop::scripted::{ScriptedLink, solid};
-use crate::app::desktop::{LinkError, LinkEvent, LinkFailure, LinkState};
+use crate::app::desktop::{DriveProblem, LinkError, LinkEvent, LinkFailure, LinkState, Notice};
 use crate::app::files::FileSource;
-use crate::app::hosts::ConnectionChoice;
+use crate::app::hosts::{ConnectionChoice, ConnectionFormField};
 use crate::app::keymap::Problem;
 use crate::app::nav::{Destination, Platform};
 use crate::app::serial::PortScan;
@@ -829,6 +829,135 @@ fn show_desktop_send_problem(
     let reason = LinkError::State.reason();
     if let Some(pane) = view.desktop_of(id).cloned() {
         pane.update(cx, |pane, cx| pane.show_send_problem(&reason, cx));
+    }
+    Ok(())
+}
+
+/// A live RDP session that reported a folder it could not map and a clipboard the
+/// server refused: the notices over the picture, each said once (R1, R5).
+fn show_desktop_notices(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let mut events = vec![LinkEvent::State {
+        state: LinkState::Connected,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    }];
+    events.extend(desktop_regions());
+    events.push(LinkEvent::Notice(Notice::DriveUnavailable(
+        DriveProblem::Missing,
+    )));
+    events.push(LinkEvent::Notice(Notice::ClipboardRefused));
+    mount_desktop(view, &capture_rdp_record(), events, cx)?;
+    Ok(())
+}
+
+/// The folder the RDP editor shot shows as mapped. Nothing reads it.
+const CAPTURE_DRIVE_FOLDER: &str = r"C:\Users\alice\Exchange";
+
+/// Writes one RDP connection that maps a folder and one VNC connection with its
+/// clipboard off, so each editor opens on the new fields with a value in them.
+fn seed_sharing_connections(root: &Path) -> Result<(), String> {
+    let mut book = shellune_storage::HostBook::new();
+    let mut rdp = shellune_core::RdpConfig::new("Design workstation", "10.0.0.40", Some("alice"))
+        .map_err(|error| format!("the RDP fixture is invalid: {error}"))?;
+    rdp.set_drive_folder(Some(CAPTURE_DRIVE_FOLDER))
+        .map_err(|error| format!("the folder fixture is invalid: {error}"))?;
+    let mut vnc = shellune_core::VncConfig::new("Build monitor", "10.0.0.41")
+        .map_err(|error| format!("the VNC fixture is invalid: {error}"))?;
+    vnc.set_clipboard(false);
+    for record in [
+        shellune_core::ConnectionRecord::Rdp(rdp),
+        shellune_core::ConnectionRecord::Vnc(vnc),
+    ] {
+        book.insert_connection(record)
+            .map_err(|error| format!("the connection fixture could not be added: {error}"))?;
+    }
+    HostStore::at(root)
+        .save(&book)
+        .map_err(|error| format!("the connection fixture could not be written: {error}"))
+}
+
+/// Opens the editor of the saved connection of one protocol, the way its row's edit
+/// button does.
+fn show_connection_editor(
+    view: &mut ShelluneView,
+    protocol: shellune_core::ProtocolKind,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let id = view
+        .book()
+        .connections()
+        .iter()
+        .find(|record| record.protocol() == protocol)
+        .map(shellune_core::ConnectionRecord::id)
+        .ok_or_else(|| format!("no saved {} connection to edit", protocol.label()))?;
+    view.edit_connection_for_test(id, cx);
+    Ok(())
+}
+
+/// The RDP editor on a saved connection: the clipboard switch and the mapped folder.
+fn show_rdp_editor(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_connection_editor(view, shellune_core::ProtocolKind::Rdp, cx)
+}
+
+/// The VNC editor on a saved connection: the clipboard switch, turned off.
+fn show_vnc_editor(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_connection_editor(view, shellune_core::ProtocolKind::Vnc, cx)
+}
+
+/// Where an editor shot has arrived: the form is open on a saved record of that
+/// protocol and holds the values the fixture wrote.
+fn connection_editor_ready_for(
+    view: &ShelluneView,
+    protocol: shellune_core::ProtocolKind,
+) -> Result<(), String> {
+    let draft = view
+        .hosts_state()
+        .protocol_draft()
+        .ok_or_else(|| "no connection form is open".to_owned())?;
+    if draft.protocol() != protocol || draft.editing().is_none() {
+        return Err(format!(
+            "the open form is a {} form, not the saved {} connection",
+            draft.protocol().label(),
+            protocol.label()
+        ));
+    }
+    Ok(())
+}
+
+fn rdp_editor_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    connection_editor_ready_for(view, shellune_core::ProtocolKind::Rdp)?;
+    let folder = view
+        .hosts_state()
+        .protocol_draft()
+        .map(|draft| draft.text(ConnectionFormField::DriveFolder).to_owned())
+        .unwrap_or_default();
+    if folder != CAPTURE_DRIVE_FOLDER {
+        return Err(format!("the folder field holds {folder:?}"));
+    }
+    Ok(())
+}
+
+fn vnc_editor_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    connection_editor_ready_for(view, shellune_core::ProtocolKind::Vnc)?;
+    if view
+        .hosts_state()
+        .protocol_draft()
+        .is_some_and(|draft| draft.clipboard())
+    {
+        return Err("the clipboard switch is on; the fixture turned it off".to_owned());
     }
     Ok(())
 }
@@ -2729,6 +2858,25 @@ pub const SCENARIOS: &[Scenario] = &[
         ready: desktop_live_ready,
     },
     Scenario {
+        id: "desktop-notices",
+        title: "远程桌面 · 剪贴板与文件夹映射提示",
+        category: Category::Desktop,
+        fixture: "a live display-only RDP surface whose scripted link reported a mapped folder that does \
+                  not exist and a clipboard the server refused; no server was dialled",
+        evidence: "shows the notices over the picture, each said once, and the way to dismiss them; proves \
+                   nothing about a real server's clipboard channel or drive redirection",
+        quick: false,
+        variants: &[
+            Variant::dark().comfortable(),
+            Variant::dark().chinese(),
+            Variant::light().smallest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_desktop_notices,
+        ready: desktop_live_ready,
+    },
+    Scenario {
         id: "terminal-local",
         title: "本地终端 · 会话与标签",
         category: Category::Terminal,
@@ -2838,6 +2986,36 @@ pub const SCENARIOS: &[Scenario] = &[
         prepare: seed_jump_hosts,
         install: show_new_host_jumps,
         ready: new_host_jumps_ready,
+    },
+    Scenario {
+        id: "connection-rdp-edit",
+        title: "对话框 · 编辑 RDP 连接 · 剪贴板与映射文件夹",
+        category: Category::Overlay,
+        fixture: "one saved RDP connection that maps a local folder and one saved VNC connection, \
+                  written before the view starts; the RDP connection's form is open",
+        evidence: "shows the clipboard switch, the mapped-folder field with its browse button and its \
+                   note in the RDP form; nothing was saved, dialled or mapped",
+        quick: false,
+        variants: &[Variant::dark().comfortable(), Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_sharing_connections,
+        install: show_rdp_editor,
+        ready: rdp_editor_ready,
+    },
+    Scenario {
+        id: "connection-vnc-edit",
+        title: "对话框 · 编辑 VNC 连接 · 剪贴板开关",
+        category: Category::Overlay,
+        fixture: "one saved RDP connection and one saved VNC connection with its clipboard turned off, \
+                  written before the view starts; the VNC connection's form is open",
+        evidence: "shows the clipboard switch, off, in the VNC form and that the form has no folder \
+                   field; nothing was saved or dialled",
+        quick: false,
+        variants: &[Variant::dark().comfortable(), Variant::dark().chinese()],
+        start: || page(Destination::Hosts),
+        prepare: seed_sharing_connections,
+        install: show_vnc_editor,
+        ready: vnc_editor_ready,
     },
     Scenario {
         id: "close-question",

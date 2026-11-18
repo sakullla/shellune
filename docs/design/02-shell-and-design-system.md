@@ -536,10 +536,95 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 全屏藏起来的标题与标签条是唯一的出口，窗口不能停在没有出口的状态里。`src/app/tests.rs` 的
 `full_screen_gives_the_window_back_when_another_page_is_chosen` 与 `..._when_the_desktop_tab_is_split` 各证一条路径。
 
-**证据边界。** 捕获场景 `desktop-rdp`、`desktop-vnc-failed`、`desktop-send-problem` 与 `serial-session` 用的是
+**剪贴板（远程桌面剪贴板与文件互通 R1—R4、R6）。** 剪贴板按连接开关（`RdpConfig::clipboard` / `VncConfig::clipboard`，
+默认开；RDP 与 VNC 表单里都是勾选框 `connection.field.clipboard`），`DesktopTarget` 带着它交给 `NativeLink::open` → `set_clipboard`；关闭时 shim 不收不发，窗格也不读本机剪贴板、
+不写远端内容。两个方向的格式规则都在 `src/app/desktop_clipboard.rs`，是纯函数，不需要窗口或服务器就能测：
+
+- **本机 → 远端**（`local_offer`）：文本原样交给 `push_clipboard`。**截断语义**：超过 1 MiB 的文本由 shim 在界内最后一个
+  完整 UTF-8 字符处截断，截断后的文本照常发送，并在会话接收这组内容时回一条 `ClipboardTooLarge(Text)` 通知，不返回错误——
+  这改变了 ADR-1 “本机超限返回参数错误”的约定（T2 落地时改为截断）。图片仍按原约定：超过 32 MiB 的图片条目让
+  `push_clipboard` 返回 `Argument`，所以窗格在交出去之前先按 32 MiB 过滤。第一张图片同时给 PNG 与 DIB 两种形式（本机是 PNG
+  就原样传，其它格式用 `image` crate 解码后重编码；DIB 为 `BITMAPINFOHEADER` + 32 位 `BI_RGB` 自底向上，第四字节在
+  `BI_RGB` 里是保留位，半透明只在 PNG 里保留）。单一形式超过 32 MiB 就只丢那一种，两种都超限才丢图片并提示“剪贴板图片超过
+  32 MiB，没有传输”；SVG 和解不开的图片静默不传（远端也贴不出来）。文件列表不走剪贴板，文件靠文件夹映射。
+- **远端 → 本机**（`local_item`）：一次远端复制的所有格式写成**一个** `ClipboardItem`（T3 的
+  `ClipboardItem::new_entries`），文本与图片同时在，由粘贴的程序自己挑；远端给了 PNG 就用 PNG，否则把 DIB 解成 PNG。
+  远端的 DIB 可能是 `CF_DIB`（`BITMAPINFOHEADER`），也可能是带 `BITMAPV5HEADER` 的 `CF_DIBV5`（`BI_BITFIELDS`，掩码在
+  头里，含 alpha）。`BITMAPV5HEADER` 之后是否再重复三个颜色掩码各家写法不一（Windows 自己合成的重复，浏览器等多数程序
+  不重复），而 `image` crate 总是跳过 12 字节；`dib_to_png` 按包长判断——像素数据总在包尾——没有这 12 字节时先补上，
+  两种写法都按原样解出（`a_remote_dibv5_pastes_as_the_same_picture_with_its_transparency`）。远端文本超过 1 MiB 时 shim 同样
+  截断后照常送达并提示“已截断”；远端图片超过 32 MiB 时从这一组里被跳过，其余格式照常送达并提示“没有传输”。RDP 远端
+  文本保留 Windows 的 CRLF 换行，原样写入本机。
+- **什么时候推送**：窗格拿到键盘（`cx.on_focus_in`）、窗口重新激活且画面仍有焦点（`observe_window_activation`；GPUI
+  的焦点事件在窗口失活时也视为失焦，所以重新激活同样触发 focus-in，两条路径由去重合并成一次）、以及按下粘贴快捷键。
+  这样远端程序无论用 Ctrl+V 还是右键“粘贴”都拿到本机最新内容。只在会话活着（Connecting / Live）且有链路时读剪贴板。
+- **去重**（`prints` / `already_shared`）：窗格记着最近一次推送或最近一次从远端写入本机的内容的“指纹”（文本把 CRLF
+  统一成 LF 后一份、每张图片一份）。RDP 远端文本带 CRLF，本机读回或用户在本机复制的同一段文字可能是 LF，统一换行后才算
+  同一份。当前剪贴板的每一部分都在其中时不再推送——Windows 的 `read_from_clipboard` 只返回第一个格式（有文本时只给文本），
+  读回来的永远不是写进去的整项，所以按“部分”比较而不是整项比较。推送只由用户动作触发，远端把内容回送过来也只会写一次
+  本机，不会形成循环。
+- **粘贴快捷键（R4）**：`Ctrl+V`（macOS 为 `⌘V`）先把本机剪贴板排进输入队列，再把快捷键本身发出去，二者同一队列、
+  同一顺序。剪贴板关闭或内容已推送过时，只发快捷键，远端程序粘贴它自己剪贴板里的内容。修饰键此前从不转发——GPUI 把
+  Ctrl / Alt / Shift 报成修饰键变化而不是按键——所以过去远端收到的是一个光秃秃的 V。现在普通键按下时按本机持有的修饰键
+  在远端按下 Ctrl / Alt / Shift（`InputQueue::set_modifier`），本机松开修饰键时（`on_modifiers_changed`）在远端松开；
+  单独按下修饰键不发送（Alt 单按会激活远端菜单栏），Windows 键不转发（单按会打开远端开始菜单）。macOS 上 ⌘ 视同 Ctrl，
+  所以 ⌘C / ⌘V 到远端就是 Ctrl+C / Ctrl+V。顺带的结果是 Shift+字母在远端成了大写字母。
+  注意 RDP 的剪贴板通道与输入通道是两条虚拟通道，服务器不保证二者之间的顺序：焦点推送通常已经在按键之前把内容送到，
+  若内容恰好是按 Ctrl+V 那一刻才变的，远端第一次粘贴可能还是旧内容，需实机确认。
+
+**文件夹映射（R5、R6）。** RDP 表单的“映射本机文件夹”是带浏览按钮（`Browse::Directory`）的输入框，留空即关闭；
+选择器 `connection.field.drive_folder`，下方一行说明远端看到什么；VNC 表单没有这一项。
+它只存在本机记录与 `platforms.<os>` 覆盖层（T1），`DesktopTarget::drive_folder` 交给 `set_drive("Shellune", …)`，
+远端“此电脑”里看到名为 Shellune 的磁盘。shim 在每次连接开始时检查文件夹（`sd_rdp_drive.c`：必须是盘符或 UNC 的完整路径、
+存在、是文件夹、能列出内容、长度在 MAX_PATH 以内），通过后经 FreeRDP 自己的 drive 通道提供。
+
+**越界拦截机制。** 让服务器只能待在这个文件夹里的唯一一道防线是 FreeRDP 补丁
+`packaging/native/patches/freerdp-drive-confinement.patch`（改 `channels/drive/client/drive_file.c`）。上游只拒绝路径文本里的
+`..`，而 `CreateFileW` / `FindFirstFileW` 会跟随符号链接、junction 与挂载点，文件夹里的一个链接就能把它指向的东西交给服务器。
+补丁让打开与创建、关闭时删除、首次目录列举和改名目标在执行前先解析：以不请求数据访问的方式打开路径中已存在的最深一段，
+用 `GetFinalPathNameByHandleW` 取最终路径（其它系统用 `realpath`），它必须落在基准文件夹最终路径之内；设备名（CON、NUL、
+COM1 等）不算文件夹里的文件。不满足的一律 `ERROR_ACCESS_DENIED`，服务器看到的是 `STATUS_ACCESS_DENIED`。Windows 上打开
+之后还按句柄再校验一次，检查与打开之间换进来的链接也会被拦下。补丁顺带修了两处：被拒绝或失败的创建不再在关闭时删掉它
+所指的路径；在任何调用设置错误码之前就被拒绝的路径（如含 `..`）回“拒绝访问”，而不是线程里残留的错误码（常为
+`STATUS_SUCCESS`）。窗格与表单不参与拦截，只负责把文件夹交出去、把结果说出来。
+
+**会话通知与原因码。** shim 的 `Notice` 经 `LinkEvent::Notice` 到窗格，由 `DesktopNotice` 归类成下面几种，每种在每个会话
+里**只显示一次**（新会话 `attach` 时清空），各行有自己的选择器：
+
+| shim 通知（`SD_NOTICE_*`） | Rust `Notice` | 选择器 `desktop.notice.*` | 文案（英文 / 中文） |
+|---|---|---|---|
+| `CLIPBOARD_REFUSED` = 1 | `ClipboardRefused` | `clipboard_refused` | This server does not allow the clipboard, so copy and paste stay on each side. / 该服务器不允许剪贴板，复制粘贴不会在本机与远端之间同步。 |
+| `CLIPBOARD_READY` = 5 | `ClipboardReady` | —（不显示） | 撤下上面那条：服务器登录完成后剪贴板才就绪，先前的“不允许”不再成立 |
+| `CLIPBOARD_LATIN1_ONLY` = 2 | `ClipboardLatin1Only` | `clipboard_latin1` | This server's clipboard only takes Western characters; text with other characters was not sent. / 该服务器的剪贴板只支持西文字符，含其他字符的文本没有发送。 |
+| `CLIPBOARD_TOO_LARGE` = 3，detail = 文本 | `ClipboardTooLarge(Text)` | `text_too_large` | Clipboard text over 1 MiB was cut to fit. / 剪贴板文本超过 1 MiB，已截断。（文本已截断并送达） |
+| `CLIPBOARD_TOO_LARGE` = 3，detail = PNG / DIB | `ClipboardTooLarge(Png \| Dib)` | `image_too_large` | A clipboard image over 32 MiB was not passed on. / 剪贴板图片超过 32 MiB，没有传输。（图片被跳过） |
+| `DRIVE_UNAVAILABLE` = 4，detail = 原因码 | `DriveUnavailable(DriveProblem)` | `drive_unavailable` | The local folder was not mapped ({reason}); the session goes on without it. / 本机文件夹没有映射（{reason}），会话照常进行。 |
+| `DRIVE_REFUSED` = 6，detail = NTSTATUS 或 0 | `DriveRefused(DriveRefusal)` | `drive_refused` | The server did not accept the mapped folder; the session goes on without it. / 服务器没有接受映射的文件夹，会话照常进行。 |
+
+`DriveUnavailable` 的原因码（`SD_DRIVE_*` → `DriveProblem` → `{reason}`）：1 `Missing` 文件夹不存在 / it does not exist；
+2 `NotAFolder` 该路径是文件 / the path is a file；3 `NotAbsolute` 不是完整路径 / it is not a full path；4 `TooLong` 路径过长
+（UTF-16 单元与 UTF-8 字节都按 MAX_PATH 数）/ the path is too long；5 `NoAccess` 没有读取权限 / it cannot be read；6 `NotAdded`
+无法建立磁盘 / the drive could not be set up；其它值 `Other` 原因未知 / the reason is unknown。`DriveRefused` 是与之分开的一种
+通知：detail 非 0 是服务器以该 NTSTATUS 拒绝了这个设备（`DriveRefusal::Declined`），0 是宽限期内服务器始终没有打开设备重定向
+（`DriveRefusal::NotOpened`）；两者文案相同，会话都照常继续。同一种通知按种类去重：文件夹不可用的几种原因只说第一条
+（shim 每次连接也只报一次磁盘问题）；文本截断与图片未传说的是两件不同的事，各算一种。`Unknown` 不显示。
+
+有画面时通知与发送失败的句子同在 `desktop.notice` 提示条里，带一个“知道了”按钮（`desktop.notice.dismiss`）收起；没有画面时
+同样的句子写在状态卡片里（经 `components::capped_text` 居中限宽换行）。
+
+**已知限制（需实机确认）。** 本机没有 RDP / VNC 服务器：cliprdr 与 rdpdr 的真实往返、服务器在 `fDisableCdm` 等策略下的回应、
+剪贴板通道与输入通道之间的先后，都只由脚本链路和 shim 探针覆盖，真实 RDP / VNC 服务器的往返未在本机验证。服务器打开了
+设备重定向却始终不回这个磁盘的 Device Reply 时客户端收不到信号，不会提示。越界拦截在 Windows 上靠打开后的句柄复核关住
+检查与打开之间的竞态；其它系统只在打开前用 `realpath` 校验，留有这一窗口。平台限制：Wayland 下本机写不出图片；X11 不支持 INCR，超过约 16 MiB 的图片无法提供给本机其它程序；libvncclient 收到超过 1 MiB 的
+服务器剪贴板文本会直接断开会话。关闭了剪贴板的主机在 0.4.8 及以前的版本上会让整份主机文件 / 同步文件被拒收，需提示其它
+设备升级。
+
+**证据边界。** 捕获场景 `desktop-rdp`、`desktop-vnc-failed`、`desktop-send-problem`、`desktop-notices` 与 `serial-session` 用的是
 **脚本链路**（`desktop::scripted`）：几个纯色区域、一条脚本化的状态事件、一个脚本化失败，没有任何服务器被拨号。
 它们证明这个应用在这些状态下画了什么（控件条、缩放、阶段卡片、提示条的位置与文案），**不证明**任何真实 RDP/VNC 服务端
 的画面、输入、剪贴板或握手，也不证明真实串口设备的收发——本机没有这些端点，对应项在捕获清单和交付说明里都记为未验证。
+`connection-rdp-edit` 与 `connection-vnc-edit` 打开的是预先写入的 RDP / VNC 记录的编辑表单，只证明剪贴板勾选框、映射文件夹
+输入框（含浏览按钮与说明）画在哪里、写了什么，不证明任何映射或剪贴板真的生效。
 
 ### 1.5 启动过场（R7，`view/startup.rs`）
 

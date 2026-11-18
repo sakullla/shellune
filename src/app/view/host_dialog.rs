@@ -1489,6 +1489,47 @@ impl ShelluneView {
                             .child(choices),
                     );
                 }
+                ConnectionFormField::Clipboard => {
+                    // On unless the user turns it off: copy and paste between this
+                    // computer and the remote desktop is what a session is expected
+                    // to do (R6).
+                    body = body.child(
+                        checkbox(
+                            "connection.clipboard",
+                            strings.connection_field_clipboard,
+                            draft.clipboard(),
+                            metrics,
+                        )
+                        .debug_selector(|| "connection.field.clipboard".to_owned())
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                let next = this
+                                    .hosts
+                                    .protocol_draft()
+                                    .is_some_and(|draft| !draft.clipboard());
+                                if let Some(draft) = this.hosts.protocol_draft_mut() {
+                                    draft.set_clipboard(next);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    );
+                }
+                ConnectionFormField::DriveFolder => {
+                    // A blank folder is the mapping turned off, so the field is the
+                    // switch and the choice at once; the note says what the remote
+                    // side gets and that it gets nothing more (R5).
+                    body = body.child(
+                        self.protocol_field(ConnectionFormField::DriveFolder).child(
+                            div()
+                                .whitespace_normal()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .debug_selector(|| "connection.drive_folder.note".to_owned())
+                                .child(strings.connection_drive_folder_note),
+                        ),
+                    );
+                }
                 ConnectionFormField::Parity => {
                     let mut choices = components::segmented(metrics);
                     for parity in SerialParity::ALL {

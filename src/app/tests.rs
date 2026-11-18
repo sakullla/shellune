@@ -27330,9 +27330,9 @@ async fn a_clipboard_that_cannot_be_sent_is_stated_over_the_live_picture(cx: &mu
         "nothing is wrong before anything was sent"
     );
 
-    // An RDP connection cannot carry clipboard text upwards, so this paste cannot
-    // reach the remote side. It used to be dropped without a word because the only
-    // place the sentence was drawn is hidden by the picture itself.
+    // The link refuses every send, so this paste cannot reach the remote side. It
+    // used to be dropped without a word because the only place the sentence was
+    // drawn is hidden by the picture itself.
     focus_desktop(&view, cx, id);
     cx.write_to_clipboard(ClipboardItem::new_string("pasted".to_owned()));
     cx.simulate_keystrokes("ctrl-v");
@@ -27367,6 +27367,617 @@ async fn a_clipboard_that_cannot_be_sent_is_stated_over_the_live_picture(cx: &mu
             .read(app)
             .is_live()
     }));
+}
+
+// ---------------------------------------------------------------------------
+// The clipboard a desktop shares, the paste shortcut and the session's notices
+// (R1-R6 of the clipboard requirement)
+// ---------------------------------------------------------------------------
+
+/// The events of a live session with a picture, for the clipboard tests.
+fn live_desktop_events() -> Vec<LinkEvent> {
+    vec![
+        LinkEvent::State {
+            state: LinkState::Connected,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::Frame(solid(0, 0, 640, 400, (640, 400), [5, 6, 7, 255])),
+    ]
+}
+
+/// A saved VNC connection, with the clipboard on or off.
+fn vnc_record_sharing(name: &str, clipboard: bool) -> shellune_core::ConnectionRecord {
+    let mut config =
+        shellune_core::VncConfig::new(name, "vnc.example.com").expect("a valid VNC record");
+    config.set_clipboard(clipboard);
+    shellune_core::ConnectionRecord::Vnc(config)
+}
+
+/// A saved RDP connection, with the clipboard on or off.
+fn rdp_record_sharing(name: &str, clipboard: bool) -> shellune_core::ConnectionRecord {
+    let mut config = shellune_core::RdpConfig::new(name, "rdp.example.com", Some("desk"))
+        .expect("a valid RDP record");
+    config.set_clipboard(clipboard);
+    shellune_core::ConnectionRecord::Rdp(config)
+}
+
+/// Everything the pane sent so far.
+fn sent(
+    log: &std::sync::Arc<std::sync::Mutex<crate::app::desktop::scripted::Log>>,
+) -> Vec<DesktopInput> {
+    log.lock().expect("the log is not poisoned").inputs.clone()
+}
+
+/// The clipboard offers the pane sent so far, each as its kinds.
+fn offers(
+    log: &std::sync::Arc<std::sync::Mutex<crate::app::desktop::scripted::Log>>,
+) -> Vec<Vec<crate::app::desktop::ClipboardKind>> {
+    log.lock()
+        .expect("the log is not poisoned")
+        .clipboard
+        .iter()
+        .map(|entries| entries.iter().map(|entry| entry.kind).collect())
+        .collect()
+}
+
+/// Releases a key the way the window reports it.
+fn release_key(cx: &mut VisualTestContext, keystroke: &str) {
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse(keystroke).expect("a keystroke"),
+    });
+}
+
+/// A small PNG file, so a test can put a picture on the clipboard.
+fn png_picture() -> Vec<u8> {
+    let picture = image::RgbaImage::from_fn(3, 2, |x, y| {
+        image::Rgba([(x * 80) as u8, (y * 120) as u8, 200, 255])
+    });
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(picture)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("the picture encodes");
+    png
+}
+
+/// Gives the desktop pane the keyboard and draws the frame that reports it, which is
+/// when the window tells the pane it took the keyboard.
+///
+/// The window is made the active one first: a test window starts inactive, and an
+/// inactive window reports no focus to anything in it.
+fn focus_desktop_drawn(view: &Entity<ShelluneView>, cx: &mut VisualTestContext, id: SessionId) {
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+    focus_desktop(view, cx, id);
+    redraw(cx);
+    cx.run_until_parked();
+}
+
+/// Takes the keyboard away from everything and draws the frame that reports it.
+fn blur_drawn(cx: &mut VisualTestContext) {
+    cx.update(|window, _app| window.blur());
+    redraw(cx);
+    cx.run_until_parked();
+}
+
+/// The desktop pane's notices, in the order they are on screen.
+fn desktop_notices(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    id: SessionId,
+) -> Vec<crate::app::view::DesktopNotice> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .notices()
+    })
+}
+
+#[gpui::test]
+async fn the_paste_shortcut_offers_the_clipboard_and_then_sends_the_shortcut_itself(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::desktop::{CONTROL_LEFT, ClipboardEntry, key_codes};
+
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    focus_desktop_drawn(&view, cx, id);
+    let before = sent(&log).len();
+
+    cx.write_to_clipboard(ClipboardItem::new_string("粘贴 this".to_owned()));
+    cx.simulate_keystrokes("ctrl-v");
+    release_key(cx, "ctrl-v");
+    cx.simulate_modifiers_change(Modifiers::none());
+
+    let v = key_codes("v").expect("v is a key");
+    assert_eq!(
+        sent(&log)[before..],
+        [
+            DesktopInput::Clipboard(vec![ClipboardEntry::text("粘贴 this")]),
+            DesktopInput::Key {
+                codes: CONTROL_LEFT,
+                down: true
+            },
+            DesktopInput::Key {
+                codes: v,
+                down: true
+            },
+            DesktopInput::Key {
+                codes: v,
+                down: false
+            },
+            DesktopInput::Key {
+                codes: CONTROL_LEFT,
+                down: false
+            },
+        ],
+        "the clipboard goes first, then Ctrl+V itself, and Control is let go with the user's"
+    );
+
+    // The same content again is not offered again: the remote side already holds it,
+    // and the shortcut still goes so the remote program pastes it.
+    let before = sent(&log).len();
+    cx.simulate_keystrokes("ctrl-v");
+    release_key(cx, "ctrl-v");
+    cx.simulate_modifiers_change(Modifiers::none());
+    let again = sent(&log)[before..].to_vec();
+    assert!(
+        !again
+            .iter()
+            .any(|input| matches!(input, DesktopInput::Clipboard(_))),
+        "content already offered is not offered twice: {again:?}"
+    );
+    assert_eq!(again.len(), 4, "Control, V, V up, Control up: {again:?}");
+}
+
+#[gpui::test]
+async fn with_the_clipboard_off_the_paste_shortcut_still_reaches_the_remote_side(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::desktop::{CONTROL_LEFT, key_codes};
+
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let record = vnc_record_sharing("vnc", false);
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    cx.write_to_clipboard(ClipboardItem::new_string("stays here".to_owned()));
+    focus_desktop_drawn(&view, cx, id);
+    cx.simulate_keystrokes("ctrl-v");
+
+    let inputs = sent(&log);
+    assert!(
+        log.lock()
+            .expect("the log is not poisoned")
+            .clipboard
+            .is_empty(),
+        "a connection with sharing off offers nothing, on focus or on paste"
+    );
+    let v = key_codes("v").expect("v is a key");
+    assert_eq!(
+        inputs,
+        [
+            DesktopInput::Key {
+                codes: CONTROL_LEFT,
+                down: true
+            },
+            DesktopInput::Key {
+                codes: v,
+                down: true
+            },
+        ],
+        "the shortcut still goes, so the remote program pastes its own clipboard"
+    );
+}
+
+#[gpui::test]
+async fn focusing_the_picture_offers_the_clipboard_once_and_again_only_when_it_changed(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    let text = vec![crate::app::desktop::ClipboardKind::Text];
+
+    cx.write_to_clipboard(ClipboardItem::new_string("first".to_owned()));
+    focus_desktop_drawn(&view, cx, id);
+    assert_eq!(
+        offers(&log),
+        vec![text.clone()],
+        "taking the keyboard offers what this computer holds"
+    );
+
+    // Leaving and coming back with the same clipboard offers nothing new.
+    blur_drawn(cx);
+    focus_desktop_drawn(&view, cx, id);
+    assert_eq!(
+        offers(&log).len(),
+        1,
+        "the same content is not offered twice"
+    );
+
+    // A new copy elsewhere is offered the next time the picture is focused.
+    blur_drawn(cx);
+    cx.write_to_clipboard(ClipboardItem::new_string("second".to_owned()));
+    focus_desktop_drawn(&view, cx, id);
+    let last = log
+        .lock()
+        .expect("the log is not poisoned")
+        .clipboard
+        .last()
+        .cloned();
+    assert_eq!(
+        last,
+        Some(vec![crate::app::desktop::ClipboardEntry::text("second")])
+    );
+
+    // The window coming back to the front with the picture focused offers a copy
+    // made in another application meanwhile.
+    cx.deactivate_window();
+    cx.write_to_clipboard(ClipboardItem::new_string("from another app".to_owned()));
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+    let last = log
+        .lock()
+        .expect("the log is not poisoned")
+        .clipboard
+        .last()
+        .cloned();
+    assert_eq!(
+        last,
+        Some(vec![crate::app::desktop::ClipboardEntry::text(
+            "from another app"
+        )]),
+        "reactivating the window offers the new clipboard"
+    );
+    assert_eq!(offers(&log).len(), 3);
+}
+
+#[gpui::test]
+async fn a_picture_on_this_clipboard_is_offered_as_png_and_dib(cx: &mut TestAppContext) {
+    use crate::app::desktop::ClipboardKind;
+
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    let png = png_picture();
+    cx.write_to_clipboard(ClipboardItem::new_entries(vec![
+        gpui::ClipboardEntry::from("a caption".to_owned()),
+        gpui::ClipboardEntry::Image(gpui::Image::from_bytes(gpui::ImageFormat::Png, png.clone())),
+    ]));
+    focus_desktop_drawn(&view, cx, id);
+
+    let offered = log
+        .lock()
+        .expect("the log is not poisoned")
+        .clipboard
+        .last()
+        .cloned()
+        .expect("the clipboard was offered");
+    let kinds: Vec<ClipboardKind> = offered.iter().map(|entry| entry.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![ClipboardKind::Text, ClipboardKind::Png, ClipboardKind::Dib],
+        "text and picture both go, the picture in the two forms Windows programs paste"
+    );
+    assert_eq!(offered[1].bytes, png, "a PNG is passed on as it was");
+}
+
+#[gpui::test]
+async fn what_the_remote_side_copies_lands_on_this_clipboard_and_is_not_offered_back(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::desktop::ClipboardEntry;
+
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    focus_desktop_drawn(&view, cx, id);
+
+    // Text alone.
+    feed.feed(vec![LinkEvent::Clipboard {
+        entries: vec![ClipboardEntry::text("远端 text")],
+    }]);
+    pump_desktop(&view, cx, id);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("远端 text".to_owned())
+    );
+
+    // A picture alone, as a DIB: it is pasted here as PNG.
+    let picture = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 200, 30, 255]));
+    let dib = crate::app::desktop_clipboard::rgba_to_dib(&picture).expect("a DIB");
+    feed.feed(vec![LinkEvent::Clipboard {
+        entries: vec![ClipboardEntry::dib(dib.clone())],
+    }]);
+    pump_desktop(&view, cx, id);
+    let item = cx
+        .read_from_clipboard()
+        .expect("the picture is on the clipboard");
+    let image = item
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            gpui::ClipboardEntry::Image(image) => Some(image.clone()),
+            _ => None,
+        })
+        .expect("an image entry");
+    assert_eq!(image.format, gpui::ImageFormat::Png);
+    let decoded = image::load_from_memory_with_format(&image.bytes, image::ImageFormat::Png)
+        .expect("a PNG")
+        .to_rgba8();
+    assert_eq!(decoded, picture, "the remote picture, pixel for pixel");
+    assert_eq!(item.text(), None);
+
+    // Text and picture together become one item holding both.
+    feed.feed(vec![LinkEvent::Clipboard {
+        entries: vec![ClipboardEntry::text("caption"), ClipboardEntry::dib(dib)],
+    }]);
+    pump_desktop(&view, cx, id);
+    let item = cx
+        .read_from_clipboard()
+        .expect("something is on the clipboard");
+    assert_eq!(item.text(), Some("caption".to_owned()));
+    assert!(
+        item.entries()
+            .iter()
+            .any(|entry| matches!(entry, gpui::ClipboardEntry::Image(_))),
+        "the picture is beside the text"
+    );
+
+    // Coming back to the picture does not send the remote side its own copy.
+    blur_drawn(cx);
+    focus_desktop_drawn(&view, cx, id);
+    cx.simulate_keystrokes("ctrl-v");
+    assert!(
+        log.lock()
+            .expect("the log is not poisoned")
+            .clipboard
+            .is_empty(),
+        "what came from the remote side is never offered back to it"
+    );
+}
+
+#[gpui::test]
+async fn a_remote_copy_on_a_connection_with_the_clipboard_off_is_not_written_here(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let feed = link.feed();
+    let record = rdp_record_sharing("desk", false);
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    cx.write_to_clipboard(ClipboardItem::new_string("mine".to_owned()));
+    feed.feed(vec![LinkEvent::Clipboard {
+        entries: vec![crate::app::desktop::ClipboardEntry::text("theirs")],
+    }]);
+    pump_desktop(&view, cx, id);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("mine".to_owned()),
+        "sharing off means the remote copy stays remote"
+    );
+}
+
+#[gpui::test]
+async fn each_notice_is_shown_once_per_session_and_a_ready_clipboard_withdraws_the_refusal(
+    cx: &mut TestAppContext,
+) {
+    use crate::app::desktop::{ClipboardKind, DriveProblem, Notice};
+    use crate::app::view::DesktopNotice;
+
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, _log) = ScriptedLink::new(live_desktop_events());
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    assert!(desktop_notices(&view, cx, id).is_empty());
+
+    feed.feed(vec![
+        LinkEvent::Notice(Notice::DriveUnavailable(DriveProblem::Missing)),
+        LinkEvent::Notice(Notice::ClipboardRefused),
+        LinkEvent::Notice(Notice::ClipboardRefused),
+        LinkEvent::Notice(Notice::Unknown(99)),
+    ]);
+    pump_desktop(&view, cx, id);
+    redraw(cx);
+    assert_eq!(
+        desktop_notices(&view, cx, id),
+        vec![
+            DesktopNotice::DriveUnavailable,
+            DesktopNotice::ClipboardRefused
+        ],
+        "a repeated notice is said once, and one this build does not know is not said"
+    );
+    let strip = bounds_of(cx, "desktop.notice");
+    assert!(
+        strip.size.width > px(0.0) && strip.size.height > px(0.0),
+        "the notices are drawn over the picture"
+    );
+    assert!(
+        cx.debug_bounds("desktop.notice.drive_unavailable")
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds("desktop.notice.clipboard_refused")
+            .is_some()
+    );
+    let reason = ENGLISH
+        .desktop_notice_drive_unavailable
+        .replace("{reason}", ENGLISH.desktop_drive_missing);
+    assert!(
+        reason.contains("does not exist"),
+        "the folder notice names its reason: {reason}"
+    );
+
+    // The clipboard becoming ready takes the refusal back.
+    feed.feed(vec![LinkEvent::Notice(Notice::ClipboardReady)]);
+    pump_desktop(&view, cx, id);
+    assert_eq!(
+        desktop_notices(&view, cx, id),
+        vec![DesktopNotice::DriveUnavailable]
+    );
+
+    // Dismissed notices stay away, and a kind already shown is not shown again.
+    click(cx, "desktop.notice.dismiss");
+    assert!(desktop_notices(&view, cx, id).is_empty());
+    feed.feed(vec![
+        LinkEvent::Notice(Notice::DriveUnavailable(DriveProblem::NoAccess)),
+        LinkEvent::Notice(Notice::ClipboardTooLarge(ClipboardKind::Text)),
+        LinkEvent::Notice(Notice::ClipboardTooLarge(ClipboardKind::Png)),
+        LinkEvent::Notice(Notice::ClipboardTooLarge(ClipboardKind::Dib)),
+        LinkEvent::Notice(Notice::ClipboardLatin1Only),
+        // A refused drive is a notice of its own, beside an unavailable one, and
+        // either way the server refused it is the same notice.
+        LinkEvent::Notice(Notice::DriveRefused(
+            shellune_desktop::DriveRefusal::Declined(0xC000_0022),
+        )),
+        LinkEvent::Notice(Notice::DriveRefused(
+            shellune_desktop::DriveRefusal::NotOpened,
+        )),
+    ]);
+    pump_desktop(&view, cx, id);
+    redraw(cx);
+    assert_eq!(
+        desktop_notices(&view, cx, id),
+        vec![
+            DesktopNotice::TextTooLarge,
+            DesktopNotice::ImageTooLarge,
+            DesktopNotice::ClipboardLatin1,
+            DesktopNotice::DriveRefused,
+        ],
+        "text cut and image left out are two notices; each image form is the same one"
+    );
+    for selector in [
+        "desktop.notice.text_too_large",
+        "desktop.notice.image_too_large",
+        "desktop.notice.clipboard_latin1",
+        "desktop.notice.drive_refused",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} is drawn");
+    }
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .is_live()
+    }));
+}
+
+#[test]
+fn a_desktop_target_carries_the_clipboard_switch_and_the_folder_to_map() {
+    let mut config = shellune_core::RdpConfig::new("desk", "rdp.example.com", Some("desk"))
+        .expect("a valid RDP record");
+    let target = crate::app::desktop::DesktopTarget::of_record(
+        &shellune_core::ConnectionRecord::Rdp(config.clone()),
+    )
+    .expect("a target");
+    assert!(target.clipboard(), "the clipboard is shared by default");
+    assert_eq!(target.drive_folder(), None, "nothing is mapped by default");
+
+    config.set_clipboard(false);
+    config
+        .set_drive_folder(Some(r"D:\Exchange"))
+        .expect("a folder path");
+    let target = crate::app::desktop::DesktopTarget::of_record(
+        &shellune_core::ConnectionRecord::Rdp(config),
+    )
+    .expect("a target");
+    assert!(!target.clipboard());
+    assert_eq!(target.drive_folder(), Some(r"D:\Exchange"));
+
+    let target = crate::app::desktop::DesktopTarget::of_record(&vnc_record_sharing("vnc", false))
+        .expect("a target");
+    assert!(!target.clipboard());
+    assert_eq!(target.drive_folder(), None, "VNC has no drive to map");
+}
+
+#[gpui::test]
+async fn the_rdp_form_saves_the_clipboard_switch_and_the_folder_and_vnc_has_only_the_switch(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("desktop-sharing-form");
+    let (view, cx) = hosts_view(cx, dir.store());
+    cx.simulate_resize(size(px(1400.0), px(1300.0)));
+    cx.run_until_parked();
+
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.rdp");
+    assert!(cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .protocol_draft()
+            .is_some_and(|draft| draft.clipboard())
+    }));
+    type_into(cx, "connection.field.address", "10.0.0.9");
+    click(cx, "connection.field.clipboard");
+    type_into(cx, "connection.field.drive_folder", r"C:\Exchange");
+    assert!(
+        cx.debug_bounds("connection.drive_folder.note").is_some(),
+        "the folder says what the remote side sees"
+    );
+    click(cx, "connection.save");
+
+    let saved = cx.update(|_window, app| view.read(app).book().connections().to_vec());
+    let rdp = saved
+        .iter()
+        .find_map(|record| match record {
+            shellune_core::ConnectionRecord::Rdp(config) => Some(config.clone()),
+            _ => None,
+        })
+        .expect("the RDP connection was saved");
+    assert!(!rdp.clipboard(), "the switch was turned off and saved off");
+    assert_eq!(rdp.drive_folder(), Some(r"C:\Exchange"));
+
+    // Opening it again shows both choices as they were saved.
+    let id = rdp.id();
+    cx.update(|_window, cx| {
+        view.update(cx, |view, cx| view.edit_connection_for_test(id, cx));
+    });
+    cx.run_until_parked();
+    let draft = cx.update(|_window, app| view.read(app).hosts_state().protocol_draft().cloned());
+    let draft = draft.expect("the form is open");
+    assert!(!draft.clipboard());
+    assert_eq!(
+        draft.text(crate::app::hosts::ConnectionFormField::DriveFolder),
+        r"C:\Exchange"
+    );
+    click(cx, "connection.cancel");
+
+    // A VNC form has the switch and no folder.
+    click(cx, "hosts.new");
+    click(cx, "connection.protocol.vnc");
+    redraw(cx);
+    let fields = cx.update(|_window, app| {
+        view.read(app)
+            .hosts_state()
+            .protocol_draft()
+            .map(|draft| draft.fields().to_vec())
+    });
+    let fields = fields.expect("the VNC form is open");
+    assert!(fields.contains(&crate::app::hosts::ConnectionFormField::Clipboard));
+    assert!(!fields.contains(&crate::app::hosts::ConnectionFormField::DriveFolder));
+    type_into(cx, "connection.field.address", "10.0.0.41");
+    click(cx, "connection.field.clipboard");
+    click(cx, "connection.save");
+    let vnc = cx.update(|_window, app| {
+        view.read(app)
+            .book()
+            .connections()
+            .iter()
+            .find_map(|record| match record {
+                shellune_core::ConnectionRecord::Vnc(config) => Some(config.clone()),
+                _ => None,
+            })
+    });
+    assert!(
+        !vnc.expect("the VNC connection was saved").clipboard(),
+        "a VNC connection keeps its switch too"
+    );
 }
 
 #[gpui::test]

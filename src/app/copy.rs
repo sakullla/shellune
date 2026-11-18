@@ -380,6 +380,14 @@ pub struct Strings {
     pub connection_field_flow: &'static str,
     /// Field label: whether typed characters are echoed locally.
     pub connection_field_local_echo: &'static str,
+    /// Field label: whether a desktop connection shares the clipboard.
+    pub connection_field_clipboard: &'static str,
+    /// Field label: the local folder a RDP connection maps as a remote drive.
+    pub connection_field_drive_folder: &'static str,
+    /// Placeholder of the mapped folder: an empty field maps nothing.
+    pub connection_drive_folder_placeholder: &'static str,
+    /// Note under the mapped folder: what the remote side sees and cannot reach.
+    pub connection_drive_folder_note: &'static str,
     /// Note under the serial fields: nothing opens until the user starts a session.
     pub connection_not_started_note: &'static str,
     /// Suffix given to a copied connection's name.
@@ -432,6 +440,34 @@ pub struct Strings {
     pub desktop_zoom_in: &'static str,
     /// Zoom control: one step smaller.
     pub desktop_zoom_out: &'static str,
+    /// Notice: the server refused the clipboard.
+    pub desktop_notice_clipboard_refused: &'static str,
+    /// Notice: the VNC server's clipboard only carries Latin-1 text.
+    pub desktop_notice_clipboard_latin1: &'static str,
+    /// Notice: clipboard text over the bound was cut.
+    pub desktop_notice_text_too_large: &'static str,
+    /// Notice: a clipboard image over the bound was left out.
+    pub desktop_notice_image_too_large: &'static str,
+    /// Notice: the mapped folder was not offered; `{reason}` is one of the drive reasons.
+    pub desktop_notice_drive_unavailable: &'static str,
+    /// Notice: the server did not take the mapped folder.
+    pub desktop_notice_drive_refused: &'static str,
+    /// Drive reason: the folder does not exist.
+    pub desktop_drive_missing: &'static str,
+    /// Drive reason: the path names a file.
+    pub desktop_drive_not_a_folder: &'static str,
+    /// Drive reason: the path is not a full path.
+    pub desktop_drive_not_absolute: &'static str,
+    /// Drive reason: the path is longer than the drive can address.
+    pub desktop_drive_too_long: &'static str,
+    /// Drive reason: the folder cannot be read.
+    pub desktop_drive_no_access: &'static str,
+    /// Drive reason: the drive could not be set up.
+    pub desktop_drive_not_added: &'static str,
+    /// Drive reason: a reason this build does not know.
+    pub desktop_drive_other: &'static str,
+    /// Button that puts the desktop notices away.
+    pub desktop_notice_dismiss: &'static str,
     /// Label of the switch that echoes typed characters locally in a serial pane.
     pub serial_echo: &'static str,
     /// The local echo is on.
@@ -1309,6 +1345,10 @@ pub static ENGLISH: Strings = Strings {
     connection_field_stop_bits: "Stop bits",
     connection_field_flow: "Flow control",
     connection_field_local_echo: "Local echo",
+    connection_field_clipboard: "Share the clipboard",
+    connection_field_drive_folder: "Map a local folder",
+    connection_drive_folder_placeholder: "Leave empty to map no folder",
+    connection_drive_folder_note: "The remote desktop sees this folder as the drive Shellune and cannot reach anything outside it.",
     connection_not_started_note: "Saving a connection opens nothing: it dials, or opens the device, only when you start a session.",
     connection_copy_suffix: " (copy)",
     connection_delete: "Delete connection",
@@ -1335,6 +1375,20 @@ pub static ENGLISH: Strings = Strings {
     desktop_zoom_fit: "Fit",
     desktop_zoom_in: "Larger",
     desktop_zoom_out: "Smaller",
+    desktop_notice_clipboard_refused: "This server does not allow the clipboard, so copy and paste stay on each side.",
+    desktop_notice_clipboard_latin1: "This server's clipboard only takes Western characters; text with other characters was not sent.",
+    desktop_notice_text_too_large: "Clipboard text over 1 MiB was cut to fit.",
+    desktop_notice_image_too_large: "A clipboard image over 32 MiB was not passed on.",
+    desktop_notice_drive_unavailable: "The local folder was not mapped ({reason}); the session goes on without it.",
+    desktop_notice_drive_refused: "The server did not accept the mapped folder; the session goes on without it.",
+    desktop_drive_missing: "it does not exist",
+    desktop_drive_not_a_folder: "the path is a file",
+    desktop_drive_not_absolute: "it is not a full path",
+    desktop_drive_too_long: "the path is too long",
+    desktop_drive_no_access: "it cannot be read",
+    desktop_drive_not_added: "the drive could not be set up",
+    desktop_drive_other: "the reason is unknown",
+    desktop_notice_dismiss: "Dismiss",
     serial_echo: "Echo",
     serial_echo_on: "on",
     serial_echo_off: "off",
@@ -1845,6 +1899,10 @@ pub static CHINESE: Strings = Strings {
     connection_field_stop_bits: "停止位",
     connection_field_flow: "流控",
     connection_field_local_echo: "本地回显",
+    connection_field_clipboard: "共享剪贴板",
+    connection_field_drive_folder: "映射本机文件夹",
+    connection_drive_folder_placeholder: "留空则不映射",
+    connection_drive_folder_note: "远端把这个文件夹看作名为 Shellune 的磁盘，无法访问它以外的文件。",
     connection_not_started_note: "保存连接不会打开任何东西：只有你启动会话时才会拨号或打开设备。",
     connection_copy_suffix: "（副本）",
     connection_delete: "删除连接",
@@ -1871,6 +1929,20 @@ pub static CHINESE: Strings = Strings {
     desktop_zoom_fit: "适应窗口",
     desktop_zoom_in: "放大",
     desktop_zoom_out: "缩小",
+    desktop_notice_clipboard_refused: "该服务器不允许剪贴板，复制粘贴不会在本机与远端之间同步。",
+    desktop_notice_clipboard_latin1: "该服务器的剪贴板只支持西文字符，含其他字符的文本没有发送。",
+    desktop_notice_text_too_large: "剪贴板文本超过 1 MiB，已截断。",
+    desktop_notice_image_too_large: "剪贴板图片超过 32 MiB，没有传输。",
+    desktop_notice_drive_unavailable: "本机文件夹没有映射（{reason}），会话照常进行。",
+    desktop_notice_drive_refused: "服务器没有接受映射的文件夹，会话照常进行。",
+    desktop_drive_missing: "文件夹不存在",
+    desktop_drive_not_a_folder: "该路径是文件",
+    desktop_drive_not_absolute: "不是完整路径",
+    desktop_drive_too_long: "路径过长",
+    desktop_drive_no_access: "没有读取权限",
+    desktop_drive_not_added: "无法建立磁盘",
+    desktop_drive_other: "原因未知",
+    desktop_notice_dismiss: "知道了",
     serial_echo: "本地回显",
     serial_echo_on: "开",
     serial_echo_off: "关",

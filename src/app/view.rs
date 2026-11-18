@@ -107,7 +107,7 @@ mod update;
 // The steps a desktop pane reports, for the tests that check the tab, the session
 // bar and the pane all say the same thing (R19).
 #[cfg(test)]
-pub use desktop::{DesktopPhase, DesktopStage};
+pub use desktop::{DesktopNotice, DesktopPhase, DesktopStage};
 #[cfg(test)]
 pub use shell::Tool;
 #[cfg(test)]
@@ -1115,6 +1115,7 @@ struct ProtocolFields {
     port: Entity<TextField>,
     user: Entity<TextField>,
     domain: Entity<TextField>,
+    drive_folder: Entity<TextField>,
     device: Entity<TextField>,
     baud: Entity<TextField>,
     data_bits: Entity<TextField>,
@@ -1130,11 +1131,13 @@ impl ProtocolFields {
             ConnectionFormField::Port => Some(&self.port),
             ConnectionFormField::User => Some(&self.user),
             ConnectionFormField::Domain => Some(&self.domain),
+            ConnectionFormField::DriveFolder => Some(&self.drive_folder),
             ConnectionFormField::Device => Some(&self.device),
             ConnectionFormField::Baud => Some(&self.baud),
             ConnectionFormField::DataBits => Some(&self.data_bits),
             ConnectionFormField::Certificate
             | ConnectionFormField::Security
+            | ConnectionFormField::Clipboard
             | ConnectionFormField::Parity
             | ConnectionFormField::StopBits
             | ConnectionFormField::Flow
@@ -3983,6 +3986,13 @@ impl ShelluneView {
         if window.is_fullscreen() {
             window.toggle_fullscreen();
         }
+    }
+
+    /// Opens the form of a saved connection the way its row's edit button does, for a
+    /// test or a capture. Nothing is saved.
+    #[cfg(any(test, feature = "ui-capture"))]
+    pub fn edit_connection_for_test(&mut self, id: HostId, cx: &mut Context<Self>) {
+        self.edit_saved_connection(id, cx);
     }
 
     /// Starts a saved record through the real start path, for the test that proves
@@ -7146,6 +7156,17 @@ impl ShelluneView {
                 cx,
             )
         });
+        // A folder is chosen rather than typed out: the field browses for one, and a
+        // blank field maps nothing (R5, R6).
+        let drive_folder = cx.new(|cx| {
+            let mut field = TextField::with_text(
+                strings.connection_drive_folder_placeholder,
+                text(ConnectionFormField::DriveFolder),
+                cx,
+            );
+            field.set_browse(Browse::Directory, cx);
+            field
+        });
         let device = cx.new(|cx| {
             TextField::with_text(
                 strings.connection_field_device,
@@ -7174,6 +7195,7 @@ impl ShelluneView {
             port,
             user,
             domain,
+            drive_folder,
             device,
             baud,
             data_bits,

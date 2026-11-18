@@ -12,19 +12,21 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    Bounds, ClipboardItem, Context, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, RenderImage, ScrollDelta,
-    ScrollWheelEvent, SharedString, Window, div, img, px,
+    Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, RenderImage,
+    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Window, div, img, px,
 };
 use shellune_core::SessionFailure;
 
 use crate::app::components::{self, Variant};
-use crate::app::copy::Locale;
+use crate::app::copy::{Locale, Strings};
 use crate::app::desktop::{
-    Availability, Buttons, DESKTOP_POLL_INTERVAL, DesktopLink, DesktopSurface, DesktopTarget,
-    DesktopZoom, InputQueue, LinkEvent, LinkFailure, LinkState, NativeLink, availability,
-    clamp_pan, content_rect, encryption_note, key_codes, to_remote_in,
+    ALT_LEFT, Availability, Buttons, CONTROL_LEFT, ClipboardEntry, ClipboardKind,
+    DESKTOP_POLL_INTERVAL, DesktopLink, DesktopSurface, DesktopTarget, DesktopZoom, DriveProblem,
+    InputQueue, KeyCodes, LinkEvent, LinkFailure, LinkState, NativeLink, Notice, SHIFT_LEFT,
+    availability, clamp_pan, content_rect, encryption_note, key_codes, to_remote_in,
 };
+use crate::app::desktop_clipboard;
 use crate::app::icons::{self, Icon};
 use crate::app::theme::{self, Elevated, Metrics, Tone, palette, spacing};
 
@@ -127,6 +129,99 @@ impl DesktopStage {
     }
 }
 
+/// Something the pane tells the user about a session beside its state (R1-R5).
+///
+/// Each is shown once per session: a server that refuses the clipboard refuses it on
+/// every paste, and saying so every time would bury the picture under one sentence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopNotice {
+    /// The server does not allow the clipboard.
+    ClipboardRefused,
+    /// The VNC server's clipboard takes only Latin-1 text.
+    ClipboardLatin1,
+    /// Clipboard text over the bound was cut.
+    TextTooLarge,
+    /// A clipboard image over the bound was left out.
+    ImageTooLarge,
+    /// The mapped folder could not be offered.
+    DriveUnavailable,
+    /// The server did not take the mapped folder.
+    DriveRefused,
+}
+
+impl DesktopNotice {
+    /// The notice a backend report is, or `None` for one the pane does not show.
+    fn of(notice: Notice) -> Option<Self> {
+        Some(match notice {
+            Notice::ClipboardRefused => Self::ClipboardRefused,
+            Notice::ClipboardLatin1Only => Self::ClipboardLatin1,
+            Notice::ClipboardTooLarge(ClipboardKind::Text) => Self::TextTooLarge,
+            Notice::ClipboardTooLarge(ClipboardKind::Png | ClipboardKind::Dib) => {
+                Self::ImageTooLarge
+            }
+            Notice::DriveUnavailable(_) => Self::DriveUnavailable,
+            Notice::DriveRefused(_) => Self::DriveRefused,
+            Notice::ClipboardReady | Notice::Unknown(_) => return None,
+        })
+    }
+
+    /// The selector of the line that says it, for the tests.
+    #[must_use]
+    pub fn selector(self) -> &'static str {
+        match self {
+            Self::ClipboardRefused => "desktop.notice.clipboard_refused",
+            Self::ClipboardLatin1 => "desktop.notice.clipboard_latin1",
+            Self::TextTooLarge => "desktop.notice.text_too_large",
+            Self::ImageTooLarge => "desktop.notice.image_too_large",
+            Self::DriveUnavailable => "desktop.notice.drive_unavailable",
+            Self::DriveRefused => "desktop.notice.drive_refused",
+        }
+    }
+}
+
+/// The sentence a notice is shown with.
+fn notice_text(notice: Notice, strings: &Strings) -> String {
+    match notice {
+        Notice::ClipboardRefused => strings.desktop_notice_clipboard_refused.to_owned(),
+        Notice::ClipboardLatin1Only => strings.desktop_notice_clipboard_latin1.to_owned(),
+        Notice::ClipboardTooLarge(ClipboardKind::Text) => {
+            strings.desktop_notice_text_too_large.to_owned()
+        }
+        Notice::ClipboardTooLarge(_) => strings.desktop_notice_image_too_large.to_owned(),
+        Notice::DriveUnavailable(problem) => {
+            let reason = match problem {
+                DriveProblem::Missing => strings.desktop_drive_missing,
+                DriveProblem::NotAFolder => strings.desktop_drive_not_a_folder,
+                DriveProblem::NotAbsolute => strings.desktop_drive_not_absolute,
+                DriveProblem::TooLong => strings.desktop_drive_too_long,
+                DriveProblem::NoAccess => strings.desktop_drive_no_access,
+                DriveProblem::NotAdded => strings.desktop_drive_not_added,
+                DriveProblem::Other(_) => strings.desktop_drive_other,
+            };
+            strings
+                .desktop_notice_drive_unavailable
+                .replace("{reason}", reason)
+        }
+        Notice::DriveRefused(_) => strings.desktop_notice_drive_refused.to_owned(),
+        Notice::ClipboardReady | Notice::Unknown(_) => String::new(),
+    }
+}
+
+/// The modifiers the remote side holds for a key pressed with these held here.
+///
+/// On macOS Command is where Control is elsewhere: Cmd+V and Cmd+C mean to a
+/// Windows or Linux desktop what Ctrl+V and Ctrl+C mean, so they reach it as those.
+/// The Windows key is not forwarded: a press the remote side reads alone opens its
+/// start menu.
+fn remote_modifiers(modifiers: &Modifiers) -> [(KeyCodes, bool); 3] {
+    let control = modifiers.control || (cfg!(target_os = "macos") && modifiers.platform);
+    [
+        (CONTROL_LEFT, control),
+        (ALT_LEFT, modifiers.alt),
+        (SHIFT_LEFT, modifiers.shift),
+    ]
+}
+
 /// One remote desktop on screen.
 pub struct DesktopPane {
     target: DesktopTarget,
@@ -168,6 +263,15 @@ pub struct DesktopPane {
     image: Option<Arc<RenderImage>>,
     image_size: (u32, u32),
     locale: Locale,
+    /// The parts of the clipboard content last offered to the remote side or written
+    /// here from it, so the same content is not offered again (R1-R3).
+    shared: Vec<u64>,
+    /// The notices on screen, with their sentences, in the order they arrived.
+    notices: Vec<(DesktopNotice, String)>,
+    /// Every notice this session has shown, so each is shown once.
+    noticed: Vec<DesktopNotice>,
+    /// The focus and activation observers, alive as long as the pane.
+    subscriptions: Vec<Subscription>,
 }
 
 impl DesktopPane {
@@ -198,6 +302,10 @@ impl DesktopPane {
             image: None,
             image_size: (0, 0),
             locale,
+            shared: Vec::new(),
+            notices: Vec::new(),
+            noticed: Vec::new(),
+            subscriptions: Vec::new(),
         }
     }
 
@@ -485,6 +593,10 @@ impl DesktopPane {
         self.failed_stage = None;
         self.surface.reset();
         self.image = None;
+        // A new session has said nothing yet and has not seen this clipboard.
+        self.shared.clear();
+        self.notices.clear();
+        self.noticed.clear();
         self.start_polling(cx);
         cx.notify();
     }
@@ -658,12 +770,101 @@ impl DesktopPane {
                 cx.notify();
                 true
             }
-            LinkEvent::Clipboard { text } => {
-                // The peer's clipboard becomes this computer's, which is the only
-                // direction a user expects to be automatic.
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            LinkEvent::Clipboard { entries } => {
+                self.receive_clipboard(&entries, cx);
                 true
             }
+            LinkEvent::Notice(notice) => {
+                self.note(notice);
+                cx.notify();
+                true
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ clipboard
+
+    /// Writes what the remote side copied to this computer's clipboard (R1-R3).
+    ///
+    /// The peer's clipboard becomes this computer's, which is the direction a user
+    /// expects to be automatic. Text and image arrive together as one item. What was
+    /// written is remembered as shared, so focusing the pane afterwards does not offer
+    /// the same content straight back.
+    fn receive_clipboard(&mut self, entries: &[ClipboardEntry], cx: &mut Context<Self>) {
+        if !self.target.clipboard() {
+            return;
+        }
+        let Some(item) = desktop_clipboard::local_item(entries) else {
+            return;
+        };
+        self.shared = desktop_clipboard::prints(&item);
+        cx.write_to_clipboard(item);
+    }
+
+    /// Offers this computer's clipboard to the remote side, unless it is what was
+    /// last offered or last received (R1-R4). Returns whether an offer was queued.
+    ///
+    /// Called when the pane takes the keyboard, when the window becomes active again
+    /// with the pane focused, and on the paste shortcut, so a remote program pastes
+    /// what this computer holds whether it pastes by key or from its own menu.
+    /// Nothing is read from the clipboard while sharing is off or no session runs.
+    fn share_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.target.clipboard() || self.link.is_none() || !self.phase.accepts_input() {
+            return false;
+        }
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let prints = desktop_clipboard::prints(&item);
+        if prints.is_empty() || desktop_clipboard::already_shared(&prints, &self.shared) {
+            return false;
+        }
+        let offer = desktop_clipboard::local_offer(&item);
+        self.shared = prints;
+        if offer.image_too_large {
+            self.note(Notice::ClipboardTooLarge(ClipboardKind::Png));
+        }
+        if offer.entries.is_empty() {
+            return false;
+        }
+        self.input.push_clipboard(offer.entries);
+        true
+    }
+
+    /// Shows a notice the first time this session reports it.
+    ///
+    /// The clipboard becoming ready withdraws the refusal said before it: the server
+    /// was still signing in, and the sentence no longer holds.
+    fn note(&mut self, notice: Notice) {
+        if notice == Notice::ClipboardReady {
+            self.notices
+                .retain(|(kind, _)| *kind != DesktopNotice::ClipboardRefused);
+            return;
+        }
+        let Some(kind) = DesktopNotice::of(notice) else {
+            return;
+        };
+        if self.noticed.contains(&kind) {
+            return;
+        }
+        self.noticed.push(kind);
+        let text = notice_text(notice, self.locale.strings());
+        self.notices.push((kind, text));
+    }
+
+    /// The notices on screen, for a test or a capture.
+    #[cfg(any(test, feature = "ui-capture"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub fn notices(&self) -> Vec<DesktopNotice> {
+        self.notices.iter().map(|(kind, _)| *kind).collect()
+    }
+
+    /// Puts the notices away. Each still counts as shown for this session.
+    pub fn dismiss_notices(&mut self, cx: &mut Context<Self>) {
+        if !self.notices.is_empty() {
+            self.notices.clear();
+            cx.notify();
         }
     }
 
@@ -956,26 +1157,45 @@ impl DesktopPane {
             && (keystroke.modifiers.control || keystroke.modifiers.platform)
             && !keystroke.modifiers.alt;
         if paste {
-            // Paste is this computer's clipboard going to the remote one. A backend
-            // that cannot carry text says so instead of dropping it silently.
-            if let Some(item) = cx.read_from_clipboard()
-                && let Some(text) = item.text()
-            {
-                self.input.push_clipboard(text);
-                self.flush_input();
-            }
-            cx.stop_propagation();
-            cx.notify();
-            return;
+            // Paste is this computer's clipboard going to the remote one first, and
+            // then the shortcut itself, so the remote program really pastes (R4).
+            // The offer is queued ahead of the keys and leaves in that order. With
+            // sharing off, or nothing new to offer, the shortcut goes alone and the
+            // remote program pastes what its own clipboard holds. A backend that
+            // cannot carry the offer says so instead of dropping it silently.
+            self.share_clipboard(cx);
         }
         let Some(codes) = key_codes(&keystroke.key) else {
             // A key this build does not translate is not sent as something else.
             return;
         };
+        // The modifiers the user holds are held on the remote side around the key,
+        // so a shortcut arrives as the shortcut and not as its bare letter.
+        for (modifier, down) in remote_modifiers(&keystroke.modifiers) {
+            self.input.set_modifier(modifier, down);
+        }
         self.input.push_key(codes, true);
         self.flush_input();
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// Lets go on the remote side of a modifier the user let go of here.
+    ///
+    /// Only releases: a modifier pressed alone is not sent, because a press the
+    /// remote side reads alone - Alt opens a menu bar - is not what pressing it for
+    /// a shortcut of this window meant. It goes down with the next key instead.
+    fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
+        let mut released = false;
+        for (modifier, down) in remote_modifiers(&event.modifiers) {
+            if !down {
+                released |= self.input.set_modifier(modifier, false);
+            }
+        }
+        if released {
+            self.flush_input();
+            cx.notify();
+        }
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
@@ -1040,16 +1260,22 @@ impl DesktopPane {
             metrics,
         )
         .debug_selector(|| "desktop.status".to_owned());
-        if let Some(problem) = &self.send_problem {
-            card = card.child(
+        let warnings = self
+            .send_problem
+            .iter()
+            .chain(self.notices.iter().map(|(_, text)| text));
+        // A centred, capped, wrapping line in the card's column goes through
+        // `capped_text`, so its box is as tall as the lines painted in it (R1).
+        for problem in warnings {
+            card = card.child(components::capped_text(
+                metrics.scale(480.0),
                 div()
-                    .max_w(metrics.scale(480.0))
                     .whitespace_normal()
                     .text_center()
                     .text_size(metrics.label_size())
                     .text_color(Tone::Warning.text())
                     .child(SharedString::from(problem.clone())),
-            );
+            ));
         }
         div()
             .w_full()
@@ -1066,8 +1292,45 @@ impl DesktopPane {
     /// nobody can see is the same as swallowing the text. Nothing here is cleared
     /// by the next frame - only by a later send that really carried something -
     /// so a lost paste stays on screen long enough to be read.
-    fn notice_strip(&self, metrics: Metrics) -> Option<gpui::Div> {
-        let problem = self.send_problem.as_ref()?;
+    ///
+    /// The session's notices (R1-R5) share the strip: a refused clipboard or a folder
+    /// that was not mapped is said here once, under the send warning when there is
+    /// one, and stays until it is dismissed.
+    fn notice_strip(&self, metrics: Metrics, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if self.send_problem.is_none() && self.notices.is_empty() {
+            return None;
+        }
+        let line = |text: &str| {
+            div()
+                .whitespace_normal()
+                .text_size(metrics.caption_size())
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .child(SharedString::from(text.to_owned()))
+        };
+        let mut lines = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap(metrics.scale(spacing::HAIRLINE));
+        if let Some(problem) = &self.send_problem {
+            lines = lines.child(line(problem));
+        }
+        for (kind, text) in &self.notices {
+            let selector = kind.selector();
+            lines = lines.child(line(text).debug_selector(move || selector.to_owned()));
+        }
+        let dismiss = (!self.notices.is_empty()).then(|| {
+            components::compact_button(
+                self.locale.strings().desktop_notice_dismiss,
+                Variant::Ghost,
+                metrics,
+            )
+            .flex_none()
+            .id(SharedString::from("desktop.notice.dismiss"))
+            .debug_selector(|| "desktop.notice.dismiss".to_owned())
+            .on_click(cx.listener(|this, _event, _window, cx| this.dismiss_notices(cx)))
+        });
         // The warning banner, lifted onto the picture: it floats over a remote
         // screen whose colours are not ours, so it carries the floating layer's
         // shadow to stay apart from it (R6).
@@ -1085,20 +1348,19 @@ impl DesktopPane {
                 .elevation(theme::Elevation::Mid)
                 .occlude()
                 .debug_selector(|| "desktop.notice".to_owned())
+                // A press on the strip belongs to it: the picture underneath is not
+                // clicked at the same time.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
+                )
                 .child(icons::icon(
                     Icon::Monitor,
                     metrics.small_icon_size(),
                     Tone::Warning.text(),
                 ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .whitespace_normal()
-                        .text_size(metrics.caption_size())
-                        .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                        .child(SharedString::from(problem.clone())),
-                ),
+                .child(lines)
+                .children(dismiss),
         )
     }
 
@@ -1294,6 +1556,27 @@ impl Render for DesktopPane {
                     });
                 })
                 .detach();
+            // Taking the keyboard, and the window becoming active again with the
+            // picture focused, are the moments the user may be about to paste in a
+            // remote program - by key or from its own menu - so this computer's
+            // clipboard is offered then (R1-R4).
+            let focused = cx.on_focus_in(&self.focus, window, |pane, _window, cx| {
+                if pane.share_clipboard(cx) {
+                    pane.flush_input();
+                    cx.notify();
+                }
+            });
+            let activated = cx.observe_window_activation(window, |pane, window, cx| {
+                if window.is_window_active()
+                    && pane.focus.is_focused(window)
+                    && pane.share_clipboard(cx)
+                {
+                    pane.flush_input();
+                    cx.notify();
+                }
+            });
+            self.subscriptions.push(focused);
+            self.subscriptions.push(activated);
         }
         // A hidden or minimised window sends no input anywhere, so the moment it
         // stops being the active one everything it may have held is let go (R17).
@@ -1376,7 +1659,12 @@ impl Render for DesktopPane {
             }))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
                 this.on_key_up(event, cx);
-            }));
+            }))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &ModifiersChangedEvent, _window, cx| {
+                    this.on_modifiers_changed(event, cx);
+                },
+            ));
 
         match picture {
             Some(picture) => {
@@ -1447,7 +1735,7 @@ impl Render for DesktopPane {
         if !matches!(self.phase, DesktopPhase::NotStarted) {
             body = body.child(self.controls(metrics, cx));
         }
-        if has_picture && let Some(notice) = self.notice_strip(metrics) {
+        if has_picture && let Some(notice) = self.notice_strip(metrics, cx) {
             body = body.child(notice);
         }
         if self.certificate.is_some() {

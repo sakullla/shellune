@@ -27,6 +27,7 @@ use gpui::{Bounds, ObjectFit, Pixels, px, size};
 use shellune_core::{
     ConnectionRecord, ProtocolKind, RdpCertificatePolicy, SessionFailure, VncSecurity,
 };
+pub use shellune_desktop::{ClipboardEntry, ClipboardKind, DriveProblem, Notice};
 
 /// How often a live surface looks for frames and state changes.
 ///
@@ -115,6 +116,10 @@ pub struct DesktopTarget {
     domain: Option<String>,
     certificate: RdpCertificatePolicy,
     security: VncSecurity,
+    /// Whether the clipboard is shared with the remote side (R6).
+    clipboard: bool,
+    /// The local folder offered to a RDP server as a drive, when one is chosen.
+    drive_folder: Option<String>,
 }
 
 impl DesktopTarget {
@@ -132,6 +137,8 @@ impl DesktopTarget {
                 domain: config.domain().map(str::to_owned),
                 certificate: config.certificate(),
                 security: VncSecurity::Automatic,
+                clipboard: config.clipboard(),
+                drive_folder: config.drive_folder().map(str::to_owned),
             }),
             ConnectionRecord::Vnc(config) => Some(Self {
                 protocol: ProtocolKind::Vnc,
@@ -142,6 +149,9 @@ impl DesktopTarget {
                 domain: None,
                 certificate: RdpCertificatePolicy::Ask,
                 security: config.security(),
+                clipboard: config.clipboard(),
+                // A VNC server has no drive channel to offer a folder on.
+                drive_folder: None,
             }),
             ConnectionRecord::Ssh(_) | ConnectionRecord::Serial(_) => None,
         }
@@ -200,6 +210,18 @@ impl DesktopTarget {
     #[must_use]
     pub fn security(&self) -> VncSecurity {
         self.security
+    }
+
+    /// Whether this connection shares the clipboard with the remote side (R6).
+    #[must_use]
+    pub fn clipboard(&self) -> bool {
+        self.clipboard
+    }
+
+    /// The local folder an RDP connection maps as a remote drive, if any (R5).
+    #[must_use]
+    pub fn drive_folder(&self) -> Option<&str> {
+        self.drive_folder.as_deref()
     }
 
     /// Whether this connection asks for an encrypted transport.
@@ -284,11 +306,15 @@ pub enum LinkEvent {
         /// The shim's own flag word.
         flags: u32,
     },
-    /// The peer put text on its clipboard.
+    /// The peer copied something: every format of that one copy the backend could
+    /// fetch, each kind at most once (R1-R3).
     Clipboard {
-        /// The text, already decoded.
-        text: String,
+        /// The formats, text already decoded to UTF-8.
+        entries: Vec<ClipboardEntry>,
     },
+    /// Something the user should know that does not change the session's state: a
+    /// clipboard the server refused, text that was cut, a folder that was not mapped.
+    Notice(Notice),
 }
 
 /// Where a desktop session is.
@@ -598,8 +624,8 @@ pub enum DesktopInput {
         /// The buttons held after this event.
         buttons: Buttons,
     },
-    /// Text for the remote clipboard.
-    Clipboard(String),
+    /// What this computer's clipboard holds, offered to the remote clipboard.
+    Clipboard(Vec<ClipboardEntry>),
 }
 
 /// The remote desktop's input queue.
@@ -693,6 +719,33 @@ impl InputQueue {
         }
     }
 
+    /// Holds or lets go of one modifier, so the remote side holds what the user
+    /// holds here. Returns whether anything was queued: a modifier already in the
+    /// wanted state adds nothing.
+    ///
+    /// A shortcut is a modifier held around a key, and the window reports the
+    /// modifiers with the key rather than as keys of their own; this is how Ctrl+V
+    /// reaches the remote side as Ctrl+V instead of a bare V (R4).
+    pub fn set_modifier(&mut self, codes: KeyCodes, down: bool) -> bool {
+        let held = self
+            .keys
+            .iter()
+            .any(|key| key.scancode == codes.scancode && key.extended == codes.extended);
+        if held == down {
+            return false;
+        }
+        if down {
+            self.push_key(codes, true);
+        } else {
+            self.motion_tail = false;
+            self.queued
+                .push_back(DesktopInput::Key { codes, down: false });
+            self.keys
+                .retain(|key| !(key.scancode == codes.scancode && key.extended == codes.extended));
+        }
+        true
+    }
+
     fn shift_held(&self) -> bool {
         self.keys
             .iter()
@@ -735,10 +788,13 @@ impl InputQueue {
         });
     }
 
-    /// Queues text for the remote clipboard.
-    pub fn push_clipboard(&mut self, text: impl Into<String>) {
+    /// Queues what this computer's clipboard holds for the remote clipboard.
+    ///
+    /// It keeps its place among the keys: a paste shortcut queued after it reaches
+    /// the remote side after the content it pastes.
+    pub fn push_clipboard(&mut self, entries: Vec<ClipboardEntry>) {
         self.motion_tail = false;
-        self.queued.push_back(DesktopInput::Clipboard(text.into()));
+        self.queued.push_back(DesktopInput::Clipboard(entries));
     }
 
     /// Appends the releases for everything the queue still believes is held.
@@ -784,7 +840,7 @@ impl InputQueue {
             let result = match &input {
                 DesktopInput::Key { codes, down } => link.key(*codes, *down),
                 DesktopInput::Pointer { x, y, buttons } => link.pointer(*x, *y, *buttons),
-                DesktopInput::Clipboard(text) => link.clipboard(text),
+                DesktopInput::Clipboard(entries) => link.clipboard(entries),
             };
             match result {
                 Ok(()) => sent += 1,
@@ -811,6 +867,22 @@ impl InputQueue {
 pub const SHIFT_LEFT: KeyCodes = KeyCodes {
     scancode: 0x2a,
     keysym: 0xffe1,
+    extended: false,
+    shift: false,
+};
+
+/// The left Control key, which a shortcut such as Ctrl+V needs held around it.
+pub const CONTROL_LEFT: KeyCodes = KeyCodes {
+    scancode: 0x1d,
+    keysym: 0xffe3,
+    extended: false,
+    shift: false,
+};
+
+/// The left Alt key.
+pub const ALT_LEFT: KeyCodes = KeyCodes {
+    scancode: 0x38,
+    keysym: 0xffe9,
     extended: false,
     shift: false,
 };
@@ -849,8 +921,8 @@ pub fn key_codes(key: &str) -> Option<KeyCodes> {
         "space" => return named(0x39, 0x20, false),
         "capslock" => return named(0x3a, 0xffe5, false),
         "shift" => return Some(SHIFT_LEFT),
-        "control" | "ctrl" => return named(0x1d, 0xffe3, false),
-        "alt" | "option" => return named(0x38, 0xffe9, false),
+        "control" | "ctrl" => return Some(CONTROL_LEFT),
+        "alt" | "option" => return Some(ALT_LEFT),
         "platform" | "cmd" | "super" | "win" | "meta" => {
             return named(0x5b, 0xffeb, true);
         }
@@ -1163,8 +1235,8 @@ pub trait DesktopLink: Send + 'static {
     fn key(&self, codes: KeyCodes, down: bool) -> Result<(), LinkError>;
     /// Sends one pointer state.
     fn pointer(&self, x: u16, y: u16, buttons: Buttons) -> Result<(), LinkError>;
-    /// Sends clipboard text to the peer.
-    fn clipboard(&self, text: &str) -> Result<(), LinkError>;
+    /// Offers this computer's clipboard to the peer; the newest offer wins.
+    fn clipboard(&self, entries: &[ClipboardEntry]) -> Result<(), LinkError>;
     /// Answers a certificate question.
     fn answer_certificate(&self, request_id: u32, accept: bool) -> Result<(), LinkError>;
     /// Tells the protocol the window changed size.
@@ -1204,6 +1276,18 @@ impl NativeLink {
         client
             .set_size(width.max(1), height.max(1))
             .map_err(native_error)?;
+        // The clipboard is shared unless the connection turned it off (R6); off
+        // means the backend neither receives nor sends anything.
+        client
+            .set_clipboard(target.clipboard())
+            .map_err(native_error)?;
+        if target.protocol() == ProtocolKind::Rdp {
+            // The folder is offered as one drive; a folder that cannot be offered
+            // is reported as a notice and the session connects without it (R5).
+            client
+                .set_drive(shellune_desktop::DRIVE_NAME, target.drive_folder())
+                .map_err(native_error)?;
+        }
         if target.protocol() == ProtocolKind::Vnc {
             // The mask is what the connection insists on: a VNC connection set to
             // the server's default asks for the two types that need no TLS backend
@@ -1268,8 +1352,8 @@ impl DesktopLink for NativeLink {
         self.client.pointer(x, y, mask).map_err(native_error)
     }
 
-    fn clipboard(&self, text: &str) -> Result<(), LinkError> {
-        self.client.clipboard(text).map_err(native_error)
+    fn clipboard(&self, entries: &[ClipboardEntry]) -> Result<(), LinkError> {
+        self.client.push_clipboard(entries).map_err(native_error)
     }
 
     fn answer_certificate(&self, request_id: u32, accept: bool) -> Result<(), LinkError> {
@@ -1364,15 +1448,13 @@ fn native_event(event: shellune_desktop::Event) -> Option<LinkEvent> {
             fingerprint,
             flags,
         },
-        // Only the text entry reaches the pane for now; images and notices are
-        // ignored until the pane handles them.
-        shellune_desktop::Event::Clipboard { entries } => LinkEvent::Clipboard {
-            text: entries
-                .iter()
-                .find_map(|entry| entry.as_text())?
-                .to_string(),
-        },
-        shellune_desktop::Event::Notice { .. } => return None,
+        shellune_desktop::Event::Clipboard { entries } => {
+            if entries.is_empty() {
+                return None;
+            }
+            LinkEvent::Clipboard { entries }
+        }
+        shellune_desktop::Event::Notice { notice } => LinkEvent::Notice(notice),
     })
 }
 
@@ -1425,7 +1507,9 @@ pub fn canvas_is_bgra(surface: &DesktopSurface) -> bool {
 #[cfg(any(test, feature = "ui-capture"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod scripted {
-    use super::{Buttons, DesktopInput, DesktopLink, KeyCodes, LinkError, LinkEvent, Region};
+    use super::{
+        Buttons, ClipboardEntry, DesktopInput, DesktopLink, KeyCodes, LinkError, LinkEvent, Region,
+    };
     use std::sync::{Arc, Mutex};
 
     /// What a scripted link recorded.
@@ -1439,8 +1523,8 @@ pub mod scripted {
         pub answers: Vec<(u32, bool)>,
         /// Sizes the surface asked for.
         pub resizes: Vec<(u32, u32)>,
-        /// Text the surface sent to the peer.
-        pub clipboard: Vec<String>,
+        /// Every clipboard offer the surface sent to the peer, in order.
+        pub clipboard: Vec<Vec<ClipboardEntry>>,
     }
 
     /// The queue a scripted link reads, so a test can hand the pane more events
@@ -1512,8 +1596,8 @@ pub mod scripted {
                 Ok(log) => log,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if let DesktopInput::Clipboard(text) = &input {
-                log.clipboard.push(text.clone());
+            if let DesktopInput::Clipboard(entries) = &input {
+                log.clipboard.push(entries.clone());
             }
             log.inputs.push(input);
             Ok(())
@@ -1540,8 +1624,8 @@ pub mod scripted {
             self.record(DesktopInput::Pointer { x, y, buttons })
         }
 
-        fn clipboard(&self, text: &str) -> Result<(), LinkError> {
-            self.record(DesktopInput::Clipboard(text.to_owned()))
+        fn clipboard(&self, entries: &[ClipboardEntry]) -> Result<(), LinkError> {
+            self.record(DesktopInput::Clipboard(entries.to_vec()))
         }
 
         fn answer_certificate(&self, request_id: u32, accept: bool) -> Result<(), LinkError> {
@@ -2036,7 +2120,7 @@ mod tests {
     fn unsupported_clipboard_does_not_block_subsequent_keyboard_input() {
         let (link, _) = scripted::ScriptedLink::failing(LinkError::Unavailable("clipboard".into()));
         let mut queue = InputQueue::new();
-        queue.push_clipboard("text");
+        queue.push_clipboard(vec![ClipboardEntry::text("text")]);
         queue.push_key(key_codes("a").unwrap(), true);
         assert!(queue.flush(&link).is_err());
         assert_eq!(queue.len(), 1);
