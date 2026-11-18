@@ -410,7 +410,7 @@ impl ShelluneView {
             .flex_1()
             .min_h_0()
             // A page with no terminal on it - a connection being set up - shows this
-            // floor, which the current tab is painted with too (R2).
+            // floor.
             .bg(theme::swatch(super::PAGE_FLOOR))
             .relative();
         if let Some(reason) = &self.local_error {
@@ -425,6 +425,7 @@ impl ShelluneView {
         // A connection being set up in its tab is the whole page: its card states the
         // progress, the question or the failure once, so no banner repeats it above.
         if self.connection_inline()
+            && !self.connection_behind_screen()
             && let Some(page) = self.connection_page(cx)
         {
             return column.child(page).children(self.standalone_session_bar(cx));
@@ -452,7 +453,15 @@ impl ShelluneView {
         // too narrow to dock them - still states it above, as a card of its own (R3).
         let tree_shown = files.is_none() || self.files_docked();
         let overlaid = tree_shown && session_id.is_some_and(|id| self.desktop_for(id).is_none());
-        if !overlaid && let Some(notice) = self.active_failure_notice(session_id, cx) {
+        let banner = (!overlaid)
+            .then_some(session_id)
+            .flatten()
+            .filter(|id| self.pane_for(*id).is_some())
+            .and_then(|id| self.status_banner(id, cx));
+        if let Some((banner, _)) = banner {
+            // The files have the terminal's place: the banner stands above them (ADR-6).
+            column = column.children(banner);
+        } else if !overlaid && let Some(notice) = self.active_failure_notice(session_id, cx) {
             column = column.child(
                 div()
                     .flex()
@@ -973,23 +982,38 @@ impl ShelluneView {
             // The pane the keys are in carries the session's half of the bar under its
             // grid; the others keep their own bar alone.
             if active && let Some(parts) = self.session_bar_parts(cx) {
-                terminal.read(cx).set_session_slot(
-                    crate::app::terminal::SessionSlot {
+                terminal
+                    .read(cx)
+                    .set_session_slot(crate::app::terminal::SessionSlot {
                         left: parts.left.into_any_element(),
                         controls: parts.controls,
                         pinned: parts.pinned,
-                    },
-                    self.session_left_floor(),
-                );
+                    });
             }
-            // The pane the keys are in carries why its session ended, centred over the
-            // grid it ended on (R3).
-            if active && let Some(card) = self.active_failure_notice(Some(id), cx) {
-                terminal
-                    .read(cx)
-                    .set_status_overlay(self.entering_status_card(id, card));
+            // The pane the keys are in carries why its session ended in a banner above
+            // the grid it ended on (ADR-6).
+            if active {
+                self.hand_banner(id, terminal, cx);
             }
             frame = frame.child(terminal.clone());
+        } else if let Some(id) = session
+            && let Some(screen) = self.reconnect_screen(id).cloned()
+        {
+            // A remote session that is reconnecting keeps its last screen under the
+            // banner that says so, until the new terminal takes its place (ADR-6).
+            if active {
+                if let Some(parts) = self.session_bar_parts(cx) {
+                    screen
+                        .read(cx)
+                        .set_session_slot(crate::app::terminal::SessionSlot {
+                            left: parts.left.into_any_element(),
+                            controls: parts.controls,
+                            pinned: parts.pinned,
+                        });
+                }
+                self.hand_banner(id, &screen, cx);
+            }
+            frame = frame.child(screen);
         } else if let Some(id) = session {
             // No terminal to lay a card over: the card takes the pane's place, centred,
             // on the terminal's own floor.
@@ -1332,8 +1356,6 @@ impl ShelluneView {
             ("session.tab", index),
             format!("session.tab.{index}"),
             selected,
-            self.tab_divider(index),
-            self.tab_floor(cx),
             metrics,
         )
         // As wide as its title, within the strip's bounds, as a session tab (R2).

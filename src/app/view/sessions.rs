@@ -416,6 +416,21 @@ impl ShelluneView {
         if !hidden.is_empty() {
             menu = menu.child(menu_divider(metrics));
         }
+        // The terminal's own tools - its size, the presentation, copy and the font size
+        // - are here rather than on the bar, which keeps only files, split, search and
+        // this menu (ADR-7). Only the pane that carries this bar offers them.
+        if self.bar_session() == Some(id)
+            && let Some(pane) = self.pane_for(id).cloned()
+        {
+            let weak = cx.entity().downgrade();
+            let closer = crate::app::terminal::MenuCloser::Window(std::rc::Rc::new(
+                move |window: &mut Window, app: &mut gpui::App| {
+                    let _ = weak.update(app, |view, cx| view.close_session_more(window, cx));
+                },
+            ));
+            let entries = pane.update(cx, |pane, cx| pane.tool_entries(metrics, closer, cx));
+            menu = menu.children(entries).child(menu_divider(metrics));
+        }
         if !closed {
             menu = menu.child(
                 menu_entry(
@@ -507,7 +522,16 @@ impl ShelluneView {
                                 px(0.0),
                             ))
                             .snap_to_window_with_margin(metrics.scale(spacing::TIGHT))
-                            .child(div().occlude().child(menu)),
+                            .child(
+                                div().occlude().child(
+                                    // With the terminal's tools in it, the menu can be
+                                    // taller than a small window at 200%: it scrolls
+                                    // rather than running past the window's edge.
+                                    menu.id("session.more.scroll")
+                                        .max_h(viewport.height - metrics.scale(spacing::BASE))
+                                        .overflow_y_scroll(),
+                                ),
+                            ),
                     ),
             ),
         )

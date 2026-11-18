@@ -95,55 +95,8 @@ struct SelectionDrag {
 /// Height of the status line under the grid.
 pub const SHELL_BAR_HEIGHT: f32 = 28.0;
 
-/// How many of the bar's own tools a narrow bar folds into its "more" menu (R3).
-///
-/// The tools go in a fixed order - the font size first, then the grid size, then copy,
-/// then the presentation switch - so a bar that gets narrower only ever loses the next
-/// one, and a reader always finds the rest where they were. Search never folds: it is
-/// the one tool a pane of any width keeps under the pointer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BarFold {
-    /// Every tool is on the bar.
-    Nothing,
-    /// The font size controls are in the menu.
-    Font,
-    /// ...and the grid size.
-    Size,
-    /// ...and copy.
-    Copy,
-    /// ...and the presentation switch: only search and the menu are left.
-    Mode,
-}
-
-impl BarFold {
-    /// Every level, from nothing folded to everything that can fold.
-    const ORDER: [Self; 5] = [
-        Self::Nothing,
-        Self::Font,
-        Self::Size,
-        Self::Copy,
-        Self::Mode,
-    ];
-
-    pub fn folds_font(self) -> bool {
-        self >= Self::Font
-    }
-
-    pub fn folds_size(self) -> bool {
-        self >= Self::Size
-    }
-
-    pub fn folds_copy(self) -> bool {
-        self >= Self::Copy
-    }
-
-    pub fn folds_mode(self) -> bool {
-        self >= Self::Mode
-    }
-}
-
 /// What the bar's last layout measured: its own width and the width of the session's
-/// middle group, which does not fold and so decides how much room the tools have.
+/// middle group, which decides which of the session's controls give way.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct BarRoom {
     width: Option<Pixels>,
@@ -166,15 +119,25 @@ struct BarRoom {
     hidden: usize,
 }
 
-impl BarRoom {
-    /// The natural width of the whole middle group, with `gap` between its parts.
-    fn middle(self, gap: Pixels) -> Pixels {
-        let between = if self.controls > px(0.0) && self.pinned > px(0.0) {
-            gap
-        } else {
-            px(0.0)
-        };
-        self.controls + between + self.pinned
+/// What closes a menu the window drew.
+pub type CloseMenu = std::rc::Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// How a command in a menu of the pane's tools closes the menu it is in (ADR-7).
+#[derive(Clone)]
+pub enum MenuCloser {
+    /// The pane's own "more" menu.
+    Own,
+    /// A menu the window drew - the session's menu - closed by the window.
+    Window(CloseMenu),
+}
+
+impl MenuCloser {
+    /// Closes the menu the command was chosen in.
+    fn close(&self, pane: &mut TerminalPane, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::Own => pane.more_menu = None,
+            Self::Window(close) => close(window, cx),
+        }
     }
 }
 
@@ -207,14 +170,6 @@ pub fn monospace_family() -> &'static str {
     } else {
         "DejaVu Sans Mono"
     }
-}
-
-/// How wide `text` is in the grid's monospace face at `size`.
-///
-/// The face has one advance for every character it draws, so the width is a count; it
-/// is what the bar reserves for the grid size and the font size it writes.
-fn monospace_width(text: &str, size: Pixels) -> Pixels {
-    px(text.chars().count() as f32 * f32::from(size) * shellune_terminal::MONOSPACE_ADVANCE_RATIO)
 }
 
 /// What a serial line left behind when its pane stopped driving it (R21).
@@ -601,18 +556,20 @@ pub struct TerminalPane {
     /// The session's own half of the bar under the grid, handed in by the window for
     /// the frame being drawn: where the session is and what can be done to it.
     session_slot: std::cell::RefCell<Option<SessionSlot>>,
-    /// The card the window lays over the grid for the next draw: why the session ended,
-    /// or that it is coming back (R3). Taken like the session's half of the bar.
-    status_slot: std::cell::RefCell<Option<gpui::AnyElement>>,
+    /// The banner the window puts above the grid for the next draw: why the session
+    /// ended, or that it is coming back (ADR-6), and the first of its controls the
+    /// keyboard reaches. Taken like the session's half of the bar.
+    banner_slot: std::cell::RefCell<Option<(Vec<gpui::AnyElement>, Option<FocusHandle>)>>,
+    /// The first control of the banner drawn last, which Tab reaches from a terminal
+    /// that no longer takes input.
+    banner_focus: std::cell::RefCell<Option<FocusHandle>>,
     /// How wide the bar was at its last layout and how much of it the session's own
-    /// middle group took: what decides which tools fold into the bar's menu (R3).
+    /// middle group took: what decides which of its controls give way (R3).
     bar_room: std::cell::Cell<BarRoom>,
     /// Where the bar's "more" menu is open, when it is.
     more_menu: Option<gpui::Point<Pixels>>,
     /// Whether the bar carried the session's half at its last draw.
     bar_has_slot: std::cell::Cell<bool>,
-    /// The room the session's left part needs, as the window measured it.
-    session_floor: std::cell::Cell<Pixels>,
     core: TerminalCore,
     source: Option<PaneSource>,
     /// What the pane is running: a program here, or a host over SSH.
@@ -872,11 +829,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
-            status_slot: std::cell::RefCell::new(None),
+            banner_slot: std::cell::RefCell::new(None),
+            banner_focus: std::cell::RefCell::new(None),
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
-            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -946,11 +903,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
-            status_slot: std::cell::RefCell::new(None),
+            banner_slot: std::cell::RefCell::new(None),
+            banner_focus: std::cell::RefCell::new(None),
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
-            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -1019,11 +976,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
-            status_slot: std::cell::RefCell::new(None),
+            banner_slot: std::cell::RefCell::new(None),
+            banner_focus: std::cell::RefCell::new(None),
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
-            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -1175,11 +1132,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
-            status_slot: std::cell::RefCell::new(None),
+            banner_slot: std::cell::RefCell::new(None),
+            banner_focus: std::cell::RefCell::new(None),
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
-            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -1369,11 +1326,11 @@ impl TerminalPane {
             pending_paste: None,
             search_open: false,
             session_slot: std::cell::RefCell::new(None),
-            status_slot: std::cell::RefCell::new(None),
+            banner_slot: std::cell::RefCell::new(None),
+            banner_focus: std::cell::RefCell::new(None),
             bar_room: std::cell::Cell::new(BarRoom::default()),
             more_menu: None,
             bar_has_slot: std::cell::Cell::new(false),
-            session_floor: std::cell::Cell::new(px(0.0)),
             search_focused: false,
             search_query: String::new(),
             search_error: None,
@@ -1921,6 +1878,18 @@ impl TerminalPane {
             platform: keystroke.modifiers.platform,
         };
         let plain = !modifiers.control && !modifiers.alt && !modifiers.platform;
+        // A terminal whose session is over takes no keys of its own, so Tab moves on to
+        // the banner above it and its commands are reached without the pointer (ADR-6).
+        if keystroke.key == "tab"
+            && plain
+            && !modifiers.shift
+            && !self.state.accepts_input()
+            && let Some(focus) = self.banner_focus.borrow().clone()
+        {
+            window.focus(&focus);
+            cx.stop_propagation();
+            return;
+        }
 
         // While the find bar holds the keyboard, the keys that edit and leave it are
         // the bar's: Escape closes it and hands the terminal back, Enter steps to the
@@ -3254,11 +3223,16 @@ impl TerminalPane {
         )
     }
 
-    /// Hands the pane the session's half of its bar for the next draw, and the room
-    /// its left part needs before its target is cut further (R3).
-    pub fn set_session_slot(&self, slot: SessionSlot, left_floor: Pixels) {
+    /// How wide the bar under the grid was at its last layout - the pane's own width -
+    /// when it has been laid out.
+    #[must_use]
+    pub fn bar_width(&self) -> Option<Pixels> {
+        self.bar_room.get().width
+    }
+
+    /// Hands the pane the session's half of its bar for the next draw (R3).
+    pub fn set_session_slot(&self, slot: SessionSlot) {
         *self.session_slot.borrow_mut() = Some(slot);
-        self.session_floor.set(left_floor);
     }
 
     /// How many of the session's controls, counted from the end of the list the window
@@ -3274,133 +3248,33 @@ impl TerminalPane {
         }
     }
 
-    /// Hands the pane the card the window lays over its grid for the next draw: why
-    /// the session ended and what can follow (R3).
+    /// Hands the pane the banner the window puts above its grid for the next draw:
+    /// why the session ended, or that it is coming back (ADR-6), and the first of its
+    /// controls, which Tab reaches from a terminal that no longer takes input.
     ///
-    /// The card is centred over the last screen rather than stacked above it, so the
-    /// grid keeps its size and the output that led up to the end stays where it was,
-    /// dimmed behind the card and still selectable around it.
-    pub fn set_status_overlay(&self, card: gpui::AnyElement) {
-        *self.status_slot.borrow_mut() = Some(card);
-    }
-
-    /// The status card laid over the grid, when the window handed one in.
-    fn status_overlay(&self) -> Option<gpui::Div> {
-        let card = self.status_slot.borrow_mut().take()?;
-        // A veil of the terminal's own background: the last screen stays legible, the
-        // card is plainly the thing in front. It takes no pointer, so a selection or a
-        // scroll in the grid still reaches the grid around the card.
-        //
-        // The veil covers the grid and nothing else: a card taller than a short pane
-        // (a stacked split at 200%) is held in a box no taller than the veil and
-        // scrolls there, from its headline down, instead of running over the bar and
-        // out of the window. The bar keeps its own Reconnect for that case (R8).
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .overflow_hidden()
-                .bg(theme::faded(color_of(palette::BACKGROUND), 0.55))
-                .debug_selector(|| "terminal.status.overlay".to_owned())
-                .child(
-                    div()
-                        .id("terminal.status.scroll")
-                        .debug_selector(|| "terminal.status.scroll".to_owned())
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .w_full()
-                        .min_h_0()
-                        .max_h_full()
-                        .overflow_y_scroll()
-                        // The margin scrolls with the card: it keeps the card off the
-                        // pane's edges and leaves its shadow room inside the box that
-                        // clips it, without taking height from a short pane.
-                        .p(px(spacing::LOOSE))
-                        .child(card),
-                ),
-        )
-    }
-
-    /// Which of the bar's tools fold into its menu at the width it last had (R3).
+    /// The banner covers nothing: the grid moves down under it and keeps its last
+    /// screen, which can still be scrolled, selected and copied.
     ///
-    /// Decided from the measured width of the bar and of the session's middle group -
-    /// neither changes with what folds, so the bar cannot flip between two forms from
-    /// one frame to the next - and from the tools' own sizes, which this pane draws.
-    pub fn bar_fold(&self, metrics: Metrics, has_slot: bool) -> BarFold {
-        let room = self.bar_room.get();
-        let Some(width) = room.width else {
-            return BarFold::Nothing;
-        };
-        let group_gap = metrics.scale(spacing::TIGHT);
-        // The left group is where the session is: its target is cut with an ellipsis, but
-        // its mark, a few letters of it and its chips stay.
-        let left_floor = if has_slot {
-            self.session_floor.get().max(metrics.scale(88.0))
-        } else {
-            metrics.scale(48.0)
-        };
-        let fixed = metrics.scale(spacing::BASE - 2.0)
-            + metrics.scale(spacing::HAIRLINE)
-            + left_floor
-            + group_gap * 2.0
-            + room.middle(metrics.scale(2.0));
-        BarFold::ORDER
-            .into_iter()
-            .find(|fold| fixed + self.tools_width(*fold, metrics) <= width)
-            .unwrap_or(BarFold::Mode)
+    /// The banner comes in parts stacked in order: its one line, which keeps its height,
+    /// and the details it unfolded, which give way first in a short pane.
+    pub fn set_status_banner(&self, banner: Vec<gpui::AnyElement>, focus: Option<FocusHandle>) {
+        *self.banner_slot.borrow_mut() = Some((banner, focus));
     }
 
-    /// How wide the bar's own tool group is with `fold` of it in the menu.
-    fn tools_width(&self, fold: BarFold, metrics: Metrics) -> Pixels {
-        let target = metrics.hit_target();
-        let mut widths = Vec::with_capacity(9);
-        if !fold.folds_size() {
-            widths.push(self.grid_label_width(metrics));
-        }
-        if !fold.folds_mode() {
-            widths.push(target);
-        }
-        // Search never folds.
-        widths.push(target);
-        if !fold.folds_copy() {
-            widths.push(target);
-        }
-        if !fold.folds_font() {
-            widths.push(px(1.0) + metrics.scale(spacing::HAIRLINE) * 2.0);
-            widths.push(target);
-            widths.push(self.font_badge_width(metrics));
-            widths.push(target);
-        }
-        if fold != BarFold::Nothing {
-            widths.push(target);
-        }
-        let gaps = metrics.scale(1.0) * (widths.len().saturating_sub(1)) as f32;
-        widths.into_iter().fold(gaps, |sum, width| sum + width)
+    /// The banner above the grid, when the window handed one in.
+    fn status_banner(&self) -> Vec<gpui::AnyElement> {
+        let slot = self.banner_slot.borrow_mut().take();
+        let (banner, focus) = match slot {
+            Some((banner, focus)) => (banner, focus),
+            None => (Vec::new(), None),
+        };
+        *self.banner_focus.borrow_mut() = focus;
+        banner
     }
 
-    /// The grid size as the bar writes it.
-    fn grid_label(&self) -> String {
+    /// The grid size as the bar's menu states it.
+    pub(crate) fn grid_label(&self) -> String {
         format!("{}\u{00D7}{}", self.grid.cols, self.grid.rows)
-    }
-
-    /// The room the grid size takes: its characters in the monospace face, its padding
-    /// and a pixel of slack for the face's own rounding.
-    fn grid_label_width(&self, metrics: Metrics) -> Pixels {
-        monospace_width(&self.grid_label(), metrics.caption_size())
-            + metrics.scale(spacing::HAIRLINE) * 2.0
-            + px(2.0)
-    }
-
-    /// The room the font size badge between A- and A+ takes.
-    fn font_badge_width(&self, metrics: Metrics) -> Pixels {
-        let text = monospace_width(&format!("{}px", self.font_size), metrics.caption_size())
-            + metrics.scale(2.0) * 2.0
-            + px(2.0);
-        text.max(metrics.scale(34.0))
     }
 
     /// Records what the bar's layout measured, and draws again when it changed.
@@ -3570,20 +3444,20 @@ impl TerminalPane {
                 .child(row),
         )
     }
-    /// The status line under the grid, in three groups (R3).
+    /// The status line under the grid, 28 high (R3, ADR-7).
     ///
-    /// The left group is where the session is: its target and, once the program
-    /// stopped, how it stopped; it is cut with an ellipsis before anything else gives
-    /// way. The middle group is what the window hands in for the session - a reconnect
-    /// or a save that is waiting, the terminal/files switch, splitting and the session
-    /// menu. The right group is this pane's own tools: the grid size, the
-    /// presentation, search, copy and the font size.
+    /// The left group is where the session is: its mark and target and, once the
+    /// program stopped, how it stopped; it is cut with an ellipsis before anything else
+    /// gives way. The middle group is what the window hands in for the session - a
+    /// reconnect or a save that is waiting, the files switch, splitting - then search
+    /// and the session's menu. Every other tool of the pane - the grid size, the
+    /// presentation, copy and the font size - is in that menu, so the bar always reads
+    /// files, split, search, more. A pane that does not carry the session's half keeps
+    /// search and its own "more" menu at the right instead.
     ///
-    /// A bar too narrow for every tool folds them into its "more" menu in a fixed
-    /// order ([`BarFold`]) instead of drawing past its pane, and what is still left
-    /// over is clipped by the bar itself. A live process needs no badge: the session's
-    /// half states the connection, so the state is only spelled out once the program
-    /// stopped, in the tone of how it stopped.
+    /// A live process needs no badge: the session's half states the connection, so the
+    /// state is only spelled out once the program stopped, in the tone of how it
+    /// stopped.
     fn bar(&self, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let slot = self.session_slot.borrow_mut().take();
         let (slot_left, slot_controls, slot_pinned) = match slot {
@@ -3593,7 +3467,6 @@ impl TerminalPane {
         let has_controls = !slot_controls.is_empty();
         let has_slot = slot_left.is_some();
         self.bar_has_slot.set(has_slot);
-        let fold = self.bar_fold(metrics, has_slot);
         let live = self.state.accepts_input();
         let tone = if live {
             Tone::Positive
@@ -3606,9 +3479,8 @@ impl TerminalPane {
         let muted = theme::swatch(shell_palette::TEXT_MUTED);
         let bar_height = metrics.hit_target().max(metrics.scale(SHELL_BAR_HEIGHT));
         // The bar's children are the three groups and, last, a box of the bar's own
-        // size; the middle group holds the session's controls at their natural width
-        // and its menu. Those widths are what the fold is decided from, and none of
-        // them changes with what folds.
+        // size; the middle group holds the session's controls at their natural width,
+        // search and the session's menu.
         let weak = cx.entity().downgrade();
         let measure_bar = move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
             let Some(frame) = bounds.get(3) else {
@@ -3819,6 +3691,17 @@ impl TerminalPane {
             .gap(middle_gap)
             .debug_selector(|| "terminal.bar.middle".to_owned())
             .children(controls)
+            // Search stands between the session's controls and its menu, so the bar
+            // reads files, split, search, more (ADR-7); like the menu it never gives way.
+            .when(has_slot, |middle| {
+                middle.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .child(self.search_button(metrics, self.locale.strings(), cx)),
+                )
+            })
             .children(
                 slot_pinned
                     .into_iter()
@@ -3849,112 +3732,29 @@ impl TerminalPane {
             .text_color(muted)
             .child(left)
             .child(middle)
-            .child(self.bar_tools(fold, metrics, cx))
+            .child(self.bar_tools(has_slot, metrics, cx))
             .child(div().absolute().inset_0())
     }
 
-    /// The bar's right group: this pane's own tools, less what `fold` put in the menu.
-    fn bar_tools(&self, fold: BarFold, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
+    /// The bar's right group: search and the "more" menu that holds every other tool of
+    /// this pane (ADR-7).
+    ///
+    /// A pane that carries the session's half has one menu, the session's: its search
+    /// stands before that menu in the middle group and the tools are in the session's
+    /// menu, so this group is empty. The group is drawn either way, so the bar always
+    /// has the same children for its measure.
+    fn bar_tools(&self, has_slot: bool, metrics: Metrics, cx: &mut Context<Self>) -> gpui::Div {
         let strings = self.locale.strings();
-        let font_changed =
-            (self.font_size - shellune_terminal::DEFAULT_FONT_SIZE).abs() >= f32::EPSILON;
-        let reset_hover = theme::swatch(shell_palette::SURFACE_HOVER);
-        let reset_tip = self.font_reset_label();
         let target = metrics.hit_target();
+        let ux = crate::app::copy::ux_for(self.locale);
         div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(1.0))
+            .gap(metrics.scale(spacing::HALF))
             .debug_selector(|| "terminal.bar.tools".to_owned())
-            .when(!fold.folds_size(), |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .px(metrics.scale(spacing::HAIRLINE))
-                        .whitespace_nowrap()
-                        .font_family(monospace_family())
-                        .debug_selector(|| "terminal.grid.size".to_owned())
-                        .child(SharedString::from(self.grid_label())),
-                )
-            })
-            .when(!fold.folds_mode(), |row| {
-                row.child(self.mode_button(metrics, strings, cx))
-            })
-            .child(self.search_button(metrics, strings, cx))
-            .when(!fold.folds_copy(), |row| {
-                row.child(
-                    components::icon_only_button(Icon::Copy, metrics)
-                        .w(target)
-                        .h(target)
-                        .id("terminal.copy")
-                        .debug_selector(|| "terminal.copy".to_owned())
-                        .tooltip(components::tooltip(SharedString::from(
-                            Self::with_shortcut(strings.terminal_copy, &self.shortcuts.copy),
-                        )))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.copy_selection(cx);
-                        })),
-                )
-            })
-            .when(!fold.folds_font(), |row| {
-                row.child(
-                    components::divider_vertical(metrics)
-                        .h(metrics.scale(12.0))
-                        .mx(metrics.scale(spacing::HAIRLINE)),
-                )
-                .child(
-                    components::icon_button("A\u{2212}", metrics)
-                        .w(target)
-                        .h(target)
-                        .id("terminal.font.decrease")
-                        .debug_selector(|| "terminal.font.decrease".to_owned())
-                        .tooltip(components::tooltip(strings.terminal_smaller))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.step_font_size(false, cx);
-                        })),
-                )
-                .child(
-                    div()
-                        .id("terminal.font.reset")
-                        .debug_selector(|| "terminal.font.reset".to_owned())
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .min_w(metrics.scale(34.0))
-                        .h(target)
-                        .px(metrics.scale(2.0))
-                        .rounded(px(theme::radius::SMALL))
-                        .whitespace_nowrap()
-                        .font_family(monospace_family())
-                        .when(font_changed, |badge| {
-                            badge
-                                .cursor_pointer()
-                                .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
-                                .hover(move |style| style.bg(reset_hover))
-                                .tooltip(components::tooltip(reset_tip))
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.set_font_size(shellune_terminal::DEFAULT_FONT_SIZE, cx);
-                                }))
-                        })
-                        .child(SharedString::from(format!("{}px", self.font_size))),
-                )
-                .child(
-                    components::icon_button("A+", metrics)
-                        .w(target)
-                        .h(target)
-                        .id("terminal.font.increase")
-                        .debug_selector(|| "terminal.font.increase".to_owned())
-                        .tooltip(components::tooltip(strings.terminal_larger))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.step_font_size(true, cx);
-                        })),
-                )
-            })
-            .when(fold != BarFold::Nothing, |row| {
-                let ux = crate::app::copy::ux_for(self.locale);
-                row.child(
+            .when(!has_slot, |row| {
+                row.child(self.search_button(metrics, strings, cx)).child(
                     components::icon_only_button(Icon::More, metrics)
                         .w(target)
                         .h(target)
@@ -3983,13 +3783,6 @@ impl TerminalPane {
             })
     }
 
-    /// Which tools the bar folds now, for a test: the draw keeps no record of what it
-    /// removed, so this is how a test knows which controls are really on the bar.
-    #[cfg(test)]
-    pub fn bar_fold_for_test(&self) -> BarFold {
-        self.bar_fold(theme::metrics(), self.bar_has_slot.get())
-    }
-
     /// Whether the bar's "more" menu is open, for a test.
     #[cfg(test)]
     pub fn more_menu_open_for_test(&self) -> bool {
@@ -4007,27 +3800,28 @@ impl TerminalPane {
         )
     }
 
-    /// The bar's "more" menu: the tools a narrow bar folded, in the order they sit on a
-    /// wide bar (R3).
+    /// The entries of this pane's own tools for a menu (R3, ADR-7): the grid size,
+    /// the presentation switch, copy and the font size, in that order.
     ///
-    /// Each keeps its own action and wording: the font steps leave the menu open so a
-    /// size can be stepped more than once, the grid size is stated rather than
-    /// pressed, and copy and the presentation switch close it like any other command.
-    fn more_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let position = self.more_menu?;
-        let metrics = theme::metrics();
-        let fold = self.bar_fold(metrics, self.bar_has_slot.get());
-        if fold == BarFold::Nothing {
-            return None;
-        }
+    /// The bar keeps only search and "more" on its line, so every other tool is here:
+    /// in the pane's own "more" menu, or in the session's menu when the pane carries the
+    /// session's half of the bar. Each keeps its own action and wording: the font steps
+    /// leave the menu open so a size can be stepped more than once, the grid size is
+    /// stated rather than pressed, and copy and the presentation switch close the menu
+    /// like any other command, through `closer`.
+    pub fn tool_entries(
+        &self,
+        metrics: Metrics,
+        closer: MenuCloser,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         let strings = self.locale.strings();
         let ux = crate::app::copy::ux_for(self.locale);
-        let viewport = window.viewport_size();
         let can_copy = self.core.has_selection();
         let integrated = self.core.presentation() == TerminalMode::Integrated;
         let font_changed =
             (self.font_size - shellune_terminal::DEFAULT_FONT_SIZE).abs() >= f32::EPSILON;
-        // What a folded entry carries at its end: the value or the key it stands for.
+        // What an entry carries at its end: the value or the key it stands for.
         let hint = |entry: gpui::Stateful<gpui::Div>, text: String| {
             entry
                 .child(div().flex_1().min_w(metrics.scale(spacing::TIGHT)))
@@ -4040,144 +3834,158 @@ impl TerminalPane {
                         .child(SharedString::from(text)),
                 )
         };
-        let mut menu = components::menu_card("terminal.more.menu", metrics)
-            .max_w(viewport.width - metrics.scale(spacing::TIGHT) * 2.0);
-        if fold.folds_size() {
-            menu = menu.child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .h(metrics.scale(30.0))
-                    .px(metrics.scale(spacing::TIGHT + 2.0))
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
-                    .debug_selector(|| "terminal.more.size".to_owned())
-                    .child(crate::app::icons::icon(
-                        Icon::Maximize,
-                        metrics.small_icon_size(),
-                        theme::swatch(shell_palette::TEXT_MUTED),
-                    ))
-                    .child(ux.terminal_grid_size)
-                    .child(div().flex_1().min_w(metrics.scale(spacing::TIGHT)))
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_family(monospace_family())
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
-                            .child(SharedString::from(self.grid_label())),
-                    ),
-            );
-        }
-        if fold.folds_mode() {
-            menu = menu.child(
-                hint(
-                    components::menu_entry(
-                        strings.terminal_mode_blocks,
-                        "terminal.more.mode",
-                        Some(Icon::Layers),
-                        true,
-                        false,
-                        metrics,
-                    ),
-                    if integrated {
-                        "\u{2713}".to_owned()
-                    } else {
-                        String::new()
-                    },
+        let mut entries: Vec<gpui::AnyElement> = Vec::new();
+        entries.push(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(metrics.scale(spacing::TIGHT))
+                .h(metrics.compact_control_height())
+                .px(metrics.scale(spacing::TIGHT + 2.0))
+                .text_size(metrics.label_size())
+                .text_color(theme::swatch(shell_palette::TEXT_SECONDARY))
+                .debug_selector(|| "terminal.more.size".to_owned())
+                .child(crate::app::icons::icon(
+                    Icon::Maximize,
+                    metrics.small_icon_size(),
+                    theme::swatch(shell_palette::TEXT_MUTED),
+                ))
+                .child(ux.terminal_grid_size)
+                .child(div().flex_1().min_w(metrics.scale(spacing::TIGHT)))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(monospace_family())
+                        .text_size(metrics.caption_size())
+                        .text_color(theme::swatch(shell_palette::TEXT_PRIMARY))
+                        .child(SharedString::from(self.grid_label())),
                 )
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.more_menu = None;
-                    this.set_presentation(
-                        if integrated {
-                            TerminalMode::Classic
-                        } else {
-                            TerminalMode::Integrated
-                        },
-                        cx,
-                    );
-                    cx.notify();
-                })),
-            );
-        }
-        if fold.folds_copy() {
-            let entry = hint(
+                .into_any_element(),
+        );
+        let close = closer.clone();
+        entries.push(
+            hint(
                 components::menu_entry(
-                    strings.terminal_copy,
-                    "terminal.more.copy",
-                    Some(Icon::Copy),
-                    can_copy,
+                    strings.terminal_mode_blocks,
+                    "terminal.more.mode",
+                    Some(Icon::Layers),
+                    true,
                     false,
                     metrics,
                 ),
-                self.shortcuts.copy.clone().unwrap_or_default(),
-            );
-            menu = menu.child(if can_copy {
-                entry.on_click(cx.listener(|this, _event, _window, cx| {
-                    this.more_menu = None;
-                    this.copy_selection(cx);
-                    cx.notify();
-                }))
-            } else {
-                entry
-            });
-        }
-        if fold.folds_font() {
-            let reset = hint(
-                components::menu_entry(
-                    self.font_reset_label(),
-                    "terminal.more.font.reset",
-                    None,
-                    font_changed,
-                    false,
-                    metrics,
-                ),
-                format!("{}px", self.font_size),
-            );
-            menu = menu
-                .child(components::menu_divider(metrics))
-                .child(
-                    hint(
-                        components::menu_entry(
-                            strings.terminal_smaller,
-                            "terminal.more.font.decrease",
-                            Some(Icon::TextSize),
-                            true,
-                            false,
-                            metrics,
-                        ),
-                        "A\u{2212}".to_owned(),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.step_font_size(false, cx);
-                    })),
-                )
-                .child(
-                    hint(
-                        components::menu_entry(
-                            strings.terminal_larger,
-                            "terminal.more.font.increase",
-                            Some(Icon::TextSize),
-                            true,
-                            false,
-                            metrics,
-                        ),
-                        "A+".to_owned(),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.step_font_size(true, cx);
-                    })),
-                )
-                .child(if font_changed {
-                    reset.on_click(cx.listener(|this, _event, _window, cx| {
-                        this.set_font_size(shellune_terminal::DEFAULT_FONT_SIZE, cx);
-                    }))
+                if integrated {
+                    "\u{2713}".to_owned()
                 } else {
-                    reset
-                });
+                    String::new()
+                },
+            )
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                close.close(this, window, cx);
+                this.set_presentation(
+                    if integrated {
+                        TerminalMode::Classic
+                    } else {
+                        TerminalMode::Integrated
+                    },
+                    cx,
+                );
+                cx.notify();
+            }))
+            .into_any_element(),
+        );
+        let copy = hint(
+            components::menu_entry(
+                strings.terminal_copy,
+                "terminal.more.copy",
+                Some(Icon::Copy),
+                can_copy,
+                false,
+                metrics,
+            ),
+            self.shortcuts.copy.clone().unwrap_or_default(),
+        );
+        let close = closer;
+        entries.push(if can_copy {
+            copy.on_click(cx.listener(move |this, _event, window, cx| {
+                close.close(this, window, cx);
+                this.copy_selection(cx);
+                cx.notify();
+            }))
+            .into_any_element()
+        } else {
+            copy.into_any_element()
+        });
+        let reset = hint(
+            components::menu_entry(
+                self.font_reset_label(),
+                "terminal.more.font.reset",
+                None,
+                font_changed,
+                false,
+                metrics,
+            ),
+            format!("{}px", self.font_size),
+        );
+        entries.push(components::menu_divider(metrics).into_any_element());
+        entries.push(
+            hint(
+                components::menu_entry(
+                    strings.terminal_smaller,
+                    "terminal.more.font.decrease",
+                    Some(Icon::TextSize),
+                    true,
+                    false,
+                    metrics,
+                ),
+                "A\u{2212}".to_owned(),
+            )
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.step_font_size(false, cx);
+            }))
+            .into_any_element(),
+        );
+        entries.push(
+            hint(
+                components::menu_entry(
+                    strings.terminal_larger,
+                    "terminal.more.font.increase",
+                    Some(Icon::TextSize),
+                    true,
+                    false,
+                    metrics,
+                ),
+                "A+".to_owned(),
+            )
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.step_font_size(true, cx);
+            }))
+            .into_any_element(),
+        );
+        entries.push(if font_changed {
+            reset
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.set_font_size(shellune_terminal::DEFAULT_FONT_SIZE, cx);
+                }))
+                .into_any_element()
+        } else {
+            reset.into_any_element()
+        });
+        entries
+    }
+
+    /// The bar's own "more" menu, in a pane that does not carry the session's half:
+    /// every tool of the pane but search (ADR-7).
+    fn more_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let position = self.more_menu?;
+        if self.bar_has_slot.get() {
+            return None;
         }
+        let metrics = theme::metrics();
+        let viewport = window.viewport_size();
+        let menu = components::menu_card("terminal.more.menu", metrics)
+            .max_w(viewport.width - metrics.scale(spacing::TIGHT) * 2.0)
+            .children(self.tool_entries(metrics, MenuCloser::Own, cx));
         Some(
             gpui::deferred(
                 gpui::anchored().position(gpui::Point::default()).child(
@@ -4421,41 +4229,6 @@ impl TerminalPane {
                 .debug_selector(|| "terminal.composition".to_owned())
                 .child(SharedString::from(marked.clone())),
         )
-    }
-
-    fn mode_button(
-        &self,
-        metrics: Metrics,
-        strings: &crate::app::copy::Strings,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let integrated = self.core.presentation() == TerminalMode::Integrated;
-        // An icon that is lit while command blocks are on; the tooltip names the
-        // view it is in.
-        let label = if integrated {
-            strings.terminal_mode_blocks
-        } else {
-            strings.terminal_mode_classic
-        };
-        components::icon_only_button(Icon::Layers, metrics)
-            // The bar is 36px tall; the button keeps the pointer-target minimum rather
-            // than a smaller drawing at a reduced text size (R4).
-            .h(metrics.hit_target())
-            .w(metrics.hit_target())
-            .when(integrated, |button| {
-                button.bg(theme::swatch(shell_palette::ACCENT_TINT))
-            })
-            .id("terminal.mode")
-            .debug_selector(|| "terminal.mode".to_owned())
-            .tooltip(components::tooltip(label))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                let next = if integrated {
-                    TerminalMode::Classic
-                } else {
-                    TerminalMode::Integrated
-                };
-                this.set_presentation(next, cx);
-            }))
     }
 
     fn search_button(
@@ -5668,12 +5441,16 @@ impl Render for TerminalPane {
         // be typed into while an answer is pending (R17).
         let window_appearance = theme::appearance();
         theme::set_appearance(theme::terminal_appearance());
+        let banner = self.status_banner();
         let pane = div()
             .flex()
             .flex_col()
             .size_full()
             .min_h_0()
             .relative()
+            // Why the session ended stands above the grid it ended on, not over it: the
+            // grid moves down and keeps its last screen (ADR-6).
+            .children(banner)
             .child(
                 // A margin inside the frame keeps the first column off the border; the
                 // grid itself is measured inside it, so no cell is lost to the margin.
@@ -5689,10 +5466,7 @@ impl Render for TerminalPane {
                     .bg(color_of(palette::BACKGROUND))
                     .child(self.viewport(window, cx))
                     .children(self.scrollback_thumb())
-                    .children(self.scroll_bottom_pill(tools, show_blocks, cx))
-                    // Why the session ended is laid over the grid it ended on, not
-                    // stacked above it: the grid keeps its size (R3).
-                    .children(self.status_overlay()),
+                    .children(self.scroll_bottom_pill(tools, show_blocks, cx)),
             )
             // A serial line states itself above the bar: its device, its settings and
             // the two send habits are what a person changes while the session runs, and

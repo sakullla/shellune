@@ -87,6 +87,7 @@ use crate::app::{components, theme::radius};
 use shellune_storage::KeymapPreferences;
 
 mod backup;
+pub(crate) mod banner;
 pub(crate) mod batch;
 mod desktop;
 mod files_menu;
@@ -996,6 +997,16 @@ pub struct ShelluneView {
     /// per session so opening one does not unfold another, and it is forgotten with the
     /// session it belonged to.
     diagnostics: BTreeSet<SessionId>,
+    /// The status banners the user closed, by session, with the status each one stated
+    /// (ADR-6): a banner stays closed until its session states something else.
+    banner_closed: HashMap<SessionId, String>,
+    /// The controls of the status banner the keyboard walks, in order: its next step,
+    /// its details, the copy of its diagnostic and its close (ADR-6).
+    banner_focus: [FocusHandle; 4],
+    /// The last screen of a remote session that is reconnecting, and why it ended,
+    /// kept so the screen stays under its banner while the new attempt runs and comes
+    /// back if that attempt is cancelled (ADR-6).
+    reconnect_screens: HashMap<SessionId, (Entity<TerminalPane>, SessionFailure)>,
     /// Attempts a test scripted, kept so their answers can be inspected.
     #[cfg(test)]
     scripted: Vec<(SessionId, shellune_ssh::ScriptedSession)>,
@@ -1533,6 +1544,13 @@ impl ShelluneView {
     pub fn capture_end_session(&mut self, id: SessionId, failure: SessionFailure) {
         self.workspace.session_failed(id, failure);
         self.workspace.clear_session_failure();
+    }
+
+    /// Unfolds the diagnostic under the banner of a capture session (ADR-6), the way
+    /// its Details button does.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_open_diagnostic(&mut self, id: SessionId) {
+        self.diagnostics.insert(id);
     }
 
     /// Puts a capture session back into connecting, the way a reconnect starts (R2).
@@ -2608,6 +2626,14 @@ impl ShelluneView {
             quick_save_notice: None,
             x11: HashMap::new(),
             diagnostics: BTreeSet::new(),
+            banner_closed: HashMap::new(),
+            banner_focus: [
+                cx.focus_handle(),
+                cx.focus_handle(),
+                cx.focus_handle(),
+                cx.focus_handle(),
+            ],
+            reconnect_screens: HashMap::new(),
             showing_connection_form: false,
             reconnect: None,
             remote_fields: RemoteFields {
@@ -4439,6 +4465,8 @@ impl ShelluneView {
         focus: bool,
         cx: &mut Context<Self>,
     ) {
+        // A new terminal takes the place of the last screen a reconnect kept.
+        self.forget_reconnect_screen(tag.session);
         // The pane reports what its process does; the entry is observed so the session
         // list repeats the truth about that one session.
         cx.observe(&pane, |view, pane, cx| view.sync_pane(pane, cx))
@@ -4486,6 +4514,7 @@ impl ShelluneView {
         pane: Entity<desktop::DesktopPane>,
         cx: &mut Context<Self>,
     ) {
+        self.forget_reconnect_screen(tag.session);
         cx.observe(&pane, |view, pane, cx| view.sync_desktop(pane, cx))
             .detach();
         self.panes.push(OpenPane {
@@ -5254,6 +5283,7 @@ impl ShelluneView {
         // session it belonged to; the record of a session that is still open does not.
         self.unsaved.retain(|(session, _)| *session != id);
         self.drop_pane(id, cx);
+        self.forget_reconnect_screen(id);
         self.workspace.session_closed(id);
         // A connecting attempt has no terminal, so closing it does not move the
         // selection by itself. Point it at a session that is still open.
@@ -6178,6 +6208,9 @@ impl ShelluneView {
                 // cleanup below takes this session's attempt, panel and questions away,
                 // and a different form on screen must not go with them.
                 self.park_focused_form();
+                // The last screen stays under the banner that says the session is
+                // coming back, until the new terminal takes its place (ADR-6).
+                self.keep_reconnect_screen(id);
                 self.end_session_resources(id, ResourceEnd::Restarted, cx);
                 self.drop_pane(id, cx);
                 self.reconnect = Some(id);
@@ -11851,6 +11884,11 @@ impl ShelluneView {
             self.reclaim_focus(window, cx);
             return true;
         }
+        // The banner over an ended or reconnecting terminal is the last thing Escape
+        // closes; it stays closed until its session states something else (ADR-6).
+        if self.dismiss_active_banner(window, cx) {
+            return true;
+        }
         false
     }
     fn notice_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
@@ -12314,9 +12352,11 @@ impl ShelluneView {
         }
         // A desktop surface is a picture of a session just as a terminal is: the
         // workspace draws it, not the home page (R18).
-        let live = self
-            .active
-            .is_some_and(|id| self.pane_for(id).is_some() || self.desktop_for(id).is_some());
+        let live = self.active.is_some_and(|id| {
+            self.pane_for(id).is_some()
+                || self.desktop_for(id).is_some()
+                || self.reconnect_screen(id).is_some()
+        });
         // A waiting pane is drawn in the workspace, and so is a connection being set up
         // in its own tab.
         live || self.workspace.layout().has_pending() || self.connection_inline()
@@ -12397,39 +12437,17 @@ impl ShelluneView {
         }
 
         if let Some(pane) = self.active_pane() {
-            // A shell that ended keeps its last screen, but the reason it stopped is
-            // stated above it instead of being left for the user to guess.
-            let notice = match (&ended, id) {
-                (Some(status), Some(id)) => Some(self.failure_notice(id, status, cx)),
-                // The pane can be ahead of the record for one frame; it still states one
-                // status, never a second wording beside the record's (R17).
-                (None, _) => pane
-                    .read(cx)
-                    .state()
-                    .failure()
-                    .map(SessionStatus::ended)
-                    .and_then(|status| id.map(|id| self.failure_notice(id, &status, cx))),
-                (Some(_), None) => None,
-            };
+            // A shell that ended keeps its last screen, and the reason it stopped is
+            // stated in a banner above it instead of being left for the user to guess
+            // (ADR-6): above the terminal while it is on screen, above the files when
+            // they have its place.
             let files_open = id.is_some_and(|id| self.files.is_open(id));
-            match (notice, id) {
-                // Over the terminal it ended on, while that terminal is on screen (R3).
-                (Some(notice), Some(id)) if !files_open || self.files_docked() => {
-                    pane.read(cx)
-                        .set_status_overlay(self.entering_status_card(id, notice));
+            if let Some(id) = id {
+                if !files_open || self.files_docked() {
+                    self.hand_banner(id, pane, cx);
+                } else if let Some((banner, _)) = self.status_banner(id, cx) {
+                    frame = frame.children(banner);
                 }
-                (Some(notice), _) => {
-                    frame = frame.child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .justify_center()
-                            .px(metrics.scale(spacing::SNUG))
-                            .pt(metrics.scale(spacing::SNUG))
-                            .child(notice),
-                    );
-                }
-                (None, _) => {}
             }
             match id.filter(|id| self.files.is_open(*id)) {
                 // A wide window keeps the terminal beside the files instead of behind
@@ -17502,8 +17520,6 @@ impl ShelluneView {
             ("session.tab", index),
             format!("session.tab.{index}"),
             selected,
-            self.tab_divider(index),
-            self.tab_floor(cx),
             metrics,
         )
         // As wide as what it holds - its title at full length - and no wider than the
@@ -17607,80 +17623,6 @@ impl ShelluneView {
             && self.workspace.destination() == Destination::LocalShells
     }
 
-    /// Whether the strip's tab at `index` draws the hairline on its left.
-    ///
-    /// Two background tabs side by side are told apart by the line; the current tab
-    /// joins the page and needs none, so neither it nor the tab after it draws one. The
-    /// first session tab sits beside the hosts tab, which counts as its neighbour.
-    pub(super) fn tab_divider(&self, index: usize) -> bool {
-        // A compact row draws one session tab, right after the hosts tab.
-        if self.header_compact() {
-            return !self.tab_is_current(index) && !self.home_is_shown();
-        }
-        let previous_current = match index.checked_sub(1) {
-            Some(previous) => self.tab_is_current(previous),
-            None => self.home_is_shown(),
-        };
-        !self.tab_is_current(index) && !previous_current
-    }
-
-    /// The colour the current tab is painted with: the floor of the page it opens onto,
-    /// so the tab and the page read as one sheet (R2).
-    ///
-    /// A session with a terminal on screen opens onto the terminal itself, which paints
-    /// the terminal scheme's background right under the head; every other page - the
-    /// hosts home, a connection being set up - opens onto [`PAGE_FLOOR`]. A remote
-    /// desktop alone in its tab opens onto its own picture where the picture reaches the
-    /// head, so the tab takes the colour of the picture's top row under it.
-    pub(super) fn tab_floor(&self, cx: &gpui::App) -> gpui::Rgba {
-        if let Some(colour) = self.desktop_tab_floor(cx) {
-            return colour;
-        }
-        let terminal = !self.home_is_shown()
-            && self
-                .workspace
-                .layout()
-                .active_session()
-                .is_some_and(|id| self.pane_for(id).is_some() && !self.files.is_open(id))
-            && !self.connection_inline();
-        if terminal {
-            terminal_floor()
-        } else {
-            theme::swatch(PAGE_FLOOR)
-        }
-    }
-
-    /// The colour of the remote picture right under the current tab, when a remote
-    /// desktop alone in its tab is what the tab opens onto (R2).
-    fn desktop_tab_floor(&self, cx: &gpui::App) -> Option<gpui::Rgba> {
-        if self.home_is_shown() || self.connection_inline() || !self.active_tab_is_solo() {
-            return None;
-        }
-        let layout = self.workspace.layout();
-        let id = layout.active_session()?;
-        if self.files.is_open(id) {
-            return None;
-        }
-        let desktop = self.desktop_for(id)?;
-        // Where the current tab stands in the strip, from the strip's last layout: a
-        // compact strip holds the current tab alone.
-        let current = layout
-            .active_tab_id()
-            .and_then(|current| layout.tabs().iter().position(|tab| tab.id() == current));
-        let item = if self.header_compact() {
-            Some(0)
-        } else {
-            current
-        };
-        let span = item
-            .and_then(|item| self.tab_scroll.bounds_for_item(item))
-            .map(|tab| {
-                let offset = self.tab_scroll.offset().x;
-                (tab.left() + offset, tab.right() + offset)
-            });
-        desktop.read(cx).top_edge_colour(span)
-    }
-
     /// The label of one tab: the user's own name, or the session's title numbered
     /// when an earlier tab has the same one, so two shells of one program can be told
     /// apart at a glance.
@@ -17777,7 +17719,8 @@ impl ShelluneView {
             .track_scroll(&handle)
             .overflow_x_scroll()
             .flex()
-            .items_end()
+            .items_center()
+            .gap(metrics.scale(spacing::HALF))
             .h_full()
             .min_w_0()
             .debug_selector(|| "session.tabs".to_owned());
@@ -18059,17 +18002,6 @@ impl ShelluneView {
             .id(selector)
             .debug_selector(move || selector.to_owned())
             .tooltip(components::tooltip(detail))
-    }
-
-    /// The word and tone [`Self::x11_chip`] draws, for what measures the chip's room.
-    pub(super) fn x11_chip_word(&self, status: &X11Status) -> (&'static str, Tone) {
-        let strings = self.strings();
-        match status {
-            X11Status::Off => (strings.x11_bar_off, Tone::Neutral),
-            X11Status::Enabling => (strings.x11_bar_enabling, Tone::Warning),
-            X11Status::Ready { .. } => (strings.x11_bar_ready, Tone::Positive),
-            X11Status::Failed { .. } => (strings.x11_bar_failed, Tone::Danger),
-        }
     }
 
     /// The save result, on the session bar that holds the save button.
@@ -18840,29 +18772,16 @@ fn overlay_layer() -> Div {
 }
 
 /// The floor of the pages a tab opens onto that are not a terminal: the hosts home and
-/// a connection being set up.
-///
-/// The current tab is painted with it, so the tab and the page under it join without
-/// an edge (R2); the home paints its own floor from here as well, so the two cannot
-/// drift apart.
+/// a connection being set up, which both paint it from here so they cannot drift apart.
 pub(super) const PAGE_FLOOR: theme::Token = palette::CANVAS;
 
-/// The background the terminal paints right under the head, in the terminal scheme of
-/// the window being drawn: the floor a terminal's tab joins (R2).
-fn terminal_floor() -> gpui::Rgba {
-    let background = shellune_terminal::palette::BACKGROUND;
-    let value =
-        u32::from(background.r) << 16 | u32::from(background.g) << 8 | u32::from(background.b);
-    gpui::rgb(theme::terminal_color(value))
-}
-
-/// The browser-shaped frame every tab of the strip shares (R2).
+/// The pill every tab of the strip shares (R2, ADR-7).
 ///
-/// The tabs stand on the head's bottom edge. The current tab is painted with the floor
-/// of the page it opens onto and is drawn down over the hairline that closes the head,
-/// with an edge on its top and sides and a rounded top, so it and the page read as one
-/// sheet. The other tabs are clear on the chrome and take a light fill under the
-/// pointer. `divider` draws the hairline that separates two background neighbours.
+/// The tabs stand in the middle of the head. The current tab is a raised pill - the
+/// raised layer with a hairline edge all round - in the primary ink; the other tabs
+/// are their words alone on the chrome and take a light fill under the pointer. No
+/// tab joins the page under it any more, so no tab depends on the colour of what is
+/// under it.
 ///
 /// The frame is also a hover group named by `selector`, so the close button can show
 /// itself while the pointer is anywhere on the tab.
@@ -18870,8 +18789,6 @@ fn browser_tab(
     id: impl Into<gpui::ElementId>,
     selector: String,
     selected: bool,
-    divider: bool,
-    floor: gpui::Rgba,
     metrics: Metrics,
 ) -> Stateful<Div> {
     let hover = theme::swatch(palette::SURFACE_HOVER);
@@ -18886,62 +18803,21 @@ fn browser_tab(
         .gap(metrics.scale(spacing::HAIRLINE))
         .h(metrics.tab_height())
         .pl(metrics.scale(spacing::SNUG - 2.0))
-        .pr(metrics.scale(spacing::HAIRLINE))
-        .rounded_t(px(radius::LARGE))
+        .pr(metrics.scale(spacing::HALF))
+        .rounded(px(radius::MEDIUM))
+        // Every tab keeps the edge's room, so the current one does not shift its words
+        // by a pixel against the others.
+        .border_1()
         .text_size(metrics.label_size())
         .cursor_pointer();
-    let tab = if selected {
-        tab.bg(floor)
-            .border_t_1()
-            .border_l_1()
-            .border_r_1()
+    if selected {
+        tab.bg(theme::swatch(palette::RAISED))
             .border_color(theme::swatch(palette::BORDER))
-            .text_color(text_on(floor))
+            .text_color(theme::swatch(palette::TEXT_PRIMARY))
     } else {
-        tab.text_color(theme::swatch(palette::TEXT_SECONDARY))
+        tab.border_color(gpui::transparent_black())
+            .text_color(theme::swatch(palette::TEXT_SECONDARY))
             .hover(move |style| style.bg(hover).text_color(hover_text))
-    };
-    tab.when(divider, |tab| {
-        tab.child(
-            div()
-                .absolute()
-                .left_0()
-                .top((metrics.tab_height() - metrics.scale(16.0)) / 2.0)
-                .w(px(1.0))
-                .h(metrics.scale(16.0))
-                .bg(theme::swatch(palette::BORDER_STRONG)),
-        )
-    })
-}
-
-/// The primary text colour that reads on `floor`, a colour that may come from outside
-/// the window's palette - a terminal scheme of the other palette, or a remote picture:
-/// the palette's own primary text where it reads better, the other palette's otherwise
-/// (R2).
-pub(super) fn text_on(floor: gpui::Rgba) -> gpui::Rgba {
-    fn luminance(color: gpui::Rgba) -> f32 {
-        let channel = |value: f32| {
-            if value <= 0.039_28 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
-    }
-    let contrast = |text: gpui::Rgba| {
-        let (a, b) = (luminance(text), luminance(floor));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    };
-    let own = theme::swatch(palette::TEXT_PRIMARY);
-    let other = gpui::rgb(palette::TEXT_PRIMARY.value(match theme::appearance() {
-        theme::Appearance::Dark => theme::Appearance::Light,
-        theme::Appearance::Light => theme::Appearance::Dark,
-    }));
-    if contrast(other) > contrast(own) {
-        other
-    } else {
-        own
     }
 }
 
@@ -19092,7 +18968,7 @@ impl StripEnds {
         }
         let offset = handle.offset().x;
         let max = handle.max_offset().width;
-        let slack = px(0.5);
+        let slack = STRIP_ROUNDING_SLACK;
         Self {
             before: offset < -slack,
             after: max > slack && offset > -max + slack,
@@ -19106,8 +18982,15 @@ impl StripEnds {
 /// It reads the scroll range itself rather than [`StripEnds`]: a strip too narrow for
 /// its scroll buttons reports no hidden end, and its tabs still run on past it.
 pub(super) fn strip_overflows(handle: &gpui::ScrollHandle) -> bool {
-    handle.max_offset().width > px(0.5)
+    handle.max_offset().width > STRIP_ROUNDING_SLACK
 }
+
+/// How far the strip's tabs may run past it before it counts as running on (R2).
+///
+/// Each tab's edges are rounded to the display's pixels, so tabs that fit exactly can
+/// end a device pixel past the strip - two thirds of a point at 150% - and that pixel
+/// is no hidden tab: it must not draw a scroll button or the list of every tab.
+const STRIP_ROUNDING_SLACK: gpui::Pixels = px(1.5);
 
 /// How far a fade reaches into the strip from an end that tabs run on past (R2).
 fn strip_fade_width(metrics: Metrics) -> gpui::Pixels {

@@ -1533,13 +1533,12 @@ impl Metrics {
         self.compact_control_height().max(px(HIT_TARGET))
     }
 
-    /// Height of one tab of the strip.
+    /// Height of one tab of the strip: 34 (ADR-7).
     ///
-    /// The strip's tabs stand on the head's bottom edge, so this is the header height
-    /// less the gap above them: the current tab then reaches down to the page it opens
-    /// onto (R2).
+    /// The tabs stand in the middle of the head, so the head's own height leaves an
+    /// even margin above and below the current tab's raised pill.
     pub fn tab_height(self) -> Pixels {
-        self.scale(36.0)
+        self.scale(34.0)
     }
 
     /// The narrowest a tab of the strip becomes before the strip scrolls instead (R2).
@@ -1722,10 +1721,10 @@ mod guard {
     use std::path::{Path, PathBuf};
 
     /// Bare `scale(<number>)` calls in the non-test source of `src/app`.
-    const SCALE_BASELINE: usize = 220;
+    const SCALE_BASELINE: usize = 203;
     /// Bare `px(<number>)` calls with a number other than zero in the non-test source
     /// of `src/app`.
-    const PX_BASELINE: usize = 82;
+    const PX_BASELINE: usize = 75;
 
     /// The files a colour literal is allowed in, and why.
     const COLOUR_HOMES: [&str; 2] = [

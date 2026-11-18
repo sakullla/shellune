@@ -660,6 +660,71 @@ fn show_disconnected(
     Ok(())
 }
 
+/// A long reason, the way a jump host or a dropped channel really words one: a
+/// sentence, the hop it came from and the raw transport error, over several lines.
+const LONG_DIAGNOSTIC: &str = "The connection to deploy@10.0.4.12:22 was lost while the \
+session was live: no answer to 3 keepalive probes sent 15 seconds apart.
+hop 1: jump.example.com:22 (bastion) answered; hop 2: 10.0.4.12:22 stopped answering.
+transport: channel 0 closed by the peer: Connection reset by peer (os error 10054) \
+at C:\\Users\\someone\\AppData\\Local\\Temp\\shellune-ssh-0123456789abcdef\\control.sock
+the last 2 KiB of output were kept on screen; nothing typed after the loss was sent.
+retrying will dial the same chain again with the credentials the host remembers.";
+
+/// The banner over a saved host's terminal that failed after it had shown output
+/// (ADR-6): put back into connecting, the way a reconnect starts, and refused.
+fn show_banner_failed(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    let id = view.attach_capture_remote_session(&host, TRANSCRIPT.as_bytes(), Some(window), cx);
+    view.capture_reconnecting(id);
+    view.capture_end_session(id, SessionFailure::TimedOut);
+    Ok(())
+}
+
+/// The banner of a lost connection with its details unfolded (ADR-6).
+fn show_banner_details(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_disconnected(view, window, cx)?;
+    let id = view
+        .open_sessions()
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the fixture opened no session".to_owned())?;
+    view.capture_open_diagnostic(id);
+    Ok(())
+}
+
+/// The banner of a lost connection whose long diagnostic is unfolded (ADR-6).
+fn show_banner_long(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    let id = view.attach_capture_remote_session(&host, TRANSCRIPT.as_bytes(), Some(window), cx);
+    view.capture_end_session(
+        id,
+        SessionFailure::RemoteIoFailed {
+            host: host.target(),
+            reason: LONG_DIAGNOSTIC.to_owned(),
+        },
+    );
+    view.capture_open_diagnostic(id);
+    Ok(())
+}
+
 /// The serial strip, in the two states a device produces: open, and not open (R21).
 ///
 /// Two panes: one whose port is open and carries a transcript, and one whose port did not
@@ -2049,6 +2114,41 @@ fn tab_list_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     }
 }
 
+/// Where the failed banner shot has arrived: one session failed with its terminal kept.
+fn banner_failed_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    let failed = view
+        .workspace()
+        .sessions()
+        .items()
+        .iter()
+        .filter(|session| {
+            matches!(session.state(), SessionState::Failed(_))
+                && view.pane_of(session.id()).is_some()
+        })
+        .count();
+    if failed == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{failed} session(s) failed with a terminal, not the one the fixture refused"
+        ))
+    }
+}
+
+/// Where a details shot has arrived: the one lost session has its diagnostic open.
+fn banner_details_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    disconnected_ready(view, cx)?;
+    let open = view
+        .open_sessions()
+        .into_iter()
+        .any(|id| view.diagnostics_open(id));
+    if open {
+        Ok(())
+    } else {
+        Err("the diagnostic is not unfolded".to_owned())
+    }
+}
+
 fn disconnected_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     let ended = view
         .workspace()
@@ -3061,11 +3161,11 @@ pub const SCENARIOS: &[Scenario] = &[
         title: "本地终端 · 会话与标签",
         category: Category::Terminal,
         fixture: "one display-only session fed a fixed transcript; no PTY or shell ran",
-        evidence: "proves terminal layout, colour and text rendering, and the bar's three \
-                   groups - where the session is, its own controls, the terminal's tools; at \
-                   720x480 and 200% the bar follows the text size and folds the tools it has \
-                   no room for into its menu; proves nothing about a live shell, its \
-                   environment or its keystrokes",
+        evidence: "proves terminal layout, colour and text rendering, and the bar's two \
+                   sides - where the session is on the left; files, split, search and the \
+                   one menu that holds the terminal's tools on the right; at 720x480 and \
+                   200% the bar follows the text size; proves nothing about a live shell, \
+                   its environment or its keystrokes",
         quick: true,
         variants: &[
             Variant::dark().smallest(),
@@ -3237,7 +3337,7 @@ pub const SCENARIOS: &[Scenario] = &[
         category: Category::Terminal,
         fixture: "two display-only shells and one saved host's terminal, the second tab \
                   carrying a background bell",
-        evidence: "proves the browser-style strip: the current tab joins the page under it, \
+        evidence: "proves the strip of pills: the current tab is raised in the head's middle, \
                    each tab is a state dot, an icon, a cut title and a close button, and \
                    another tab's bell is marked while it is not the one on screen; no shell, \
                    SSH session or bell from a real program is part of it",
@@ -3322,8 +3422,8 @@ pub const SCENARIOS: &[Scenario] = &[
         fixture: "one session split left and right, the second pane holding a second \
                   display-only session",
         evidence: "proves a split marks its panes and its active pane without repeating the \
-                   session, and that each pane's bar folds the tools its width has no room \
-                   for into its menu instead of running past the pane; the second pane has \
+                   session, and that a pane of its own keeps search and its menu, with \
+                   every terminal tool in that menu, inside the pane; the second pane has \
                    no process behind it",
         quick: true,
         variants: &[
@@ -3338,24 +3438,83 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         id: "terminal-disconnected",
-        title: "终端 · 连接断开",
+        title: "终端 · 连接断开横幅",
         category: Category::Terminal,
         fixture: "a saved host's display-only terminal, ended the way a lost connection ends",
-        evidence: "proves the state, the target and the next step are a card centred over the \
-                   last screen, which keeps its size and stays legible behind it, and that \
-                   the card and the bar fit 720x480 at 200%; the capture runs with reduced \
-                   motion, so the card's entrance is not in the picture; no connection was \
-                   ever made, so no transport behaviour is shown",
+        evidence: "proves the state, the reason and the next step are one banner above the \
+                   last screen, which moves down under it and stays readable and uncovered, \
+                   and that the banner and the bar fit 720x480 at 200%; the capture runs with \
+                   reduced motion, so the banner's fade is not in the picture; no connection \
+                   was ever made, so no transport behaviour is shown",
         quick: true,
         variants: &[
             Variant::dark().chinese(),
             Variant::light().comfortable(),
             Variant::dark().smallest().largest(),
+            Variant::light().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_disconnected,
         ready: disconnected_ready,
+    },
+    Scenario {
+        id: "terminal-banner-failed",
+        title: "终端 · 失败横幅（已有内容）",
+        category: Category::Terminal,
+        fixture: "a saved host's display-only terminal put back into connecting the way a \
+                  reconnect starts, then refused with a timeout",
+        evidence: "proves a failure after the terminal had shown output is a banner above \
+                   the kept screen with its Reconnect, details and close; nothing was dialled",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_banner_failed,
+        ready: banner_failed_ready,
+    },
+    Scenario {
+        id: "terminal-banner-details",
+        title: "终端 · 横幅展开诊断",
+        category: Category::Terminal,
+        fixture: "the terminal-disconnected fixture with the banner's details unfolded",
+        evidence: "proves the diagnostic unfolds under the banner in the monospace face with \
+                   its copy command, between the banner and the grid, inside the window at \
+                   720x480 and 200%; nothing was copied",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_banner_details,
+        ready: banner_details_ready,
+    },
+    Scenario {
+        id: "terminal-banner-long",
+        title: "终端 · 横幅长诊断",
+        category: Category::Terminal,
+        fixture: "a saved host's display-only terminal ended with a fixed six-line reason \
+                  that quotes a hop, an error and a long path, its details unfolded",
+        evidence: "proves a long diagnostic wraps at the banner's width and stops at the \
+                   details' height, where it scrolls, and that the bar stays on screen at \
+                   720x480 and 200%; the reason is a fixture, not a real transport error",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::dark().smallest().largest(),
+            Variant::light().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_banner_long,
+        ready: banner_details_ready,
     },
     Scenario {
         id: "files-dual",

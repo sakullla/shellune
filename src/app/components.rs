@@ -993,20 +993,6 @@ pub(crate) fn segment_reserved_width(label: &str, metrics: Metrics) -> Pixels {
     (text + padding + border).min(cap)
 }
 
-/// Border-box width a [`chip`] with `label` in `tone` takes: its words, its padding, its
-/// hairline and, for any tone but the neutral one, its mark.
-pub(crate) fn chip_reserved_width(label: &str, tone: Tone, metrics: Metrics) -> Pixels {
-    let text = reserved_text_width(label, metrics.caption_size());
-    let padding = metrics.scale(spacing::TIGHT) * 2.0;
-    let border = px(2.0);
-    let mark = if tone == Tone::Neutral {
-        px(0.0)
-    } else {
-        metrics.scale(spacing::NARROW) * 2.0
-    };
-    text + padding + border + mark
-}
-
 /// Border-box floor for a [`compact_button`] label.
 pub(crate) fn compact_label_reserved_width(label: &str, metrics: Metrics) -> Pixels {
     let text = reserved_text_width(label, metrics.caption_size());
@@ -2771,6 +2757,20 @@ pub fn inline_banner(
     message: impl Into<SharedString>,
     metrics: Metrics,
 ) -> Div {
+    inline_banner_frame(tone, icon, metrics).child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+            .child(line_text(message)),
+    )
+}
+
+/// The [`inline_banner`] without its sentence: the tint, the hairline and the tone's
+/// icon, for a caller that draws its own sentence - one with a tooltip and a selector
+/// of its own - and its commands after it.
+pub fn inline_banner_frame(tone: Tone, icon: Icon, metrics: Metrics) -> Div {
     div()
         .flex()
         .flex_none()
@@ -2787,14 +2787,6 @@ pub fn inline_banner(
         .border_color(theme::faded(tone.text(), 0.24))
         .text_size(metrics.label_size())
         .child(icons::icon(icon, metrics.small_icon_size(), tone.text()))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .child(line_text(message)),
-        )
 }
 
 /// How far a piece of work has come, for a [`progress_bar`].

@@ -26,7 +26,7 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 |              |                                                                    |
 | >_ 本地终端   |                                                                    |  侧栏底部
 +----------------------------------------------------------------------------------+
-终端页（浏览器式标签：当前标签与下方页面连成一片，只有一条底边）：
+终端页（标签是头部垂直居中的胶囊：当前标签为 raised 底 + 发丝边，头部只有一条底边）：
 | [◐] [▤ 主机 3] ╭● ▣ prod-web ×╮ ● ▣ db … | ‹ ● ▣ api … › [⧉][+|v] ……拖动区…… [⌕] [⚙] [_][□][×] |  头部第一行：标签即身份
 | root@…:22  ● X11 关闭            ⫼ ⊟ [终端|文件] [⋯]  | ×                         |  头部第二行：目标、状态、操作
 +----------------------------------------------------------------------------------+
@@ -326,15 +326,13 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 **浏览器式标签（R2，`view.rs::browser_tab`、`session_tab`、`tab_strip`，`view/panes.rs::pending_tab`，
 `view/shell.rs::home_tab`）。** 三种标签共用同一个外框：
 
-- 标签条是 `chrome` 层；标签立在头部底边上（高 `Metrics::tab_height` = 36，顶部留 10）。当前标签用它所通向页面的
-  底色填充（`tab_floor`：有终端时是终端配色的背景；独占标签的远程桌面画面顶到头部时，是标签正下方那一行远程
-  画面的颜色（`DesktopPane::top_edge_colour`，按标签横向覆盖的列取平均；画面上方留有 canvas 边带、标签中点不在
-  画面上方或尚无画面时仍是 canvas）；主页与连接卡片页是 `PAGE_FLOOR` = `canvas`）。当前标签的文字色取能在这块
-  底色上读清的主文字色（`text_on`：本调色板的主文字色，或在对比更高时取另一调色板的），所以浅色画面或另一调色板
-  的终端配色上标题仍可读（测试 `the_current_desktop_tab_takes_the_colour_of_the_picture_under_it`、
-  `the_current_tab_writes_in_the_ink_its_floor_needs`）。顶部圆角 8、
-  上左右一条 `border` 发丝线、底边不画线，并盖住头部底边那条发丝线（发丝线先画、标签后画），与下方页面连成一张纸；
-  非当前标签透明，悬停时 `surface hover` 浅底。两个相邻的非当前标签之间画 1px `border strong` 分隔线，当前标签两侧不画。
+- 标签条是 `chrome` 层；标签是**胶囊**（ADR-7），在头部里垂直居中（高 `Metrics::tab_height` = 34，随缩放；
+  主机标签、标签条与滚动条都 `items_center`，相邻标签间距 `HALF`）。当前标签：`RAISED` 底、1px `BORDER` 发丝边、
+  圆角 `radius::MEDIUM`、主文字色；其他标签：同样留 1px 透明边（切换当前标签时字不会挪动一个像素）、次要文字色，
+  悬停 `surface hover` 浅底与主文字色。头部底边那条发丝线横贯整行，当前标签不再向下伸到页面、也不再取下方页面
+  （终端配色或远程画面）的颜色——旧的 `tab_floor`、`desktop_tab_floor`、`DesktopPane::top_edge_colour`、`text_on`
+  与相邻标签之间的竖分隔线都已移除，所以任何终端配色或画面下标签的对比都只由本调色板决定（测试
+  `the_tabs_are_pills_in_the_middle_of_the_head`：当前标签是 raised 胶囊、在头部中线上、不碰头部底边）。
 - 内容依次为：状态点（`components::pulsing_status_dot`；连接中在允许动效时以 `Motion::PULSE` 脉动，减少动效时静止，
   形状与色调仍表达状态）、辨识色竖条（有颜色时）、类型图标（当前标签为 accent）、标题、后台标记（响铃/结束）、关闭按钮。
   **状态文字不在标签里**，只在悬停提示里（名字 · 类型 · 目标 · 状态 · 跳转快捷键 · 标记），所以"连接中""已断开"不会把标签撑宽。
@@ -362,7 +360,9 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 "全部标签"、新建、搜索、设置与窗口按钮都在滚动条之外，20 个标签时仍在窗口内可点（测试覆盖）。
 
 **"全部标签"按钮只在有标签看不到时出现（R2，`overlays.rs::tab_list_control`、`tab_list_wanted`）。** 条件：
-标签条溢出（`strip_overflows`：滚动范围 `max_offset` > 0，直接读滚动范围而不是两端按钮，条窄到不画两端时也算），
+标签条溢出（`strip_overflows`：滚动范围 `max_offset` 超过 `STRIP_ROUNDING_SLACK` = 1.5，直接读滚动范围而不是两端按钮，
+条窄到不画两端时也算；每个标签的边都按显示器像素取整，恰好放下的标签可能多出一个设备像素——150% 时 0.67——
+这一点不是被藏起来的标签，不能画出滚动按钮与"全部标签"，两端按钮用同一个容差），
 或顶栏处于紧凑形态（只显示当前标签），或列表正开着（关闭前不让锚点消失）。所有标签都在条上可见时不画它——它只会
 重复标签条，还会站在最后一个标签和"+"之间。位置不变：标签条之后、"+"之前。溢出与否读上一帧布局，变化时由标签条
 的布局观察者（与两端渐隐同一个 canvas）再画一帧，所以按钮不会滞后一帧；按钮出现会让标签条更窄（仍溢出），消失会让
@@ -394,49 +394,74 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 测试 `the_top_rows_notices_never_cut_the_current_tab` 在 720×480 @100%/200% 与 1080–1920 @200% 下逐一断言三种形态与当前
 标签完整；截图场景 `tabs-notices` 覆盖三种形态。
 
-会话的信息与工具在**终端底栏**（`TerminalPane::bar`）。底栏分三组，随窗口文字大小缩放（`theme::metrics()`），
-外框 `overflow_hidden`，任何宽度下都不画出窗格：
+会话的信息与工具在**终端底栏**（`TerminalPane::bar`）。底栏只有左右两侧（ADR-7），随窗口文字大小缩放
+（`theme::metrics()`），外框 `overflow_hidden`，任何宽度下都不画出窗格：
 
-- **左组：会话在哪里**（`terminal.bar.left`，`flex_1`）。状态点、目标（SSH 为 `user@host:port`，本地为 Shell 路径；
+- **左侧：会话在哪里**（`terminal.bar.left`，`flex_1`）。状态点、目标（SSH 为 `user@host:port`，本地为 Shell 路径；
   点击复制）、非"已连接"时的状态 chip、非"关闭"的 X11 chip、未保存提示。目标以省略号截断，空间不够时它最先让位，
   但至少留下状态点（40，随缩放）。
-- **中组：会话自己的控件**（`terminal.bar.middle`）。可重连时的"重新连接"图标按钮（`session.reconnect`，↻，悬停提示
-  带快捷键；与邻居同为一个点击目标大小）、待处理的主按钮（保存主机 / 无法重连时的"关闭会话"）、
-  终端 | 文件 切换、分屏（仅有终端时），最后是会话菜单 `⋯`。左中两组由视图交给前台窗格
-  （`session_bar_parts` → `TerminalPane::set_session_slot(SessionSlot { left, controls, pinned }, left_floor)`）；`left_floor`
-  （`session_left_floor`）是左组在目标继续截断前需要的宽度：状态点、目标最少 64、以及每个 chip 的实际宽度。
-  中组分两段（R3、R9）：`controls`（`terminal.bar.controls`，顺序即 `session_bar_controls` 的 `BarControl` 列表）
-  在窄宽时**从末尾起整个让位**——放不下的控件换到被一行高度隐藏的第二行；连第一个控件都放不下时整段不画
-  （仍参与布局，测量不变），不会被裁成半截；`pinned`（会话菜单 `⋯` 与其后的分隔线）在段外、`flex_none`，中组
-  最窄收缩到它为止，**任何宽度下 `⋯` 都在底栏这一行上**。窗格测出让位的控件数（`bar_hidden_controls`），会话菜单
-  打开时按同一列表把让位的控件放在菜单最前（`session.more.reconnect/save_host/files/terminal/split_right/split_down`，
-  动作与底栏按钮相同），其后是分隔线和菜单原有项。左右分屏 720×480 @200% 时分屏按钮、乃至重新连接都经 `⋯` 可达
-  （测试 `a_narrow_split_bar_keeps_the_session_menu_and_offers_what_it_hides_there`）。搜索与"更多"永远可点。
-- **右组：终端工具**（`terminal.bar.tools`）。尺寸（`134×36`）、模式、搜索、复制 | A− 字号 A+。
-  放不下时按固定顺序收进"⋯ 更多"菜单（`terminal.more` → `terminal.more.menu`，`BarFold`）：先收字号，再收尺寸，
-  再收复制，最后收模式；搜索从不收起。是否收起只由上一帧测得的底栏宽度与中组自然宽度决定
-  （两者都不随收起变化，所以不会在两种形态间来回跳），工具自身宽度由窗格按令牌算出。菜单中字号步进不关闭菜单，
-  尺寸只陈述，复制与模式执行后关闭；Esc 或点菜单外关闭。
+- **右侧：会话自己的控件**（`terminal.bar.middle`）。可重连时的"重新连接"图标按钮（`session.reconnect`，↻，悬停提示
+  带快捷键）、待处理的主按钮（保存主机 / 无法重连时的"关闭会话"）、终端 | 文件 切换、分屏（仅有终端时），然后是
+  搜索（`terminal.search`），最后是会话菜单 `⋯`（`session.more`）。左侧与这些控件由视图交给前台窗格
+  （`session_bar_parts` → `TerminalPane::set_session_slot(SessionSlot { left, controls, pinned })`）。
+  `controls`（`terminal.bar.controls`，顺序即 `session_bar_controls` 的 `BarControl` 列表）在窄宽时**从末尾起整个
+  让位**——放不下的控件换到被一行高度隐藏的第二行；连第一个控件都放不下时整段不画（仍参与布局，测量不变），
+  不会被裁成半截；搜索与 `⋯` 在段外、`flex_none`，**任何宽度下搜索与 `⋯` 都在底栏这一行上**。窗格测出让位的控件数
+  （`bar_hidden_controls`），会话菜单打开时按同一列表把让位的控件放在菜单最前
+  （`session.more.reconnect/save_host/files/terminal/split_right/split_down`，动作与底栏按钮相同）。
+- **终端工具都在菜单里。** 底栏不再常驻尺寸（`134×36`）、模式、复制与 A− 字号 A+，也不再按宽度折叠它们（旧的
+  `BarFold`、`tools_width`、`session_left_floor`、`chip_reserved_width` 已移除）。`TerminalPane::tool_entries` 生成一组
+  菜单项：`terminal.more.size`（只陈述行列）、`.mode`、`.copy`、`.font.decrease/.font.increase/.font.reset`；
+  字号步进不关闭菜单，模式与复制执行后关闭（`MenuCloser::Own` 关窗格自己的菜单，`MenuCloser::Window` 关视图画的
+  会话菜单）。前台窗格的会话菜单（`view/sessions.rs`，`bar_session()` 即该会话时）在原有项之后接上这组工具；菜单
+  最高 `max_h`、超出时纵向滚动（`session.more.scroll`）。没有会话槽位的窗格（分屏里的另一窗格）在自己的底栏上
+  只画搜索与它自己的 `terminal.more`（`terminal.more.menu`，同一组工具）。Esc 或点菜单外关闭。测试
+  `the_terminal_bar_keeps_files_split_search_and_more_and_its_tools_are_in_the_menu`、
+  `a_pane_of_its_own_keeps_search_and_its_menu_with_every_tool_in_it`。
 
 文件视图或没有终端时，左中两组画成独立底栏（`standalone_session_bar`）。"X11 关"是默认状态，不再显示。
 
-**会话状态卡**（`components::status_card`）。会话结束（断开、失败、程序退出）时，原因不再是终端上方的横幅，
-而是居中叠在最后一屏之上的卡片（`failure_notice` 经 `TerminalPane::set_status_overlay` 交给前台窗格，
-`terminal.status.overlay`）：raised + 强边 + 圆角 12 + Overlay，左侧色调徽记块（连接断开为插头，正常退出为终端），
-标题是会话投影的状态词，下一行是等宽目标（单行省略号截断，完整目标在悬停提示与底栏里；Shell 的完整路径是一个
-不可断开的长词，按字换行曾让卡片高出窗口），下面是下一步（重新连接 / 关闭会话）与"显示详情"。网格尺寸不变，
-卡片下面铺一层 55% 的终端底色，最后一屏仍可读，卡片之外的网格仍可选择与滚动；卡片本身吃掉指针。遮罩只盖网格、
-`overflow_hidden`，卡片放在不高于遮罩的滚动盒里（`terminal.status.scroll`，从卡片顶部开始滚动）：窗格比卡片矮时
-（如上下分屏 @200%）卡片可滚动查看，不会盖住底栏或画出窗口。卡片挡住按下与悬停、但让滚轮穿过
-（`entering_status_card` 用 `block_mouse_except_scroll`），所以指针停在卡片上也能滚动它（测试
-`the_wheel_over_an_ended_card_scrolls_it_in_a_short_pane`）。卡片上的"重新连接"是带文字的主按钮，底栏中组
-同时保留"重新连接"图标按钮（R8 的底栏入口），卡片放不下下一步时用它；底栏连它也放不下时经会话菜单 `⋯` 到达。测试
-`an_ended_shell_*` 覆盖单窗格、左右与上下分屏在设计尺寸与 720×480 @200% 下的卡片尺寸与可点的重新连接。没有终端的会话（连接中且已转到后台、或尚未打开终端）在窗格位置画同一种卡片：
-连接中用进行中指示条作徽记并说明"连接建立后，终端会在这里打开"（`session_state_card`）。这类卡片与上面同一结构
+**终端状态横幅**（ADR-6、R5，`view/banner.rs`）。会话结束（断开、失败、程序退出）、在终端已经显示过内容之后失败，
+或正在重连时，状态不再是叠在最后一屏上的卡片，而是终端**上方**的一行横幅（`terminal.failure`，重连中为
+`terminal.reconnecting`；外层 `terminal.banner`）：网格整体下移到横幅之下，最后一屏完整可读、可滚动、可选择与复制，
+不被任何东西盖住。视图经 `hand_banner` → `TerminalPane::set_status_banner(元素, 焦点)` 交给窗格，窗格把它画在
+自己那一列的网格之上（`banner_slot`）。
+
+- **一行**（`banner_line`，高 `large_control_height`，可收缩、`overflow_hidden`）：外框是
+  `components::inline_banner_frame(tone, icon)`（色调 chip 底 + 色调 24% 的底边发丝线 + 色调图标），然后是一句话
+  （`terminal.failure.headline`：状态词 · 原因，单行省略号截断，完整句子与会话目标在悬停提示里），右侧依次是下一步
+  （`terminal.failure.next`：重新连接，或无法重连时的关闭会话；重连中为 `terminal.reconnecting.cancel` 取消）、
+  "显示详情 / 收起详情"（`terminal.failure.details`）与关闭（`terminal.failure.dismiss`，悬停提示带 Esc）。
+  窗格（或文件视图占位时的窗口）窄于 `BANNER_WORDS_WIDTH`（560，随缩放）时命令改为图标按钮，名字在悬停提示里，
+  句子保住这一行的空间。重连中横幅用不定进度条作徽记。
+- **详情**在横幅下方展开（`terminal.failure.detail`）："诊断"标题与"复制诊断"（`terminal.failure.copy`），下面是等宽字的
+  完整诊断（`terminal.failure.diagnostic`，`copyable_lines`：每行一个按横幅宽度换行的块，点任何一行复制全部），
+  最高 `DIAGNOSTIC_MAX_HEIGHT`（160，随缩放）、超出时纵向滚动。展开后长诊断需要多布局一帧（`window.on_next_frame`
+  请求重画）。复制的是会话陈述的整段诊断（哪个会话停止 + 原因），经 `sanitize_diagnostic` 清理。
+- **键盘**：横幅出现时不抢键盘。终端不再接收输入时，在终端里按 Tab 到达横幅第一个控件；Tab / Shift+Tab 在
+  `BannerStop`（下一步、详情、复制、关闭）之间走，走过最后一个回到终端；Enter 或 Space 按下当前控件；Esc 关闭横幅
+  （`dismiss_active_banner`，接在视图的 Esc 链上），直到会话陈述别的状态（`banner_closed` 按会话记住关闭时的状态键）。
+- **重连在最后一屏上进行。** `reconnect_session` 用 `keep_reconnect_screen` 留住旧窗格与失败记录
+  （`reconnect_screens`）；新连接建立前，标签里仍画旧窗格的最后一屏，上方是"正在重新连接"横幅与取消
+  （`cancel_reconnect`），连接卡片与 `layout_terminal` 在 `connection_behind_screen()` 时让位；新窗格接上
+  （`attach_pane` / 桌面接上）或会话关闭时 `forget_reconnect_screen`。重连被拒时横幅回到失败状态。
+- 底栏中组同时保留"重新连接"图标按钮（R8 的底栏入口）；横幅关闭后仍可从底栏或会话菜单重连。
+- 测试：`a_dropped_session_states_itself_in_a_banner_above_its_last_screen`、
+  `the_banner_closes_with_its_button_or_escape_and_the_bar_keeps_reconnect`、`tab_reaches_the_banner_and_enter_presses_its_step`、
+  `a_long_diagnostic_unfolds_under_the_banner_scrolls_and_copies`、
+  `a_reconnect_runs_under_a_banner_over_the_last_screen_and_can_be_cancelled`，以及 `an_ended_shell_*`（单窗格、左右与上下
+  分屏在设计尺寸与 720×480 @200% 下横幅可见、下一步可达；上下分屏 @200% 时窗格比横幅一行还矮，横幅行被压短）。
+  截图场景 `terminal-disconnected`、`terminal-banner-failed`、`terminal-banner-details`、`terminal-banner-long`。
+
+**仍用卡片的状态。** 还没有任何屏幕内容的会话——首次连接、证书或密码的问题——仍是居中卡片。
+没有终端的会话（连接中且已转到后台、或尚未打开终端）在窗格位置画状态卡片（`components::status_card` 结构）：
+连接中用进行中指示条作徽记并说明"连接建立后，终端会在这里打开"（`session_state_card`）。这类卡片的结构
 （`status_card_floor`：外层 `overflow_hidden` 居中，内层 `pane.state.scroll` 最高为窗格高、纵向滚动），矮窗格里从
 卡片顶部开始、滚轮在卡片上可滚（测试 `a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wheel`）。远程桌面与窄窗口下
 铺满的文件视图占着终端的位置，此时卡片画在内容上方居中。所有状态卡与连接卡片（`remote.page.card`）进入时
 `Enter::Rise`（BASE），按会话 id 只播放一次；减少动效时直接画在最终位置。
+
+**选择器变更（T6，供 T9 汇总）**：删除 `terminal.status.overlay`、`terminal.status.scroll`（状态卡改为横幅）、底栏常驻工具 `terminal.grid.size`、`terminal.mode`、`terminal.font.decrease/.increase/.reset`（同名动作在菜单里：`terminal.more.size`、`terminal.more.mode`、`terminal.more.copy`、`terminal.more.font.decrease/.increase/.reset`）；新增 `terminal.banner`、`terminal.failure.copy/.detail/.dismiss`、`terminal.reconnecting(.headline/.cancel/.dismiss)`、`session.more.scroll`；保留 `terminal.failure(.headline/.next/.details/.diagnostic)`、`terminal.bar(.left/.middle/.controls/.tools)`、`terminal.search`、`terminal.more(.menu)`、`session.more(.menu)`、`session.tab.<n>`。
 
 **连接在标签里进行。** 按"连接"后标签立即出现并切过去，连接卡片（`connection_page`，与对话框同一份内容
 `connection_content`）画在终端区域中央：四步进度、需要回答的问题、失败原因与重试都在这里，不再是盖住主页的
@@ -977,7 +1002,8 @@ tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得�
 | --- | --- | --- | --- |
 | 迁移前（`d59a63f`，T3 记录） | 280 | 91（另有 316 处 `px(0)`，不计） | ADR-9 的“一半以下”以这一行为准：最终需 `scale` ≤ 140、`px` ≤ 45 |
 | T3 之后 | 267 | 82 | 新组件只用 spacing 令牌；状态标记与选中竖条的 1 / 1.5 / 2px 收为 `MARK_CORNER` / `MARK_STROKE` / `MARK_BAR_WIDTH` |
-| T4 之后（当前基线） | 220 | 82 | 首页改为侧栏 + 单列表：卡片带、快速连接栏、分组列与分组头删除；新代码的尺寸都是命名常量（`SIDEBAR_WIDTH` 等）或 spacing 令牌 |
+| T4 之后 | 220 | 82 | 首页改为侧栏 + 单列表：卡片带、快速连接栏、分组列与分组头删除；新代码的尺寸都是命名常量（`SIDEBAR_WIDTH` 等）或 spacing 令牌 |
+| T6 之后（当前基线） | 203 | 75 | 标签改为胶囊（标签底色、分隔线与远程画面取色删除）；底栏终端工具收进菜单（折叠测量与 `tools_width` 删除）；状态卡改为横幅，横幅只用 spacing 令牌与命名常量（`DIAGNOSTIC_MAX_HEIGHT`、`BANNER_WORDS_WIDTH`）；标签条溢出容差 `STRIP_ROUNDING_SLACK` |
 
 ### 终端内搜索（`crates/terminal` + `src/app/terminal.rs`）
 

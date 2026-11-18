@@ -1068,8 +1068,6 @@ pub struct Strings {
     pub pane_mode_classic: &'static str,
     /// Command-block mode, restored as a preference. Output is not brought back.
     pub pane_mode_integrated: &'static str,
-    /// Toolbar: show the classic grid.
-    pub terminal_mode_classic: &'static str,
     /// Toolbar: show command blocks when the shell reports them.
     pub terminal_mode_blocks: &'static str,
     /// Command block that has not ended.
@@ -1677,7 +1675,6 @@ pub static ENGLISH: Strings = Strings {
     workspace_dangling_pane: "The saved active pane is not on its tab. Choose a pane. The layout was kept.",
     pane_mode_classic: "Classic terminal",
     pane_mode_integrated: "Command blocks, not restored",
-    terminal_mode_classic: "Classic grid",
     terminal_mode_blocks: "Command blocks",
     terminal_block_running: "Running",
     terminal_block_unknown: "Unknown",
@@ -2227,7 +2224,6 @@ pub static CHINESE: Strings = Strings {
     workspace_dangling_pane: "保存的活动窗格不在它的标签上。请另选一个窗格，布局已保留。",
     pane_mode_classic: "经典终端",
     pane_mode_integrated: "命令块模式，内容未恢复",
-    terminal_mode_classic: "经典网格",
     terminal_mode_blocks: "命令块",
     terminal_block_running: "进行中",
     terminal_block_unknown: "未知",
@@ -3206,6 +3202,16 @@ pub struct UxStrings {
     pub terminal_grid_size: &'static str,
     /// The line under it: the attempt's own steps are behind the tab
     pub session_connecting_card_hint: &'static str,
+    /// The banner over a terminal whose session is coming back: `{target}` (ADR-6)
+    pub banner_reconnecting: &'static str,
+    /// The banner's command that stops a reconnect and keeps the last screen
+    pub banner_cancel: &'static str,
+    /// Tooltip of the banner's close button
+    pub banner_dismiss: &'static str,
+    /// The title of the banner's unfolded diagnostic
+    pub banner_diagnostic: &'static str,
+    /// The command that copies the whole diagnostic
+    pub banner_copy_diagnostic: &'static str,
 }
 
 impl UxStrings {
@@ -3614,6 +3620,11 @@ impl UxStrings {
             self.terminal_more,
             self.terminal_grid_size,
             self.session_connecting_card_hint,
+            self.banner_reconnecting,
+            self.banner_cancel,
+            self.banner_dismiss,
+            self.banner_diagnostic,
+            self.banner_copy_diagnostic,
         ]
     }
 }
@@ -4037,6 +4048,11 @@ included",
     terminal_more: "More terminal tools",
     terminal_grid_size: "Terminal size",
     session_connecting_card_hint: "The terminal opens here as soon as the connection is up.",
+    banner_reconnecting: "Reconnecting to {target}\u{2026}",
+    banner_cancel: "Cancel",
+    banner_dismiss: "Dismiss (Esc)",
+    banner_diagnostic: "Diagnostics",
+    banner_copy_diagnostic: "Copy diagnostics",
 };
 
 /// Simplified Chinese.
@@ -4455,6 +4471,11 @@ pub static CHINESE_UX: UxStrings = UxStrings {
     terminal_more: "更多终端工具",
     terminal_grid_size: "终端尺寸",
     session_connecting_card_hint: "连接建立后，终端会在这里打开。",
+    banner_reconnecting: "正在重新连接 {target}\u{2026}",
+    banner_cancel: "取消",
+    banner_dismiss: "关闭（Esc）",
+    banner_diagnostic: "诊断信息",
+    banner_copy_diagnostic: "复制诊断",
 };
 
 /// The redesigned-shell strings of the current language.

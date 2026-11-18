@@ -190,9 +190,8 @@ impl ShelluneView {
     /// session's actions. Drawing the name again under the tabs is what made the old
     /// window spend two rows on one object.
     pub(super) fn session_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
-        // The hairline that closes the head is drawn first and the row over it, so the
-        // current tab, which reaches the bottom edge, covers it and joins the page
-        // below; everywhere else the line shows (R2).
+        // One hairline closes the head along its whole width; the current tab is a
+        // raised pill inside the head and no longer reaches it (ADR-7).
         div()
             .relative()
             .flex()
@@ -245,19 +244,18 @@ impl ShelluneView {
                     .child(brand_mark(metrics.scale(22.0), metrics))
             });
 
-        // The tabs stand on the head's bottom edge, so the current one reaches down to
-        // the page it opens onto. The hosts tab is pinned and never cut: the row's
-        // narrowest is at least its width. The session tabs scroll beside it once they
-        // do not fit, and only they give up room (R2).
+        // The tabs stand in the middle of the head (ADR-7). The hosts tab is pinned and
+        // never cut: the row's narrowest is at least its width. The session tabs scroll
+        // beside it once they do not fit, and only they give up room (R2).
         let home = div()
             .flex()
-            .items_end()
+            .items_center()
             .flex_none()
             .h(height)
             .child(self.home_tab(compact, cx));
         let tabs = div()
             .flex()
-            .items_end()
+            .items_center()
             .flex_initial()
             .min_w_0()
             .h(height)
@@ -593,15 +591,6 @@ impl ShelluneView {
             )
             .into_any_element(),
         );
-        // The terminal's own tools follow in the same bar when there is a terminal.
-        if has_terminal {
-            pinned.push(
-                components::divider_vertical(metrics)
-                    .h(metrics.scale(12.0))
-                    .mx(metrics.scale(spacing::HAIRLINE))
-                    .into_any_element(),
-            );
-        }
         Some(SessionBarParts {
             left,
             controls: right,
@@ -610,7 +599,7 @@ impl ShelluneView {
     }
 
     /// The session the bar under the terminal speaks for.
-    fn bar_session(&self) -> Option<SessionId> {
+    pub(super) fn bar_session(&self) -> Option<SessionId> {
         if self.workspace.layout().active_tab().is_some() {
             self.workspace.layout().active_session()
         } else {
@@ -687,51 +676,6 @@ impl ShelluneView {
                 BarControl::SplitDown => "pane.split.down",
             })
             .collect()
-    }
-
-    /// The room the left half of [`Self::session_bar_parts`] needs before its target is
-    /// cut further: the status mark, a few letters of the target and every chip it
-    /// draws, which do not shrink (R3).
-    ///
-    /// The terminal's bar reads it to decide how many of its own tools fold, so a state
-    /// chip or a failed display bridge is never what the tools push out of the bar.
-    pub(super) fn session_left_floor(&self) -> Pixels {
-        let metrics = self.metrics();
-        let gap = metrics.scale(spacing::TIGHT);
-        let mut floor = metrics.scale(7.0) + gap + metrics.scale(64.0);
-        let id = if self.workspace.layout().active_tab().is_some() {
-            self.workspace.layout().active_session()
-        } else {
-            self.active
-        };
-        let Some(session) = id.and_then(|id| self.workspace.session(id)) else {
-            return floor;
-        };
-        let status = crate::app::workspace::SessionStatus::of(session);
-        if !status.phase().is_live() {
-            let label = status.headline(self.workspace.locale());
-            floor += gap + components::chip_reserved_width(&label, status.tone(), metrics);
-        }
-        if let Some(x11) = self
-            .x11
-            .get(&session.id())
-            .filter(|status| !matches!(status, X11Status::Off))
-        {
-            let (label, tone) = self.x11_chip_word(x11);
-            floor += gap + components::chip_reserved_width(label, tone, metrics);
-        }
-        if self
-            .unsaved
-            .iter()
-            .any(|(unsaved, _)| *unsaved == session.id())
-        {
-            floor += gap
-                + components::reserved_text_width(
-                    self.strings().quick_unsaved_note,
-                    metrics.caption_size(),
-                );
-        }
-        floor
     }
 
     /// The session bar on its own, for when no terminal is on screen to carry it: the
@@ -965,46 +909,39 @@ impl ShelluneView {
             Some(shortcut) => format!("{name} · {shortcut}"),
             None => name,
         };
-        super::browser_tab(
-            "nav.hosts",
-            "nav.hosts".to_owned(),
-            selected,
-            false,
-            self.tab_floor(cx),
-            metrics,
-        )
-        // Pinned and always there, so it is only as wide as its word and count (up to
-        // the strip's widest tab): the room it does not take is the session tabs'.
-        .flex_none()
-        .max_w(metrics.tab_max_width())
-        .pr(metrics.scale(spacing::SNUG - 2.0))
-        .tooltip(components::tooltip(SharedString::from(tooltip)))
-        .on_click(cx.listener(|this, _event, window, cx| {
-            this.select(Destination::Hosts, window, cx);
-        }))
-        .child(
-            super::tab_body(metrics)
-                .child(super::tab_icon(Icon::Server, selected, metrics))
-                // One short word that is never cut, with the count right after it.
-                .when(!compact, |body| {
-                    body.child(
-                        div()
-                            .flex_none()
-                            .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
-                            .debug_selector(|| "nav.hosts.title".to_owned())
-                            .child(strings.nav_hosts),
-                    )
-                })
-                .when(count > 0 && !compact, |body| {
-                    body.child(
-                        div()
-                            .flex_none()
-                            .text_size(metrics.caption_size())
-                            .text_color(theme::swatch(palette::TEXT_MUTED))
-                            .child(SharedString::from(count.to_string())),
-                    )
-                }),
-        )
+        super::browser_tab("nav.hosts", "nav.hosts".to_owned(), selected, metrics)
+            // Pinned and always there, so it is only as wide as its word and count (up to
+            // the strip's widest tab): the room it does not take is the session tabs'.
+            .flex_none()
+            .max_w(metrics.tab_max_width())
+            .pr(metrics.scale(spacing::SNUG - 2.0))
+            .tooltip(components::tooltip(SharedString::from(tooltip)))
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.select(Destination::Hosts, window, cx);
+            }))
+            .child(
+                super::tab_body(metrics)
+                    .child(super::tab_icon(Icon::Server, selected, metrics))
+                    // One short word that is never cut, with the count right after it.
+                    .when(!compact, |body| {
+                        body.child(
+                            div()
+                                .flex_none()
+                                .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
+                                .debug_selector(|| "nav.hosts.title".to_owned())
+                                .child(strings.nav_hosts),
+                        )
+                    })
+                    .when(count > 0 && !compact, |body| {
+                        body.child(
+                            div()
+                                .flex_none()
+                                .text_size(metrics.caption_size())
+                                .text_color(theme::swatch(palette::TEXT_MUTED))
+                                .child(SharedString::from(count.to_string())),
+                        )
+                    }),
+            )
     }
 
     /// "+" opens the default shell in a new tab; the chevron lists every shell, quick
@@ -1667,7 +1604,9 @@ impl ShelluneView {
             return None;
         }
         // An attempt that has its own tab is shown in that tab, not over the page.
-        if self.connection_inline() {
+        // A reconnect that asks nothing runs under the banner over the last screen it
+        // keeps (ADR-6); its dialog comes back when it asks a question or fails.
+        if self.connection_inline() || self.connection_behind_screen() {
             return None;
         }
         let content = self.connection_content(cx)?;

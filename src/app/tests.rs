@@ -47,8 +47,8 @@ use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
 use crate::app::serial::{DeviceChoice, PortScan, SerialLink};
 use crate::app::terminal::{
-    BarFold, PaneState, SELECTION_DRAG_THRESHOLD, SearchNote, SnippetOffer, SourceEvent,
-    TerminalAttention, TerminalPane, TerminalShortcuts,
+    PaneState, SELECTION_DRAG_THRESHOLD, SearchNote, SnippetOffer, SourceEvent, TerminalAttention,
+    TerminalPane, TerminalShortcuts,
 };
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
@@ -2255,7 +2255,6 @@ fn rendered_strings(strings: &Strings) -> Vec<(&'static str, &'static str)> {
             workspace_dangling_pane,
             pane_mode_classic,
             pane_mode_integrated,
-            terminal_mode_classic,
             terminal_mode_blocks,
             terminal_block_running,
             terminal_block_unknown,
@@ -5349,7 +5348,9 @@ async fn the_font_size_controls_change_the_grid(cx: &mut TestAppContext) {
         (pane.font_size(), pane.grid().cols)
     });
 
-    let bounds = bounds_of(cx, "terminal.font.increase");
+    // The font size is in the bar's menu (ADR-7); a step leaves the menu open.
+    click(cx, "terminal.more");
+    let bounds = bounds_of(cx, "terminal.more.font.increase");
     let center = bounds.center();
     cx.simulate_click(point(center.x, center.y), Modifiers::default());
     cx.run_until_parked();
@@ -5364,7 +5365,7 @@ async fn the_font_size_controls_change_the_grid(cx: &mut TestAppContext) {
         "a larger font must not fit more columns than before"
     );
 
-    let bounds = bounds_of(cx, "terminal.font.decrease");
+    let bounds = bounds_of(cx, "terminal.more.font.decrease");
     let center = bounds.center();
     cx.simulate_click(point(center.x, center.y), Modifiers::default());
     cx.run_until_parked();
@@ -19755,13 +19756,7 @@ async fn icon_controls_keep_a_24_by_24_pointer_target_at_the_smallest_text_size(
 
     // The terminal's own controls follow the same rule.
     let (_pane, cx) = pane_with("", cx);
-    for selector in [
-        "terminal.mode",
-        "terminal.search",
-        "terminal.copy",
-        "terminal.font.increase",
-        "terminal.font.decrease",
-    ] {
+    for selector in ["terminal.search", "terminal.more"] {
         assert_pointer_target(cx, selector);
     }
 }
@@ -31030,13 +31025,14 @@ async fn terminal_scrollback_jump_pill_select_all_and_font_reset_work_end_to_end
         "Select All copies both scrollback and live screen: {copied:?}"
     );
 
-    // Clicking the font readout resets the font size back to DEFAULT_FONT_SIZE.
-    click(cx, "terminal.font.increase");
-    click(cx, "terminal.font.increase");
+    // The menu's reset puts the font size back to DEFAULT_FONT_SIZE.
+    click(cx, "terminal.more");
+    click(cx, "terminal.more.font.increase");
+    click(cx, "terminal.more.font.increase");
     assert!(
         cx.update(|_window, app| pane.read(app).font_size()) > shellune_terminal::DEFAULT_FONT_SIZE
     );
-    click(cx, "terminal.font.reset");
+    click(cx, "terminal.more.font.reset");
     assert_eq!(
         cx.update(|_window, app| pane.read(app).font_size()),
         shellune_terminal::DEFAULT_FONT_SIZE,
@@ -34646,42 +34642,15 @@ async fn an_update_waits_for_saves_held_by_a_sync_before_the_installer_starts(
 // The terminal's bar and its status cards (R3)
 // ---------------------------------------------------------------------------
 
-/// The controls the bar draws now: the session's half when it carries it, and this
-/// pane's tools less what is folded into the menu.
-///
-/// GPUI keeps the last bounds of a selector that is no longer drawn, so the list comes
-/// from the fold the pane reports rather than from what was ever measured.
-fn drawn_bar_controls(fold: BarFold, with_session: bool) -> Vec<&'static str> {
-    let mut drawn = Vec::new();
+/// The controls the bar always draws on its line (ADR-7): where the session is, search
+/// and the session's menu when the pane carries the session's half, search and the
+/// pane's own menu otherwise.
+fn drawn_bar_controls(with_session: bool) -> Vec<&'static str> {
     if with_session {
-        drawn.extend([
-            "session.context",
-            "session.more",
-            "pane.split.right",
-            "pane.split.down",
-        ]);
+        vec!["session.context", "terminal.search", "session.more"]
+    } else {
+        vec!["terminal.search", "terminal.more"]
     }
-    if !fold.folds_size() {
-        drawn.push("terminal.grid.size");
-    }
-    if !fold.folds_mode() {
-        drawn.push("terminal.mode");
-    }
-    drawn.push("terminal.search");
-    if !fold.folds_copy() {
-        drawn.push("terminal.copy");
-    }
-    if !fold.folds_font() {
-        drawn.extend([
-            "terminal.font.decrease",
-            "terminal.font.reset",
-            "terminal.font.increase",
-        ]);
-    }
-    if fold != BarFold::Nothing {
-        drawn.push("terminal.more");
-    }
-    drawn
 }
 
 /// Every control the bar draws is inside the bar and the window, where a pointer
@@ -34697,16 +34666,25 @@ fn assert_bar_controls_inside(cx: &mut VisualTestContext, selectors: &[&'static 
     }
 }
 
-fn bar_fold(cx: &mut VisualTestContext, pane: &Entity<TerminalPane>) -> BarFold {
-    cx.update(|_window, app| pane.read(app).bar_fold_for_test())
-}
-
 fn more_menu_open(cx: &mut VisualTestContext, pane: &Entity<TerminalPane>) -> bool {
     cx.update(|_window, app| pane.read(app).more_menu_open_for_test())
 }
 
+/// The tools a menu of the pane offers, wherever that menu is (ADR-7).
+const TOOL_ENTRIES: [&str; 6] = [
+    "terminal.more.size",
+    "terminal.more.mode",
+    "terminal.more.copy",
+    "terminal.more.font.decrease",
+    "terminal.more.font.increase",
+    "terminal.more.font.reset",
+];
+
+/// The bar under a terminal is 28 high and keeps files, split, search and the session's
+/// menu on its line; the grid size, the presentation, copy and the font size are in that
+/// menu, where they still work, and the bar fits 720x480 at 200% (ADR-7).
 #[gpui::test]
-async fn the_terminal_bar_folds_its_tools_into_more_at_two_hundred_percent_in_the_smallest_window(
+async fn the_terminal_bar_keeps_files_split_search_and_more_and_its_tools_are_in_the_menu(
     cx: &mut TestAppContext,
 ) {
     let (view, cx) = remote_view(cx);
@@ -34715,16 +34693,78 @@ async fn the_terminal_bar_folds_its_tools_into_more_at_two_hundred_percent_in_th
         .update(|_window, app| view.read(app).pane_of(id).cloned())
         .expect("the remote terminal exists");
 
-    // With room, every tool is on the bar and there is nothing to fold.
-    assert_eq!(bar_fold(cx, &pane), BarFold::Nothing);
+    let bar = bounds_of(cx, "terminal.bar");
     assert!(
-        cx.debug_bounds("terminal.more").is_none(),
-        "a bar with room for every tool has no menu for them"
+        bar.size.height >= px(crate::app::terminal::SHELL_BAR_HEIGHT) - px(0.5)
+            && bar.size.height <= px(crate::app::terminal::SHELL_BAR_HEIGHT) + px(1.5),
+        "the bar is 28 high: {bar:?}"
     );
-    assert_bar_controls_inside(cx, &drawn_bar_controls(BarFold::Nothing, true));
+    for gone in [
+        "terminal.grid.size",
+        "terminal.mode",
+        "terminal.copy",
+        "terminal.font.decrease",
+        "terminal.font.reset",
+        "terminal.font.increase",
+        "terminal.more",
+    ] {
+        assert!(
+            cx.debug_bounds(gone).is_none(),
+            "{gone} is in the menu, not on the bar"
+        );
+    }
+    assert_bar_controls_inside(cx, &drawn_bar_controls(true));
+    let split = bounds_of(cx, "pane.split.down");
+    let search = bounds_of(cx, "terminal.search");
+    let more = bounds_of(cx, "session.more");
+    assert!(
+        split.right() <= search.left() + px(0.5) && search.right() <= more.left() + px(0.5),
+        "the bar reads split, search, more: {split:?} {search:?} {more:?}"
+    );
+    if let Some(files) = cx.debug_bounds("session.files") {
+        assert!(
+            files.right() <= split.left() + px(0.5),
+            "files come before split: {files:?} {split:?}"
+        );
+    }
 
-    // 720x480 at 200%: the bar follows the text size, so its tools no longer fit and
-    // fold in their order - the font size first - instead of running past the pane.
+    // The tools are in the session's menu, and they work from there.
+    click(cx, "session.more");
+    for entry in TOOL_ENTRIES {
+        assert!(
+            cx.debug_bounds(entry).is_some(),
+            "{entry} is in the session's menu"
+        );
+    }
+    let before = cx.update(|_window, app| pane.read(app).font_size());
+    click(cx, "terminal.more.font.increase");
+    assert!(
+        cx.update(|_window, app| pane.read(app).font_size()) > before,
+        "the menu's step makes the font larger"
+    );
+    assert!(
+        cx.update(|_window, app| view.read(app).session_more_open()),
+        "a font step leaves the menu open for the next one"
+    );
+    click(cx, "terminal.more.font.reset");
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).font_size()),
+        before,
+        "the reset puts the default size back"
+    );
+    let mode = cx.update(|_window, app| pane.read(app).presentation());
+    click(cx, "terminal.more.mode");
+    assert_ne!(
+        cx.update(|_window, app| pane.read(app).presentation()),
+        mode,
+        "the menu's switch changes the presentation"
+    );
+    assert!(
+        !cx.update(|_window, app| view.read(app).session_more_open()),
+        "a command closes the menu"
+    );
+
+    // 720x480 at 200%: the bar follows the text size and still holds its line.
     cx.simulate_resize(minimum_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
@@ -34733,126 +34773,99 @@ async fn the_terminal_bar_folds_its_tools_into_more_at_two_hundred_percent_in_th
         bar.size.height >= px(crate::app::terminal::SHELL_BAR_HEIGHT * 2.0) - px(0.5),
         "the bar follows the text size: {bar:?}"
     );
-    let fold = bar_fold(cx, &pane);
-    assert!(
-        fold.folds_font(),
-        "the font size is the first tool to fold: {fold:?}"
-    );
-    assert_bar_controls_inside(cx, &drawn_bar_controls(fold, true));
-    assert_pointer_target(cx, "terminal.more");
+    assert_bar_controls_inside(cx, &drawn_bar_controls(true));
     assert_pointer_target(cx, "terminal.search");
-
-    // What folded is in the menu, and it still works from there.
-    let before = cx.update(|_window, app| pane.read(app).font_size());
-    click(cx, "terminal.more");
-    assert!(more_menu_open(cx, &pane));
+    assert_pointer_target(cx, "session.more");
+    click(cx, "session.more");
     let viewport = cx.update(|window, _app| window.viewport_size());
     assert_fits_inside(
-        bounds_of(cx, "terminal.more.menu"),
+        bounds_of(cx, "session.more.menu"),
         viewport,
-        "terminal.more.menu",
+        "session.more.menu",
     );
-    click(cx, "terminal.more.font.increase");
-    let after = cx.update(|_window, app| pane.read(app).font_size());
-    assert!(after > before, "the folded control still steps the font");
-    assert!(
-        more_menu_open(cx, &pane),
-        "a font step leaves the menu open for the next one"
-    );
-    click(cx, "terminal.more.font.reset");
-    assert_eq!(
-        cx.update(|_window, app| pane.read(app).font_size()),
-        before,
-        "the folded reset puts the default size back"
-    );
-    // A press beside the menu closes it.
-    cx.simulate_click(point(px(4.0), viewport.height / 2.0), Modifiers::default());
-    cx.run_until_parked();
-    assert!(!more_menu_open(cx, &pane));
-
-    // Back in the design window at the regular size, nothing is folded any more.
-    cx.simulate_resize(design_window());
-    smallest_text_size(&view, cx);
-    cx.run_until_parked();
-    assert_eq!(bar_fold(cx, &pane), BarFold::Nothing);
-    assert_bar_controls_inside(cx, &drawn_bar_controls(BarFold::Nothing, true));
 }
 
+/// A pane that does not carry the session's half keeps search and its own menu on its
+/// bar at any width, and that menu holds every other tool (ADR-7).
 #[gpui::test]
-async fn a_narrow_pane_folds_its_bar_tools_and_keeps_them_reachable(cx: &mut TestAppContext) {
+async fn a_pane_of_its_own_keeps_search_and_its_menu_with_every_tool_in_it(
+    cx: &mut TestAppContext,
+) {
     let (pane, cx) = pane_with("hello", cx);
-    let mut previous = BarFold::Nothing;
-    for width in [520.0, 300.0, 240.0, 200.0, 160.0] {
+    for width in [520.0, 300.0, 200.0, 160.0] {
         cx.simulate_resize(size(px(width), px(320.0)));
         cx.run_until_parked();
-        let fold = bar_fold(cx, &pane);
-        assert!(
-            fold >= previous,
-            "a narrower pane never unfolds a tool: {fold:?} after {previous:?} at {width}"
-        );
-        previous = fold;
-        assert_bar_controls_inside(cx, &drawn_bar_controls(fold, false));
+        assert_bar_controls_inside(cx, &drawn_bar_controls(false));
     }
-    assert_eq!(
-        previous,
-        BarFold::Mode,
-        "the narrowest pane keeps only search and the menu"
-    );
-    // Everything that folded is in the menu.
     click(cx, "terminal.more");
-    for selector in [
-        "terminal.more.size",
-        "terminal.more.mode",
-        "terminal.more.copy",
-        "terminal.more.font.decrease",
-        "terminal.more.font.increase",
-        "terminal.more.font.reset",
-    ] {
+    for selector in TOOL_ENTRIES {
         assert!(
             cx.debug_bounds(selector).is_some(),
             "{selector} is reachable in the menu"
         );
     }
+    let before = cx.update(|_window, app| pane.read(app).font_size());
+    click(cx, "terminal.more.font.increase");
+    assert!(cx.update(|_window, app| pane.read(app).font_size()) > before);
+    assert!(
+        more_menu_open(cx, &pane),
+        "a font step leaves the menu open"
+    );
     let mode = cx.update(|_window, app| pane.read(app).presentation());
     click(cx, "terminal.more.mode");
     assert_ne!(
         cx.update(|_window, app| pane.read(app).presentation()),
         mode,
-        "the folded switch still changes the presentation"
+        "the menu's switch still changes the presentation"
     );
     assert!(!more_menu_open(cx, &pane), "a command closes the menu");
 }
 
+/// A remote session that drops states it in a banner above its last screen: the grid
+/// moves down and nothing covers it, and the banner holds the sentence, Reconnect, the
+/// details and a close, inside the window at 720x480 and 200% (ADR-6, R5).
 #[gpui::test]
-async fn an_ended_session_states_itself_in_a_card_over_its_last_screen(cx: &mut TestAppContext) {
+async fn a_dropped_session_states_itself_in_a_banner_above_its_last_screen(
+    cx: &mut TestAppContext,
+) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
     let grid_before = bounds_of(cx, "terminal.viewport");
+    assert!(!banner_shown(cx, &view, id), "a live session has no banner");
     lose_remote_session(&view, cx, id);
 
-    let card = bounds_of(cx, "terminal.failure");
+    assert!(banner_shown(cx, &view, id));
+    let banner = bounds_of(cx, "terminal.failure");
     let grid = bounds_of(cx, "terminal.viewport");
-    assert_eq!(
-        grid.size.height, grid_before.size.height,
-        "the card is laid over the grid; it does not push the terminal down"
+    assert!(
+        banner.bottom() <= grid.top() + px(0.5),
+        "the banner stands above the grid and covers none of it: {banner:?} over {grid:?}"
     );
     assert!(
-        cx.debug_bounds("terminal.status.overlay").is_some(),
-        "the card sits on a veil over the last screen"
+        grid.top() > grid_before.top() + px(20.0),
+        "the grid moved down under the banner: {grid_before:?} then {grid:?}"
     );
-    assert_inside_box(card, grid, "the status card");
-    let centre = grid.center();
     assert!(
-        (card.center().x - centre.x).abs() <= px(16.0)
-            && (card.center().y - centre.y).abs() <= px(16.0),
-        "the card is centred over the terminal: {card:?} in {grid:?}"
+        (banner.size.height - px(36.0)).abs() <= px(1.5),
+        "the banner is one line, 36 high: {banner:?}"
     );
-    assert!(cx.debug_bounds("terminal.failure.headline").is_some());
-    assert!(cx.debug_bounds("terminal.failure.target").is_some());
+    for selector in [
+        "terminal.failure.headline",
+        "terminal.failure.next",
+        "terminal.failure.details",
+        "terminal.failure.dismiss",
+    ] {
+        assert_inside_box(bounds_of(cx, selector), banner, selector);
+    }
     assert_pointer_target(cx, "terminal.failure.next");
+    assert_pointer_target(cx, "terminal.failure.dismiss");
+    // The last screen is still there under it.
+    let row = bounds_of(cx, "terminal.row.0");
+    assert!(
+        row.top() >= banner.bottom() - px(0.5),
+        "{row:?} under {banner:?}"
+    );
 
-    // At 720x480 and 200% the card and its step still fit in the window, and so does
-    // the bar under it.
     cx.simulate_resize(minimum_window());
     largest_text_size(&view, cx);
     cx.run_until_parked();
@@ -34862,55 +34875,276 @@ async fn an_ended_session_states_itself_in_a_card_over_its_last_screen(cx: &mut 
         "terminal.failure.headline",
         "terminal.failure.next",
         "terminal.failure.details",
+        "terminal.failure.dismiss",
+        "terminal.bar",
     ] {
         assert_fits_inside(bounds_of(cx, selector), viewport, selector);
     }
-    let pane = cx
-        .update(|_window, app| view.read(app).pane_of(id).cloned())
-        .expect("the ended terminal keeps its last screen");
-    let fold = bar_fold(cx, &pane);
-    assert_bar_controls_inside(cx, &drawn_bar_controls(fold, true));
+    assert_bar_controls_inside(cx, &drawn_bar_controls(true));
 
-    // The step on the card is the real one: the reconnect starts, and the attempt's own
-    // card takes the ended card's place.
+    // The step on the banner is the real one: the reconnect starts.
     cx.simulate_resize(design_window());
     cx.run_until_parked();
     click(cx, "terminal.failure.next");
     assert!(
         cx.update(|_window, app| view.read(app).pane_of(id).is_none()),
-        "the ended terminal is gone with the card over it once the reconnect starts"
+        "the ended terminal is gone once the reconnect starts"
     );
     assert!(
         cx.debug_bounds("remote.dialog").is_some(),
-        "the attempt states itself in its own card"
+        "an attempt that asks for the password states itself in its own card"
     );
 }
 
+/// Whether the banner of `id` is on screen, as the window decides it.
+fn banner_shown(cx: &mut VisualTestContext, view: &Entity<ShelluneView>, id: SessionId) -> bool {
+    cx.update(|_window, app| view.read(app).banner_shown_for_test(id, app))
+}
+
+/// The close button and Escape close the banner and give the grid its room back; the
+/// banner stays closed while the session states the same thing, and the bar keeps the
+/// session's Reconnect (ADR-6).
 #[gpui::test]
-async fn a_status_card_rises_into_the_place_a_still_card_takes(cx: &mut TestAppContext) {
-    theme::set_motion(Motion::Full);
+async fn the_banner_closes_with_its_button_or_escape_and_the_bar_keeps_reconnect(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = remote_view(cx);
+    let id = live_remote(cx, &view);
+    let grid_live = bounds_of(cx, "terminal.viewport");
+    lose_remote_session(&view, cx, id);
+    assert!(banner_shown(cx, &view, id));
+    click(cx, "terminal.failure.dismiss");
+    assert!(!banner_shown(cx, &view, id), "the close button closes it");
+    redraw(cx);
+    let grid = bounds_of(cx, "terminal.viewport");
+    assert!(
+        (grid.top() - grid_live.top()).abs() <= px(0.5),
+        "the grid takes its room back: {grid:?} vs {grid_live:?}"
+    );
+    assert!(
+        cx.debug_bounds("session.reconnect").is_some(),
+        "the bar keeps the session's Reconnect"
+    );
+    redraw(cx);
+    assert!(
+        !banner_shown(cx, &view, id),
+        "it stays closed for the same state"
+    );
+
+    // A second session, closed with Escape.
+    let second = live_remote_second(cx, &view, id);
+    lose_remote_session(&view, cx, second);
+    assert!(banner_shown(cx, &view, second));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!banner_shown(cx, &view, second), "Escape closes it");
+    assert_eq!(
+        session_state(cx, &view, second)
+            .map(|state| matches!(state, SessionState::Disconnected(_))),
+        Some(true),
+        "closing the banner changes nothing about the session"
+    );
+}
+
+/// The banner never takes the keyboard when it appears; Tab from the ended terminal
+/// reaches its first control, Tab walks the rest and goes back to the terminal past
+/// the last one, and Enter presses the control that has the keyboard (ADR-6).
+#[gpui::test]
+async fn tab_reaches_the_banner_and_enter_presses_its_step(cx: &mut TestAppContext) {
     let (view, cx) = remote_view(cx);
     let id = live_remote(cx, &view);
     lose_remote_session(&view, cx, id);
-    // The entrance is a short animation keyed to the session, played on the wall
-    // clock; once it has played the card is where a still card stands.
-    std::thread::sleep(crate::app::theme::Motion::SLOW * 2);
-    cx.update(|window, _app| window.refresh());
+    redraw(cx);
+    let focused = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| view.read(app).banner_focus_for_test(window))
+    };
+    assert_eq!(focused(cx), None, "the banner does not take the keyboard");
+    assert!(cx.update(|window, app| view.read(app).terminal_has_the_keyboard(window, app)));
+    cx.simulate_keystrokes("tab");
     cx.run_until_parked();
-    let moving = bounds_of(cx, "terminal.failure");
-
-    cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+    assert_eq!(focused(cx), Some(0), "Tab reaches the next step first");
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(focused(cx), Some(1), "then the details");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).diagnostics_open(id)),
+        "Enter on the details unfolds them"
+    );
+    cx.simulate_keystrokes("tab");
     cx.run_until_parked();
     assert_eq!(
-        cx.update(|_window, app| view.read(app).workspace().motion()),
-        Motion::Reduced
+        focused(cx),
+        Some(2),
+        "then the copy of the unfolded diagnostic"
     );
-    let still = bounds_of(cx, "terminal.failure");
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    assert_eq!(focused(cx), Some(3), "then the close");
+    cx.simulate_keystrokes("shift-tab");
+    cx.run_until_parked();
+    assert_eq!(focused(cx), Some(2), "Shift+Tab walks back");
+    cx.simulate_keystrokes("tab tab");
+    cx.run_until_parked();
+    assert_eq!(focused(cx), None);
     assert!(
-        (moving.origin.y - still.origin.y).abs() <= px(0.5),
-        "the entrance ends where the reduced-motion card stands: {moving:?} vs {still:?}"
+        cx.update(|window, app| view.read(app).terminal_has_the_keyboard(window, app)),
+        "past the last control the keyboard is back in the terminal"
     );
-    theme::set_motion(Motion::Full);
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_window, app| view.read(app).pane_of(id).is_none()),
+        "Enter on the step starts the reconnect"
+    );
+}
+
+/// The details unfold under the banner: the whole diagnostic in the monospace face, no
+/// taller than 160 and scrolling past that, with a command that copies all of it; a
+/// long diagnostic stays inside the window and leaves the bar on screen at 720x480 and
+/// 200% (ADR-6, R5).
+#[gpui::test]
+async fn a_long_diagnostic_unfolds_under_the_banner_scrolls_and_copies(cx: &mut TestAppContext) {
+    let (view, cx) = remote_view(cx);
+    while cx.update(|_window, app| view.read(app).workspace().motion()) != Motion::Reduced {
+        cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+        cx.run_until_parked();
+    }
+    let id = live_remote(cx, &view);
+    let long = (0..14)
+        .map(|line| format!("{line}: {LONG_LOSS}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    lose_pane_with(&view, cx, id, &long);
+    assert!(cx.debug_bounds("terminal.failure.detail").is_none());
+    click(cx, "terminal.failure.details");
+    // The window asks for the second frame a long diagnostic is laid out over; the
+    // test platform does not run that request, so the test draws it.
+    redraw(cx);
+    let banner = bounds_of(cx, "terminal.failure");
+    let detail = bounds_of(cx, "terminal.failure.detail");
+    let text = bounds_of(cx, "terminal.failure.diagnostic");
+    let grid = bounds_of(cx, "terminal.viewport");
+    assert!(
+        detail.top() >= banner.bottom() - px(0.5) && detail.bottom() <= grid.top() + px(0.5),
+        "the details unfold between the banner and the grid: {banner:?} {detail:?} {grid:?}"
+    );
+    assert!(
+        detail.size.height <= px(crate::app::view::banner::DIAGNOSTIC_MAX_HEIGHT) + px(0.5),
+        "the details are at most 160 high: {detail:?}"
+    );
+    assert!(
+        text.size.height > detail.size.height,
+        "a long diagnostic is taller than its box, so it scrolls: {text:?} in {detail:?}"
+    );
+    assert!(
+        text.size.width <= detail.size.width + px(0.5),
+        "the diagnostic wraps at the box's width: {text:?} in {detail:?}"
+    );
+    click(cx, "terminal.failure.copy");
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    // The diagnostic is the failure as the session states it - which session stopped,
+    // then its reason - and the copy takes every line of it.
+    assert!(
+        copied.ends_with(crate::app::workspace::sanitize_diagnostic(&long).as_str()),
+        "the copy takes the whole diagnostic: {copied:?}"
+    );
+
+    cx.simulate_resize(minimum_window());
+    largest_text_size(&view, cx);
+    cx.run_until_parked();
+    let viewport = cx.update(|window, _app| window.viewport_size());
+    let detail = bounds_of(cx, "terminal.failure.detail");
+    assert!(
+        detail.size.height <= px(crate::app::view::banner::DIAGNOSTIC_MAX_HEIGHT * 2.0) + px(0.5),
+        "{detail:?}"
+    );
+    for selector in [
+        "terminal.failure",
+        "terminal.failure.detail",
+        "terminal.failure.copy",
+        "terminal.bar",
+    ] {
+        assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+    }
+    click(cx, "terminal.failure.details");
+    assert!(!cx.update(|_window, app| view.read(app).diagnostics_open(id)));
+}
+
+/// A remote reconnect that asks nothing runs under a banner over the last screen: a
+/// bar that says it is working and Cancel. Cancel goes back to that screen and the
+/// reason it ended; a reconnect that connects replaces the screen (ADR-6).
+#[gpui::test]
+async fn a_reconnect_runs_under_a_banner_over_the_last_screen_and_can_be_cancelled(
+    cx: &mut TestAppContext,
+) {
+    let dir = TempDir::new("banner-reconnect");
+    let (view, cx, id, remember) = connected_remote_tab(cx, &dir, X11Forwarding::Off, Vec::new());
+    while cx.update(|_window, app| view.read(app).workspace().motion()) != Motion::Reduced {
+        cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
+        cx.run_until_parked();
+    }
+    lose_remote_session(&view, cx, id);
+    remember();
+    click(cx, "terminal.failure.next");
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connecting));
+    assert!(cx.update(|_window, app| view.read(app).pane_of(id).is_none()));
+    assert!(banner_shown(cx, &view, id), "the reconnect has its banner");
+    let banner = bounds_of(cx, "terminal.reconnecting");
+    let grid = bounds_of(cx, "terminal.viewport");
+    assert!(
+        banner.bottom() <= grid.top() + px(0.5),
+        "the last screen is under the banner: {banner:?} over {grid:?}"
+    );
+    assert!(
+        cx.debug_bounds("progress.still").is_some(),
+        "the banner says it is working (still under reduced motion)"
+    );
+    assert_pointer_target(cx, "terminal.reconnecting.cancel");
+
+    click(cx, "terminal.reconnecting.cancel");
+    assert!(
+        matches!(
+            session_state(cx, &view, id),
+            Some(SessionState::Failed(_) | SessionState::Disconnected(_))
+        ),
+        "cancel ends the attempt and the session states why it ended again"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).pending_attempt_count()),
+        0,
+        "nothing is dialling any more"
+    );
+    assert_eq!(
+        cx.update(|_window, app| view.read(app).open_tabs()),
+        vec![id]
+    );
+    assert!(banner_shown(cx, &view, id));
+    redraw(cx);
+    let banner = bounds_of(cx, "terminal.failure");
+    let grid = bounds_of(cx, "terminal.viewport");
+    assert!(
+        banner.bottom() <= grid.top() + px(0.5),
+        "the last screen is back"
+    );
+
+    // Reconnect again, and let it connect: the new terminal takes the screen's place.
+    click(cx, "terminal.failure.next");
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connecting));
+    accept_attempt(&view, cx, id);
+    assert_eq!(session_state(cx, &view, id), Some(SessionState::Connected));
+    assert!(cx.update(|_window, app| view.read(app).pane_of(id).is_some()));
+    assert!(!banner_shown(cx, &view, id), "a live session has no banner");
+    assert!(
+        !cx.update(|_window, app| view.read(app).keeps_reconnect_screen_for_test(id)),
+        "the kept screen is forgotten once the new terminal is there"
+    );
 }
 
 /// A reason as long as the ones a shell or a jump host really reports: one unbroken
@@ -34951,10 +35185,6 @@ fn on_the_line(control: gpui::Bounds<Pixels>, context: gpui::Bounds<Pixels>) -> 
     centre >= context.origin.y && centre <= context.origin.y + context.size.height
 }
 
-fn viewport_width(cx: &mut VisualTestContext) -> Pixels {
-    cx.update(|window, _app| window.viewport_size().width)
-}
-
 /// Whether `inner` lies wholly inside `outer`, to half a pixel.
 fn wholly_inside(inner: gpui::Bounds<Pixels>, outer: gpui::Bounds<Pixels>) -> bool {
     inner.size.width > px(0.0)
@@ -34965,99 +35195,9 @@ fn wholly_inside(inner: gpui::Bounds<Pixels>, outer: gpui::Bounds<Pixels>) -> bo
         && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + px(0.5)
 }
 
-/// The ended session's card as the window lays it out now: on its veil over the grid
-/// and never over the bar, its headline on screen, and a Reconnect the pointer can
-/// press - on the card when the card has the room, in the bar otherwise, and in the
-/// session's menu on the bar when the bar has no room for it either (R3, R8, R9).
-///
-/// Returns the presses that reach the Reconnect on screen. `card_fits` asks for the
-/// whole card to stand inside the veil, which every layout at the design size gives.
-fn assert_ended_card_reachable(
-    view: &Entity<ShelluneView>,
-    cx: &mut VisualTestContext,
-    card_fits: bool,
-    what: &str,
-) -> &'static [&'static str] {
-    let viewport = cx.update(|window, _app| window.viewport_size());
-    let window = gpui::Bounds::new(point(px(0.0), px(0.0)), viewport);
-    let overlay = bounds_of(cx, "terminal.status.overlay");
-    let context = bounds_of(cx, "session.context");
-    assert!(
-        wholly_inside(overlay, window),
-        "{what}: the veil stays in the window: {overlay:?}"
-    );
-    assert!(
-        overlay.origin.y + overlay.size.height <= context.origin.y + px(0.5),
-        "{what}: the veil covers the grid, not the bar under it: {overlay:?} over {context:?}"
-    );
-    let scroll = bounds_of(cx, "terminal.status.scroll");
-    assert!(
-        wholly_inside(scroll, overlay),
-        "{what}: the card's box is held inside the veil: {scroll:?} in {overlay:?}"
-    );
-    let card = bounds_of(cx, "terminal.failure");
-    assert!(
-        card.size.height <= viewport.height,
-        "{what}: the card is no taller than its content needs: {card:?}"
-    );
-    let headline = bounds_of(cx, "terminal.failure.headline");
-    // A card taller than its box starts at the box's top and scrolls down from there:
-    // nothing of it is pushed above the box, out of the scroll's reach.
-    assert!(
-        card.origin.y >= scroll.origin.y - px(0.5) && headline.origin.y >= card.origin.y,
-        "{what}: the card opens on its headline: {headline:?} in {scroll:?}"
-    );
-    let target = bounds_of(cx, "terminal.failure.target");
-    assert!(
-        wholly_inside(target, card),
-        "{what}: the target stays on the card: {target:?} in {card:?}"
-    );
-    // Cut to the card's width, not to its ellipsis alone.
-    assert!(
-        target.size.width >= card.size.width / 3.0,
-        "{what}: the target keeps the card's width to show itself in: {target:?} in {card:?}"
-    );
-    if card_fits {
-        assert!(
-            wholly_inside(card, scroll),
-            "{what}: the whole card stands in the veil: {card:?} in {scroll:?}"
-        );
-    }
-    let next = bounds_of(cx, "terminal.failure.next");
-    if wholly_inside(next, scroll) && wholly_inside(next, window) {
-        return &["terminal.failure.next"];
-    }
-    assert!(
-        !card_fits,
-        "{what}: a card that fits shows its step: {next:?} in {scroll:?}"
-    );
-    let id = cx
-        .update(|_window, app| view.read(app).active_session())
-        .expect("the ended session is on screen");
-    let hidden = cx.update(|_window, app| view.read(app).session_bar_hidden_for_test(id, app));
-    if hidden.contains(&"session.reconnect") {
-        // The bar has no room for it: the session's menu, which always stays on the
-        // bar's line, offers it.
-        let menu = bounds_of(cx, "session.more");
-        assert!(
-            wholly_inside(menu, window) && on_the_line(menu, context),
-            "{what}: the session's menu is on screen, on the bar's line: {menu:?} beside {context:?}"
-        );
-        return &["session.more", "session.more.reconnect"];
-    }
-    let bar_step = cx
-        .debug_bounds("session.reconnect")
-        .unwrap_or_else(|| panic!("{what}: the bar offers the reconnect the card cannot show"));
-    assert!(
-        wholly_inside(bar_step, window) && on_the_line(bar_step, context),
-        "{what}: the bar's reconnect is on screen, on the bar's line: {bar_step:?} beside          {context:?}"
-    );
-    &["session.reconnect"]
-}
-
 /// A local shell that ended - its target a full path, the default session of the app -
-/// keeps its card, its headline and a Reconnect on screen in `split`, at the design size
-/// and at 720x480 and 200%; the Reconnect that shows restarts it in place (R3, R8, R9).
+/// states it in a banner above its terminal in `split`, at the design size and at
+/// 720x480 and 200%; the banner's Reconnect restarts it in place (ADR-6, R8, R9).
 fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<SplitAxis>) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
     cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
@@ -35066,7 +35206,6 @@ fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<S
     if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
         return;
     }
-    // Measured where the card stands, not part way through its entrance.
     while cx.update(|_window, app| view.read(app).workspace().motion()) != Motion::Reduced {
         cx.update(|_window, app| view.update(app, |view, cx| view.cycle_motion(cx)));
         cx.run_until_parked();
@@ -35091,47 +35230,55 @@ fn an_ended_shell_card_reaches_its_step(cx: &mut TestAppContext, split: Option<S
     lose_pane_with(&view, cx, id, LONG_LOSS);
 
     let layout = format!("{split:?}");
-    assert_eq!(
-        assert_ended_card_reachable(&view, cx, true, &format!("{layout} at the design size")),
-        &["terminal.failure.next"]
-    );
-    // The bar keeps its own Reconnect too: it is one of the entries the user is told
-    // about (R8), on the bar's one line beside where the session is.
-    assert!(
-        cx.update(|_window, app| view.read(app).offers_reconnect(id)),
-        "{layout}: the session can be reconnected"
-    );
-    let bar_step = bounds_of(cx, "session.reconnect");
-    let context = bounds_of(cx, "session.context");
-    assert!(
-        on_the_line(bar_step, context)
-            && bar_step.origin.x + bar_step.size.width <= viewport_width(cx) + px(0.5),
-        "{layout}: the bar's reconnect is on the bar's line: {bar_step:?} beside {context:?}"
-    );
-    // The raw reason, unfolded, makes the card taller but not one letter per line.
-    click(cx, "terminal.failure.details");
-    let card = bounds_of(cx, "terminal.failure");
-    let viewport = cx.update(|window, _app| window.viewport_size());
-    assert!(
-        card.size.height <= viewport.height / 2.0,
-        "{layout}: the unfolded reason wraps at the card's width: {card:?}"
-    );
-    click(cx, "terminal.failure.details");
-
-    cx.simulate_resize(minimum_window());
-    largest_text_size(&view, cx);
-    cx.run_until_parked();
-    let steps =
-        assert_ended_card_reachable(&view, cx, false, &format!("{layout} at 720x480 and 200%"));
-    for step in steps {
-        click(cx, step);
+    for (what, small) in [("at the design size", false), ("at 720x480 and 200%", true)] {
+        if small {
+            cx.simulate_resize(minimum_window());
+            largest_text_size(&view, cx);
+            cx.run_until_parked();
+        }
+        let viewport = cx.update(|window, _app| window.viewport_size());
+        let banner = bounds_of(cx, "terminal.failure");
+        let grid = bounds_of(cx, "terminal.viewport");
+        let bar = bounds_of(cx, "terminal.bar");
+        assert!(
+            banner.bottom() <= grid.top() + px(0.5) && grid.bottom() <= bar.top() + px(0.5),
+            "{layout} {what}: banner, grid and bar stand one under the other: {banner:?} {grid:?} {bar:?}"
+        );
+        for selector in ["terminal.failure", "terminal.bar", "session.more"] {
+            assert_fits_inside(bounds_of(cx, selector), viewport, selector);
+        }
+        let next = bounds_of(cx, "terminal.failure.next");
+        // A stacked pane at 720x480 and 200% is too short for the whole line and the
+        // bar: the line gives way and the bar, with its Reconnect and its menu, stays.
+        let short = small && split == Some(SplitAxis::TopBottom);
+        assert!(
+            wholly_inside(next, banner) || short,
+            "{layout} {what}: the step is whole on the banner: {next:?} in {banner:?}"
+        );
+        // The raw reason, unfolded, wraps at the banner's width and is no taller than
+        // its box.
+        if short {
+            continue;
+        }
+        click(cx, "terminal.failure.details");
+        let detail = bounds_of(cx, "terminal.failure.detail");
+        let cap = crate::app::view::banner::DIAGNOSTIC_MAX_HEIGHT * if small { 2.0 } else { 1.0 };
+        assert!(
+            detail.size.width <= banner.size.width + px(0.5)
+                && detail.size.height <= px(cap) + px(0.5),
+            "{layout} {what}: the unfolded reason stays in its box: {detail:?}"
+        );
+        click(cx, "terminal.failure.details");
     }
+    cx.simulate_resize(design_window());
+    cx.run_until_parked();
+    click(cx, "terminal.failure.next");
     assert!(
         !matches!(
             session_state(cx, &view, id),
             Some(SessionState::Disconnected(_) | SessionState::Failed(_))
         ),
-        "{layout}: pressing {steps:?} starts the shell again"
+        "{layout}: pressing Reconnect starts the shell again"
     );
     assert_eq!(
         cx.update(|_window, app| view.read(app).open_tabs().len()),
@@ -35349,38 +35496,6 @@ fn wheel_over_card(
     (card, bounds_of(cx, card_selector))
 }
 
-/// The card over an ended terminal in a stacked split at 720x480 and 200% is taller
-/// than its pane; the wheel turned over the card itself scrolls it (R3, R9).
-#[gpui::test]
-async fn the_wheel_over_an_ended_card_scrolls_it_in_a_short_pane(cx: &mut TestAppContext) {
-    let Some((view, cx)) = split_local_shell(cx, SplitAxis::TopBottom) else {
-        return;
-    };
-    let id = cx
-        .update(|_window, app| view.read(app).active_session())
-        .expect("a shell is on screen");
-    lose_pane_with(&view, cx, id, LONG_LOSS);
-    cx.simulate_resize(minimum_window());
-    largest_text_size(&view, cx);
-    cx.run_until_parked();
-
-    let card = bounds_of(cx, "terminal.failure");
-    let scroll = bounds_of(cx, "terminal.status.scroll");
-    assert!(
-        card.size.height > scroll.size.height,
-        "the card is taller than the short pane gives it: {card:?} in {scroll:?}"
-    );
-    assert!(
-        card.origin.y >= scroll.origin.y - px(0.5),
-        "the card opens on its top, inside its box: {card:?} in {scroll:?}"
-    );
-    let (before, after) = wheel_over_card(cx, "terminal.failure", "terminal.status.scroll");
-    assert!(
-        after.origin.y < before.origin.y - px(1.0),
-        "the wheel over the card scrolls the card: {before:?} then {after:?}"
-    );
-}
-
 /// A session with no terminal in a short pane - a stacked split at 720x480 and 200% -
 /// shows its card from the top, inside the pane, and the wheel over the card scrolls
 /// the rest into view (R3, R9).
@@ -35444,6 +35559,11 @@ async fn a_state_card_in_a_short_pane_starts_at_its_top_and_scrolls_under_the_wh
         Some(SessionState::Connecting)
     );
     assert!(cx.update(|_window, app| view.read(app).pane_of(left).is_none()));
+    // The kept last screen would stand in the card's place (ADR-6); this test is about
+    // the card of a session that has nothing to show.
+    cx.update(|_window, app| {
+        view.update(app, |view, _cx| view.forget_reconnect_screen_for_test(left))
+    });
     cx.update(|_window, app| view.update(app, |view, cx| view.activate(lower, cx)));
     cx.run_until_parked();
 
@@ -36651,117 +36771,38 @@ async fn the_brand_fits_the_smallest_window_at_the_largest_text(cx: &mut TestApp
     }
 }
 
-/// The colour `bgra` is drawn in.
-fn bgra_colour(bgra: [u8; 4]) -> gpui::Rgba {
-    gpui::Rgba {
-        r: f32::from(bgra[2]) / 255.0,
-        g: f32::from(bgra[1]) / 255.0,
-        b: f32::from(bgra[0]) / 255.0,
-        a: 1.0,
-    }
-}
-
-fn same_colour(a: gpui::Rgba, b: gpui::Rgba) -> bool {
-    (a.r - b.r).abs() < 0.01 && (a.g - b.g).abs() < 0.01 && (a.b - b.b).abs() < 0.01
-}
-
-/// The colour the current tab is painted with, and where the current tab is.
-fn current_tab_floor(
-    view: &Entity<ShelluneView>,
-    cx: &mut VisualTestContext,
-) -> (gpui::Rgba, gpui::Bounds<Pixels>) {
-    let index = cx
-        .update(|_window, app| {
-            let layout = view.read(app).workspace().layout();
-            layout
-                .active_tab_id()
-                .and_then(|current| layout.tabs().iter().position(|tab| tab.id() == current))
-        })
-        .expect("a tab is current");
-    let selector: &'static str = Box::leak(format!("session.tab.{index}").into_boxed_str());
-    let tab = bounds_of(cx, selector);
-    let floor = cx.update(|_window, app| view.read(app).tab_floor(app));
-    (floor, tab)
-}
-
-/// A remote desktop alone in its tab opens onto its own picture: the current tab takes
-/// the colour of the picture's top row right under it, and the page floor again where
-/// the fitted picture leaves a band of floor under the head (R2).
+/// The tabs stand in the middle of the head, 34 high; the current tab is the one raised
+/// pill and the hosts tab is pinned before the session tabs (ADR-7).
 #[gpui::test]
-async fn the_current_desktop_tab_takes_the_colour_of_the_picture_under_it(cx: &mut TestAppContext) {
+async fn the_tabs_are_pills_in_the_middle_of_the_head(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.update(|_window, app| app.bind_keys(key_bindings(Platform::current())));
     cx.simulate_resize(design_window());
     cx.run_until_parked();
-    let connected = || LinkEvent::State {
-        state: LinkState::Connected,
-        failure: LinkFailure::None,
-        detail: 0,
-        reason: String::new(),
-    };
-
-    // A 4:3 desktop is fitted to the pane's height: its top row is right under the
-    // head, light grey there and dark below.
-    let desktop = (1200u32, 900u32);
-    let top = [40, 160, 220, 255];
-    let body = [10, 20, 30, 255];
-    let (link, _log) = ScriptedLink::new(vec![
-        connected(),
-        LinkEvent::Frame(solid(0, 0, 1200, 900, desktop, body)),
-        LinkEvent::Frame(solid(0, 0, 1200, 12, desktop, top)),
-    ]);
-    let id = mount_scripted_desktop(&view, cx, &desktop_record("tall"), link);
-    redraw(cx);
-    cx.run_until_parked();
-    let surface = bounds_of(cx, "desktop.surface");
-    let picture = crate::app::desktop::content_rect(surface, desktop);
-    let (floor, tab) = current_tab_floor(&view, cx);
+    assert_eq!(theme::Metrics::default().tab_height(), px(34.0));
+    let head = bounds_of(cx, "topbar");
+    let home = bounds_of(cx, "nav.hosts");
     assert!(
-        (picture.origin.y - surface.origin.y).abs() <= px(0.5)
-            && tab.center().x >= picture.origin.x
-            && tab.center().x <= picture.origin.x + picture.size.width,
-        "the picture reaches the head under the current tab: {picture:?} under {tab:?}"
+        (home.size.height - px(34.0)).abs() <= px(0.5),
+        "a tab is 34 high: {home:?}"
     );
     assert!(
-        same_colour(floor, bgra_colour(top)),
-        "the current tab is the picture's top row: {floor:?}"
+        home.top() > head.top() + px(1.0)
+            && home.bottom() < head.bottom() - px(1.0)
+            && (home.center().y - head.center().y).abs() <= px(1.0),
+        "the tab stands in the middle of the head, clear of its edges: {home:?} in {head:?}"
     );
+    if cx.update(|_window, app| view.read(app).workspace().shells().is_empty()) {
+        return;
+    }
+    click(cx, "header.primary");
+    let tab = bounds_of(cx, "session.tab.0");
     assert!(
-        (tab.origin.y + tab.size.height - surface.origin.y).abs() <= px(1.5),
-        "the tab stands right on the picture: {tab:?} over {surface:?}"
+        (tab.center().y - home.center().y).abs() <= px(0.5)
+            && (tab.size.height - home.size.height).abs() <= px(0.5),
+        "a session tab stands on the same line as the hosts tab: {tab:?} beside {home:?}"
     );
-
-    // A wide desktop is fitted to the pane's width, with a band of floor above it.
-    let wide = (3200u32, 900u32);
-    let (link, _log) = ScriptedLink::new(vec![
-        connected(),
-        LinkEvent::Frame(solid(0, 0, 3200, 900, wide, top)),
-    ]);
-    let wide_id = mount_scripted_desktop(&view, cx, &desktop_record("wide"), link);
-    redraw(cx);
-    cx.run_until_parked();
-    assert_eq!(
-        cx.update(|_window, app| view.read(app).active_session()),
-        Some(wide_id)
-    );
-    let surface = bounds_of(cx, "desktop.surface");
-    let picture = crate::app::desktop::content_rect(surface, wide);
-    assert!(
-        picture.origin.y > surface.origin.y + px(0.5),
-        "the wide picture leaves a band of floor under the head: {picture:?} in {surface:?}"
-    );
-    let (floor, _tab) = current_tab_floor(&view, cx);
-    assert!(
-        same_colour(floor, theme::swatch(palette::CANVAS)),
-        "over the band the tab is the page floor: {floor:?}"
-    );
-
-    // Back on the first desktop, the tab follows its picture again.
-    cx.update(|_window, app| view.update(app, |view, cx| view.activate(id, cx)));
-    cx.run_until_parked();
-    redraw(cx);
-    cx.run_until_parked();
-    let (floor, _tab) = current_tab_floor(&view, cx);
-    assert!(same_colour(floor, bgra_colour(top)), "{floor:?}");
+    assert!(tab.left() >= home.right(), "{tab:?} after {home:?}");
 }
 
 /// The window opens on the floor of the palette the saved theme gives (R7).
@@ -36919,33 +36960,4 @@ async fn a_system_that_does_not_answer_holds_the_start_back_only_so_long(cx: &mu
         Motion::Reduced,
         "the answer that came late is still taken"
     );
-}
-
-/// The current tab's words read on whatever floor it takes - a remote picture or a
-/// terminal scheme of the other palette - in either palette of the window (R2).
-#[test]
-fn the_current_tab_writes_in_the_ink_its_floor_needs() {
-    use crate::app::theme::{Appearance, contrast};
-    let hex = |color: gpui::Rgba| {
-        let byte = |value: f32| (value * 255.0).round() as u32;
-        (byte(color.r) << 16) | (byte(color.g) << 8) | byte(color.b)
-    };
-    for appearance in [Appearance::Dark, Appearance::Light] {
-        theme::set_appearance(appearance);
-        for floor in [
-            0xf4_f4_f4, 0xff_ff_ff, 0xd0_d4_da, 0x10_10_10, 0x00_00_00, 0x2a_2e_38,
-        ] {
-            let ink = crate::app::view::text_on(gpui::rgb(floor));
-            assert!(
-                contrast::ratio(hex(ink), floor) >= theme::BODY_CONTRAST_FLOOR,
-                "{appearance:?}: the tab's words read on {floor:06x}: {ink:?}"
-            );
-        }
-        // On the window's own floor the words are the palette's own.
-        assert_eq!(
-            crate::app::view::text_on(theme::swatch(palette::CANVAS)),
-            theme::swatch(palette::TEXT_PRIMARY)
-        );
-    }
-    theme::set_appearance(Appearance::Dark);
 }
