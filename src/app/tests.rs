@@ -27742,6 +27742,132 @@ async fn what_the_remote_side_copies_lands_on_this_clipboard_and_is_not_offered_
     );
 }
 
+/// The send warning of the desktop pane, when one is up.
+fn desktop_send_problem(
+    view: &Entity<ShelluneView>,
+    cx: &mut VisualTestContext,
+    id: SessionId,
+) -> Option<String> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .desktop_of(id)
+            .expect("the surface is mounted")
+            .read(app)
+            .send_problem()
+            .map(str::to_owned)
+    })
+}
+
+#[gpui::test]
+async fn a_session_still_connecting_is_offered_the_clipboard_when_it_goes_live(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let connected = LinkEvent::State {
+        state: LinkState::Connected,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    };
+    let (link, log) = ScriptedLink::new(vec![connected]);
+    let feed = link.feed();
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    cx.write_to_clipboard(ClipboardItem::new_string(
+        "copied while connecting".to_owned(),
+    ));
+
+    // The picture takes the keyboard before the first frame: the session cannot
+    // take an offer yet, so nothing is read or queued.
+    focus_desktop_drawn(&view, cx, id);
+    assert!(
+        offers(&log).is_empty(),
+        "nothing is offered before the session is live"
+    );
+
+    // The first frame makes it live while the picture still holds the keyboard -
+    // no focus event follows, as after a reconnect - and the clipboard goes then.
+    feed.feed(vec![LinkEvent::Frame(solid(
+        0,
+        0,
+        640,
+        400,
+        (640, 400),
+        [5, 6, 7, 255],
+    ))]);
+    pump_desktop(&view, cx, id);
+    redraw(cx);
+    cx.run_until_parked();
+    let last = log
+        .lock()
+        .expect("the log is not poisoned")
+        .clipboard
+        .last()
+        .cloned();
+    assert_eq!(
+        last,
+        Some(vec![crate::app::desktop::ClipboardEntry::text(
+            "copied while connecting"
+        )]),
+        "going live with the keyboard offers this computer's clipboard"
+    );
+    redraw(cx);
+    cx.run_until_parked();
+    assert_eq!(offers(&log).len(), 1, "once, not on every frame");
+}
+
+#[gpui::test]
+async fn focusing_a_session_still_connecting_raises_no_send_warning(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let connected = LinkEvent::State {
+        state: LinkState::Connected,
+        failure: LinkFailure::None,
+        detail: 0,
+        reason: String::new(),
+    };
+    // The native link refuses a clipboard offer with a state error until the
+    // session is connected; this one refuses every send that way.
+    let (link, log) =
+        ScriptedLink::failing_after(vec![connected], crate::app::desktop::LinkError::State);
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    cx.write_to_clipboard(ClipboardItem::new_string("waiting".to_owned()));
+
+    focus_desktop_drawn(&view, cx, id);
+    cx.deactivate_window();
+    cx.update(|window, _app| window.activate_window());
+    cx.run_until_parked();
+    pump_desktop(&view, cx, id);
+    redraw(cx);
+
+    assert_eq!(
+        desktop_send_problem(&view, cx, id),
+        None,
+        "the user sent nothing, so the connecting card says nothing failed"
+    );
+    assert!(sent(&log).is_empty());
+}
+
+/// Elsewhere than macOS the Windows or Super key is this computer's: it is not
+/// forwarded, so a key pressed with it is not sent as its bare letter, and Super+V
+/// is not the paste shortcut.
+#[cfg(not(target_os = "macos"))]
+#[gpui::test]
+async fn a_key_pressed_with_the_super_key_stays_on_this_computer(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    let (link, log) = ScriptedLink::new(live_desktop_events());
+    let id = mount_scripted_desktop(&view, cx, &desktop_record("desk"), link);
+    focus_desktop_drawn(&view, cx, id);
+    cx.write_to_clipboard(ClipboardItem::new_string("not this way".to_owned()));
+    let before = sent(&log).len();
+
+    cx.simulate_keystrokes("super-v super-a");
+
+    assert_eq!(
+        sent(&log)[before..],
+        [],
+        "no offer and no bare letter reach the remote side"
+    );
+}
+
 #[gpui::test]
 async fn a_remote_copy_on_a_connection_with_the_clipboard_off_is_not_written_here(
     cx: &mut TestAppContext,

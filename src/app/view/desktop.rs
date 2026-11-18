@@ -214,12 +214,43 @@ fn notice_text(notice: Notice, strings: &Strings) -> String {
 /// The Windows key is not forwarded: a press the remote side reads alone opens its
 /// start menu.
 fn remote_modifiers(modifiers: &Modifiers) -> [(KeyCodes, bool); 3] {
-    let control = modifiers.control || (cfg!(target_os = "macos") && modifiers.platform);
+    let control = shortcut_modifier_held(modifiers);
     [
         (CONTROL_LEFT, control),
         (ALT_LEFT, modifiers.alt),
         (SHIFT_LEFT, modifiers.shift),
     ]
+}
+
+/// Whether the modifier of copy and paste shortcuts is held: Control, and on macOS
+/// Command as well.
+fn shortcut_modifier_held(modifiers: &Modifiers) -> bool {
+    modifiers.control || (cfg!(target_os = "macos") && modifiers.platform)
+}
+
+/// A number the system moves on whenever anything is put on the clipboard, or
+/// `None` where there is none to ask.
+///
+/// Reading the clipboard is not free: a Windows screenshot is a bitmap that is
+/// encoded to PNG on every read, on the window's thread. The pane asks this first
+/// and reads only when something was copied since its last read.
+#[cfg(all(windows, not(test)))]
+fn clipboard_generation() -> Option<u32> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
+    }
+    // SAFETY: the call takes no arguments and touches no memory of this process.
+    let number = unsafe { GetClipboardSequenceNumber() };
+    // Zero is the answer of a session that may not see the clipboard's number.
+    (number != 0).then_some(number)
+}
+
+/// The tests write a clipboard of their own that has no such number, and other
+/// systems keep none GPUI exposes.
+#[cfg(not(all(windows, not(test))))]
+fn clipboard_generation() -> Option<u32> {
+    None
 }
 
 /// One remote desktop on screen.
@@ -266,6 +297,13 @@ pub struct DesktopPane {
     /// The parts of the clipboard content last offered to the remote side or written
     /// here from it, so the same content is not offered again (R1-R3).
     shared: Vec<u64>,
+    /// The clipboard's number at the pane's last read of it, so an unchanged
+    /// clipboard is not read again (see [clipboard_generation]).
+    read_generation: Option<u32>,
+    /// Whether this session has yet to be offered the clipboard since it went live.
+    /// A pane that keeps the keyboard through a reconnect sees no focus event, so
+    /// the first frame drawn live and focused offers it instead (R1-R4).
+    offer_when_live: bool,
     /// The notices on screen, with their sentences, in the order they arrived.
     notices: Vec<(DesktopNotice, String)>,
     /// Every notice this session has shown, so each is shown once.
@@ -303,6 +341,8 @@ impl DesktopPane {
             image_size: (0, 0),
             locale,
             shared: Vec::new(),
+            read_generation: None,
+            offer_when_live: true,
             notices: Vec::new(),
             noticed: Vec::new(),
             subscriptions: Vec::new(),
@@ -595,6 +635,8 @@ impl DesktopPane {
         self.image = None;
         // A new session has said nothing yet and has not seen this clipboard.
         self.shared.clear();
+        self.read_generation = None;
+        self.offer_when_live = true;
         self.notices.clear();
         self.noticed.clear();
         self.start_polling(cx);
@@ -799,19 +841,36 @@ impl DesktopPane {
         };
         self.shared = desktop_clipboard::prints(&item);
         cx.write_to_clipboard(item);
+        // What is on the clipboard now is what was just shared; reading it back
+        // would only find that out again.
+        self.read_generation = clipboard_generation();
     }
 
     /// Offers this computer's clipboard to the remote side, unless it is what was
     /// last offered or last received (R1-R4). Returns whether an offer was queued.
     ///
     /// Called when the pane takes the keyboard, when the window becomes active again
-    /// with the pane focused, and on the paste shortcut, so a remote program pastes
-    /// what this computer holds whether it pastes by key or from its own menu.
-    /// Nothing is read from the clipboard while sharing is off or no session runs.
+    /// with the pane focused, when the session goes live with the pane focused, and
+    /// on the paste shortcut, so a remote program pastes what this computer holds
+    /// whether it pastes by key or from its own menu.
+    ///
+    /// Nothing is read from the clipboard while sharing is off or the session is not
+    /// live: a session still connecting - or waiting on a certificate answer - cannot
+    /// take an offer, and one queued then would only come back as a send failure on
+    /// the card the user is waiting on. Going live offers it instead.
     fn share_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.target.clipboard() || self.link.is_none() || !self.phase.accepts_input() {
+        if !self.target.clipboard()
+            || self.link.is_none()
+            || !matches!(self.phase, DesktopPhase::Live)
+        {
             return false;
         }
+        self.offer_when_live = false;
+        let generation = clipboard_generation();
+        if generation.is_some() && generation == self.read_generation {
+            return false;
+        }
+        self.read_generation = generation;
         let Some(item) = cx.read_from_clipboard() else {
             return false;
         };
@@ -1001,6 +1060,13 @@ impl DesktopPane {
         cx.notify();
     }
 
+    /// Why the last send failed, when the warning is up, for a test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn send_problem(&self) -> Option<&str> {
+        self.send_problem.as_deref()
+    }
+
     /// Releases everything the remote side may still think is held (R17).
     ///
     /// Called when the picture loses the keyboard, when the window is not the
@@ -1153,8 +1219,14 @@ impl DesktopPane {
                 _ => {}
             }
         }
+        if keystroke.modifiers.platform && !cfg!(target_os = "macos") {
+            // The Windows or Super key is not forwarded (see remote_modifiers), so a
+            // key pressed with it would reach the remote side as its bare letter -
+            // Super+V would type a v. It is this computer's shortcut, not a key.
+            return;
+        }
         let paste = keystroke.key == "v"
-            && (keystroke.modifiers.control || keystroke.modifiers.platform)
+            && shortcut_modifier_held(&keystroke.modifiers)
             && !keystroke.modifiers.alt;
         if paste {
             // Paste is this computer's clipboard going to the remote one first, and
@@ -1586,6 +1658,18 @@ impl Render for DesktopPane {
             self.release_input();
         }
         self.was_active = active;
+        // The session went live - a first connection or a reconnect - while the
+        // picture held the keyboard, which no focus event reports: this computer's
+        // clipboard is offered now, so a paste from the remote program's own menu
+        // right away pastes it.
+        if self.offer_when_live
+            && active
+            && matches!(self.phase, DesktopPhase::Live)
+            && self.focus.is_focused(window)
+            && self.share_clipboard(cx)
+        {
+            self.flush_input();
+        }
         let picture = self.picture();
         // Whether the picture is what the body shows. The status card below stands in
         // for it while it is absent, and the warning strip belongs over the picture

@@ -95,6 +95,11 @@ fn offer_within(item: &ClipboardItem, bound: usize) -> LocalOffer {
 /// whichever it understands. The image is the PNG when the remote side offered one,
 /// otherwise its DIB decoded to PNG; an image that does not decode is left out and
 /// the text still arrives.
+///
+/// Line breaks are written in this computer's own style (R1): a Windows server
+/// copies CRLF, which a program on macOS or Linux would paste with a stray `\r` on
+/// every line, and a Linux VNC server copies LF, which older Windows programs run
+/// together.
 #[must_use]
 pub fn local_item(entries: &[ClipboardEntry]) -> Option<ClipboardItem> {
     let mut parts = Vec::new();
@@ -103,7 +108,10 @@ pub fn local_item(entries: &[ClipboardEntry]) -> Option<ClipboardItem> {
         .find_map(ClipboardEntry::as_text)
         .filter(|text| !text.is_empty())
     {
-        parts.push(gpui::ClipboardEntry::from(text.to_owned()));
+        parts.push(gpui::ClipboardEntry::from(local_line_breaks(
+            text,
+            cfg!(windows),
+        )));
     }
     let png = entries
         .iter()
@@ -153,6 +161,23 @@ pub fn prints(item: &ClipboardItem) -> Vec<u64> {
         }
     }
     prints
+}
+
+/// The text with every line break - CRLF, a lone LF, a lone CR - written as CRLF
+/// when `crlf` is set and as LF otherwise.
+#[must_use]
+fn local_line_breaks(text: &str, crlf: bool) -> String {
+    let break_as = if crlf { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(['\r', '\n']) {
+        out.push_str(&rest[..at]);
+        out.push_str(break_as);
+        let skip = if rest[at..].starts_with("\r\n") { 2 } else { 1 };
+        rest = &rest[at + skip..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether every part of `current` is among the parts last shared, so offering it
@@ -555,6 +580,35 @@ mod tests {
         assert!(local_item(&[]).is_none());
         assert!(local_item(&[ClipboardEntry::dib(vec![1, 2, 3])]).is_none());
         assert!(local_item(&[ClipboardEntry::text("")]).is_none());
+    }
+
+    #[test]
+    fn remote_text_is_written_with_this_computers_line_breaks() {
+        assert_eq!(local_line_breaks("a\r\nb\rc\nd", false), "a\nb\nc\nd");
+        assert_eq!(local_line_breaks("a\r\nb\rc\nd", true), "a\r\nb\r\nc\r\nd");
+        assert_eq!(
+            local_line_breaks("\r\n\r\n你好\r", false),
+            "\n\n你好\n",
+            "breaks at the ends and next to each other each stay one break"
+        );
+        assert_eq!(local_line_breaks("no break", true), "no break");
+
+        // What a Windows server copies pastes here without a stray CR, and what a
+        // Linux server copies pastes on Windows with CRLF.
+        let local = if cfg!(windows) {
+            "one\r\ntwo"
+        } else {
+            "one\ntwo"
+        };
+        for remote in ["one\r\ntwo", "one\ntwo"] {
+            let item = local_item(&[ClipboardEntry::text(remote)]).expect("text to paste");
+            assert_eq!(item.text().as_deref(), Some(local));
+            // Either form still counts as the same text, so it is not offered back.
+            assert!(already_shared(
+                &prints(&ClipboardItem::new_string(remote.to_owned())),
+                &prints(&item)
+            ));
+        }
     }
 
     #[test]

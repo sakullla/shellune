@@ -553,11 +553,20 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   头里，含 alpha）。`BITMAPV5HEADER` 之后是否再重复三个颜色掩码各家写法不一（Windows 自己合成的重复，浏览器等多数程序
   不重复），而 `image` crate 总是跳过 12 字节；`dib_to_png` 按包长判断——像素数据总在包尾——没有这 12 字节时先补上，
   两种写法都按原样解出（`a_remote_dibv5_pastes_as_the_same_picture_with_its_transparency`）。远端文本超过 1 MiB 时 shim 同样
-  截断后照常送达并提示“已截断”；远端图片超过 32 MiB 时从这一组里被跳过，其余格式照常送达并提示“没有传输”。RDP 远端
-  文本保留 Windows 的 CRLF 换行，原样写入本机。
+  截断后照常送达并提示“已截断”；远端图片超过 32 MiB 时从这一组里被跳过，其余格式照常送达并提示“没有传输”。换行按
+  本机习惯写入（R1，`local_line_breaks`）：CRLF、单独的 LF、单独的 CR 都算一个换行，Windows 上写成 CRLF，macOS 与 Linux
+  上写成 LF——RDP 远端复制的 CRLF 在 macOS / Linux 上原样写入会让每行多一个 `\r`（vim 里的 `^M`），Linux VNC 远端的 LF
+  在旧的 Windows 程序里会连成一行（`remote_text_is_written_with_this_computers_line_breaks`）。
 - **什么时候推送**：窗格拿到键盘（`cx.on_focus_in`）、窗口重新激活且画面仍有焦点（`observe_window_activation`；GPUI
   的焦点事件在窗口失活时也视为失焦，所以重新激活同样触发 focus-in，两条路径由去重合并成一次）、以及按下粘贴快捷键。
-  这样远端程序无论用 Ctrl+V 还是右键“粘贴”都拿到本机最新内容。只在会话活着（Connecting / Live）且有链路时读剪贴板。
+  这样远端程序无论用 Ctrl+V 还是右键“粘贴”都拿到本机最新内容。只在会话 **Live**（画面已出现）且有链路时读剪贴板：
+  连接中、等证书回答时 shim 的 `sd_client_clipboard_set_cut` 回 `SD_ERR_STATE`，排进队列的推送只会在连接卡片上变成一句
+  “发送失败”，用户却什么也没做（`focusing_a_session_still_connecting_raises_no_send_warning`）。因此会话变成 Live 时若画面
+  持有键盘且窗口是活动窗口，由下一帧绘制补推一次（`offer_when_live`，每个会话一次；新会话 `attach` 时重置）——首次连接
+  时在连接过程中就点了画面、以及重连时窗格一直持有键盘，都没有新的 focus-in 事件，靠的是这一次
+  （`a_session_still_connecting_is_offered_the_clipboard_when_it_goes_live`）。Windows 上读剪贴板不便宜：只有 `CF_DIB` 的截图
+  每读一次都在界面线程上编码成 PNG，所以窗格先问系统的剪贴板序号（`GetClipboardSequenceNumber`），与上次读取时相同就不读
+  （远端内容写入本机后也记下写入后的序号）；其它系统 GPUI 不提供这个序号，照常读取再按指纹去重。
 - **去重**（`prints` / `already_shared`）：窗格记着最近一次推送或最近一次从远端写入本机的内容的“指纹”（文本把 CRLF
   统一成 LF 后一份、每张图片一份）。RDP 远端文本带 CRLF，本机读回或用户在本机复制的同一段文字可能是 LF，统一换行后才算
   同一份。当前剪贴板的每一部分都在其中时不再推送——Windows 的 `read_from_clipboard` 只返回第一个格式（有文本时只给文本），
@@ -568,7 +577,9 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
   Ctrl / Alt / Shift 报成修饰键变化而不是按键——所以过去远端收到的是一个光秃秃的 V。现在普通键按下时按本机持有的修饰键
   在远端按下 Ctrl / Alt / Shift（`InputQueue::set_modifier`），本机松开修饰键时（`on_modifiers_changed`）在远端松开；
   单独按下修饰键不发送（Alt 单按会激活远端菜单栏），Windows 键不转发（单按会打开远端开始菜单）。macOS 上 ⌘ 视同 Ctrl，
-  所以 ⌘C / ⌘V 到远端就是 Ctrl+C / Ctrl+V。顺带的结果是 Shift+字母在远端成了大写字母。
+  所以 ⌘C / ⌘V 到远端就是 Ctrl+C / Ctrl+V。macOS 以外，按着 Windows / Super 键按下的键整个不发给远端——Super 不转发，
+  发出去就成了光秃秃的字母（Super+V 会在远端打出 v）——粘贴快捷键也只认 Ctrl+V
+  （`a_key_pressed_with_the_super_key_stays_on_this_computer`）。顺带的结果是 Shift+字母在远端成了大写字母。
   注意 RDP 的剪贴板通道与输入通道是两条虚拟通道，服务器不保证二者之间的顺序：焦点推送通常已经在按键之前把内容送到，
   若内容恰好是按 Ctrl+V 那一刻才变的，远端第一次粘贴可能还是旧内容，需实机确认。
 
