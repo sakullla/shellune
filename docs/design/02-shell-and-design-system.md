@@ -653,10 +653,21 @@ tokens 只在 `theme.rs` 定义一次，文档与代码不一致时以代码为�
 （`desktop.notice`）只画在**有画面**的时候；没有画面时同一句话由状态卡片（`desktop.status`）说一次，两处不会同时出现
 同一句警告。证书确认是独立的卡片（`desktop.certificate`），不会被提示条替代。
 全部用共享组件画（R6）：控件条是 `components::floating_bar`（raised + 强边 + 圆角 8 + Overlay，紧凑 Ghost 按钮，全屏带图标，
-百分比与按钮之间一条竖线），浮在别人的画面上所以带浮层阴影；状态卡片是 `state_card_with_icon`（显示器图标，色调随阶段）；
-提示条是 Warning 色调的 `banner` 抬到画面上（Overlay 阴影，正文主色）；证书确认是 raised 的 `card`，头部是警告色调的
-`modal_icon`，指纹用等宽 `endpoint`，底部"拒绝"（Danger）在前、"信任"（Primary）在后。窗口在桌面标签上方画的失败卡片
-下面留 24px，给卡片的浮层阴影落脚，不再被下面的画布切成一条硬边。
+百分比与按钮之间一条竖线），浮在别人的画面上所以带浮层阴影。
+
+**新视觉（T7，ADR-7）**：
+- **状态卡**改为终端位置同一种 `components::status_card`（raised + 强边 + 圆角 12 + Overlay，左侧色调图块 + 标题 + 一行说明，
+  经 `status_card_slot` 居中限宽 440、按画出的宽度测量）：连接中图块是加载标记，其余是显示器图标，色调随阶段；标题与说明
+  另有选择器 `desktop.status.headline` / `desktop.status.detail`。没有画面时的警告句是卡片里的一行（警告色调的状态记号 + 换行文字）。
+- **会话结束**：窗口不再在桌面上方另画一张失败卡片（旧版与桌面自己的状态卡上下叠成两张），而是与终端同一条顶部横幅
+  （ADR-6 的 `status_banner`：图标、一句话、重新连接、详情、关闭，选择器仍是 `terminal.failure*`），桌面自己的状态卡留在画面
+  位置说“远程桌面会话已结束”和停在哪一步。横幅关闭后不再回落成旧卡片；Tab、Esc 与终端横幅相同，键盘离开横幅时回到桌面画面。
+- **证书确认**是同一种 `status_card`（警告色调、锁图标），标题是证书摘要，指纹以等宽字体**整段换行显示、不加省略号**
+  （`desktop.certificate.fingerprint`，点按复制）——它是决定的依据；底部“拒绝”（Danger）在前、“信任”（Primary）在后，右对齐。
+- **提示条**（`desktop.notice`）移到画面**左下角**：在顶部时，最小窗口里它会盖住右上角的缩放控件（截图 `desktop-notices`
+  720×480 可见）；最宽 `NOTICE_WIDTH` 420（桌面窗格按 `Metrics::default()` 绘制，与改版前一样不随文字大小缩放）。控件条里百分比的宽度是命名常量 `ZOOM_LABEL_WIDTH`。
+- 截图：`desktop-rdp`、`desktop-vnc-failed`（横幅 + 状态卡）、`desktop-certificate`（新增）、`desktop-send-problem`、
+  `desktop-notices`，各有浅色中文与 720×480 @200% 变体。
 
 **全屏的作用域（R18）。** 全屏不是窗口进入的一种模式，而是「这块画面此刻是不是屏幕上唯一的那块」：它只在
 会话页（`Destination::LocalShells` 的画面上）、该会话是活动窗格、窗格仍在、而且它的标签里只有它这一个叶子时成立。
@@ -1003,7 +1014,8 @@ tooltip 这类在窗口渲染之外绘制的部件用 `theme::metrics()` 取得�
 | 迁移前（`d59a63f`，T3 记录） | 280 | 91（另有 316 处 `px(0)`，不计） | ADR-9 的“一半以下”以这一行为准：最终需 `scale` ≤ 140、`px` ≤ 45 |
 | T3 之后 | 267 | 82 | 新组件只用 spacing 令牌；状态标记与选中竖条的 1 / 1.5 / 2px 收为 `MARK_CORNER` / `MARK_STROKE` / `MARK_BAR_WIDTH` |
 | T4 之后 | 220 | 82 | 首页改为侧栏 + 单列表：卡片带、快速连接栏、分组列与分组头删除；新代码的尺寸都是命名常量（`SIDEBAR_WIDTH` 等）或 spacing 令牌 |
-| T6 之后（当前基线） | 203 | 75 | 标签改为胶囊（标签底色、分隔线与远程画面取色删除）；底栏终端工具收进菜单（折叠测量与 `tools_width` 删除）；状态卡改为横幅，横幅只用 spacing 令牌与命名常量（`DIAGNOSTIC_MAX_HEIGHT`、`BANNER_WORDS_WIDTH`）；标签条溢出容差 `STRIP_ROUNDING_SLACK` |
+| T6 之后 | 203 | 75 | 标签改为胶囊（标签底色、分隔线与远程画面取色删除）；底栏终端工具收进菜单（折叠测量与 `tools_width` 删除）；状态卡改为横幅，横幅只用 spacing 令牌与命名常量（`DIAGNOSTIC_MAX_HEIGHT`、`BANNER_WORDS_WIDTH`）；标签条溢出容差 `STRIP_ROUNDING_SLACK` |
+| T7 之后（当前基线） | 163 | 66 | 文件栏头、面包屑、文件行、问题、传输条与进度条、远程桌面状态卡与证书卡、隧道表单改用组件与 spacing / 度量令牌；余下的长度是命名常量（`FILES_SIZE_WIDTH`、`FILES_SELECTION_WORDS_MIN`、`NOTICE_WIDTH`、`ZOOM_LABEL_WIDTH`、`FORWARD_PORT_WIDTH`、`FORWARD_ROW_WORDS_MIN`、`LIST_ROW_MIN_HEIGHT`、`TOOLBAR_MIN_HEIGHT`、`HAIRLINE_WIDTH`）；状态卡徽记、浮动条、竖线与选中竖条的裸数换成等值的度量（外观不变） |
 
 ### 终端内搜索（`crates/terminal` + `src/app/terminal.rs`）
 
@@ -1144,8 +1156,32 @@ resize 都按同一条 recount 路径重新计数，视口停在读者原处，�
 而不是每个按钮各占一整行；读取失败是共享的 `card`，
 头部是危险色调的图标块与一句"无法读取此目录"；SCP 问题里"递归复制"是共享的勾选框（仍是键盘停靠点，焦点环不挪位）。
 **行内问题仍留在栏内**（新建文件夹、改名、删除、上传 / 下载确认）：它是该栏键盘停靠序列的一部分（`files_question_stops`），
-只挡住自己那一栏，另一栏与终端照常可用；改成全窗口的 `modal` 会改变这两条交互语义（R6 要求不变），所以它保留
-`banner` 外形（色调底 + 3px 色条，组件清单里"确认问题"的那一种），头部加上动作图标（危险问题为危险色调），按钮层级不变。
+只挡住自己那一栏，另一栏与终端照常可用；改成全窗口的 `modal` 会改变这两条交互语义（R6 要求不变）。外形见下文 T7。
+
+**新视觉（T7，ADR-7）。** 结构、键盘顺序与选择器不变，只换外形：
+- **栏头是 `components::toolbar`**（`files.header` / `files.local.header`：最小高 44、底部发丝线、可换行）。左边是 28 见方的
+  `leading_icon`（服务器 accent 色调 / 本机中性色调，`files.source`）、名称（title 字重，`files.host`）与等宽的目标，
+  右边是工具（上一级、刷新、跟随、新建文件夹、上传 / 下载）。栏头贴着栏的两边，内容在它下面留 12 的边距。
+  窄窗口的“本机 | 服务器”切换行也是一条 chrome 层的 `toolbar`（新增选择器 `files.toolbar`）。两栏之间、终端与文件之间
+  是 `components::column_divider`。
+- **面包屑**（`files.path`）不再是带边框的输入框样式：行首一个文件夹图标，每段是 `components::crumb`（次要文字、
+  悬停浅底与主文字色，当前段主文字 + 500 字重），段间是 caption 大小的 `crumb_separator`。每段仍以 `CRUMB_ROOM`
+  为上限、段内换行、整体换行、提示完整路径。
+- **筛选框**是带放大镜的搜索框（`TextField::set_leading_icon(Search)`）。
+- **列表**不再装在 surface 卡片里：表头（紧凑 28 高、500 字重、底部发丝线）和行直接铺在页面上。每行（含“上级目录”）是
+  `components::compact_row_frame`：与 `list_row` 同一张面表，高一个紧凑控件（28）。键盘所在行是 Selected
+  （`SURFACE_SELECTED` + 左侧 accent 竖条，改版前是 accent tint），批量标记行是 `ACCENT_TINT`（改版前是 selected 底），
+  与首页列表一致；其余行只在悬停时亮一档。大小列宽 `FILES_SIZE_WIDTH`。
+- **读取中**是一句 muted 说明加 `FILES_LOADING_ROWS`（3）行 `skeleton_row`（`files.loading`）；**空目录**是居中的
+  accent tint 打开文件夹图块 + 状态 + 下一步（`capped_text`，`files.empty` / `files.empty.hint`）；筛选无结果是放大镜 + 一句。
+  等待服务器应答的提示（`files.pending`）是警告色调的 `inline_banner_frame` 加可换行的句子。
+- **行内问题是 `components::inline_form`**：raised 底 + 强发丝边（危险 / 警告问题为该色调的边）+ 圆角 8 + Raised，
+  头部是 `form_heading`（动作图标在色调 tint 上 + 一句，`files.question.heading`），字段上方是 `form_label`，目标路径用等宽
+  字体，协议分段只有自己的宽度。行的顺序、键盘停靠点与“确定在前、取消在后”不变。
+- 栏的焦点环改为 `FOCUS_RING`，边框平时就在（透明），拿到键盘时内容不再挪动 1px。
+- 拖动文件时跟随指针的标签是 raised + 强边 + Overlay，尺寸取窗口正在用的缩放。
+- 截图：`files-dual`、`files-question`（新增）、`files-marked`、`files-server-failed`、`files-empty` 各有深浅、中文与
+  720×480 @200% 变体；`files-split` 只在宽窗口出现，保留深浅与 1680×940 中文。
 
 ### SCP 文件复制（`crates/ssh/src/scp.rs`、`transfers.rs`）
 
@@ -1243,6 +1279,12 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
   通知 worker，之后 worker 的报告只更新留下的部分文件，不会把已停的任务改回进行中。
 - 没有“暂停/继续”：worker 与队列都没有暂停语义（`TransferCommand` 只有 Start / Decide / Cancel），本轮不给一个只会改
   样式的按钮。真正的暂停需要 `crates/ssh` 与 `crates/core` 的改动，超出本轮范围，记为未实现。
+- **新视觉（T7，ADR-7）**：传输条的标题行是它自己的工具行（传输图标 + “传输” + 运行中的数量，仍在滚动区之上）；
+  每个任务是 panel 底 + 发丝边 + 圆角 6 的一行，状态句与动作同在第一行，条太窄时动作整体换到句子下面（句子最窄
+  `FILES_SELECTION_WORDS_MIN`，不再被挤成一行两个字）；进度条是共享的 `components::progress_bar`（确定）；“无法开始”与
+  “文件夹未传输”是色调 tint 上的状态记号 + 句子；覆盖确认是危险边的 `inline_form`。传输中心（传输对话框）的
+  行改为 `list_row_frame`：左侧上传 / 下载图标在状态色调上，右侧状态 chip；没有任务时是共享的 `empty_state`
+  （`transfers.empty`，取代原来的 `state.card`）。
 
 **端口转发。** 每行写清四件事：类型（本地 / 远程 / SOCKS）、经由哪台主机、两个端点各自的所在侧、当前状态。端点方向
 按类型写成句子而不是只列两个地址：本地转发是 `本机 127.0.0.1:8080 → 服务器 db.internal:5432`，远程转发反过来是
@@ -1256,11 +1298,23 @@ SCP 失败就报 SCP 的失败，SFTP 失败就报 SFTP 的失败，不会静默
   （`stopping_or_deleting_a_tunnel_asks_first_and_the_answer_is_what_changes_it`）。
 - 新建/编辑表单本身就是“类型 · 经由主机 · 两个带标签的端点 · 一句话预览”；保存前校验在表单内出现（`forwards.error`），
   被拒绝时表单不关、文件不写（`the_tunnel_form_refuses_an_incomplete_endpoint_and_saves_nothing`）。
+- **新视觉（T7，ADR-7）**：表单是 `inline_form`（头部隧道图标 + “新建 / 编辑端口转发”，每个字段上方 `form_label`，端口框宽
+  `FORWARD_PORT_WIDTH`，底部取消在前、保存在后右对齐）；停止 / 删除确认与“监听所有地址”确认是警告 / 危险边的
+  `inline_form`（停止图标 / 垃圾桶 / 地球，按钮右对齐）。规则行仍是 `list_row_frame`，文字最窄 `FORWARD_ROW_WORDS_MIN`，
+  对话框太窄（720×480 @200%）时命令换到文字下一行，不再压在“监听中”chip 上。
 
 **捕获。** `files-dual`、`files-empty`、`transfers-running`、`transfers-failed`、`forwards-empty`、`forwards-running`
 六个场景由夹具数据构造：两侧目录来自脚本化通道（不读磁盘、不连服务器），传输任务通过队列自己的事件进入“进行中 /
-失败”，转发规则在不绑定任何套接字的情况下标记为监听中。每个场景都有浅色与深色，另加中文 + 115% 或最小窗口中的一种；
-就绪判断读的是渲染所用的同一份模型（`capture_files_listing`、`capture_transfer_count`、`capture_forward_counts`）。
+失败”，转发规则在不绑定任何套接字的情况下标记为监听中。每个场景都有浅色与深色，T7 起另有浅色中文与
+720×480 @200%；T7 新增 `files-question`（上传问题的行内表单）与 `forwards-form`（新建隧道表单）；
+就绪判断读的是渲染所用的同一份模型（`capture_files_listing`、`capture_transfer_count`、`capture_forward_counts`、
+`capture_files_question_open`、`capture_forward_form_open`）。
+
+**选择器变更（T7，供 T9 汇总）**：传输对话框无任务时 `state.card` → `transfers.empty`（测试
+`transfers_and_forwards_open_over_the_page_and_close_again` 同步）；远程桌面结束时窗口画的 `terminal.failure` 从卡片变成横幅，
+选择器同名（`terminal.failure`、`.next`、`.details`、`.copy`、`.detail` 与 `terminal.banner`）；新增 `files.toolbar`、
+`files(.local).loading.skeleton.<n>`（骨架行的动画 id）、`transfers.progress.bar.<n>`、`desktop.status.headline`、
+`desktop.status.detail`、`desktop.certificate.fingerprint`；其余文件、传输、转发、桌面选择器不变。
 ### X11 转发（`crates/ssh/src/x11.rs`、连接表单、会话头）
 
 X11 转发让服务器上的图形程序显示在这台电脑上。三个模式与 OpenSSH 命令行同名：关闭（默认，`ssh` 不加参数）、
@@ -1893,6 +1947,10 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 | `status_card(tone, emblem, title, detail)` + `status_card_slot` | 叠在终端上的会话状态卡：raised + 强边 + 圆角 12 + Overlay，色调徽记块 36 + 标题 + 一行说明；吃掉指针，动作由调用方追加，进入时 Rise。卡片本身不带宽度，一律经 `status_card_slot` 放置（`capped` 规则，上限 `STATUS_CARD_WIDTH` 440），按画出的宽度求高度——修复了“展开诊断”时文字溢出卡片底边（测试 `a_status_card_is_as_tall_as_the_diagnostic_it_paints`） |
 | `search_field(field, clear, shortcut, state)` | 唯一的搜索框：放大镜图标 + 调用方的文本框 + 可选清除按钮 + 可选快捷键提示（`kbd`）；外观取 `field_face(state)`，高 32、圆角 6。文本框的占位文字比框宽时以“…”结尾（`text_field.rs` 绘制时截断，测试 `a_placeholder_wider_than_its_field_ends_in_an_ellipsis`）；已输入的文字仍横向滚动 |
 | `list_row(ListRow, state)` / `list_row_frame(state)` / `list_row_face` / `leading_icon` | 列表行：扁平（静止无底无边），悬停 hover 底、选中 selected 底 + 左侧 2px accent 竖条（画在内边距里，内容不移动）、焦点 2px 焦点环；左侧头像或图标块（32），两行文字（名称 13 MEDIUM、副行 12，放不下时以画出的“…”结尾，测试 `cut_words_in_rows_banners_and_sidebars_end_in_a_drawn_ellipsis` 读回排版后的行来校验），右侧元信息（12、muted）与动作区；`reveal_actions` 时动作只在悬停（`ROW_GROUP`）或选中时显示。端口转发列表已改用它 |
+| `compact_row_frame(state, marked)` | 紧凑列表行（T7）：与 `list_row_frame` 同一张面表、同一个 `ROW_GROUP`，最小高一个紧凑控件（28）、无上下内边距、间距 8；`marked` 为批量标记行（`ACCENT_TINT` 底，悬停不覆盖）。文件列表与“上级目录”行用它 |
+| `inline_form(tone)` + `form_heading(tone, icon, title)` + `form_label(label)` | 栏内 / 对话框内的问题与短表单（T7）：raised 底 + 强发丝边（危险、警告为该色调的边）+ 圆角 8 + Raised，内边距 12、间距 8；头部是指针目标大小的色调图块 + 一句（body、500）；字段标签 caption、500、次要色；主次按钮放在最后一行并靠右，不用大面积强调色底。文件栏问题、传输覆盖确认、隧道表单与停止 / 删除 / 暴露确认用它，取代这些地方的 `banner` 与 `card` |
+| `crumb(current)` + `crumb_separator` | 面包屑的一段与段间箭头（T7）：次要文字、圆角 4、悬停浅底与主文字色，当前段主文字 + 500；箭头 caption 大小、muted |
+| `column_divider` / `HAIRLINE_WIDTH` | 两栏之间从顶到底的发丝线；发丝线宽度常量（`divider_vertical` 与文件栏宽度计算也用它） |
 | `sidebar_item(icon, label, count, selected)` / `sidebar_icon_item` | 侧栏项：高 32、圆角 6，图标 16 + 文字（省略号）+ 右对齐计数（12、muted）；选中为 selected 底 + 主色 + MEDIUM；折叠侧栏用仅图标的方形项 |
 | `toolbar` | 页面或栏的头部工具条：一行、居中对齐、间距 8、最小高 44、底部发丝线；调用方放标题、搜索框和命令，`flex_1` 的子元素占剩余空间 |
 | `inline_banner(tone, icon, message)` | 内容上方的状态横幅（ADR-6 用）：色调 tint 底 + 底部色调发丝线，最小高 36；色调图标 + 一句话（省略号截断）+ 调用方追加的紧凑按钮与关闭按钮。不遮挡下方内容 |
@@ -1940,6 +1998,11 @@ surface 底、静止 Raised，焦点环叠在 Raised 之上；尺寸不随窗口
 `components_row`（卡片当行用）→ `list_row_frame` + `leading_icon`；`view/home.rs` 的本地 `checkbox` → `checkbox_target`；
 `view/desktop.rs` 状态卡的手写居中限宽 → `capped`；`view/shell.rs` 的 `switch_control` 手写开关行 → `labelled_switch`；
 会话状态卡的限宽 → `status_card_slot`。`view/shell.rs::modal` 只是把 `components::modal` 放进覆盖层并记下遮罩淡出，保留。
+T7 又把文件视图、传输、端口转发与远程桌面里的手写外形换成组件：文件栏头的自绘图块与标题行 → `toolbar` +
+`leading_icon`；面包屑的带框行与自绘段 → `crumb` / `crumb_separator`；文件行与上级行的自绘悬停 / 选中 →
+`compact_row_frame`；传输进度条的自绘槽与填充 → `progress_bar`；文件问题、传输覆盖问题（3px 左边的手写块）、隧道表单与确认 →
+`inline_form`；桌面的 `state_card_with_icon` 与证书 `card` → `status_card` + `status_card_slot`；两处 `w(px(1))` 竖线 →
+`column_divider`。
 
 组件的测试在 `components.rs` 与 `theme.rs` 各自的 `#[cfg(test)]` 模块里：八种状态逐格校验文字对比
 度（禁用态取 3:1 图形下限）、同一变体的八种状态互不相同、焦点与校验失败只加宽边框、浮层使用 overlay /

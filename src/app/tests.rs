@@ -1385,7 +1385,16 @@ async fn transfers_and_forwards_open_over_the_page_and_close_again(cx: &mut Test
     go(cx, GoToTransfers);
     let viewport = cx.update(|window, _app| window.viewport_size());
     assert_fits_inside(bounds_of(cx, "transfers.dialog"), viewport, "transfers");
-    assert_fits_inside(bounds_of(cx, "state.card"), viewport, "no transfer yet");
+    // No transfer yet is the shared empty state (ADR-7), not a failure-shaped card.
+    assert_fits_inside(
+        bounds_of(cx, "transfers.empty"),
+        viewport,
+        "no transfer yet",
+    );
+    assert!(
+        cx.debug_bounds("state.card").is_none(),
+        "an empty transfer list is not drawn as a state card"
+    );
     click(cx, "transfers.dialog.close");
     assert_eq!(
         cx.update(|_window, app| view.read(app).tool_for_test()),
@@ -27103,6 +27112,60 @@ async fn a_desktop_that_was_refused_states_one_reason_and_forgets_its_disclosure
     assert!(
         !cx.update(|_window, app| view.read(app).diagnostics_open(id)),
         "the disclosure is forgotten with the session it belonged to"
+    );
+}
+
+/// A remote desktop that ended says so once in the banner above its place and once in
+/// its own status card under it, the way a terminal does (ADR-6, ADR-7): the window no
+/// longer stacks a second failure card over the desktop's card, and closing the banner
+/// leaves the card, not the old one.
+#[gpui::test]
+async fn an_ended_desktop_states_itself_in_the_banner_above_its_own_card(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|_window, cx| ShelluneView::new(cx));
+    cx.simulate_resize(design_window());
+    let (link, _log) = ScriptedLink::new(vec![LinkEvent::State {
+        state: LinkState::Failed(LinkFailure::Authentication),
+        failure: LinkFailure::Authentication,
+        detail: 0,
+        reason: "the server rejected the logon".to_owned(),
+    }]);
+    let record = desktop_record("desk");
+    let id = mount_scripted_desktop(&view, cx, &record, link);
+    redraw(cx);
+
+    let metrics = Metrics::default();
+    let banner = bounds_of(cx, "terminal.failure");
+    let card = bounds_of(cx, "desktop.status");
+    assert!(
+        banner.size.height <= metrics.large_control_height() + px(1.0),
+        "the failure is one banner line, not a card: {banner:?}"
+    );
+    assert!(
+        card.top() >= banner.bottom() - px(0.5),
+        "the desktop's own card stands under the banner, not under a second card: \
+         banner {banner:?}, card {card:?}"
+    );
+    assert!(
+        cx.debug_bounds("terminal.failure.next").is_some(),
+        "the banner offers the next step"
+    );
+
+    click(cx, "terminal.failure.dismiss");
+    redraw(cx);
+    assert!(
+        !cx.update(|_window, app| view.read(app).banner_shown_for_test(id, app)),
+        "the banner closed"
+    );
+    // A selector that is no longer drawn keeps its last bounds, so the old card would
+    // show here as a `terminal.failure` taller than one banner line.
+    let after = bounds_of(cx, "terminal.failure");
+    assert!(
+        after.size.height <= metrics.large_control_height() + px(1.0),
+        "a closed banner does not come back as the old failure card: {after:?}"
+    );
+    assert!(
+        bounds_of(cx, "desktop.status").size.height > px(0.0),
+        "the desktop's card still says the session ended"
     );
 }
 

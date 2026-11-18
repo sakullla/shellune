@@ -1721,10 +1721,10 @@ mod guard {
     use std::path::{Path, PathBuf};
 
     /// Bare `scale(<number>)` calls in the non-test source of `src/app`.
-    const SCALE_BASELINE: usize = 203;
+    const SCALE_BASELINE: usize = 163;
     /// Bare `px(<number>)` calls with a number other than zero in the non-test source
     /// of `src/app`.
-    const PX_BASELINE: usize = 75;
+    const PX_BASELINE: usize = 66;
 
     /// The files a colour literal is allowed in, and why.
     const COLOUR_HOMES: [&str; 2] = [

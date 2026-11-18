@@ -452,16 +452,21 @@ impl ShelluneView {
         // terminal's place - a remote desktop's own surface, or the files in a window
         // too narrow to dock them - still states it above, as a card of its own (R3).
         let tree_shown = files.is_none() || self.files_docked();
-        let overlaid = tree_shown && session_id.is_some_and(|id| self.desktop_for(id).is_none());
+        let desktop = session_id.is_some_and(|id| self.desktop_for(id).is_some());
+        let overlaid = tree_shown && !desktop;
         let banner = (!overlaid)
             .then_some(session_id)
             .flatten()
-            .filter(|id| self.pane_for(*id).is_some())
+            .filter(|id| self.pane_for(*id).is_some() || self.desktop_for(*id).is_some())
             .and_then(|id| self.status_banner(id, cx));
         if let Some((banner, _)) = banner {
-            // The files have the terminal's place: the banner stands above them (ADR-6).
+            // The files have the terminal's place, or a remote desktop draws its own
+            // card where the picture was: the banner stands above them (ADR-6, ADR-7).
             column = column.children(banner);
-        } else if !overlaid && let Some(notice) = self.active_failure_notice(session_id, cx) {
+        } else if !overlaid
+            && !desktop
+            && let Some(notice) = self.active_failure_notice(session_id, cx)
+        {
             column = column.child(
                 div()
                     .flex()

@@ -921,6 +921,33 @@ fn show_desktop_vnc_failed(
     Ok(())
 }
 
+/// An RDP server that asks whether its certificate is trusted, before any picture: the
+/// question card over the place the picture will be (ADR-7).
+fn show_desktop_certificate(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let events = vec![
+        LinkEvent::State {
+            state: LinkState::Connecting,
+            failure: LinkFailure::None,
+            detail: 0,
+            reason: String::new(),
+        },
+        LinkEvent::Certificate {
+            request_id: 7,
+            host: "build-monitor.example.internal".to_owned(),
+            subject: "CN=build-monitor.example.internal".to_owned(),
+            issuer: "CN=Example Internal CA".to_owned(),
+            fingerprint: "3F:9A:61:0C:D2:7E:44:B8:19:A5:C3:70:5E:2D:88:F1:06:BC:4A:93".to_owned(),
+            flags: 0,
+        },
+    ];
+    mount_desktop(view, &capture_rdp_record(), events, cx)?;
+    Ok(())
+}
+
 /// A live RDP session whose last send did not reach the remote side: the strip over the
 /// picture, which is the only place that sentence can be read.
 fn show_desktop_send_problem(
@@ -1084,6 +1111,18 @@ fn desktop_live_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
         .count();
     if shown != 1 {
         return Err(format!("{shown} desktop surfaces hold a picture"));
+    }
+    Ok(())
+}
+
+/// Where the certificate shot has arrived: one surface waiting for the answer.
+fn desktop_certificate_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    let asked = view.open_sessions().into_iter().any(|id| {
+        view.desktop_of(id)
+            .is_some_and(|pane| pane.read(cx).certificate_asked())
+    });
+    if !asked {
+        return Err("no desktop surface is asking about its certificate".to_owned());
     }
     Ok(())
 }
@@ -1531,6 +1570,20 @@ fn show_files_of(
     Ok(())
 }
 
+/// The file view with the server's column asking where an upload goes (ADR-7).
+fn show_files_question(
+    view: &mut ShelluneView,
+    window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    show_files(view, window, cx)?;
+    let id = view
+        .active_session()
+        .ok_or_else(|| "no session".to_owned())?;
+    view.capture_files_question(id, cx);
+    Ok(())
+}
+
 /// The file view with two rows of the server's column marked (R14).
 fn show_marked_files(
     view: &mut ShelluneView,
@@ -1628,6 +1681,20 @@ fn show_forwards_running(
     Ok(())
 }
 
+/// The forwarding page on a new tunnel's form (ADR-7).
+fn show_forward_form(
+    view: &mut ShelluneView,
+    _window: &mut Window,
+    cx: &mut Context<ShelluneView>,
+) -> Result<(), String> {
+    let host = saved_hosts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the host fixture is empty".to_owned())?;
+    view.capture_forward_form(&host, cx);
+    Ok(())
+}
+
 /// Shows several tabs, then lists all of them over the terminal (R17).
 fn show_tab_list(
     view: &mut ShelluneView,
@@ -1689,6 +1756,21 @@ fn files_ready_at(view: &ShelluneView, expected: (&str, usize)) -> Result<(), St
 
 fn files_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
     files_ready_at(view, ("/home/deploy/项目 发布/2026-11 版本", 4))
+}
+
+fn files_question_ready(view: &ShelluneView, cx: &App) -> Result<(), String> {
+    files_ready(view, cx)?;
+    if !view.capture_files_question_open() {
+        return Err("the upload question is not open".to_owned());
+    }
+    Ok(())
+}
+
+fn forward_form_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
+    if !view.capture_forward_form_open() {
+        return Err("the tunnel form is not open".to_owned());
+    }
+    Ok(())
 }
 
 fn empty_files_ready(view: &ShelluneView, _cx: &App) -> Result<(), String> {
@@ -3103,6 +3185,8 @@ pub const SCENARIOS: &[Scenario] = &[
             Variant::dark().smallest(),
             Variant::dark().comfortable(),
             Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
@@ -3117,11 +3201,37 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the card a refused sign-in leaves and the step it stopped on; proves nothing about a \
                    real VNC server's handshake or security types",
         quick: false,
-        variants: &[Variant::dark().smallest(), Variant::dark().chinese()],
+        variants: &[
+            Variant::dark().smallest(),
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+            Variant::light().smallest().largest(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_desktop_vnc_failed,
         ready: desktop_failed_ready,
+    },
+    Scenario {
+        id: "desktop-certificate",
+        title: "远程桌面 · 证书确认",
+        category: Category::Desktop,
+        fixture: "a display-only RDP surface whose scripted link asks whether a fixed \
+                  certificate is trusted; no server was dialled",
+        evidence: "shows the question card a certificate decision is asked in, with the \
+                   fingerprint and both answers; proves nothing about a real server's \
+                   certificate or the policy that checks it",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: nothing,
+        install: show_desktop_certificate,
+        ready: desktop_certificate_ready,
     },
     Scenario {
         id: "desktop-send-problem",
@@ -3131,7 +3241,12 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows where the warning sits over a picture and that it does not replace it; proves nothing \
                    about a real input path",
         quick: false,
-        variants: &[Variant::dark().comfortable(), Variant::dark().chinese()],
+        variants: &[
+            Variant::dark().comfortable(),
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
         install: show_desktop_send_problem,
@@ -3150,6 +3265,8 @@ pub const SCENARIOS: &[Scenario] = &[
             Variant::dark().comfortable(),
             Variant::dark().chinese(),
             Variant::light().smallest(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
         prepare: nothing,
@@ -3526,13 +3643,35 @@ pub const SCENARIOS: &[Scenario] = &[
         quick: true,
         variants: &[
             Variant::dark().chinese().comfortable(),
+            Variant::light().chinese(),
             Variant::dark().smallest(),
             Variant::dark().smallest().largest(),
+            Variant::light().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_files,
         ready: files_ready,
+    },
+    Scenario {
+        id: "files-question",
+        title: "文件 · 栏内的上传问题",
+        category: Category::Terminal,
+        fixture: "both columns answered from fixture listings, with the server's column \
+                  asking where an upload goes",
+        evidence: "shows the inline form a file question is drawn in, its fields, its \
+                   protocol switch and its answers, in the column it is about; nothing \
+                   was uploaded and no server answered",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_files_question,
+        ready: files_question_ready,
     },
     Scenario {
         id: "files-marked",
@@ -3545,6 +3684,7 @@ pub const SCENARIOS: &[Scenario] = &[
         quick: false,
         variants: &[
             Variant::dark().chinese(),
+            Variant::light().chinese(),
             Variant::dark().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
@@ -3561,7 +3701,11 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the reason and the recovery entries of the server's column beside \
                    this computer's unchanged list; no permission or disconnection was real",
         quick: false,
-        variants: &[Variant::dark().chinese().smallest()],
+        variants: &[
+            Variant::dark().chinese().smallest(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_isolated_failure,
@@ -3590,7 +3734,11 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows what an empty directory says and the actions still offered beside it; nothing \
                    was listed on a server",
         quick: false,
-        variants: &[Variant::dark().chinese().smallest()],
+        variants: &[
+            Variant::dark().chinese().smallest(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_empty_files,
@@ -3606,7 +3754,9 @@ pub const SCENARIOS: &[Scenario] = &[
         quick: true,
         variants: &[
             Variant::dark().chinese().comfortable(),
+            Variant::light().chinese(),
             Variant::dark().smallest(),
+            Variant::dark().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
@@ -3621,7 +3771,12 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the reason, the partial file and the retry actions of a task the queue really \
                    holds; no transfer was attempted",
         quick: true,
-        variants: &[Variant::dark().chinese()],
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+            Variant::light().smallest().largest(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_failed_transfer,
@@ -3635,7 +3790,11 @@ pub const SCENARIOS: &[Scenario] = &[
         evidence: "shows the empty forwarding page and how a tunnel is created; nothing was bound or \
                    dialled",
         quick: false,
-        variants: &[Variant::dark().chinese().smallest()],
+        variants: &[
+            Variant::dark().chinese().smallest(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_forwards_empty,
@@ -3651,12 +3810,34 @@ pub const SCENARIOS: &[Scenario] = &[
         quick: true,
         variants: &[
             Variant::dark().chinese().comfortable(),
+            Variant::light().chinese(),
             Variant::dark().smallest(),
+            Variant::dark().smallest().largest(),
         ],
         start: || page(Destination::LocalShells),
         prepare: seed_hosts,
         install: show_forwards_running,
         ready: forwards_running_ready,
+    },
+    Scenario {
+        id: "forwards-form",
+        title: "转发 · 新建隧道表单",
+        category: Category::Overlay,
+        fixture: "one saved host and an empty rule book, with the form of a new tunnel \
+                  opened from that host",
+        evidence: "shows the inline form a tunnel is made in: its kind, the host it goes \
+                   through, its two labelled endpoints and the sentence it will do; \
+                   nothing was saved, bound or dialled",
+        quick: false,
+        variants: &[
+            Variant::dark().chinese(),
+            Variant::light().chinese(),
+            Variant::dark().smallest().largest(),
+        ],
+        start: || page(Destination::LocalShells),
+        prepare: seed_hosts,
+        install: show_forward_form,
+        ready: forward_form_ready,
     },
     Scenario {
         id: "settings",

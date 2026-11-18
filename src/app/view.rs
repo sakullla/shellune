@@ -47,7 +47,7 @@ use crate::app::actions::{
     SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, ToggleLanguage,
     ToggleSidebar, ZoomPane,
 };
-use crate::app::components::Variant;
+use crate::app::components::{ControlState, Variant};
 use crate::app::copy::{self, Locale, Strings};
 #[cfg(any(test, feature = "ui-capture"))]
 use crate::app::files::BrowseChannel;
@@ -72,7 +72,7 @@ use crate::app::remote::{
 use crate::app::snippets::{SnippetLibrary, SnippetsPanel};
 use crate::app::terminal::{self, PaneState, SourceEvent, TerminalAttention, TerminalPane};
 use crate::app::text_field::{Browse, TextField};
-use crate::app::theme::{self, Metrics, Tone, palette, spacing};
+use crate::app::theme::{self, Elevated, Metrics, Tone, palette, spacing};
 #[cfg(test)]
 use crate::app::transfers::TransferChannel;
 use crate::app::transfers::{
@@ -258,14 +258,18 @@ struct FileDragLabel {
 
 impl Render for FileDragLabel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // The label is drawn by the platform's drag layer, outside the window's own
+        // pass, so it reads the zoom the window drew with.
+        let metrics = theme::metrics();
         div()
-            .px(px(8.0))
-            .py(px(4.0))
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::HAIRLINE))
             .rounded(px(radius::SMALL))
-            .bg(theme::swatch(palette::SURFACE))
+            .bg(theme::swatch(palette::RAISED))
             .border_1()
-            .border_color(theme::swatch(palette::BORDER))
-            .text_size(px(12.0))
+            .border_color(theme::swatch(palette::BORDER_STRONG))
+            .elevation(theme::Elevation::Overlay)
+            .text_size(metrics.caption_size())
             .child(self.name.clone())
     }
 }
@@ -285,7 +289,7 @@ fn files_actions_width(metrics: Metrics, source: FileSource) -> gpui::Pixels {
         FileSource::Local => 3.0,
     };
     let slot = f32::from(metrics.hit_target());
-    let gap = f32::from(metrics.scale(1.0));
+    let gap = f32::from(metrics.scale(spacing::HALF));
     px(slot * slots + gap * (slots - 1.0))
 }
 
@@ -401,6 +405,16 @@ pub const DOCK_MIN_WIDTH: f32 = (FILES_PANEL_WIDTH * 2.0 + 120.0) * 2.0 + 40.0;
 /// segment keeps the others on the same row and leaves the full path in the segment's
 /// tooltip, so a deep directory is readable instead of being cut off at the edge (R6).
 const CRUMB_ROOM: f32 = 240.0;
+
+/// How many placeholder rows a column draws while its listing is on the way.
+const FILES_LOADING_ROWS: usize = 3;
+
+/// The width of a file listing's size column, before text scale.
+const FILES_SIZE_WIDTH: f32 = 80.0;
+
+/// The narrowest the words of a column's batch bar get before its actions wrap under
+/// them, before text scale.
+const FILES_SELECTION_WORDS_MIN: f32 = 180.0;
 
 /// How often the shell looks for answers from a file view.
 ///
@@ -2294,6 +2308,46 @@ impl ShelluneView {
             })
             .count();
         (rows.len(), listening)
+    }
+
+    /// Opens the upload question of the server's column of a capture session (ADR-7).
+    ///
+    /// The question is the build's own: its fields, its protocol switch and its
+    /// answers are what a press on Upload draws. Nothing is sent until it is answered,
+    /// and a capture never answers it.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_files_question(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.files_ask_upload(id, cx);
+        cx.notify();
+    }
+
+    /// Whether a file question is open in the session on screen, for a capture.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_files_question_open(&self) -> bool {
+        self.active_session().is_some_and(|id| {
+            self.files_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.session() == id)
+        })
+    }
+
+    /// Opens the forwarding page of a capture host on a new tunnel's form (ADR-7).
+    ///
+    /// The form starts on the host it was opened from, as a press on New tunnel does;
+    /// nothing is saved or bound.
+    #[cfg(feature = "ui-capture")]
+    pub fn capture_forward_form(&mut self, host: &HostConfig, cx: &mut Context<Self>) {
+        self.capture_forwards(host, false, cx);
+        self.open_forward_editor(cx);
+        cx.notify();
+    }
+
+    /// Whether the forwarding page shows its tunnel form, for a capture.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn capture_forward_form_open(&self) -> bool {
+        self.forwards.editor().is_some()
     }
 
     /// Draws the host list in one place of the sidebar, the way a press on it does
@@ -12518,13 +12572,7 @@ impl ShelluneView {
             panes = panes.child(self.files_panel(id, FileSource::Local, cx));
         }
         if wide {
-            panes = panes.child(
-                div()
-                    .flex_none()
-                    .w(px(1.0))
-                    .h_full()
-                    .bg(theme::swatch(palette::BORDER)),
-            );
+            panes = panes.child(components::column_divider());
         }
         if wide || shown == FileSource::Remote {
             panes = panes.child(self.files_panel(id, FileSource::Remote, cx));
@@ -12583,18 +12631,12 @@ impl ShelluneView {
                     .child(SharedString::from(label)),
             )
         });
-        // The switch is only needed when the window is too narrow for both sides.
+        // The switch is only needed when the window is too narrow for both sides. It is
+        // the view's own toolbar, on the chrome layer above the column it switches.
         let toolbar = switch.map(|switch| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(metrics.scale(spacing::TIGHT))
-                .h(metrics.scale(40.0))
-                .px(metrics.scale(spacing::SNUG))
+            components::toolbar(metrics)
                 .bg(theme::swatch(palette::CHROME))
-                .border_b_1()
-                .border_color(theme::swatch(palette::BORDER))
+                .debug_selector(|| "files.toolbar".to_owned())
                 .child(switch)
                 .children(other_side)
         });
@@ -12701,13 +12743,7 @@ impl ShelluneView {
                     .min_h_0()
                     .child(terminal),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(1.0))
-                    .h_full()
-                    .bg(theme::swatch(palette::BORDER)),
-            )
+            .child(components::column_divider())
             .child(
                 div()
                     .flex()
@@ -12864,7 +12900,8 @@ impl ShelluneView {
     /// window.
     fn files_area_width(&self) -> gpui::Pixels {
         if self.files_docked() {
-            self.viewport_width * 0.5 - px(1.0)
+            // Half the window, less the hairline between the terminal and the files.
+            self.viewport_width * 0.5 - px(components::HAIRLINE_WIDTH)
         } else {
             self.viewport_width
         }
@@ -12912,6 +12949,9 @@ impl ShelluneView {
                     TextField::with_text(placeholder, &existing, cx)
                 };
                 field.set_clearable(true, cx);
+                // The filter is a search of the column's names, and looks like one: the
+                // magnifier at its start, as in every other search field (ADR-2).
+                field.set_leading_icon(Icon::Search, cx);
                 field
             });
             // The observer already runs inside an update of this view: updating it again
@@ -14734,7 +14774,7 @@ impl ShelluneView {
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .child(self.row_icon_button(
                 files_element_id(source, "up"),
                 Icon::ArrowUp,
@@ -14799,45 +14839,27 @@ impl ShelluneView {
             }
         }
 
-        // The header wraps: when the column is too narrow for the name and every tool
-        // (the minimum window at 200% text), the tools take a line of their own
-        // instead of running past the column's edge (R4).
-        let header = div()
-            .flex()
-            .flex_none()
+        // The column's head is a toolbar (ADR-7): which source it is, then its tools. It
+        // wraps: when the column is too narrow for the name and every tool (the minimum
+        // window at 200% text), the tools take a line of their own instead of running
+        // past the column's edge (R4).
+        let header = components::toolbar(metrics)
             .flex_wrap()
-            .items_center()
-            .gap(metrics.scale(spacing::SNUG - 2.0))
             .debug_selector({
                 let header_id = header_id.clone();
                 move || header_id.to_string()
             })
             .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(metrics.scale(32.0))
-                    .rounded(px(radius::MEDIUM))
-                    .bg(theme::swatch(if remote {
-                        palette::ACCENT_TINT
-                    } else {
-                        palette::SURFACE_SELECTED
-                    }))
-                    .debug_selector({
-                        let source_id = source_id.clone();
-                        move || source_id.to_string()
-                    })
-                    .child(icons::icon(
-                        if remote { Icon::Server } else { Icon::Monitor },
-                        metrics.small_icon_size(),
-                        theme::swatch(if remote {
-                            palette::ACCENT
-                        } else {
-                            palette::TEXT_SECONDARY
-                        }),
-                    )),
+                components::leading_icon(
+                    if remote { Icon::Server } else { Icon::Monitor },
+                    if remote { Tone::Accent } else { Tone::Neutral },
+                    metrics,
+                )
+                .size(metrics.compact_control_height())
+                .debug_selector({
+                    let source_id = source_id.clone();
+                    move || source_id.to_string()
+                }),
             )
             .child(
                 div()
@@ -14849,7 +14871,7 @@ impl ShelluneView {
                         div()
                             .truncate()
                             .text_size(metrics.body_size())
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(metrics.title_weight())
                             .text_color(theme::swatch(palette::TEXT_PRIMARY))
                             .debug_selector({
                                 let host_id = host_id.clone();
@@ -14860,6 +14882,7 @@ impl ShelluneView {
                     .child(
                         div()
                             .truncate()
+                            .font_family(terminal::monospace_family())
                             .text_size(metrics.caption_size())
                             .text_color(theme::swatch(palette::TEXT_MUTED))
                             .child(SharedString::from(subtitle)),
@@ -14867,7 +14890,8 @@ impl ShelluneView {
             )
             .child(tools);
 
-        // The path, as breadcrumbs that each go back up to that folder.
+        // The path, as breadcrumbs that each go back up to that folder: quiet words on
+        // the page rather than a field, the current folder in the primary ink (ADR-7).
         let crumbs = path.as_deref().map(path_crumbs).unwrap_or_default();
         let mut crumb_row = div()
             .flex()
@@ -14879,17 +14903,16 @@ impl ShelluneView {
             // tooltip (R6, R8).
             .flex_wrap()
             .overflow_hidden()
-            .gap(metrics.scale(2.0))
-            .px(metrics.scale(spacing::HAIRLINE + 2.0))
-            .py(metrics.scale(3.0))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::CANVAS))
-            .border_1()
-            .border_color(theme::swatch(palette::BORDER))
+            .gap(metrics.scale(spacing::HALF))
             .debug_selector({
                 let path_id = path_id.clone();
                 move || path_id.to_string()
-            });
+            })
+            .child(icons::icon(
+                Icon::Folder,
+                metrics.small_icon_size(),
+                theme::swatch(palette::TEXT_MUTED),
+            ));
         let last = crumbs.len().saturating_sub(1);
         for (index, crumb) in crumbs.iter().enumerate() {
             let crumb_path = crumb.path.clone();
@@ -14899,13 +14922,8 @@ impl ShelluneView {
                 crumb.label.clone()
             };
             let crumb_id = files_element_id(source, &format!("crumb.{index}"));
-            let hover = theme::swatch(palette::SURFACE_HOVER);
             if index > 0 {
-                crumb_row = crumb_row.child(icons::icon(
-                    Icon::ChevronRight,
-                    metrics.scale(12.0),
-                    theme::swatch(palette::TEXT_MUTED),
-                ));
+                crumb_row = crumb_row.child(components::crumb_separator(metrics));
             }
             // One segment of a long path is bounded, and carries the whole path it
             // leads to in its tooltip: a deep folder at 200% text otherwise pushes the
@@ -14917,25 +14935,10 @@ impl ShelluneView {
                 crumb.path.clone()
             };
             crumb_row = crumb_row.child(
-                div()
+                components::crumb(index == last, metrics)
                     .id(crumb_id.clone())
                     .debug_selector(move || crumb_id.to_string())
-                    .flex()
-                    .flex_none()
-                    .min_w_0()
                     .max_w(metrics.scale(CRUMB_ROOM))
-                    .px(metrics.scale(spacing::HAIRLINE + 1.0))
-                    .py(metrics.scale(1.0))
-                    .rounded(px(radius::SMALL))
-                    .text_size(metrics.label_size())
-                    .text_color(theme::swatch(if index == last {
-                        palette::TEXT_PRIMARY
-                    } else {
-                        palette::TEXT_SECONDARY
-                    }))
-                    .when(index == last, |crumb| crumb.font_weight(FontWeight::MEDIUM))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
                     .tooltip(components::tooltip(SharedString::from(crumb_tooltip)))
                     .on_click(cx.listener(move |view, _event, _window, cx| {
                         view.files_go(id, source, &crumb_path, cx);
@@ -14954,15 +14957,33 @@ impl ShelluneView {
 
         let body: gpui::AnyElement = match &state {
             BrowseState::Loading => {
+                // The rows that are coming stand in their place, so the column does
+                // not jump when the listing lands (ADR-2); the words say what it is.
                 let loading_id = files_element_id(source, "loading");
-                div()
+                let mut loading = div()
+                    .flex()
+                    .flex_col()
                     .flex_none()
-                    .p(metrics.scale(spacing::SNUG))
-                    .text_size(metrics.label_size())
-                    .text_color(Tone::Warning.text())
-                    .debug_selector(move || loading_id.to_string())
-                    .child(SharedString::from(strings.files_loading))
-                    .into_any_element()
+                    .gap(metrics.scale(spacing::HALF))
+                    .debug_selector({
+                        let loading_id = loading_id.clone();
+                        move || loading_id.to_string()
+                    })
+                    .child(
+                        div()
+                            .px(metrics.scale(spacing::SNUG))
+                            .py(metrics.scale(spacing::HALF))
+                            .text_size(metrics.caption_size())
+                            .text_color(theme::swatch(palette::TEXT_MUTED))
+                            .child(SharedString::from(strings.files_loading)),
+                    );
+                for row in 0..FILES_LOADING_ROWS {
+                    loading = loading.child(components::skeleton_row(
+                        SharedString::from(format!("{loading_id}.skeleton.{row}")),
+                        metrics,
+                    ));
+                }
+                loading.into_any_element()
             }
             BrowseState::Failed(failure) => self
                 .files_failure(id, source, failure, cx)
@@ -14980,10 +15001,8 @@ impl ShelluneView {
                     // Page Up/Down turns the entries themselves while they are taller
                     // than the box that holds them (R4).
                     .track_scroll(&list_scroll)
-                    .rounded(px(radius::LARGE))
-                    .bg(theme::swatch(palette::SURFACE))
-                    .border_1()
-                    .border_color(theme::swatch(palette::BORDER))
+                    // The listing lies on the page: its header's hairline and the rows'
+                    // own faces are what set it apart, not a card around it (ADR-1).
                     .debug_selector({
                         let list_id = list_id.clone();
                         move || list_id.to_string()
@@ -15002,37 +15021,43 @@ impl ShelluneView {
                     // (R6, R8). The icon carries the meaning as well as the words do.
                     let empty_id = files_element_id(source, "empty");
                     let empty_hint_id = files_element_id(source, "empty.hint");
+                    // The shared empty look in the list's own size: the folder on the
+                    // accent tint, the state, and the next step under it, centred and
+                    // measured at the width they are painted at (ADR-2).
                     list = list.child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_none()
-                            .gap(metrics.scale(spacing::HAIRLINE))
-                            .p(metrics.scale(spacing::SNUG))
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .px(metrics.scale(spacing::BASE))
+                            .py(metrics.scale(spacing::LOOSE))
                             .debug_selector(move || empty_id.to_string())
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(metrics.scale(spacing::TIGHT))
-                                    .text_size(metrics.label_size())
-                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                    .child(icons::icon(
-                                        if remote { Icon::Server } else { Icon::Folder },
-                                        metrics.small_icon_size(),
-                                        theme::swatch(palette::TEXT_MUTED),
-                                    ))
-                                    .child(SharedString::from(strings.files_empty)),
+                                components::leading_icon(Icon::FolderOpen, Tone::Accent, metrics)
+                                    .rounded(px(radius::LARGE)),
                             )
-                            .child(
+                            .child(components::capped_text(
+                                metrics.scale(CRUMB_ROOM * 2.0),
                                 div()
-                                    .max_w(metrics.scale(CRUMB_ROOM * 2.0))
                                     .whitespace_normal()
+                                    .text_center()
+                                    .text_size(metrics.body_size())
+                                    .font_weight(metrics.medium_weight())
+                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                                    .child(SharedString::from(strings.files_empty)),
+                            ))
+                            .child(components::capped_text(
+                                metrics.scale(CRUMB_ROOM * 2.0),
+                                div()
+                                    .whitespace_normal()
+                                    .text_center()
                                     .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_MUTED))
+                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
                                     .debug_selector(move || empty_hint_id.to_string())
                                     .child(SharedString::from(strings.files_empty_hint)),
-                            ),
+                            )),
                     );
                 }
                 // The rows the column shows: the listing ordered by the column's own
@@ -15046,17 +15071,20 @@ impl ShelluneView {
                     list = list.child(
                         div()
                             .flex()
-                            .flex_col()
                             .flex_none()
-                            .gap(metrics.scale(spacing::HAIRLINE))
-                            .p(metrics.scale(spacing::SNUG))
+                            .items_center()
+                            .gap(metrics.scale(spacing::TIGHT))
+                            .px(metrics.scale(spacing::SNUG))
+                            .py(metrics.scale(spacing::BASE))
+                            .text_size(metrics.label_size())
+                            .text_color(theme::swatch(palette::TEXT_SECONDARY))
                             .debug_selector(move || none_id.to_string())
-                            .child(
-                                div()
-                                    .text_size(metrics.label_size())
-                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                    .child(SharedString::from(strings.files_filter_none)),
-                            ),
+                            .child(icons::icon(
+                                Icon::Search,
+                                metrics.small_icon_size(),
+                                theme::swatch(palette::TEXT_MUTED),
+                            ))
+                            .child(SharedString::from(strings.files_filter_none)),
                     );
                 }
                 for (index, entry) in rows.iter().enumerate() {
@@ -15077,14 +15105,12 @@ impl ShelluneView {
         let panel_id = files_element_id(source, "panel");
         let focus = self.files_panel_focus(source).clone();
         let panel_scroll = self.files_panel_scroll(source).clone();
-        let mut panel = div()
+        let panel = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .gap(metrics.scale(spacing::TIGHT + 2.0))
-            .p(metrics.scale(spacing::BASE - 2.0))
             .id(panel_id.clone())
             .debug_selector({
                 let panel_id = panel_id.clone();
@@ -15102,12 +15128,11 @@ impl ShelluneView {
             .track_scroll(&panel_scroll)
             .track_focus(&focus)
             // The column draws the ring while it holds the keys, so the keyboard's place
-            // is visible before Tab has moved it anywhere (R4).
-            .focus(|style| {
-                style
-                    .border_1()
-                    .border_color(theme::swatch(palette::ACCENT))
-            })
+            // is visible before Tab has moved it anywhere (R4). The edge is there unlit,
+            // so taking the keys does not move the column's content by a pixel.
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .focus(|style| style.border_color(theme::swatch(palette::FOCUS_RING)))
             .on_key_down(cx.listener(move |view, event: &KeyDownEvent, window, cx| {
                 if view.files_key(id, source, event, window, cx) {
                     cx.stop_propagation();
@@ -15141,33 +15166,54 @@ impl ShelluneView {
                     }
                 }),
             )
-            .child(header)
+            .child(header);
+        // Under the toolbar, the column's content on the page's own padding: the path,
+        // what is asked or marked, and the listing. It keeps the height of what cannot
+        // shrink (no `min_h_0`): a failed read taller than the slice makes the column
+        // turn, while a listing still fills the rest and scrolls in its own box (R4).
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(metrics.scale(spacing::TIGHT))
+            .px(metrics.scale(spacing::SNUG))
+            .pt(metrics.scale(spacing::TIGHT))
+            .pb(metrics.scale(spacing::SNUG))
             .child(crumb_row);
         // The batch of one column sits under its path, where the rows it acts on are:
         // what it covers is stated once, above the listing it came from (R14).
         if !self.files.marked(id, source).is_empty() {
-            panel = panel.child(self.files_selection_bar(id, source, cx));
+            content = content.child(self.files_selection_bar(id, source, cx));
         }
         if let Some(question) = self.files_question(id, source, cx) {
-            panel = panel.child(question);
+            content = content.child(question);
         } else if changing {
             let pending_id = files_element_id(source, "pending");
             let pending = match source {
                 FileSource::Local => strings.files_change_pending_local,
                 FileSource::Remote => strings.files_change_pending,
             };
-            panel = panel.child(
-                components::banner(Tone::Warning, metrics)
-                    .text_size(metrics.caption_size())
+            content = content.child(
+                components::inline_banner_frame(Tone::Warning, Icon::Refresh, metrics)
+                    .rounded(px(radius::MEDIUM))
+                    .border_1()
                     .debug_selector(move || pending_id.to_string())
-                    .child(SharedString::from(pending)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                            .child(SharedString::from(pending)),
+                    ),
             );
         }
-        panel = panel.child(body);
+        content = content.child(body);
         if let Some(report) = self.files_report(id, source) {
-            panel = panel.child(report);
+            content = content.child(report);
         }
-        panel
+        panel.child(content)
     }
 
     /// Title and count for the transfer strip. They sit above the scroller so its
@@ -15180,17 +15226,26 @@ impl ShelluneView {
             .for_session(id)
             .filter(|task| task.is_active())
             .count();
+        // The strip's own toolbar line: what it is and how many tasks still run.
         div()
             .flex()
             .flex_none()
             .items_center()
             .flex_wrap()
-            .gap(metrics.scale(spacing::HAIRLINE))
+            .gap(metrics.scale(spacing::NARROW))
             .debug_selector(|| "transfers.heading".to_owned())
-            .child(components::section_label(
-                strings.transfers_heading,
-                metrics,
+            .child(icons::icon(
+                Icon::Transfer,
+                metrics.small_icon_size(),
+                theme::swatch(palette::TEXT_MUTED),
             ))
+            .child(
+                div()
+                    .text_size(metrics.caption_size())
+                    .font_weight(metrics.medium_weight())
+                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                    .child(SharedString::from(strings.transfers_heading)),
+            )
             .child(
                 components::badge(
                     active,
@@ -15220,22 +15275,51 @@ impl ShelluneView {
             .flex()
             .flex_col()
             .flex_none()
-            .gap(metrics.scale(1.0))
+            .gap(metrics.scale(spacing::HALF))
             .debug_selector(|| "transfers.panel".to_owned());
+        // A line the strip states about the whole batch: the tone's mark, then the
+        // words, wrapping inside the strip.
+        let strip_note = |tone: Tone, text: String| {
+            div()
+                .flex()
+                .flex_none()
+                .items_start()
+                .gap(metrics.scale(spacing::NARROW))
+                .px(metrics.scale(spacing::TIGHT))
+                .py(metrics.scale(spacing::HAIRLINE))
+                .rounded(px(radius::MEDIUM))
+                .bg(tone.chip_background())
+                .text_size(metrics.caption_size())
+                .text_color(tone.text())
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .h(metrics.caption_size() * 1.4)
+                        .child(components::status_mark(
+                            tone,
+                            metrics.scale(spacing::NARROW),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_normal()
+                        .child(SharedString::from(text)),
+                )
+        };
 
         if let Some((session, problem)) = &self.transfer_problem
             && *session == id
         {
             card = card.child(
-                div()
-                    .flex_none()
-                    .p(metrics.scale(spacing::HAIRLINE))
-                    .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(palette::CHROME))
-                    .text_size(metrics.caption_size())
-                    .text_color(Tone::Danger.text())
-                    .debug_selector(|| "transfers.refused".to_owned())
-                    .child(SharedString::from(transfer_problem_text(problem, strings))),
+                strip_note(
+                    Tone::Danger,
+                    transfer_problem_text(problem, strings).to_owned(),
+                )
+                .debug_selector(|| "transfers.refused".to_owned()),
             );
         }
         // What a batch left out is said once, in the words of how many: a folder is a
@@ -15245,18 +15329,14 @@ impl ShelluneView {
             && *session == id
         {
             card = card.child(
-                div()
-                    .flex_none()
-                    .p(metrics.scale(spacing::HAIRLINE))
-                    .rounded(px(radius::SMALL))
-                    .bg(theme::swatch(palette::CHROME))
-                    .text_size(metrics.caption_size())
-                    .text_color(Tone::Warning.text())
-                    .debug_selector(|| "transfers.skipped".to_owned())
-                    .child(SharedString::from(copy::fill(
+                strip_note(
+                    Tone::Warning,
+                    copy::fill(
                         strings.files_batch_folders_skipped,
                         &[("count", &folders.to_string())],
-                    ))),
+                    ),
+                )
+                .debug_selector(|| "transfers.skipped".to_owned()),
             );
         }
 
@@ -15295,18 +15375,12 @@ impl ShelluneView {
         let metrics = self.metrics();
         let strings = self.strings();
         let id = task.id();
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(metrics.scale(spacing::HAIRLINE))
-            .pl(metrics.scale(spacing::TIGHT))
-            .pr(metrics.scale(spacing::HAIRLINE))
-            .py(metrics.scale(spacing::HAIRLINE + 2.0))
-            .rounded(px(radius::MEDIUM))
-            .bg(theme::swatch(palette::DANGER_TINT))
-            .border_l(metrics.scale(3.0))
-            .border_color(theme::swatch(palette::DANGER))
+        // The same inline form a file question is, in its danger edge: the answer
+        // decides whether a file that already exists is replaced (ADR-7).
+        components::inline_form(Tone::Danger, metrics)
+            .gap(metrics.scale(spacing::NARROW))
+            .px(metrics.scale(spacing::TIGHT))
+            .py(metrics.scale(spacing::NARROW))
             .text_size(metrics.caption_size())
             .debug_selector(move || format!("transfers.overwrite.{index}"))
             .child(
@@ -15324,7 +15398,8 @@ impl ShelluneView {
                     .flex()
                     .items_center()
                     .flex_wrap()
-                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .justify_end()
+                    .gap(metrics.scale(spacing::TIGHT))
                     .child(self.text_button(
                         SharedString::from(format!("transfers.overwrite.replace.{index}")),
                         strings.transfers_overwrite_replace,
@@ -15361,25 +15436,19 @@ impl ShelluneView {
         };
         let metrics = self.metrics();
         let permille = task.state().permille().unwrap_or(0).min(1000) as f32;
+        // The shared determinate bar (ADR-2).
         Some(
             div()
                 .flex()
-                .flex_row()
                 .flex_none()
                 .w_full()
                 .min_w_0()
-                .h(metrics.scale(4.0))
-                .rounded_full()
-                .overflow_hidden()
-                .bg(theme::swatch(palette::LOADING_TRACK))
                 .debug_selector(move || format!("transfers.progress.{index}"))
-                .child(
-                    div()
-                        .flex_none()
-                        .h_full()
-                        .w(gpui::relative(permille / 1000.0))
-                        .bg(theme::swatch(palette::LOADING_FILL)),
-                ),
+                .child(components::progress_bar(
+                    SharedString::from(format!("transfers.progress.bar.{index}")),
+                    components::Progress::Determinate(permille / 1000.0),
+                    metrics,
+                )),
         )
     }
 
@@ -15594,30 +15663,37 @@ impl ShelluneView {
         // Reason and Retry come before the path. At 720×480 and 200% text the strip
         // cannot hold a wrapped path and still show the failure, and the path is the
         // part a reader can scroll to (R4).
+        // One task is one row of the strip's list: the panel's face with a hairline,
+        // so a row reads as one object on the chrome it lies on (ADR-7).
         div()
             .id(("transfers.row", index))
             .debug_selector(move || format!("transfers.row.{index}"))
             .flex()
             .flex_col()
             .flex_none()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .rounded(px(radius::MEDIUM))
             .bg(theme::swatch(palette::SURFACE))
+            .border_1()
+            .border_color(theme::swatch(palette::BORDER))
             .px(metrics.scale(spacing::TIGHT))
-            .py(metrics.scale(spacing::HAIRLINE + 2.0))
+            .py(metrics.scale(spacing::NARROW))
             .text_size(metrics.caption_size())
             // The state and the actions it allows share one line: the button sits
-            // beside what it acts on instead of on a line of its own under the bar.
+            // beside what it acts on instead of on a line of its own under the bar. In a
+            // narrow strip the actions wrap under the words rather than squeezing them
+            // into a column of two words a line.
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(metrics.scale(spacing::TIGHT))
                     .min_w_0()
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(metrics.scale(FILES_SELECTION_WORDS_MIN))
                             .whitespace_normal()
                             .text_color(tone.text())
                             .debug_selector(move || format!("transfers.state.{index}"))
@@ -15740,9 +15816,11 @@ impl ShelluneView {
             .and_then(|browser| browser.current_directory())
             .map(str::to_owned);
         let danger = matches!(dialog, FilesDialog::Delete { .. });
-        let card = components::banner(if danger { Tone::Danger } else { Tone::Accent }, metrics)
-            .gap(metrics.scale(spacing::TIGHT - 2.0))
-            .debug_selector(|| "files.question".to_owned());
+        let tone = if danger { Tone::Danger } else { Tone::Accent };
+        // The question is an inline form of its column (ADR-7): asked in the flow, where
+        // the keyboard already is, and only this column waits for the answer (R6).
+        let card =
+            components::inline_form(tone, metrics).debug_selector(|| "files.question".to_owned());
         // Every row of the question, with the controls the keyboard can stop on. The
         // frame that draws them records where each one landed, so the column can turn a
         // control the keyboard just reached into its slice (R4).
@@ -15759,24 +15837,8 @@ impl ShelluneView {
         // the way a dialog is: the action's icon in its tone and the plain words (R6).
         rows.push((
             Vec::new(),
-            div()
-                .flex()
-                .items_center()
-                .gap(metrics.scale(spacing::TIGHT))
-                .text_size(metrics.body_size())
-                .font_weight(metrics.medium_weight())
-                .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                .debug_selector(|| "files.question.heading".to_owned())
-                .child(icons::icon(
-                    icon,
-                    metrics.icon_size(),
-                    if danger {
-                        Tone::Danger.text()
-                    } else {
-                        theme::swatch(palette::ACCENT)
-                    },
-                ))
-                .child(SharedString::from(heading)),
+            components::form_heading(tone, icon, heading, metrics)
+                .debug_selector(|| "files.question.heading".to_owned()),
         ));
 
         match dialog {
@@ -15820,14 +15882,9 @@ impl ShelluneView {
                             .flex()
                             .flex_col()
                             .flex_none()
-                            .gap(metrics.scale(2.0))
+                            .gap(metrics.scale(spacing::HAIRLINE))
                             .debug_selector(|| "files.question.remote".to_owned())
-                            .child(
-                                div()
-                                    .text_size(metrics.caption_size())
-                                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
-                                    .child(SharedString::from(label)),
-                            )
+                            .child(components::form_label(label, metrics))
                             .child(div().flex_none().child(field.clone())),
                     ));
                 }
@@ -15836,6 +15893,7 @@ impl ShelluneView {
                     div()
                         .flex_1()
                         .min_w_0()
+                        .font_family(terminal::monospace_family())
                         .text_size(metrics.caption_size())
                         .text_color(theme::swatch(palette::TEXT_SECONDARY))
                         .debug_selector(|| "files.question.target".to_owned())
@@ -15851,9 +15909,13 @@ impl ShelluneView {
                     ));
                 }
                 if let Some(chosen) = dialog.protocol() {
+                    // The switch is as wide as its choices, not the form.
                     rows.push((
                         vec![FilesStop::QuestionSftp, FilesStop::QuestionScp],
-                        self.transfer_protocol_choice(chosen, metrics, strings, cx),
+                        div()
+                            .flex()
+                            .min_w_0()
+                            .child(self.transfer_protocol_choice(chosen, metrics, strings, cx)),
                     ));
                     if chosen == TransferProtocol::Scp {
                         rows.push((
@@ -15928,7 +15990,8 @@ impl ShelluneView {
                         .flex()
                         .items_center()
                         .flex_wrap()
-                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .justify_end()
+                        .gap(metrics.scale(spacing::TIGHT))
                         .child(
                             self.text_button(
                                 SharedString::from("files.question.confirm"),
@@ -16090,7 +16153,8 @@ impl ShelluneView {
                         .flex()
                         .items_center()
                         .flex_wrap()
-                        .gap(metrics.scale(spacing::HAIRLINE))
+                        .justify_end()
+                        .gap(metrics.scale(spacing::TIGHT))
                         .child(
                             self.text_button(
                                 SharedString::from("files.question.confirm"),
@@ -16178,7 +16242,7 @@ impl ShelluneView {
         let report_heading = files_element_id(source, "report.heading");
         let mut card =
             components::banner(if done { Tone::Positive } else { Tone::Danger }, metrics)
-                .gap(metrics.scale(1.0))
+                .gap(metrics.scale(spacing::HALF))
                 .debug_selector(move || report.to_string())
                 .child(
                     div()
@@ -16242,20 +16306,12 @@ impl ShelluneView {
     ) -> Stateful<Div> {
         let metrics = self.metrics();
         let parent_id = files_element_id(source, "parent");
-        let hover = theme::swatch(palette::SURFACE_HOVER);
-        div()
+        components::compact_row_frame(ControlState::Resting, false, metrics)
             .id(parent_id.clone())
             .debug_selector(move || parent_id.to_string())
-            .flex()
-            .items_center()
-            .flex_none()
-            .gap(metrics.scale(spacing::TIGHT))
-            .h(metrics.scale(30.0))
-            .px(metrics.scale(spacing::SNUG))
             .text_size(metrics.label_size())
             .text_color(theme::swatch(palette::TEXT_SECONDARY))
             .cursor_pointer()
-            .hover(move |style| style.bg(hover))
             .on_click(cx.listener(move |view, _event, _window, cx| {
                 view.files_up(id, source, cx);
             }))
@@ -16281,17 +16337,19 @@ impl ShelluneView {
     /// server's order alone, and the arrow beside the key says which way it runs.
     fn files_list_header(&self, id: SessionId, source: FileSource, cx: &mut Context<Self>) -> Div {
         let metrics = self.metrics();
+        // The header stands where the rows do: the same inset (the rows' unlit edge
+        // and padding), so a key's words are above the column they sort.
         div()
             .flex()
             .flex_none()
             .items_center()
             .gap(metrics.scale(spacing::TIGHT))
-            .h(metrics.scale(28.0))
-            .px(metrics.scale(spacing::SNUG))
+            .h(metrics.compact_control_height())
+            .px(metrics.scale(spacing::SNUG) + px(components::HAIRLINE_WIDTH))
             .border_b_1()
             .border_color(theme::swatch(palette::BORDER))
             .text_size(metrics.caption_size())
-            .font_weight(FontWeight::SEMIBOLD)
+            .font_weight(metrics.medium_weight())
             .text_color(theme::swatch(palette::TEXT_MUTED))
             .child(div().flex_none().w(metrics.hit_target()))
             .child(self.files_sort_cell(id, source, SortKey::Name, cx))
@@ -16345,12 +16403,12 @@ impl ShelluneView {
             .debug_selector(move || cell_id.clone())
             .flex()
             .items_center()
-            .gap(metrics.scale(2.0))
+            .gap(metrics.scale(spacing::HALF))
             .rounded(px(radius::SMALL))
             .cursor_pointer()
             .when(key == SortKey::Name, |cell| cell.flex_1().min_w_0())
             .when(key == SortKey::Size, |cell| {
-                cell.flex_none().w(metrics.scale(80.0))
+                cell.flex_none().w(metrics.scale(FILES_SIZE_WIDTH))
             })
             .hover(move |style| style.bg(hover))
             .tooltip(components::tooltip(SharedString::from(tip)))
@@ -16476,8 +16534,8 @@ impl ShelluneView {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_w(metrics.scale(180.0))
-                    .gap(metrics.scale(2.0))
+                    .min_w(metrics.scale(FILES_SELECTION_WORDS_MIN))
+                    .gap(metrics.scale(spacing::HALF))
                     .child(
                         div()
                             .text_size(metrics.label_size())
@@ -16621,7 +16679,7 @@ impl ShelluneView {
             .child(
                 div()
                     .flex_none()
-                    .w(metrics.scale(80.0))
+                    .w(metrics.scale(FILES_SIZE_WIDTH))
                     .truncate()
                     .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
@@ -16662,7 +16720,7 @@ impl ShelluneView {
             .items_center()
             .justify_end()
             .w(files_actions_width(metrics, source))
-            .gap(metrics.scale(1.0));
+            .gap(metrics.scale(spacing::HALF));
         // Only a file has content to copy; a folder button would promise a transfer
         // the connection cannot do. Dragging a file does the same.
         if !openable {
@@ -16723,7 +16781,6 @@ impl ShelluneView {
                 move |view, cx| view.files_ask_delete(id, source, &delete, kind, cx),
             ));
 
-        let hover = theme::swatch(palette::SURFACE_HOVER);
         let row_selector = format!("{prefix}.row.{index}");
         let selected = self.files.selected(id, source) == Some(name);
         // The mark is what a batch acts on, so it is drawn on the row itself and its box
@@ -16776,7 +16833,15 @@ impl ShelluneView {
             kind,
             folder: openable,
         };
-        div()
+        // A compact row of the shared list (ADR-7): the keyboard's row has the selected
+        // fill and the accent bar, a row a batch covers keeps the accent tint, and the
+        // rest light only under the pointer.
+        let state = if selected {
+            ControlState::Selected
+        } else {
+            ControlState::Resting
+        };
+        components::compact_row_frame(state, marked && !selected, metrics)
             .id(SharedString::from(row_selector.clone()))
             .debug_selector(move || row_selector.clone())
             .group(row_group)
@@ -16787,20 +16852,7 @@ impl ShelluneView {
                     view.open_files_menu(id, source, Some(menu_entry.clone()), event.position, cx);
                 }),
             )
-            .flex()
-            .items_center()
-            .flex_none()
-            .gap(metrics.scale(spacing::TIGHT))
-            .h(metrics.scale(30.0))
-            .px(metrics.scale(spacing::SNUG))
             .text_size(metrics.label_size())
-            .when(selected, |row| row.bg(theme::swatch(palette::ACCENT_TINT)))
-            .when(marked && !selected, |row| {
-                row.bg(theme::swatch(palette::SURFACE_SELECTED))
-            })
-            .when(!selected && !marked, |row| {
-                row.hover(move |style| style.bg(hover))
-            })
             .on_click(
                 cx.listener(move |view, event: &gpui::ClickEvent, _window, cx| {
                     // A plain click is one row and clears the batch; Ctrl adds one row to it
@@ -18178,11 +18230,20 @@ impl ShelluneView {
             true,
             cx,
         );
-        components::row(metrics)
+        // A row of the shared list (ADR-7): the direction on its tone's tint, what moves
+        // where, and the state at the end.
+        let direction_icon = match transfer.direction() {
+            TransferDirection::Upload => Icon::Upload,
+            TransferDirection::Download => Icon::Download,
+        };
+        components::list_row_frame(ControlState::Resting, metrics)
+            .items_start()
+            .child(components::leading_icon(direction_icon, tone, metrics))
             .child(
                 div()
                     .flex()
                     .flex_col()
+                    .flex_1()
                     .gap(metrics.scale(spacing::HAIRLINE))
                     .min_w_0()
                     .child(
@@ -18191,7 +18252,6 @@ impl ShelluneView {
                             .items_center()
                             .gap(metrics.scale(spacing::SNUG))
                             .min_w_0()
-                            .child(components::status_dot(tone, metrics))
                             .child(components::kind_badge(
                                 self.direction_label(transfer.direction()),
                                 false,

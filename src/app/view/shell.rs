@@ -1963,11 +1963,22 @@ impl ShelluneView {
                     close,
                 );
                 let state = self.workspace.state(Destination::Transfers);
-                let card = self.section_card(Destination::Transfers, state);
-                let list = if state == SectionState::Populated {
-                    self.rows_for(Destination::Transfers, card, cx)
-                } else {
-                    card
+                let list = match state {
+                    SectionState::Populated => {
+                        let card = self.section_card(Destination::Transfers, state);
+                        self.rows_for(Destination::Transfers, card, cx)
+                    }
+                    // Nothing to list is a state of its own with the shared empty look:
+                    // what the panel holds and where a transfer starts (ADR-7).
+                    SectionState::Empty => components::empty_state(
+                        Icon::Transfer,
+                        self.strings().empty_transfers_title,
+                        Some(SharedString::from(self.strings().empty_transfers_body)),
+                        None,
+                        metrics,
+                    )
+                    .debug_selector(|| "transfers.empty".to_owned()),
+                    _ => self.section_card(Destination::Transfers, state),
                 };
                 let body = div()
                     .px(metrics.scale(spacing::LOOSE))

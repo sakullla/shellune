@@ -441,7 +441,7 @@ fn mark_bar(token: Token, metrics: Metrics) -> Div {
     div()
         .flex_none()
         .w(px(MARK_BAR_WIDTH))
-        .h(metrics.scale(14.0))
+        .h(metrics.small_icon_size())
         .rounded(px(MARK_CORNER))
         .bg(theme::swatch(token))
 }
@@ -1517,7 +1517,7 @@ pub fn floating_bar(metrics: Metrics) -> Div {
         .flex()
         .flex_none()
         .items_center()
-        .gap(metrics.scale(2.0))
+        .gap(metrics.scale(spacing::HALF))
         .p(metrics.scale(spacing::HAIRLINE))
         .rounded(px(radius::LARGE))
         .bg(theme::swatch(palette::RAISED))
@@ -1530,7 +1530,7 @@ pub fn floating_bar(metrics: Metrics) -> Div {
 pub fn menu_divider(metrics: Metrics) -> Div {
     div()
         .flex_none()
-        .h(px(1.0))
+        .h(px(HAIRLINE_WIDTH))
         .mx(metrics.scale(spacing::HAIRLINE))
         .my(metrics.scale(spacing::HAIRLINE - 1.0))
         .bg(theme::swatch(palette::BORDER))
@@ -1637,7 +1637,7 @@ pub fn dialog_header(
                 .flex()
                 .flex_col()
                 .min_w_0()
-                .gap(metrics.scale(2.0))
+                .gap(metrics.scale(spacing::HALF))
                 .child(
                     div()
                         .whitespace_normal()
@@ -1738,7 +1738,7 @@ pub fn stacked(
         .flex()
         .flex_col()
         .min_w_0()
-        .gap(metrics.scale(2.0))
+        .gap(metrics.scale(spacing::HALF))
         .child(
             div()
                 .text_size(metrics.body_size())
@@ -1760,8 +1760,8 @@ pub fn stacked(
 pub fn divider_vertical(metrics: Metrics) -> Div {
     div()
         .flex_none()
-        .w(px(1.0))
-        .h(metrics.scale(16.0))
+        .w(px(HAIRLINE_WIDTH))
+        .h(metrics.icon_size())
         .bg(theme::swatch(palette::BORDER))
 }
 
@@ -1861,7 +1861,7 @@ pub fn status_card(
                         .flex_none()
                         .items_center()
                         .justify_center()
-                        .size(metrics.scale(36.0))
+                        .size(metrics.large_control_height())
                         .rounded(px(radius::LARGE))
                         .bg(tone.chip_background())
                         .child(emblem),
@@ -1872,7 +1872,7 @@ pub fn status_card(
                         .flex_col()
                         .flex_1()
                         .min_w_0()
-                        .gap(metrics.scale(2.0))
+                        .gap(metrics.scale(spacing::HALF))
                         .child(
                             title
                                 .whitespace_normal()
@@ -2486,8 +2486,50 @@ pub fn list_row_face(state: ControlState) -> ControlFace {
 /// The hover group a [`list_row`]'s revealed actions follow.
 pub const ROW_GROUP: &str = "list-row";
 
+/// The least height of a [`list_row`]: two lines of words and their padding.
+const LIST_ROW_MIN_HEIGHT: f32 = 44.0;
+
 /// The frame of a [`list_row`] alone, for a row that lays out its own content.
 pub fn list_row_frame(state: ControlState, metrics: Metrics) -> Div {
+    row_frame(
+        state,
+        false,
+        metrics,
+        metrics.scale(LIST_ROW_MIN_HEIGHT),
+        metrics.scale(spacing::NARROW),
+        metrics.scale(spacing::SNUG),
+        metrics.scale(spacing::TIGHT + spacing::HALF),
+    )
+}
+
+/// The frame of a dense row: a [`list_row_frame`] one compact control high (28), for
+/// the long lists of a tool - a file listing, a transfer queue (ADR-7).
+///
+/// `marked` is the batch's own mark: the row is one of the entries a batch action will
+/// cover, so it keeps the accent tint under the pointer as well. The keyboard's row is
+/// `ControlState::Selected`, the selected fill with the accent bar, as in every list.
+pub fn compact_row_frame(state: ControlState, marked: bool, metrics: Metrics) -> Div {
+    row_frame(
+        state,
+        marked,
+        metrics,
+        metrics.compact_control_height(),
+        px(0.0),
+        metrics.scale(spacing::TIGHT),
+        metrics.scale(spacing::NARROW),
+    )
+}
+
+/// The one frame both list rows are drawn in.
+fn row_frame(
+    state: ControlState,
+    marked: bool,
+    metrics: Metrics,
+    min_height: Pixels,
+    padding_y: Pixels,
+    gap: Pixels,
+    mark_inset: Pixels,
+) -> Div {
     let face = list_row_face(state);
     let base = painted(
         div()
@@ -2496,16 +2538,17 @@ pub fn list_row_frame(state: ControlState, metrics: Metrics) -> Div {
             .flex()
             .flex_none()
             .items_center()
-            .gap(metrics.scale(spacing::SNUG))
+            .gap(gap)
             .w_full()
             .min_w_0()
-            .min_h(metrics.scale(44.0))
+            .min_h(min_height)
             .px(metrics.scale(spacing::SNUG))
-            .py(metrics.scale(spacing::NARROW))
+            .py(padding_y)
             .rounded(px(radius::MEDIUM)),
         face,
     );
     let base = match state {
+        ControlState::Resting if marked => base.bg(theme::swatch(palette::ACCENT_TINT)),
         ControlState::Resting => base.hover(hover_style(list_row_face(ControlState::Hovered))),
         _ => base,
     };
@@ -2516,14 +2559,133 @@ pub fn list_row_frame(state: ControlState, metrics: Metrics) -> Div {
             div()
                 .absolute()
                 .left(px(0.0))
-                .top(metrics.scale(spacing::TIGHT + spacing::HALF))
-                .bottom(metrics.scale(spacing::TIGHT + spacing::HALF))
+                .top(mark_inset)
+                .bottom(mark_inset)
                 .w(px(MARK_BAR_WIDTH))
                 .rounded(px(MARK_CORNER))
                 .bg(theme::swatch(token)),
         ),
         None => base,
     }
+}
+
+/// The frame of a question or a short form drawn in the flow of the column it is
+/// about (ADR-7): the raised fill and the strong hairline of a floating layer, without
+/// lifting off the page, so it reads as "answer this here" rather than as a dialog.
+///
+/// The caller adds the [`form_heading`], the labelled fields and the buttons as its
+/// children, in reading order. A dangerous question keeps a danger edge, so it is not
+/// told by the colour of its icon alone.
+pub fn inline_form(tone: Tone, metrics: Metrics) -> Div {
+    let edge = match tone {
+        Tone::Danger | Tone::Warning => theme::faded(tone.text(), 0.45),
+        _ => theme::swatch(palette::BORDER_STRONG),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .min_w_0()
+        .gap(metrics.scale(spacing::TIGHT))
+        .p(metrics.scale(spacing::SNUG))
+        .rounded(px(radius::LARGE))
+        .bg(theme::swatch(palette::RAISED))
+        .border_1()
+        .border_color(edge)
+        .elevation(Elevation::Raised)
+        .text_size(metrics.label_size())
+}
+
+/// The heading of an [`inline_form`]: the action's icon on its tone's tint and the
+/// plain words of the question.
+pub fn form_heading(
+    tone: Tone,
+    icon: Icon,
+    title: impl Into<SharedString>,
+    metrics: Metrics,
+) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(metrics.scale(spacing::TIGHT))
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(metrics.hit_target())
+                .rounded(px(radius::MEDIUM))
+                .bg(tone.chip_background())
+                .child(icons::icon(icon, metrics.small_icon_size(), tone.text())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .text_size(metrics.body_size())
+                .font_weight(metrics.medium_weight())
+                .text_color(theme::swatch(palette::TEXT_PRIMARY))
+                .child(title.into()),
+        )
+}
+
+/// The label above one field of a form: caption size, medium weight, secondary ink.
+pub fn form_label(label: impl Into<SharedString>, metrics: Metrics) -> Div {
+    div()
+        .text_size(metrics.caption_size())
+        .font_weight(metrics.medium_weight())
+        .text_color(theme::swatch(palette::TEXT_SECONDARY))
+        .child(label.into())
+}
+
+/// The width of a hairline: a divider, a frame's edge.
+pub const HAIRLINE_WIDTH: f32 = 1.0;
+
+/// A hairline from the top of a row of columns to its bottom, between two of them.
+pub fn column_divider() -> Div {
+    div()
+        .flex_none()
+        .w(px(HAIRLINE_WIDTH))
+        .h_full()
+        .bg(theme::swatch(palette::BORDER))
+}
+
+/// One segment of a breadcrumb path (ADR-7): quiet words that light under the pointer,
+/// the current place in the primary ink and the medium weight. The caller adds the
+/// words, its id, its tooltip and its click.
+pub fn crumb(current: bool, metrics: Metrics) -> Div {
+    let hover = theme::swatch(palette::SURFACE_HOVER);
+    let hover_ink = theme::swatch(palette::TEXT_PRIMARY);
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .min_w_0()
+        .px(metrics.scale(spacing::NARROW))
+        .py(metrics.scale(spacing::HALF))
+        .rounded(px(radius::SMALL))
+        .text_size(metrics.label_size())
+        .text_color(theme::swatch(if current {
+            palette::TEXT_PRIMARY
+        } else {
+            palette::TEXT_SECONDARY
+        }))
+        .when(current, |crumb| crumb.font_weight(metrics.medium_weight()))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover).text_color(hover_ink))
+}
+
+/// The mark between two [`crumb`]s.
+pub fn crumb_separator(metrics: Metrics) -> gpui::Svg {
+    icons::icon(
+        Icon::ChevronRight,
+        metrics.caption_size(),
+        theme::swatch(palette::TEXT_MUTED),
+    )
 }
 
 /// What one [`list_row`] shows, left to right.
@@ -2724,10 +2886,12 @@ pub fn sidebar_icon_item(icon: Icon, selected: bool, metrics: Metrics) -> Div {
         .child(icons::icon(icon, metrics.icon_size(), ink))
 }
 
+/// The least height of a [`toolbar`]: a control and the bar's own padding.
+const TOOLBAR_MIN_HEIGHT: f32 = 44.0;
+
 /// The bar of controls at the head of a page or a column (ADR-2): one line, items
 /// centred, a hairline under it. The caller adds the title, the search field and the
 /// commands; a child with `flex_1` takes the room between them.
-#[cfg_attr(not(any(test, feature = "ui-capture")), allow(dead_code))]
 pub fn toolbar(metrics: Metrics) -> Div {
     div()
         .flex()
@@ -2736,7 +2900,7 @@ pub fn toolbar(metrics: Metrics) -> Div {
         .gap(metrics.scale(spacing::TIGHT))
         .w_full()
         .min_w_0()
-        .min_h(metrics.scale(44.0))
+        .min_h(metrics.scale(TOOLBAR_MIN_HEIGHT))
         .px(metrics.scale(spacing::SNUG))
         .py(metrics.scale(spacing::NARROW))
         .border_b_1()

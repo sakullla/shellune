@@ -84,9 +84,15 @@ impl ShelluneView {
             Some(SessionPhase::Starting) if self.reconnect_screen(id).is_some() => {
                 Some(BannerState::Reconnecting)
             }
+            // A remote desktop that ended states it in the same banner, above its own
+            // card (ADR-7).
             _ => self
                 .pane_for(id)
                 .and_then(|pane| pane.read(cx).state().failure())
+                .or_else(|| {
+                    self.desktop_for(id)
+                        .and_then(|pane| pane.read(cx).phase().failure())
+                })
                 .map(|failure| BannerState::Ended(SessionStatus::ended(failure))),
         }
     }
@@ -160,7 +166,11 @@ impl ShelluneView {
         let handle = self
             .pane_for(id)
             .or_else(|| self.reconnect_screen(id))
-            .map(|pane| pane.read(cx).focus_handle().clone());
+            .map(|pane| pane.read(cx).focus_handle().clone())
+            .or_else(|| {
+                self.desktop_for(id)
+                    .map(|pane| pane.read(cx).focus_handle().clone())
+            });
         match handle {
             Some(handle) => window.focus(&handle),
             None => self.reclaim_focus(window, cx),

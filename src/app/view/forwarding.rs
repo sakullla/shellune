@@ -18,6 +18,14 @@ use crate::app::forwarding::{
 use crate::app::icons::Icon;
 use crate::app::theme::{self, Tone, palette, spacing};
 
+/// The width of a port field beside its address, before text scale: five digits and
+/// the field's own padding.
+const FORWARD_PORT_WIDTH: f32 = 120.0;
+
+/// The narrowest a tunnel row's words get before its commands wrap under them, before
+/// text scale.
+const FORWARD_ROW_WORDS_MIN: f32 = 200.0;
+
 impl ShelluneView {
     pub(super) fn reload_forwards(&mut self) {
         let store = ForwardStore::at(self.store.root());
@@ -492,7 +500,11 @@ impl ShelluneView {
             list = list.child(
                 // A tunnel is one row of the shared list kind, so the list reads like
                 // every other list of saved things (R6, ADR-2).
+                // The row wraps: when the dialog is too narrow for the words and the
+                // commands (the minimum window at 200% text), the commands take a line
+                // of their own under the words instead of drawing over them.
                 components::list_row_frame(ControlState::Resting, metrics)
+                    .flex_wrap()
                     .debug_selector(move || format!("forwards.row.{index}"))
                     .child(components::leading_icon(
                         Icon::Forward,
@@ -504,8 +516,8 @@ impl ShelluneView {
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .min_w_0()
-                            .gap(metrics.scale(3.0))
+                            .min_w(metrics.scale(FORWARD_ROW_WORDS_MIN))
+                            .gap(metrics.scale(spacing::HALF))
                             .child(
                                 div()
                                     .flex()
@@ -560,7 +572,7 @@ impl ShelluneView {
                             .flex()
                             .flex_none()
                             .items_center()
-                            .gap(metrics.scale(2.0))
+                            .gap(metrics.scale(spacing::HALF))
                             .child(
                                 self.icon_text_button(
                                     SharedString::from(format!("forwards.start.{index}")),
@@ -797,15 +809,19 @@ impl ShelluneView {
                 )
             }
         };
-        components::banner(Tone::Warning, metrics)
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
+        // The question is an inline form above the rows it is about (ADR-7): stopping
+        // asks in the warning tone, deleting in the danger tone.
+        let (tone, icon) = match question {
+            ForwardConfirm::Stop => (Tone::Warning, Icon::Stop),
+            ForwardConfirm::Delete => (Tone::Danger, Icon::Trash),
+        };
+        components::inline_form(tone, metrics)
             .debug_selector(|| "forwards.confirm".to_owned())
-            .child(SharedString::from(title))
+            .child(components::form_heading(tone, icon, title, metrics))
             .child(
                 div()
                     .whitespace_normal()
-                    .text_size(metrics.caption_size())
+                    .text_size(metrics.label_size())
                     .text_color(theme::swatch(palette::TEXT_SECONDARY))
                     .debug_selector(|| "forwards.confirm.body".to_owned())
                     .child(SharedString::from(body)),
@@ -814,7 +830,8 @@ impl ShelluneView {
                 div()
                     .flex()
                     .flex_wrap()
-                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .justify_end()
+                    .gap(metrics.scale(spacing::TIGHT))
                     .child(self.text_button(
                         SharedString::from("forwards.confirm.no"),
                         strings.files_cancel,
@@ -849,16 +866,27 @@ impl ShelluneView {
                 _ => strings.forward_exposure_named,
             })
             .unwrap_or(strings.forward_exposure_named);
-        crate::app::components::banner(Tone::Warning, metrics)
-            .flex_col()
-            .gap(metrics.scale(spacing::HAIRLINE))
+        components::inline_form(Tone::Warning, metrics)
             .debug_selector(|| "forwards.exposure".to_owned())
-            .child(strings.forward_exposure_title)
-            .child(SharedString::from(format!("{listen} · {body}")))
+            .child(components::form_heading(
+                Tone::Warning,
+                Icon::Globe,
+                strings.forward_exposure_title,
+                metrics,
+            ))
+            .child(
+                div()
+                    .whitespace_normal()
+                    .text_size(metrics.label_size())
+                    .text_color(theme::swatch(palette::TEXT_SECONDARY))
+                    .child(SharedString::from(format!("{listen} · {body}"))),
+            )
             .child(
                 div()
                     .flex()
-                    .gap(metrics.scale(spacing::HAIRLINE))
+                    .flex_wrap()
+                    .justify_end()
+                    .gap(metrics.scale(spacing::TIGHT))
                     .child(self.text_button(
                         SharedString::from("forwards.exposure.cancel"),
                         strings.forward_exposure_cancel,
@@ -938,13 +966,7 @@ impl ShelluneView {
             .unwrap_or("—")
             .to_owned();
 
-        let field_label = |text: &'static str| {
-            div()
-                .text_size(metrics.caption_size())
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::swatch(palette::TEXT_MUTED))
-                .child(text)
-        };
+        let field_label = |text: &'static str| components::form_label(text, metrics);
         let pair = |label: &'static str,
                     address: gpui::Entity<crate::app::text_field::TextField>,
                     port: gpui::Entity<crate::app::text_field::TextField>,
@@ -952,7 +974,7 @@ impl ShelluneView {
             div()
                 .flex()
                 .flex_col()
-                .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                .gap(metrics.scale(spacing::NARROW))
                 .debug_selector(move || selector.to_owned())
                 .child(field_label(label))
                 .child(
@@ -960,7 +982,12 @@ impl ShelluneView {
                         .flex()
                         .gap(metrics.scale(spacing::TIGHT))
                         .child(div().flex_1().min_w_0().child(address))
-                        .child(div().w(metrics.scale(120.0)).flex_none().child(port)),
+                        .child(
+                            div()
+                                .w(metrics.scale(FORWARD_PORT_WIDTH))
+                                .flex_none()
+                                .child(port),
+                        ),
                 )
         };
 
@@ -987,25 +1014,28 @@ impl ShelluneView {
             ],
         );
 
-        let mut form = components::card(metrics)
+        // The tunnel form is the dialog's inline form (ADR-7): a heading with the tunnel
+        // icon, one labelled field per line, the sentence it will do and the answers at
+        // its foot.
+        let mut form = components::inline_form(Tone::Accent, metrics)
             .gap(metrics.scale(spacing::BASE))
+            .p(metrics.scale(spacing::BASE))
             .debug_selector(|| "forwards.form".to_owned())
-            .child(
-                div()
-                    .text_size(metrics.title_size())
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                    .child(if editor.id.is_some() {
-                        ux.fwd_edit
-                    } else {
-                        ux.fwd_new
-                    }),
-            )
+            .child(components::form_heading(
+                Tone::Accent,
+                Icon::Forward,
+                if editor.id.is_some() {
+                    ux.fwd_edit
+                } else {
+                    ux.fwd_new
+                },
+                metrics,
+            ))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                    .gap(metrics.scale(spacing::NARROW))
                     .child(field_label(ux.fwd_type))
                     .child(div().flex().child(kind_control))
                     .child(
@@ -1019,7 +1049,7 @@ impl ShelluneView {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(metrics.scale(spacing::HAIRLINE + 2.0))
+                    .gap(metrics.scale(spacing::NARROW))
                     .child(field_label(ux.fwd_through))
                     .child(div().flex().child(host_control)),
             )

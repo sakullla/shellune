@@ -37,6 +37,13 @@ use crate::app::theme::{self, Elevated, Metrics, Tone, palette, spacing};
 /// knows the space it really has.
 pub const FIRST_DESKTOP_SIZE: (u32, u32) = (1280, 720);
 
+/// The widest the notice strip over a picture grows, before text scale.
+const NOTICE_WIDTH: f32 = 420.0;
+
+/// The room the zoom step's words take between the two zoom buttons, before text
+/// scale: "100%" and "Fit" in either language, so the buttons do not move.
+const ZOOM_LABEL_WIDTH: f32 = 44.0;
+
 /// Whether a certificate question is still waiting for an answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CertificateQuestion {
@@ -919,6 +926,13 @@ impl DesktopPane {
     /// server waiting out its own timeout with the worker and its socket still
     /// held. Accepting starts the sign-in, which is the next visible step; refusing
     /// ends the session, and ending it shuts the link down.
+    /// Whether the server's certificate question is waiting on screen, for a capture.
+    #[cfg(feature = "ui-capture")]
+    #[must_use]
+    pub fn certificate_asked(&self) -> bool {
+        self.certificate.is_some()
+    }
+
     pub fn answer_certificate(&mut self, accept: bool, cx: &mut Context<Self>) {
         let Some(question) = self.certificate.take() else {
             return;
@@ -1262,14 +1276,25 @@ impl DesktopPane {
                 },
             ),
         };
-        // The shared state card: the place the picture will be is a section that is
-        // waiting, live or ended, so it is drawn like every other such section (R6).
-        let mut card = components::state_card_with_icon(
+        // The status card a terminal's place shows (ADR-7): the place the picture will
+        // be is waiting, live or ended, and says so the way a session without a
+        // terminal does. While the connection is being made the emblem is the loading
+        // mark.
+        let emblem = match self.phase {
+            DesktopPhase::Connecting => components::loading_indicator(metrics),
+            _ => icons::icon(Icon::Monitor, metrics.icon_size(), tone.text()).into_any_element(),
+        };
+        let mut card = components::status_card(
             tone,
-            Some(Icon::Monitor),
-            headline,
-            detail,
-            None,
+            emblem,
+            div()
+                .debug_selector(|| "desktop.status.headline".to_owned())
+                .child(SharedString::from(headline)),
+            (!detail.is_empty()).then(|| {
+                div()
+                    .debug_selector(|| "desktop.status.detail".to_owned())
+                    .child(SharedString::from(detail))
+            }),
             metrics,
         )
         .debug_selector(|| "desktop.status".to_owned());
@@ -1277,22 +1302,40 @@ impl DesktopPane {
             .send_problem
             .iter()
             .chain(self.notices.iter().map(|(_, text)| text));
-        // A centred, capped, wrapping line in the card's column goes through
-        // `capped_text`, so its box is as tall as the lines painted in it (R1).
+        // A warning is a line of the card in its tone, with the tone's mark, wrapping
+        // inside the card.
         for problem in warnings {
-            card = card.child(components::capped_text(
-                metrics.scale(480.0),
+            card = card.child(
                 div()
-                    .whitespace_normal()
-                    .text_center()
-                    .text_size(metrics.label_size())
-                    .text_color(Tone::Warning.text())
-                    .child(SharedString::from(problem.clone())),
-            ));
+                    .flex()
+                    .items_start()
+                    .gap(metrics.scale(spacing::TIGHT))
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(metrics.label_size() * 1.4)
+                            .child(components::status_mark(
+                                Tone::Warning,
+                                metrics.scale(spacing::NARROW),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_size(metrics.label_size())
+                            .text_color(Tone::Warning.text())
+                            .child(SharedString::from(problem.clone())),
+                    ),
+            );
         }
-        // The card is centred and capped by the shared rule, so it is measured at the
-        // width it is painted at (ADR-2).
-        components::capped(metrics.scale(560.0), card).px(metrics.scale(spacing::LOOSE))
+        // Centred and capped by the shared rule, so it is measured at the width it is
+        // painted at (ADR-2).
+        components::status_card_slot(card, metrics).px(metrics.scale(spacing::LOOSE))
     }
 
     /// The strip that says a send did not reach the remote side (R18).
@@ -1344,15 +1387,16 @@ impl DesktopPane {
         });
         // The warning banner, lifted onto the picture: it floats over a remote
         // screen whose colours are not ours, so it carries the floating layer's
-        // shadow to stay apart from it (R6).
+        // shadow to stay apart from it (R6). It stands at the picture's foot, so the
+        // zoom controls at its head stay whole in a narrow window (ADR-7).
         Some(
             components::banner(Tone::Warning, metrics)
                 .absolute()
-                .top_0()
+                .bottom_0()
                 .left_0()
                 .w(gpui::Length::Auto)
                 .m(metrics.scale(spacing::TIGHT))
-                .max_w(px(420.0))
+                .max_w(metrics.scale(NOTICE_WIDTH))
                 .flex_row()
                 .items_center()
                 .gap(metrics.scale(spacing::TIGHT))
@@ -1414,7 +1458,7 @@ impl DesktopPane {
             .child(
                 div()
                     .flex_none()
-                    .min_w(metrics.scale(44.0))
+                    .min_w(metrics.scale(ZOOM_LABEL_WIDTH))
                     .px(metrics.scale(spacing::HAIRLINE))
                     .text_center()
                     .text_size(metrics.caption_size())
@@ -1458,84 +1502,59 @@ impl DesktopPane {
             return div();
         };
         let fingerprint = question.fingerprint.clone();
-        // A question about the server's identity: the shared card on the floating layer,
-        // with the warning tile a dialog's question carries and the answers at its foot
-        // (R6).
-        components::card(metrics)
-            .occlude()
-            .w_full()
-            .max_w(metrics.scale(480.0))
-            .bg(theme::swatch(palette::RAISED))
-            .border_color(theme::swatch(palette::BORDER_STRONG))
-            .elevation(theme::Elevation::Overlay)
-            .debug_selector(|| "desktop.certificate".to_owned())
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(metrics.scale(spacing::SNUG))
-                    .child(components::modal_icon(
-                        Icon::Lock,
-                        Some(Tone::Warning),
+        // A question about the server's identity: the same status card the picture's
+        // place shows, in the warning tone, with the answers at its foot (ADR-7).
+        components::status_card(
+            Tone::Warning,
+            icons::icon(Icon::Lock, metrics.icon_size(), Tone::Warning.text()).into_any_element(),
+            div().child(SharedString::from(question.summary())),
+            // The fingerprint is what the decision is made on, so it is drawn whole -
+            // wrapping, never cut to an ellipsis - in the monospace face, one click from
+            // the clipboard.
+            Some(
+                components::copy_on_click(
+                    div()
+                        .min_w_0()
+                        .font_family(crate::app::terminal::monospace_family())
+                        .debug_selector(|| "desktop.certificate.fingerprint".to_owned()),
+                    fingerprint.clone(),
+                )
+                .child(SharedString::from(fingerprint)),
+            ),
+            metrics,
+        )
+        .debug_selector(|| "desktop.certificate".to_owned())
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap(metrics.scale(spacing::TIGHT))
+                .child(
+                    components::compact_button(
+                        strings.desktop_certificate_reject,
+                        Variant::Danger,
                         metrics,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(metrics.scale(spacing::HAIRLINE))
-                            .child(
-                                div()
-                                    .whitespace_normal()
-                                    .text_size(metrics.body_size())
-                                    .font_weight(metrics.medium_weight())
-                                    .text_color(theme::swatch(palette::TEXT_PRIMARY))
-                                    .child(SharedString::from(question.summary())),
-                            )
-                            .child(
-                                components::endpoint(fingerprint, metrics)
-                                    .whitespace_normal()
-                                    .text_size(metrics.caption_size()),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_end()
-                    .gap(metrics.scale(spacing::TIGHT))
-                    .child(
-                        components::compact_button(
-                            strings.desktop_certificate_reject,
-                            Variant::Danger,
-                            metrics,
-                        )
-                        .id(SharedString::from("desktop.certificate.reject"))
-                        .debug_selector(|| "desktop.certificate.reject".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.answer_certificate(false, cx);
-                            },
-                        )),
                     )
-                    .child(
-                        components::compact_button(
-                            strings.desktop_certificate_trust,
-                            Variant::Primary,
-                            metrics,
-                        )
-                        .id(SharedString::from("desktop.certificate.trust"))
-                        .debug_selector(|| "desktop.certificate.trust".to_owned())
-                        .on_click(cx.listener(
-                            |this, _event, _window, cx| {
-                                this.answer_certificate(true, cx);
-                            },
-                        )),
-                    ),
-            )
+                    .id(SharedString::from("desktop.certificate.reject"))
+                    .debug_selector(|| "desktop.certificate.reject".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.answer_certificate(false, cx);
+                    })),
+                )
+                .child(
+                    components::compact_button(
+                        strings.desktop_certificate_trust,
+                        Variant::Primary,
+                        metrics,
+                    )
+                    .id(SharedString::from("desktop.certificate.trust"))
+                    .debug_selector(|| "desktop.certificate.trust".to_owned())
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.answer_certificate(true, cx);
+                    })),
+                ),
+        )
     }
 }
 
@@ -1770,7 +1789,8 @@ impl Render for DesktopPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(card),
+                    .px(metrics.scale(spacing::LOOSE))
+                    .child(components::status_card_slot(card, metrics)),
             );
         }
         if self.surface.is_empty()
@@ -1784,7 +1804,7 @@ impl Render for DesktopPane {
                     .bottom(px(0.0))
                     .left(px(0.0))
                     .p(metrics.scale(spacing::TIGHT))
-                    .text_size(metrics.scale(11.0))
+                    .text_size(metrics.caption_size())
                     .text_color(theme::swatch(palette::TEXT_MUTED))
                     .child(SharedString::from(self.target.target())),
             );
