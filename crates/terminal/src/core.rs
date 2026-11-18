@@ -536,17 +536,38 @@ impl TerminalCore {
     }
 
     /// Starts a mouse selection at a viewport row and column.
-    pub fn begin_selection(&mut self, row: usize, column: usize, kind: SelectionType) {
+    ///
+    /// `side` is the half of the cell the pointer is in. A selection's edges are
+    /// between cells, as in other terminals: a drag that starts on the left half of
+    /// a character takes it, one that starts on its right half leaves it out, in
+    /// whichever direction the drag then goes.
+    pub fn begin_selection(&mut self, row: usize, column: usize, side: Side, kind: SelectionType) {
         let point = self.grid_point(row, column);
-        self.term.selection = Some(Selection::new(kind, point, Side::Left));
+        self.term.selection = Some(Selection::new(kind, point, side));
     }
 
-    /// Extends the selection to a viewport row and column.
-    pub fn extend_selection(&mut self, row: usize, column: usize) {
+    /// Starts a selection at the cursor's cell, on its left edge.
+    ///
+    /// It is what Shift+click extends when nothing is selected yet: the text
+    /// between the cursor and the click.
+    pub fn begin_selection_at_cursor(&mut self) {
+        let point = self.term.grid().cursor.point;
+        self.term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+    }
+
+    /// Moves the free end of the selection to a viewport row and column, on the
+    /// `side` half of that cell.
+    pub fn extend_selection(&mut self, row: usize, column: usize, side: Side) {
         let point = self.grid_point(row, column);
         if let Some(selection) = self.term.selection.as_mut() {
-            selection.update(point, Side::Right);
+            selection.update(point, side);
         }
+    }
+
+    /// The kind of the selection being kept, even one that covers nothing yet.
+    #[must_use]
+    pub fn selection_kind(&self) -> Option<SelectionType> {
+        self.term.selection.as_ref().map(|selection| selection.ty)
     }
 
     /// Removes the selection.
@@ -1845,8 +1866,8 @@ mod tests {
     fn a_selection_returns_the_text_under_it() {
         let mut terminal = core();
         terminal.feed(b"one\r\ntwo\r\nthree");
-        terminal.begin_selection(0, 0, SelectionType::Simple);
-        terminal.extend_selection(2, 2);
+        terminal.begin_selection(0, 0, Side::Left, SelectionType::Simple);
+        terminal.extend_selection(2, 2, Side::Right);
         let text = terminal.selection_text().expect("a selection exists");
         assert_eq!(text.trim_end(), "one\ntwo\nthr");
         assert!(terminal.has_selection());
@@ -1864,12 +1885,56 @@ mod tests {
     fn a_selection_is_drawn_as_selected_cells() {
         let mut terminal = core();
         terminal.feed(b"abc");
-        terminal.begin_selection(0, 0, SelectionType::Simple);
-        terminal.extend_selection(0, 2);
+        terminal.begin_selection(0, 0, Side::Left, SelectionType::Simple);
+        terminal.extend_selection(0, 2, Side::Right);
         let snapshot = terminal.snapshot();
         assert!(snapshot.rows[0].cells[0].selected);
         assert!(snapshot.rows[0].cells[2].selected);
         assert!(!snapshot.rows[0].cells[3].selected);
+    }
+
+    /// The edges of a selection are the halves of cells the pointer was in, in
+    /// either direction (R4).
+    #[test]
+    fn a_selection_takes_the_cells_between_its_edges() {
+        let mut terminal = core();
+        terminal.feed(b"cd test-c9685ba2 now");
+
+        // Leftwards from the left half of the space after `2` to the left half of `t`.
+        terminal.begin_selection(0, 16, Side::Left, SelectionType::Simple);
+        terminal.extend_selection(0, 3, Side::Left);
+        assert_eq!(terminal.selection_text().as_deref(), Some("test-c9685ba2"));
+
+        // From the right half of `t`: the `t` is left out.
+        terminal.begin_selection(0, 3, Side::Right, SelectionType::Simple);
+        terminal.extend_selection(0, 15, Side::Right);
+        assert_eq!(terminal.selection_text().as_deref(), Some("est-c9685ba2"));
+
+        // From the right half of one cell to the left half of the next covers nothing.
+        terminal.begin_selection(0, 3, Side::Right, SelectionType::Simple);
+        terminal.extend_selection(0, 4, Side::Left);
+        assert!(!terminal.has_selection());
+        assert_eq!(terminal.selection_kind(), Some(SelectionType::Simple));
+    }
+
+    /// A block selection takes the same columns from every row it spans.
+    #[test]
+    fn a_block_selection_takes_a_rectangle() {
+        let mut terminal = core();
+        terminal.feed(b"abcd\r\nefgh\r\nijkl");
+        terminal.begin_selection(0, 1, Side::Left, SelectionType::Block);
+        terminal.extend_selection(2, 2, Side::Right);
+        assert_eq!(terminal.selection_text().as_deref(), Some("bc\nfg\njk"));
+    }
+
+    /// With nothing selected, a selection can start at the cursor (Shift+click).
+    #[test]
+    fn a_selection_can_start_at_the_cursor() {
+        let mut terminal = core();
+        terminal.feed(b"hello world");
+        terminal.begin_selection_at_cursor();
+        terminal.extend_selection(0, 6, Side::Left);
+        assert_eq!(terminal.selection_text().as_deref(), Some("world"));
     }
 
     #[test]

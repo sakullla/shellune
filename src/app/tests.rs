@@ -47,8 +47,8 @@ use crate::app::product;
 use crate::app::remote::{MethodChoice, RemotePanel, RemoteStatus};
 use crate::app::serial::{DeviceChoice, PortScan, SerialLink};
 use crate::app::terminal::{
-    BarFold, PaneState, SearchNote, SnippetOffer, SourceEvent, TerminalAttention, TerminalPane,
-    TerminalShortcuts,
+    BarFold, PaneState, SELECTION_DRAG_THRESHOLD, SearchNote, SnippetOffer, SourceEvent,
+    TerminalAttention, TerminalPane, TerminalShortcuts,
 };
 use crate::app::theme::{
     self, BODY_CONTRAST_FLOOR, GRAPHIC_CONTRAST_FLOOR, Metrics, Motion, Tone, Zoom, palette,
@@ -4676,8 +4676,10 @@ async fn a_mouse_selection_is_copied_when_it_is_released(cx: &mut TestAppContext
     let cell = cx.update(|_window, app| pane.read(app).cell_size());
     let origin = viewport.origin;
     let y = origin.y + px(cell.height * 0.5);
-    let first = point(origin.x + px(cell.width * 0.5), y);
-    let fifth = point(origin.x + px(cell.width * 4.5), y);
+    // From the left half of the first cell to the right half of the fifth: the
+    // edges of a selection are the halves of cells the pointer was in (R4).
+    let first = point(origin.x + px(cell.width * 0.25), y);
+    let fifth = point(origin.x + px(cell.width * 4.75), y);
 
     cx.simulate_mouse_down(first, MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_move(fifth, Some(MouseButton::Left), Modifiers::default());
@@ -4692,6 +4694,393 @@ async fn a_mouse_selection_is_copied_when_it_is_released(cx: &mut TestAppContext
     let clipboard =
         cx.update(|_window, app| app.read_from_clipboard().and_then(|item| item.text()));
     assert_eq!(clipboard, Some("hello".to_owned()));
+}
+
+/// Window pixels of a place inside the grid, in cells: `column` 3.25 is the left
+/// quarter of the fourth cell, 3.75 its right quarter.
+fn grid_point_at(
+    cx: &mut VisualTestContext,
+    pane: &Entity<TerminalPane>,
+    row: f32,
+    column: f32,
+) -> gpui::Point<Pixels> {
+    let viewport = bounds_of(cx, "terminal.viewport");
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    point(
+        viewport.origin.x + px(cell.width * column),
+        viewport.origin.y + px(cell.height * row),
+    )
+}
+
+/// Presses at `from`, moves to `to` with the button held and releases there, all
+/// with the same modifiers; returns what the release copied.
+fn drag_in_grid(
+    cx: &mut VisualTestContext,
+    pane: &Entity<TerminalPane>,
+    from: gpui::Point<Pixels>,
+    to: gpui::Point<Pixels>,
+    modifiers: Modifiers,
+) -> Option<String> {
+    cx.simulate_mouse_down(from, MouseButton::Left, modifiers);
+    cx.simulate_mouse_move(to, Some(MouseButton::Left), modifiers);
+    cx.simulate_mouse_up(to, MouseButton::Left, modifiers);
+    cx.run_until_parked();
+    cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned))
+}
+
+/// The case from the report: dragging leftwards from just after
+/// `test-c9685ba2` to the left half of its `t` dropped the `t` (R4). The edge of a
+/// selection is the half of a cell the pointer is in, as in other terminals, so a
+/// drag that starts or ends on the left half of a character includes it.
+#[gpui::test]
+async fn a_drag_from_the_left_half_of_a_character_includes_it(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("cd test-c9685ba2 now", cx);
+
+    // Leftwards: from the left half of the space after `2` to the left half of `t`.
+    let after = grid_point_at(cx, &pane, 0.5, 16.25);
+    let t = grid_point_at(cx, &pane, 0.5, 3.25);
+    assert_eq!(
+        drag_in_grid(cx, &pane, after, t, Modifiers::default()),
+        Some("test-c9685ba2".to_owned()),
+        "a leftward drag ending on the left half of `t` includes the `t`"
+    );
+
+    // Rightwards: from the left half of `t` to the right half of `2`.
+    let two = grid_point_at(cx, &pane, 0.5, 15.75);
+    assert_eq!(
+        drag_in_grid(cx, &pane, t, two, Modifiers::default()),
+        Some("test-c9685ba2".to_owned()),
+        "a rightward drag from the left half of `t` includes the `t`"
+    );
+}
+
+/// A drag that starts on the right half of a character leaves it out, in either
+/// direction, and a drag that runs left of the grid reaches the first column (R4).
+#[gpui::test]
+async fn the_half_of_a_cell_decides_whether_it_is_selected(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello world", cx);
+
+    // From the right half of `h` to the right half of `o`: `h` is left out.
+    let h_right = grid_point_at(cx, &pane, 0.5, 0.75);
+    let o_right = grid_point_at(cx, &pane, 0.5, 4.75);
+    assert_eq!(
+        drag_in_grid(cx, &pane, h_right, o_right, Modifiers::default()),
+        Some("ello".to_owned()),
+        "a drag starting on the right half of a character does not take it"
+    );
+
+    // Leftwards from the right half of `o` to the right half of `e`: `e` is left out
+    // and `o` is kept.
+    let e_right = grid_point_at(cx, &pane, 0.5, 1.75);
+    assert_eq!(
+        drag_in_grid(cx, &pane, o_right, e_right, Modifiers::default()),
+        Some("llo".to_owned()),
+        "a leftward drag keeps the pressed character and drops the one it ends right of"
+    );
+
+    // Leftwards past the start of the line: the pointer is left of the grid, which
+    // is the first column's left half, so the first character is taken.
+    let viewport = bounds_of(cx, "terminal.viewport");
+    let left_of_grid = point(viewport.origin.x - px(20.0), o_right.y);
+    assert_eq!(
+        drag_in_grid(cx, &pane, o_right, left_of_grid, Modifiers::default()),
+        Some("hello".to_owned()),
+        "a drag past the start of the line selects through its first character"
+    );
+}
+
+/// A press becomes a selection only after the pointer moved more than 3 px or into
+/// another cell; a shaky click selects nothing and copies nothing (R4).
+#[gpui::test]
+async fn a_press_becomes_a_selection_past_the_drag_threshold(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello world", cx);
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    assert!(
+        cell.width > 2.0 * SELECTION_DRAG_THRESHOLD && cell.width < 20.0,
+        "the cases below need a cell wider than twice the threshold and under 20 px"
+    );
+    let start = grid_point_at(cx, &pane, 0.5, 0.1);
+
+    // 2 px inside the first cell: still a click.
+    let near = point(start.x + px(2.0), start.y);
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(near, Some(MouseButton::Left), Modifiers::default());
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).selection_kind()),
+        None,
+        "a move under the threshold inside the pressed cell does not begin a selection"
+    );
+    cx.simulate_mouse_up(near, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        None,
+        "a click that shook by 2 px copies nothing"
+    );
+
+    // Crossing into the next cell begins a selection even under 3 px.
+    let edge = grid_point_at(cx, &pane, 0.5, 0.9);
+    let across = point(edge.x + px(2.0), edge.y);
+    cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(across, Some(MouseButton::Left), Modifiers::default());
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).selection_kind()),
+        Some(shellune_terminal::SelectionType::Simple),
+        "crossing into another cell begins the selection"
+    );
+    cx.simulate_mouse_up(across, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+
+    // More than 3 px inside one cell, into its right half, selects that character.
+    let far = point(
+        start.x + px((cell.width * 0.6).max(SELECTION_DRAG_THRESHOLD + 1.0)),
+        start.y,
+    );
+    assert_eq!(
+        drag_in_grid(cx, &pane, start, far, Modifiers::default()),
+        Some("h".to_owned()),
+        "a move past the threshold begins the selection"
+    );
+}
+
+/// Shift+click moves the end of the selection to the click; with nothing selected
+/// it selects from the cursor to the click (R4).
+#[gpui::test]
+async fn shift_click_extends_the_selection(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello world", cx);
+    let h = grid_point_at(cx, &pane, 0.5, 0.25);
+    let o = grid_point_at(cx, &pane, 0.5, 4.75);
+    assert_eq!(
+        drag_in_grid(cx, &pane, h, o, Modifiers::default()),
+        Some("hello".to_owned())
+    );
+
+    let d = grid_point_at(cx, &pane, 0.5, 10.75);
+    cx.simulate_mouse_down(d, MouseButton::Left, Modifiers::shift());
+    cx.simulate_mouse_up(d, MouseButton::Left, Modifiers::shift());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        Some("hello world".to_owned()),
+        "Shift+click moves the end of the selection to the click"
+    );
+
+    // A plain click clears the selection; Shift+click then selects from the cursor,
+    // which is after `world`, back to the click.
+    cx.simulate_mouse_down(h, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(h, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).selection_kind()),
+        None
+    );
+    let w = grid_point_at(cx, &pane, 0.5, 6.25);
+    cx.simulate_mouse_down(w, MouseButton::Left, Modifiers::shift());
+    cx.simulate_mouse_up(w, MouseButton::Left, Modifiers::shift());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        Some("world".to_owned()),
+        "with nothing selected, Shift+click selects from the cursor to the click"
+    );
+}
+
+/// Alt (Option on macOS) drags a block: the same columns from every row (R4).
+#[gpui::test]
+async fn alt_drag_selects_a_block(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("abcd\r\nefgh\r\nijkl", cx);
+    let from = grid_point_at(cx, &pane, 0.5, 1.25);
+    let to = grid_point_at(cx, &pane, 2.5, 2.75);
+    assert_eq!(
+        drag_in_grid(cx, &pane, from, to, Modifiers::alt()),
+        Some("bc\nfg\njk".to_owned()),
+        "an Alt drag takes columns 2-3 of every row it spans"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).selection_kind()),
+        Some(shellune_terminal::SelectionType::Block)
+    );
+
+    // Without Alt the same drag runs through the text.
+    assert_eq!(
+        drag_in_grid(cx, &pane, from, to, Modifiers::default()),
+        Some("bcd\nefgh\nijk".to_owned())
+    );
+}
+
+/// A drag keeps following the pointer after it leaves the grid, and the release
+/// outside the grid still ends it (R4).
+#[gpui::test]
+async fn a_drag_that_leaves_the_grid_keeps_selecting(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello world\r\nsecond line", cx);
+    let viewport = bounds_of(cx, "terminal.viewport");
+    let h = grid_point_at(cx, &pane, 0.5, 0.25);
+
+    // Right of the grid and of the window, on the first row.
+    let outside = point(viewport.right() + px(400.0), h.y);
+    cx.simulate_mouse_down(h, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(outside, Some(MouseButton::Left), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).selected_text()),
+        Some("hello world".to_owned()),
+        "a pointer right of the grid selects to the end of its row"
+    );
+
+    // Down onto the second row, still outside, then released there.
+    let lower = grid_point_at(cx, &pane, 1.5, 0.0);
+    let outside_lower = point(viewport.right() + px(400.0), lower.y);
+    cx.simulate_mouse_move(outside_lower, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(outside_lower, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        Some("hello world\nsecond line".to_owned()),
+        "a release outside the grid ends the drag and copies it"
+    );
+
+    // The drag is over: moving the pointer afterwards changes nothing.
+    let elsewhere = grid_point_at(cx, &pane, 0.5, 2.0);
+    cx.simulate_mouse_move(elsewhere, None, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).selected_text()),
+        Some("hello world\nsecond line".to_owned())
+    );
+}
+
+/// A drag held past the top edge scrolls the history every 50 ms, one line per
+/// row height past the edge and at most 5 lines a step, and extends the selection
+/// with it (R4).
+#[gpui::test]
+async fn a_drag_past_the_edge_scrolls_the_history(cx: &mut TestAppContext) {
+    let mut content = String::new();
+    for line in 0..200 {
+        content.push_str(&format!("line {line}\r\n"));
+    }
+    let (pane, cx) = pane_with(&content, cx);
+    let rows = cx.update(|_window, app| pane.read(app).grid().rows);
+    let cell = cx.update(|_window, app| pane.read(app).cell_size());
+    let viewport = bounds_of(cx, "terminal.viewport");
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 0);
+
+    let press = grid_point_at(cx, &pane, 2.5, 0.25);
+    cx.simulate_mouse_down(press, MouseButton::Left, Modifiers::default());
+    // One and a half rows above the grid: two lines a step.
+    let above = point(press.x, viewport.origin.y - px(cell.height * 1.5));
+    cx.simulate_mouse_move(above, Some(MouseButton::Left), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).display_offset()),
+        0,
+        "nothing scrolls before the first step"
+    );
+    cx.executor()
+        .advance_clock(crate::app::terminal::SELECTION_AUTOSCROLL_INTERVAL);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 2);
+
+    // Far above: the step is capped at five lines.
+    let far = point(press.x, viewport.origin.y - px(cell.height * 20.0));
+    cx.simulate_mouse_move(far, Some(MouseButton::Left), Modifiers::default());
+    cx.executor()
+        .advance_clock(crate::app::terminal::SELECTION_AUTOSCROLL_INTERVAL);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 7);
+
+    // Back inside the grid the scrolling stops.
+    let inside = grid_point_at(cx, &pane, 0.5, 0.25);
+    cx.simulate_mouse_move(inside, Some(MouseButton::Left), Modifiers::default());
+    cx.executor()
+        .advance_clock(crate::app::terminal::SELECTION_AUTOSCROLL_INTERVAL * 4);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_window, app| pane.read(app).display_offset()), 7);
+
+    cx.simulate_mouse_up(inside, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    // The grid holds `line 0` .. `line 199` and the empty line the cursor is on. The
+    // press was on row 2 with the view at the bottom; the release on row 0 with the
+    // view 7 lines back.
+    let first = 201 - rows - 7;
+    let last = 201 - rows + 2;
+    let expected = (first..last)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let copied = cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned));
+    assert_eq!(
+        copied.as_deref().map(str::trim_end),
+        Some(expected.as_str()),
+        "the selection runs from the row scrolled into view to where the drag began"
+    );
+}
+
+/// In a program that took the mouse, Shift keeps the pointer for the terminal: a
+/// Shift+drag selects and copies locally and nothing is reported (R4).
+#[gpui::test]
+async fn shift_drag_selects_locally_while_a_program_has_the_mouse(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello world\x1b[?1000h\x1b[?1006h", cx);
+    let h = grid_point_at(cx, &pane, 0.5, 0.25);
+    let o = grid_point_at(cx, &pane, 0.5, 4.75);
+    let sent_before = cx.update(|_window, app| pane.read(app).sent().len());
+    assert_eq!(
+        drag_in_grid(cx, &pane, h, o, Modifiers::shift()),
+        Some("hello".to_owned()),
+        "Shift+drag selects even while the program takes the mouse"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).sent().len()),
+        sent_before,
+        "a Shift+drag is not reported to the program"
+    );
+
+    // Without Shift the drag is the program's: it is reported and nothing is copied.
+    let w = grid_point_at(cx, &pane, 0.5, 6.25);
+    let d = grid_point_at(cx, &pane, 0.5, 10.75);
+    cx.simulate_mouse_down(w, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(d, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(d, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    let sent = cx.update(|_window, app| pane.read(app).sent()[sent_before..].to_vec());
+    assert!(
+        String::from_utf8_lossy(&sent).contains("\x1b[<0;"),
+        "a plain drag is reported to the program: {sent:?}"
+    );
+    assert_eq!(
+        cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned)),
+        Some("hello".to_owned()),
+        "a reported drag copies nothing"
+    );
+}
+
+/// A double click still selects a word and a triple click the line (R4).
+#[gpui::test]
+async fn double_and_triple_clicks_select_a_word_and_a_line(cx: &mut TestAppContext) {
+    let (pane, cx) = pane_with("hello world", cx);
+    let w = grid_point_at(cx, &pane, 0.5, 7.5);
+    for (count, expected) in [(2, "world"), (3, "hello world")] {
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: w,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: count,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: w,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: count,
+        });
+        cx.run_until_parked();
+        // A line selection carries its line break, as it did before.
+        let copied = cx.update(|_window, app| pane.read(app).last_copy().map(str::to_owned));
+        assert_eq!(
+            copied.as_deref().map(str::trim_end),
+            Some(expected),
+            "a click {count} times selects and copies {expected:?}"
+        );
+    }
 }
 
 #[gpui::test]

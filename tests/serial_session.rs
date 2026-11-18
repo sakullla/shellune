@@ -24,6 +24,7 @@ use shellune_serial::{
     SessionLimits, StopBits, list_ports,
 };
 use shellune_terminal::SelectionType;
+use shellune_terminal::Side;
 use shellune_terminal::TerminalCore;
 use shellune_terminal::core::SearchOptions;
 
@@ -190,8 +191,9 @@ fn the_grid_over_a_serial_session_can_be_searched_scrolled_and_copied() {
     rig.core.scroll_to_bottom();
 
     // Copy: a selection over one row reads back as that row.
-    rig.core.begin_selection(0, 0, SelectionType::Simple);
-    rig.core.extend_selection(0, 3);
+    rig.core
+        .begin_selection(0, 0, Side::Left, SelectionType::Simple);
+    rig.core.extend_selection(0, 3, Side::Right);
     let copied = rig
         .core
         .selection_text()

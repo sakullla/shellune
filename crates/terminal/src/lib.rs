@@ -27,6 +27,7 @@ pub mod palette;
 pub mod pty;
 pub mod shell;
 
+pub use alacritty_terminal::index::Side;
 pub use alacritty_terminal::selection::SelectionType;
 pub use alacritty_terminal::term::TermMode;
 pub use alacritty_terminal::vte::ansi::{CursorShape, Rgb};

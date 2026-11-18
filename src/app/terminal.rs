@@ -21,10 +21,10 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, BoxShadow, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size,
-    UTF16Selection, Window, canvas, div, point, px,
+    App, Bounds, BoxShadow, ClipboardItem, Context, DispatchPhase, ElementInputHandler,
+    EntityInputHandler, FocusHandle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString,
+    Size, UTF16Selection, Window, canvas, div, point, px,
 };
 use std::ops::Range;
 
@@ -36,7 +36,7 @@ use shellune_terminal::{
     BlockFilter, BlockStatus, CellSize, CommandBlock, CommandBlockId, CursorShape, ExitReport,
     GridSize, HistoryMatch, Key, KeyModifiers, LocalSession, MouseAction,
     MouseButton as TerminalMouseButton, MouseModifiers, PtyEvent, RenderedCell, Rgb, SelectionType,
-    Snapshot, TermMode, TerminalCore, TerminalEffects, encode_alternate_scroll, encode_key,
+    Side, Snapshot, TermMode, TerminalCore, TerminalEffects, encode_alternate_scroll, encode_key,
     encode_mouse, encode_paste, encode_text, grid_for, mouse_reporting, palette,
     paste_needs_confirmation, sanitize_font_size, step_font_size,
 };
@@ -57,6 +57,40 @@ use crate::app::theme::{self, Metrics, Tone, palette as shell_palette, radius, s
 /// thousands of small chunks must not force thousands of frames, and 12ms is below
 /// the point where typing feels delayed.
 pub const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(12);
+
+/// How far the pointer moves, in pixels, before a press becomes a drag.
+///
+/// Below it, and inside the cell the button went down on, the press is a click: a
+/// hand that shakes while clicking must not select, and copy, one character.
+pub const SELECTION_DRAG_THRESHOLD: f32 = 3.0;
+
+/// How often a drag held past the top or bottom edge scrolls the view.
+pub const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The most lines one auto-scroll step moves, however far past the edge the
+/// pointer is.
+pub const SELECTION_AUTOSCROLL_MAX_LINES: usize = 5;
+
+/// A left-button selection gesture the terminal handles itself.
+///
+/// The press only records where it was. The selection begins once the pointer
+/// has moved more than [`SELECTION_DRAG_THRESHOLD`] or crossed into another cell;
+/// a double or triple click, and a Shift+click, begin it at once. That is what
+/// separates a click from a selection: a click selected nothing, and copying would
+/// replace the user's clipboard with a character they never chose.
+#[derive(Clone, Copy, Debug)]
+struct SelectionDrag {
+    /// Where the button went down, in window pixels.
+    origin: gpui::Point<Pixels>,
+    /// The cell the button went down on and the half of it the pointer was in.
+    anchor: ((usize, usize), Side),
+    /// What the drag selects: characters, a block (Alt/Option), words or lines.
+    kind: SelectionType,
+    /// The selection has begun.
+    started: bool,
+    /// Where the pointer last was, which auto-scroll keeps extending to.
+    pointer: gpui::Point<Pixels>,
+}
 
 /// Height of the status line under the grid.
 pub const SHELL_BAR_HEIGHT: f32 = 28.0;
@@ -601,16 +635,11 @@ pub struct TerminalPane {
     grid: GridSize,
     viewport: Option<Bounds<Pixels>>,
     focus: FocusHandle,
-    dragging: bool,
-    /// Cell the left button went down on, while a drag is in progress.
-    ///
-    /// It is what separates a click from a selection: a release on the cell the
-    /// button went down on selected nothing, and copying there would replace the
-    /// user's clipboard with a single character they never chose.
-    press: Option<(usize, usize)>,
-    /// The selection came from a double or triple click (a word or a line), so
-    /// releasing on the same cell keeps and copies it.
-    press_selects: bool,
+    /// The left-button selection gesture, from the press to the release.
+    drag: Option<SelectionDrag>,
+    /// A timer is scrolling the view while a drag holds the pointer past the top
+    /// or bottom edge of the grid.
+    autoscrolling: bool,
     /// The button a program is being told is held, while it asked for the mouse.
     mouse_held: Option<TerminalMouseButton>,
     /// The cell the last motion report named, so moving inside one cell does not
@@ -837,9 +866,8 @@ impl TerminalPane {
             grid,
             viewport: None,
             focus: cx.focus_handle(),
-            dragging: false,
-            press: None,
-            press_selects: false,
+            drag: None,
+            autoscrolling: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -912,9 +940,8 @@ impl TerminalPane {
             grid,
             viewport: None,
             focus: cx.focus_handle(),
-            dragging: false,
-            press: None,
-            press_selects: false,
+            drag: None,
+            autoscrolling: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -986,9 +1013,8 @@ impl TerminalPane {
             grid,
             viewport: None,
             focus: cx.focus_handle(),
-            dragging: false,
-            press: None,
-            press_selects: false,
+            drag: None,
+            autoscrolling: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1143,9 +1169,8 @@ impl TerminalPane {
             grid,
             viewport: None,
             focus: cx.focus_handle(),
-            dragging: false,
-            press: None,
-            press_selects: false,
+            drag: None,
+            autoscrolling: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1338,9 +1363,8 @@ impl TerminalPane {
             grid,
             viewport: None,
             focus: cx.focus_handle(),
-            dragging: false,
-            press: None,
-            press_selects: false,
+            drag: None,
+            autoscrolling: false,
             mouse_held: None,
             last_report_cell: None,
             menu: None,
@@ -1454,6 +1478,19 @@ impl TerminalPane {
     #[cfg(test)]
     pub fn last_copy(&self) -> Option<&str> {
         self.last_copy.as_deref()
+    }
+
+    /// The kind of selection being kept, even one that covers nothing yet; `None`
+    /// while a press has not begun one.
+    #[cfg(test)]
+    pub fn selection_kind(&self) -> Option<SelectionType> {
+        self.core.selection_kind()
+    }
+
+    /// The selected text, without copying it.
+    #[cfg(test)]
+    pub fn selected_text(&self) -> Option<String> {
+        self.core.selection_text()
     }
 
     /// Bytes the pane sent to the shell.
@@ -2650,17 +2687,45 @@ impl TerminalPane {
         cx.notify();
     }
 
-    fn cell_at(&self, position: gpui::Point<Pixels>) -> Option<(usize, usize)> {
+    /// The viewport cell under a window position, as `(row, column)`, and the half
+    /// of that cell the position is in.
+    ///
+    /// A position outside the grid is clamped to it: left of the grid is the first
+    /// column's left half, right of it the last column's right half, and above or
+    /// below it the first or last row. A drag that leaves the grid, or the window,
+    /// keeps selecting to the edge it left by. A position exactly on the middle of a
+    /// cell is its left half, as in other terminals.
+    fn cell_at(&self, position: gpui::Point<Pixels>) -> Option<((usize, usize), Side)> {
         let bounds = self.viewport?;
         let cell = self.cell.sanitized();
+        let cols = self.grid.cols.max(1);
+        let rows = self.grid.rows.max(1);
         let x = f32::from(position.x) - f32::from(bounds.origin.x);
         let y = f32::from(position.y) - f32::from(bounds.origin.y);
-        if x < 0.0 || y < 0.0 {
-            return None;
+        let row = if y <= 0.0 {
+            0
+        } else {
+            ((y / cell.height) as usize).min(rows - 1)
+        };
+        if x <= 0.0 {
+            return Some(((row, 0), Side::Left));
         }
-        let column = ((x / cell.width) as usize).min(self.grid.cols.saturating_sub(1));
-        let row = ((y / cell.height) as usize).min(self.grid.rows.saturating_sub(1));
-        Some((row, column))
+        let column = (x / cell.width) as usize;
+        if column >= cols {
+            return Some(((row, cols - 1), Side::Right));
+        }
+        let within = x - column as f32 * cell.width;
+        let side = if within > cell.width / 2.0 {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        Some(((row, column), side))
+    }
+
+    /// The viewport cell under a window position, for mouse reports.
+    fn report_cell_at(&self, position: gpui::Point<Pixels>) -> Option<(usize, usize)> {
+        self.cell_at(position).map(|(cell, _side)| cell)
     }
 
     /// Tells the program about a pointer event, when it asked for the mouse.
@@ -2680,7 +2745,7 @@ impl TerminalPane {
         if !mouse_reporting(mode) || modifiers.shift {
             return false;
         }
-        let Some((row, column)) = self.cell_at(position) else {
+        let Some((row, column)) = self.report_cell_at(position) else {
             return true;
         };
         if action == MouseAction::Motion {
@@ -2717,22 +2782,50 @@ impl TerminalPane {
             cx,
         ) {
             self.mouse_held = Some(TerminalMouseButton::Left);
-            self.last_report_cell = self.cell_at(event.position);
+            self.last_report_cell = self.report_cell_at(event.position);
             return;
         }
-        let Some((row, column)) = self.cell_at(event.position) else {
+        let Some(((row, column), side)) = self.cell_at(event.position) else {
             return;
         };
-        // A double click selects a word, a triple click the line.
+        // A double click selects a word, a triple click the line; Alt (Option on
+        // macOS) drags a block, the same columns from every row.
         let kind = match event.click_count {
             2 => SelectionType::Semantic,
             count if count >= 3 => SelectionType::Lines,
+            _ if event.modifiers.alt => SelectionType::Block,
             _ => SelectionType::Simple,
         };
-        self.dragging = true;
-        self.press = Some((row, column));
-        self.press_selects = kind != SelectionType::Simple;
-        self.core.begin_selection(row, column, kind);
+        let mut drag = SelectionDrag {
+            origin: event.position,
+            anchor: ((row, column), side),
+            kind,
+            started: false,
+            pointer: event.position,
+        };
+        if matches!(kind, SelectionType::Semantic | SelectionType::Lines) {
+            // A word or a line is chosen by the click itself.
+            self.core.begin_selection(row, column, side, kind);
+            drag.started = true;
+        } else if event.modifiers.shift && self.core.has_selection() {
+            // Shift+click moves the end of the selection to the click, and a drag
+            // from there keeps moving it.
+            self.core.extend_selection(row, column, side);
+            drag.started = true;
+        } else if event.modifiers.shift && !mouse_reporting(self.core.mode()) {
+            // With nothing selected, Shift+click selects from the cursor to the
+            // click. A program that took the mouse places its own cursor, so there
+            // Shift only keeps the pointer for the terminal and the drag starts
+            // where the button went down, like any other.
+            self.core.begin_selection_at_cursor();
+            self.core.extend_selection(row, column, side);
+            drag.started = true;
+        } else {
+            // A press only records where it was; the old highlight goes, as the
+            // press starts something new.
+            self.core.clear_selection();
+        }
+        self.drag = Some(drag);
         cx.notify();
     }
 
@@ -2800,58 +2893,166 @@ impl TerminalPane {
         true
     }
 
+    /// Pointer motion over the grid, which a program that took the mouse is told
+    /// about. A selection drag follows the pointer through
+    /// [`TerminalPane::drag_moved`] instead, wherever in the window it is.
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if !self.dragging {
-            let button = self.mouse_held.unwrap_or(TerminalMouseButton::None);
-            self.report_mouse(
-                button,
-                MouseAction::Motion,
-                event.position,
-                &event.modifiers,
-                cx,
-            );
+        if self.drag.is_some() {
             return;
         }
-        let Some((row, column)) = self.cell_at(event.position) else {
+        let button = self.mouse_held.unwrap_or(TerminalMouseButton::None);
+        self.report_mouse(
+            button,
+            MouseAction::Motion,
+            event.position,
+            &event.modifiers,
+            cx,
+        );
+    }
+
+    /// The pointer moved anywhere in the window while a selection drag is held.
+    ///
+    /// The grid only hears its own hover, so a drag that left the grid, or the
+    /// window, would stop following the pointer and never hear the release. The
+    /// pane listens at the window instead (see [`TerminalPane::viewport`]) and
+    /// does nothing unless a drag is held here.
+    fn drag_moved(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.drag.is_none() {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            // The release happened where the window never heard it; the drag ends
+            // where the pointer is now.
+            self.finish_drag(event.position, cx);
+            return;
+        }
+        self.drag_to(event.position, cx);
+        self.start_autoscroll(cx);
+    }
+
+    /// The left button came up anywhere in the window while a drag is held.
+    fn drag_released(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.drag.is_some() {
+            self.finish_drag(event.position, cx);
+        }
+    }
+
+    /// Moves the end of the drag's selection to a window position, beginning the
+    /// selection once the pointer has gone far enough.
+    fn drag_to(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(((row, column), side)) = self.cell_at(position) else {
             return;
         };
-        self.core.extend_selection(row, column);
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
+        drag.pointer = position;
+        if !drag.started {
+            let dx = f32::from(position.x - drag.origin.x);
+            let dy = f32::from(position.y - drag.origin.y);
+            let far = dx * dx + dy * dy > SELECTION_DRAG_THRESHOLD * SELECTION_DRAG_THRESHOLD;
+            if !far && (row, column) == drag.anchor.0 {
+                return;
+            }
+            drag.started = true;
+            let ((anchor_row, anchor_column), anchor_side) = drag.anchor;
+            let kind = drag.kind;
+            self.core
+                .begin_selection(anchor_row, anchor_column, anchor_side, kind);
+        }
+        self.core.extend_selection(row, column, side);
         cx.notify();
     }
 
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.release_reported(TerminalMouseButton::Left, event, cx) {
+    /// Ends the drag at a window position.
+    fn finish_drag(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        self.drag_to(position, cx);
+        let Some(drag) = self.drag.take() else {
             return;
-        }
-        if !self.dragging {
-            return;
-        }
-        self.dragging = false;
-        let released = self.cell_at(event.position);
-        if let Some((row, column)) = released {
-            self.core.extend_selection(row, column);
-        }
-        let press = self.press.take();
-        // A selection needs movement: pressing and releasing on the same cell is a
-        // click, and copying it would replace whatever the user had on the
-        // clipboard with one character they did not select. A release outside the
-        // grid counts as movement, because the pointer really did leave the cell
-        // the button went down on. A double or triple click did choose something.
-        let moved = match (press, released) {
-            (Some(press), Some(released)) => press != released,
-            (Some(_), None) => true,
-            (None, _) => false,
         };
-        if moved || std::mem::take(&mut self.press_selects) {
+        if drag.started && self.core.has_selection() {
             // Copying on release is what makes "select with the mouse, paste" work
             // without a second step; the copy button stays for a repeat.
             self.copy_selection(cx);
         } else {
-            // A click clears the selection instead of leaving a one-cell highlight
-            // that claims the user selected something.
+            // A click selected nothing: no one-cell highlight claims it did, and
+            // the clipboard keeps what the user put there.
             self.core.clear_selection();
         }
         cx.notify();
+    }
+
+    /// Lines one auto-scroll step moves for a pointer at window height `y`:
+    /// positive back into the history when it is above the grid, negative
+    /// towards the live output when it is below, zero inside. One line per row
+    /// height past the edge, rounded up, at most
+    /// [`SELECTION_AUTOSCROLL_MAX_LINES`].
+    fn autoscroll_lines(&self, y: Pixels) -> i32 {
+        let Some(bounds) = self.viewport else {
+            return 0;
+        };
+        let height = self.cell.sanitized().height;
+        let above = f32::from(bounds.origin.y - y);
+        let below = f32::from(y - bounds.bottom());
+        let lines = |distance: f32| {
+            ((distance / height).ceil() as usize).clamp(1, SELECTION_AUTOSCROLL_MAX_LINES) as i32
+        };
+        if above > 0.0 {
+            lines(above)
+        } else if below > 0.0 {
+            -lines(below)
+        } else {
+            0
+        }
+    }
+
+    /// Starts scrolling while a selection drag holds the pointer past the top or
+    /// bottom edge of the grid.
+    fn start_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscrolling {
+            return;
+        }
+        let Some(drag) = self.drag.filter(|drag| drag.started) else {
+            return;
+        };
+        if self.autoscroll_lines(drag.pointer.y) == 0 {
+            return;
+        }
+        self.autoscrolling = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(SELECTION_AUTOSCROLL_INTERVAL)
+                    .await;
+                let keep_going = this.update(cx, |pane, cx| pane.autoscroll_step(cx));
+                match keep_going {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One auto-scroll step: scrolls towards the pointer and extends the
+    /// selection to the row now at the edge. Returns whether to keep going.
+    fn autoscroll_step(&mut self, cx: &mut Context<Self>) -> bool {
+        let pointer = match self.drag {
+            Some(drag) if drag.started => drag.pointer,
+            _ => {
+                self.autoscrolling = false;
+                return false;
+            }
+        };
+        let lines = self.autoscroll_lines(pointer.y);
+        if lines == 0 {
+            self.autoscrolling = false;
+            return false;
+        }
+        self.core.scroll(lines);
+        self.drag_to(pointer, cx);
+        cx.notify();
+        true
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
@@ -4845,6 +5046,7 @@ impl TerminalPane {
         let weak = cx.entity().downgrade();
         let entity = cx.entity();
         let focus = self.focus.clone();
+        let capture = weak.clone();
         let listener = move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
             if let Some(bounds) = bounds.first() {
                 let _ = weak.update(cx, |pane, cx| pane.apply_viewport(*bounds, cx));
@@ -4888,6 +5090,29 @@ impl TerminalPane {
                         ElementInputHandler::new(bounds, entity.clone()),
                         cx,
                     );
+                    // A selection drag follows the pointer and hears the release
+                    // anywhere in the window, not only over the grid: the grid's own
+                    // handlers only fire while it is hovered. The listeners are part
+                    // of every frame, so the first motion after the press is heard
+                    // even before the frame the press caused, and they do nothing
+                    // unless this pane holds a drag.
+                    let moved = capture.clone();
+                    window.on_mouse_event(
+                        move |event: &MouseMoveEvent, phase, _window, cx: &mut App| {
+                            if phase == DispatchPhase::Bubble {
+                                let _ = moved.update(cx, |pane, cx| pane.drag_moved(event, cx));
+                            }
+                        },
+                    );
+                    let released = capture.clone();
+                    window.on_mouse_event(
+                        move |event: &MouseUpEvent, phase, _window, cx: &mut App| {
+                            if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                                let _ =
+                                    released.update(cx, |pane, cx| pane.drag_released(event, cx));
+                            }
+                        },
+                    );
                 },
             )))
             .on_mouse_down(
@@ -4902,7 +5127,8 @@ impl TerminalPane {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.on_mouse_up(event, cx);
+                    // A selection drag hears its release at the window.
+                    this.release_reported(TerminalMouseButton::Left, event, cx);
                 }),
             )
             .on_mouse_down(
